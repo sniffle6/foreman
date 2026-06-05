@@ -2,3 +2,7 @@
 *.png
 *.log
 run-stderr.log
+
+# IDE / tooling caches
+/.idea/
+/.serena/

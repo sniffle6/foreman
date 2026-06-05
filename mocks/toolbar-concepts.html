@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foreman — toolbar concepts</title>
+<style>
+  :root{
+    --steel-0:#15171a;      /* app bg / deepest */
+    --steel-1:#1d2024;      /* bar body */
+    --steel-2:#262a30;      /* raised bay */
+    --steel-3:#31363d;      /* keys */
+    --edge:#0d0e10;         /* hard shadow line */
+    --hi:#3a4048;           /* top highlight */
+    --ink:#c9ced6;          /* primary text */
+    --ink-dim:#7c838d;      /* labels */
+    --orange:#ff7a18;       /* safety / hi-vis accent (matches active tab) */
+    --orange-dim:#b9560f;
+    --caution:#f5c518;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:
+      radial-gradient(1200px 400px at 20% -10%, #1b1e22, var(--steel-0));
+    color:var(--ink);
+    font:13px/1.4 "SF Mono",ui-monospace,Menlo,Consolas,monospace;
+    padding:34px 28px 60px;
+  }
+  h1{font:600 12px/1 system-ui;letter-spacing:.18em;color:var(--ink-dim);
+     text-transform:uppercase;margin:0 0 4px}
+  .sub{font:11px/1.4 system-ui;color:#5a616b;margin:0 0 26px;max-width:60ch}
+  .case{margin:0 0 30px}
+  .tag{display:flex;align-items:baseline;gap:10px;margin:0 0 8px}
+  .tag b{font:600 12px/1 system-ui;letter-spacing:.04em;color:var(--ink)}
+  .tag .role{font:10px/1 system-ui;text-transform:uppercase;letter-spacing:.14em;
+       padding:3px 6px;border-radius:3px}
+  .role.bold{color:#0c0d0e;background:var(--orange)}
+  .role.mid{color:var(--orange);border:1px solid var(--orange-dim)}
+  .role.safe{color:var(--ink-dim);border:1px solid #3a4048}
+  .tag .note{font:11px/1 system-ui;color:#5a616b}
+
+  /* ---- shared bar shell ---- */
+  .bar{
+    display:flex;align-items:stretch;gap:0;height:46px;
+    background:linear-gradient(var(--steel-1),#191c20);
+    border:1px solid var(--edge);
+    border-top:1px solid var(--hi);
+    border-radius:7px; overflow:hidden;
+    box-shadow:0 8px 22px -10px #000, inset 0 1px 0 #2c3138;
+  }
+  .brand{
+    display:flex;align-items:center;gap:9px;padding:0 16px;
+    border-right:1px solid var(--edge);
+    background:linear-gradient(var(--steel-2),#1a1d21);
+  }
+  .chip-logo{width:13px;height:13px;border-radius:2px;
+    background:repeating-linear-gradient(45deg,var(--caution) 0 4px,#1a1c1f 4px 8px);
+    box-shadow:0 0 0 1px #000;}
+  .brand .name{font:700 12px/1 system-ui;letter-spacing:.22em;color:#e8ebef}
+  .bay{display:flex;align-items:center;gap:10px;padding:0 16px;
+    border-right:1px solid var(--edge);box-shadow:inset 1px 0 0 var(--hi)}
+  .bay:last-child{border-right:0}
+  .baylabel{font:9px/1 system-ui;text-transform:uppercase;letter-spacing:.16em;color:var(--ink-dim)}
+  .grow{flex:1}
+
+  /* buttons */
+  .btn{appearance:none;border:1px solid var(--edge);cursor:pointer;color:var(--ink);
+    background:linear-gradient(var(--steel-3),#24282d);border-top-color:#444a52;
+    padding:7px 12px;border-radius:5px;font:600 11px/1 system-ui;letter-spacing:.02em;
+    box-shadow:0 1px 0 #000, inset 0 1px 0 #4046; transition:.08s}
+  .btn:hover{background:linear-gradient(#3a4047,#2a2f35);color:#fff}
+  .btn:active{transform:translateY(1px);box-shadow:inset 0 2px 4px #000}
+  .btn.primary{background:linear-gradient(var(--orange),var(--orange-dim));
+    color:#140a02;border-color:#7c3a08;border-top-color:#ffb066;text-shadow:0 1px 0 #ffd1a3}
+  .btn.primary:hover{filter:brightness(1.08)}
+  /* stamped trade key */
+  .key{font:700 11px/1 ui-monospace,monospace;letter-spacing:.06em;min-width:46px;text-align:center;
+    padding:8px 10px}
+  .site{display:inline-flex;align-items:center;gap:7px;color:var(--ink)}
+  .site .dot{width:7px;height:7px;border-radius:50%;background:var(--orange);
+    box-shadow:0 0 7px var(--orange)}
+  .site .nm{font:600 11px/1 system-ui;color:#e8ebef}
+  .crew{font:10px/1 system-ui;color:var(--ink-dim)}
+
+  /* split button */
+  .split{display:inline-flex}
+  .split .main{border-radius:5px 0 0 5px}
+  .split .caret{border-radius:0 5px 5px 0;border-left:1px solid #000;padding:7px 9px}
+  .menu{position:absolute;margin-top:6px;background:#1c1f23;border:1px solid var(--edge);
+    border-radius:6px;padding:5px;box-shadow:0 10px 24px -8px #000;display:none;z-index:9}
+  .menu.open{display:block}
+  .menu div{padding:7px 14px 7px 12px;border-radius:4px;font:600 11px/1 system-ui;color:var(--ink)}
+  .menu div:hover{background:var(--orange);color:#140a02}
+  .wrap{position:relative}
+
+  /* command bar */
+  .cmd{display:flex;align-items:center;gap:9px;flex:1;
+    background:#101215;border:1px solid var(--edge);border-radius:6px;
+    padding:0 12px;height:32px;box-shadow:inset 0 2px 6px #000}
+  .cmd .caret{color:var(--orange);font-weight:700}
+  .cmd input{flex:1;background:none;border:0;outline:0;color:var(--ink);
+    font:13px/1 ui-monospace,monospace;caret-color:var(--orange)}
+  .cmd input::placeholder{color:#4d545d}
+  .runhint{font:9px/1 system-ui;color:#4d545d;border:1px solid #2c3137;border-radius:3px;padding:3px 5px}
+  .hintline{font:10px/1.5 system-ui;color:#565d66;padding:7px 16px 0}
+  .hintline b{color:var(--orange);font-weight:600}
+  .echo{font:11px/1 ui-monospace,monospace;color:var(--caution);padding:6px 16px 0;min-height:14px}
+  .echo .x{color:#ff5d5d}
+  .minichips{display:flex;gap:6px;padding:8px 16px 0}
+  .minichips .btn{padding:5px 9px;font-size:10px}
+
+  /* faux window tabs under each, to show context */
+  .tabs{display:flex;gap:0;margin-top:0}
+  .tabrow{display:flex;height:26px;margin-top:8px;font:11px/1 system-ui}
+  .tabrow .t{display:flex;align-items:center;gap:8px;padding:0 12px;color:var(--ink-dim);
+    background:#191c20;border:1px solid var(--edge);border-bottom:0;border-radius:5px 5px 0 0;margin-right:4px}
+  .tabrow .t.active{color:#fff;border-top:2px solid var(--orange);background:#23262b}
+  .tabrow .t .wc{color:#4d545d;font-size:10px}
+</style>
+</head>
+<body>
+  <h1>Foreman · toolbar concepts</h1>
+  <p class="sub">Concept: the toolbar is a foreman's <b style="color:#cbd0d7">dispatch rail</b> — commission sites, dispatch crews (terminals) of a trade (shell) into the <i>focused</i> site. Charcoal steel + the safety-orange already on your active tab. Rough mock; spacing/fonts will differ in egui.</p>
+
+  <!-- ============ CONCEPT 1 : COMMAND BAR ============ -->
+  <section class="case">
+    <div class="tag"><b>1 — Work-order command bar</b><span class="role bold">bold · recommended</span><span class="note">keyboard-first · try typing below</span></div>
+    <div class="bar">
+      <div class="brand"><span class="chip-logo"></span><span class="name">FOREMAN</span></div>
+      <div class="bay grow" style="padding-right:12px">
+        <div class="cmd">
+          <span class="caret">›</span>
+          <input id="ci" placeholder='dispatch bash into project 1   ·   new site   ·   kill project 2' autocomplete="off">
+          <span class="runhint">⏎ RUN</span>
+        </div>
+      </div>
+    </div>
+    <div class="echo" id="echo">&nbsp;</div>
+    <div class="hintline">orders: <b>new site</b> · <b>dispatch ps|cmd|sh</b> [into &lt;site&gt;] · <b>kill</b> &lt;site&gt; · <b>switch</b> &lt;site&gt;</div>
+    <div class="minichips">
+      <button class="btn primary">+ site</button>
+      <button class="btn">ps</button><button class="btn">cmd</button><button class="btn">sh</button>
+      <span style="align-self:center;color:#4d545d;font:10px/1 system-ui">← fallback chips for mouse</span>
+    </div>
+  </section>
+
+  <!-- ============ CONCEPT 2 : DISPATCH RAIL ============ -->
+  <section class="case">
+    <div class="tag"><b>2 — Dispatch rail</b><span class="role mid">memorable · visual</span><span class="note">click-based · focused site now visible</span></div>
+    <div class="bar">
+      <div class="brand"><span class="chip-logo"></span><span class="name">FOREMAN</span></div>
+      <div class="bay">
+        <span class="baylabel">commission</span>
+        <button class="btn primary">+ SITE</button>
+      </div>
+      <div class="bay grow">
+        <span class="baylabel">dispatch →</span>
+        <span class="site"><span class="dot"></span><span class="nm">project 2</span></span>
+        <span style="width:10px"></span>
+        <button class="btn key">PS</button>
+        <button class="btn key">CMD</button>
+        <button class="btn key">SH</button>
+        <span class="grow"></span>
+        <span class="crew">crew: 2</span>
+      </div>
+    </div>
+    <div class="tabrow">
+      <div class="t active">project 2 <span class="wc">▢ ✕</span></div>
+      <div class="t">project 1 <span class="wc">▢ ✕</span></div>
+    </div>
+  </section>
+
+  <!-- ============ CONCEPT 3 : SPLIT BUTTON ============ -->
+  <section class="case">
+    <div class="tag"><b>3 — Split-button</b><span class="role safe">safe · expected</span><span class="note">smallest change · click caret for menu</span></div>
+    <div class="bar">
+      <div class="brand"><span class="chip-logo"></span><span class="name">FOREMAN</span></div>
+      <div class="bay grow">
+        <button class="btn primary">+ Site</button>
+        <span style="width:6px"></span>
+        <div class="split wrap">
+          <button class="btn main">+ Dispatch → project 2</button>
+          <button class="btn caret" onclick="this.parentNode.querySelector('.menu').classList.toggle('open')">▾</button>
+          <div class="menu">
+            <div>PowerShell</div><div>cmd</div><div>bash</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+<script>
+  // tiny parser so concept 1 feels real
+  const ci = document.getElementById('ci'), echo = document.getElementById('echo');
+  ci.addEventListener('keydown', e => {
+    if(e.key!=='Enter') return;
+    const s = ci.value.trim().toLowerCase();
+    let out;
+    if(!s) out='';
+    else if(/^new site/.test(s)) out='✓ commissioned new site';
+    else if(/^kill\s+(.+)/.test(s)) out='✓ killed site "'+RegExp.$1+'"';
+    else if(/^switch\s+(.+)/.test(s)) out='✓ focus → "'+RegExp.$1+'"';
+    else if(/^dispatch\s+(ps|cmd|sh|powershell|bash)/.test(s)){
+      const trade=RegExp.$1, m=s.match(/into\s+(.+)$/); out='✓ dispatched '+trade+' → "'+(m?m[1]:'project 2 (focused)')+'"';
+    } else out='<span class="x">✕ unknown order — try: dispatch ps · new site</span>';
+    echo.innerHTML = out||'&nbsp;'; ci.value='';
+  });
+</script>
+</body>
+</html>
