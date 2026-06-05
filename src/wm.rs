@@ -339,7 +339,9 @@ impl WindowManager {
 
         for &i in &order {
             let id = self.windows[i].id;
-            let is_focus = focused == Some(id) && active;
+            // While the directory picker is open, no window is active — this stops the
+            // focused terminal from also consuming the keystrokes meant for the picker.
+            let is_focus = focused == Some(id) && active && self.picker.is_none();
             let is_project = matches!(self.windows[i].content, Content::Project(_));
 
             // Re-fit to the (possibly resized) area every frame: snapped/maximized
