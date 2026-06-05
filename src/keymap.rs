@@ -25,6 +25,11 @@ pub enum Command {
     Rename,
     NewTerm,
     LastTerm,
+    /// Cycle to the next tab in the focused stack; if the focused window is not a
+    /// stack, falls back to the last-focused toggle (supersedes plain `Tab`).
+    TabCycle,
+    /// Cycle to the previous tab in the focused stack (no fallback).
+    TabPrev,
     // project (outer) level
     ProjFocus(Dir),
     ZoomProject,
@@ -68,6 +73,8 @@ impl Command {
             NewTerm,
             Rename,
             LastTerm,
+            TabCycle,
+            TabPrev,
             // Actions
             Help,
             OpenSettings,
@@ -79,9 +86,8 @@ impl Command {
         use Command::*;
         match self {
             ProjFocus(_) | ZoomProject | CloseProject | NewProject | LastProject => Group::Projects,
-            TermFocus(_) | TermSnap(_) | ZoomTerm | CloseTerm | NewTerm | Rename | LastTerm => {
-                Group::Terminals
-            }
+            TermFocus(_) | TermSnap(_) | ZoomTerm | CloseTerm | NewTerm | Rename | LastTerm
+            | TabCycle | TabPrev => Group::Terminals,
             Help | OpenSettings => Group::Actions,
         }
     }
@@ -117,6 +123,8 @@ impl Command {
             NewTerm => "New terminal",
             Rename => "Rename focused window",
             LastTerm => "Toggle last terminal",
+            TabCycle => "Next tab / last terminal",
+            TabPrev => "Previous tab",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
         }
@@ -463,8 +471,14 @@ impl Default for Keymap {
         t.insert(ctrl(K::Z), ZoomProject);
         t.insert(plain(K::Comma), Rename);
 
-        // --- last-focused toggle ---
-        t.insert(plain(K::Tab), LastTerm);
+        // --- tab cycle / last-focused toggle ---
+        // `Tab` cycles tabs in the focused stack, falling back to the last-focused
+        // toggle when the focused window is not a stack (handled in `dispatch`).
+        // This supersedes the old plain-`Tab` → LastTerm binding. `Shift+Tab`
+        // cycles backwards. `LastTerm` is still a dispatchable command (the
+        // fallback path) but no longer owns a default chord of its own.
+        t.insert(plain(K::Tab), TabCycle);
+        t.insert(shift(K::Tab), TabPrev);
         t.insert(ctrl(K::Tab), LastProject);
 
         // --- discoverability ---
@@ -656,6 +670,23 @@ mod tests {
     }
 
     #[test]
+    fn tab_bindings_are_cycle_prev_and_last_project() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.resolve(Chord::new(K::Tab, false, false, false)),
+            Some(Command::TabCycle)
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::Tab, false, true, false)),
+            Some(Command::TabPrev)
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::Tab, true, false, false)),
+            Some(Command::LastProject)
+        );
+    }
+
+    #[test]
     fn unbound_chord_resolves_none() {
         let km = Keymap::default();
         assert_eq!(km.resolve(Chord::new(K::F, false, false, false)), None);
@@ -813,6 +844,12 @@ mod tests {
     #[test]
     fn all_commands_have_a_default_chord_and_metadata() {
         for &cmd in Command::ALL {
+            // `LastTerm` deliberately has no default chord: `Tab` is now
+            // `TabCycle`, which falls back to last-terminal behaviour. The command
+            // remains dispatchable so a user can still bind it.
+            if cmd == Command::LastTerm {
+                continue;
+            }
             assert!(
                 default_chord(cmd).is_some(),
                 "command {cmd:?} has no default chord"

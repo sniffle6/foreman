@@ -211,17 +211,64 @@ impl Content {
             Content::Project(wm) => wm.show(ui, rect, active, base.with(("proj", win_id))),
         }
     }
+
+    /// Keep this content alive while it is an *inactive* tab (not rendered this
+    /// frame). A terminal drains its PTY (answering startup device queries and
+    /// buffering output); a project recurses so every nested terminal stays alive
+    /// too. Pure book-keeping — no rendering, no input.
+    fn keepalive(&mut self) {
+        match self {
+            Content::Terminal(s) => s.keepalive(),
+            Content::Project(wm) => wm.keepalive(),
+        }
+    }
+}
+
+/// One entry in a window's tab-stack: a title and the content it shows. The
+/// per-tab title lives here (a window no longer has a single title); the active
+/// tab's title is what the titlebar renders and what rename targets.
+pub struct Tab {
+    pub title: String,
+    pub content: Content,
 }
 
 pub struct Win {
     pub id: WinId,
-    pub title: String,
+    /// The stack of tabs this window holds. Invariant: never empty — closing the
+    /// last tab closes the window. A len-1 stack renders exactly like a classic
+    /// single-content window (no tab bar drawn).
+    pub tabs: Vec<Tab>,
+    /// Index into `tabs` of the active (rendered + keyboard-owning) tab.
+    pub active: usize,
     pub rect: egui::Rect, // local coords (origin = manager area.min)
     pub z: u64,
     pub minimized: bool,
     pub snap: Option<Zone>, // Some => tiled/maximized: refit to area each frame
     pub prev: Option<egui::Rect>, // floating rect to restore to when un-snapped
-    pub content: Content,
+}
+
+impl Win {
+    /// The active tab's title (what the titlebar shows and rename edits).
+    pub fn title(&self) -> &str {
+        &self.tabs[self.active].title
+    }
+    /// Mutable handle to the active tab's content.
+    fn active_content(&mut self) -> &mut Content {
+        &mut self.tabs[self.active].content
+    }
+    /// Is the active tab a project? (Drives titlebar styling + the +project key.)
+    fn is_project(&self) -> bool {
+        matches!(self.tabs[self.active].content, Content::Project(_))
+    }
+    /// Pump every tab that is *not* the active one so backgrounded PTYs stay alive.
+    fn keepalive_inactive(&mut self) {
+        let active = self.active;
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if i != active {
+                t.content.keepalive();
+            }
+        }
+    }
 }
 
 // The resolved-command type lives in `keymap.rs` as `Command` (data-driven in
@@ -242,6 +289,15 @@ enum Act {
     /// Fired by the "+" on a project titlebar; the actual project is created when
     /// the user accepts a directory in the picker.
     OpenProjectPicker,
+    /// Switch window `WinId` to tab index `usize` (tab-bar click).
+    SetTab(WinId, usize),
+    /// Close tab index `usize` of window `WinId` (tab-bar close affordance).
+    CloseTab(WinId, usize),
+    /// Merge the source window's tabs onto the target window's stack, then remove
+    /// the source. Fired when a window's titlebar is dropped onto another window.
+    Merge { src: WinId, dst: WinId },
+    /// Detach tab `idx` of window `id` into a new floating window at `pos` (local).
+    Untab { id: WinId, idx: usize, pos: egui::Pos2 },
 }
 
 pub struct WindowManager {
@@ -337,13 +393,13 @@ impl WindowManager {
     fn push_win(&mut self, id: WinId, title: String, rect: egui::Rect, content: Content) {
         self.windows.push(Win {
             id,
-            title,
+            tabs: vec![Tab { title, content }],
+            active: 0,
             rect,
             z: self.z,
             minimized: false,
             snap: None,
             prev: None,
-            content,
         });
         self.focused = Some(id);
     }
@@ -380,7 +436,7 @@ impl WindowManager {
     fn picker_start(&self) -> PathBuf {
         self.focused
             .and_then(|id| self.windows.iter().find(|w| w.id == id))
-            .and_then(|w| match &w.content {
+            .and_then(|w| match &w.tabs[w.active].content {
                 Content::Project(wm) => wm.cwd.clone(),
                 _ => None,
             })
@@ -519,7 +575,7 @@ impl WindowManager {
             }
             Command::CloseProject => {
                 if let Some(id) = self.focused {
-                    self.close(id);
+                    self.close_active_tab(id);
                 }
             }
             Command::LastProject => self.toggle_last(),
@@ -543,12 +599,14 @@ impl WindowManager {
                         }
                         Command::CloseTerm => {
                             if let Some(id) = child.focused {
-                                child.close(id);
+                                child.close_active_tab(id);
                             }
                         }
                         Command::Rename => child.begin_rename(),
                         Command::NewTerm => child.add_terminal(Shell::PowerShell, &ctx),
                         Command::LastTerm => child.toggle_last(),
+                        Command::TabCycle => child.cycle_tab(true),
+                        Command::TabPrev => child.cycle_tab(false),
                         // project-level handled above
                         _ => {}
                     }
@@ -570,7 +628,7 @@ impl WindowManager {
         self.windows
             .iter_mut()
             .find(|w| w.id == id)
-            .and_then(|w| match &mut w.content {
+            .and_then(|w| match w.active_content() {
                 Content::Project(wm) => Some(wm.as_mut()),
                 _ => None,
             })
@@ -580,12 +638,13 @@ impl WindowManager {
         if let Some(id) = self.focused {
             if let Some(w) = self.windows.iter().find(|w| w.id == id) {
                 self.renaming = Some(id);
-                self.rename_buf = w.title.clone();
+                self.rename_buf = w.title().to_string();
                 self.rename_focus = true;
             }
         }
     }
 
+    /// Remove an entire window (all of its tabs) and fix up focus.
     fn close(&mut self, id: WinId) {
         self.windows.retain(|w| w.id != id);
         if self.focused == Some(id) {
@@ -596,10 +655,155 @@ impl WindowManager {
         }
     }
 
+    /// Close one tab: the given tab index of window `id`. Removing the last tab
+    /// closes the window. Otherwise the active index is clamped so it still points
+    /// at a live tab (prefer staying on the tab to the left of the one removed).
+    fn close_tab(&mut self, id: WinId, idx: usize) {
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        if idx >= w.tabs.len() {
+            return;
+        }
+        if w.tabs.len() == 1 {
+            self.close(id);
+            return;
+        }
+        w.tabs.remove(idx);
+        if w.active >= idx && w.active > 0 {
+            w.active -= 1;
+        }
+        if w.active >= w.tabs.len() {
+            w.active = w.tabs.len() - 1;
+        }
+    }
+
+    /// Close the active tab of window `id` (used by `x` / the titlebar close
+    /// control). Closes the window when it was the last tab.
+    fn close_active_tab(&mut self, id: WinId) {
+        let active = self.windows.iter().find(|w| w.id == id).map(|w| w.active);
+        if let Some(a) = active {
+            self.close_tab(id, a);
+        }
+    }
+
+    /// Merge `src` window's tabs onto `dst` window's stack, then remove `src`.
+    /// The merged tabs are appended; the first moved tab becomes active so the
+    /// dropped window is what the user sees. No-op if either id is missing or
+    /// `src == dst` (can't merge a window onto itself).
+    fn merge_windows(&mut self, src: WinId, dst: WinId) {
+        if src == dst {
+            return;
+        }
+        let Some(si) = self.windows.iter().position(|w| w.id == src) else {
+            return;
+        };
+        let Some(di) = self.windows.iter().position(|w| w.id == dst) else {
+            return;
+        };
+        // Remove the source first; recompute the destination index afterwards
+        // since removal may shift it.
+        let src_win = self.windows.remove(si);
+        let di = self.windows.iter().position(|w| w.id == dst).unwrap_or(di);
+        let dst_win = &mut self.windows[di];
+        let first_new = dst_win.tabs.len();
+        dst_win.tabs.extend(src_win.tabs);
+        dst_win.active = first_new; // show the just-dropped tab
+        // Focus the merged target; drop any dangling focus/last-focus on src.
+        if self.last_focused == Some(src) {
+            self.last_focused = None;
+        }
+        if self.focused == Some(src) {
+            self.focused = None;
+        }
+        self.focus(dst);
+    }
+
+    /// Detach tab `idx` of window `id` into a brand-new floating window placed at
+    /// `local_pos` (manager-local coords). Used by drag-out (untab). The new
+    /// window restores a sensible floating size. If the source had only one tab,
+    /// this is a no-op (dragging the sole tab just moves the window, handled by the
+    /// normal title drag).
+    fn untab(&mut self, id: WinId, idx: usize, local_pos: egui::Pos2) {
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        if w.tabs.len() <= 1 || idx >= w.tabs.len() {
+            return;
+        }
+        let tab = w.tabs.remove(idx);
+        if w.active >= idx && w.active > 0 {
+            w.active -= 1;
+        }
+        if w.active >= w.tabs.len() {
+            w.active = w.tabs.len() - 1;
+        }
+        // A sensible restored size: the source window's pre-snap floating size if
+        // it has one, else its current rect size, clamped to a floor.
+        let size = w
+            .prev
+            .map(|r| r.size())
+            .unwrap_or_else(|| w.rect.size())
+            .max(egui::vec2(MIN_W, MIN_H));
+        let new_id = self.next;
+        self.next += 1;
+        self.z += 1;
+        // Anchor the new window so the grabbed title sits roughly under the cursor.
+        let origin = egui::pos2(local_pos.x - size.x * 0.5, local_pos.y - TITLE_H * 0.5);
+        self.windows.push(Win {
+            id: new_id,
+            tabs: vec![tab],
+            active: 0,
+            rect: egui::Rect::from_min_size(origin, size),
+            z: self.z,
+            minimized: false,
+            snap: None,
+            prev: None,
+        });
+        self.focus(new_id);
+    }
+
     fn toggle_last(&mut self) {
         if let Some(prev) = self.last_focused {
             if self.windows.iter().any(|w| w.id == prev && !w.minimized) {
                 self.focus(prev);
+            }
+        }
+    }
+
+    /// `Tab`: advance the focused window's active tab by `+1`/`-1`. If the focused
+    /// window is *not* a stack (len-1) and `forward`, fall back to the last-focused
+    /// window toggle (the pre-tabs `Tab` behaviour). `Shift+Tab` on a non-stack
+    /// does nothing (there is no "previous tab" to go to).
+    fn cycle_tab(&mut self, forward: bool) {
+        let Some(id) = self.focused else { return };
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let n = w.tabs.len();
+        if n <= 1 {
+            if forward {
+                self.toggle_last();
+            }
+            return;
+        }
+        w.active = if forward {
+            (w.active + 1) % n
+        } else {
+            (w.active + n - 1) % n
+        };
+        self.focus(id);
+    }
+
+    /// Recursively pump every PTY in this manager's tree — used to keep an entire
+    /// *inactive project tab* (whole child manager) alive while it is not rendered.
+    /// Mirrors `Content::keepalive` but reaches every tab of every window, since an
+    /// un-rendered manager's show loop (which normally pumps the active tab) never
+    /// runs this frame.
+    fn keepalive(&mut self) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                t.content.keepalive();
             }
         }
     }
@@ -700,6 +904,36 @@ impl WindowManager {
         }
     }
 
+    /// Hit-test the pointer (screen coords) against the windows in `order`
+    /// (back-to-front draw order), returning the index of the *top-most* window —
+    /// other than `src` — whose **titlebar** contains the pointer. Dropping a
+    /// dragged window's title onto another window's titlebar tabs (merges) it onto
+    /// that window's stack. Requiring the *titlebar* (not the whole body) makes
+    /// merge a deliberate gesture, so ordinary repositioning that happens to
+    /// overlap another window does not accidentally merge. Skips `src` so a window
+    /// can never be merged onto itself.
+    fn merge_target_at(
+        &self,
+        src: WinId,
+        p: egui::Pos2,
+        area: egui::Rect,
+        order: &[usize],
+    ) -> Option<usize> {
+        // `order` is back-to-front; iterate in reverse for top-most-first.
+        for &j in order.iter().rev() {
+            let w = &self.windows[j];
+            if w.id == src || w.minimized {
+                continue;
+            }
+            let scr = w.rect.translate(area.min.to_vec2());
+            let titlebar = egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H));
+            if titlebar.contains(p) {
+                return Some(j);
+            }
+        }
+        None
+    }
+
     /// Returns whether any window in this manager was interacted with this frame.
     /// The parent uses this to propagate focus upward: clicking a sub-window in a
     /// background project bubbles up and switches the desktop to that project.
@@ -736,6 +970,9 @@ impl WindowManager {
         let mut acts: Vec<Act> = vec![];
         // overlay rect (screen coords) for the snap zone of the window being dragged
         let mut snap_overlay: Option<egui::Rect> = None;
+        // index (into self.windows) of a window the dragged title is hovering as a
+        // merge (tab) target; painted with a highlight to telegraph the drop.
+        let mut merge_hint: Option<usize> = None;
 
         for &i in &order {
             let id = self.windows[i].id;
@@ -748,8 +985,12 @@ impl WindowManager {
                 && self.picker.is_none()
                 && self.renaming.is_none()
                 && self.settings.is_none();
-            let is_project = matches!(self.windows[i].content, Content::Project(_));
+            let is_project = self.windows[i].is_project();
             let is_renaming = self.renaming == Some(id);
+            // Keep backgrounded tabs (everything but the active tab) alive: their
+            // PTYs are drained / device queries answered even though they are not
+            // drawn this frame. The active tab is pumped by its own render below.
+            self.windows[i].keepalive_inactive();
 
             // Re-fit to the (possibly resized) area every frame: snapped/maximized
             // windows recompute to the new size; floating windows clamp back in.
@@ -779,7 +1020,7 @@ impl WindowManager {
                 let title_w = ui
                     .painter()
                     .layout_no_wrap(
-                        self.windows[i].title.clone(),
+                        self.windows[i].title().to_string(),
                         egui::FontId::proportional(12.5),
                         TEXT,
                     )
@@ -789,7 +1030,7 @@ impl WindowManager {
                 let on_name = dr.interact_pointer_pos().is_some_and(|p| name_rect.contains(p));
                 if on_name {
                     self.renaming = Some(id);
-                    self.rename_buf = self.windows[i].title.clone();
+                    self.rename_buf = self.windows[i].title().to_string();
                     self.rename_focus = true;
                 } else {
                     acts.push(Act::Max(id));
@@ -823,28 +1064,48 @@ impl WindowManager {
                 }
                 scr = self.windows[i].rect.translate(area.min.to_vec2());
 
-                // --- snap: detect zone under the pointer (relative to area) ---
-                // The top zone escalates to maximize the longer you hold it; the
-                // overlay grows from top-half to full to telegraph the switch.
-                if let Some(p) = ui.ctx().pointer_latest_pos() {
-                    let fx = (p.x - area.min.x) / asz.x;
-                    let fy = (p.y - area.min.y) / asz.y;
-                    let now = ui.input(|inp| inp.time);
-                    let raw = detect_zone(fx, fy);
-                    if raw != self.dwell_zone {
-                        self.dwell_zone = raw;
-                        self.dwell_start = now;
-                    }
-                    let held = now - self.dwell_start;
-                    let (_committed, overlay) = resolve_zone(raw, held, asz, self.split);
-                    if let Some(r) = overlay {
-                        snap_overlay = Some(r.translate(area.min.to_vec2()));
+                // --- merge target detection: is the pointer over another window? ---
+                // Dropping a window's title onto another window tabs it onto that
+                // window's stack. While hovering a merge target we suppress the snap
+                // overlay and instead highlight the target (handled at paint time).
+                let pointer = ui.ctx().pointer_latest_pos();
+                let over_target =
+                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
+                if let Some(tgt) = over_target {
+                    merge_hint = Some(tgt);
+                    self.dwell_zone = None;
+                } else {
+                    // --- snap: detect zone under the pointer (relative to area) ---
+                    // The top zone escalates to maximize the longer you hold it; the
+                    // overlay grows from top-half to full to telegraph the switch.
+                    if let Some(p) = pointer {
+                        let fx = (p.x - area.min.x) / asz.x;
+                        let fy = (p.y - area.min.y) / asz.y;
+                        let now = ui.input(|inp| inp.time);
+                        let raw = detect_zone(fx, fy);
+                        if raw != self.dwell_zone {
+                            self.dwell_zone = raw;
+                            self.dwell_start = now;
+                        }
+                        let held = now - self.dwell_start;
+                        let (_committed, overlay) = resolve_zone(raw, held, asz, self.split);
+                        if let Some(r) = overlay {
+                            snap_overlay = Some(r.translate(area.min.to_vec2()));
+                        }
                     }
                 }
             }
             if dr.drag_stopped() {
-                // commit the snap on release, applying the hold-to-maximize escalation
-                if let Some(p) = ui.ctx().pointer_latest_pos() {
+                let pointer = ui.ctx().pointer_latest_pos();
+                // A drop onto another window merges (tabs) onto it and wins over the
+                // snap: the dragged window is consumed, so we skip snapping entirely.
+                let merge_dst =
+                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
+                if let Some(dst_i) = merge_dst {
+                    let dst = self.windows[dst_i].id;
+                    acts.push(Act::Merge { src: id, dst });
+                } else if let Some(p) = pointer {
+                    // commit the snap on release, applying the hold-to-maximize escalation
                     let fx = (p.x - area.min.x) / asz.x;
                     let fy = (p.y - area.min.y) / asz.y;
                     let now = ui.input(|inp| inp.time);
@@ -934,15 +1195,127 @@ impl WindowManager {
                 } else if resp.lost_focus() {
                     let t = self.rename_buf.trim().to_string();
                     if !t.is_empty() {
-                        self.windows[i].title = t;
+                        let a = self.windows[i].active;
+                        self.windows[i].tabs[a].title = t;
                     }
                     self.renaming = None;
+                }
+            } else if self.windows[i].tabs.len() > 1 {
+                // --- tab bar (multi-tab stacks only) ---
+                // Drawn inside the titlebar (respecting TITLE_H): one chip per tab,
+                // active highlighted, each with a small close affordance. Chips are
+                // registered after the window-drag rect so they win pointer priority;
+                // dragging a chip off the bar detaches it (untab).
+                let ntabs = self.windows[i].tabs.len();
+                let tab_font = egui::FontId::proportional(11.5);
+                let chip_h = TITLE_H - 6.0;
+                let cy = scr.min.y + 3.0;
+                let mut cx = scr.min.x + 6.0;
+                let avail_end = scr.max.x - ctl_w;
+                for ti in 0..ntabs {
+                    let is_active_tab = self.windows[i].active == ti;
+                    let label = self.windows[i].tabs[ti].title.clone();
+                    let tw = ui
+                        .painter()
+                        .layout_no_wrap(label.clone(), tab_font.clone(), TEXT)
+                        .size()
+                        .x
+                        .min(120.0);
+                    let close_w = 16.0;
+                    let chip_w = tw + 12.0 + close_w;
+                    if cx + chip_w > avail_end && ti > 0 {
+                        // Out of room: stop drawing further chips (rare; many tabs on
+                        // a narrow window). The active tab is always within the first
+                        // few, and cycling still reaches the rest.
+                        break;
+                    }
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(cx, cy),
+                        egui::vec2(chip_w, chip_h),
+                    );
+                    let chip_resp = ui.interact(
+                        chip,
+                        base.with((id, "tab", ti)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let bg = if is_active_tab {
+                        if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }
+                    } else if chip_resp.hovered() {
+                        egui::Color32::from_rgb(50, 45, 35)
+                    } else {
+                        egui::Color32::from_rgb(38, 34, 27)
+                    };
+                    p.rect_filled(chip, egui::CornerRadius::same(4), bg);
+                    if is_active_tab {
+                        p.rect_stroke(
+                            chip,
+                            egui::CornerRadius::same(4),
+                            egui::Stroke::new(1.0, BORDER_FOCUS),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let txt_col = if is_active_tab && is_focus { TEXT } else { DIM };
+                    p.text(
+                        egui::pos2(cx + 7.0, cy + chip_h / 2.0),
+                        egui::Align2::LEFT_CENTER,
+                        &label,
+                        tab_font.clone(),
+                        txt_col,
+                    );
+                    // per-tab close affordance (small ×)
+                    let xr = egui::Rect::from_min_size(
+                        egui::pos2(cx + chip_w - close_w, cy),
+                        egui::vec2(close_w, chip_h),
+                    );
+                    let xresp = ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
+                    let xc = xr.center();
+                    let xs = 3.0;
+                    let xcol = if xresp.hovered() {
+                        egui::Color32::from_rgb(220, 120, 100)
+                    } else {
+                        txt_col
+                    };
+                    let xstroke = egui::Stroke::new(1.2, xcol);
+                    let pp = ui.painter();
+                    pp.line_segment(
+                        [egui::pos2(xc.x - xs, xc.y - xs), egui::pos2(xc.x + xs, xc.y + xs)],
+                        xstroke,
+                    );
+                    pp.line_segment(
+                        [egui::pos2(xc.x - xs, xc.y + xs), egui::pos2(xc.x + xs, xc.y - xs)],
+                        xstroke,
+                    );
+                    if xresp.clicked() {
+                        acts.push(Act::CloseTab(id, ti));
+                    } else if chip_resp.clicked() {
+                        acts.push(Act::SetTab(id, ti));
+                    } else if chip_resp.drag_stopped() {
+                        // Dragging a chip off the titlebar detaches it into its own
+                        // floating window at the drop point (local coords).
+                        if let Some(dp) = ui.ctx().pointer_latest_pos() {
+                            let off = (dp.y - scr.min.y).abs() > TITLE_H * 1.5
+                                || dp.x < scr.min.x
+                                || dp.x > scr.max.x;
+                            if off {
+                                let local = dp - area.min.to_vec2();
+                                acts.push(Act::Untab {
+                                    id,
+                                    idx: ti,
+                                    pos: egui::pos2(local.x, local.y),
+                                });
+                            } else {
+                                // Dropped back on the bar: just activate it.
+                                acts.push(Act::SetTab(id, ti));
+                            }
+                        }
+                    }
+                    cx += chip_w + 4.0;
                 }
             } else {
                 p.text(
                     egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
                     egui::Align2::LEFT_CENTER,
-                    &self.windows[i].title,
+                    self.windows[i].title(),
                     egui::FontId::proportional(12.5),
                     if is_focus { TEXT } else { DIM },
                 );
@@ -956,7 +1329,7 @@ impl WindowManager {
                 let title_w = ui
                     .painter()
                     .layout_no_wrap(
-                        self.windows[i].title.clone(),
+                        self.windows[i].title().to_string(),
                         egui::FontId::proportional(12.5),
                         TEXT,
                     )
@@ -1099,7 +1472,7 @@ impl WindowManager {
             }
             let child_interacted =
                 self.windows[i]
-                    .content
+                    .active_content()
                     .show(ui, content_rect, is_focus, base, id, &cresp);
             if child_interacted {
                 // A sub-window inside this project was clicked: raise this project
@@ -1196,12 +1569,25 @@ impl WindowManager {
             );
         }
 
+        // --- merge (tab) drop hint: highlight the target window while hovering ---
+        if let Some(j) = merge_hint {
+            let r = self.windows[j].rect.translate(area.min.to_vec2()).intersect(area);
+            let p = ui.painter_at(area);
+            p.rect_filled(r, egui::CornerRadius::same(8), SNAP_FILL);
+            p.rect_stroke(
+                r,
+                egui::CornerRadius::same(8),
+                egui::Stroke::new(2.0, SNAP_STROKE),
+                egui::StrokeKind::Inside,
+            );
+        }
+
         // --- taskbar (minimized) ---
         let mins: Vec<(WinId, String)> = self
             .windows
             .iter()
             .filter(|w| w.minimized)
-            .map(|w| (w.id, w.title.clone()))
+            .map(|w| (w.id, w.title().to_string()))
             .collect();
         if !mins.is_empty() {
             let mut tx = area.min.x + 8.0;
@@ -1239,7 +1625,7 @@ impl WindowManager {
                 Act::Focus(id) => self.focus(id),
                 Act::AddTerm(id, shell) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        if let Content::Project(wm) = &mut w.content {
+                        if let Content::Project(wm) = w.active_content() {
                             wm.add_terminal(shell, &ctx);
                         }
                     }
@@ -1248,12 +1634,20 @@ impl WindowManager {
                 Act::OpenProjectPicker => {
                     self.picker = Some(DirPicker::new(self.picker_start()));
                 }
-                Act::Close(id) => {
-                    self.windows.retain(|w| w.id != id);
-                    if self.focused == Some(id) {
-                        self.focused = None;
+                // The titlebar close control closes the *active tab* — which closes
+                // the whole window only when it was the last tab.
+                Act::Close(id) => self.close_active_tab(id),
+                Act::SetTab(id, idx) => {
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                        if idx < w.tabs.len() {
+                            w.active = idx;
+                        }
                     }
+                    self.focus(id);
                 }
+                Act::CloseTab(id, idx) => self.close_tab(id, idx),
+                Act::Merge { src, dst } => self.merge_windows(src, dst),
+                Act::Untab { id, idx, pos } => self.untab(id, idx, pos),
                 Act::Min(id) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         w.minimized = true;
@@ -1483,4 +1877,162 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     let x = rect.min.x.clamp(0.0, (area.x - w).max(0.0));
     let y = rect.min.y.clamp(0.0, (area.y - h).max(0.0));
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A cheap stub window content: an empty nested manager. Avoids spawning a PTY
+    // (which would need an egui context), while exercising every tab op — they are
+    // agnostic to whether content is a terminal or a project.
+    fn stub_content() -> Content {
+        Content::Project(Box::new(WindowManager::new()))
+    }
+
+    // Push a single-tab window with the given title; returns its id.
+    fn push(wm: &mut WindowManager, title: &str) -> WinId {
+        let id = wm.next;
+        wm.next += 1;
+        wm.z += 1;
+        wm.windows.push(Win {
+            id,
+            tabs: vec![Tab {
+                title: title.to_string(),
+                content: stub_content(),
+            }],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
+            z: wm.z,
+            minimized: false,
+            snap: None,
+            prev: None,
+        });
+        wm.focused = Some(id);
+        id
+    }
+
+    #[test]
+    fn len1_window_has_no_tab_bar_and_title_is_the_tab_title() {
+        let mut wm = WindowManager::new();
+        let id = push(&mut wm, "alpha");
+        let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.title(), "alpha");
+    }
+
+    #[test]
+    fn merge_appends_source_tab_and_removes_source() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        assert_eq!(wm.windows.len(), 2);
+
+        wm.merge_windows(a, b); // drop A onto B
+        assert_eq!(wm.windows.len(), 1, "source window removed");
+        let merged = &wm.windows[0];
+        assert_eq!(merged.id, b, "destination survives");
+        assert_eq!(merged.tabs.len(), 2, "source tab appended");
+        // The just-dropped tab becomes active and is the merge target's focus.
+        assert_eq!(merged.tabs[merged.active].title, "A");
+        assert_eq!(wm.focused, Some(b));
+    }
+
+    #[test]
+    fn merge_onto_self_is_noop() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.merge_windows(a, a);
+        assert_eq!(wm.windows.len(), 1);
+        assert_eq!(wm.windows[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn closing_last_tab_removes_the_window() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.close_tab(a, 0);
+        assert!(wm.windows.is_empty(), "single-tab close removes the window");
+    }
+
+    #[test]
+    fn closing_one_of_many_tabs_keeps_window_and_clamps_active() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.merge_windows(b, a); // A now has tabs [A, B], active = 1 (B)
+        assert_eq!(wm.windows[0].tabs.len(), 2);
+        assert_eq!(wm.windows[0].active, 1);
+
+        wm.close_tab(a, 1); // close the active (last) tab
+        let w = &wm.windows[0];
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.active, 0, "active clamps to a live tab");
+        assert_eq!(w.tabs[0].title, "A");
+    }
+
+    #[test]
+    fn cycle_tab_wraps_forward_and_back() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        let c = push(&mut wm, "C");
+        wm.merge_windows(b, a);
+        wm.merge_windows(c, a); // A: [A, B, C]
+        let id = a;
+        wm.focus(id);
+        // set active to 0 deterministically
+        wm.windows.iter_mut().find(|w| w.id == id).unwrap().active = 0;
+
+        wm.cycle_tab(true);
+        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 1);
+        wm.cycle_tab(true);
+        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 2);
+        wm.cycle_tab(true);
+        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 0, "wraps");
+        wm.cycle_tab(false);
+        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 2, "back wraps");
+    }
+
+    #[test]
+    fn cycle_tab_on_len1_falls_back_to_last_focused() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        // Focus A then B so last_focused = A while focused = B (both len-1).
+        wm.focus(a);
+        wm.focus(b);
+        assert_eq!(wm.focused, Some(b));
+        assert_eq!(wm.last_focused, Some(a));
+        wm.cycle_tab(true); // not a stack → toggle to last focused
+        assert_eq!(wm.focused, Some(a));
+    }
+
+    #[test]
+    fn untab_detaches_into_new_floating_window() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.merge_windows(b, a); // A: [A, B]
+        assert_eq!(wm.windows.len(), 1);
+
+        wm.untab(a, 1, egui::pos2(500.0, 400.0)); // pull B out
+        assert_eq!(wm.windows.len(), 2, "a new window appeared");
+        let src = wm.windows.iter().find(|w| w.id == a).unwrap();
+        assert_eq!(src.tabs.len(), 1, "source lost the detached tab");
+        assert_eq!(src.tabs[0].title, "A");
+        // The new window holds exactly the detached tab and is focused.
+        let new = wm.windows.iter().max_by_key(|w| w.id).unwrap();
+        assert_eq!(new.tabs.len(), 1);
+        assert_eq!(new.tabs[0].title, "B");
+        assert_eq!(wm.focused, Some(new.id));
+    }
+
+    #[test]
+    fn untab_on_len1_is_noop() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.untab(a, 0, egui::pos2(500.0, 400.0));
+        assert_eq!(wm.windows.len(), 1, "single-tab window is not detachable");
+    }
 }

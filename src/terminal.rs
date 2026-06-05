@@ -412,6 +412,16 @@ impl Session {
     /// Render the terminal into `rect`. Reads keyboard if `active`.
     /// `resp` is the content-area interaction from the window manager (used for
     /// mouse text selection and right-click paste).
+    /// Keep an *inactive* (un-rendered) tab's PTY alive: drain the reader channel
+    /// into the grid and answer any pending device queries (e.g. the startup DSR
+    /// `ESC[6n`). The reader thread runs independently of rendering, so this only
+    /// needs to advance the parser — without resizing, drawing, or reading input.
+    /// Called every frame for tabs that are not the active tab so a backgrounded
+    /// shell never hangs on a query and keeps producing output.
+    pub fn keepalive(&mut self) {
+        self.pump();
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, active: bool, resp: &egui::Response) {
         let font = egui::FontId::monospace(13.0);
         let probe = ui.painter().layout_no_wrap("M".to_string(), font.clone(), FG);
