@@ -35,6 +35,7 @@ pub enum Command {
     TabPrev,
     // project (outer) level
     ProjFocus(Dir),
+    ProjSnap(Dir),
     ZoomProject,
     CloseProject,
     NewProject,
@@ -58,6 +59,10 @@ impl Command {
             ProjFocus(Down),
             ProjFocus(Up),
             ProjFocus(Right),
+            ProjSnap(Left),
+            ProjSnap(Down),
+            ProjSnap(Up),
+            ProjSnap(Right),
             ZoomProject,
             CloseProject,
             NewProject,
@@ -92,7 +97,9 @@ impl Command {
     pub fn group(self) -> Group {
         use Command::*;
         match self {
-            ProjFocus(_) | ZoomProject | CloseProject | NewProject | LastProject => Group::Projects,
+            ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject => {
+                Group::Projects
+            }
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
             | LastTerm | TabCycle | TabPrev => Group::Terminals,
             Help | OpenSettings => Group::Actions,
@@ -108,6 +115,12 @@ impl Command {
                 Dir::Down => "Focus project down",
                 Dir::Up => "Focus project up",
                 Dir::Right => "Focus project right",
+            },
+            ProjSnap(d) => match d {
+                Dir::Left => "Snap project left",
+                Dir::Down => "Snap project down",
+                Dir::Up => "Snap project up",
+                Dir::Right => "Snap project right",
             },
             ZoomProject => "Zoom (maximize) project",
             CloseProject => "Close project",
@@ -451,11 +464,13 @@ impl Default for Keymap {
         let plain = |k: K| Chord::new(k, false, false, false);
         let ctrl = |k: K| Chord::new(k, true, false, false);
         let shift = |k: K| Chord::new(k, false, true, false);
+        let alt = |k: K| Chord::new(k, false, false, true);
 
         let mut t: HashMap<Chord, Command> = HashMap::new();
 
-        // --- directional: arrows ---
-        // plain = terminal focus, Shift = terminal snap, Ctrl = project focus.
+        // --- directional: arrows (final §2 scheme) ---
+        // plain arrows = terminal focus; Ctrl+arrows = project focus.
+        // (Terminal snap moved to WASD; project snap to Ctrl+WASD; both below.)
         for (k, d) in [
             (K::ArrowLeft, Left),
             (K::ArrowDown, Down),
@@ -463,20 +478,18 @@ impl Default for Keymap {
             (K::ArrowRight, Right),
         ] {
             t.insert(plain(k), TermFocus(d));
-            t.insert(shift(k), TermSnap(d));
             t.insert(ctrl(k), ProjFocus(d));
         }
 
-        // --- vi h/j/k/l: terminal focus only (no ctrl/shift in Phase 1) ---
-        for (k, d) in [(K::H, Left), (K::J, Down), (K::K, Up), (K::L, Right)] {
-            t.insert(plain(k), TermFocus(d));
-        }
-
-        // --- split: Alt+WASD (W=up, A=left, S=down, D=right) ---
-        // Creates a new terminal snapped to the pointed zone, tabbing onto an
-        // existing window already snapped there (Phase 2).
-        let alt = |k: K| Chord::new(k, false, false, true);
+        // --- WASD (W=up, A=left, S=down, D=right): snap + split ---
+        // plain WASD  = terminal snap (replaces the old Shift+arrows)
+        // Ctrl+WASD   = project snap
+        // Alt+WASD    = split (new terminal → zone, tab on collision; Phase 2)
+        // `h/j/k/l` terminal focus is intentionally dropped — re-addable via the
+        // settings editor.
         for (k, d) in [(K::W, Up), (K::A, Left), (K::S, Down), (K::D, Right)] {
+            t.insert(plain(k), TermSnap(d));
+            t.insert(ctrl(k), ProjSnap(d));
             t.insert(alt(k), Split(d));
         }
 
@@ -649,18 +662,35 @@ mod tests {
     #[test]
     fn default_resolves_known_chords() {
         let km = Keymap::default();
-        // arrows
+        // arrows: plain = terminal focus, Ctrl = project focus.
         assert_eq!(
             km.resolve(Chord::new(K::ArrowLeft, false, false, false)),
             Some(Command::TermFocus(Dir::Left))
         );
         assert_eq!(
-            km.resolve(Chord::new(K::ArrowRight, false, true, false)),
+            km.resolve(Chord::new(K::ArrowUp, true, false, false)),
+            Some(Command::ProjFocus(Dir::Up))
+        );
+        // WASD: plain = terminal snap, Ctrl = project snap, Alt = split.
+        assert_eq!(
+            km.resolve(Chord::new(K::D, false, false, false)),
             Some(Command::TermSnap(Dir::Right))
         );
         assert_eq!(
-            km.resolve(Chord::new(K::ArrowUp, true, false, false)),
-            Some(Command::ProjFocus(Dir::Up))
+            km.resolve(Chord::new(K::W, false, false, false)),
+            Some(Command::TermSnap(Dir::Up))
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::A, true, false, false)),
+            Some(Command::ProjSnap(Dir::Left))
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::S, true, false, false)),
+            Some(Command::ProjSnap(Dir::Down))
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::W, false, false, true)),
+            Some(Command::Split(Dir::Up))
         );
         // action keys
         assert_eq!(
@@ -683,11 +713,11 @@ mod tests {
             km.resolve(Chord::new(K::Questionmark, false, false, false)),
             Some(Command::Help)
         );
-        // vi keys
-        assert_eq!(
-            km.resolve(Chord::new(K::J, false, false, false)),
-            Some(Command::TermFocus(Dir::Down))
-        );
+        // vi keys are no longer bound by default (dropped in the §2 rebind).
+        assert_eq!(km.resolve(Chord::new(K::H, false, false, false)), None);
+        assert_eq!(km.resolve(Chord::new(K::J, false, false, false)), None);
+        assert_eq!(km.resolve(Chord::new(K::K, false, false, false)), None);
+        assert_eq!(km.resolve(Chord::new(K::L, false, false, false)), None);
     }
 
     #[test]
@@ -705,6 +735,43 @@ mod tests {
             km.resolve(Chord::new(K::Tab, true, false, false)),
             Some(Command::LastProject)
         );
+    }
+
+    #[test]
+    fn wasd_snap_and_split_defaults() {
+        let km = Keymap::default();
+        // terminal snap on plain WASD (W=up, A=left, S=down, D=right)
+        for (k, d) in [
+            (K::W, Dir::Up),
+            (K::A, Dir::Left),
+            (K::S, Dir::Down),
+            (K::D, Dir::Right),
+        ] {
+            assert_eq!(
+                km.resolve(Chord::new(k, false, false, false)),
+                Some(Command::TermSnap(d)),
+                "plain {k:?} should be TermSnap({d:?})"
+            );
+            // project snap on Ctrl+WASD
+            assert_eq!(
+                km.resolve(Chord::new(k, true, false, false)),
+                Some(Command::ProjSnap(d)),
+                "Ctrl+{k:?} should be ProjSnap({d:?})"
+            );
+            // split on Alt+WASD
+            assert_eq!(
+                km.resolve(Chord::new(k, false, false, true)),
+                Some(Command::Split(d)),
+                "Alt+{k:?} should be Split({d:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn letter_chords_pretty_print_with_modifiers() {
+        assert_eq!(Chord::new(K::W, false, false, true).pretty(), "Alt+W");
+        assert_eq!(Chord::new(K::A, true, false, false).pretty(), "Ctrl+A");
+        assert_eq!(Chord::new(K::D, false, false, false).pretty(), "D");
     }
 
     #[test]

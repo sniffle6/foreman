@@ -581,6 +581,7 @@ impl WindowManager {
         match cmd {
             // ---- project (outer) level: act on the desktop ----
             Command::ProjFocus(d) => self.focus_dir(d),
+            Command::ProjSnap(d) => self.snap_dir(d),
             Command::ZoomProject => {
                 if let Some(id) = self.focused {
                     self.toggle_zoom(id, asz_proj);
