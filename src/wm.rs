@@ -2028,6 +2028,32 @@ mod tests {
     }
 
     #[test]
+    fn snap_into_occupied_zone_tabs_onto_occupant() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.set_snap(a, Zone::Left); // A holds the Left zone
+        wm.focused = Some(b);
+        wm.snap_dir(Dir::Left); // snap B onto the same zone
+
+        assert_eq!(wm.windows.len(), 1, "B tabbed onto A, not double-occupying");
+        let merged = &wm.windows[0];
+        assert_eq!(merged.id, a, "occupant survives");
+        assert_eq!(merged.snap, Some(Zone::Left), "occupant keeps its zone");
+        assert_eq!(merged.tabs.len(), 2, "B appended as a tab");
+    }
+
+    #[test]
+    fn snap_into_empty_zone_just_snaps() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.focused = Some(a);
+        wm.snap_dir(Dir::Right);
+        assert_eq!(wm.windows.len(), 1);
+        assert_eq!(wm.windows[0].snap, Some(Zone::Right));
+    }
+
+    #[test]
     fn merge_appends_source_tab_and_removes_source() {
         let mut wm = WindowManager::new();
         let a = push(&mut wm, "A");
