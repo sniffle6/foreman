@@ -47,15 +47,30 @@ and nested inside each project. Each project window's content is another
 are confined to their project. Focus cascades so exactly one terminal reads the
 keyboard. Window rects are **local** (relative to each manager's `area`).
 
+**Tabs** are a generic `Win` property restricted by *level, not zone*: any window
+can tab onto any other in the **same** `WindowManager` (so projects tab with
+projects, terminals with terminals). A one-tab stack is a normal window; dragging
+a tab out untabs it. **Split** (`Alt+WASD`) makes a new terminal, snaps it to the
+pointed zone, and tabs it onto the occupant if that zone is taken.
+
 - `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
 - `src/wm.rs` — the reusable window engine: drag/focus/z-order/min/max/resize/
   close/snap, `Win`, `Content`, `Zone`/snap logic, per-frame re-fit.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
   selection/clipboard, key routing, grid render.
 - `src/dirpicker.rs` — keyboard-driven project directory picker.
+- `src/keymap.rs` — data-driven leader-key bindings. Defaults live in
+  `Keymap::default` (in code); a user file at `%APPDATA%\foreman\keybindings.json`
+  is merged *over* them, so new commands always get a default chord. Leader is
+  `Ctrl+B` by default (tmux-style).
+- `src/settings.rs` — in-app keybindings editor; a desktop-level modal overlay
+  (mirrors the `dirpicker.rs` pattern), edits the live `Keymap` and signals the
+  wm when to persist.
 
-Subsystem docs: `docs/project-directories.md`. (`docs/foreman.md` is older
-narrative notes — prefer HANDOFF.md on any conflict.)
+Subsystem docs: `docs/project-directories.md`,
+`docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
+`docs/epics/window-tabbing-split-epic.md` (tab-stacks + Alt+WASD split).
+(`docs/foreman.md` is older narrative notes — prefer HANDOFF.md on any conflict.)
 
 ## Working agreement
 
