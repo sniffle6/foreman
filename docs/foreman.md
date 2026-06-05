@@ -121,7 +121,8 @@ How it works:
   `base.with(("proj", win_id))`. Without this, egui interaction Ids (drag/resize/
   buttons keyed on `base.with((id, role))`) would collide across projects that
   reuse the same per-window ids (each manager numbers windows from 1).
-- **Adding things.** `add_project(shell, ctx)` makes a project window that starts
+- **Adding things.** `add_project(shell, cwd, ctx)` makes a project window (rooted
+  at `cwd`) that starts
   with one terminal sub-window. There's no global toolbar anymore — a project
   titlebar carries its own `+` button just left of the min/max/close controls,
   which queues `Act::OpenProjectPicker`. That opens the directory picker
