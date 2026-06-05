@@ -2,10 +2,11 @@
 
 Read this top-to-bottom before doing anything. It is self-contained: the vision,
 the current state, the build/verify loop, the gotchas that already cost hours, and
-the next phases. Paths are relative to the repo root (`H:\claude code\foreman`).
+the next phases. Paths are relative to the repo root (the `foreman` directory,
+wherever you cloned it).
 
-Companion: `docs/foreman.md` (user-facing notes; may use the old
-`foreman-native/...` paths — treat this file as authoritative).
+Companion: `docs/foreman.md` (user-facing narrative notes) — treat this file as
+authoritative on any conflict.
 
 ---
 
@@ -95,7 +96,7 @@ Each `WindowManager` works in its own `area: Rect`. Window rects are **local**
 Windows, PowerShell, no MSVC. PATH for cargo + linker:
 ```powershell
 $env:Path = "C:\w64devkit\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
-Set-Location "H:\claude code\foreman"
+Set-Location <repo root>   # the foreman/ directory, wherever you cloned it
 ```
 (`C:\w64devkit\bin` is also persisted on the user PATH, so a plain terminal works.)
 

@@ -4,7 +4,7 @@ A fast, native desktop for running many AI-agent terminal sessions. Rust + egui,
 with real PTYs and a full terminal emulator. This is the "real" build that
 replaces the HTML mockups in `foreman/`.
 
-Lives in `foreman-native/`.
+Lives at the repo root (`src/`).
 
 ## What it does today
 
@@ -172,7 +172,6 @@ Gotchas / TODO:
 ## Build / run
 
 ```
-cd foreman-native
 cargo run
 ```
 
@@ -200,18 +199,18 @@ gotchas below.
   (`ui.painter().layout_no_wrap`, `painter.layout_job`) instead.
 - **eframe 0.34 `App` trait uses `ui(&mut Ui, ...)`**, not `update(&Context, ...)`.
 - **`Access is denied (os error 5)` on build** = the app is still running and
-  locking the exe. Kill `foreman-native` first.
+  locking the exe. Kill `foreman` first.
 
 ## Key files
 
-- `foreman-native/src/terminal.rs` — `Session` (PTY + alacritty + reader thread),
+- `src/terminal.rs` — `Session` (PTY + alacritty + reader thread),
   color resolver, `show(rect, active)` that renders the grid and routes keys.
-- `foreman-native/src/wm.rs` — `WindowManager` + `Win` + `Content`. The reusable
+- `src/wm.rs` — `WindowManager` + `Win` + `Content`. The reusable
   window engine (drag/focus/z/min/max/resize/close/snap), confined to a rect.
   `Content::Project(Box<WindowManager>)` nests it (recursive compositor); see
   "Nesting" above. `add_project` makes the outer level; the per-project header keys
   (`Act::AddTerm` → child `add_terminal`) make the inner one.
-- `foreman-native/src/main.rs` — the eframe app: just hosts the desktop manager
+- `src/main.rs` — the eframe app: just hosts the desktop manager
   full-bleed (no toolbar; new projects come from the `+` on a project titlebar).
 
 ## Bash on Windows

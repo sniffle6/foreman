@@ -1,0 +1,65 @@
+# Foreman — Claude Code Project Memory
+
+Fast, native desktop for running many AI-agent terminal sessions ("tmux built
+for AI"). Rust + egui, real PTYs (`portable-pty`/ConPTY), full terminal emulation
+(`alacritty_terminal`). **Hard requirement: it must be fast** — native, not
+Electron/Tauri.
+
+**Authoritative deep doc:** `docs/HANDOFF.md` — read it top-to-bottom before
+substantial work (vision, full architecture, next phases, working agreement).
+This file is the quick-load summary; HANDOFF.md wins on any conflict.
+
+## Build / verify loop (Windows, PowerShell, GNU toolchain — no MSVC)
+
+Kill the running app first or the link fails with `Access is denied (os error 5)`:
+
+```powershell
+Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+cargo build 2>&1 | Select-Object -Last 20
+cargo run            # debug
+cargo run --release  # the "is it fast" build
+```
+
+The GUI can't be seen from the terminal — to verify visually, run the exe and
+screenshot the window, then `Read` the PNG. Full screenshot script is in
+`docs/HANDOFF.md` § 3.
+
+## Gotchas (these already cost hours — do not rediscover)
+
+- **GNU toolchain, not MSVC:** `rustup default stable-gnu`.
+- **Linker = w64devkit** at `C:\w64devkit\bin` (on PATH; provides `dlltool`/`gcc`/`ld`).
+- **`cannot find -lgcc_eh`:** w64devkit GCC 16 folded EH into `libgcc`. Fix is an
+  empty stub: `ar crs C:\w64devkit\lib\gcc\x86_64-w64-mingw32\16.1.0\libgcc_eh.a`.
+  Recreate if you reinstall w64devkit.
+- **Black pane / shell never prompts = the DSR trap.** Shells send `ESC [ 6 n` on
+  startup and hang until the terminal replies. `Session`'s `Listener` captures
+  `Event::PtyWrite` and `pump()` writes it back. **Never use `VoidListener`.**
+- **`Access is denied (os error 5)`** on build = app still running; kill it first.
+- **egui 0.34:** `App::ui(&mut Ui, ...)` (not `update`); go through the painter
+  (`ui.painter().layout_no_wrap`) since `ui.fonts(|f|…)` needs `&mut`. Ctrl+C/V may
+  arrive as `Event::Copy`/`Paste` — handle those AND key events.
+
+## Architecture
+
+A **recursive compositor**: one `WindowManager` engine runs at the desktop level
+and nested inside each project. Each project window's content is another
+`WindowManager` (`Content::Project(Box<WindowManager>)`) of terminals. Sub-windows
+are confined to their project. Focus cascades so exactly one terminal reads the
+keyboard. Window rects are **local** (relative to each manager's `area`).
+
+- `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
+- `src/wm.rs` — the reusable window engine: drag/focus/z-order/min/max/resize/
+  close/snap, `Win`, `Content`, `Zone`/snap logic, per-frame re-fit.
+- `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
+  selection/clipboard, key routing, grid render.
+- `src/dirpicker.rs` — keyboard-driven project directory picker.
+
+Subsystem docs: `docs/project-directories.md`. (`docs/foreman.md` is older
+narrative notes — prefer HANDOFF.md on any conflict.)
+
+## Working agreement
+
+- Quality- and speed-obsessed user; no flattery, push back on bad ideas.
+- Verify by building + screenshotting — don't claim it works without evidence.
+- Don't needlessly hijack the user's mouse/keyboard to test.
+- Commit only when asked.
