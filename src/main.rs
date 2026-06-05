@@ -27,26 +27,6 @@ impl eframe::App for App {
             self.started = true;
         }
 
-        ui.horizontal(|ui| {
-            ui.strong("FOREMAN");
-            ui.separator();
-            if ui.button("+ project").clicked() {
-                self.desktop.add_project(Shell::PowerShell, &ctx);
-            }
-            ui.separator();
-            ui.label("+ terminal in project:");
-            if ui.button("powershell").clicked() {
-                self.desktop.add_terminal_to_focused(Shell::PowerShell, &ctx);
-            }
-            if ui.button("cmd").clicked() {
-                self.desktop.add_terminal_to_focused(Shell::Cmd, &ctx);
-            }
-            if ui.button("bash").clicked() {
-                self.desktop.add_terminal_to_focused(Shell::Bash, &ctx);
-            }
-        });
-        ui.separator();
-
         let area = ui.available_rect_before_wrap();
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
 

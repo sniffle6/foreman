@@ -36,8 +36,12 @@ Lives entirely in `wm.rs`. Ported from the web mockup `foreman/index.html`
 - The edge band is `T = 0.085` (8.5%) and corners use a `0.22` cross-axis band.
   Because only the outer ~8.5% triggers, the whole middle is a natural dead-zone.
 - `zone_rect(zone, area_size)` returns the target rect in **local** coords, inset
-  by `SNAP_GAP = 8.0` (matches the mockup's `g`), with a half-gap down the centre
-  split so left/right halves don't touch.
+  by `SNAP_GAP` from the area edge with a half-gap down the centre split.
+  `SNAP_GAP = 0.0` today, so snapped/maximized windows tile **edge-to-edge** and
+  adjacent halves/quarters touch (bump the const to reintroduce a gap). Snapped
+  windows also square their corners (`CornerRadius::ZERO`) so they sit flush to the
+  area edges — rounded corners would leave triangular gaps. Floating windows keep
+  the 6px radius.
 - While a drag is active and over a zone, a single amber overlay
   (`SNAP_FILL` ~13% alpha + 1.5px `SNAP_STROKE`) is painted **after** the window
   loop so it sits on top of all windows.
@@ -48,6 +52,12 @@ Lives entirely in `wm.rs`. Ported from the web mockup `foreman/index.html`
 
 Gotcha: snap is detected from `ui.ctx().pointer_latest_pos()` (screen coords)
 minus `area.min`, not from the drag delta — the delta only moves the rect.
+
+Dragging a snapped/maximized window out: on the first `dr.dragged()` frame the
+window restores to its pre-snap size from `prev` (same size the double-click /
+restore toggle returns), then re-anchors that smaller rect under the cursor (the
+pointer keeps the same horizontal fraction across the title) so the title stays
+grabbed instead of the window jumping away.
 
 ## Nesting (project windows)
 
@@ -70,19 +80,35 @@ How it works:
   desktop passes `active=true`; each project receives `active = is_focus` of its
   own `Win`, and passes that down to its sub-windows. So the keyboard is read by
   exactly one leaf: the focused terminal inside the focused project. Two terminals
-  in two different projects never both type.
+  in two different projects never both type. Interaction now also propagates
+  **upward**: `WindowManager::show` returns whether any of its windows was
+  interacted with this frame, and when a `Content::Project` window's child reports
+  an interaction the parent focuses that project. So clicking a sub-window inside a
+  background project switches the desktop to that project (this cascades through
+  arbitrary nesting depth, since each focus makes the parent's `acts` non-empty too).
 - **Id namespacing.** Every nested manager gets a unique `base` Id via
   `base.with(("proj", win_id))`. Without this, egui interaction Ids (drag/resize/
   buttons keyed on `base.with((id, role))`) would collide across projects that
   reuse the same per-window ids (each manager numbers windows from 1).
 - **Adding things.** `add_project(shell, ctx)` makes a project window that starts
-  with one terminal sub-window. `add_terminal_to_focused(shell, ctx)` adds a
-  terminal *inside* the currently-focused project (no-op if the focused window
-  isn't a project). The toolbar wires both: `+ project`, and `+ terminal in
-  project` (powershell/cmd/bash).
+  with one terminal sub-window. There's no global toolbar anymore — a project
+  titlebar carries its own `+` button just left of the min/max/close controls,
+  which queues `Act::AddProject` (applied after the render loop) to spawn a sibling
+  project. Adding a terminal *into* a project is done from that same titlebar:
+  each project header draws compact `PS · CMD · SH` keys after its title.
+  Clicking one queues `Act::AddTerm(win_id, shell)`, which (after the render loop)
+  finds that project window and calls its child manager's `add_terminal(shell)`.
+  The controls live on the header (not a global bar) so the target site is the
+  window you click — no "focused project" ambiguity. Terminal headers don't get
+  the keys or the `+` (gated on `is_project`); the keys also drop off if a project
+  window is too narrow to fit them beside the window controls.
 - **Visual distinction.** Project titlebars use a subtly cooler/deeper tint
   (`PROJ_TITLE_BG` / `PROJ_TITLE_BG_FOCUS`) vs the warm terminal titlebars, so the
   two nesting levels read as distinct without leaving the warm-graphite palette.
+  Window borders are a thin uniform `BORDER_W = 0.75` px; focus is shown by colour,
+  not weight. The focused **project** uses a punchier `PROJ_BORDER_FOCUS`
+  (`240,158,11`) while focused terminals keep the softer `BORDER_FOCUS`
+  (`231,169,63`), so the selected project pops at a glance.
 
 Snap/min/max/resize/close/taskbar all work *inside* a project for free because the
 engine is shared. You can also snap/drag the project windows themselves on the
@@ -149,8 +175,10 @@ gotchas below.
 - `foreman-native/src/wm.rs` — `WindowManager` + `Win` + `Content`. The reusable
   window engine (drag/focus/z/min/max/resize/close/snap), confined to a rect.
   `Content::Project(Box<WindowManager>)` nests it (recursive compositor); see
-  "Nesting" above. `add_project` / `add_terminal_to_focused` create the two levels.
-- `foreman-native/src/main.rs` — the eframe app: toolbar + the desktop manager.
+  "Nesting" above. `add_project` makes the outer level; the per-project header keys
+  (`Act::AddTerm` → child `add_terminal`) make the inner one.
+- `foreman-native/src/main.rs` — the eframe app: just hosts the desktop manager
+  full-bleed (no toolbar; new projects come from the `+` on a project titlebar).
 
 ## Bash on Windows
 

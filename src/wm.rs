@@ -13,6 +13,10 @@ const PROJ_TITLE_BG: egui::Color32 = egui::Color32::from_rgb(37, 41, 39);
 const PROJ_TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(48, 56, 52);
 const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 55, 45);
 const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
+// The focused project gets a punchier, more saturated amber than focused terminals
+// so the selected project reads at a glance even with thin borders.
+const PROJ_BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(150, 107, 28);
+const BORDER_W: f32 = 0.75; // uniform window border width; focus is shown by colour
 const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
@@ -21,8 +25,8 @@ const TITLE_H: f32 = 26.0;
 // snap overlay (amber, matches BORDER_FOCUS / web mockup --needs #e7a93f)
 const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
 const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
-const SNAP_GAP: f32 = 8.0; // inset of zones from the area edge (web mockup `g`)
-const TOP_HOLD: f64 = 0.6; // hold in the top zone this long (s) → escalate to maximize
+const SNAP_GAP: f32 = 0.0; // inset of zones from the area edge; 0 = windows tile edge-to-edge
+const TOP_HOLD: f64 = 0.4; // hold in the top zone this long (s) → escalate to maximize
 const GROW_LEAD: f64 = 0.25; // overlay grows top-half → full over the last GROW_LEAD secs
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +121,10 @@ pub enum Content {
     Project(Box<WindowManager>),
 }
 impl Content {
+    /// Returns whether a window in this content was interacted with this frame.
+    /// Terminals are leaves (no child windows) so they always return false; a
+    /// project returns whatever its nested manager reports, which lets the parent
+    /// raise focus to a background project when one of its sub-windows is clicked.
     fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -125,9 +133,12 @@ impl Content {
         base: egui::Id,
         win_id: WinId,
         resp: &egui::Response,
-    ) {
+    ) -> bool {
         match self {
-            Content::Terminal(s) => s.show(ui, rect, active, resp),
+            Content::Terminal(s) => {
+                s.show(ui, rect, active, resp);
+                false
+            }
             // Recurse: the project's content rect becomes the child manager's area.
             // The child only reads the keyboard if this project is itself active,
             // so `active` ANDs down the tree to exactly one leaf terminal.
@@ -153,6 +164,13 @@ enum Act {
     Min(WinId),
     Max(WinId),
     Restore(WinId),
+    /// Dispatch a terminal of `Shell` into project window `WinId`. Deferred like
+    /// the rest: the header key is drawn mid-loop, but reaching into the project's
+    /// nested manager has to wait until after the render borrow is released.
+    AddTerm(WinId, Shell),
+    /// Spawn a new sibling project on the desktop. Fired by the "+" on a project
+    /// titlebar; applied after the render borrow drops like the rest.
+    AddProject,
 }
 
 pub struct WindowManager {
@@ -227,18 +245,6 @@ impl WindowManager {
         );
     }
 
-    /// Add a terminal inside the currently-focused project window. No-op if the
-    /// focused window is not a project (or nothing is focused).
-    pub fn add_terminal_to_focused(&mut self, shell: Shell, ctx: &egui::Context) {
-        if let Some(fid) = self.focused {
-            if let Some(w) = self.windows.iter_mut().find(|w| w.id == fid) {
-                if let Content::Project(wm) = &mut w.content {
-                    wm.add_terminal(shell, ctx);
-                }
-            }
-        }
-    }
-
     fn focus(&mut self, id: WinId) {
         self.z += 1;
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -247,7 +253,10 @@ impl WindowManager {
         self.focused = Some(id);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect, active: bool, base: egui::Id) {
+    /// Returns whether any window in this manager was interacted with this frame.
+    /// The parent uses this to propagate focus upward: clicking a sub-window in a
+    /// background project bubbles up and switches the desktop to that project.
+    pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect, active: bool, base: egui::Id) -> bool {
         ui.painter_at(area)
             .rect_filled(area, egui::CornerRadius::ZERO, DESK_BG);
 
@@ -279,7 +288,8 @@ impl WindowManager {
                 }
             }
             let mut scr = self.windows[i].rect.translate(area.min.to_vec2());
-            let ctl_w = 88.0;
+            // Projects reserve extra right-side room for the "+" new-project button.
+            let ctl_w = if is_project { 116.0 } else { 88.0 };
 
             // --- title drag (interact first, then we know final position) ---
             let drag_rect =
@@ -294,8 +304,27 @@ impl WindowManager {
             if dr.dragged() {
                 {
                     let w = &mut self.windows[i];
+                    // Dragging pops a snapped/maximized window back to floating. Like
+                    // double-click/restore, it returns to its pre-snap size; we re-anchor
+                    // the restored rect under the cursor so the title stays grabbed.
+                    if w.snap.is_some() {
+                        if let (Some(pr), Some(p)) =
+                            (w.prev.take(), ui.ctx().pointer_latest_pos())
+                        {
+                            let local = p - area.min.to_vec2();
+                            let frac = if w.rect.width() > 0.0 {
+                                ((local.x - w.rect.min.x) / w.rect.width()).clamp(0.0, 1.0)
+                            } else {
+                                0.5
+                            };
+                            w.rect = egui::Rect::from_min_size(
+                                egui::pos2(local.x - frac * pr.width(), local.y - TITLE_H * 0.5),
+                                pr.size(),
+                            );
+                        }
+                        w.snap = None;
+                    }
                     w.rect = w.rect.translate(dr.drag_delta());
-                    w.snap = None; // dragging pops a snapped/maximized window back to floating
                     clamp(&mut w.rect, asz);
                 }
                 scr = self.windows[i].rect.translate(area.min.to_vec2());
@@ -351,8 +380,15 @@ impl WindowManager {
             );
 
             // --- paint window ---
+            // Snapped/maximized windows square their corners so they tile flush to
+            // the area edges and to each other (rounded corners would leave gaps).
+            let cr = if self.windows[i].snap.is_some() {
+                egui::CornerRadius::ZERO
+            } else {
+                egui::CornerRadius::same(6)
+            };
             let p = ui.painter_at(scr.intersect(area));
-            p.rect_filled(scr, egui::CornerRadius::same(6), WIN_BG);
+            p.rect_filled(scr, cr, WIN_BG);
             let (tbg, tbg_focus) = if is_project {
                 (PROJ_TITLE_BG, PROJ_TITLE_BG_FOCUS)
             } else {
@@ -360,7 +396,7 @@ impl WindowManager {
             };
             p.rect_filled(
                 title_rect,
-                egui::CornerRadius::same(6),
+                cr,
                 if is_focus { tbg_focus } else { tbg },
             );
             p.text(
@@ -371,13 +407,66 @@ impl WindowManager {
                 if is_focus { TEXT } else { DIM },
             );
 
+            // --- dispatch keys (project headers only) ---
+            // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
+            // a terminal of that shell *into this project*. Lives here (not the
+            // global bar) so the target site is unambiguous — the window you click.
+            if is_project {
+                let title_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        self.windows[i].title.clone(),
+                        egui::FontId::proportional(12.5),
+                        TEXT,
+                    )
+                    .size()
+                    .x;
+                let kh = TITLE_H - 10.0;
+                let ky = scr.min.y + 5.0;
+                let mut kx = scr.min.x + 11.0 + title_w + 14.0;
+                let key_font = egui::FontId::proportional(10.5);
+                for (label, shell) in [
+                    ("PS", Shell::PowerShell),
+                    ("CMD", Shell::Cmd),
+                    ("SH", Shell::Bash),
+                ] {
+                    let tw = ui
+                        .painter()
+                        .layout_no_wrap(label.to_owned(), key_font.clone(), TEXT)
+                        .size()
+                        .x;
+                    let kw = tw + 12.0;
+                    // keep keys from colliding with the window controls on narrow windows
+                    if kx + kw > scr.max.x - ctl_w {
+                        break;
+                    }
+                    let r = egui::Rect::from_min_size(egui::pos2(kx, ky), egui::vec2(kw, kh));
+                    let kresp = ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
+                    let kbg = if kresp.hovered() {
+                        egui::Color32::from_rgb(72, 82, 76)
+                    } else {
+                        egui::Color32::from_rgb(45, 51, 48)
+                    };
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(3), kbg);
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        label,
+                        key_font.clone(),
+                        if is_focus { TEXT } else { DIM },
+                    );
+                    if kresp.clicked() {
+                        acts.push(Act::AddTerm(id, shell));
+                    }
+                    kx += kw + 5.0;
+                }
+            }
+
             // --- window controls ---
             let by = scr.min.y + 3.0;
             let bh = TITLE_H - 6.0;
             let mut bx = scr.max.x - 4.0 - 22.0;
-            for (role, glyph, danger) in
-                [("close", "✕", true), ("max", "▢", false), ("min", "—", false)]
-            {
+            for (role, danger) in [("close", true), ("max", false), ("min", false)] {
                 let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
                 let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
                 let bg = if resp.hovered() {
@@ -390,13 +479,38 @@ impl WindowManager {
                     egui::Color32::TRANSPARENT
                 };
                 ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
-                ui.painter().text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    glyph,
-                    egui::FontId::proportional(12.0),
-                    if is_focus { TEXT } else { DIM },
-                );
+                // Icons are drawn as vector strokes (not font glyphs) so all three
+                // share one optical center, size, and weight regardless of font.
+                let c = r.center();
+                let s = 4.0; // icon half-extent
+                let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                let p = ui.painter();
+                match role {
+                    "min" => {
+                        p.line_segment(
+                            [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                            stroke,
+                        );
+                    }
+                    "max" => {
+                        p.rect_stroke(
+                            egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
+                            egui::CornerRadius::same(1),
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    _ => {
+                        p.line_segment(
+                            [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                            stroke,
+                        );
+                        p.line_segment(
+                            [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
+                            stroke,
+                        );
+                    }
+                }
                 if resp.clicked() {
                     acts.push(match role {
                         "close" => Act::Close(id),
@@ -405,6 +519,29 @@ impl WindowManager {
                     });
                 }
                 bx -= 25.0;
+            }
+
+            // --- new-project button (project titlebars only) ---
+            // Sits just left of the window controls; spawns a sibling project on
+            // the desktop. Replaces the old global "+ project" header button.
+            if is_project {
+                let r = egui::Rect::from_min_size(egui::pos2(bx - 4.0, by), egui::vec2(22.0, bh));
+                let resp = ui.interact(r, base.with((id, "addproj")), egui::Sense::click());
+                let bg = if resp.hovered() {
+                    egui::Color32::from_rgb(72, 64, 50)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
+                let c = r.center();
+                let s = 4.0;
+                let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                let p = ui.painter();
+                p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
+                p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+                if resp.clicked() {
+                    acts.push(Act::AddProject);
+                }
             }
 
             // --- content ---
@@ -419,15 +556,31 @@ impl WindowManager {
             if cresp.clicked() {
                 acts.push(Act::Focus(id));
             }
-            self.windows[i]
-                .content
-                .show(ui, content_rect, is_focus, base, id, &cresp);
+            let child_interacted =
+                self.windows[i]
+                    .content
+                    .show(ui, content_rect, is_focus, base, id, &cresp);
+            if child_interacted {
+                // A sub-window inside this project was clicked: raise this project
+                // to focus so the keyboard cascade reaches it. This also makes
+                // `acts` non-empty, propagating the interaction further up.
+                acts.push(Act::Focus(id));
+            }
 
             // --- border + resize ---
+            let border_col = if is_focus {
+                if is_project {
+                    PROJ_BORDER_FOCUS
+                } else {
+                    BORDER_FOCUS
+                }
+            } else {
+                BORDER
+            };
             ui.painter_at(area).rect_stroke(
                 scr,
-                egui::CornerRadius::same(6),
-                egui::Stroke::new(1.0, if is_focus { BORDER_FOCUS } else { BORDER }),
+                cr,
+                egui::Stroke::new(BORDER_W, border_col),
                 egui::StrokeKind::Inside,
             );
             let rh = egui::Rect::from_min_size(
@@ -495,9 +648,24 @@ impl WindowManager {
             }
         }
 
+        // Any Act means a window in this manager was interacted with this frame.
+        // Captured before the apply loop consumes `acts`, returned at the end so
+        // the parent can bubble focus upward through arbitrary nesting depth.
+        let interacted = !acts.is_empty();
+
+        let ctx = ui.ctx().clone();
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
+                Act::AddTerm(id, shell) => {
+                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                        if let Content::Project(wm) = &mut w.content {
+                            wm.add_terminal(shell, &ctx);
+                        }
+                    }
+                    self.focus(id);
+                }
+                Act::AddProject => self.add_project(Shell::PowerShell, &ctx),
                 Act::Close(id) => {
                     self.windows.retain(|w| w.id != id);
                     if self.focused == Some(id) {
@@ -535,6 +703,8 @@ impl WindowManager {
                 }
             }
         }
+
+        interacted
     }
 }
 
