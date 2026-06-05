@@ -1,0 +1,10 @@
+[package]
+name = "foreman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+arboard = "3.6.1"
+eframe = "0.34.3"
+portable-pty = "0.9.0"
