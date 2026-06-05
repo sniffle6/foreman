@@ -13,7 +13,7 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            desktop: WindowManager::new(),
+            desktop: WindowManager::new().as_desktop(),
             started: false,
         }
     }

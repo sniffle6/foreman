@@ -24,6 +24,13 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
 const TITLE_H: f32 = 26.0;
 
+// Leader (prefix) key — tmux-style. The one binding worth making trivial to
+// change. After it is pressed the next chord is a *command* (consumed, never
+// sent to the PTY). `Ctrl+Space` is the recommended alternative if `Ctrl+b`
+// collides with something inside a terminal.
+const LEADER: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B);
+
 const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
 const MIN_H: f32 = 140.0;
@@ -35,6 +42,26 @@ const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 const SNAP_GAP: f32 = 0.0; // inset of zones from the area edge; 0 = windows tile edge-to-edge
 const TOP_HOLD: f64 = 0.4; // hold in the top zone this long (s) → escalate to maximize
 const GROW_LEAD: f64 = 0.25; // overlay grows top-half → full over the last GROW_LEAD secs
+
+// A cardinal direction for directional focus / snap commands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+impl Dir {
+    // The snap zone a directional snap maps to (half-screen tiling).
+    fn zone(self) -> Zone {
+        match self {
+            Dir::Left => Zone::Left,
+            Dir::Right => Zone::Right,
+            Dir::Up => Zone::Top,
+            Dir::Down => Zone::Bottom,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Zone {
@@ -197,6 +224,28 @@ pub struct Win {
     pub content: Content,
 }
 
+/// A resolved leader command. Terminal-level variants act on the focused
+/// project's child manager; project-level variants act on the desktop.
+#[derive(Clone, Copy)]
+enum Cmd {
+    // terminal (inner) level
+    TermFocus(Dir),
+    TermSnap(Dir),
+    ZoomTerm,
+    CloseTerm,
+    Rename,
+    NewTerm,
+    LastTerm,
+    // project (outer) level
+    ProjFocus(Dir),
+    ZoomProject,
+    CloseProject,
+    NewProject,
+    LastProject,
+    // global
+    Help,
+}
+
 enum Act {
     Focus(WinId),
     Close(WinId),
@@ -235,6 +284,21 @@ pub struct WindowManager {
     renaming: Option<WinId>,
     rename_buf: String,
     rename_focus: bool,
+    /// True only on the root (desktop) manager. The leader state machine and the
+    /// `?` overlay run here once per frame, *before* the recursion reaches any
+    /// terminal, so command chords never leak to a PTY.
+    desktop: bool,
+    /// Command mode is armed: the leader was pressed and the next chord is a
+    /// command. No timeout, no multi-key sequences — deliberately dumb.
+    armed: bool,
+    /// Read-only bindings cheat sheet is open. Dismissed by any key.
+    show_help: bool,
+    /// Previously-focused window in this manager, for the `Tab` toggle. On the
+    /// desktop this is the last project; inside a project, the last terminal.
+    last_focused: Option<WinId>,
+    /// Size of the area this manager was last rendered into. Lets keyboard-driven
+    /// zoom/snap commit a rect immediately (the show loop refits next frame).
+    last_area: egui::Vec2,
 }
 
 impl WindowManager {
@@ -252,7 +316,18 @@ impl WindowManager {
             renaming: None,
             rename_buf: String::new(),
             rename_focus: false,
+            desktop: false,
+            armed: false,
+            show_help: false,
+            last_focused: None,
+            last_area: egui::vec2(0.0, 0.0),
         }
+    }
+
+    /// Mark this manager as the root desktop: it runs the leader state machine.
+    pub fn as_desktop(mut self) -> Self {
+        self.desktop = true;
+        self
     }
 
     // Cascading offset for a freshly spawned window, plus a fresh id + z.
@@ -325,13 +400,365 @@ impl WindowManager {
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.z = self.z;
         }
+        // Remember the outgoing focus so `Tab` can toggle back to it.
+        if self.focused != Some(id) {
+            self.last_focused = self.focused;
+        }
         self.focused = Some(id);
+    }
+
+    // --- leader / command mode (desktop only) -------------------------------
+
+    /// Run the leader state machine for one frame. Returns the command chord to
+    /// execute, if armed and a chord arrived this frame. All keystrokes that the
+    /// command layer claims are *drained from egui input here* so they never
+    /// reach the focused terminal's `read_input`.
+    ///
+    /// States: idle → (leader) → armed → (any chord) → idle. An unbound chord
+    /// while armed disarms and is swallowed (tmux behaviour).
+    fn pump_leader(&mut self, ui: &mut egui::Ui) -> Option<Cmd> {
+        // The help overlay eats the next keystroke (any key dismisses it) so the
+        // dismissing key never lands in a terminal.
+        if self.show_help {
+            let any_key = ui.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Copy
+                            | egui::Event::Cut
+                            | egui::Event::Paste(_)
+                    )
+                })
+            });
+            if any_key {
+                self.show_help = false;
+            }
+            // Always swallow input while the overlay is up so the dismissing key
+            // (or any stray keystroke) never reaches a terminal.
+            self.swallow_input(ui);
+            return None;
+        }
+
+        if !self.armed {
+            // Idle: arm on the leader chord, consuming it so it never reaches a PTY.
+            if ui.input_mut(|i| i.consume_shortcut(&LEADER)) {
+                self.armed = true;
+            }
+            return None;
+        }
+
+        // Armed: the next keystroke is a command. Find the first key-press event,
+        // map it to a command, then swallow *everything* this frame (including the
+        // companion Event::Text) so no fragment leaks to the terminal.
+        let chord = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                // egui may deliver Ctrl+C / Ctrl+X as these; treat as their keys.
+                egui::Event::Copy => Some((egui::Key::C, egui::Modifiers::CTRL)),
+                egui::Event::Cut => Some((egui::Key::X, egui::Modifiers::CTRL)),
+                _ => None,
+            })
+        });
+
+        let Some((key, mods)) = chord else {
+            // No key yet this frame (e.g. only Text from the held leader). Wait,
+            // but still swallow any stray text so it can't reach the terminal.
+            self.swallow_input(ui);
+            return None;
+        };
+
+        self.armed = false;
+        let cmd = Self::resolve(key, mods);
+        // Whether bound or not, the whole chord is ours: swallow it.
+        self.swallow_input(ui);
+        cmd
+    }
+
+    /// Drain every keyboard-ish input event for this frame so nothing reaches a
+    /// focused terminal. Used while armed and while the help overlay is open.
+    fn swallow_input(&self, ui: &mut egui::Ui) {
+        ui.input_mut(|i| {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                )
+            });
+        });
+    }
+
+    /// The hardcoded keymap: (key, modifiers) → command. Binding and meaning live
+    /// in the same arm on purpose (locality; Phase 2 replaces this with data).
+    /// `Ctrl` selects the *project* (outer) level; plain/`Shift` act on the
+    /// focused project's terminals (inner). Returns `None` for unbound chords.
+    fn resolve(key: egui::Key, m: egui::Modifiers) -> Option<Cmd> {
+        use egui::Key as K;
+        let ctrl = m.ctrl || m.command;
+        let shift = m.shift;
+        Some(match key {
+            // --- directional: arrows (and vi h/j/k/l for terminal focus) ---
+            K::ArrowLeft | K::ArrowDown | K::ArrowUp | K::ArrowRight => {
+                let d = match key {
+                    K::ArrowLeft => Dir::Left,
+                    K::ArrowDown => Dir::Down,
+                    K::ArrowUp => Dir::Up,
+                    _ => Dir::Right,
+                };
+                if ctrl {
+                    Cmd::ProjFocus(d) // Ctrl+arrows: move between projects
+                } else if shift {
+                    Cmd::TermSnap(d) // Shift+arrows: snap focused terminal
+                } else {
+                    Cmd::TermFocus(d) // arrows: move terminal focus
+                }
+            }
+            K::H | K::J | K::K | K::L if !ctrl && !shift => {
+                let d = match key {
+                    K::H => Dir::Left,
+                    K::J => Dir::Down,
+                    K::K => Dir::Up,
+                    _ => Dir::Right,
+                };
+                Cmd::TermFocus(d)
+            }
+
+            // --- new / close / zoom / rename ---
+            K::C if !ctrl => Cmd::NewTerm,
+            K::P => Cmd::NewProject, // P (shift-p or plain p both fine)
+            K::X if ctrl => Cmd::CloseProject,
+            K::X => Cmd::CloseTerm,
+            K::Z if ctrl => Cmd::ZoomProject,
+            K::Z => Cmd::ZoomTerm,
+            K::Comma => Cmd::Rename,
+
+            // --- last-focused toggle ---
+            K::Tab if ctrl => Cmd::LastProject,
+            K::Tab => Cmd::LastTerm,
+
+            // --- discoverability ---
+            K::Questionmark => Cmd::Help,
+
+            _ => return None,
+        })
+    }
+
+    /// Execute a resolved command. Terminal-level commands route into the focused
+    /// project's child manager; project-level commands act on `self` (desktop).
+    fn dispatch(&mut self, cmd: Cmd, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let asz_proj = self.last_area; // desktop area for project-level zoom
+        match cmd {
+            // ---- project (outer) level: act on the desktop ----
+            Cmd::ProjFocus(d) => self.focus_dir(d),
+            Cmd::ZoomProject => {
+                if let Some(id) = self.focused {
+                    self.toggle_zoom(id, asz_proj);
+                }
+            }
+            Cmd::CloseProject => {
+                if let Some(id) = self.focused {
+                    self.close(id);
+                }
+            }
+            Cmd::LastProject => self.toggle_last(),
+            Cmd::NewProject => {
+                self.picker = Some(DirPicker::new(self.picker_start()));
+            }
+            Cmd::Help => self.show_help = true,
+
+            // ---- terminal (inner) level: act on the focused project's child ----
+            other => {
+                if let Some(child) = self.focused_child() {
+                    let asz = child.last_area;
+                    match other {
+                        Cmd::TermFocus(d) => child.focus_dir(d),
+                        Cmd::TermSnap(d) => child.snap_dir(d),
+                        Cmd::ZoomTerm => {
+                            if let Some(id) = child.focused {
+                                child.toggle_zoom(id, asz);
+                            }
+                        }
+                        Cmd::CloseTerm => {
+                            if let Some(id) = child.focused {
+                                child.close(id);
+                            }
+                        }
+                        Cmd::Rename => child.begin_rename(),
+                        Cmd::NewTerm => child.add_terminal(Shell::PowerShell, &ctx),
+                        Cmd::LastTerm => child.toggle_last(),
+                        // project-level handled above
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mutable borrow of the focused window's child manager, if it is a project.
+    fn focused_child(&mut self) -> Option<&mut WindowManager> {
+        let id = self.focused?;
+        self.windows
+            .iter_mut()
+            .find(|w| w.id == id)
+            .and_then(|w| match &mut w.content {
+                Content::Project(wm) => Some(wm.as_mut()),
+                _ => None,
+            })
+    }
+
+    fn begin_rename(&mut self) {
+        if let Some(id) = self.focused {
+            if let Some(w) = self.windows.iter().find(|w| w.id == id) {
+                self.renaming = Some(id);
+                self.rename_buf = w.title.clone();
+                self.rename_focus = true;
+            }
+        }
+    }
+
+    fn close(&mut self, id: WinId) {
+        self.windows.retain(|w| w.id != id);
+        if self.focused == Some(id) {
+            self.focused = self.last_focused.take();
+        }
+        if self.last_focused == Some(id) {
+            self.last_focused = None;
+        }
+    }
+
+    fn toggle_last(&mut self) {
+        if let Some(prev) = self.last_focused {
+            if self.windows.iter().any(|w| w.id == prev && !w.minimized) {
+                self.focus(prev);
+            }
+        }
+    }
+
+    /// Toggle maximize (zoom) for a window — mirrors the `Act::Max` handler.
+    fn toggle_zoom(&mut self, id: WinId, asz: egui::Vec2) {
+        let split = self.split;
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            if w.snap == Some(Zone::Max) {
+                w.snap = None;
+                if let Some(pr) = w.prev.take() {
+                    w.rect = pr;
+                }
+            } else {
+                w.prev = Some(w.rect);
+                w.snap = Some(Zone::Max);
+                if asz.x > 1.0 && asz.y > 1.0 {
+                    w.rect = zone_rect(Zone::Max, asz, split);
+                }
+            }
+        }
+        self.focus(id);
+    }
+
+    /// Snap the focused window to a half-screen zone. The show loop refits the
+    /// rect to `zone_rect` each frame, so we only set `snap`/`prev` here.
+    fn snap_dir(&mut self, d: Dir) {
+        let Some(id) = self.focused else { return };
+        let zone = d.zone();
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            // Toggling the same snap pops back to floating (handy to undo).
+            if w.snap == Some(zone) {
+                w.snap = None;
+                if let Some(pr) = w.prev.take() {
+                    w.rect = pr;
+                }
+            } else {
+                if w.snap.is_none() {
+                    w.prev = Some(w.rect);
+                }
+                w.snap = Some(zone);
+            }
+        }
+        self.focus(id);
+    }
+
+    /// Move focus to the nearest window in direction `d`, by geometry on local
+    /// rects: among windows whose center lies in the requested half-plane, pick
+    /// the one minimizing (dominant-axis distance, then cross-axis distance).
+    fn focus_dir(&mut self, d: Dir) {
+        let Some(cur) = self.focused else {
+            // No focus yet: focus the top-most visible window.
+            if let Some(id) = self
+                .windows
+                .iter()
+                .filter(|w| !w.minimized)
+                .max_by_key(|w| w.z)
+                .map(|w| w.id)
+            {
+                self.focus(id);
+            }
+            return;
+        };
+        let Some(from) = self
+            .windows
+            .iter()
+            .find(|w| w.id == cur)
+            .map(|w| w.rect.center())
+        else {
+            return;
+        };
+
+        let mut best: Option<(WinId, f32, f32)> = None;
+        for w in self.windows.iter().filter(|w| !w.minimized && w.id != cur) {
+            let c = w.rect.center();
+            let dx = c.x - from.x;
+            let dy = c.y - from.y;
+            let (along, cross) = match d {
+                Dir::Left => (-dx, dy.abs()),
+                Dir::Right => (dx, dy.abs()),
+                Dir::Up => (-dy, dx.abs()),
+                Dir::Down => (dy, dx.abs()),
+            };
+            // Must lie meaningfully in the requested direction.
+            if along <= 1.0 {
+                continue;
+            }
+            // Prefer candidates roughly in line (cross small) and nearer (along
+            // small): rank by along + a cross penalty so a window directly in the
+            // direction beats one far off-axis.
+            let score = along + cross * 2.0;
+            if best.map_or(true, |(_, b, _)| score < b) {
+                best = Some((w.id, score, cross));
+            }
+        }
+        if let Some((id, _, _)) = best {
+            self.focus(id);
+        }
     }
 
     /// Returns whether any window in this manager was interacted with this frame.
     /// The parent uses this to propagate focus upward: clicking a sub-window in a
     /// background project bubbles up and switches the desktop to that project.
     pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect, active: bool, base: egui::Id) -> bool {
+        // Record the area so keyboard-driven zoom/snap can commit to a sensible
+        // rect before the next render refits it.
+        self.last_area = area.size();
+
+        // Leader / command mode: only the root desktop runs it, and only while it
+        // is the active (keyboard-owning) manager and no modal is up. Resolve and
+        // dispatch *before* the render recursion so command chords are drained
+        // from egui input and never reach a terminal's read_input.
+        if self.desktop && active && self.picker.is_none() && self.renaming.is_none() {
+            if let Some(cmd) = self.pump_leader(ui) {
+                self.dispatch(cmd, ui);
+            }
+        }
+
         ui.painter_at(area)
             .rect_filled(area, egui::CornerRadius::ZERO, DESK_BG);
 
@@ -901,7 +1328,128 @@ impl WindowManager {
             }
         }
 
+        // --- leader visual cue + help overlay (desktop only) ---
+        if self.desktop {
+            if self.armed {
+                self.paint_armed_pill(ui, area);
+            }
+            if self.show_help {
+                self.paint_help(ui, area);
+            }
+        }
+
         interacted
+    }
+
+    /// A small amber pill in the bottom-right while command mode is armed, so the
+    /// leader press is visibly acknowledged.
+    fn paint_armed_pill(&self, ui: &egui::Ui, area: egui::Rect) {
+        let text = "PREFIX  ^b";
+        let font = egui::FontId::monospace(11.5);
+        let p = ui.painter_at(area);
+        let galley = p.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::BLACK);
+        let pad = egui::vec2(10.0, 5.0);
+        let size = galley.size() + pad * 2.0;
+        let min = egui::pos2(area.max.x - size.x - 12.0, area.max.y - size.y - 12.0);
+        let r = egui::Rect::from_min_size(min, size);
+        p.rect_filled(r, egui::CornerRadius::same(6), BORDER_FOCUS);
+        p.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            egui::Color32::from_rgb(25, 23, 19),
+        );
+    }
+
+    /// Read-only bindings cheat sheet. Mirrors the dirpicker modal pattern: dim
+    /// the desktop, draw a centered panel. Dismissed by any key (handled in
+    /// `pump_leader`).
+    fn paint_help(&self, ui: &mut egui::Ui, area: egui::Rect) {
+        ui.painter_at(area)
+            .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
+
+        const ROWS: &[(&str, &str)] = &[
+            ("Leader", "Ctrl+b  (then a command)"),
+            ("", ""),
+            ("Terminals (after leader)", ""),
+            ("  arrows / h j k l", "move terminal focus"),
+            ("  Shift+arrows", "snap terminal (toggle)"),
+            ("  z", "zoom (maximize) terminal"),
+            ("  c", "new terminal"),
+            ("  x", "close terminal"),
+            ("  ,", "rename focused window"),
+            ("  Tab", "toggle last terminal"),
+            ("", ""),
+            ("Projects (after leader)", ""),
+            ("  Ctrl+arrows", "move project focus"),
+            ("  Ctrl+z", "zoom (maximize) project"),
+            ("  Ctrl+x", "close project"),
+            ("  P", "new project (directory picker)"),
+            ("  Ctrl+Tab", "toggle last project"),
+            ("", ""),
+            ("  ?", "this cheat sheet  ·  any key closes"),
+        ];
+
+        let title_font = egui::FontId::proportional(15.0);
+        let key_font = egui::FontId::monospace(12.5);
+        let val_font = egui::FontId::proportional(12.5);
+        let line_h = 19.0;
+        let pad = 22.0;
+        let key_col_w = 190.0;
+        let panel_w = 470.0_f32;
+        let panel_h = pad * 2.0 + 30.0 + ROWS.len() as f32 * line_h;
+        let center = area.center();
+        let panel = egui::Rect::from_center_size(center, egui::vec2(panel_w, panel_h));
+
+        let p = ui.painter_at(area);
+        p.rect_filled(panel, egui::CornerRadius::same(8), WIN_BG);
+        p.rect_stroke(
+            panel,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, BORDER_FOCUS),
+            egui::StrokeKind::Inside,
+        );
+
+        let mut y = panel.min.y + pad;
+        p.text(
+            egui::pos2(panel.min.x + pad, y),
+            egui::Align2::LEFT_TOP,
+            "Keyboard bindings",
+            title_font,
+            BORDER_FOCUS,
+        );
+        y += 30.0;
+        for (k, v) in ROWS {
+            // Section headers (non-empty key, empty value) render emphasized.
+            if v.is_empty() {
+                if !k.is_empty() {
+                    p.text(
+                        egui::pos2(panel.min.x + pad, y),
+                        egui::Align2::LEFT_TOP,
+                        k,
+                        val_font.clone(),
+                        TEXT,
+                    );
+                }
+            } else {
+                p.text(
+                    egui::pos2(panel.min.x + pad, y),
+                    egui::Align2::LEFT_TOP,
+                    k,
+                    key_font.clone(),
+                    BORDER_FOCUS,
+                );
+                p.text(
+                    egui::pos2(panel.min.x + pad + key_col_w, y),
+                    egui::Align2::LEFT_TOP,
+                    v,
+                    val_font.clone(),
+                    DIM,
+                );
+            }
+            y += line_h;
+        }
     }
 }
 
