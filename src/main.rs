@@ -23,7 +23,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if !self.started {
             // Desktop hosts project windows; each project is its own sandbox.
-            self.desktop.add_project(Shell::PowerShell, &ctx);
+            let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            self.desktop.add_project(Shell::PowerShell, dir, &ctx);
             self.started = true;
         }
 

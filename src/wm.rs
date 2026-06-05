@@ -1,5 +1,6 @@
 use crate::terminal::{Session, Shell};
 use eframe::egui;
+use std::path::PathBuf;
 
 pub type WinId = u64;
 
@@ -220,6 +221,9 @@ pub struct WindowManager {
     // Fractional position (0..1) of the tiling dividers. Snapped windows lay out
     // from these, so dragging a shared edge moves the divider for every tile on it.
     split: egui::Vec2,
+    /// Working directory new terminals in this manager spawn into. `None` on the
+    /// desktop (process cwd); `Some` on a project, set when the project is created.
+    cwd: Option<PathBuf>,
 }
 
 impl WindowManager {
@@ -232,6 +236,7 @@ impl WindowManager {
             dwell_zone: None,
             dwell_start: 0.0,
             split: egui::vec2(0.5, 0.5),
+            cwd: None,
         }
     }
 
@@ -261,7 +266,7 @@ impl WindowManager {
     }
 
     pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) {
-        if let Ok(s) = Session::spawn(shell, ctx.clone()) {
+        if let Ok(s) = Session::spawn(shell, self.cwd.as_deref(), ctx.clone()) {
             let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
             self.push_win(
                 id,
@@ -274,16 +279,17 @@ impl WindowManager {
 
     /// Add a new project window. It starts as a sandbox containing one terminal.
     /// TODO(status line): show repo / branch on the project titlebar.
-    pub fn add_project(&mut self, shell: Shell, ctx: &egui::Context) {
+    pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) {
         let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
+        let title = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("project {}", id));
         let mut child = WindowManager::new();
+        child.cwd = Some(cwd);
         child.add_terminal(shell, ctx);
-        self.push_win(
-            id,
-            format!("project {}", id),
-            rect,
-            Content::Project(Box::new(child)),
-        );
+        self.push_win(id, title, rect, Content::Project(Box::new(child)));
     }
 
     fn focus(&mut self, id: WinId) {
@@ -746,7 +752,10 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
-                Act::AddProject => self.add_project(Shell::PowerShell, &ctx),
+                Act::AddProject => {
+                    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    self.add_project(Shell::PowerShell, dir, &ctx);
+                }
                 Act::Close(id) => {
                     self.windows.retain(|w| w.id != id);
                     if self.focused == Some(id) {
