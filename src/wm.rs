@@ -229,6 +229,12 @@ pub struct WindowManager {
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
+    /// When `Some`, that window's title is being edited inline (double-click the
+    /// name). `rename_buf` holds the in-progress text; `rename_focus` requests
+    /// keyboard focus on the first frame of editing.
+    renaming: Option<WinId>,
+    rename_buf: String,
+    rename_focus: bool,
 }
 
 impl WindowManager {
@@ -243,6 +249,9 @@ impl WindowManager {
             split: egui::vec2(0.5, 0.5),
             cwd: None,
             picker: None,
+            renaming: None,
+            rename_buf: String::new(),
+            rename_focus: false,
         }
     }
 
@@ -341,8 +350,12 @@ impl WindowManager {
             let id = self.windows[i].id;
             // While the directory picker is open, no window is active — this stops the
             // focused terminal from also consuming the keystrokes meant for the picker.
-            let is_focus = focused == Some(id) && active && self.picker.is_none();
+            // While renaming, no window is active so the typed title doesn't also
+            // leak into the focused terminal (which reads raw input events).
+            let is_focus =
+                focused == Some(id) && active && self.picker.is_none() && self.renaming.is_none();
             let is_project = matches!(self.windows[i].content, Content::Project(_));
+            let is_renaming = self.renaming == Some(id);
 
             // Re-fit to the (possibly resized) area every frame: snapped/maximized
             // windows recompute to the new size; floating windows clamp back in.
@@ -367,7 +380,26 @@ impl WindowManager {
                 acts.push(Act::Focus(id));
             }
             if dr.double_clicked() {
-                acts.push(Act::Max(id));
+                // Double-clicking the name edits it inline; elsewhere on the bar
+                // still maximizes/restores.
+                let title_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        self.windows[i].title.clone(),
+                        egui::FontId::proportional(12.5),
+                        TEXT,
+                    )
+                    .size()
+                    .x;
+                let name_rect = egui::Rect::from_min_size(scr.min, egui::vec2(title_w + 22.0, TITLE_H));
+                let on_name = dr.interact_pointer_pos().is_some_and(|p| name_rect.contains(p));
+                if on_name {
+                    self.renaming = Some(id);
+                    self.rename_buf = self.windows[i].title.clone();
+                    self.rename_focus = true;
+                } else {
+                    acts.push(Act::Max(id));
+                }
             }
             if dr.dragged() {
                 {
@@ -468,13 +500,59 @@ impl WindowManager {
                 cr,
                 if is_focus { tbg_focus } else { tbg },
             );
-            p.text(
-                egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
-                egui::Align2::LEFT_CENTER,
-                &self.windows[i].title,
-                egui::FontId::proportional(12.5),
-                if is_focus { TEXT } else { DIM },
-            );
+            if is_renaming {
+                // Field box centered in the titlebar; `vertical_align(Center)` lets
+                // egui center the text within it, so no pixel-fudging is needed.
+                let te_h = TITLE_H - 8.0;
+                let te_rect = egui::Rect::from_min_size(
+                    egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
+                    egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
+                );
+                // Theme the field to the dark/amber titlebar instead of egui's
+                // default light TextEdit: dark inset fill + amber edit-mode border.
+                p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
+                p.rect_stroke(
+                    te_rect,
+                    egui::CornerRadius::same(3),
+                    egui::Stroke::new(1.0, BORDER_FOCUS),
+                    egui::StrokeKind::Inside,
+                );
+                ui.visuals_mut().selection.bg_fill =
+                    egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
+                let resp = ui.put(
+                    te_rect,
+                    egui::TextEdit::singleline(&mut self.rename_buf)
+                        .id(base.with((id, "rename")))
+                        .font(egui::FontId::proportional(12.5))
+                        .text_color(TEXT)
+                        .vertical_align(egui::Align::Center)
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::symmetric(6, 0))
+                        .desired_width(te_rect.width()),
+                );
+                if self.rename_focus {
+                    resp.request_focus();
+                    self.rename_focus = false;
+                }
+                // Escape cancels; Enter or clicking away (lost focus) commits.
+                if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                    self.renaming = None;
+                } else if resp.lost_focus() {
+                    let t = self.rename_buf.trim().to_string();
+                    if !t.is_empty() {
+                        self.windows[i].title = t;
+                    }
+                    self.renaming = None;
+                }
+            } else {
+                p.text(
+                    egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    &self.windows[i].title,
+                    egui::FontId::proportional(12.5),
+                    if is_focus { TEXT } else { DIM },
+                );
+            }
 
             // --- dispatch keys (project headers only) ---
             // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
