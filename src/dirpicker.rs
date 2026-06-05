@@ -255,4 +255,18 @@ mod tests {
         p.pop_char();
         assert_eq!(p.items().first(), Some(&Item::Parent));
     }
+
+    #[test]
+    fn empty_filter_clamps_and_drill_is_safe() {
+        let d = tree();
+        let mut p = DirPicker::new(d.path().to_path_buf());
+        p.move_down();
+        p.move_down(); // highlight some non-zero row
+        p.push_char('z'); // matches nothing
+        assert_eq!(p.items().len(), 0);
+        assert_eq!(p.selected(), 0); // clamp pinned to zero
+        p.drill_in(); // must NOT panic on empty list
+        p.move_down(); // must NOT panic / overflow on empty list
+        assert_eq!(p.cwd(), d.path()); // drill_in on empty list was a no-op
+    }
 }
