@@ -124,8 +124,10 @@ How it works:
 - **Adding things.** `add_project(shell, ctx)` makes a project window that starts
   with one terminal sub-window. There's no global toolbar anymore — a project
   titlebar carries its own `+` button just left of the min/max/close controls,
-  which queues `Act::AddProject` (applied after the render loop) to spawn a sibling
-  project. Adding a terminal *into* a project is done from that same titlebar:
+  which queues `Act::OpenProjectPicker`. That opens the directory picker
+  (`src/dirpicker.rs`); accepting a directory spawns a sibling project whose
+  terminals start in that directory. See `docs/project-directories.md`.
+  Adding a terminal *into* a project is done from that same titlebar:
   each project header draws compact `PS · CMD · SH` keys after its title.
   Clicking one queues `Act::AddTerm(win_id, shell)`, which (after the render loop)
   finds that project window and calls its child manager's `add_terminal(shell)`.
