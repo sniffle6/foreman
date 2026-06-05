@@ -1,5 +1,6 @@
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::keymap::{Chord, Command, Keymap};
+use crate::settings::{Outcome as SettingsOutcome, SettingsView};
 use crate::terminal::{Session, Shell};
 use eframe::egui;
 use std::path::PathBuf;
@@ -274,6 +275,9 @@ pub struct WindowManager {
     armed: bool,
     /// Read-only bindings cheat sheet is open. Dismissed by any key.
     show_help: bool,
+    /// When `Some`, the keybindings editor modal is open (desktop only). Like the
+    /// picker, while it is up no terminal is active so its input is fully captured.
+    settings: Option<SettingsView>,
     /// Previously-focused window in this manager, for the `Tab` toggle. On the
     /// desktop this is the last project; inside a project, the last terminal.
     last_focused: Option<WinId>,
@@ -304,6 +308,7 @@ impl WindowManager {
             desktop: false,
             armed: false,
             show_help: false,
+            settings: None,
             last_focused: None,
             last_area: egui::vec2(0.0, 0.0),
             keymap: Keymap::default(),
@@ -522,6 +527,7 @@ impl WindowManager {
                 self.picker = Some(DirPicker::new(self.picker_start()));
             }
             Command::Help => self.show_help = true,
+            Command::OpenSettings => self.open_settings(),
 
             // ---- terminal (inner) level: act on the focused project's child ----
             other => {
@@ -549,6 +555,13 @@ impl WindowManager {
                 }
             }
         }
+    }
+
+    /// Open the keybindings editor modal (desktop only). Closes the read-only
+    /// help overlay if it was up, so the two modals never stack.
+    fn open_settings(&mut self) {
+        self.show_help = false;
+        self.settings = Some(SettingsView::new());
     }
 
     /// Mutable borrow of the focused window's child manager, if it is a project.
@@ -699,7 +712,12 @@ impl WindowManager {
         // is the active (keyboard-owning) manager and no modal is up. Resolve and
         // dispatch *before* the render recursion so command chords are drained
         // from egui input and never reach a terminal's read_input.
-        if self.desktop && active && self.picker.is_none() && self.renaming.is_none() {
+        if self.desktop
+            && active
+            && self.picker.is_none()
+            && self.renaming.is_none()
+            && self.settings.is_none()
+        {
             if let Some(cmd) = self.pump_leader(ui) {
                 self.dispatch(cmd, ui);
             }
@@ -725,8 +743,11 @@ impl WindowManager {
             // focused terminal from also consuming the keystrokes meant for the picker.
             // While renaming, no window is active so the typed title doesn't also
             // leak into the focused terminal (which reads raw input events).
-            let is_focus =
-                focused == Some(id) && active && self.picker.is_none() && self.renaming.is_none();
+            let is_focus = focused == Some(id)
+                && active
+                && self.picker.is_none()
+                && self.renaming.is_none()
+                && self.settings.is_none();
             let is_project = matches!(self.windows[i].content, Content::Project(_));
             let is_renaming = self.renaming == Some(id);
 
@@ -1274,6 +1295,25 @@ impl WindowManager {
             }
         }
 
+        // --- keybindings editor modal (desktop only) ---
+        // The editor reads input itself; afterwards we swallow every keyboard
+        // event for the frame so nothing the editor didn't consume can leak to a
+        // terminal — the same capture discipline as the picker / help overlay.
+        if let Some(mut settings) = self.settings.take() {
+            let outcome = settings.show(ui, &mut self.keymap);
+            match outcome {
+                SettingsOutcome::Close => { /* drop it: closed */ }
+                SettingsOutcome::Changed => {
+                    if let Err(e) = self.keymap.save() {
+                        settings.set_save_error(e);
+                    }
+                    self.settings = Some(settings);
+                }
+                SettingsOutcome::Pending => self.settings = Some(settings),
+            }
+            self.swallow_input(ui);
+        }
+
         // --- leader visual cue + help overlay (desktop only) ---
         if self.desktop {
             if self.armed {
@@ -1290,7 +1330,8 @@ impl WindowManager {
     /// A small amber pill in the bottom-right while command mode is armed, so the
     /// leader press is visibly acknowledged.
     fn paint_armed_pill(&self, ui: &egui::Ui, area: egui::Rect) {
-        let text = "PREFIX  ^b";
+        let text = format!("PREFIX  {}", self.keymap.leader.pretty());
+        let text = text.as_str();
         let font = egui::FontId::monospace(11.5);
         let p = ui.painter_at(area);
         let galley = p.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::BLACK);
@@ -1310,32 +1351,42 @@ impl WindowManager {
 
     /// Read-only bindings cheat sheet. Mirrors the dirpicker modal pattern: dim
     /// the desktop, draw a centered panel. Dismissed by any key (handled in
-    /// `pump_leader`).
+    /// `pump_leader`). Rows are built from the **live** keymap so hand-edits and
+    /// in-app rebinds are reflected here, not a stale hardcoded list.
     fn paint_help(&self, ui: &mut egui::Ui, area: egui::Rect) {
+        use crate::keymap::{Command, Group};
         ui.painter_at(area)
             .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
 
-        const ROWS: &[(&str, &str)] = &[
-            ("Leader", "Ctrl+b  (then a command)"),
-            ("", ""),
-            ("Terminals (after leader)", ""),
-            ("  arrows / h j k l", "move terminal focus"),
-            ("  Shift+arrows", "snap terminal (toggle)"),
-            ("  z", "zoom (maximize) terminal"),
-            ("  c", "new terminal"),
-            ("  x", "close terminal"),
-            ("  ,", "rename focused window"),
-            ("  Tab", "toggle last terminal"),
-            ("", ""),
-            ("Projects (after leader)", ""),
-            ("  Ctrl+arrows", "move project focus"),
-            ("  Ctrl+z", "zoom (maximize) project"),
-            ("  Ctrl+x", "close project"),
-            ("  P", "new project (directory picker)"),
-            ("  Ctrl+Tab", "toggle last project"),
-            ("", ""),
-            ("  ?", "this cheat sheet  ·  any key closes"),
-        ];
+        // (key, value). Empty value = section header; empty both = spacer.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        rows.push(("Leader".into(), format!("{}  (then a command)", self.keymap.leader.pretty())));
+        for &g in Group::ALL {
+            rows.push((String::new(), String::new()));
+            rows.push((format!("{} (after leader)", g.title()), String::new()));
+            for &cmd in Command::ALL {
+                if cmd.group() != g {
+                    continue;
+                }
+                let chord = self
+                    .keymap
+                    .chord_for(cmd)
+                    .map(|c| c.pretty())
+                    .unwrap_or_else(|| "—".into());
+                rows.push((format!("  {chord}"), cmd.label().to_string()));
+            }
+        }
+        rows.push((String::new(), String::new()));
+        rows.push((
+            "  Edit".into(),
+            format!(
+                "{} opens the editor  ·  any key closes",
+                self.keymap
+                    .chord_for(Command::OpenSettings)
+                    .map(|c| c.pretty())
+                    .unwrap_or_else(|| "—".into())
+            ),
+        ));
 
         let title_font = egui::FontId::proportional(15.0);
         let key_font = egui::FontId::monospace(12.5);
@@ -1344,7 +1395,7 @@ impl WindowManager {
         let pad = 22.0;
         let key_col_w = 190.0;
         let panel_w = 470.0_f32;
-        let panel_h = pad * 2.0 + 30.0 + ROWS.len() as f32 * line_h;
+        let panel_h = pad * 2.0 + 30.0 + rows.len() as f32 * line_h;
         let center = area.center();
         let panel = egui::Rect::from_center_size(center, egui::vec2(panel_w, panel_h));
 
@@ -1366,7 +1417,7 @@ impl WindowManager {
             BORDER_FOCUS,
         );
         y += 30.0;
-        for (k, v) in ROWS {
+        for (k, v) in &rows {
             // Section headers (non-empty key, empty value) render emphasized.
             if v.is_empty() {
                 if !k.is_empty() {

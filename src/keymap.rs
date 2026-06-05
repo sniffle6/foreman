@@ -33,6 +33,113 @@ pub enum Command {
     LastProject,
     // global
     Help,
+    OpenSettings,
+}
+
+impl Command {
+    /// Every command, in display order, paired with its UI group and label.
+    /// The settings editor iterates this to build its grouped rows; the `?`
+    /// overlay reuses the labels. Keep this exhaustive — a missing arm is a
+    /// compile error once the `match` below is updated.
+    pub const ALL: &'static [Command] = {
+        use Command::*;
+        use Dir::*;
+        &[
+            // Projects
+            ProjFocus(Left),
+            ProjFocus(Down),
+            ProjFocus(Up),
+            ProjFocus(Right),
+            ZoomProject,
+            CloseProject,
+            NewProject,
+            LastProject,
+            // Terminals
+            TermFocus(Left),
+            TermFocus(Down),
+            TermFocus(Up),
+            TermFocus(Right),
+            TermSnap(Left),
+            TermSnap(Down),
+            TermSnap(Up),
+            TermSnap(Right),
+            ZoomTerm,
+            CloseTerm,
+            NewTerm,
+            Rename,
+            LastTerm,
+            // Actions
+            Help,
+            OpenSettings,
+        ]
+    };
+
+    /// The group a command belongs to in the settings editor and help overlay.
+    pub fn group(self) -> Group {
+        use Command::*;
+        match self {
+            ProjFocus(_) | ZoomProject | CloseProject | NewProject | LastProject => Group::Projects,
+            TermFocus(_) | TermSnap(_) | ZoomTerm | CloseTerm | NewTerm | Rename | LastTerm => {
+                Group::Terminals
+            }
+            Help | OpenSettings => Group::Actions,
+        }
+    }
+
+    /// Human-readable label for the editor / help overlay.
+    pub fn label(self) -> &'static str {
+        use Command::*;
+        match self {
+            ProjFocus(d) => match d {
+                Dir::Left => "Focus project left",
+                Dir::Down => "Focus project down",
+                Dir::Up => "Focus project up",
+                Dir::Right => "Focus project right",
+            },
+            ZoomProject => "Zoom (maximize) project",
+            CloseProject => "Close project",
+            NewProject => "New project (picker)",
+            LastProject => "Toggle last project",
+            TermFocus(d) => match d {
+                Dir::Left => "Focus terminal left",
+                Dir::Down => "Focus terminal down",
+                Dir::Up => "Focus terminal up",
+                Dir::Right => "Focus terminal right",
+            },
+            TermSnap(d) => match d {
+                Dir::Left => "Snap terminal left",
+                Dir::Down => "Snap terminal down",
+                Dir::Up => "Snap terminal up",
+                Dir::Right => "Snap terminal right",
+            },
+            ZoomTerm => "Zoom (maximize) terminal",
+            CloseTerm => "Close terminal",
+            NewTerm => "New terminal",
+            Rename => "Rename focused window",
+            LastTerm => "Toggle last terminal",
+            Help => "Show bindings cheat sheet",
+            OpenSettings => "Open keybindings editor",
+        }
+    }
+}
+
+/// UI grouping for the settings editor and help overlay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    Projects,
+    Terminals,
+    Actions,
+}
+
+impl Group {
+    pub const ALL: &'static [Group] = &[Group::Projects, Group::Terminals, Group::Actions];
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Projects => "Projects",
+            Group::Terminals => "Terminals",
+            Group::Actions => "Actions",
+        }
+    }
 }
 
 /// A key chord: a single key plus modifier flags. The key is serialized as a
@@ -65,6 +172,24 @@ impl Chord {
             shift: m.shift,
             alt: m.alt,
         }
+    }
+
+    /// Pretty-print a chord for the editor / help overlay, e.g. `Ctrl+Shift+→`.
+    /// Modifier order is fixed (Ctrl, Shift, Alt) so equal chords render
+    /// identically.
+    pub fn pretty(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.shift {
+            s.push_str("Shift+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        s.push_str(key_label(self.key));
+        s
     }
 }
 
@@ -136,6 +261,98 @@ impl Keymap {
         self.table.get(&chord).copied()
     }
 
+    /// The first chord currently bound to `command`, if any. Several chords may
+    /// map to one command (e.g. plain *and* shift `?` → Help); the editor shows
+    /// and rebinds the canonical (default) one. We pick the default chord if it
+    /// is still bound to this command, else any bound chord, in a stable order.
+    pub fn chord_for(&self, command: Command) -> Option<Chord> {
+        if let Some(def) = default_chord(command) {
+            if self.table.get(&def) == Some(&command) {
+                return Some(def);
+            }
+        }
+        // Deterministic fallback: smallest chord by its on-disk key name + mods.
+        let mut hits: Vec<Chord> = self
+            .table
+            .iter()
+            .filter(|&(_, &c)| c == command)
+            .map(|(&ch, _)| ch)
+            .collect();
+        hits.sort_by(|a, b| chord_sort_key(*a).cmp(&chord_sort_key(*b)));
+        hits.into_iter().next()
+    }
+
+    /// Rebind `command` to `chord`: remove every chord currently mapped to this
+    /// command (so a command never has stale duplicates) and any chord previously
+    /// mapped to a *different* command at `chord` (the conflict the caller already
+    /// confirmed), then insert. Returns the command that previously owned `chord`
+    /// and was displaced (for the caller's records), if any.
+    pub fn rebind(&mut self, command: Command, chord: Chord) -> Option<Command> {
+        let displaced = self.table.get(&chord).copied().filter(|&c| c != command);
+        self.table.retain(|_, &mut c| c != command);
+        self.table.insert(chord, command);
+        displaced
+    }
+
+    /// Reset a single command to its in-code default chord. Removes any current
+    /// chords for it first. Returns the command that the default chord displaced,
+    /// if it was bound elsewhere.
+    pub fn reset_one(&mut self, command: Command) -> Option<Command> {
+        if let Some(def) = default_chord(command) {
+            self.rebind(command, def)
+        } else {
+            self.table.retain(|_, &mut c| c != command);
+            None
+        }
+    }
+
+    /// Replace the entire keymap (leader + table) with the in-code defaults.
+    pub fn reset_all(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Set the leader chord.
+    pub fn set_leader(&mut self, chord: Chord) {
+        self.leader = chord;
+    }
+
+    /// Persist the current keymap to `%APPDATA%\foreman\keybindings.json`,
+    /// creating the `foreman` directory if needed. Errors are returned (never
+    /// panicked) so the caller can surface them in-UI; they are also logged.
+    pub fn save(&self) -> Result<(), String> {
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| "APPDATA is not set; cannot locate the config directory".to_string())?;
+        let dir = std::path::Path::new(&appdata).join("foreman");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let msg = format!("could not create {}: {}", dir.display(), e);
+            eprintln!("foreman: {msg}");
+            return Err(msg);
+        }
+        let path = dir.join("keybindings.json");
+
+        let mut bindings: Vec<BindingRepr> = self
+            .table
+            .iter()
+            .map(|(&chord, &command)| BindingRepr { chord, command })
+            .collect();
+        // Stable, diff-friendly on-disk order.
+        bindings.sort_by(|a, b| chord_sort_key(a.chord).cmp(&chord_sort_key(b.chord)));
+
+        let file = KeymapFile {
+            leader: Some(self.leader),
+            bindings,
+        };
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| format!("could not serialize keybindings: {e}"))?;
+
+        if let Err(e) = std::fs::write(&path, json) {
+            let msg = format!("could not write {}: {}", path.display(), e);
+            eprintln!("foreman: {msg}");
+            return Err(msg);
+        }
+        Ok(())
+    }
+
     /// Load from `%APPDATA%\foreman\keybindings.json`, merged over the defaults.
     ///
     /// Missing file → defaults (silent, the common case). Unreadable or
@@ -185,6 +402,16 @@ impl Keymap {
         if let Some(leader) = file.leader {
             self.leader = leader;
         }
+        // The file is *authoritative* for every command it mentions: drop all of
+        // that command's default chords first, so a rebind that moved a command
+        // off its default chord doesn't resurrect the default on reload. Commands
+        // absent from the file keep their in-code defaults (the merge contract).
+        let mentioned: std::collections::HashSet<Command> =
+            file.bindings.iter().map(|b| b.command).collect();
+        self.table.retain(|_, c| !mentioned.contains(c));
+        // Now apply the file's chords. Inserting a chord that a *different*
+        // command held by default overwrites it (last-writer-wins), matching the
+        // editor's conflict-resolution semantics.
         for b in file.bindings {
             self.table.insert(b.chord, b.command);
         }
@@ -246,6 +473,11 @@ impl Default for Keymap {
         t.insert(plain(K::Questionmark), Help);
         t.insert(shift(K::Questionmark), Help);
 
+        // --- settings / rebinding editor ---
+        // `Ctrl+,` after the leader — the conventional "preferences" chord, and
+        // unused here (plain `,` is Rename). Documented in the `?` overlay.
+        t.insert(ctrl(K::Comma), OpenSettings);
+
         Keymap {
             leader: Chord::new(K::B, true, false, false), // Ctrl+b
             table: t,
@@ -295,6 +527,66 @@ pub fn key_to_name(key: egui::Key) -> &'static str {
         K::Z => "Z",
         // egui's own name is a reasonable stable fallback for anything else.
         other => other.name(),
+    }
+}
+
+/// The in-code default chord for a command, if one exists. Used by the editor's
+/// reset-one and by `chord_for` to prefer the canonical chord. Built from a
+/// fresh default keymap so it always matches `Keymap::default`.
+pub fn default_chord(command: Command) -> Option<Chord> {
+    let def = Keymap::default();
+    if let Some(def_chord) = default_canonical(command) {
+        if def.table.get(&def_chord) == Some(&command) {
+            return Some(def_chord);
+        }
+    }
+    let mut hits: Vec<Chord> = def
+        .table
+        .iter()
+        .filter(|&(_, &c)| c == command)
+        .map(|(&ch, _)| ch)
+        .collect();
+    hits.sort_by(|a, b| chord_sort_key(*a).cmp(&chord_sort_key(*b)));
+    hits.into_iter().next()
+}
+
+/// For commands bound to multiple default chords (Help, NewProject), the one to
+/// treat as canonical (shown/reset-to). `None` falls through to the sort-order
+/// pick in [`default_chord`].
+fn default_canonical(command: Command) -> Option<Chord> {
+    use egui::Key as K;
+    match command {
+        Command::Help => Some(Chord::new(K::Questionmark, false, true, false)), // Shift+? (typed form)
+        Command::NewProject => Some(Chord::new(K::P, false, true, false)),       // Shift+P
+        _ => None,
+    }
+}
+
+/// A total, stable ordering key for a chord: (key name, ctrl, shift, alt).
+fn chord_sort_key(c: Chord) -> (String, bool, bool, bool) {
+    (key_to_name(c.key).to_string(), c.ctrl, c.shift, c.alt)
+}
+
+/// Display label for a key in the pretty-printed chord (arrows as glyphs,
+/// punctuation as the symbol, letters/words otherwise). Distinct from
+/// [`key_to_name`], which produces the stable on-disk name.
+pub fn key_label(key: egui::Key) -> &'static str {
+    use egui::Key as K;
+    match key {
+        K::ArrowLeft => "←",
+        K::ArrowRight => "→",
+        K::ArrowUp => "↑",
+        K::ArrowDown => "↓",
+        K::Comma => ",",
+        K::Questionmark => "?",
+        K::OpenBracket => "[",
+        K::CloseBracket => "]",
+        K::Space => "Space",
+        K::Enter => "Enter",
+        K::Tab => "Tab",
+        K::Backspace => "Backspace",
+        K::Escape => "Esc",
+        other => key_to_name(other),
     }
 }
 
@@ -420,5 +712,121 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let back: Chord = serde_json::from_str(&s).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// Build a `KeymapFile` from the live keymap exactly as `save()` does, then
+    /// serialize → parse → merge back into a fresh default and confirm every
+    /// binding (including a rebound one) survives. This exercises the whole
+    /// write→read contract without touching APPDATA.
+    #[test]
+    fn keymap_write_read_roundtrip_preserves_all_bindings() {
+        let mut km = Keymap::default();
+        // Mutate via the editor API: change the leader and rebind one command.
+        km.set_leader(Chord::new(K::Space, true, false, false));
+        km.rebind(Command::CloseTerm, Chord::new(K::Q, false, false, false));
+
+        // Serialize exactly like save() (same KeymapFile construction).
+        let mut bindings: Vec<BindingRepr> = km
+            .table
+            .iter()
+            .map(|(&chord, &command)| BindingRepr { chord, command })
+            .collect();
+        bindings.sort_by(|a, b| chord_sort_key(a.chord).cmp(&chord_sort_key(b.chord)));
+        let file = KeymapFile {
+            leader: Some(km.leader),
+            bindings,
+        };
+        let json = serde_json::to_string_pretty(&file).unwrap();
+
+        // Read back: parse + merge over a fresh default, as load() does.
+        let parsed: KeymapFile = serde_json::from_str(&json).unwrap();
+        let mut reloaded = Keymap::default();
+        reloaded.merge(parsed);
+
+        assert_eq!(reloaded.leader, Chord::new(K::Space, true, false, false));
+        assert_eq!(
+            reloaded.resolve(Chord::new(K::Q, false, false, false)),
+            Some(Command::CloseTerm)
+        );
+        // The rebind unbound the old chord for CloseTerm (plain `x`).
+        assert_ne!(
+            reloaded.resolve(Chord::new(K::X, false, false, false)),
+            Some(Command::CloseTerm)
+        );
+        // An untouched default still resolves.
+        assert_eq!(
+            reloaded.resolve(Chord::new(K::C, false, false, false)),
+            Some(Command::NewTerm)
+        );
+    }
+
+    #[test]
+    fn rebind_displaces_and_unbinds_old() {
+        let mut km = Keymap::default();
+        // C is NewTerm; bind it to NewTerm's slot... actually rebind NewTerm to F.
+        km.rebind(Command::NewTerm, Chord::new(K::F, false, false, false));
+        assert_eq!(
+            km.resolve(Chord::new(K::F, false, false, false)),
+            Some(Command::NewTerm)
+        );
+        // Old chord `c` is now free.
+        assert_eq!(km.resolve(Chord::new(K::C, false, false, false)), None);
+
+        // Now rebind CloseTerm onto F: NewTerm is displaced and reported.
+        let displaced = km.rebind(Command::CloseTerm, Chord::new(K::F, false, false, false));
+        assert_eq!(displaced, Some(Command::NewTerm));
+        assert_eq!(
+            km.resolve(Chord::new(K::F, false, false, false)),
+            Some(Command::CloseTerm)
+        );
+        // NewTerm no longer has any chord.
+        assert_eq!(km.chord_for(Command::NewTerm), None);
+    }
+
+    #[test]
+    fn reset_one_restores_default_chord() {
+        let mut km = Keymap::default();
+        km.rebind(Command::CloseTerm, Chord::new(K::Q, false, false, false));
+        km.reset_one(Command::CloseTerm);
+        assert_eq!(
+            km.resolve(Chord::new(K::X, false, false, false)),
+            Some(Command::CloseTerm)
+        );
+        assert_eq!(km.resolve(Chord::new(K::Q, false, false, false)), None);
+    }
+
+    #[test]
+    fn chord_for_prefers_default_then_canonical() {
+        let km = Keymap::default();
+        // Help is bound plain and shift; canonical is the typed Shift+? form.
+        assert_eq!(
+            km.chord_for(Command::Help),
+            Some(Chord::new(K::Questionmark, false, true, false))
+        );
+        // Single-binding command.
+        assert_eq!(
+            km.chord_for(Command::OpenSettings),
+            Some(Chord::new(K::Comma, true, false, false))
+        );
+    }
+
+    #[test]
+    fn all_commands_have_a_default_chord_and_metadata() {
+        for &cmd in Command::ALL {
+            assert!(
+                default_chord(cmd).is_some(),
+                "command {cmd:?} has no default chord"
+            );
+            // label + group must not panic and label is non-empty.
+            assert!(!cmd.label().is_empty());
+            let _ = cmd.group();
+        }
+    }
+
+    #[test]
+    fn pretty_prints_modifiers_and_arrows() {
+        assert_eq!(Chord::new(K::ArrowRight, true, true, false).pretty(), "Ctrl+Shift+→");
+        assert_eq!(Chord::new(K::Comma, true, false, false).pretty(), "Ctrl+,");
+        assert_eq!(Chord::new(K::C, false, false, false).pretty(), "C");
     }
 }
