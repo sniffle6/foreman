@@ -862,8 +862,26 @@ impl WindowManager {
         }
     }
 
+    /// Snap `id` to `zone`, or — if another window already occupies that zone —
+    /// tab `id` onto it instead. Shared by manual snap ([`snap_dir`]) and split
+    /// placement ([`place_split`]) so "snap onto an occupied zone" tabs uniformly.
+    fn snap_or_tab(&mut self, id: WinId, zone: Zone) {
+        let occupant = self
+            .windows
+            .iter()
+            .find(|w| w.id != id && w.snap == Some(zone))
+            .map(|w| w.id);
+        if let Some(dst) = occupant {
+            self.merge_windows(id, dst);
+        } else {
+            self.set_snap(id, zone);
+            self.focus(id);
+        }
+    }
+
     /// Snap the focused window to a half-screen zone. The show loop refits the
-    /// rect to `zone_rect` each frame, so we only set `snap`/`prev` here.
+    /// rect to `zone_rect` each frame, so we only set `snap`/`prev` here. Snapping
+    /// onto a zone another window already holds tabs the two together.
     fn snap_dir(&mut self, d: Dir) {
         let Some(id) = self.focused else { return };
         let zone = d.zone();
@@ -881,10 +899,10 @@ impl WindowManager {
                     w.rect = pr;
                 }
             }
+            self.focus(id);
         } else {
-            self.set_snap(id, zone);
+            self.snap_or_tab(id, zone);
         }
-        self.focus(id);
     }
 
     /// Phase 2 split: create a new terminal and place it in the pointed zone.
@@ -921,21 +939,9 @@ impl WindowManager {
     /// so it is testable without spawning a real `Session`.
     fn place_split(&mut self, src: WinId, src_snap: Option<Zone>, new_id: WinId, d: Dir) {
         let zone = d.zone();
-        // Collision: an existing window (not the source, not the newcomer) already
-        // snapped to the target zone → the newcomer tabs onto it.
-        let collision = self
-            .windows
-            .iter()
-            .find(|w| w.id != src && w.id != new_id && w.snap == Some(zone))
-            .map(|w| w.id);
-
-        if let Some(dst) = collision {
-            // Tab the fresh terminal onto the occupant (Phase 1 merge op).
-            self.merge_windows(new_id, dst);
-        } else {
-            self.set_snap(new_id, zone);
-            self.focus(new_id);
-        }
+        // Place the newcomer in the target zone, tabbing onto any existing
+        // occupant (shared with manual snap via `snap_or_tab`).
+        self.snap_or_tab(new_id, zone);
 
         // Source placement: only when it was floating, snap it opposite so the
         // two panes face each other. An already-snapped source stays put.
@@ -1249,6 +1255,9 @@ impl WindowManager {
                 cr,
                 if is_focus { tbg_focus } else { tbg },
             );
+            // Right edge of the title/tab area; the project shell chips anchor here
+            // so they never overlap a multi-tab bar. Set by each titlebar branch.
+            let title_end_x;
             if is_renaming {
                 // Field box centered in the titlebar; `vertical_align(Center)` lets
                 // egui center the text within it, so no pixel-fudging is needed.
@@ -1257,6 +1266,7 @@ impl WindowManager {
                     egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
                     egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
                 );
+                title_end_x = te_rect.max.x + 8.0;
                 // Theme the field to the dark/amber titlebar instead of egui's
                 // default light TextEdit: dark inset fill + amber edit-mode border.
                 p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
@@ -1405,22 +1415,9 @@ impl WindowManager {
                     }
                     cx += chip_w + 4.0;
                 }
+                title_end_x = cx + 6.0;
             } else {
-                p.text(
-                    egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
-                    egui::Align2::LEFT_CENTER,
-                    self.windows[i].title(),
-                    egui::FontId::proportional(12.5),
-                    if is_focus { TEXT } else { DIM },
-                );
-            }
-
-            // --- dispatch keys (project headers only) ---
-            // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
-            // a terminal of that shell *into this project*. Lives here (not the
-            // global bar) so the target site is unambiguous — the window you click.
-            if is_project {
-                let title_w = ui
+                let tw = ui
                     .painter()
                     .layout_no_wrap(
                         self.windows[i].title().to_string(),
@@ -1429,9 +1426,24 @@ impl WindowManager {
                     )
                     .size()
                     .x;
+                p.text(
+                    egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
+                    egui::Align2::LEFT_CENTER,
+                    self.windows[i].title(),
+                    egui::FontId::proportional(12.5),
+                    if is_focus { TEXT } else { DIM },
+                );
+                title_end_x = scr.min.x + 11.0 + tw + 14.0;
+            }
+
+            // --- dispatch keys (project headers only) ---
+            // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
+            // a terminal of that shell *into this project*. Lives here (not the
+            // global bar) so the target site is unambiguous — the window you click.
+            if is_project {
                 let kh = TITLE_H - 10.0;
                 let ky = scr.min.y + 5.0;
-                let mut kx = scr.min.x + 11.0 + title_w + 14.0;
+                let mut kx = title_end_x;
                 let key_font = egui::FontId::proportional(10.5);
                 for (label, shell) in [
                     ("PS", Shell::PowerShell),
