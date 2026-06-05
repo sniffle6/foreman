@@ -172,7 +172,7 @@ impl DirPicker {
         });
 
         // Dim the desktop behind the modal.
-        let screen = ui.ctx().screen_rect();
+        let screen = ui.ctx().content_rect();
         ui.painter()
             .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
 
