@@ -1,6 +1,7 @@
 use eframe::egui;
 use eframe::egui::text::LayoutJob;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -156,7 +157,7 @@ fn read_clipboard() -> Option<String> {
 }
 
 impl Session {
-    pub fn spawn(shell: Shell, ctx: egui::Context) -> std::io::Result<Session> {
+    pub fn spawn(shell: Shell, cwd: Option<&Path>, ctx: egui::Context) -> std::io::Result<Session> {
         let (cols, rows) = (80usize, 24usize);
         let pty = native_pty_system();
         let pair = pty
@@ -167,9 +168,13 @@ impl Session {
                 pixel_height: 0,
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut cmd = CommandBuilder::new(shell.program());
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         let child = pair
             .slave
-            .spawn_command(CommandBuilder::new(shell.program()))
+            .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         drop(pair.slave);
         let mut reader = pair

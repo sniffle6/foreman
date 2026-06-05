@@ -1,5 +1,7 @@
+use crate::dirpicker::{DirPicker, Outcome};
 use crate::terminal::{Session, Shell};
 use eframe::egui;
+use std::path::PathBuf;
 
 pub type WinId = u64;
 
@@ -205,9 +207,10 @@ enum Act {
     /// the rest: the header key is drawn mid-loop, but reaching into the project's
     /// nested manager has to wait until after the render borrow is released.
     AddTerm(WinId, Shell),
-    /// Spawn a new sibling project on the desktop. Fired by the "+" on a project
-    /// titlebar; applied after the render borrow drops like the rest.
-    AddProject,
+    /// Open the directory picker to create a new sibling project on the desktop.
+    /// Fired by the "+" on a project titlebar; the actual project is created when
+    /// the user accepts a directory in the picker.
+    OpenProjectPicker,
 }
 
 pub struct WindowManager {
@@ -220,6 +223,12 @@ pub struct WindowManager {
     // Fractional position (0..1) of the tiling dividers. Snapped windows lay out
     // from these, so dragging a shared edge moves the divider for every tile on it.
     split: egui::Vec2,
+    /// Working directory new terminals in this manager spawn into. `None` on the
+    /// desktop (process cwd); `Some` on a project, set when the project is created.
+    cwd: Option<PathBuf>,
+    /// When `Some`, the directory picker modal is open (desktop only). Opening it
+    /// defers project creation until the user accepts a directory.
+    picker: Option<DirPicker>,
 }
 
 impl WindowManager {
@@ -232,6 +241,8 @@ impl WindowManager {
             dwell_zone: None,
             dwell_start: 0.0,
             split: egui::vec2(0.5, 0.5),
+            cwd: None,
+            picker: None,
         }
     }
 
@@ -261,7 +272,7 @@ impl WindowManager {
     }
 
     pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) {
-        if let Ok(s) = Session::spawn(shell, ctx.clone()) {
+        if let Ok(s) = Session::spawn(shell, self.cwd.as_deref(), ctx.clone()) {
             let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
             self.push_win(
                 id,
@@ -274,16 +285,30 @@ impl WindowManager {
 
     /// Add a new project window. It starts as a sandbox containing one terminal.
     /// TODO(status line): show repo / branch on the project titlebar.
-    pub fn add_project(&mut self, shell: Shell, ctx: &egui::Context) {
+    pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) {
         let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
+        let title = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("project {}", id));
         let mut child = WindowManager::new();
+        child.cwd = Some(cwd);
         child.add_terminal(shell, ctx);
-        self.push_win(
-            id,
-            format!("project {}", id),
-            rect,
-            Content::Project(Box::new(child)),
-        );
+        self.push_win(id, title, rect, Content::Project(Box::new(child)));
+    }
+
+    /// Where the picker opens: the focused project's cwd if there is one, else the
+    /// process working directory, else `.`.
+    fn picker_start(&self) -> PathBuf {
+        self.focused
+            .and_then(|id| self.windows.iter().find(|w| w.id == id))
+            .and_then(|w| match &w.content {
+                Content::Project(wm) => wm.cwd.clone(),
+                _ => None,
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     fn focus(&mut self, id: WinId) {
@@ -314,7 +339,9 @@ impl WindowManager {
 
         for &i in &order {
             let id = self.windows[i].id;
-            let is_focus = focused == Some(id) && active;
+            // While the directory picker is open, no window is active — this stops the
+            // focused terminal from also consuming the keystrokes meant for the picker.
+            let is_focus = focused == Some(id) && active && self.picker.is_none();
             let is_project = matches!(self.windows[i].content, Content::Project(_));
 
             // Re-fit to the (possibly resized) area every frame: snapped/maximized
@@ -582,7 +609,7 @@ impl WindowManager {
                 p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
                 p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
                 if resp.clicked() {
-                    acts.push(Act::AddProject);
+                    acts.push(Act::OpenProjectPicker);
                 }
             }
 
@@ -746,7 +773,9 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
-                Act::AddProject => self.add_project(Shell::PowerShell, &ctx),
+                Act::OpenProjectPicker => {
+                    self.picker = Some(DirPicker::new(self.picker_start()));
+                }
                 Act::Close(id) => {
                     self.windows.retain(|w| w.id != id);
                     if self.focused == Some(id) {
@@ -783,6 +812,14 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
+            }
+        }
+
+        if let Some(mut picker) = self.picker.take() {
+            match picker.show(ui) {
+                Outcome::Pending => self.picker = Some(picker),
+                Outcome::Cancelled => {}
+                Outcome::Accepted(path) => self.add_project(Shell::PowerShell, path, &ctx),
             }
         }
 
