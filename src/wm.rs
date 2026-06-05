@@ -1,3 +1,4 @@
+use crate::dirpicker::{DirPicker, Outcome};
 use crate::terminal::{Session, Shell};
 use eframe::egui;
 use std::path::PathBuf;
@@ -206,9 +207,10 @@ enum Act {
     /// the rest: the header key is drawn mid-loop, but reaching into the project's
     /// nested manager has to wait until after the render borrow is released.
     AddTerm(WinId, Shell),
-    /// Spawn a new sibling project on the desktop. Fired by the "+" on a project
-    /// titlebar; applied after the render borrow drops like the rest.
-    AddProject,
+    /// Open the directory picker to create a new sibling project on the desktop.
+    /// Fired by the "+" on a project titlebar; the actual project is created when
+    /// the user accepts a directory in the picker.
+    OpenProjectPicker,
 }
 
 pub struct WindowManager {
@@ -224,6 +226,9 @@ pub struct WindowManager {
     /// Working directory new terminals in this manager spawn into. `None` on the
     /// desktop (process cwd); `Some` on a project, set when the project is created.
     cwd: Option<PathBuf>,
+    /// When `Some`, the directory picker modal is open (desktop only). Opening it
+    /// defers project creation until the user accepts a directory.
+    picker: Option<DirPicker>,
 }
 
 impl WindowManager {
@@ -237,6 +242,7 @@ impl WindowManager {
             dwell_start: 0.0,
             split: egui::vec2(0.5, 0.5),
             cwd: None,
+            picker: None,
         }
     }
 
@@ -290,6 +296,19 @@ impl WindowManager {
         child.cwd = Some(cwd);
         child.add_terminal(shell, ctx);
         self.push_win(id, title, rect, Content::Project(Box::new(child)));
+    }
+
+    /// Where the picker opens: the focused project's cwd if there is one, else the
+    /// process working directory, else `.`.
+    fn picker_start(&self) -> PathBuf {
+        self.focused
+            .and_then(|id| self.windows.iter().find(|w| w.id == id))
+            .and_then(|w| match &w.content {
+                Content::Project(wm) => wm.cwd.clone(),
+                _ => None,
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     fn focus(&mut self, id: WinId) {
@@ -588,7 +607,7 @@ impl WindowManager {
                 p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
                 p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
                 if resp.clicked() {
-                    acts.push(Act::AddProject);
+                    acts.push(Act::OpenProjectPicker);
                 }
             }
 
@@ -752,9 +771,8 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
-                Act::AddProject => {
-                    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    self.add_project(Shell::PowerShell, dir, &ctx);
+                Act::OpenProjectPicker => {
+                    self.picker = Some(DirPicker::new(self.picker_start()));
                 }
                 Act::Close(id) => {
                     self.windows.retain(|w| w.id != id);
@@ -792,6 +810,14 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
+            }
+        }
+
+        if let Some(mut picker) = self.picker.take() {
+            match picker.show(ui) {
+                Outcome::Pending => self.picker = Some(picker),
+                Outcome::Cancelled => {}
+                Outcome::Accepted(path) => self.add_project(Shell::PowerShell, path, &ctx),
             }
         }
 
