@@ -1,3 +1,4 @@
+use eframe::egui;
 use std::path::{Path, PathBuf};
 
 /// One row in the picker list.
@@ -128,6 +129,107 @@ impl DirPicker {
     /// Enter: accept the current location as the chosen directory.
     pub fn accept(&self) -> PathBuf {
         self.cwd.clone()
+    }
+}
+
+impl DirPicker {
+    /// Render the modal for one frame and report the outcome. Keyboard:
+    /// Up/Down move, Right/Tab drill in, Left up, Enter accept, Esc cancel,
+    /// typing filters. Characters are captured manually (no focusable text
+    /// field) so the arrow/Tab/Enter keys are free for navigation.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> Outcome {
+        let mut outcome = Outcome::Pending;
+
+        ui.input(|i| {
+            for ev in &i.events {
+                if let egui::Event::Text(t) = ev {
+                    for c in t.chars() {
+                        self.push_char(c);
+                    }
+                }
+            }
+            if i.key_pressed(egui::Key::Backspace) {
+                self.pop_char();
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.move_down();
+            }
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.move_up();
+            }
+            if i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::ArrowRight) {
+                self.drill_in();
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                self.go_parent();
+            }
+            if i.key_pressed(egui::Key::Enter) {
+                outcome = Outcome::Accepted(self.accept());
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                outcome = Outcome::Cancelled;
+            }
+        });
+
+        // Dim the desktop behind the modal.
+        let screen = ui.ctx().screen_rect();
+        ui.painter()
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+
+        egui::Window::new("set project directory")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(440.0);
+                ui.label(egui::RichText::new(self.cwd.display().to_string()).strong());
+                let hint = if self.query.is_empty() {
+                    "type to filter · → enter · ← up · Enter open here · Esc cancel".to_string()
+                } else {
+                    format!("filter: {}", self.query)
+                };
+                ui.label(egui::RichText::new(hint).weak());
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (idx, item) in self.items().into_iter().enumerate() {
+                            let (label, is_parent) = match &item {
+                                Item::Parent => (".. (parent)".to_string(), true),
+                                Item::Dir(p) => (
+                                    p.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    false,
+                                ),
+                            };
+                            let resp = ui.selectable_label(idx == self.selected, label);
+                            if resp.clicked() {
+                                self.selected = idx;
+                                if is_parent {
+                                    self.go_parent();
+                                } else {
+                                    self.drill_in();
+                                }
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("open here").clicked() {
+                        outcome = Outcome::Accepted(self.accept());
+                    }
+                    if ui.button("cancel").clicked() {
+                        outcome = Outcome::Cancelled;
+                    }
+                });
+            });
+
+        outcome
     }
 }
 
