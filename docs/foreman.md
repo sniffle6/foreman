@@ -10,7 +10,8 @@ Lives in `foreman-native/`.
 
 - A **window-manager desktop**: each terminal is a floating window you can drag,
   focus (click), raise (z-order), **minimize** (to a taskbar), **maximize**,
-  **resize** (corner), and **close**. Windows are confined to the desktop area.
+  **resize** (any edge or corner — hover the frame), and **close**. Windows are
+  confined to the desktop area. See "Resizing" below.
 - Each window hosts a **real shell** via a PTY: **PowerShell / cmd / bash(WSL)**.
   Top toolbar spawns new terminals.
 - Full ANSI emulation (colors, cursor, inverse/dim), resizes the shell to the
@@ -35,8 +36,9 @@ Lives entirely in `wm.rs`. Ported from the web mockup `foreman/index.html`
   - the four corners → **quarter** zones; middle → no snap (free drop).
 - The edge band is `T = 0.085` (8.5%) and corners use a `0.22` cross-axis band.
   Because only the outer ~8.5% triggers, the whole middle is a natural dead-zone.
-- `zone_rect(zone, area_size)` returns the target rect in **local** coords, inset
-  by `SNAP_GAP` from the area edge with a half-gap down the centre split.
+- `zone_rect(zone, area_size, split)` returns the target rect in **local** coords,
+  inset by `SNAP_GAP` from the area edge with the centre split at `split` (see
+  "Resizing" — dividers are draggable).
   `SNAP_GAP = 0.0` today, so snapped/maximized windows tile **edge-to-edge** and
   adjacent halves/quarters touch (bump the const to reintroduce a gap). Snapped
   windows also square their corners (`CornerRadius::ZERO`) so they sit flush to the
@@ -58,6 +60,35 @@ window restores to its pre-snap size from `prev` (same size the double-click /
 restore toggle returns), then re-anchors that smaller rect under the cursor (the
 pointer keeps the same horizontal fraction across the title) so the title stays
 grabbed instead of the window jumping away.
+
+## Resizing (edges, corners, shared dividers)
+
+Lives in `wm.rs`, at the end of each window's render block. Every window gets
+**8 invisible hit-bands** around its frame — 4 edges + 4 corners, each
+`RESIZE_BAND` (6px) thick. Hovering one sets the matching OS resize cursor
+(`ResizeWest`/`ResizeNorthEast`/…); dragging it resizes. They're registered
+*last* in the block so they win pointer priority over the content/title in that
+thin frame. Floating-window minimum size is `MIN_W`×`MIN_H` (240×140).
+
+Two behaviours depending on whether the window is snapped:
+
+- **Floating window:** `resize_floating` moves only the dragged edge(s),
+  enforcing the min size and keeping every edge inside the area. Corners move two
+  edges at once.
+- **Snapped window:** the manager holds a `split: Vec2` — the fractional position
+  (0..1) of the vertical (x) and horizontal (y) tiling dividers. `zone_rect` now
+  lays every snapped window out from `split` instead of a hardcoded 0.5, and
+  snapped windows refit from it every frame. So dragging a snapped window's
+  **interior** edge (the one shared with a neighbour) just nudges `split`, and
+  *every tile on that divider resizes together* next frame. `interior_edges(zone)`
+  says which edges are interior per zone; a divider can't pass `MIN_TILE` (120px)
+  from either side. Dragging an **outer** edge (against the desktop boundary, or
+  any edge of a maximized window) instead **pops the window back to floating** and
+  resizes it freely from there.
+
+Gotcha: `split` is per-`WindowManager`, so a project has its own divider state
+independent of the desktop and of sibling projects. Adjusting a divider takes
+effect on the next frame's refit (a 1-frame lag, imperceptible while dragging).
 
 ## Nesting (project windows)
 

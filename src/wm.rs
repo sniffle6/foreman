@@ -22,6 +22,11 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
 const TITLE_H: f32 = 26.0;
 
+const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
+const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
+const MIN_H: f32 = 140.0;
+const MIN_TILE: f32 = 120.0; // smallest a tiled pane may shrink to when dragging a split
+
 // snap overlay (amber, matches BORDER_FOCUS / web mockup --needs #e7a93f)
 const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
 const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
@@ -73,26 +78,53 @@ fn detect_zone(fx: f32, fy: f32) -> Option<Zone> {
     None
 }
 
-// target rect for a zone in LOCAL coords, inset by SNAP_GAP (ports `zoneRect`).
-fn zone_rect(zone: Zone, area: egui::Vec2) -> egui::Rect {
+// target rect for a zone in LOCAL coords, given the manager's split ratios.
+// `split` is the fractional position (0..1) of the vertical (x) and horizontal
+// (y) tiling dividers, so adjacent snapped windows share a movable edge. With
+// split = (0.5, 0.5) this reduces to the old fixed half/quarter tiling.
+fn zone_rect(zone: Zone, area: egui::Vec2, split: egui::Vec2) -> egui::Rect {
     let g = SNAP_GAP;
     let (w, h) = (area.x, area.y);
-    let hw = (w / 2.0 - g * 1.5).max(1.0); // half width, accounting for outer + center gap
-    let hh = (h / 2.0 - g * 1.5).max(1.0);
-    let rx = w / 2.0 + g / 2.0; // right-column x
-    let by = h / 2.0 + g / 2.0; // bottom-row y
+    let divx = w * split.x; // vertical divider x
+    let divy = h * split.y; // horizontal divider y
+    let lx = g; // left column x
+    let lw = (divx - g * 1.5).max(1.0); // left column width
+    let rx = divx + g * 0.5; // right column x
+    let rw = (w - divx - g * 1.5).max(1.0);
+    let ty = g; // top row y
+    let th = (divy - g * 1.5).max(1.0);
+    let by = divy + g * 0.5; // bottom row y
+    let bh = (h - divy - g * 1.5).max(1.0);
+    let fw = (w - g * 2.0).max(1.0);
+    let fh = (h - g * 2.0).max(1.0);
     let (x, y, sw, sh) = match zone {
-        Zone::Max => (g, g, (w - g * 2.0).max(1.0), (h - g * 2.0).max(1.0)),
-        Zone::Top => (g, g, (w - g * 2.0).max(1.0), hh),
-        Zone::Bottom => (g, by, (w - g * 2.0).max(1.0), hh),
-        Zone::Left => (g, g, hw, h - g * 2.0),
-        Zone::Right => (rx, g, hw, h - g * 2.0),
-        Zone::Tl => (g, g, hw, hh),
-        Zone::Tr => (rx, g, hw, hh),
-        Zone::Bl => (g, by, hw, hh),
-        Zone::Br => (rx, by, hw, hh),
+        Zone::Max => (g, g, fw, fh),
+        Zone::Top => (g, ty, fw, th),
+        Zone::Bottom => (g, by, fw, bh),
+        Zone::Left => (lx, g, lw, fh),
+        Zone::Right => (rx, g, rw, fh),
+        Zone::Tl => (lx, ty, lw, th),
+        Zone::Tr => (rx, ty, rw, th),
+        Zone::Bl => (lx, by, lw, bh),
+        Zone::Br => (rx, by, rw, bh),
     };
     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(sw, sh))
+}
+
+// Which edges of a snapped zone are interior — i.e. shared with a neighbouring
+// tile and thus draggable via the split divider: (left, right, top, bottom).
+fn interior_edges(zone: Zone) -> (bool, bool, bool, bool) {
+    match zone {
+        Zone::Left => (false, true, false, false),
+        Zone::Right => (true, false, false, false),
+        Zone::Top => (false, false, false, true),
+        Zone::Bottom => (false, false, true, false),
+        Zone::Tl => (false, true, false, true),
+        Zone::Tr => (true, false, false, true),
+        Zone::Bl => (false, true, true, false),
+        Zone::Br => (true, false, true, false),
+        Zone::Max => (false, false, false, false),
+    }
 }
 
 fn lerp_rect(a: egui::Rect, b: egui::Rect, t: f32) -> egui::Rect {
@@ -102,15 +134,20 @@ fn lerp_rect(a: egui::Rect, b: egui::Rect, t: f32) -> egui::Rect {
 // Given the raw drag zone and how long it's been held, return the zone to commit
 // plus the overlay rect to preview (local coords). The Top zone escalates to Max
 // after TOP_HOLD seconds, the overlay growing top-half → full over GROW_LEAD.
-fn resolve_zone(raw: Option<Zone>, held: f64, asz: egui::Vec2) -> (Option<Zone>, Option<egui::Rect>) {
+fn resolve_zone(
+    raw: Option<Zone>,
+    held: f64,
+    asz: egui::Vec2,
+    split: egui::Vec2,
+) -> (Option<Zone>, Option<egui::Rect>) {
     match raw {
         Some(Zone::Top) => {
             let p = (((held - (TOP_HOLD - GROW_LEAD)) / GROW_LEAD) as f32).clamp(0.0, 1.0);
-            let ov = lerp_rect(zone_rect(Zone::Top, asz), zone_rect(Zone::Max, asz), p);
+            let ov = lerp_rect(zone_rect(Zone::Top, asz, split), zone_rect(Zone::Max, asz, split), p);
             let committed = if held >= TOP_HOLD { Zone::Max } else { Zone::Top };
             (Some(committed), Some(ov))
         }
-        Some(z) => (Some(z), Some(zone_rect(z, asz))),
+        Some(z) => (Some(z), Some(zone_rect(z, asz, split))),
         None => (None, None),
     }
 }
@@ -180,6 +217,9 @@ pub struct WindowManager {
     next: WinId,
     dwell_zone: Option<Zone>, // raw zone the drag is currently hovering
     dwell_start: f64,         // time (s) the current dwell_zone was entered
+    // Fractional position (0..1) of the tiling dividers. Snapped windows lay out
+    // from these, so dragging a shared edge moves the divider for every tile on it.
+    split: egui::Vec2,
 }
 
 impl WindowManager {
@@ -191,6 +231,7 @@ impl WindowManager {
             next: 1,
             dwell_zone: None,
             dwell_start: 0.0,
+            split: egui::vec2(0.5, 0.5),
         }
     }
 
@@ -283,7 +324,7 @@ impl WindowManager {
             {
                 let w = &mut self.windows[i];
                 match w.snap {
-                    Some(z) => w.rect = zone_rect(z, asz),
+                    Some(z) => w.rect = zone_rect(z, asz, self.split),
                     None => clamp(&mut w.rect, asz),
                 }
             }
@@ -342,7 +383,7 @@ impl WindowManager {
                         self.dwell_start = now;
                     }
                     let held = now - self.dwell_start;
-                    let (_committed, overlay) = resolve_zone(raw, held, asz);
+                    let (_committed, overlay) = resolve_zone(raw, held, asz, self.split);
                     if let Some(r) = overlay {
                         snap_overlay = Some(r.translate(area.min.to_vec2()));
                     }
@@ -360,13 +401,14 @@ impl WindowManager {
                     } else {
                         0.0
                     };
-                    let (committed, _) = resolve_zone(raw, held, asz);
+                    let (committed, _) = resolve_zone(raw, held, asz, self.split);
                     if let Some(zone) = committed {
+                        let split = self.split;
                         let w = &mut self.windows[i];
                         // remember the free-floating rect so restore/un-snap works
                         w.prev = Some(w.rect);
                         w.snap = Some(zone);
-                        w.rect = zone_rect(zone, asz);
+                        w.rect = zone_rect(zone, asz, split);
                         scr = w.rect.translate(area.min.to_vec2());
                     }
                 }
@@ -583,24 +625,63 @@ impl WindowManager {
                 egui::Stroke::new(BORDER_W, border_col),
                 egui::StrokeKind::Inside,
             );
-            let rh = egui::Rect::from_min_size(
-                egui::pos2(scr.max.x - 15.0, scr.max.y - 15.0),
-                egui::vec2(15.0, 15.0),
-            );
-            let rr = ui.interact(rh, base.with((id, "rsz")), egui::Sense::drag());
-            if rr.dragged() {
-                let w = &mut self.windows[i];
-                let mut nr = w.rect;
-                nr.max.x = (nr.max.x + rr.drag_delta().x).max(nr.min.x + 240.0);
-                nr.max.y = (nr.max.y + rr.drag_delta().y).max(nr.min.y + 140.0);
-                w.rect = nr;
-                w.snap = None; // manual resize un-snaps
-                clamp(&mut w.rect, asz);
+            // --- resize: 8 invisible bands around the frame (4 edges + 4 corners) ---
+            // Registered last so they take pointer priority over content/title in the
+            // thin RESIZE_BAND frame. Floating windows resize freely on any edge; a
+            // snapped window's INTERIOR edge (shared with a neighbour) drags the tiling
+            // divider so both tiles resize together, while an OUTER edge pops it back to
+            // floating. Corners that touch any outer edge also pop to floating.
+            let bnd = RESIZE_BAND;
+            let (x0, y0, x1, y1) = (scr.min.x, scr.min.y, scr.max.x, scr.max.y);
+            type Ci = egui::CursorIcon;
+            // (key, rect, left, right, top, bottom, cursor)
+            let handles: [(&str, egui::Rect, bool, bool, bool, bool, Ci); 8] = [
+                ("w", egui::Rect::from_min_max(egui::pos2(x0, y0 + bnd), egui::pos2(x0 + bnd, y1 - bnd)), true, false, false, false, Ci::ResizeWest),
+                ("e", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y0 + bnd), egui::pos2(x1, y1 - bnd)), false, true, false, false, Ci::ResizeEast),
+                ("n", egui::Rect::from_min_max(egui::pos2(x0 + bnd, y0), egui::pos2(x1 - bnd, y0 + bnd)), false, false, true, false, Ci::ResizeNorth),
+                ("s", egui::Rect::from_min_max(egui::pos2(x0 + bnd, y1 - bnd), egui::pos2(x1 - bnd, y1)), false, false, false, true, Ci::ResizeSouth),
+                ("nw", egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + bnd, y0 + bnd)), true, false, true, false, Ci::ResizeNorthWest),
+                ("ne", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y0), egui::pos2(x1, y0 + bnd)), false, true, true, false, Ci::ResizeNorthEast),
+                ("sw", egui::Rect::from_min_max(egui::pos2(x0, y1 - bnd), egui::pos2(x0 + bnd, y1)), true, false, false, true, Ci::ResizeSouthWest),
+                ("se", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y1 - bnd), egui::pos2(x1, y1)), false, true, false, true, Ci::ResizeSouthEast),
+            ];
+            for (key, hr, hl, hrr, ht, hb, cursor) in handles {
+                let resp = ui.interact(hr, base.with((id, "rsz", key)), egui::Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(cursor);
+                }
+                if resp.drag_started() {
+                    acts.push(Act::Focus(id));
+                }
+                if !resp.dragged() {
+                    continue;
+                }
+                let d = resp.drag_delta();
+                match self.windows[i].snap {
+                    Some(zone) => {
+                        let (il, ir, it, ib) = interior_edges(zone);
+                        let touches_outer =
+                            (hl && !il) || (hrr && !ir) || (ht && !it) || (hb && !ib);
+                        if touches_outer {
+                            let w = &mut self.windows[i];
+                            w.snap = None;
+                            w.prev = None;
+                            resize_floating(&mut w.rect, d, hl, hrr, ht, hb, asz);
+                        } else {
+                            // drag the shared divider(s); every tile on it refits next frame
+                            if hl || hrr {
+                                let lo = (MIN_TILE / asz.x).min(0.5);
+                                self.split.x = (self.split.x + d.x / asz.x).clamp(lo, 1.0 - lo);
+                            }
+                            if ht || hb {
+                                let lo = (MIN_TILE / asz.y).min(0.5);
+                                self.split.y = (self.split.y + d.y / asz.y).clamp(lo, 1.0 - lo);
+                            }
+                        }
+                    }
+                    None => resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz),
+                }
             }
-            ui.painter().line_segment(
-                [egui::pos2(rh.min.x + 4.0, rh.max.y - 3.0), egui::pos2(rh.max.x - 3.0, rh.min.y + 4.0)],
-                egui::Stroke::new(1.0, DIM),
-            );
         }
 
         // --- snap overlay (amber), painted above all windows while dragging ---
@@ -687,6 +768,7 @@ impl WindowManager {
                     self.focus(id);
                 }
                 Act::Max(id) => {
+                    let split = self.split;
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         if w.snap == Some(Zone::Max) {
                             w.snap = None;
@@ -696,7 +778,7 @@ impl WindowManager {
                         } else {
                             w.prev = Some(w.rect);
                             w.snap = Some(Zone::Max);
-                            w.rect = zone_rect(Zone::Max, asz);
+                            w.rect = zone_rect(Zone::Max, asz, split);
                         }
                     }
                     self.focus(id);
@@ -706,6 +788,33 @@ impl WindowManager {
 
         interacted
     }
+}
+
+// Apply a resize drag to the affected edges of a floating window's rect, holding
+// a minimum size and keeping every edge inside the area.
+fn resize_floating(
+    rect: &mut egui::Rect,
+    d: egui::Vec2,
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+    area: egui::Vec2,
+) {
+    let mut nr = *rect;
+    if left {
+        nr.min.x = (nr.min.x + d.x).max(0.0).min(nr.max.x - MIN_W);
+    }
+    if right {
+        nr.max.x = (nr.max.x + d.x).min(area.x).max(nr.min.x + MIN_W);
+    }
+    if top {
+        nr.min.y = (nr.min.y + d.y).max(0.0).min(nr.max.y - MIN_H);
+    }
+    if bottom {
+        nr.max.y = (nr.max.y + d.y).min(area.y).max(nr.min.y + MIN_H);
+    }
+    *rect = nr;
 }
 
 fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
