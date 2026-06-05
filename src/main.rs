@@ -1,4 +1,5 @@
 mod dirpicker;
+mod keymap;
 mod terminal;
 mod wm;
 

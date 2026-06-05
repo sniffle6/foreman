@@ -1176,6 +1176,8 @@ dependencies = [
  "arboard",
  "eframe",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

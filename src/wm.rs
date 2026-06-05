@@ -1,4 +1,5 @@
 use crate::dirpicker::{DirPicker, Outcome};
+use crate::keymap::{Chord, Command, Keymap};
 use crate::terminal::{Session, Shell};
 use eframe::egui;
 use std::path::PathBuf;
@@ -24,12 +25,10 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
 const TITLE_H: f32 = 26.0;
 
-// Leader (prefix) key — tmux-style. The one binding worth making trivial to
-// change. After it is pressed the next chord is a *command* (consumed, never
-// sent to the PTY). `Ctrl+Space` is the recommended alternative if `Ctrl+b`
-// collides with something inside a terminal.
-const LEADER: egui::KeyboardShortcut =
-    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::B);
+// Leader (prefix) key — tmux-style. After it is pressed the next chord is a
+// *command* (consumed, never sent to the PTY). The leader is now data-driven:
+// it lives in `Keymap::leader` (default `Ctrl+b`), loaded from
+// `%APPDATA%\foreman\keybindings.json` and overridable per user.
 
 const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
@@ -44,8 +43,8 @@ const TOP_HOLD: f64 = 0.4; // hold in the top zone this long (s) → escalate to
 const GROW_LEAD: f64 = 0.25; // overlay grows top-half → full over the last GROW_LEAD secs
 
 // A cardinal direction for directional focus / snap commands.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Dir {
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Dir {
     Left,
     Right,
     Up,
@@ -224,27 +223,9 @@ pub struct Win {
     pub content: Content,
 }
 
-/// A resolved leader command. Terminal-level variants act on the focused
-/// project's child manager; project-level variants act on the desktop.
-#[derive(Clone, Copy)]
-enum Cmd {
-    // terminal (inner) level
-    TermFocus(Dir),
-    TermSnap(Dir),
-    ZoomTerm,
-    CloseTerm,
-    Rename,
-    NewTerm,
-    LastTerm,
-    // project (outer) level
-    ProjFocus(Dir),
-    ZoomProject,
-    CloseProject,
-    NewProject,
-    LastProject,
-    // global
-    Help,
-}
+// The resolved-command type lives in `keymap.rs` as `Command` (data-driven in
+// Phase 2). Terminal-level variants act on the focused project's child manager;
+// project-level variants act on the desktop.
 
 enum Act {
     Focus(WinId),
@@ -299,6 +280,10 @@ pub struct WindowManager {
     /// Size of the area this manager was last rendered into. Lets keyboard-driven
     /// zoom/snap commit a rect immediately (the show loop refits next frame).
     last_area: egui::Vec2,
+    /// The active key bindings (leader + chord→command). Only the desktop manager
+    /// consults it (the leader state machine runs there); child managers carry a
+    /// default and never read it.
+    keymap: Keymap,
 }
 
 impl WindowManager {
@@ -321,12 +306,15 @@ impl WindowManager {
             show_help: false,
             last_focused: None,
             last_area: egui::vec2(0.0, 0.0),
+            keymap: Keymap::default(),
         }
     }
 
-    /// Mark this manager as the root desktop: it runs the leader state machine.
+    /// Mark this manager as the root desktop: it runs the leader state machine,
+    /// and load the user's key bindings (merged over the in-code defaults).
     pub fn as_desktop(mut self) -> Self {
         self.desktop = true;
+        self.keymap = Keymap::load();
         self
     }
 
@@ -416,7 +404,7 @@ impl WindowManager {
     ///
     /// States: idle → (leader) → armed → (any chord) → idle. An unbound chord
     /// while armed disarms and is swallowed (tmux behaviour).
-    fn pump_leader(&mut self, ui: &mut egui::Ui) -> Option<Cmd> {
+    fn pump_leader(&mut self, ui: &mut egui::Ui) -> Option<Command> {
         // The help overlay eats the next keystroke (any key dismisses it) so the
         // dismissing key never lands in a terminal.
         if self.show_help {
@@ -442,9 +430,17 @@ impl WindowManager {
         }
 
         if !self.armed {
-            // Idle: arm on the leader chord, consuming it so it never reaches a PTY.
-            if ui.input_mut(|i| i.consume_shortcut(&LEADER)) {
+            // Idle: arm when the leader chord arrives. We look for the *exact*
+            // chord (key + modifiers) so e.g. a plain `b` never arms when the
+            // leader is `Ctrl+b`. If matched, swallow this frame's input so the
+            // leader never reaches a PTY.
+            let leader = self.keymap.leader;
+            let hit = ui.input(|i| {
+                i.events.iter().any(|e| Self::event_chord(e) == Some(leader))
+            });
+            if hit {
                 self.armed = true;
+                self.swallow_input(ui);
             }
             return None;
         }
@@ -452,22 +448,9 @@ impl WindowManager {
         // Armed: the next keystroke is a command. Find the first key-press event,
         // map it to a command, then swallow *everything* this frame (including the
         // companion Event::Text) so no fragment leaks to the terminal.
-        let chord = ui.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => Some((*key, *modifiers)),
-                // egui may deliver Ctrl+C / Ctrl+X as these; treat as their keys.
-                egui::Event::Copy => Some((egui::Key::C, egui::Modifiers::CTRL)),
-                egui::Event::Cut => Some((egui::Key::X, egui::Modifiers::CTRL)),
-                _ => None,
-            })
-        });
+        let chord = ui.input(|i| i.events.iter().find_map(Self::event_chord));
 
-        let Some((key, mods)) = chord else {
+        let Some(chord) = chord else {
             // No key yet this frame (e.g. only Text from the held leader). Wait,
             // but still swallow any stray text so it can't reach the terminal.
             self.swallow_input(ui);
@@ -475,7 +458,7 @@ impl WindowManager {
         };
 
         self.armed = false;
-        let cmd = Self::resolve(key, mods);
+        let cmd = self.keymap.resolve(chord);
         // Whether bound or not, the whole chord is ours: swallow it.
         self.swallow_input(ui);
         cmd
@@ -498,105 +481,68 @@ impl WindowManager {
         });
     }
 
-    /// The hardcoded keymap: (key, modifiers) → command. Binding and meaning live
-    /// in the same arm on purpose (locality; Phase 2 replaces this with data).
-    /// `Ctrl` selects the *project* (outer) level; plain/`Shift` act on the
-    /// focused project's terminals (inner). Returns `None` for unbound chords.
-    fn resolve(key: egui::Key, m: egui::Modifiers) -> Option<Cmd> {
-        use egui::Key as K;
-        let ctrl = m.ctrl || m.command;
-        let shift = m.shift;
-        Some(match key {
-            // --- directional: arrows (and vi h/j/k/l for terminal focus) ---
-            K::ArrowLeft | K::ArrowDown | K::ArrowUp | K::ArrowRight => {
-                let d = match key {
-                    K::ArrowLeft => Dir::Left,
-                    K::ArrowDown => Dir::Down,
-                    K::ArrowUp => Dir::Up,
-                    _ => Dir::Right,
-                };
-                if ctrl {
-                    Cmd::ProjFocus(d) // Ctrl+arrows: move between projects
-                } else if shift {
-                    Cmd::TermSnap(d) // Shift+arrows: snap focused terminal
-                } else {
-                    Cmd::TermFocus(d) // arrows: move terminal focus
-                }
-            }
-            K::H | K::J | K::K | K::L if !ctrl && !shift => {
-                let d = match key {
-                    K::H => Dir::Left,
-                    K::J => Dir::Down,
-                    K::K => Dir::Up,
-                    _ => Dir::Right,
-                };
-                Cmd::TermFocus(d)
-            }
-
-            // --- new / close / zoom / rename ---
-            K::C if !ctrl => Cmd::NewTerm,
-            K::P => Cmd::NewProject, // P (shift-p or plain p both fine)
-            K::X if ctrl => Cmd::CloseProject,
-            K::X => Cmd::CloseTerm,
-            K::Z if ctrl => Cmd::ZoomProject,
-            K::Z => Cmd::ZoomTerm,
-            K::Comma => Cmd::Rename,
-
-            // --- last-focused toggle ---
-            K::Tab if ctrl => Cmd::LastProject,
-            K::Tab => Cmd::LastTerm,
-
-            // --- discoverability ---
-            K::Questionmark => Cmd::Help,
-
-            _ => return None,
-        })
+    /// Map a single egui input `Event` to the [`Chord`] it represents, or `None`
+    /// if it is not a key-press chord. `command` (⌘) is folded onto `ctrl` to
+    /// match Phase 1. egui delivers `Ctrl+C` / `Ctrl+X` as `Copy` / `Cut`
+    /// events, so we translate those back to their key chords.
+    fn event_chord(e: &egui::Event) -> Option<Chord> {
+        match e {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => Some(Chord::from_event(*key, *modifiers)),
+            egui::Event::Copy => Some(Chord::new(egui::Key::C, true, false, false)),
+            egui::Event::Cut => Some(Chord::new(egui::Key::X, true, false, false)),
+            _ => None,
+        }
     }
 
     /// Execute a resolved command. Terminal-level commands route into the focused
     /// project's child manager; project-level commands act on `self` (desktop).
-    fn dispatch(&mut self, cmd: Cmd, ui: &mut egui::Ui) {
+    fn dispatch(&mut self, cmd: Command, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let asz_proj = self.last_area; // desktop area for project-level zoom
         match cmd {
             // ---- project (outer) level: act on the desktop ----
-            Cmd::ProjFocus(d) => self.focus_dir(d),
-            Cmd::ZoomProject => {
+            Command::ProjFocus(d) => self.focus_dir(d),
+            Command::ZoomProject => {
                 if let Some(id) = self.focused {
                     self.toggle_zoom(id, asz_proj);
                 }
             }
-            Cmd::CloseProject => {
+            Command::CloseProject => {
                 if let Some(id) = self.focused {
                     self.close(id);
                 }
             }
-            Cmd::LastProject => self.toggle_last(),
-            Cmd::NewProject => {
+            Command::LastProject => self.toggle_last(),
+            Command::NewProject => {
                 self.picker = Some(DirPicker::new(self.picker_start()));
             }
-            Cmd::Help => self.show_help = true,
+            Command::Help => self.show_help = true,
 
             // ---- terminal (inner) level: act on the focused project's child ----
             other => {
                 if let Some(child) = self.focused_child() {
                     let asz = child.last_area;
                     match other {
-                        Cmd::TermFocus(d) => child.focus_dir(d),
-                        Cmd::TermSnap(d) => child.snap_dir(d),
-                        Cmd::ZoomTerm => {
+                        Command::TermFocus(d) => child.focus_dir(d),
+                        Command::TermSnap(d) => child.snap_dir(d),
+                        Command::ZoomTerm => {
                             if let Some(id) = child.focused {
                                 child.toggle_zoom(id, asz);
                             }
                         }
-                        Cmd::CloseTerm => {
+                        Command::CloseTerm => {
                             if let Some(id) = child.focused {
                                 child.close(id);
                             }
                         }
-                        Cmd::Rename => child.begin_rename(),
-                        Cmd::NewTerm => child.add_terminal(Shell::PowerShell, &ctx),
-                        Cmd::LastTerm => child.toggle_last(),
+                        Command::Rename => child.begin_rename(),
+                        Command::NewTerm => child.add_terminal(Shell::PowerShell, &ctx),
+                        Command::LastTerm => child.toggle_last(),
                         // project-level handled above
                         _ => {}
                     }
