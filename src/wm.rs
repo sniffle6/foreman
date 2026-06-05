@@ -118,6 +118,13 @@ fn detect_zone(fx: f32, fy: f32) -> Option<Zone> {
     None
 }
 
+// True once a dragged tab chip has left its window's titlebar far enough to count
+// as a drag-out (untab): well below/above the title row, or past either side edge.
+// Shared by the live drag-out path and the release fallback so both agree.
+fn tab_drag_off(p: egui::Pos2, scr: egui::Rect) -> bool {
+    (p.y - scr.min.y).abs() > TITLE_H * 1.5 || p.x < scr.min.x || p.x > scr.max.x
+}
+
 // target rect for a zone in LOCAL coords, given the manager's split ratios.
 // `split` is the fractional position (0..1) of the vertical (x) and horizontal
 // (y) tiling dividers, so adjacent snapped windows share a movable edge. With
@@ -149,6 +156,46 @@ fn zone_rect(zone: Zone, area: egui::Vec2, split: egui::Vec2) -> egui::Rect {
         Zone::Br => (rx, by, rw, bh),
     };
     egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(sw, sh))
+}
+
+// Compose a directional snap onto the current snap state, per-axis. A window snap
+// is a horizontal pin (left/right/none) × a vertical pin (top/bottom/none);
+// floating and `Max` both read as fully un-pinned. A direction pins its own axis,
+// or — if that axis is already pinned the same way — releases it (toggle), leaving
+// the other axis untouched. Returns the resulting zone, or `None` when both axes
+// end up un-pinned (→ floating). This is the whole edge/corner tiling state
+// machine, kept pure so it is unit-testable without an egui context.
+fn compose_zone(cur: Option<Zone>, d: Dir) -> Option<Zone> {
+    // (h, v) in {-1, 0, 1}: h<0 left / h>0 right; v<0 top / v>0 bottom; 0 = unpinned.
+    let (mut h, mut v) = match cur {
+        None | Some(Zone::Max) => (0i8, 0i8),
+        Some(Zone::Left) => (-1, 0),
+        Some(Zone::Right) => (1, 0),
+        Some(Zone::Top) => (0, -1),
+        Some(Zone::Bottom) => (0, 1),
+        Some(Zone::Tl) => (-1, -1),
+        Some(Zone::Tr) => (1, -1),
+        Some(Zone::Bl) => (-1, 1),
+        Some(Zone::Br) => (1, 1),
+    };
+    match d {
+        Dir::Left => h = if h == -1 { 0 } else { -1 },
+        Dir::Right => h = if h == 1 { 0 } else { 1 },
+        Dir::Up => v = if v == -1 { 0 } else { -1 },
+        Dir::Down => v = if v == 1 { 0 } else { 1 },
+    }
+    match (h, v) {
+        (0, 0) => None,
+        (-1, 0) => Some(Zone::Left),
+        (1, 0) => Some(Zone::Right),
+        (0, -1) => Some(Zone::Top),
+        (0, 1) => Some(Zone::Bottom),
+        (-1, -1) => Some(Zone::Tl),
+        (1, -1) => Some(Zone::Tr),
+        (-1, 1) => Some(Zone::Bl),
+        (1, 1) => Some(Zone::Br),
+        _ => unreachable!(),
+    }
 }
 
 // Which edges of a snapped zone are interior — i.e. shared with a neighbouring
@@ -308,7 +355,10 @@ enum Act {
     /// the source. Fired when a window's titlebar is dropped onto another window.
     Merge { src: WinId, dst: WinId },
     /// Detach tab `idx` of window `id` into a new floating window at `pos` (local).
-    Untab { id: WinId, idx: usize, pos: egui::Pos2 },
+    /// `grab` transfers the in-progress pointer drag onto the new window's title so
+    /// it keeps following the cursor (live drag-out); set false for a drop-release
+    /// detach where no drag continues.
+    Untab { id: WinId, idx: usize, pos: egui::Pos2, grab: bool },
 }
 
 pub struct WindowManager {
@@ -738,15 +788,14 @@ impl WindowManager {
 
     /// Detach tab `idx` of window `id` into a brand-new floating window placed at
     /// `local_pos` (manager-local coords). Used by drag-out (untab). The new
-    /// window restores a sensible floating size. If the source had only one tab,
-    /// this is a no-op (dragging the sole tab just moves the window, handled by the
-    /// normal title drag).
-    fn untab(&mut self, id: WinId, idx: usize, local_pos: egui::Pos2) {
-        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
-            return;
-        };
+    /// window restores a sensible floating size. Returns the new window's id, or
+    /// `None` if nothing was detached (source had only one tab / bad index). If the
+    /// source had only one tab, this is a no-op (dragging the sole tab just moves
+    /// the window, handled by the normal title drag).
+    fn untab(&mut self, id: WinId, idx: usize, local_pos: egui::Pos2) -> Option<WinId> {
+        let w = self.windows.iter_mut().find(|w| w.id == id)?;
         if w.tabs.len() <= 1 || idx >= w.tabs.len() {
-            return;
+            return None;
         }
         let tab = w.tabs.remove(idx);
         if w.active >= idx && w.active > 0 {
@@ -778,6 +827,7 @@ impl WindowManager {
             prev: None,
         });
         self.focus(new_id);
+        Some(new_id)
     }
 
     fn toggle_last(&mut self) {
@@ -879,29 +929,26 @@ impl WindowManager {
         }
     }
 
-    /// Snap the focused window to a half-screen zone. The show loop refits the
-    /// rect to `zone_rect` each frame, so we only set `snap`/`prev` here. Snapping
-    /// onto a zone another window already holds tabs the two together.
+    /// Snap the focused window, composing the pressed direction onto its current
+    /// snap so half + perpendicular direction → corner (see [`compose_zone`]). The
+    /// show loop refits the rect to `zone_rect` each frame, so we only set
+    /// `snap`/`prev` here. Composing onto a zone another window already holds tabs
+    /// the two together (via [`snap_or_tab`]); when both axes un-pin, the window
+    /// pops back to floating at its pre-snap rect.
     fn snap_dir(&mut self, d: Dir) {
         let Some(id) = self.focused else { return };
-        let zone = d.zone();
-        // Toggling the same snap pops back to floating (handy to undo).
-        let already = self
-            .windows
-            .iter()
-            .find(|w| w.id == id)
-            .map(|w| w.snap == Some(zone))
-            .unwrap_or(false);
-        if already {
-            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                w.snap = None;
-                if let Some(pr) = w.prev.take() {
-                    w.rect = pr;
+        let cur = self.windows.iter().find(|w| w.id == id).and_then(|w| w.snap);
+        match compose_zone(cur, d) {
+            Some(zone) => self.snap_or_tab(id, zone),
+            None => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    w.snap = None;
+                    if let Some(pr) = w.prev.take() {
+                        w.rect = pr;
+                    }
                 }
+                self.focus(id);
             }
-            self.focus(id);
-        } else {
-            self.snap_or_tab(id, zone);
         }
     }
 
@@ -1217,13 +1264,27 @@ impl WindowManager {
                     };
                     let (committed, _) = resolve_zone(raw, held, asz, self.split);
                     if let Some(zone) = committed {
-                        let split = self.split;
-                        let w = &mut self.windows[i];
-                        // remember the free-floating rect so restore/un-snap works
-                        w.prev = Some(w.rect);
-                        w.snap = Some(zone);
-                        w.rect = zone_rect(zone, asz, split);
-                        scr = w.rect.translate(area.min.to_vec2());
+                        // If another window already holds this zone, tab onto it
+                        // instead of stacking a second window in the same slot
+                        // (mirrors `snap_or_tab` / the keyboard snap path). Deferred
+                        // as a merge — like the titlebar-drop path above — so we
+                        // never remove a window mid-render and invalidate `order`.
+                        let occupant = self
+                            .windows
+                            .iter()
+                            .find(|w| w.id != id && w.snap == Some(zone))
+                            .map(|w| w.id);
+                        if let Some(dst) = occupant {
+                            acts.push(Act::Merge { src: id, dst });
+                        } else {
+                            let split = self.split;
+                            let w = &mut self.windows[i];
+                            // remember the free-floating rect so restore/un-snap works
+                            w.prev = Some(w.rect);
+                            w.snap = Some(zone);
+                            w.rect = zone_rect(zone, asz, split);
+                            scr = w.rect.translate(area.min.to_vec2());
+                        }
                     }
                 }
                 self.dwell_zone = None;
@@ -1393,22 +1454,36 @@ impl WindowManager {
                         acts.push(Act::CloseTab(id, ti));
                     } else if chip_resp.clicked() {
                         acts.push(Act::SetTab(id, ti));
-                    } else if chip_resp.drag_stopped() {
-                        // Dragging a chip off the titlebar detaches it into its own
-                        // floating window at the drop point (local coords).
+                    } else if chip_resp.dragged() {
+                        // Live drag-out: the instant the pointer leaves the tab bar,
+                        // detach the tab into its own floating window and hand the
+                        // drag to that window (`grab`) so it pops to floating size and
+                        // follows the cursor immediately — no wait for release.
                         if let Some(dp) = ui.ctx().pointer_latest_pos() {
-                            let off = (dp.y - scr.min.y).abs() > TITLE_H * 1.5
-                                || dp.x < scr.min.x
-                                || dp.x > scr.max.x;
-                            if off {
+                            if tab_drag_off(dp, scr) {
                                 let local = dp - area.min.to_vec2();
                                 acts.push(Act::Untab {
                                     id,
                                     idx: ti,
                                     pos: egui::pos2(local.x, local.y),
+                                    grab: true,
+                                });
+                            }
+                        }
+                    } else if chip_resp.drag_stopped() {
+                        // Released without ever crossing off the bar (e.g. a tiny
+                        // flick the live path never caught): off → detach in place,
+                        // else just activate the tab.
+                        if let Some(dp) = ui.ctx().pointer_latest_pos() {
+                            if tab_drag_off(dp, scr) {
+                                let local = dp - area.min.to_vec2();
+                                acts.push(Act::Untab {
+                                    id,
+                                    idx: ti,
+                                    pos: egui::pos2(local.x, local.y),
+                                    grab: false,
                                 });
                             } else {
-                                // Dropped back on the bar: just activate it.
                                 acts.push(Act::SetTab(id, ti));
                             }
                         }
@@ -1753,7 +1828,16 @@ impl WindowManager {
                 }
                 Act::CloseTab(id, idx) => self.close_tab(id, idx),
                 Act::Merge { src, dst } => self.merge_windows(src, dst),
-                Act::Untab { id, idx, pos } => self.untab(id, idx, pos),
+                Act::Untab { id, idx, pos, grab } => {
+                    if let Some(new_id) = self.untab(id, idx, pos) {
+                        if grab {
+                            // Hand the live pointer drag to the new window's title so
+                            // the detached window keeps following the cursor this
+                            // gesture (egui reports it dragged next frame).
+                            ctx.set_dragged_id(base.with((new_id, "drag")));
+                        }
+                    }
+                }
                 Act::Min(id) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         w.minimized = true;
@@ -1876,6 +1960,11 @@ impl WindowManager {
                 rows.push((format!("  {chord}"), cmd.label().to_string()));
             }
         }
+        rows.push((String::new(), String::new()));
+        rows.push((
+            "  Corners".into(),
+            "snap, then snap a perpendicular direction \u{2192} quarter-screen tiles".into(),
+        ));
         rows.push((String::new(), String::new()));
         rows.push((
             "  Edit".into(),
@@ -2051,6 +2140,65 @@ mod tests {
         wm.snap_dir(Dir::Right);
         assert_eq!(wm.windows.len(), 1);
         assert_eq!(wm.windows[0].snap, Some(Zone::Right));
+    }
+
+    #[test]
+    fn compose_zone_matches_full_transition_table() {
+        use Zone::*;
+        // (current snap, Left, Right, Up, Down) — `None` = floating. Mirrors the
+        // design table exactly so a regression in the state machine is obvious.
+        let rows: &[(Option<Zone>, Option<Zone>, Option<Zone>, Option<Zone>, Option<Zone>)] = &[
+            (None, Some(Left), Some(Right), Some(Top), Some(Bottom)),
+            (Some(Max), Some(Left), Some(Right), Some(Top), Some(Bottom)),
+            (Some(Left), None, Some(Right), Some(Tl), Some(Bl)),
+            (Some(Right), Some(Left), None, Some(Tr), Some(Br)),
+            (Some(Top), Some(Tl), Some(Tr), None, Some(Bottom)),
+            (Some(Bottom), Some(Bl), Some(Br), Some(Top), None),
+            (Some(Tl), Some(Top), Some(Tr), Some(Left), Some(Bl)),
+            (Some(Tr), Some(Tl), Some(Top), Some(Right), Some(Br)),
+            (Some(Bl), Some(Bottom), Some(Br), Some(Tl), Some(Left)),
+            (Some(Br), Some(Bl), Some(Bottom), Some(Tr), Some(Right)),
+        ];
+        for &(cur, l, r, u, dn) in rows {
+            assert_eq!(compose_zone(cur, Dir::Left), l, "{cur:?} + Left");
+            assert_eq!(compose_zone(cur, Dir::Right), r, "{cur:?} + Right");
+            assert_eq!(compose_zone(cur, Dir::Up), u, "{cur:?} + Up");
+            assert_eq!(compose_zone(cur, Dir::Down), dn, "{cur:?} + Down");
+        }
+    }
+
+    #[test]
+    fn snap_dir_composes_into_and_out_of_a_corner() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.focused = Some(a);
+        let floating = wm.windows[0].rect;
+
+        wm.snap_dir(Dir::Left); // floating → left half
+        assert_eq!(wm.windows[0].snap, Some(Zone::Left));
+        wm.snap_dir(Dir::Up); // left half + up → top-left corner
+        assert_eq!(wm.windows[0].snap, Some(Zone::Tl));
+        wm.snap_dir(Dir::Up); // press the pinned axis again → back to left half
+        assert_eq!(wm.windows[0].snap, Some(Zone::Left));
+        wm.snap_dir(Dir::Left); // same direction again → un-snap to floating
+        assert_eq!(wm.windows[0].snap, None);
+        assert_eq!(wm.windows[0].rect, floating, "restores pre-snap rect");
+    }
+
+    #[test]
+    fn snap_dir_into_occupied_corner_tabs_onto_occupant() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.set_snap(a, Zone::Br); // A holds the bottom-right corner
+        wm.focused = Some(b);
+        wm.snap_dir(Dir::Right); // B: floating → right half
+        wm.snap_dir(Dir::Down); // right half + down → Br, already occupied → tab
+
+        assert_eq!(wm.windows.len(), 1, "B tabbed onto A in the corner");
+        assert_eq!(wm.windows[0].id, a);
+        assert_eq!(wm.windows[0].snap, Some(Zone::Br));
+        assert_eq!(wm.windows[0].tabs.len(), 2);
     }
 
     #[test]
