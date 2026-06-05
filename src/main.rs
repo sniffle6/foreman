@@ -1,3 +1,4 @@
+mod dirpicker;
 mod terminal;
 mod wm;
 
