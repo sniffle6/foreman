@@ -61,9 +61,20 @@ impl Dir {
             Dir::Down => Zone::Bottom,
         }
     }
+
+    // The opposite direction — used by split to place the source pane facing the
+    // newcomer (Left↔Right, Up↔Down).
+    fn opposite(self) -> Dir {
+        match self {
+            Dir::Left => Dir::Right,
+            Dir::Right => Dir::Left,
+            Dir::Up => Dir::Down,
+            Dir::Down => Dir::Up,
+        }
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Zone {
     Max,
     Left,
@@ -404,16 +415,18 @@ impl WindowManager {
         self.focused = Some(id);
     }
 
-    pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) {
-        if let Ok(s) = Session::spawn(shell, self.cwd.as_deref(), ctx.clone()) {
-            let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
-            self.push_win(
-                id,
-                format!("{}  ·  #{}", shell.label(), id),
-                rect,
-                Content::Terminal(s),
-            );
-        }
+    /// Spawn a terminal into this manager. Returns the new window's id, or `None`
+    /// if the PTY failed to spawn (the caller treats that as a no-op).
+    pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
+        let s = Session::spawn(shell, self.cwd.as_deref(), ctx.clone()).ok()?;
+        let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
+        self.push_win(
+            id,
+            format!("{}  ·  #{}", shell.label(), id),
+            rect,
+            Content::Terminal(s),
+        );
+        Some(id)
     }
 
     /// Add a new project window. It starts as a sandbox containing one terminal.
@@ -592,6 +605,7 @@ impl WindowManager {
                     match other {
                         Command::TermFocus(d) => child.focus_dir(d),
                         Command::TermSnap(d) => child.snap_dir(d),
+                        Command::Split(d) => child.split_dir(d, &ctx),
                         Command::ZoomTerm => {
                             if let Some(id) = child.focused {
                                 child.toggle_zoom(id, asz);
@@ -603,7 +617,9 @@ impl WindowManager {
                             }
                         }
                         Command::Rename => child.begin_rename(),
-                        Command::NewTerm => child.add_terminal(Shell::PowerShell, &ctx),
+                        Command::NewTerm => {
+                            child.add_terminal(Shell::PowerShell, &ctx);
+                        }
                         Command::LastTerm => child.toggle_last(),
                         Command::TabCycle => child.cycle_tab(true),
                         Command::TabPrev => child.cycle_tab(false),
@@ -828,26 +844,103 @@ impl WindowManager {
         self.focus(id);
     }
 
+    /// Snap window `id` to `zone`, preserving its pre-snap floating rect in `prev`
+    /// so an un-snap can restore it. Mirrors the mouse-drop snap path: only
+    /// `snap`/`prev` are set; the show loop refits the rect to `zone_rect` next
+    /// frame. A no-op if the window is already snapped to `zone`. This is the one
+    /// place split and directional snap share.
+    fn set_snap(&mut self, id: WinId, zone: Zone) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            if w.snap == Some(zone) {
+                return;
+            }
+            if w.snap.is_none() {
+                w.prev = Some(w.rect);
+            }
+            w.snap = Some(zone);
+        }
+    }
+
     /// Snap the focused window to a half-screen zone. The show loop refits the
     /// rect to `zone_rect` each frame, so we only set `snap`/`prev` here.
     fn snap_dir(&mut self, d: Dir) {
         let Some(id) = self.focused else { return };
         let zone = d.zone();
-        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-            // Toggling the same snap pops back to floating (handy to undo).
-            if w.snap == Some(zone) {
+        // Toggling the same snap pops back to floating (handy to undo).
+        let already = self
+            .windows
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.snap == Some(zone))
+            .unwrap_or(false);
+        if already {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                 w.snap = None;
                 if let Some(pr) = w.prev.take() {
                     w.rect = pr;
                 }
-            } else {
-                if w.snap.is_none() {
-                    w.prev = Some(w.rect);
-                }
-                w.snap = Some(zone);
             }
+        } else {
+            self.set_snap(id, zone);
         }
         self.focus(id);
+    }
+
+    /// Phase 2 split: create a new terminal and place it in the pointed zone.
+    ///
+    /// - If a window is **already snapped to the target zone**, the newcomer is
+    ///   *tabbed* onto it (reusing [`merge_windows`]) instead of stacking a second
+    ///   window in the same zone.
+    /// - Otherwise the new terminal is snapped to the target zone (reusing the
+    ///   snap path via [`set_snap`]).
+    /// - If the focused source window was **unsnapped (floating)**, it is also
+    ///   snapped to the **opposite** zone for an instant two-pane split. An
+    ///   already-snapped source is left untouched.
+    ///
+    /// No-ops cleanly if there is no source window or the PTY fails to spawn.
+    fn split_dir(&mut self, d: Dir, ctx: &egui::Context) {
+        let Some(src) = self.focused else { return };
+        // Capture the source's snap state *before* creating the newcomer, since
+        // source placement depends on whether it was floating.
+        let Some(src_snap) = self.windows.iter().find(|w| w.id == src).map(|w| w.snap) else {
+            return; // focused id no longer exists
+        };
+        // Spawn the newcomer. add_terminal focuses it and returns its id; bail on
+        // a spawn failure without disturbing the existing layout.
+        let Some(new_id) = self.add_terminal(Shell::PowerShell, ctx) else {
+            return;
+        };
+        self.place_split(src, src_snap, new_id, d);
+    }
+
+    /// The pure placement half of [`split_dir`] (no PTY/spawn): given the source
+    /// window, its pre-split snap state, and an already-created newcomer window,
+    /// place the newcomer in the pointed zone — tabbing onto an existing occupant
+    /// on collision — and snap an unsnapped source to the opposite zone. Split out
+    /// so it is testable without spawning a real `Session`.
+    fn place_split(&mut self, src: WinId, src_snap: Option<Zone>, new_id: WinId, d: Dir) {
+        let zone = d.zone();
+        // Collision: an existing window (not the source, not the newcomer) already
+        // snapped to the target zone → the newcomer tabs onto it.
+        let collision = self
+            .windows
+            .iter()
+            .find(|w| w.id != src && w.id != new_id && w.snap == Some(zone))
+            .map(|w| w.id);
+
+        if let Some(dst) = collision {
+            // Tab the fresh terminal onto the occupant (Phase 1 merge op).
+            self.merge_windows(new_id, dst);
+        } else {
+            self.set_snap(new_id, zone);
+            self.focus(new_id);
+        }
+
+        // Source placement: only when it was floating, snap it opposite so the
+        // two panes face each other. An already-snapped source stays put.
+        if src_snap.is_none() {
+            self.set_snap(src, d.opposite().zone());
+        }
     }
 
     /// Move focus to the nearest window in direction `d`, by geometry on local
@@ -2034,5 +2127,88 @@ mod tests {
         let a = push(&mut wm, "A");
         wm.untab(a, 0, egui::pos2(500.0, 400.0));
         assert_eq!(wm.windows.len(), 1, "single-tab window is not detachable");
+    }
+
+    // --- Phase 2: split placement (drives place_split with stub windows so no
+    // real PTY/Session is spawned; split_dir only adds the spawn + id capture). ---
+
+    #[test]
+    fn dir_zone_and_opposite_mapping() {
+        assert_eq!(Dir::Left.zone(), Zone::Left);
+        assert_eq!(Dir::Right.zone(), Zone::Right);
+        assert_eq!(Dir::Up.zone(), Zone::Top);
+        assert_eq!(Dir::Down.zone(), Zone::Bottom);
+        assert_eq!(Dir::Left.opposite(), Dir::Right);
+        assert_eq!(Dir::Right.opposite(), Dir::Left);
+        assert_eq!(Dir::Up.opposite(), Dir::Down);
+        assert_eq!(Dir::Down.opposite(), Dir::Up);
+    }
+
+    #[test]
+    fn split_from_floating_source_snaps_both_panes() {
+        // Source is floating; Alt+D (Right) → newcomer right, source snaps left.
+        let mut wm = WindowManager::new();
+        let src = push(&mut wm, "src");
+        let newcomer = push(&mut wm, "new"); // stands in for the freshly spawned terminal
+        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
+        assert_eq!(src_snap, None, "source starts floating");
+
+        wm.place_split(src, src_snap, newcomer, Dir::Right);
+
+        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
+        let n = wm.windows.iter().find(|w| w.id == newcomer).unwrap();
+        assert_eq!(n.snap, Some(Zone::Right), "newcomer snaps to pointed zone");
+        assert_eq!(s.snap, Some(Zone::Left), "floating source snaps opposite");
+        assert!(n.prev.is_some(), "newcomer keeps a pre-snap floating rect");
+        assert!(s.prev.is_some(), "source keeps a pre-snap floating rect");
+        assert_eq!(wm.focused, Some(newcomer), "newcomer is focused");
+    }
+
+    #[test]
+    fn split_from_snapped_source_leaves_source_untouched() {
+        // Source already snapped left; Alt+D → newcomer right, source stays left.
+        let mut wm = WindowManager::new();
+        let src = push(&mut wm, "src");
+        wm.set_snap(src, Zone::Left);
+        let src_prev = wm.windows.iter().find(|w| w.id == src).unwrap().prev;
+        let newcomer = push(&mut wm, "new");
+        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
+
+        wm.place_split(src, src_snap, newcomer, Dir::Right);
+
+        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
+        let n = wm.windows.iter().find(|w| w.id == newcomer).unwrap();
+        assert_eq!(s.snap, Some(Zone::Left), "snapped source is untouched");
+        assert_eq!(s.prev, src_prev, "source prev rect unchanged");
+        assert_eq!(n.snap, Some(Zone::Right), "newcomer snaps to pointed zone");
+    }
+
+    #[test]
+    fn split_into_occupied_zone_tabs_onto_occupant() {
+        // A window already snapped right; splitting right again must tab onto it,
+        // not place a second window in the same zone.
+        let mut wm = WindowManager::new();
+        let src = push(&mut wm, "src");
+        let occupant = push(&mut wm, "occ");
+        wm.set_snap(occupant, Zone::Right);
+        let newcomer = push(&mut wm, "new");
+        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
+        let before = wm.windows.len();
+
+        wm.place_split(src, src_snap, newcomer, Dir::Right);
+
+        assert_eq!(wm.windows.len(), before - 1, "newcomer merged, not added");
+        let occ = wm.windows.iter().find(|w| w.id == occupant).unwrap();
+        assert_eq!(occ.snap, Some(Zone::Right), "occupant keeps its zone");
+        assert_eq!(occ.tabs.len(), 2, "newcomer became a tab on the occupant");
+        assert_eq!(occ.tabs[occ.active].title, "new", "merged tab is active");
+        assert!(
+            !wm.windows.iter().any(|w| w.id == newcomer),
+            "newcomer window no longer exists on its own"
+        );
+        assert_eq!(wm.focused, Some(occupant), "occupant is focused after tab");
+        // Floating source still gets the opposite zone.
+        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
+        assert_eq!(s.snap, Some(Zone::Left), "floating source snaps opposite");
     }
 }

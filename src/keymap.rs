@@ -20,6 +20,9 @@ pub enum Command {
     // terminal (inner) level
     TermFocus(Dir),
     TermSnap(Dir),
+    /// Create a new terminal and snap it to the pointed zone; if a window is
+    /// already snapped there, tab the newcomer onto it instead (Phase 2 split).
+    Split(Dir),
     ZoomTerm,
     CloseTerm,
     Rename,
@@ -68,6 +71,10 @@ impl Command {
             TermSnap(Down),
             TermSnap(Up),
             TermSnap(Right),
+            Split(Left),
+            Split(Down),
+            Split(Up),
+            Split(Right),
             ZoomTerm,
             CloseTerm,
             NewTerm,
@@ -86,8 +93,8 @@ impl Command {
         use Command::*;
         match self {
             ProjFocus(_) | ZoomProject | CloseProject | NewProject | LastProject => Group::Projects,
-            TermFocus(_) | TermSnap(_) | ZoomTerm | CloseTerm | NewTerm | Rename | LastTerm
-            | TabCycle | TabPrev => Group::Terminals,
+            TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
+            | LastTerm | TabCycle | TabPrev => Group::Terminals,
             Help | OpenSettings => Group::Actions,
         }
     }
@@ -117,6 +124,12 @@ impl Command {
                 Dir::Down => "Snap terminal down",
                 Dir::Up => "Snap terminal up",
                 Dir::Right => "Snap terminal right",
+            },
+            Split(d) => match d {
+                Dir::Left => "Split terminal left",
+                Dir::Down => "Split terminal down",
+                Dir::Up => "Split terminal up",
+                Dir::Right => "Split terminal right",
             },
             ZoomTerm => "Zoom (maximize) terminal",
             CloseTerm => "Close terminal",
@@ -457,6 +470,14 @@ impl Default for Keymap {
         // --- vi h/j/k/l: terminal focus only (no ctrl/shift in Phase 1) ---
         for (k, d) in [(K::H, Left), (K::J, Down), (K::K, Up), (K::L, Right)] {
             t.insert(plain(k), TermFocus(d));
+        }
+
+        // --- split: Alt+WASD (W=up, A=left, S=down, D=right) ---
+        // Creates a new terminal snapped to the pointed zone, tabbing onto an
+        // existing window already snapped there (Phase 2).
+        let alt = |k: K| Chord::new(k, false, false, true);
+        for (k, d) in [(K::W, Up), (K::A, Left), (K::S, Down), (K::D, Right)] {
+            t.insert(alt(k), Split(d));
         }
 
         // --- new / close / zoom / rename ---
