@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
@@ -237,13 +237,14 @@ impl Session {
         }
         let (s, e) = if a <= b { (a, b) } else { (b, a) };
         let grid = self.term.grid();
+        let off = grid.display_offset() as i32;
         let mut out = String::new();
         for row in s.0..=e.0 {
             let c0 = if row == s.0 { s.1 } else { 0 };
             let c1 = if row == e.0 { e.1 } else { self.cols.saturating_sub(1) };
             let mut line = String::new();
             for col in c0..=c1.min(self.cols - 1) {
-                let ch = grid[Line(row as i32)][Column(col)].c;
+                let ch = grid[Line(row as i32 - off)][Column(col)].c;
                 line.push(if ch == '\0' { ' ' } else { ch });
             }
             out.push_str(line.trim_end());
@@ -272,6 +273,9 @@ impl Session {
         self.cols = cols;
         self.rows = rows;
         self.term.resize(Size { cols, rows });
+        // Reflow under a preserved scroll offset points the viewport at stale
+        // content; snap back to the live prompt like a normal terminal.
+        self.term.scroll_display(Scroll::Bottom);
         let _ = self.master.resize(PtySize {
             rows: rows as u16,
             cols: cols as u16,
@@ -290,6 +294,7 @@ impl Session {
         let mut paste_event = false;
         let mut want_clip_paste = false; // Ctrl+Shift+V
         let mut copy_action = 0u8; // 1 = Ctrl+C (copy if selection, else interrupt); 2 = Ctrl+Shift+C
+        let mut scroll: Option<Scroll> = None;
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
@@ -311,6 +316,29 @@ impl Session {
                         ..
                     } => {
                         let ctrl = modifiers.ctrl || modifiers.command;
+                        // Shift + Home/End/PageUp/PageDown scrolls the scrollback
+                        // instead of going to the shell.
+                        if modifiers.shift && !ctrl {
+                            match key {
+                                egui::Key::Home => {
+                                    scroll = Some(Scroll::Top);
+                                    continue;
+                                }
+                                egui::Key::End => {
+                                    scroll = Some(Scroll::Bottom);
+                                    continue;
+                                }
+                                egui::Key::PageUp => {
+                                    scroll = Some(Scroll::PageUp);
+                                    continue;
+                                }
+                                egui::Key::PageDown => {
+                                    scroll = Some(Scroll::PageDown);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         if !ctrl {
                             match key {
                                 egui::Key::Enter => out.push(b'\r'),
@@ -349,6 +377,9 @@ impl Session {
                 }
             }
         });
+        if let Some(s) = scroll {
+            self.term.scroll_display(s);
+        }
         // Ctrl+Shift+V reads the clipboard directly; Ctrl+V/Shift+Insert come via Event::Paste.
         if want_clip_paste && !paste_event {
             if let Some(txt) = read_clipboard() {
@@ -356,6 +387,7 @@ impl Session {
             }
         }
         if !out.is_empty() {
+            self.term.scroll_display(Scroll::Bottom);
             self.send(&out);
         }
         match copy_action {
@@ -413,6 +445,17 @@ impl Session {
             self.read_input(ui);
         }
 
+        // Mouse-wheel scrollback (works whenever the pane is hovered).
+        if resp.hovered() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                let lines = (dy / rh).round() as i32;
+                if lines != 0 {
+                    self.term.scroll_display(Scroll::Delta(lines));
+                }
+            }
+        }
+
         let (cur_line, cur_col, cur_visible) = {
             let c = self.term.renderable_content();
             (
@@ -423,6 +466,8 @@ impl Session {
         };
 
         let grid = self.term.grid();
+        let off = grid.display_offset() as i32;
+        let hist = grid.history_size();
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
         for row in 0..self.rows {
@@ -447,7 +492,7 @@ impl Session {
                     run.clear();
                 };
             for col in 0..self.cols {
-                let cell = &grid[Line(row as i32)][Column(col)];
+                let cell = &grid[Line(row as i32 - off)][Column(col)];
                 let inverse = cell.flags.contains(Flags::INVERSE);
                 let mut fg = resolve(cell.fg).unwrap_or(FG);
                 let mut bg = resolve(cell.bg);
@@ -498,13 +543,29 @@ impl Session {
             }
         }
 
-        if active && cur_visible && cur_line >= 0 {
+        if active && cur_visible && cur_line >= 0 && off == 0 {
             let cx = rect.min.x + cur_col as f32 * cw;
             let cy = rect.min.y + cur_line as f32 * rh;
             painter.rect_filled(
                 egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, rh)),
                 egui::CornerRadius::ZERO,
                 egui::Color32::from_rgba_unmultiplied(231, 169, 63, 130),
+            );
+        }
+
+        // scrollback indicator: thin right-edge thumb, shown only when there is
+        // history and the user is scrolled back or hovering the pane.
+        let total = self.rows + hist;
+        if hist > 0 && total > self.rows && (off > 0 || resp.hovered()) {
+            let track_h = rect.height();
+            let thumb_h = (track_h * self.rows as f32 / total as f32).max(16.0);
+            let top_frac = (hist as i32 - off).max(0) as f32 / total as f32;
+            let thumb_y = (rect.min.y + track_h * top_frac).min(rect.max.y - thumb_h);
+            let w = 4.0;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(rect.max.x - w, thumb_y), egui::vec2(w, thumb_h)),
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgba_unmultiplied(231, 169, 63, 150),
             );
         }
     }
