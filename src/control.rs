@@ -37,6 +37,8 @@ pub struct OpenReply {
     pub project: Option<String>, // "p1"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<String>>, // chat --history results
 }
 
 impl OpenReply {
@@ -46,8 +48,27 @@ impl OpenReply {
             terminal: None,
             project: None,
             error: Some(msg.into()),
+            history: None,
         }
     }
+}
+
+/// Project chat post or history read (spec: agent-group-chat §1). Exactly one
+/// of `text` (post) / `history` (read last N) must be set — the client
+/// enforces this; the server treats `history` as the discriminator. `from` is
+/// the sender's own terminal id from its env. As with `open`, this is a
+/// guardrail against confused agents, NOT a security boundary — any local
+/// process can speak to the pipe and claim any `from`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChatRequest {
+    pub cmd: String, // always "chat"
+    #[serde(default)]
+    pub project: Option<String>, // "p1"; None = focused project
+    pub from: String, // "t2"
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub history: Option<usize>,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -104,6 +125,7 @@ use std::sync::mpsc;
 /// and a retrying dispatcher would then create a duplicate.
 pub enum CtrlMsg {
     Open(OpenRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Chat(ChatRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
@@ -133,20 +155,33 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
         if conn.read_line(&mut line).is_err() {
             continue;
         }
-        let reply = match serde_json::from_str::<OpenRequest>(&line) {
-            Ok(req) if req.cmd != "open" => OpenReply::err(format!("unknown cmd: {}", req.cmd)),
-            Ok(req) => {
-                let (rtx, rrx) = mpsc::channel();
-                if tx
-                    .send(CtrlMsg::Open(req, rtx, std::time::Instant::now()))
-                    .is_err()
-                {
+        #[derive(serde::Deserialize)]
+        struct Verb {
+            cmd: String,
+        }
+        let now = std::time::Instant::now();
+        let (rtx, rrx) = mpsc::channel();
+        let msg = match serde_json::from_str::<Verb>(&line) {
+            Err(e) => Err(format!("bad request: {e}")),
+            Ok(v) => match v.cmd.as_str() {
+                "open" => serde_json::from_str::<OpenRequest>(&line)
+                    .map(|r| CtrlMsg::Open(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                "chat" => serde_json::from_str::<ChatRequest>(&line)
+                    .map(|r| CtrlMsg::Chat(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                other => Err(format!("unknown cmd: {other}")),
+            },
+        };
+        let reply = match msg {
+            Err(e) => OpenReply::err(e),
+            Ok(m) => {
+                if tx.send(m).is_err() {
                     return; // GUI gone; stop serving
                 }
                 rrx.recv_timeout(REPLY_TIMEOUT)
                     .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
             }
-            Err(e) => OpenReply::err(format!("bad request: {e}")),
         };
         let mut out = serde_json::to_string(&reply).expect("OpenReply is always serializable");
         out.push('\n');
@@ -158,7 +193,7 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
 ///
 /// Connecting waits (deadline-bounded) while the serial server is busy with
 /// another client; a pipe that doesn't exist at all still fails immediately.
-pub fn request(pipe: &str, req: &OpenRequest) -> std::io::Result<OpenReply> {
+pub fn request(pipe: &str, req: &impl serde::Serialize) -> std::io::Result<OpenReply> {
     let name = pipe.to_ns_name::<GenericNamespaced>()?;
     let conn = ConnectOptions::new()
         .name(name)
@@ -230,6 +265,7 @@ mod tests {
             terminal: Some("t4".into()),
             project: Some("p1".into()),
             error: None,
+            history: None,
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(!s.contains("error"));
@@ -344,19 +380,23 @@ mod tests {
         std::thread::spawn(move || serve(&p2, tx));
         // Fake GUI thread: answer the first request.
         std::thread::spawn(move || {
-            let CtrlMsg::Open(req, reply, sent) =
-                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            assert_eq!(req.command, vec!["cmd.exe", "/c", "echo hi"]);
-            assert!(
-                sent.elapsed() < REPLY_TIMEOUT,
-                "server stamps requests when queued"
-            );
-            let _ = reply.send(OpenReply {
-                ok: true,
-                terminal: Some("t9".into()),
-                project: Some("p1".into()),
-                error: None,
-            });
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Open(req, reply, sent) => {
+                    assert_eq!(req.command, vec!["cmd.exe", "/c", "echo hi"]);
+                    assert!(
+                        sent.elapsed() < REPLY_TIMEOUT,
+                        "server stamps requests when queued"
+                    );
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: Some("t9".into()),
+                        project: Some("p1".into()),
+                        error: None,
+                        history: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Open"),
+            }
         });
         let req = OpenRequest {
             cmd: "open".into(),
@@ -379,5 +419,80 @@ mod tests {
         let reply = reply.expect("no reply from pipe server");
         assert!(reply.ok);
         assert_eq!(reply.terminal.as_deref(), Some("t9"));
+    }
+
+    #[test]
+    fn chat_request_roundtrips_and_reply_omits_empty_history() {
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"cmd":"chat","project":"p1","from":"t2","text":"taking the parser"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.from, "t2");
+        assert_eq!(req.text.as_deref(), Some("taking the parser"));
+        assert_eq!(req.history, None);
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<ChatRequest>(&s).unwrap(), req);
+
+        // ok-reply without history must not serialize the field
+        let ok = OpenReply {
+            ok: true,
+            terminal: None,
+            project: None,
+            error: None,
+            history: None,
+        };
+        assert!(!serde_json::to_string(&ok).unwrap().contains("history"));
+        // history reply roundtrips
+        let h = OpenReply {
+            ok: true,
+            terminal: None,
+            project: None,
+            error: None,
+            history: Some(vec!["#1 t2: hi".into()]),
+        };
+        let s = serde_json::to_string(&h).unwrap();
+        assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), h);
+    }
+
+    #[test]
+    fn chat_pipe_roundtrip() {
+        let pipe = format!("foreman-test-chat-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Chat(req, reply, _) => {
+                    assert_eq!(req.from, "t2");
+                    assert_eq!(req.text.as_deref(), Some("hello"));
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Chat"),
+            }
+        });
+        let req = ChatRequest {
+            cmd: "chat".into(),
+            project: Some("p1".into()),
+            from: "t2".into(),
+            text: Some("hello".into()),
+            history: None,
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(reply.expect("no reply").ok);
     }
 }

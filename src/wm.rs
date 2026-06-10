@@ -385,6 +385,17 @@ enum Act {
     },
 }
 
+/// What a validated chat request resolved to. Posting is split from injection
+/// so the reply can be sent between the two (spec §3).
+enum ChatOutcome {
+    Posted {
+        pid: WinId,
+        from: WinId,
+        framed: String,
+    },
+    History(Vec<String>),
+}
+
 pub struct WindowManager {
     pub windows: Vec<Win>,
     z: u64,
@@ -576,24 +587,61 @@ impl WindowManager {
     }
 
     /// Drain-side handler for one control message (desktop manager only).
-    /// Enforces both halves of the reply-timeout contract:
-    /// - a request the pipe server already timed out on is dropped unexecuted
-    ///   (the client was told "foreman did not respond"; spawning now would
-    ///   open a terminal the dispatcher believes failed, and its retry would
-    ///   create a duplicate);
-    /// - if the server times out between our age check and the reply (the
-    ///   receiver is gone), the just-spawned terminal is closed again so the
-    ///   failure the client saw stays true.
+    /// Both verbs honor the reply-timeout contract (drop stale requests
+    /// unexecuted). `open` additionally undoes orphaned spawns; chat posts
+    /// instead reply BEFORE injecting — an injection cannot be undone, so the
+    /// bytes only flow once the client is guaranteed to hear "ok" (spec §3).
     pub fn handle_ctrl(&mut self, msg: crate::control::CtrlMsg, ctx: &egui::Context) {
-        let crate::control::CtrlMsg::Open(req, reply, sent) = msg;
-        if sent.elapsed() >= crate::control::REPLY_TIMEOUT {
-            return;
-        }
-        let res = self.open_dispatch(req, ctx);
-        let undo = res.as_ref().ok().copied();
-        if reply.send(Self::open_reply(res)).is_err() {
-            if let Some((pid, tid)) = undo {
-                self.close_terminal(pid, tid);
+        use crate::control::{CtrlMsg, OpenReply, REPLY_TIMEOUT};
+        match msg {
+            CtrlMsg::Open(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let res = self.open_dispatch(req, ctx);
+                let undo = res.as_ref().ok().copied();
+                if reply.send(Self::open_reply(res)).is_err() {
+                    if let Some((pid, tid)) = undo {
+                        self.close_terminal(pid, tid);
+                    }
+                }
+            }
+            CtrlMsg::Chat(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                match self.chat_dispatch(&req) {
+                    Err(e) => {
+                        let _ = reply.send(OpenReply::err(e));
+                    }
+                    Ok(ChatOutcome::History(lines)) => {
+                        let _ = reply.send(OpenReply {
+                            ok: true,
+                            terminal: None,
+                            project: None,
+                            error: None,
+                            history: Some(lines),
+                        });
+                    }
+                    // Unlike open's spawn-undo, a post whose reply channel died
+                    // STAYS in the log (spec §3: append-only; the room is the
+                    // log, not the audience) — only the injection is skipped.
+                    // A retrying client may therefore duplicate a history line;
+                    // accepted v1.
+                    Ok(ChatOutcome::Posted { pid, from, framed }) => {
+                        let ok = OpenReply {
+                            ok: true,
+                            terminal: None,
+                            project: None,
+                            error: None,
+                            history: None,
+                        };
+                        if reply.send(ok).is_ok() {
+                            self.chat_broadcast_in(pid, from, &framed);
+                        }
+                        ctx.request_repaint(); // log changed either way (viewer)
+                    }
+                }
             }
         }
     }
@@ -606,6 +654,7 @@ impl WindowManager {
                 terminal: Some(format!("t{tid}")),
                 project: Some(format!("p{pid}")),
                 error: None,
+                history: None,
             },
             Err(e) => OpenReply::err(e),
         }
@@ -638,6 +687,39 @@ impl WindowManager {
             )
             .map(|tid| (pid, tid))
             .map_err(|e| format!("spawn failed: {e}"))
+    }
+
+    /// Resolve + execute the room-side half of a chat request: history reads
+    /// answer immediately; posts append/join and return the framed line for
+    /// the post-reply broadcast.
+    fn chat_dispatch(&mut self, req: &crate::control::ChatRequest) -> Result<ChatOutcome, String> {
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let win = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == pid)
+            .expect("resolved");
+        let Content::Project(child) = &mut win.tabs[win.active].content else {
+            return Err("not a project".into()); // unreachable after resolve
+        };
+        match (&req.text, req.history) {
+            (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
+            (Some(text), None) => {
+                let from = term_id(&req.from)?;
+                let framed = child.chat_post(from, text)?;
+                Ok(ChatOutcome::Posted { pid, from, framed })
+            }
+            _ => Err("chat needs exactly one of text/history".into()),
+        }
+    }
+
+    /// Broadcast a framed post inside project `pid` (the after-reply half).
+    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str) {
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
+            && let Content::Project(child) = &mut win.tabs[win.active].content
+        {
+            child.chat_broadcast(from, framed);
+        }
     }
 
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
@@ -676,6 +758,8 @@ impl WindowManager {
         // Dispatched agents auto-join the project chat room (spec §2).
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.tabs[w.active].chat_member = true;
+        } else {
+            debug_assert!(false, "just-pushed window {id} missing");
         }
         self.focused = prev_focus;
         Ok(id)
@@ -3098,6 +3182,186 @@ mod tests {
                 panic!()
             };
             assert!(s.exited().is_none(), "{who} must not be injected");
+        }
+    }
+
+    // --- Task 4: chat verb end-to-end (handle_ctrl + chat_dispatch) ---
+
+    /// Desktop with one project (p1) containing two member terminals.
+    fn chat_fixture(ctx: &egui::Context) -> (WindowManager, WinId, WinId) {
+        let mut child = WindowManager::new();
+        child.tag = Some("p1".to_string());
+        let a = child
+            .add_terminal_cmd(&pause_argv(), None, None, ctx)
+            .unwrap();
+        let b = child
+            .add_terminal_cmd(&pause_argv(), None, None, ctx)
+            .unwrap();
+        let mut d = WindowManager::new().as_desktop();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        d.push_win(1, "proj".into(), rect, Content::Project(Box::new(child)));
+        (d, a, b)
+    }
+
+    fn chat_req(
+        from: WinId,
+        text: Option<&str>,
+        history: Option<usize>,
+    ) -> crate::control::ChatRequest {
+        crate::control::ChatRequest {
+            cmd: "chat".into(),
+            project: Some("p1".into()),
+            from: format!("t{from}"),
+            text: text.map(str::to_string),
+            history,
+        }
+    }
+
+    #[test]
+    fn chat_post_replies_ok_then_broadcasts() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        // Pre-pump all sessions so any startup DSR scans are resolved before
+        // handle_ctrl fires its one-shot broadcast.
+        let deadline_pump = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline_pump {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            if let Content::Project(child) = &mut win.tabs[win.active].content {
+                for w in child.windows.iter_mut() {
+                    if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                        s.keepalive();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(
+                chat_req(a, Some("go"), None),
+                rtx,
+                std::time::Instant::now(),
+            ),
+            &ctx,
+        );
+        assert!(rrx.try_recv().expect("no reply").ok);
+        // end-to-end: member b runs `cmd /c pause` and exits when bytes arrive
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            // Keep pumping so the broadcast bytes actually flush through.
+            for w in child.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            let w = child.windows.iter_mut().find(|w| w.id == b).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "member never received the post"
+            );
+            // If the one-shot broadcast may have been eaten by the DSR scan,
+            // re-send via another handle_ctrl call (plan deviation: noted in report).
+            let (rtx2, _rrx2) = std::sync::mpsc::channel();
+            d.handle_ctrl(
+                crate::control::CtrlMsg::Chat(
+                    chat_req(a, Some("go"), None),
+                    rtx2,
+                    std::time::Instant::now(),
+                ),
+                &ctx,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn chat_history_replies_lines_and_does_not_join() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        // seed one message
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(
+                chat_req(a, Some("hi"), None),
+                rtx,
+                std::time::Instant::now(),
+            ),
+            &ctx,
+        );
+        rrx.try_recv().expect("post reply");
+        // make b a known terminal that is NOT a room member, so the
+        // does-not-join assertion below actually has something to catch
+        {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            let w = child.windows.iter_mut().find(|w| w.id == b).unwrap();
+            w.tabs[w.active].chat_member = false;
+        }
+        // history from a non-member: replies, does not error, does not join
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(
+                chat_req(b, None, Some(10)),
+                rtx,
+                std::time::Instant::now(),
+            ),
+            &ctx,
+        );
+        let r = rrx.try_recv().expect("no history reply");
+        assert!(r.ok);
+        assert_eq!(r.history.as_deref().map(|h| h.len()), Some(1));
+        let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+        let Content::Project(child) = &mut win.tabs[win.active].content else {
+            panic!()
+        };
+        let w = child.windows.iter().find(|w| w.id == b).unwrap();
+        assert!(
+            !w.tabs[w.active].chat_member,
+            "reading history must not join the room"
+        );
+    }
+
+    #[test]
+    fn stale_chat_request_is_dropped_without_reply() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let stale = std::time::Instant::now() - crate::control::REPLY_TIMEOUT;
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(chat_req(a, Some("late"), None), rtx, stale),
+            &ctx,
+        );
+        assert!(
+            rrx.try_recv().is_err(),
+            "stale request must be dropped unanswered (client already saw a timeout)"
+        );
+    }
+
+    #[test]
+    fn chat_request_with_both_or_neither_is_rejected() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        for req in [chat_req(a, Some("x"), Some(5)), chat_req(a, None, None)] {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            d.handle_ctrl(
+                crate::control::CtrlMsg::Chat(req, rtx, std::time::Instant::now()),
+                &ctx,
+            );
+            let r = rrx.try_recv().expect("shape errors must still reply");
+            assert!(!r.ok);
+            assert!(r.error.unwrap().contains("exactly one"), "wrong error");
         }
     }
 
