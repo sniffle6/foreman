@@ -1126,9 +1126,10 @@ impl WindowManager {
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
                 if tab < w.tabs.len() {
                     w.active = tab;
+                    w.minimized = false;
+                    self.focus(win);
                 }
-                w.minimized = false;
-                self.focus(win);
+                // else: tab merged/closed away — drop silently, same as a missing window
             }
         }
     }
@@ -3736,6 +3737,18 @@ mod tests {
         }
         wm.drain_chat_clicks();
         assert_eq!(wm.focused, Some(t), "stale click is a no-op");
+        // stale tab in a live window: also a silent no-op (focus must stay put)
+        wm.open_chat_window(); // refocuses the singleton viewer
+        let chat_id = wm.focused.expect("viewer focused");
+        for w in &mut wm.windows {
+            for tab in &mut w.tabs {
+                if let Content::Chat(v) = &mut tab.content {
+                    v.click = Some((t, 5));
+                }
+            }
+        }
+        wm.drain_chat_clicks();
+        assert_eq!(wm.focused, Some(chat_id), "stale tab index is a silent no-op");
     }
 
     #[test]
