@@ -152,6 +152,9 @@ pub struct Session {
     rows: usize,
     sel_anchor: Option<(usize, usize)>, // (row, col) where a selection drag began
     sel_head: Option<(usize, usize)>,   // (row, col) current selection end
+    // Dispatch banner queued by inject_note(); flushed (fitted to the real
+    // width) by the first resize(). See inject_note for why it is deferred.
+    pending_note: Option<String>,
 }
 
 fn read_clipboard() -> Option<String> {
@@ -276,6 +279,7 @@ impl Session {
             rows,
             sel_anchor: None,
             sel_head: None,
+            pending_note: None,
         })
     }
 
@@ -345,13 +349,18 @@ impl Session {
         (!out.is_empty()).then_some(out)
     }
 
-    /// Write a synthetic note into the emulator (NOT the PTY): renders as a
+    /// Queue a synthetic note for the emulator (NOT the PTY): renders as a
     /// dim line in the pane. Used to announce a dispatched command before the
     /// child produces output — a `claude -p` worker is silent until done, and
     /// an empty pane reads as hung.
+    ///
+    /// Deferred, not written immediately: at spawn the grid is a placeholder
+    /// 80x24, and writing a wide note there reflows on the first-frame shrink
+    /// to the real pane size, stranding the note's head in scrollback (only an
+    /// "…──" tail stays visible). The first resize() flushes it, fitted to the
+    /// real width.
     pub fn inject_note(&mut self, text: &str) {
-        let bytes = format!("\x1b[2m{text}\x1b[0m\r\n").into_bytes();
-        self.parser.advance(&mut self.term, &bytes);
+        self.pending_note = Some(text.to_string());
     }
 
     fn pump(&mut self) {
@@ -366,21 +375,48 @@ impl Session {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
-        if (cols == self.cols && rows == self.rows) || cols < 2 || rows < 1 {
+        if cols < 2 || rows < 1 {
             return;
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.term.resize(Size { cols, rows });
-        // Reflow under a preserved scroll offset points the viewport at stale
-        // content; snap back to the live prompt like a normal terminal.
-        self.term.scroll_display(Scroll::Bottom);
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if cols != self.cols || rows != self.rows {
+            self.cols = cols;
+            self.rows = rows;
+            self.term.resize(Size { cols, rows });
+            // Reflow under a preserved scroll offset points the viewport at stale
+            // content; snap back to the live prompt like a normal terminal.
+            self.term.scroll_display(Scroll::Bottom);
+            let _ = self.master.resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        // First resize() = first time the grid has its real render-time width
+        // (show() calls this every frame). Flush the deferred note now, fitted
+        // so it can never wrap — a wrapped note reflows its head into
+        // scrollback on the spawn-time shrink (see inject_note).
+        if let Some(note) = self.pending_note.take() {
+            // Fit by display columns, not chars: CJK chars in a task prompt
+            // occupy two cells each, and a char-count fit would still wrap.
+            use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+            let fitted = if note.width() > cols {
+                let budget = cols.saturating_sub(4);
+                let mut used = 0;
+                let head: String = note
+                    .chars()
+                    .take_while(|c| {
+                        used += c.width().unwrap_or(0);
+                        used <= budget
+                    })
+                    .collect();
+                format!("{head}… ──")
+            } else {
+                note
+            };
+            let bytes = format!("\x1b[2m{fitted}\x1b[0m\r\n").into_bytes();
+            self.parser.advance(&mut self.term, &bytes);
+        }
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -751,8 +787,25 @@ mod tests {
         assert!(Session::spawn(Shell::Cmd, None, &env, ctx).is_ok());
     }
 
+    fn grid_row(s: &Session, line: i32, cols: usize) -> String {
+        let grid = s.term.grid();
+        (0..cols)
+            .map(|c| {
+                let ch = grid[Line(line)][Column(c)].c;
+                if ch == '\0' { ' ' } else { ch }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The banner must survive the first-render shrink. Injecting at the
+    /// spawn-time 80-col grid and then resizing narrower reflows the row and
+    /// strands its head in scrollback (the real bug: only "…──" was visible).
+    /// Contract: the note is deferred to the first resize() and fitted to the
+    /// real width, so it renders on row 0, whole, never wrapped.
     #[test]
-    fn inject_note_renders_a_banner_line_in_the_grid() {
+    fn inject_note_survives_first_render_shrink() {
         let ctx = egui::Context::default();
         let argv = vec![
             "cmd.exe".to_string(),
@@ -760,12 +813,77 @@ mod tests {
             "exit 0".to_string(),
         ];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
-        s.inject_note("dispatched: claude -p task");
-        let grid = s.term.grid();
-        let row: String = (0..40).map(|c| grid[Line(0)][Column(c)].c).collect();
+        // 79 chars — the widest banner dispatch_banner() can produce.
+        s.inject_note(&format!("── dispatched: {}… ──", "x".repeat(60)));
+        s.resize(60, 24); // first render: pane narrower than the banner
+        let row0 = grid_row(&s, 0, 60);
         assert!(
-            row.contains("dispatched: claude -p task"),
-            "banner not in first grid row: {row:?}"
+            row0.starts_with("── dispatched:"),
+            "banner head missing from viewport row 0: {row0:?}"
+        );
+        assert!(
+            row0.ends_with("… ──") && row0.chars().count() <= 60,
+            "banner not fitted to width: {row0:?}"
+        );
+        assert!(
+            !grid_row(&s, 1, 60).contains("──"),
+            "banner wrapped onto row 1"
+        );
+        assert_eq!(
+            s.term.grid().history_size(),
+            0,
+            "banner head stranded in scrollback"
+        );
+    }
+
+    /// Wide (2-column) chars: the fit must count display columns, not chars.
+    /// 49 chars of mostly-CJK is ~79 columns — a char-count fit passes it
+    /// through unfitted at 60 cols and it wraps, re-stranding the head.
+    #[test]
+    fn inject_note_fits_wide_chars_by_display_width() {
+        let ctx = egui::Context::default();
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.inject_note(&format!("── dispatched: {}… ──", "汉".repeat(30)));
+        s.resize(60, 24);
+        let row0 = grid_row(&s, 0, 60);
+        assert!(
+            row0.starts_with("── dispatched:") && row0.ends_with("… ──"),
+            "banner head missing or unfitted on row 0: {row0:?}"
+        );
+        assert!(
+            !grid_row(&s, 1, 60).contains("──"),
+            "banner wrapped onto row 1"
+        );
+        assert_eq!(
+            s.term.grid().history_size(),
+            0,
+            "banner head stranded in scrollback"
+        );
+    }
+
+    /// Pane that happens to render at exactly the spawn-time 80x24: resize()
+    /// early-returns on the no-op size change, but the deferred note must
+    /// still flush.
+    #[test]
+    fn inject_note_flushes_even_when_first_resize_is_a_noop() {
+        let ctx = egui::Context::default();
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.inject_note("── dispatched: claude -p task ──");
+        s.resize(80, 24); // same as spawn size
+        let row0 = grid_row(&s, 0, 80);
+        assert!(
+            row0.contains("dispatched: claude -p task"),
+            "note not flushed on no-op resize: {row0:?}"
         );
     }
 

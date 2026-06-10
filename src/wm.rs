@@ -2408,7 +2408,9 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 /// task prompt can't flood the pane.
 fn dispatch_banner(argv: &[String]) -> String {
     let full = argv.join(" ");
-    // 15-char prefix + 60 + "… ──" = 79 chars: fits the 80-col spawn-time grid.
+    // 15-char prefix + 60 + "… ──" = 79 chars: flood control only. The final
+    // fit to the pane's real width happens in Session::resize, which defers
+    // the note past the spawn-time 80-col placeholder grid.
     if full.chars().count() > 60 {
         let head: String = full.chars().take(60).collect();
         format!("── dispatched: {head}… ──")
