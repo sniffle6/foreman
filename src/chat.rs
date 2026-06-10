@@ -81,6 +81,7 @@ impl ChatLog {
     /// Append a membership event (join/exit). Text stays empty; the viewer
     /// derives the display line from kind + name + id.
     pub fn sys(&mut self, kind: ChatKind, from: &str, name: &str) -> &ChatMsg {
+        debug_assert!(kind != ChatKind::Post, "use post() for user messages");
         self.push(from, name, "", kind)
     }
 
@@ -104,6 +105,7 @@ impl ChatLog {
         &self.msgs
     }
 
+    /// Seq of the most recent entry (any kind); equals msgs.len() since seqs are assigned by length and entries are never removed.
     pub fn last_seq(&self) -> u64 {
         self.msgs.len() as u64
     }
@@ -151,7 +153,6 @@ impl ChatLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime};
 
     #[test]
     fn post_assigns_increasing_seq_from_one() {

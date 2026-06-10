@@ -843,6 +843,7 @@ impl WindowManager {
             "chat_post on a tag-less (desktop?) manager — routing bug"
         );
         let project = self.tag.as_deref().unwrap_or("p?");
+        // .to_string() drops the &mut Win borrow before the RefCell borrow below
         let name = display_name(sender.title()).to_string();
         let mut log = self.chat.borrow_mut();
         let msg = log.post(&format!("t{from}"), &name, text);
