@@ -307,8 +307,17 @@ impl Content {
             // so `active` ANDs down the tree to exactly one leaf terminal.
             Content::Project(wm) => wm.show(ui, rect, active, base.with(("proj", win_id))),
             Content::Chat(view) => {
+                // Reserve the input strip up front and shrink the working
+                // rect so the board/log lay out above it. The painter keeps
+                // the FULL rect (it must draw the strip chrome too).
+                const INPUT_H: f32 = 32.0;
+                let input_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, rect.max.y - INPUT_H),
+                    rect.max,
+                );
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, WIN_BG);
+                let rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
                 let pad = 8.0;
                 let meta_font = egui::FontId::proportional(11.0);
                 let body_font = egui::FontId::proportional(12.5);
@@ -524,6 +533,45 @@ impl Content {
                     }
                 }
                 view.on_frame(active);
+
+                // ---- input strip (slice 2): the human posts from here ----
+                // Repaint the strip ground first: the painter's clip spans
+                // the full window, so a partially-scrolled log line can bleed
+                // under the strip.
+                p.rect_filled(input_rect, 0.0, WIN_BG);
+                p.line_segment(
+                    [input_rect.min, egui::pos2(input_rect.max.x, input_rect.min.y)],
+                    egui::Stroke::new(1.0, BORDER),
+                );
+                let te_rect = input_rect.shrink2(egui::vec2(8.0, 5.0));
+                p.rect_filled(te_rect, egui::CornerRadius::same(3), DESK_BG);
+                p.rect_stroke(
+                    te_rect,
+                    egui::CornerRadius::same(3),
+                    egui::Stroke::new(1.0, BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                ui.visuals_mut().selection.bg_fill =
+                    egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
+                let te = ui.put(
+                    te_rect,
+                    egui::TextEdit::singleline(&mut view.input)
+                        .id(base.with((win_id, "chat-input")))
+                        .font(egui::FontId::proportional(12.5))
+                        .text_color(TEXT)
+                        .hint_text("Message…")
+                        .vertical_align(egui::Align::Center)
+                        .frame(egui::Frame::NONE)
+                        .margin(egui::Margin::symmetric(6, 0))
+                        .desired_width(te_rect.width()),
+                );
+                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    view.pending_post = Some(std::mem::take(&mut view.input));
+                    te.request_focus(); // keep typing; multi-post sessions are the norm
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) && te.has_focus() {
+                    view.input.clear();
+                }
                 false
             }
         }
@@ -968,7 +1016,7 @@ impl WindowManager {
         if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
             && let Content::Project(child) = &mut win.tabs[win.active].content
         {
-            child.chat_broadcast(from, framed);
+            child.chat_broadcast(Some(from), framed);
         }
     }
 
@@ -1090,6 +1138,15 @@ impl WindowManager {
                 r.last = log.last_activity(&r.id);
             }
         }
+        // The pane identity itself sits on the board — the human is crew too.
+        rows.push(crate::chat::CrewRow {
+            win: 0, // no window: click is a no-op (id 0 never matches; ids start at 1)
+            tab: 0,
+            id: Self::HUMAN_ID.to_string(),
+            name: Self::HUMAN_ID.to_string(),
+            exited: false,
+            last: self.chat.borrow().last_activity(Self::HUMAN_ID),
+        });
         crate::chat::sort_crew(&mut rows);
         let n_live = rows.iter().filter(|r| !r.exited).count();
         for w in &mut self.windows {
@@ -1134,6 +1191,26 @@ impl WindowManager {
         }
     }
 
+    /// Apply input-line submissions recorded during the draw. Human posts
+    /// broadcast to ALL members — there is no sender terminal to exclude.
+    fn drain_chat_posts(&mut self) {
+        let mut pending = None;
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Chat(v) = &mut t.content {
+                    if let Some(p) = v.pending_post.take() {
+                        pending = Some(p);
+                    }
+                }
+            }
+        }
+        if let Some(text) = pending {
+            if let Some(framed) = self.chat_post_human(&text) {
+                self.chat_broadcast(None, &framed);
+            }
+        }
+    }
+
     /// Post into this project's chat: validate the sender, append, join the
     /// sender (spec §2: join-on-first-post). Returns the framed injection line.
     /// Injection itself is `chat_broadcast` — kept separate because the reply
@@ -1167,15 +1244,34 @@ impl WindowManager {
         Ok(msg.frame(project))
     }
 
+    /// The pane's reserved sender identity — can never collide with a "tN"
+    /// terminal id (spec: chat-dispatcher-window §Slices).
+    const HUMAN_ID: &'static str = "you";
+
+    /// Append a post from the chat pane's input line. No membership games —
+    /// the human is not a terminal. Returns the framed line for broadcast.
+    fn chat_post_human(&mut self, text: &str) -> Option<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        debug_assert!(self.tag.is_some(), "human post on a tag-less manager");
+        let project = self.tag.as_deref().unwrap_or("p?").to_string();
+        let mut log = self.chat.borrow_mut();
+        let msg = log.post(Self::HUMAN_ID, Self::HUMAN_ID, text);
+        Some(msg.frame(&project))
+    }
+
     /// Inject a framed chat line into every member tab except the sender's
     /// active tab, skipping exited sessions and non-terminal content (the
     /// chat viewer renders the log directly — never injected). Background
     /// tabs receive too: keepalive keeps their PTYs drained, and chat's
-    /// whole point is that members never have to poll.
-    fn chat_broadcast(&mut self, from: WinId, framed: &str) {
+    /// whole point is that members never have to poll. `None` = the human
+    /// posting from the chat pane; excludes nobody.
+    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str) {
         for w in self.windows.iter_mut() {
             let active = w.active;
-            let is_sender = w.id == from;
+            let is_sender = Some(w.id) == from;
             for (i, tab) in w.tabs.iter_mut().enumerate() {
                 if (is_sender && i == active) || !tab.chat_member {
                     continue;
@@ -2572,6 +2668,7 @@ impl WindowManager {
         // hit also pushed Act::Focus(chat window) via cresp — draining last is
         // the fixed order that lets the member, not the viewer, end up focused.
         self.drain_chat_clicks();
+        self.drain_chat_posts();
         self.show_modals(ui, area, &ctx);
 
         interacted
@@ -3698,13 +3795,22 @@ mod tests {
             .iter()
             .find(|t| matches!(t.content, Content::Chat(_)))
             .unwrap();
-        assert_eq!(tab.title, "chat · 1 live");
+        assert_eq!(tab.title, "chat · 2 live");
         let Content::Chat(v) = &tab.content else { panic!() };
-        assert_eq!(v.crew.len(), 1, "only members appear");
-        assert_eq!(v.crew[0].id, format!("t{a}"));
-        assert_eq!(v.crew[0].name, "worker A");
-        assert!(!v.crew[0].exited);
-        assert!(v.crew[0].last.is_some(), "joined entry counts as heard");
+        assert_eq!(v.crew.len(), 2, "the member + the human pane identity");
+        // index by id, not position — the human row may sort above or below
+        let m = v
+            .crew
+            .iter()
+            .find(|r| r.id == format!("t{a}"))
+            .expect("member row missing");
+        assert_eq!(m.name, "worker A");
+        assert!(!m.exited);
+        assert!(m.last.is_some(), "joined entry counts as heard");
+        let h = v.crew.iter().find(|r| r.id == "you").expect("human row missing");
+        assert_eq!(h.name, "you");
+        assert!(!h.exited);
+        assert_eq!(h.win, 0, "human row has no window — click must be a no-op");
     }
 
     #[test]
@@ -3749,6 +3855,73 @@ mod tests {
         }
         wm.drain_chat_clicks();
         assert_eq!(wm.focused, Some(chat_id), "stale tab index is a silent no-op");
+    }
+
+    #[test]
+    fn human_post_appends_with_reserved_id_and_broadcasts_to_all_members() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        wm.last_area = egui::vec2(800.0, 600.0);
+        // both members run `cmd /c pause`: ANY stdin byte makes them exit
+        let a = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let b = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        wm.open_chat_window();
+        // simulate the input line submitting
+        for w in &mut wm.windows {
+            for t in &mut w.tabs {
+                if let Content::Chat(v) = &mut t.content {
+                    v.pending_post = Some("go".to_string());
+                }
+            }
+        }
+        wm.drain_chat_posts();
+        {
+            let log = wm.chat.borrow();
+            let m = log
+                .msgs()
+                .iter()
+                .rfind(|m| m.kind == crate::chat::ChatKind::Post)
+                .expect("post missing");
+            assert_eq!(m.from, "you");
+            assert_eq!(m.name, "you");
+            assert!(m.frame("p1").starts_with(&format!("[chat p1 #{}] you: go", m.seq)));
+        }
+        // BOTH members exit — the human excludes nobody
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut done = 0;
+            for id in [a, b] {
+                let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                s.keepalive();
+                if s.exited().is_some() {
+                    done += 1;
+                }
+            }
+            if done == 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "a member never got the post");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn empty_or_blank_human_post_is_a_noop() {
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        wm.last_area = egui::vec2(800.0, 600.0);
+        wm.open_chat_window();
+        for w in &mut wm.windows {
+            for t in &mut w.tabs {
+                if let Content::Chat(v) = &mut t.content {
+                    v.pending_post = Some("   ".to_string());
+                }
+            }
+        }
+        wm.drain_chat_posts();
+        assert_eq!(wm.chat.borrow().msgs().len(), 0);
     }
 
     #[test]
@@ -3806,7 +3979,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_broadcast(sender, &framed);
+            wm.chat_broadcast(Some(sender), &framed);
             // positive signal: the member exits because bytes hit its stdin
             let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
@@ -4059,7 +4232,7 @@ mod tests {
                     }
                 }
             }
-            wm.chat_broadcast(sender, &framed);
+            wm.chat_broadcast(Some(sender), &framed);
             // positive signal: the background member tab exits
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
             let Content::Terminal(s) = &mut w.tabs[0].content else {

@@ -234,6 +234,10 @@ pub struct ChatView {
     /// Crew row clicked this frame; drained by the manager after the draw
     /// loop (content must never mutate sibling windows mid-draw).
     pub click: Option<(crate::wm::WinId, usize)>,
+    /// In-progress input line text (slice 2).
+    pub input: String,
+    /// A submitted line awaiting the manager's drain (`drain_chat_posts`).
+    pub pending_post: Option<String>,
 }
 
 impl ChatView {
@@ -249,6 +253,8 @@ impl ChatView {
             scroll: 0.0,
             stick: true,
             click: None,
+            input: String::new(),
+            pending_post: None,
         }
     }
 
