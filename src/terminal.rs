@@ -143,8 +143,9 @@ pub struct Session {
     rx: Receiver<Vec<u8>>,
     resp: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    exit: Option<u32>,
     pub shell: Shell,
     cols: usize,
     rows: usize,
@@ -157,7 +158,52 @@ fn read_clipboard() -> Option<String> {
 }
 
 impl Session {
-    pub fn spawn(shell: Shell, cwd: Option<&Path>, ctx: egui::Context) -> std::io::Result<Session> {
+    pub fn spawn(
+        shell: Shell,
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        ctx: egui::Context,
+    ) -> std::io::Result<Session> {
+        let mut cmd = CommandBuilder::new(shell.program());
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        Self::spawn_with(cmd, shell, ctx)
+    }
+
+    /// Spawn an explicit argv (an agent command, not a shell). npm shims like
+    /// `claude` are `.cmd` files CreateProcess can't run directly — if the
+    /// direct spawn fails, retry once through `cmd /c`.
+    pub fn spawn_argv(
+        argv: &[String],
+        cwd: Option<&Path>,
+        env: &[(String, String)],
+        ctx: egui::Context,
+    ) -> std::io::Result<Session> {
+        let build = |words: &[String]| {
+            let mut c = CommandBuilder::new(&words[0]);
+            for a in &words[1..] {
+                c.arg(a);
+            }
+            if let Some(dir) = cwd {
+                c.cwd(dir);
+            }
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            c
+        };
+        Self::spawn_with(build(argv), Shell::Cmd, ctx.clone()).or_else(|_| {
+            let mut wrapped = vec!["cmd.exe".to_string(), "/c".to_string()];
+            wrapped.extend_from_slice(argv);
+            Self::spawn_with(build(&wrapped), Shell::Cmd, ctx)
+        })
+    }
+
+    fn spawn_with(cmd: CommandBuilder, shell: Shell, ctx: egui::Context) -> std::io::Result<Session> {
         let (cols, rows) = (80usize, 24usize);
         let pty = native_pty_system();
         let pair = pty
@@ -168,11 +214,7 @@ impl Session {
                 pixel_height: 0,
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let mut cmd = CommandBuilder::new(shell.program());
-        if let Some(dir) = cwd {
-            cmd.cwd(dir);
-        }
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -214,14 +256,24 @@ impl Session {
             rx,
             resp,
             writer,
-            master: pair.master,
-            _child: child,
+            master: Some(pair.master),
+            child,
+            exit: None,
             shell,
             cols,
             rows,
             sel_anchor: None,
             sel_head: None,
         })
+    }
+
+    /// Exit code of the child process, once it has ended. Cached — `try_wait`
+    /// is a cheap non-blocking poll until then.
+    pub fn exited(&mut self) -> Option<u32> {
+        if self.exit.is_none() {
+            self.exit = self.child.try_wait().ok().flatten().map(|s| s.exit_code());
+        }
+        self.exit
     }
 
     fn cell_at(&self, rect: egui::Rect, cw: f32, rh: f32, pos: egui::Pos2) -> (usize, usize) {
@@ -285,12 +337,14 @@ impl Session {
         // Reflow under a preserved scroll offset points the viewport at stale
         // content; snap back to the live prompt like a normal terminal.
         self.term.scroll_display(Scroll::Bottom);
-        let _ = self.master.resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(m) = self.master.as_ref() {
+            let _ = m.resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -594,5 +648,48 @@ impl Session {
                 egui::Color32::from_rgba_unmultiplied(231, 169, 63, 150),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_argv_runs_a_plain_exe() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        // cmd.exe sends a DSR (ESC[6n) at startup waiting for the terminal to reply.
+        // pump() reads PTY output and writes back any pending device-status replies;
+        // without it cmd.exe hangs before executing /c exit and never exits.
+        let mut code = None;
+        for _ in 0..100 {
+            s.pump(); // answer DSR queries so cmd.exe can proceed to exit
+            if let Some(c) = s.exited() {
+                code = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn spawn_argv_falls_back_to_cmd_for_shims() {
+        // npm-style shim: a .cmd file is not directly CreateProcess-able.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("fake-agent.cmd");
+        std::fs::write(&shim, "@echo shim ran\r\n@exit 0\r\n").unwrap();
+        let ctx = egui::Context::default();
+        let argv = vec![shim.to_string_lossy().to_string()];
+        assert!(Session::spawn_argv(&argv, None, &[], ctx).is_ok());
+    }
+
+    #[test]
+    fn shell_sessions_still_spawn_with_env() {
+        let ctx = egui::Context::default();
+        let env = [("FOREMAN".to_string(), "1".to_string())];
+        assert!(Session::spawn(Shell::Cmd, None, &env, ctx).is_ok());
     }
 }

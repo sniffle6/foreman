@@ -468,7 +468,7 @@ impl WindowManager {
     /// Spawn a terminal into this manager. Returns the new window's id, or `None`
     /// if the PTY failed to spawn (the caller treats that as a no-op).
     pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
-        let s = Session::spawn(shell, self.cwd.as_deref(), ctx.clone()).ok()?;
+        let s = Session::spawn(shell, self.cwd.as_deref(), &[], ctx.clone()).ok()?;
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
         self.push_win(
             id,
