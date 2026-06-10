@@ -374,6 +374,10 @@ pub struct WindowManager {
     /// Working directory new terminals in this manager spawn into. `None` on the
     /// desktop (process cwd); `Some` on a project, set when the project is created.
     cwd: Option<PathBuf>,
+    /// Stable id string ("p3") when this manager is a project's child manager;
+    /// env-injected into its terminals so dispatchers can self-target. None on
+    /// the desktop.
+    tag: Option<String>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -418,6 +422,7 @@ impl WindowManager {
             dwell_start: 0.0,
             split: egui::vec2(0.5, 0.5),
             cwd: None,
+            tag: None,
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -468,7 +473,8 @@ impl WindowManager {
     /// Spawn a terminal into this manager. Returns the new window's id, or `None`
     /// if the PTY failed to spawn (the caller treats that as a no-op).
     pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
-        let s = Session::spawn(shell, self.cwd.as_deref(), &[], ctx.clone()).ok()?;
+        let env = self.term_env(self.next);
+        let s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()).ok()?;
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
         self.push_win(
             id,
@@ -489,9 +495,99 @@ impl WindowManager {
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("project {}", id));
         let mut child = WindowManager::new();
+        child.tag = Some(format!("p{}", id));
         child.cwd = Some(cwd);
         child.add_terminal(shell, ctx);
         self.push_win(id, title, rect, Content::Project(Box::new(child)));
+    }
+
+    /// Env injected into every PTY this manager spawns (spec: agent-dispatch).
+    fn term_env(&self, term_id: WinId) -> Vec<(String, String)> {
+        let mut v = vec![
+            ("FOREMAN".to_string(), "1".to_string()),
+            ("FOREMAN_TERMINAL_ID".to_string(), format!("t{term_id}")),
+        ];
+        if let Some(t) = &self.tag {
+            v.push(("FOREMAN_PROJECT_ID".to_string(), t.clone()));
+        }
+        // The client needs to find this exe; PATH won't have target\debug.
+        if let Ok(exe) = std::env::current_exe() {
+            v.push(("FOREMAN_EXE".to_string(), exe.display().to_string()));
+        }
+        v
+    }
+
+    /// Resolve a control-request project spec ("p3"; None = focused project)
+    /// to a desktop window id. Only checks the ACTIVE tab — after tab-merging
+    /// projects, the swallowed project's old id is stale (documented gotcha).
+    fn resolve_project(&self, spec: Option<&str>) -> Result<WinId, String> {
+        let is_project = |w: &&Win| matches!(w.tabs[w.active].content, Content::Project(_));
+        match spec {
+            Some(s) => {
+                let id: WinId = s
+                    .strip_prefix('p')
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| format!("bad project id: {s}"))?;
+                self.windows
+                    .iter()
+                    .filter(is_project)
+                    .find(|w| w.id == id)
+                    .map(|w| w.id)
+                    .ok_or_else(|| format!("no such project: {s}"))
+            }
+            None => self
+                .focused
+                .and_then(|id| self.windows.iter().filter(is_project).find(|w| w.id == id))
+                .map(|w| w.id)
+                .ok_or_else(|| "no focused project (pass --project)".to_string()),
+        }
+    }
+
+    /// Handle a control-channel open request (desktop manager only).
+    pub fn handle_open(&mut self, req: crate::control::OpenRequest, ctx: &egui::Context) -> crate::control::OpenReply {
+        use crate::control::OpenReply;
+        if req.command.is_empty() || req.command[0].is_empty() {
+            return OpenReply::err("empty command");
+        }
+        let pid = match self.resolve_project(req.project.as_deref()) {
+            Ok(id) => id,
+            Err(e) => return OpenReply::err(e),
+        };
+        let win = self.windows.iter_mut().find(|w| w.id == pid).expect("resolved");
+        let Content::Project(child) = &mut win.tabs[win.active].content else {
+            return OpenReply::err("not a project"); // unreachable after resolve
+        };
+        match child.add_terminal_cmd(
+            &req.command,
+            req.cwd.as_deref().map(std::path::Path::new),
+            req.title.as_deref(),
+            ctx,
+        ) {
+            Ok(tid) => OpenReply {
+                ok: true,
+                terminal: Some(format!("t{tid}")),
+                project: Some(format!("p{pid}")),
+                error: None,
+            },
+            Err(e) => OpenReply::err(format!("spawn failed: {e}")),
+        }
+    }
+
+    /// Spawn an explicit command (agent dispatch) as a terminal in this manager.
+    fn add_terminal_cmd(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        title: Option<&str>,
+        ctx: &egui::Context,
+    ) -> std::io::Result<WinId> {
+        let env = self.term_env(self.next);
+        let cwd = cwd.or(self.cwd.as_deref());
+        let s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
+        let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
+        let title = title.map(str::to_string).unwrap_or_else(|| format!("agent · {}", argv[0]));
+        self.push_win(id, title, rect, Content::Terminal(s));
+        Ok(id)
     }
 
     /// Where the picker opens: the focused project's cwd if there is one, else the
@@ -1081,6 +1177,25 @@ impl WindowManager {
         None
     }
 
+    /// Append an `exited (code)` marker to terminals whose process ended. Runs
+    /// over every tab (not just visible ones) so background agents update too.
+    fn refresh_exit_titles(&mut self) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                match &mut t.content {
+                    Content::Terminal(s) => {
+                        if let Some(code) = s.exited() {
+                            if !t.title.contains("· exited") {
+                                t.title.push_str(&format!("  ·  exited ({code})"));
+                            }
+                        }
+                    }
+                    Content::Project(wm) => wm.refresh_exit_titles(),
+                }
+            }
+        }
+    }
+
     /// Returns whether any window in this manager was interacted with this frame.
     /// The parent uses this to propagate focus upward: clicking a sub-window in a
     /// background project bubbles up and switches the desktop to that project.
@@ -1088,6 +1203,10 @@ impl WindowManager {
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
         self.last_area = area.size();
+
+        if self.desktop {
+            self.refresh_exit_titles();
+        }
 
         self.pump_commands(ui, active);
 
@@ -2436,5 +2555,40 @@ mod tests {
         // Floating source still gets the opposite zone.
         let s = wm.windows.iter().find(|w| w.id == src).unwrap();
         assert_eq!(s.snap, Some(Zone::Left), "floating source snaps opposite");
+    }
+
+    fn mgr_with_project(id_focused: bool) -> WindowManager {
+        let mut m = WindowManager::new();
+        let (id, rect) = m.next_slot(egui::vec2(100.0, 100.0));
+        let mut child = WindowManager::new();
+        child.tag = Some(format!("p{id}"));
+        m.push_win(id, "proj".into(), rect, Content::Project(Box::new(child)));
+        if !id_focused {
+            m.focused = None;
+        }
+        m
+    }
+
+    #[test]
+    fn resolve_project_by_id_and_focus() {
+        let m = mgr_with_project(true);
+        assert_eq!(m.resolve_project(Some("p1")), Ok(1));
+        assert_eq!(m.resolve_project(None), Ok(1)); // focused project
+        assert!(m.resolve_project(Some("p9")).is_err());
+        assert!(m.resolve_project(Some("zzz")).is_err());
+        let unfocused = mgr_with_project(false);
+        assert!(unfocused.resolve_project(None).is_err());
+    }
+
+    #[test]
+    fn term_env_carries_ids() {
+        let mut child = WindowManager::new();
+        child.tag = Some("p3".into());
+        let env = child.term_env(7);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("FOREMAN").as_deref(), Some("1"));
+        assert_eq!(get("FOREMAN_PROJECT_ID").as_deref(), Some("p3"));
+        assert_eq!(get("FOREMAN_TERMINAL_ID").as_deref(), Some("t7"));
+        assert!(get("FOREMAN_EXE").is_some());
     }
 }
