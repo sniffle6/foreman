@@ -586,7 +586,13 @@ impl WindowManager {
         let s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
         let title = title.map(str::to_string).unwrap_or_else(|| format!("agent · {}", argv[0]));
+        // push_win focuses the new window; a dispatched agent must never yank
+        // the keyboard out from under the user mid-keystroke (fire-and-watch:
+        // the new terminal is to LOOK at, not type into). Keep focus where it
+        // was; the window still spawns on top visually (z from next_slot).
+        let prev_focus = self.focused;
         self.push_win(id, title, rect, Content::Terminal(s));
+        self.focused = prev_focus;
         Ok(id)
     }
 
@@ -2590,5 +2596,10 @@ mod tests {
         assert_eq!(get("FOREMAN_PROJECT_ID").as_deref(), Some("p3"));
         assert_eq!(get("FOREMAN_TERMINAL_ID").as_deref(), Some("t7"));
         assert!(get("FOREMAN_EXE").is_some());
+
+        // Desktop (untagged) managers must not claim a project id.
+        let desktop = WindowManager::new();
+        let env = desktop.term_env(1);
+        assert!(env.iter().all(|(n, _)| n != "FOREMAN_PROJECT_ID"));
     }
 }
