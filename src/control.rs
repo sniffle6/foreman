@@ -67,6 +67,95 @@ pub fn parse_open_args(
     Err("missing -- <command...>".into())
 }
 
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::mpsc;
+
+/// One control request, plus the channel the GUI thread answers on.
+pub enum CtrlMsg {
+    Open(OpenRequest, mpsc::Sender<OpenReply>),
+}
+
+/// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
+/// GUI drains `tx`'s receiver each frame. One JSON line in, one JSON line out,
+/// per connection.
+pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
+    let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else { return };
+    let listener = match ListenerOptions::new().name(name).create_sync() {
+        Ok(l) => l,
+        // Another foreman owns the pipe (or it's blocked): GUI still works,
+        // dispatch is just unavailable in this instance.
+        Err(e) => {
+            eprintln!("control: pipe unavailable ({e}); agent dispatch disabled");
+            return;
+        }
+    };
+    for conn in listener.incoming() {
+        let Ok(conn) = conn else { continue };
+        let mut conn = BufReader::new(conn);
+        let mut line = String::new();
+        if conn.read_line(&mut line).is_err() {
+            continue;
+        }
+        let reply = match serde_json::from_str::<OpenRequest>(&line) {
+            Ok(req) => {
+                let (rtx, rrx) = mpsc::channel();
+                if tx.send(CtrlMsg::Open(req, rtx)).is_err() {
+                    return; // GUI gone; stop serving
+                }
+                rrx.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
+            }
+            Err(e) => OpenReply::err(format!("bad request: {e}")),
+        };
+        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+        out.push('\n');
+        let _ = conn.get_mut().write_all(out.as_bytes());
+    }
+}
+
+/// Client side: send one request, wait for the one-line reply.
+pub fn request(pipe: &str, req: &OpenRequest) -> std::io::Result<OpenReply> {
+    let name = pipe.to_ns_name::<GenericNamespaced>()?;
+    let conn = Stream::connect(name)?;
+    let mut conn = BufReader::new(conn);
+    let mut line = serde_json::to_string(req).map_err(std::io::Error::other)?;
+    line.push('\n');
+    conn.get_mut().write_all(line.as_bytes())?;
+    let mut reply = String::new();
+    conn.read_line(&mut reply)?;
+    serde_json::from_str(&reply).map_err(std::io::Error::other)
+}
+
+/// `foreman open ...` entry point (no GUI). Returns the process exit code.
+pub fn client_main(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) != Some("open") {
+        eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
+        return 2;
+    }
+    let req = match parse_open_args(&args[1..], std::env::var("FOREMAN_PROJECT_ID").ok()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman open: {e}");
+            return 2;
+        }
+    };
+    match request(PIPE, &req) {
+        Ok(r) if r.ok => {
+            println!("{}", serde_json::to_string(&r).unwrap_or_default());
+            0
+        }
+        Ok(r) => {
+            eprintln!("foreman open: {}", r.error.unwrap_or_default());
+            1
+        }
+        Err(e) => {
+            eprintln!("foreman open: cannot reach foreman ({e}) — is it running?");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +212,46 @@ mod tests {
         assert!(parse_open_args(&s(&["--"]), None).is_err()); // no command
         assert!(parse_open_args(&s(&["claude"]), None).is_err()); // missing --
         assert!(parse_open_args(&s(&["--nope", "--", "x"]), None).is_err());
+    }
+
+    #[test]
+    fn pipe_roundtrip() {
+        // Unique name so parallel test runs / a live foreman don't collide.
+        let pipe = format!("foreman-test-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        // Fake GUI thread: answer the first request.
+        std::thread::spawn(move || {
+            let CtrlMsg::Open(req, reply) = rx.recv().unwrap();
+            assert_eq!(req.command, vec!["cmd.exe", "/c", "echo hi"]);
+            let _ = reply.send(OpenReply {
+                ok: true,
+                terminal: Some("t9".into()),
+                project: Some("p1".into()),
+                error: None,
+            });
+        });
+        let req = OpenRequest {
+            cmd: "open".into(),
+            project: None,
+            cwd: None,
+            title: None,
+            command: vec!["cmd.exe".into(), "/c".into(), "echo hi".into()],
+        };
+        // Retry while the listener binds (no sleep-and-hope).
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply from pipe server");
+        assert!(reply.ok);
+        assert_eq!(reply.terminal.as_deref(), Some("t9"));
     }
 }
