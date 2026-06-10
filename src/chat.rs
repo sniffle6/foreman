@@ -150,6 +150,76 @@ impl ChatLog {
     }
 }
 
+/// One crew-board row, assembled by the owning project manager each frame.
+/// `win`/`tab` locate the member for click-to-focus. Identity is the hosting
+/// window's id — the same active-tab staleness family as the rest of chat.
+pub struct CrewRow {
+    pub win: crate::wm::WinId,
+    pub tab: usize,
+    pub id: String,   // "t4"
+    pub name: String, // live tab title (exit marker stripped)
+    pub exited: bool,
+    pub last: Option<SystemTime>,
+}
+
+/// Crew-board order: live members stalest-first (the ones to worry about),
+/// never-heard counting as oldest; exited members sink to the bottom.
+pub fn sort_crew(rows: &mut [CrewRow]) {
+    rows.sort_by(|a, b| {
+        a.exited
+            .cmp(&b.exited)
+            .then_with(|| a.last.cmp(&b.last)) // None sorts before Some(_) = oldest first
+    });
+}
+
+/// Per-window viewer state behind `Content::Chat`. The log is shared with
+/// the project manager; everything else is this window's view of it.
+pub struct ChatView {
+    pub log: std::rc::Rc<std::cell::RefCell<ChatLog>>,
+    /// Refreshed by the owning manager before each draw (`refresh_chat_view`).
+    pub crew: Vec<CrewRow>,
+    /// NEW-divider watermark: highest seq seen while this window had focus.
+    pub last_seen: u64,
+    was_active: bool,
+    /// Scroll offset from the TOP of the laid-out log, in px. Meaningful only
+    /// while `stick` is false.
+    pub scroll: f32,
+    /// Follow the tail (autoscroll). Scrolling up unsticks — the view then
+    /// holds its content position while new messages arrive — and scrolling
+    /// back to the bottom re-sticks (spec: scrolling decision row).
+    pub stick: bool,
+    /// Crew row clicked this frame; drained by the manager after the draw
+    /// loop (content must never mutate sibling windows mid-draw).
+    pub click: Option<(crate::wm::WinId, usize)>,
+}
+
+impl ChatView {
+    pub fn new(log: std::rc::Rc<std::cell::RefCell<ChatLog>>) -> Self {
+        // Watermark starts at the current tail: opening the window is the
+        // act of looking, so the backlog is not "new".
+        let last_seen = log.borrow().last_seq();
+        Self {
+            log,
+            crew: Vec::new(),
+            last_seen,
+            was_active: false,
+            scroll: 0.0,
+            stick: true,
+            click: None,
+        }
+    }
+
+    /// Call once per rendered frame. The watermark advances only on the
+    /// focus-LOSS edge, so everything that arrived during a focused stretch
+    /// stays marked NEW until the user looks away and comes back.
+    pub fn on_frame(&mut self, active: bool) {
+        if self.was_active && !active {
+            self.last_seen = self.log.borrow().last_seq();
+        }
+        self.was_active = active;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +302,31 @@ mod tests {
         assert_eq!(age_label(Duration::from_secs(299)), ("4m".to_string(), false));
         assert_eq!(age_label(Duration::from_secs(300)), ("5m".to_string(), true));
         assert_eq!(age_label(Duration::from_secs(3600)), ("1h".to_string(), true));
+    }
+
+    fn row(id: &str, exited: bool, last_secs_ago: Option<u64>) -> CrewRow {
+        let now = SystemTime::now();
+        CrewRow {
+            win: 1,
+            tab: 0,
+            id: id.to_string(),
+            name: id.to_string(),
+            exited,
+            last: last_secs_ago.map(|s| now - Duration::from_secs(s)),
+        }
+    }
+
+    #[test]
+    fn sort_crew_puts_stalest_live_first_and_exited_last() {
+        let mut rows = vec![
+            row("t1", false, Some(5)),
+            row("t3", true, Some(10)),
+            row("t5", false, Some(600)),
+            row("t4", false, None), // never heard: treated as oldest
+        ];
+        sort_crew(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(order, vec!["t4", "t5", "t1", "t3"]);
     }
 
     #[test]

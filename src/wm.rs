@@ -253,9 +253,10 @@ pub enum Content {
     Terminal(Session),
     /// A project window is a sandbox hosting its own nested WindowManager.
     Project(Box<WindowManager>),
-    /// Read-only viewer of the owning project's chat room. Shares the log via
-    /// Rc — a viewer, not a member: never injected into (spec §4).
-    Chat(Rc<RefCell<crate::chat::ChatLog>>),
+    /// Read-only viewer of the owning project's chat room. Carries per-window
+    /// view state; shares the log via Rc — a viewer, not a member: never
+    /// injected into (spec §4).
+    Chat(crate::chat::ChatView),
 }
 impl Content {
     /// Returns whether a window in this content was interacted with this frame.
@@ -280,7 +281,7 @@ impl Content {
             // The child only reads the keyboard if this project is itself active,
             // so `active` ANDs down the tree to exactly one leaf terminal.
             Content::Project(wm) => wm.show(ui, rect, active, base.with(("proj", win_id))),
-            Content::Chat(log) => {
+            Content::Chat(view) => {
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, WIN_BG);
                 let font = egui::FontId::monospace(13.0);
@@ -291,7 +292,7 @@ impl Content {
                 // into other windows' show() (post paths borrow_mut the log).
                 // tail_rows expands multi-line messages into physical rows so
                 // later messages are never overpainted.
-                let rows = log.borrow().tail_rows(fit);
+                let rows = view.log.borrow().tail_rows(fit);
                 for (i, row) in rows.iter().enumerate() {
                     p.text(
                         egui::pos2(rect.min.x + pad, rect.min.y + pad + i as f32 * line_h),
@@ -827,8 +828,60 @@ impl WindowManager {
             id,
             "chat".into(),
             rect,
-            Content::Chat(Rc::clone(&self.chat)),
+            Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
         );
+    }
+
+    /// Rebuild the chat viewer's crew rows and title chip. Runs before the
+    /// draw loop each frame (cheap: a handful of members). No-op when no
+    /// viewer window is open.
+    fn refresh_chat_view(&mut self) {
+        if !self
+            .windows
+            .iter()
+            .any(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
+        {
+            return;
+        }
+        let mut rows = Vec::new();
+        for w in &mut self.windows {
+            let wid = w.id;
+            for (i, t) in w.tabs.iter_mut().enumerate() {
+                if !t.chat_member {
+                    continue;
+                }
+                let Content::Terminal(s) = &mut t.content else { continue };
+                rows.push(crate::chat::CrewRow {
+                    win: wid,
+                    tab: i,
+                    id: term_tag(wid),
+                    name: display_name(&t.title).to_string(),
+                    exited: s.exited().is_some(),
+                    last: None,
+                });
+            }
+        }
+        {
+            let log = self.chat.borrow();
+            for r in &mut rows {
+                r.last = log.last_activity(&r.id);
+            }
+        }
+        crate::chat::sort_crew(&mut rows);
+        let n_live = rows.iter().filter(|r| !r.exited).count();
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Chat(v) = &mut t.content {
+                    // mem::take, not a move — the compiler can't see that the
+                    // singleton makes a second loop iteration unreachable.
+                    v.crew = std::mem::take(&mut rows);
+                    // Clobbers a user rename each frame — accepted: the chip
+                    // IS the title for the chat window.
+                    t.title = format!("chat · {n_live} live");
+                    return;
+                }
+            }
+        }
     }
 
     /// Post into this project's chat: validate the sender, append, join the
@@ -1530,6 +1583,11 @@ impl WindowManager {
         if self.desktop {
             self.refresh_exit_titles();
         }
+
+        // Fill the chat viewer's crew rows / title chip before any window
+        // draws. Each nested project manager refreshes its own room; on the
+        // desktop manager this is a no-op (no viewer).
+        self.refresh_chat_view();
 
         self.pump_commands(ui, active);
 
@@ -3362,6 +3420,54 @@ mod tests {
             "reopen must re-activate the chat tab"
         );
         assert_eq!(wm.focused, Some(id));
+    }
+
+    #[test]
+    fn refresh_chat_view_builds_rows_and_title_chip() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        wm.last_area = egui::vec2(800.0, 600.0);
+        let a = wm.add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx).unwrap();
+        let b = wm.add_terminal_cmd(&pause_argv(), None, Some("plain"), &ctx).unwrap();
+        let w = wm.windows.iter_mut().find(|w| w.id == b).unwrap();
+        w.tabs[w.active].chat_member = false;
+        wm.open_chat_window();
+        wm.refresh_chat_view();
+        let view_win = wm
+            .windows
+            .iter()
+            .find(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
+            .unwrap();
+        let tab = view_win
+            .tabs
+            .iter()
+            .find(|t| matches!(t.content, Content::Chat(_)))
+            .unwrap();
+        assert_eq!(tab.title, "chat · 1 live");
+        let Content::Chat(v) = &tab.content else { panic!() };
+        assert_eq!(v.crew.len(), 1, "only members appear");
+        assert_eq!(v.crew[0].id, format!("t{a}"));
+        assert_eq!(v.crew[0].name, "worker A");
+        assert!(!v.crew[0].exited);
+        assert!(v.crew[0].last.is_some(), "joined entry counts as heard");
+    }
+
+    #[test]
+    fn chat_view_watermark_moves_on_focus_loss_only() {
+        let log = Rc::new(RefCell::new(crate::chat::ChatLog::new()));
+        log.borrow_mut().post("t1", "a", "before-open");
+        let mut v = crate::chat::ChatView::new(Rc::clone(&log));
+        assert_eq!(v.last_seen, 1, "creation watermark = current tail (no NEW backlog)");
+        v.on_frame(true); // focused
+        log.borrow_mut().post("t1", "a", "while-focused");
+        v.on_frame(true);
+        assert_eq!(v.last_seen, 1, "watermark holds while focused");
+        v.on_frame(false); // focus left
+        assert_eq!(v.last_seen, 2, "watermark catches up on the focus-loss edge");
+        log.borrow_mut().post("t1", "a", "while-unfocused");
+        v.on_frame(false);
+        assert_eq!(v.last_seen, 2, "unfocused arrivals stay above the watermark");
     }
 
     #[test]
