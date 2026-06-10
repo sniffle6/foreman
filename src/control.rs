@@ -16,6 +16,9 @@ pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// an error the dispatching agent can act on.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How many chat lines a bare `--history` (no count) returns.
+pub const DEFAULT_HISTORY: usize = 20;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpenRequest {
     pub cmd: String, // always "open" in v1
@@ -208,37 +211,147 @@ pub fn request(pipe: &str, req: &impl serde::Serialize) -> std::io::Result<OpenR
     serde_json::from_str(&reply).map_err(std::io::Error::other)
 }
 
-/// `foreman open ...` entry point (no GUI). Returns the process exit code.
-pub fn client_main(args: &[String]) -> i32 {
-    if args.first().map(String::as_str) != Some("open") {
-        eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
-        return 2;
+/// Parse `foreman chat` args: `[--project P] [--history [N]] [--] <message...>`.
+/// Flags come first; the first positional word (or an explicit `--`) ends flag
+/// parsing and the remainder is the message verbatim — so flag-like text inside
+/// the message body is never reinterpreted. A message post and `--history`
+/// (default [`DEFAULT_HISTORY`]) are mutually exclusive. `default_project` /
+/// `self_terminal` come from the caller's FOREMAN_* env; a caller outside a
+/// foreman terminal cannot use chat.
+pub fn parse_chat_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<ChatRequest, String> {
+    let from = self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
+    let mut project = default_project;
+    let mut history: Option<usize> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--history" => {
+                // optional count: `--history 5` or bare `--history`
+                match args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => {
+                        history = Some(n);
+                        i += 2;
+                    }
+                    None => {
+                        history = Some(DEFAULT_HISTORY);
+                        i += 1;
+                    }
+                }
+            }
+            "--" => {
+                // explicit end of flags: everything after is the message verbatim
+                words.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!(
+                    "unknown flag: {other} (use -- to post a message starting with --)"
+                ));
+            }
+            _ => {
+                // first positional ends flag parsing: the rest is the message verbatim
+                words.extend_from_slice(&args[i..]);
+                break;
+            }
+        }
     }
-    let req = match parse_open_args(&args[1..], std::env::var("FOREMAN_PROJECT_ID").ok()) {
+    match (words.is_empty(), history) {
+        (false, None) => Ok(ChatRequest {
+            cmd: "chat".into(),
+            project,
+            from,
+            text: Some(words.join(" ")),
+            history: None,
+        }),
+        (true, Some(n)) => Ok(ChatRequest {
+            cmd: "chat".into(),
+            project,
+            from,
+            text: None,
+            history: Some(n),
+        }),
+        (true, None) => Err("nothing to do: give a message or --history".into()),
+        (false, Some(_)) => Err("--history and a message are mutually exclusive".into()),
+    }
+}
+
+/// Subcommand entry point (no GUI). Returns the process exit code.
+pub fn client_main(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("open") => open_main(&args[1..]),
+        Some("chat") => chat_main(&args[1..]),
+        _ => {
+            eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
+            eprintln!("       foreman chat [--project P] <message...>");
+            eprintln!("       foreman chat [--project P] --history [N]");
+            2
+        }
+    }
+}
+
+fn open_main(args: &[String]) -> i32 {
+    let req = match parse_open_args(args, std::env::var("FOREMAN_PROJECT_ID").ok()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("foreman open: {e}");
             return 2;
         }
     };
-    match request(PIPE, &req) {
+    report("foreman open", request(PIPE, &req))
+}
+
+fn chat_main(args: &[String]) -> i32 {
+    let req = match parse_chat_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman chat: {e}");
+            return 2;
+        }
+    };
+    report("foreman chat", request(PIPE, &req))
+}
+
+/// Print the pipe reply (or the connection failure) the way all subcommands do.
+/// History replies print line-per-line for agent readability; other ok replies
+/// print as JSON (the open reply carries terminal/project ids the caller needs).
+fn report(label: &str, res: std::io::Result<OpenReply>) -> i32 {
+    match res {
         Ok(r) if r.ok => {
-            println!("{}", serde_json::to_string(&r).unwrap_or_default());
+            if let Some(lines) = &r.history {
+                for l in lines {
+                    println!("{l}");
+                }
+            } else {
+                println!("{}", serde_json::to_string(&r).unwrap_or_default());
+            }
             0
         }
         Ok(r) => {
-            eprintln!("foreman open: {}", r.error.unwrap_or_default());
+            eprintln!("{label}: {}", r.error.unwrap_or_default());
             1
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             eprintln!(
-                "foreman open: foreman is running but its control pipe stayed busy for {}s — retry, or check for a wedged dispatch",
+                "{label}: foreman is running but its control pipe stayed busy for {}s — retry, or check for a wedged dispatch",
                 CONNECT_TIMEOUT.as_secs()
             );
             1
         }
         Err(e) => {
-            eprintln!("foreman open: cannot reach foreman ({e}) — is it running?");
+            eprintln!("{label}: cannot reach foreman ({e}) — is it running?");
             1
         }
     }
@@ -452,6 +565,76 @@ mod tests {
         };
         let s = serde_json::to_string(&h).unwrap();
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), h);
+    }
+
+    #[test]
+    fn parse_chat_args_builds_post_and_history() {
+        // post: trailing words join into one message
+        let req = parse_chat_args(
+            &s(&["taking", "the", "parser"]),
+            Some("p1".into()),
+            Some("t2".into()),
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        assert_eq!(req.from, "t2");
+        assert_eq!(req.text.as_deref(), Some("taking the parser"));
+        assert_eq!(req.history, None);
+        // history with explicit N
+        let req = parse_chat_args(&s(&["--history", "5"]), None, Some("t2".into())).unwrap();
+        assert_eq!(req.history, Some(5));
+        assert_eq!(req.text, None);
+        // history default N
+        let req = parse_chat_args(&s(&["--history"]), None, Some("t2".into())).unwrap();
+        assert_eq!(req.history, Some(20));
+        // explicit --project beats env default
+        let req = parse_chat_args(
+            &s(&["--project", "p2", "hi"]),
+            Some("p1".into()),
+            Some("t2".into()),
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn parse_chat_args_treats_message_body_verbatim() {
+        // flags inside the message body are message text, not flags
+        let req = parse_chat_args(
+            &s(&["use", "--project", "p2", "for", "that"]),
+            Some("p1".into()),
+            Some("t1".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            req.project.as_deref(),
+            Some("p1"),
+            "message content must not reroute the post"
+        );
+        assert_eq!(req.text.as_deref(), Some("use --project p2 for that"));
+        // -- escape hatch for leading-dash messages
+        let req = parse_chat_args(
+            &s(&["--", "--project", "p2"]),
+            Some("p1".into()),
+            Some("t1".into()),
+        )
+        .unwrap();
+        assert_eq!(req.text.as_deref(), Some("--project p2"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        // typo'd leading flag errors instead of posting garbage
+        assert!(parse_chat_args(&s(&["--histroy", "5"]), None, Some("t1".into())).is_err());
+    }
+
+    #[test]
+    fn parse_chat_args_rejects_bad_input() {
+        // not inside a foreman terminal
+        assert!(parse_chat_args(&s(&["hi"]), None, None).is_err());
+        // nothing to do
+        assert!(parse_chat_args(&s(&[]), None, Some("t2".into())).is_err());
+        // both post and history
+        assert!(parse_chat_args(&s(&["--history", "5", "hi"]), None, Some("t2".into())).is_err());
+        // flag without value
+        assert!(parse_chat_args(&s(&["--project"]), None, Some("t2".into())).is_err());
     }
 
     #[test]
