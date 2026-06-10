@@ -1107,6 +1107,32 @@ impl WindowManager {
         }
     }
 
+    /// Apply crew-board clicks recorded during the draw (content cannot
+    /// mutate sibling windows mid-loop). Stale targets (closed windows,
+    /// merged-away tabs) are dropped silently — same staleness family as
+    /// terminal-id resolution.
+    fn drain_chat_clicks(&mut self) {
+        let mut req = None;
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Chat(v) = &mut t.content {
+                    if let Some(c) = v.click.take() {
+                        req = Some(c);
+                    }
+                }
+            }
+        }
+        if let Some((win, tab)) = req {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
+                if tab < w.tabs.len() {
+                    w.active = tab;
+                }
+                w.minimized = false;
+                self.focus(win);
+            }
+        }
+    }
+
     /// Post into this project's chat: validate the sender, append, join the
     /// sender (spec §2: join-on-first-post). Returns the framed injection line.
     /// Injection itself is `chat_broadcast` — kept separate because the reply
@@ -2541,6 +2567,10 @@ impl WindowManager {
 
         let ctx = ui.ctx().clone();
         self.apply_acts(acts, asz, base, &ctx);
+        // After the acts, not before: the same click that recorded a crew-row
+        // hit also pushed Act::Focus(chat window) via cresp — draining last is
+        // the fixed order that lets the member, not the viewer, end up focused.
+        self.drain_chat_clicks();
         self.show_modals(ui, area, &ctx);
 
         interacted
@@ -3674,6 +3704,38 @@ mod tests {
         assert_eq!(v.crew[0].name, "worker A");
         assert!(!v.crew[0].exited);
         assert!(v.crew[0].last.is_some(), "joined entry counts as heard");
+    }
+
+    #[test]
+    fn chat_click_focuses_the_member_window_and_tab() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        wm.last_area = egui::vec2(800.0, 600.0);
+        let t = wm.add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx).unwrap();
+        wm.open_chat_window();
+        let chat_id = wm.focused.expect("open focuses the viewer");
+        // simulate the render arm recording a click on worker A's row
+        for w in &mut wm.windows {
+            for tab in &mut w.tabs {
+                if let Content::Chat(v) = &mut tab.content {
+                    v.click = Some((t, 0));
+                }
+            }
+        }
+        wm.drain_chat_clicks();
+        assert_eq!(wm.focused, Some(t), "click focused the member");
+        assert_ne!(wm.focused, Some(chat_id));
+        // stale target: must not panic or change focus
+        for w in &mut wm.windows {
+            for tab in &mut w.tabs {
+                if let Content::Chat(v) = &mut tab.content {
+                    v.click = Some((9999, 0));
+                }
+            }
+        }
+        wm.drain_chat_clicks();
+        assert_eq!(wm.focused, Some(t), "stale click is a no-op");
     }
 
     #[test]
