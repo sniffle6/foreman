@@ -1089,20 +1089,7 @@ impl WindowManager {
         // rect before the next render refits it.
         self.last_area = area.size();
 
-        // Leader / command mode: only the root desktop runs it, and only while it
-        // is the active (keyboard-owning) manager and no modal is up. Resolve and
-        // dispatch *before* the render recursion so command chords are drained
-        // from egui input and never reach a terminal's read_input.
-        if self.desktop
-            && active
-            && self.picker.is_none()
-            && self.renaming.is_none()
-            && self.settings.is_none()
-        {
-            if let Some(cmd) = self.pump_leader(ui) {
-                self.dispatch(cmd, ui);
-            }
-        }
+        self.pump_commands(ui, active);
 
         ui.painter_at(area)
             .rect_filled(area, egui::CornerRadius::ZERO, DESK_BG);
@@ -1737,6 +1724,48 @@ impl WindowManager {
             }
         }
 
+        self.paint_drag_overlays(ui, area, snap_overlay, merge_hint);
+        self.paint_taskbar(ui, area, base, &mut acts);
+
+        // Any Act means a window in this manager was interacted with this frame.
+        // Captured before the apply loop consumes `acts`, returned at the end so
+        // the parent can bubble focus upward through arbitrary nesting depth.
+        let interacted = !acts.is_empty();
+
+        let ctx = ui.ctx().clone();
+        self.apply_acts(acts, asz, base, &ctx);
+        self.show_modals(ui, area, &ctx);
+
+        interacted
+    }
+
+    /// Leader / command mode: only the root desktop runs it, and only while it is
+    /// the active (keyboard-owning) manager and no modal is up. Resolved and
+    /// dispatched *before* the render recursion so command chords are drained from
+    /// egui input and never reach a terminal's read_input.
+    fn pump_commands(&mut self, ui: &mut egui::Ui, active: bool) {
+        if self.desktop
+            && active
+            && self.picker.is_none()
+            && self.renaming.is_none()
+            && self.settings.is_none()
+        {
+            if let Some(cmd) = self.pump_leader(ui) {
+                self.dispatch(cmd, ui);
+            }
+        }
+    }
+
+    /// Overlays painted above all windows while a title drag is in flight: the
+    /// amber snap-zone preview, and (mutually exclusive) the merge/tab drop hint
+    /// highlighting the window the pointer is over.
+    fn paint_drag_overlays(
+        &self,
+        ui: &egui::Ui,
+        area: egui::Rect,
+        snap_overlay: Option<egui::Rect>,
+        merge_hint: Option<usize>,
+    ) {
         // --- snap overlay (amber), painted above all windows while dragging ---
         if let Some(ov) = snap_overlay {
             let p = ui.painter_at(area);
@@ -1762,52 +1791,60 @@ impl WindowManager {
                 egui::StrokeKind::Inside,
             );
         }
+    }
 
-        // --- taskbar (minimized) ---
+    /// Bottom-left taskbar of minimized windows; clicking a chip restores it.
+    fn paint_taskbar(
+        &self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        base: egui::Id,
+        acts: &mut Vec<Act>,
+    ) {
         let mins: Vec<(WinId, String)> = self
             .windows
             .iter()
             .filter(|w| w.minimized)
             .map(|w| (w.id, w.title().to_string()))
             .collect();
-        if !mins.is_empty() {
-            let mut tx = area.min.x + 8.0;
-            let ty = area.max.y - 30.0;
-            for (id, title) in mins {
-                let r = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(160.0, 24.0));
-                let resp = ui.interact(r, base.with((id, "task")), egui::Sense::click());
-                ui.painter().rect_filled(
-                    r,
-                    egui::CornerRadius::same(5),
-                    egui::Color32::from_rgb(42, 38, 29),
-                );
-                ui.painter().text(
-                    egui::pos2(tx + 9.0, ty + 12.0),
-                    egui::Align2::LEFT_CENTER,
-                    &title,
-                    egui::FontId::proportional(11.5),
-                    DIM,
-                );
-                if resp.clicked() {
-                    acts.push(Act::Restore(id));
-                }
-                tx += 168.0;
-            }
+        if mins.is_empty() {
+            return;
         }
+        let mut tx = area.min.x + 8.0;
+        let ty = area.max.y - 30.0;
+        for (id, title) in mins {
+            let r = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(160.0, 24.0));
+            let resp = ui.interact(r, base.with((id, "task")), egui::Sense::click());
+            ui.painter().rect_filled(
+                r,
+                egui::CornerRadius::same(5),
+                egui::Color32::from_rgb(42, 38, 29),
+            );
+            ui.painter().text(
+                egui::pos2(tx + 9.0, ty + 12.0),
+                egui::Align2::LEFT_CENTER,
+                &title,
+                egui::FontId::proportional(11.5),
+                DIM,
+            );
+            if resp.clicked() {
+                acts.push(Act::Restore(id));
+            }
+            tx += 168.0;
+        }
+    }
 
-        // Any Act means a window in this manager was interacted with this frame.
-        // Captured before the apply loop consumes `acts`, returned at the end so
-        // the parent can bubble focus upward through arbitrary nesting depth.
-        let interacted = !acts.is_empty();
-
-        let ctx = ui.ctx().clone();
+    /// Deferred window mutations collected during render, applied after the render
+    /// borrow on `self.windows` is released so we never remove/retab a window
+    /// mid-loop and invalidate the draw order.
+    fn apply_acts(&mut self, acts: Vec<Act>, asz: egui::Vec2, base: egui::Id, ctx: &egui::Context) {
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
                 Act::AddTerm(id, shell) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         if let Content::Project(wm) = w.active_content() {
-                            wm.add_terminal(shell, &ctx);
+                            wm.add_terminal(shell, ctx);
                         }
                     }
                     self.focus(id);
@@ -1870,12 +1907,16 @@ impl WindowManager {
                 }
             }
         }
+    }
 
+    /// Desktop-level modal overlays drawn last, on top of everything: the dir
+    /// picker, the keybindings editor, and the leader cue / help cheat-sheet.
+    fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
             match picker.show(ui) {
                 Outcome::Pending => self.picker = Some(picker),
                 Outcome::Cancelled => {}
-                Outcome::Accepted(path) => self.add_project(Shell::PowerShell, path, &ctx),
+                Outcome::Accepted(path) => self.add_project(Shell::PowerShell, path, ctx),
             }
         }
 
@@ -1907,8 +1948,6 @@ impl WindowManager {
                 self.paint_help(ui, area);
             }
         }
-
-        interacted
     }
 
     /// A small amber pill in the bottom-right while command mode is armed, so the
