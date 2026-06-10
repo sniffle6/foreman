@@ -330,6 +330,9 @@ impl eframe::App for App {
 
         self.show_os_chrome(&ctx);
 
+        // Also keeps the control-pipe drain alive: serve() has no Context to
+        // wake us, so dispatch latency rides on this unconditional repaint.
+        // If repainting ever becomes event-driven, hand serve() a Context.
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }

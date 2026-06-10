@@ -146,6 +146,7 @@ pub struct Session {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     exit: Option<u32>,
+    exit_noted: bool,
     pub shell: Shell,
     cols: usize,
     rows: usize,
@@ -265,6 +266,7 @@ impl Session {
             master: pair.master,
             child,
             exit: None,
+            exit_noted: false,
             shell,
             cols,
             rows,
@@ -280,6 +282,17 @@ impl Session {
             self.exit = self.child.try_wait().ok().flatten().map(|s| s.exit_code());
         }
         self.exit
+    }
+
+    /// Like `exited`, but reports the exit exactly once — for one-shot
+    /// reactions like stamping the window title.
+    pub fn exit_to_note(&mut self) -> Option<u32> {
+        let code = self.exited()?;
+        if self.exit_noted {
+            return None;
+        }
+        self.exit_noted = true;
+        Some(code)
     }
 
     fn cell_at(&self, rect: egui::Rect, cw: f32, rh: f32, pos: egui::Pos2) -> (usize, usize) {
@@ -696,5 +709,24 @@ mod tests {
         let ctx = egui::Context::default();
         let env = [("FOREMAN".to_string(), "1".to_string())];
         assert!(Session::spawn(Shell::Cmd, None, &env, ctx).is_ok());
+    }
+
+    #[test]
+    fn exit_is_noted_exactly_once() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let mut noted = None;
+        for _ in 0..100 {
+            s.pump();
+            if let Some(c) = s.exit_to_note() {
+                noted = Some(c);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(noted, Some(0));
+        assert_eq!(s.exit_to_note(), None); // second note must not fire
+        assert_eq!(s.exited(), Some(0)); // plain exited() still reports
     }
 }

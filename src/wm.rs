@@ -1190,10 +1190,8 @@ impl WindowManager {
             for t in &mut w.tabs {
                 match &mut t.content {
                     Content::Terminal(s) => {
-                        if let Some(code) = s.exited() {
-                            if !t.title.contains("· exited") {
-                                t.title.push_str(&format!("  ·  exited ({code})"));
-                            }
+                        if let Some(code) = s.exit_to_note() {
+                            t.title.push_str(&format!("  ·  exited ({code})"));
                         }
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),

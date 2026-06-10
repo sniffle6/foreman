@@ -75,15 +75,17 @@ arguments.
 ### 4. Spawn semantics
 
 The worker is a new terminal window in the target project running the
-command directly (not wrapped in a shell). It snaps/tabs/focuses like any
-terminal. Title: `agent · <label>`.
+command directly (not wrapped in a shell). It snaps/tabs like any terminal
+but deliberately does NOT take focus — a dispatch must never move the
+keyboard out from under the user. Title: `agent · <label>`.
 
 - **Exit:** when the process ends, the terminal stays open with scrollback
   and the title gains `exited (code)`. In fire-and-watch the terminal IS the
   record — closing is manual.
 - **npm shims:** `claude` on Windows is a `.cmd` shim, not an exe. No PATH
-  detection — try the direct spawn, and if it fails with file-not-found,
-  retry once wrapped in `cmd /c`.
+  detection — try the direct spawn, and on ANY spawn error retry once wrapped
+  in `cmd /c`. Consequence: `ok:true` means "a terminal opened", not "your
+  command exists" — a bogus command opens a terminal showing cmd's error.
 
 ### 5. Claude as first client
 
@@ -102,6 +104,9 @@ different command.
   old `pN` id no longer resolves and dispatchers inside B get an error until
   they pass an explicit `--project`.
 - **One foreman instance per machine** (v1). First instance owns the pipe.
+- **One request in flight at a time.** The pipe thread handles connections
+  serially (a dispatch can hold it for up to 5s); a concurrent client may
+  get a busy/connect error and should just retry.
 - **The pipe is a command-execution surface.** Security boundary v1 is the
   pipe's default same-user ACL — anything running as you can open terminals.
   That's the same trust level as the shell itself.
@@ -120,7 +125,7 @@ different command.
 - `src/control.rs` — pipe server thread, protocol types, arg parsing, client mode.
 - `src/main.rs` — argv split (subcommand → client, else GUI); drain the
   control channel each frame and route to the desktop `WindowManager`.
-- `src/wm.rs` — `add_terminal_with_command(project, cwd, title, cmd)`;
-  project lookup by id.
+- `src/wm.rs` — `handle_open` (request → project → spawn), `add_terminal_cmd`,
+  project resolution, env injection, exited-title refresh.
 - `src/terminal.rs` — command sessions (vs shell sessions), env injection,
   exited-state title.

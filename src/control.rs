@@ -102,6 +102,7 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
             continue;
         }
         let reply = match serde_json::from_str::<OpenRequest>(&line) {
+            Ok(req) if req.cmd != "open" => OpenReply::err(format!("unknown cmd: {}", req.cmd)),
             Ok(req) => {
                 let (rtx, rrx) = mpsc::channel();
                 if tx.send(CtrlMsg::Open(req, rtx)).is_err() {
@@ -217,6 +218,34 @@ mod tests {
         assert!(parse_open_args(&s(&["--"]), None).is_err()); // no command
         assert!(parse_open_args(&s(&["claude"]), None).is_err()); // missing --
         assert!(parse_open_args(&s(&["--nope", "--", "x"]), None).is_err());
+    }
+
+    #[test]
+    fn unknown_verb_is_rejected() {
+        let pipe = format!("foreman-test-verb-{}", std::process::id());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        let req = OpenRequest {
+            cmd: "status".into(),
+            project: None,
+            cwd: None,
+            title: None,
+            command: vec!["x".into()],
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply");
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("unknown cmd: status"));
     }
 
     #[test]
