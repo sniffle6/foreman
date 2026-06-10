@@ -1,3 +1,4 @@
+mod control;
 mod dirpicker;
 mod keymap;
 mod settings;
