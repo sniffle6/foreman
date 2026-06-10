@@ -380,9 +380,11 @@ impl Session {
     /// Deliver chat text into this session's stdin: bracketed paste, then a
     /// separate `\r` to submit (spec: agent-group-chat §3).
     /// Empty text is a no-op — a bare `\r` would submit the target's
-    /// half-typed input. Paste markers are sent unconditionally; whether to
-    /// gate on the child's bracketed-paste mode (DECSET 2004) is decided
-    /// after live verification on ConPTY.
+    /// half-typed input. Live-verified on ConPTY (2026-06-10): claude
+    /// sessions honor the bracketed-paste markers (multi-line lands as one
+    /// input block), so the wrap stays unconditional in v1; gating on
+    /// TermMode::BRACKETED_PASTE remains a possible hardening if non-claude
+    /// members ever matter.
     pub fn inject_input(&mut self, text: &str) {
         if text.is_empty() {
             return;
