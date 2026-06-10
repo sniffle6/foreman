@@ -16,14 +16,17 @@ struct App {
     chrome_open: bool,
     /// When the pointer entered the top reveal zone (for the dwell timer).
     chrome_hot_since: Option<f64>,
+    /// Agent-dispatch requests from the control pipe thread.
+    ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
 }
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    fn new(ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>) -> Self {
         Self {
             desktop: WindowManager::new().as_desktop(),
             started: false,
             chrome_open: false,
             chrome_hot_since: None,
+            ctrl,
         }
     }
 }
@@ -311,6 +314,11 @@ impl eframe::App for App {
             self.started = true;
         }
 
+        while let Ok(control::CtrlMsg::Open(req, reply)) = self.ctrl.try_recv() {
+            let res = self.desktop.handle_open(req, &ctx);
+            let _ = reply.send(res);
+        }
+
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let mut area = ui.available_rect_before_wrap();
         if !maximized {
@@ -349,12 +357,19 @@ fn install_panic_logger() {
 }
 
 fn main() -> eframe::Result {
+    // Subcommand = thin pipe client (`foreman open ...`), no GUI.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        std::process::exit(control::client_main(&args[1..]));
+    }
     install_panic_logger();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || control::serve(control::PIPE, tx));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_decorations(false),
         ..Default::default()
     };
-    eframe::run_native("Foreman", opts, Box::new(|_cc| Ok(Box::new(App::default()))))
+    eframe::run_native("Foreman", opts, Box::new(move |_cc| Ok(Box::new(App::new(rx)))))
 }
