@@ -433,6 +433,7 @@ mod tests {
         // and the first header lands at blocks[1].
         let blocks = build_blocks(&msgs, 0, false);
         assert!(matches!(&blocks[0], ChatBlock::Divider));
+        // Byte-length compare is timezone-invariant: HH:MM is always 5 ASCII bytes; the · separators are 2 bytes each in both strings.
         assert!(matches!(&blocks[1], ChatBlock::Header { meta, .. }
             if meta.starts_with("t4 · #1 · ") && meta.len() == "t4 · #1 · 00:00".len()));
         // nothing new => no divider

@@ -396,8 +396,8 @@ impl Content {
                 enum Painted {
                     Galley(std::sync::Arc<egui::Galley>, egui::Color32, f32 /*indent*/, bool /*edge*/),
                     Centered(std::sync::Arc<egui::Galley>),
-                    MetaPair(std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>, egui::Color32),
-                    Rule(egui::Color32, Option<std::sync::Arc<egui::Galley>>),
+                    MetaPair(std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>),
+                    Rule(Option<std::sync::Arc<egui::Galley>>),
                     Gap(f32),
                 }
                 let mut items: Vec<Painted> = Vec::new();
@@ -413,14 +413,14 @@ impl Content {
                         crate::chat::ChatBlock::Divider => {
                             let g = p.layout("NEW".into(), egui::FontId::proportional(9.0), CHAT_STALE, wrap);
                             total += 14.0;
-                            items.push(Painted::Rule(CHAT_STALE, Some(g)));
+                            items.push(Painted::Rule(Some(g)));
                         }
                         crate::chat::ChatBlock::Header { name, id, meta } => {
                             let gn = p.layout_no_wrap(name.clone(), egui::FontId::proportional(12.0), chat_color(id));
                             let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), DIM);
                             total += gn.size().y + 2.0 + 4.0; // header + breathing room above
                             items.push(Painted::Gap(4.0));
-                            items.push(Painted::MetaPair(gn, gm, chat_color(id)));
+                            items.push(Painted::MetaPair(gn, gm));
                         }
                         crate::chat::ChatBlock::Text { text, to } => {
                             // Mention chips: lay the body out as a LayoutJob so
@@ -478,8 +478,9 @@ impl Content {
                             p.galley(egui::pos2(x, y), g, DIM);
                             y += h;
                         }
-                        Painted::Rule(col, label) => {
+                        Painted::Rule(label) => {
                             let mid = y + 7.0;
+                            // The rule is intentionally dim (mockup: 1px #45402f); the amber NEW label is the affordance.
                             p.line_segment(
                                 [egui::pos2(log_rect.min.x, mid), egui::pos2(log_rect.max.x, mid)],
                                 egui::Stroke::new(1.0, CHAT_MENTION_BG),
@@ -495,11 +496,11 @@ impl Content {
                                     0.0,
                                     WIN_BG,
                                 );
-                                p.galley(egui::pos2(lx, y + 1.0), g, col);
+                                p.galley(egui::pos2(lx, y + 1.0), g, CHAT_STALE);
                             }
                             y += 14.0;
                         }
-                        Painted::MetaPair(gn, gm, _col) => {
+                        Painted::MetaPair(gn, gm) => {
                             let h = gn.size().y;
                             let nw = gn.size().x;
                             p.galley(egui::pos2(log_rect.min.x, y), gn, TEXT);
