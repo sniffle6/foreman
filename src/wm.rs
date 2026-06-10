@@ -3,7 +3,9 @@ use crate::keymap::{Chord, Command, Keymap};
 use crate::settings::{Outcome as SettingsOutcome, SettingsView};
 use crate::terminal::{Session, Shell};
 use eframe::egui;
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 pub type WinId = u64;
 
@@ -296,6 +298,12 @@ impl Content {
 pub struct Tab {
     pub title: String,
     pub content: Content,
+    /// Member of this project's chat room (spec: agent-group-chat §2).
+    /// Dispatched terminals auto-join; others join on first post. Lives on
+    /// the Tab so membership travels with its terminal through tab
+    /// merges/untabs. Sender identity still resolves via Win id (active
+    /// tab) — same staleness family as terminal-id resolution.
+    pub chat_member: bool,
 }
 
 pub struct Win {
@@ -394,6 +402,9 @@ pub struct WindowManager {
     /// env-injected into its terminals so dispatchers can self-target. None on
     /// the desktop.
     tag: Option<String>,
+    /// This project's chat room (unused at desktop level). Shared with the
+    /// viewer window (`Content::Chat`), hence the Rc<RefCell<…>>.
+    pub chat: Rc<RefCell<crate::chat::ChatLog>>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -439,6 +450,7 @@ impl WindowManager {
             split: egui::vec2(0.5, 0.5),
             cwd: None,
             tag: None,
+            chat: Rc::new(RefCell::new(crate::chat::ChatLog::new())),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -475,7 +487,11 @@ impl WindowManager {
     fn push_win(&mut self, id: WinId, title: String, rect: egui::Rect, content: Content) {
         self.windows.push(Win {
             id,
-            tabs: vec![Tab { title, content }],
+            tabs: vec![Tab {
+                title,
+                content,
+                chat_member: false,
+            }],
             active: 0,
             rect,
             z: self.z,
@@ -657,8 +673,63 @@ impl WindowManager {
         // was; the window still spawns on top visually (z from next_slot).
         let prev_focus = self.focused;
         self.push_win(id, title, rect, Content::Terminal(s));
+        // Dispatched agents auto-join the project chat room (spec §2).
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.tabs[w.active].chat_member = true;
+        }
         self.focused = prev_focus;
         Ok(id)
+    }
+
+    /// Post into this project's chat: validate the sender, append, join the
+    /// sender (spec §2: join-on-first-post). Returns the framed injection line.
+    /// Injection itself is `chat_broadcast` — kept separate because the reply
+    /// must be sent BEFORE bytes flow (spec §3: reply-before-inject).
+    fn chat_post(&mut self, from: WinId, text: &str) -> Result<String, String> {
+        if text.is_empty() {
+            return Err("empty message".into());
+        }
+        let sender = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == from)
+            .ok_or_else(|| format!("no such terminal: t{from}"))?;
+        sender.tabs[sender.active].chat_member = true;
+        debug_assert!(
+            self.tag.is_some(),
+            "chat_post on a tag-less (desktop?) manager — routing bug"
+        );
+        let project = self.tag.as_deref().unwrap_or("p?");
+        let mut log = self.chat.borrow_mut();
+        let msg = log.post(&format!("t{from}"), text);
+        Ok(msg.frame(project))
+    }
+
+    /// Inject a framed chat line into every member tab except the sender's
+    /// active tab, skipping exited sessions and non-terminal content (the
+    /// chat viewer renders the log directly — never injected). Background
+    /// tabs receive too: keepalive keeps their PTYs drained, and chat's
+    /// whole point is that members never have to poll.
+    fn chat_broadcast(&mut self, from: WinId, framed: &str) {
+        for w in self.windows.iter_mut() {
+            let active = w.active;
+            let is_sender = w.id == from;
+            for (i, tab) in w.tabs.iter_mut().enumerate() {
+                if (is_sender && i == active) || !tab.chat_member {
+                    continue;
+                }
+                if let Content::Terminal(s) = &mut tab.content {
+                    if s.exited().is_none() {
+                        s.inject_input(framed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Last `n` chat lines (the `--history` verb; reading does not join).
+    fn chat_history(&self, n: usize) -> Vec<String> {
+        self.chat.borrow().tail_lines(n)
     }
 
     /// Where the picker opens: the focused project's cwd if there is one, else the
@@ -2403,6 +2474,13 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
 }
 
+/// Parse a "t4"-style terminal id.
+fn term_id(spec: &str) -> Result<WinId, String> {
+    spec.strip_prefix('t')
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("bad terminal id: {spec}"))
+}
+
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
@@ -2440,6 +2518,7 @@ mod tests {
             tabs: vec![Tab {
                 title: title.to_string(),
                 content: stub_content(),
+                chat_member: false,
             }],
             active: 0,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
@@ -2900,5 +2979,200 @@ mod tests {
         let desktop = WindowManager::new();
         let env = desktop.term_env(1);
         assert!(env.iter().all(|(n, _)| n != "FOREMAN_PROJECT_ID"));
+    }
+
+    // --- group chat: membership, post, broadcast, history ---
+
+    fn pause_argv() -> Vec<String> {
+        // stays alive until stdin sees a key; exits cleanly when the PTY drops
+        vec!["cmd.exe".into(), "/c".into(), "pause".into()]
+    }
+
+    #[test]
+    fn dispatched_terminals_auto_join_chat() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let t = wm.add_terminal_cmd(&argv, None, None, &ctx).unwrap();
+        let w = wm.windows.iter().find(|w| w.id == t).unwrap();
+        assert!(w.tabs[w.active].chat_member);
+    }
+
+    #[test]
+    fn chat_post_validates_joins_and_frames() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let t = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        // simulate a hand-opened (non-dispatched) terminal
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
+            w.tabs[w.active].chat_member = false;
+        }
+
+        assert!(wm.chat_post(t, "").is_err(), "empty message rejected");
+        assert!(wm.chat_post(999, "hi").is_err(), "unknown sender rejected");
+        let framed = wm.chat_post(t, "hello room").unwrap();
+        assert_eq!(framed, format!("[chat p1 #1] t{t}: hello room"));
+        let w = wm.windows.iter().find(|w| w.id == t).unwrap();
+        assert!(
+            w.tabs[w.active].chat_member,
+            "posting joins the sender's active tab"
+        );
+        assert_eq!(wm.chat_history(10), vec![format!("#1 t{t}: hello room")]);
+    }
+
+    #[test]
+    fn chat_broadcast_hits_members_only_excluding_sender() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        // all three run `cmd /c pause`: receiving ANY stdin byte makes them exit
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let member = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let outsider = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
+            w.tabs[w.active].chat_member = false;
+        }
+
+        let framed = wm.chat_post(sender, "go").unwrap();
+
+        // Pump every session each iteration: keepalive() answers the startup
+        // DSR (the documented trap — bytes injected before a child's DSR scan
+        // resolves get eaten by the scan, see terminal.rs's
+        // inject_input_reaches_child_stdin). wm.rs has no public grid access
+        // to wait for "prompt rendered", so instead of a timing-based sleep
+        // the broadcast is re-sent until the member's stdin sees it. That is
+        // deterministic and still proves the membership filter: every send
+        // skips the sender and the non-member, who are pumped too — so a
+        // wrongful injection into them WOULD make them exit below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            wm.chat_broadcast(sender, &framed);
+            // positive signal: the member exits because bytes hit its stdin
+            let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "member never received the broadcast"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // sender and non-member saw nothing: still alive after the member
+        // exited (kept pumped so an erroneous injection would surface).
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < grace {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        for (id, who) in [(sender, "sender"), (outsider, "non-member")] {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            assert!(s.exited().is_none(), "{who} must not be injected");
+        }
+    }
+
+    #[test]
+    fn chat_broadcast_reaches_background_member_tab_not_foreground_shell() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let host = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        // simulate a tab-merge: host window gains a foreground NON-member shell
+        // tab; the dispatched member terminal stays behind it as a background tab
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
+            let shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+            w.tabs.push(Tab {
+                title: "shell".into(),
+                content: Content::Terminal(shell),
+                chat_member: false,
+            });
+            w.active = 1; // shell in front, member behind
+        }
+        let framed = wm.chat_post(sender, "go").unwrap();
+
+        // Same re-broadcast + pump-everything pattern as
+        // chat_broadcast_hits_members_only_excluding_sender (the DSR trap):
+        // every tab of every window is kept pumped, so a wrongful injection
+        // into the foreground shell would make it exit below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            for w in wm.windows.iter_mut() {
+                for t in w.tabs.iter_mut() {
+                    if let Content::Terminal(s) = &mut t.content {
+                        s.keepalive();
+                    }
+                }
+            }
+            wm.chat_broadcast(sender, &framed);
+            // positive signal: the background member tab exits
+            let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[0].content else {
+                panic!()
+            };
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background member tab never received the broadcast"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // foreground non-member shell saw nothing: still alive after grace
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < grace {
+            for w in wm.windows.iter_mut() {
+                for t in w.tabs.iter_mut() {
+                    if let Content::Terminal(s) = &mut t.content {
+                        s.keepalive();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
+        let Content::Terminal(s) = &mut w.tabs[1].content else {
+            panic!()
+        };
+        assert!(
+            s.exited().is_none(),
+            "foreground non-member shell must not be injected"
+        );
     }
 }
