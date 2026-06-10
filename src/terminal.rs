@@ -183,6 +183,12 @@ impl Session {
         env: &[(String, String)],
         ctx: egui::Context,
     ) -> std::io::Result<Session> {
+        if argv.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "argv is empty",
+            ));
+        }
         let build = |words: &[String]| {
             let mut c = CommandBuilder::new(&words[0]);
             for a in &words[1..] {
@@ -675,7 +681,8 @@ mod tests {
 
     #[test]
     fn spawn_argv_falls_back_to_cmd_for_shims() {
-        // npm-style shim: a .cmd file is not directly CreateProcess-able.
+        // npm-style shim: a .cmd file is not directly CreateProcess-able, so a
+        // bare Ok here proves the cmd /c fallback path actually ran.
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("fake-agent.cmd");
         std::fs::write(&shim, "@echo shim ran\r\n@exit 0\r\n").unwrap();
