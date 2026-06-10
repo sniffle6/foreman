@@ -46,6 +46,11 @@ impl ChatLog {
         self.msgs.last().expect("just pushed")
     }
 
+    /// Read access for renderers; formatting stays with the consumer.
+    pub fn msgs(&self) -> &[ChatMsg] {
+        &self.msgs
+    }
+
     /// Last `n` messages as display lines, oldest first.
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
         let start = self.msgs.len().saturating_sub(n);
@@ -70,6 +75,15 @@ mod tests {
         let m = log.post("t2", "taking the parser refactor");
         assert_eq!(m.line(), "#1 t2: taking the parser refactor");
         assert_eq!(m.frame("p1"), "[chat p1 #1] t2: taking the parser refactor");
+    }
+
+    #[test]
+    fn msgs_exposes_the_raw_slice() {
+        let mut log = ChatLog::new();
+        log.post("t1", "a");
+        log.post("t2", "b");
+        assert_eq!(log.msgs().len(), 2);
+        assert_eq!(log.msgs().last().unwrap().text, "b");
     }
 
     #[test]

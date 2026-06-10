@@ -253,6 +253,9 @@ pub enum Content {
     Terminal(Session),
     /// A project window is a sandbox hosting its own nested WindowManager.
     Project(Box<WindowManager>),
+    /// Read-only viewer of the owning project's chat room. Shares the log via
+    /// Rc — a viewer, not a member: never injected into (spec §4).
+    Chat(Rc<RefCell<crate::chat::ChatLog>>),
 }
 impl Content {
     /// Returns whether a window in this content was interacted with this frame.
@@ -277,6 +280,29 @@ impl Content {
             // The child only reads the keyboard if this project is itself active,
             // so `active` ANDs down the tree to exactly one leaf terminal.
             Content::Project(wm) => wm.show(ui, rect, active, base.with(("proj", win_id))),
+            Content::Chat(log) => {
+                let p = ui.painter_at(rect);
+                p.rect_filled(rect, 0.0, WIN_BG);
+                let font = egui::FontId::monospace(13.0);
+                let line_h = 17.0;
+                let pad = 6.0;
+                let fit = (((rect.height() - 2.0 * pad) / line_h).floor() as usize).max(1);
+                // Borrow stays scoped to this arm — never held across recursion
+                // into other windows' show() (post paths borrow_mut the log).
+                let log = log.borrow();
+                let msgs = log.msgs();
+                let start = msgs.len().saturating_sub(fit);
+                for (i, m) in msgs[start..].iter().enumerate() {
+                    p.text(
+                        egui::pos2(rect.min.x + pad, rect.min.y + pad + i as f32 * line_h),
+                        egui::Align2::LEFT_TOP,
+                        m.line(),
+                        font.clone(),
+                        TEXT,
+                    );
+                }
+                false
+            }
         }
     }
 
@@ -288,6 +314,7 @@ impl Content {
         match self {
             Content::Terminal(s) => s.keepalive(),
             Content::Project(wm) => wm.keepalive(),
+            Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
         }
     }
 }
@@ -765,6 +792,38 @@ impl WindowManager {
         Ok(id)
     }
 
+    /// Open (or focus) this project's chat viewer — singleton per project
+    /// (spec §4). Closing it later doesn't touch the log; the room is the log.
+    fn open_chat_window(&mut self) {
+        if let Some(w) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
+        {
+            // Surface it like the taskbar's Restore does: unminimize and make
+            // the chat tab active before focusing — focus() alone leaves a
+            // minimized window invisible and a background tab hidden.
+            if let Some(i) = w
+                .tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::Chat(_)))
+            {
+                w.active = i;
+            }
+            w.minimized = false;
+            let id = w.id;
+            self.focus(id);
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(420.0, 320.0));
+        self.push_win(
+            id,
+            "chat".into(),
+            rect,
+            Content::Chat(Rc::clone(&self.chat)),
+        );
+    }
+
     /// Post into this project's chat: validate the sender, append, join the
     /// sender (spec §2: join-on-first-post). Returns the framed injection line.
     /// Injection itself is `chat_broadcast` — kept separate because the reply
@@ -998,6 +1057,7 @@ impl WindowManager {
                         Command::LastTerm => child.toggle_last(),
                         Command::TabCycle => child.cycle_tab(true),
                         Command::TabPrev => child.cycle_tab(false),
+                        Command::OpenChat => child.open_chat_window(),
                         // project-level handled above
                         _ => {}
                     }
@@ -1421,6 +1481,7 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),
+                    Content::Chat(_) => {} // no process, no exit marker
                 }
             }
         }
@@ -3110,6 +3171,65 @@ mod tests {
             "posting joins the sender's active tab"
         );
         assert_eq!(wm.chat_history(10), vec![format!("#1 t{t}: hello room")]);
+    }
+
+    #[test]
+    fn open_chat_window_is_a_singleton() {
+        let mut wm = WindowManager::new();
+        wm.open_chat_window();
+        let chat_wins = |wm: &WindowManager| {
+            wm.windows
+                .iter()
+                .filter(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
+                .count()
+        };
+        assert_eq!(chat_wins(&wm), 1);
+        let first = wm.windows.last().unwrap().id;
+        // focus something else, then reopen: focuses, does not duplicate
+        wm.focused = None;
+        wm.open_chat_window();
+        assert_eq!(chat_wins(&wm), 1);
+        assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn open_chat_window_resurfaces_minimized_or_buried_viewer() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.open_chat_window();
+        let id = wm.windows.last().unwrap().id;
+
+        // (a) minimized viewer: reopening must unminimize, not just focus.
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            w.minimized = true;
+        }
+        wm.focused = None;
+        wm.open_chat_window();
+        let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+        assert!(!w.minimized, "reopen must unminimize the viewer");
+        assert_eq!(wm.focused, Some(id));
+
+        // (b) chat tab buried behind a merged terminal tab: reopening must
+        // re-activate the chat tab, not raise the window showing the terminal.
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+            w.tabs.push(Tab {
+                title: "shell".into(),
+                content: Content::Terminal(shell),
+                chat_member: false,
+            });
+            w.active = 1; // terminal in front, chat behind
+        }
+        wm.focused = None;
+        wm.open_chat_window();
+        let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+        assert!(
+            matches!(w.tabs[w.active].content, Content::Chat(_)),
+            "reopen must re-activate the chat tab"
+        );
+        assert_eq!(wm.focused, Some(id));
     }
 
     #[test]

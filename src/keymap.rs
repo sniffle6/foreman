@@ -33,6 +33,8 @@ pub enum Command {
     TabCycle,
     /// Cycle to the previous tab in the focused stack (no fallback).
     TabPrev,
+    /// Open (or focus) the focused project's chat viewer window.
+    OpenChat,
     // project (outer) level
     ProjFocus(Dir),
     ProjSnap(Dir),
@@ -87,6 +89,7 @@ impl Command {
             LastTerm,
             TabCycle,
             TabPrev,
+            OpenChat,
             // Actions
             Help,
             OpenSettings,
@@ -101,7 +104,7 @@ impl Command {
                 Group::Projects
             }
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
-            | LastTerm | TabCycle | TabPrev => Group::Terminals,
+            | LastTerm | TabCycle | TabPrev | OpenChat => Group::Terminals,
             Help | OpenSettings => Group::Actions,
         }
     }
@@ -151,6 +154,7 @@ impl Command {
             LastTerm => "Toggle last terminal",
             TabCycle => "Next tab / last terminal",
             TabPrev => "Previous tab",
+            OpenChat => "Open project chat",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
         }
@@ -504,6 +508,9 @@ impl Default for Keymap {
         t.insert(plain(K::Z), ZoomTerm);
         t.insert(ctrl(K::Z), ZoomProject);
         t.insert(plain(K::Comma), Rename);
+
+        // --- project chat viewer (agent-group-chat §4) ---
+        t.insert(plain(K::G), OpenChat);
 
         // --- tab cycle / last-focused toggle ---
         // `Tab` cycles tabs in the focused stack, falling back to the last-focused
