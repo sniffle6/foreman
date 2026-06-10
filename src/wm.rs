@@ -789,7 +789,7 @@ impl WindowManager {
             // (`title` was moved into push_win — read it back off the window)
             self.chat.borrow_mut().sys(
                 crate::chat::ChatKind::Joined,
-                &format!("t{id}"),
+                &term_tag(id),
                 display_name(w.title()),
             );
         } else {
@@ -853,13 +853,14 @@ impl WindowManager {
         let project = self.tag.as_deref().unwrap_or("p?");
         // .to_string() drops the &mut Win borrow before the RefCell borrow below
         let name = display_name(sender.title()).to_string();
+        let from_tag = term_tag(from);
         let mut log = self.chat.borrow_mut();
         if newly_joined {
             // join-on-first-post: the sysline lands BEFORE the post so the
             // transcript reads join-then-speak
-            log.sys(crate::chat::ChatKind::Joined, &format!("t{from}"), &name);
+            log.sys(crate::chat::ChatKind::Joined, &from_tag, &name);
         }
-        let msg = log.post(&format!("t{from}"), &name, text);
+        let msg = log.post(&from_tag, &name, text);
         Ok(msg.frame(project))
     }
 
@@ -1498,7 +1499,7 @@ impl WindowManager {
                                 // Name must be read BEFORE the marker is appended.
                                 chat.borrow_mut().sys(
                                     crate::chat::ChatKind::Exited,
-                                    &format!("t{wid}"),
+                                    &term_tag(wid),
                                     display_name(&t.title),
                                 );
                             }
@@ -2657,6 +2658,11 @@ fn term_id(spec: &str) -> Result<WinId, String> {
         .ok_or_else(|| format!("bad terminal id: {spec}"))
 }
 
+/// Inverse of `term_id`: render a WinId as the chat identity string.
+fn term_tag(id: WinId) -> String {
+    format!("t{id}")
+}
+
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
@@ -3209,8 +3215,12 @@ mod tests {
         // dispatch auto-join from add_terminal_cmd, then the simulated
         // un-join means: Joined (dispatch), Joined (first post), Post
         assert_eq!(
-            &kinds[kinds.len() - 2..],
-            &[crate::chat::ChatKind::Joined, crate::chat::ChatKind::Post]
+            &kinds[kinds.len() - 3..],
+            &[
+                crate::chat::ChatKind::Joined, // dispatch auto-join
+                crate::chat::ChatKind::Joined, // first post joins
+                crate::chat::ChatKind::Post
+            ]
         );
         drop(log);
         // second post: member already — no second Joined
