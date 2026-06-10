@@ -1,3 +1,4 @@
+mod chat;
 mod control;
 mod dirpicker;
 mod keymap;
