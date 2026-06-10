@@ -223,8 +223,13 @@ On a post the GUI thread:
 reference earlier messages.
 
 **Bracketed paste:** delivery wraps the payload in `ESC[200~ … ESC[201~`
-so multi-line content lands as one paste block, then a **separate `\r`** to
-submit. ESC is stripped from the payload itself (added during
+so multi-line content lands as one paste block, then a **deferred `\r`**
+(~150 ms, fired by the frame loop's pump) to submit. The deferral exists
+because Claude Code's burst detection folds a back-to-back `\r` into the
+paste — it lands as a literal newline and the message sits unsubmitted in
+the input box (live failure, 2026-06-10; the tmux `send-keys; sleep;
+send-keys Enter` problem). Posts inside the window merge into one
+submitted turn. ESC is stripped from the payload itself (added during
 implementation review, mirroring alacritty's paste hygiene) so a crafted
 `ESC[201~` inside the text cannot escape the paste block into live
 keystrokes. The bracketed-paste guards are applied unconditionally —

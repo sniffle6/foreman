@@ -155,7 +155,19 @@ pub struct Session {
     // Dispatch banner queued by inject_note(); flushed (fitted to the real
     // width) by the first resize(). See inject_note for why it is deferred.
     pending_note: Option<String>,
+    // When to send the deferred chat-submit `\r`; fired by pump(). See
+    // inject_input for why the submit cannot ride with the paste.
+    pending_submit: Option<std::time::Instant>,
 }
+
+/// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
+/// input arriving within the same few-ms burst as a paste INTO the paste, so
+/// a `\r` written back-to-back with `ESC[201~` becomes a literal newline in
+/// the input box instead of an Enter keypress (the same reason tmux users
+/// must `send-keys "msg"; sleep; send-keys Enter`). One frame later is not
+/// enough under load; ~150ms is comfortably past the burst window while
+/// still feeling instant.
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
@@ -294,6 +306,7 @@ impl Session {
             sel_anchor: None,
             sel_head: None,
             pending_note: None,
+            pending_submit: None,
         })
     }
 
@@ -385,12 +398,21 @@ impl Session {
     /// input block), so the wrap stays unconditional in v1; gating on
     /// TermMode::BRACKETED_PASTE remains a possible hardening if non-claude
     /// members ever matter.
+    /// The submit is DEFERRED by [`SUBMIT_DELAY`], not written with the
+    /// paste: a back-to-back `\r` gets folded into the paste by Claude
+    /// Code's burst detection and lands as a literal newline (live failure
+    /// 2026-06-10 — message sat unsubmitted in the input box). pump() fires
+    /// it once the deadline passes; the frame loop pumps every session every
+    /// ~16ms, so no extra repaint plumbing is needed. Accepted quirks: two
+    /// posts inside the window merge into one submitted turn for the
+    /// receiver, and bytes buffered through a member's entire boot can still
+    /// coalesce (residual; revisit with age-gating if it bites).
     pub fn inject_input(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         self.send(&paste_wrap(text));
-        self.send(b"\r");
+        self.pending_submit = Some(std::time::Instant::now() + SUBMIT_DELAY);
     }
 
     fn pump(&mut self) {
@@ -401,6 +423,13 @@ impl Session {
         if !reply.is_empty() {
             let _ = self.writer.write_all(&reply);
             let _ = self.writer.flush();
+        }
+        // Deferred chat submit (see inject_input).
+        if let Some(due) = self.pending_submit
+            && std::time::Instant::now() >= due
+        {
+            self.pending_submit = None;
+            self.send(b"\r");
         }
     }
 
@@ -932,6 +961,33 @@ mod tests {
         assert!(
             !interior.contains(&0x1b),
             "payload ESC must be stripped: {b:?}"
+        );
+    }
+
+    #[test]
+    fn inject_input_defers_the_submit_keypress() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.inject_input("hello");
+        assert!(
+            s.pending_submit.is_some(),
+            "submit must be deferred, not written with the paste"
+        );
+        s.pump();
+        assert!(
+            s.pending_submit.is_some(),
+            "a pump before the deadline must not fire the submit"
+        );
+        // a second post inside the window refreshes the deadline (posts merge
+        // into one submitted turn — accepted quirk)
+        s.inject_input("world");
+        assert!(s.pending_submit.is_some());
+        std::thread::sleep(SUBMIT_DELAY + std::time::Duration::from_millis(30));
+        s.pump();
+        assert!(
+            s.pending_submit.is_none(),
+            "a pump past the deadline fires the submit exactly once"
         );
     }
 

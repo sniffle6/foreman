@@ -25,6 +25,14 @@ Dispatch (PowerShell) — pick the mode by whether the human wants to watch:
 If a `-p` worker's text scrolls away or can't be copied, its full transcript
 is recoverable at `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
 
+**Variadic-flag trap (live failure, 2026-06-10):** flags like
+`--allowedTools` consume every following word, so
+`claude --allowedTools Bash Read "<prompt>"` swallows the prompt as a tool
+name — the worker starts with NO task (interactive: an empty REPL; `-p`:
+exits 1 "Input must be provided"). Put the prompt IMMEDIATELY after
+`claude` / `claude -p`, before any variadic flags:
+`claude -p "<full task prompt>" --allowedTools Bash Read Grep`.
+
 - The worker appears as a new terminal in YOUR project (foreman reads
   `FOREMAN_PROJECT_ID` from your environment). Pass `--project pN` to target
   another project, `--cwd <dir>` to set its working directory.

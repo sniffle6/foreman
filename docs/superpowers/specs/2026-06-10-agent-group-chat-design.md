@@ -110,7 +110,13 @@ On a post, the GUI thread:
    - **Framing:** `[chat p1 #14] t2: <text>` — provenance plus seq so
      agents can reference earlier messages.
    - **Bracketed paste** (`ESC[200~ … ESC[201~`) so multi-line content
-     lands as one paste block, then a **separate `\r`** to submit.
+     lands as one paste block, then a **deferred `\r`** (~150 ms) to
+     submit — revised 2026-06-10 after a live failure: a `\r` written
+     back-to-back with the paste is folded into it by Claude Code's
+     burst detection and lands as a literal newline, leaving the message
+     unsubmitted in the input box (the tmux `send-keys; sleep;
+     send-keys Enter` problem). Posts landing inside the window merge
+     into one submitted turn (accepted).
    - Injection uses the existing `Session::send` path via a new
      `inject_input` method.
 
@@ -184,7 +190,8 @@ spawn real `cmd.exe` PTYs — established repo pattern):
   injection (dead reply channel ⇒ log may append, bytes must not flow).
 - History: last-N slicing, formatting, empty room.
 - Framing bytes: `[chat p1 #N] from:` prefix, bracketed-paste wrap,
-  separate trailing `\r`.
+  deferred trailing `\r` (fired by pump after the delay, never written
+  with the paste).
 - Chat window: open command creates the singleton, reopen focuses it,
   renders log lines (state-level assertions; pixel checks are the live
   verify's job).
