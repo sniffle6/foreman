@@ -169,9 +169,11 @@ impl App {
                     CHROME_DIM,
                 );
 
-                for (resp, glyph) in
-                    [(&minb, Glyph::Min), (&maxb, Glyph::Max), (&close, Glyph::Close)]
-                {
+                for (resp, glyph) in [
+                    (&minb, Glyph::Min),
+                    (&maxb, Glyph::Max),
+                    (&close, Glyph::Close),
+                ] {
                     let hovered = resp.hovered();
                     let mut bg = CHROME_BG;
                     if hovered {
@@ -314,9 +316,10 @@ impl eframe::App for App {
             self.started = true;
         }
 
-        while let Ok(control::CtrlMsg::Open(req, reply)) = self.ctrl.try_recv() {
-            let res = self.desktop.handle_open(req, &ctx);
-            let _ = reply.send(res);
+        while let Ok(msg) = self.ctrl.try_recv() {
+            // Drops server-abandoned requests and undoes orphaned spawns; see
+            // WindowManager::handle_ctrl for the reply-timeout contract.
+            self.desktop.handle_ctrl(msg, &ctx);
         }
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -374,5 +377,9 @@ fn main() -> eframe::Result {
             .with_decorations(false),
         ..Default::default()
     };
-    eframe::run_native("Foreman", opts, Box::new(move |_cc| Ok(Box::new(App::new(rx)))))
+    eframe::run_native(
+        "Foreman",
+        opts,
+        Box::new(move |_cc| Ok(Box::new(App::new(rx)))),
+    )
 }

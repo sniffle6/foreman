@@ -5,6 +5,17 @@
 /// Pipe name; `GenericNamespaced` maps it to `\\.\pipe\foreman` on Windows.
 pub const PIPE: &str = "foreman";
 
+/// How long the pipe server waits for the GUI to answer one request. The GUI
+/// drain uses the same constant to drop requests the server has given up on.
+pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Client-side deadline for connecting to a busy pipe. The server handles one
+/// connection at a time, so concurrent dispatchers queue on the pipe (the
+/// `interprocess` crate waits on `ERROR_PIPE_BUSY` via `WaitNamedPipeW`); the
+/// deadline turns "server wedged by a bad client" from an infinite hang into
+/// an error the dispatching agent can act on.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpenRequest {
     pub cmd: String, // always "open" in v1
@@ -30,7 +41,12 @@ pub struct OpenReply {
 
 impl OpenReply {
     pub fn err(msg: impl Into<String>) -> Self {
-        OpenReply { ok: false, terminal: None, project: None, error: Some(msg.into()) }
+        OpenReply {
+            ok: false,
+            terminal: None,
+            project: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -50,10 +66,19 @@ pub fn parse_open_args(
                 if command.is_empty() {
                     return Err("no command after --".into());
                 }
-                return Ok(OpenRequest { cmd: "open".into(), project, cwd, title, command });
+                return Ok(OpenRequest {
+                    cmd: "open".into(),
+                    project,
+                    cwd,
+                    title,
+                    command,
+                });
             }
             flag @ ("--project" | "--title" | "--cwd") => {
-                let v = args.get(i + 1).ok_or_else(|| format!("{flag} needs a value"))?.clone();
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} needs a value"))?
+                    .clone();
                 match flag {
                     "--project" => project = Some(v),
                     "--title" => title = Some(v),
@@ -67,20 +92,27 @@ pub fn parse_open_args(
     Err("missing -- <command...>".into())
 }
 
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream, prelude::*};
+use interprocess::ConnectWaitMode;
+use interprocess::local_socket::{ConnectOptions, GenericNamespaced, ListenerOptions, prelude::*};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc;
 
-/// One control request, plus the channel the GUI thread answers on.
+/// One control request, the channel the GUI thread answers on, and when the
+/// server queued it. The GUI must NOT execute requests older than
+/// [`REPLY_TIMEOUT`]: the server has already told that client "foreman did not
+/// respond", so spawning would open a terminal the dispatcher believes failed —
+/// and a retrying dispatcher would then create a duplicate.
 pub enum CtrlMsg {
-    Open(OpenRequest, mpsc::Sender<OpenReply>),
+    Open(OpenRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
 /// GUI drains `tx`'s receiver each frame. One JSON line in, one JSON line out,
 /// per connection.
 pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
-    let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else { return };
+    let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else {
+        return;
+    };
     let listener = match ListenerOptions::new().name(name).create_sync() {
         Ok(l) => l,
         // Another foreman owns the pipe (or it's blocked): GUI still works,
@@ -105,25 +137,33 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
             Ok(req) if req.cmd != "open" => OpenReply::err(format!("unknown cmd: {}", req.cmd)),
             Ok(req) => {
                 let (rtx, rrx) = mpsc::channel();
-                if tx.send(CtrlMsg::Open(req, rtx)).is_err() {
+                if tx
+                    .send(CtrlMsg::Open(req, rtx, std::time::Instant::now()))
+                    .is_err()
+                {
                     return; // GUI gone; stop serving
                 }
-                rrx.recv_timeout(std::time::Duration::from_secs(5))
+                rrx.recv_timeout(REPLY_TIMEOUT)
                     .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
             }
             Err(e) => OpenReply::err(format!("bad request: {e}")),
         };
-        let mut out =
-            serde_json::to_string(&reply).expect("OpenReply is always serializable");
+        let mut out = serde_json::to_string(&reply).expect("OpenReply is always serializable");
         out.push('\n');
         let _ = conn.get_mut().write_all(out.as_bytes());
     }
 }
 
 /// Client side: send one request, wait for the one-line reply.
+///
+/// Connecting waits (deadline-bounded) while the serial server is busy with
+/// another client; a pipe that doesn't exist at all still fails immediately.
 pub fn request(pipe: &str, req: &OpenRequest) -> std::io::Result<OpenReply> {
     let name = pipe.to_ns_name::<GenericNamespaced>()?;
-    let conn = Stream::connect(name)?;
+    let conn = ConnectOptions::new()
+        .name(name)
+        .wait_mode(ConnectWaitMode::Timeout(CONNECT_TIMEOUT))
+        .connect_sync()?;
     let mut conn = BufReader::new(conn);
     let mut line = serde_json::to_string(req).map_err(std::io::Error::other)?;
     line.push('\n');
@@ -155,6 +195,13 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("foreman open: {}", r.error.unwrap_or_default());
             1
         }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            eprintln!(
+                "foreman open: foreman is running but its control pipe stayed busy for {}s — retry, or check for a wedged dispatch",
+                CONNECT_TIMEOUT.as_secs()
+            );
+            1
+        }
         Err(e) => {
             eprintln!("foreman open: cannot reach foreman ({e}) — is it running?");
             1
@@ -178,7 +225,12 @@ mod tests {
 
     #[test]
     fn reply_roundtrips_and_omits_none_fields() {
-        let ok = OpenReply { ok: true, terminal: Some("t4".into()), project: Some("p1".into()), error: None };
+        let ok = OpenReply {
+            ok: true,
+            terminal: Some("t4".into()),
+            project: Some("p1".into()),
+            error: None,
+        };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(!s.contains("error"));
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), ok);
@@ -192,7 +244,18 @@ mod tests {
     #[test]
     fn parse_full_flags() {
         let req = parse_open_args(
-            &s(&["--project", "p2", "--title", "agent · t", "--cwd", "H:\\x", "--", "claude", "-p", "task"]),
+            &s(&[
+                "--project",
+                "p2",
+                "--title",
+                "agent · t",
+                "--cwd",
+                "H:\\x",
+                "--",
+                "claude",
+                "-p",
+                "task",
+            ]),
             None,
         )
         .unwrap();
@@ -207,7 +270,8 @@ mod tests {
         let req = parse_open_args(&s(&["--", "cmd.exe"]), Some("p7".into())).unwrap();
         assert_eq!(req.project.as_deref(), Some("p7"));
         // explicit flag beats the default
-        let req = parse_open_args(&s(&["--project", "p1", "--", "cmd.exe"]), Some("p7".into())).unwrap();
+        let req =
+            parse_open_args(&s(&["--project", "p1", "--", "cmd.exe"]), Some("p7".into())).unwrap();
         assert_eq!(req.project.as_deref(), Some("p1"));
     }
 
@@ -218,6 +282,29 @@ mod tests {
         assert!(parse_open_args(&s(&["--"]), None).is_err()); // no command
         assert!(parse_open_args(&s(&["claude"]), None).is_err()); // missing --
         assert!(parse_open_args(&s(&["--nope", "--", "x"]), None).is_err());
+    }
+
+    #[test]
+    fn request_to_missing_pipe_fails_fast() {
+        // No pipe with this name exists: the client must error immediately
+        // (ERROR_FILE_NOT_FOUND), not sit out the busy-pipe connect deadline.
+        let req = OpenRequest {
+            cmd: "open".into(),
+            project: None,
+            cwd: None,
+            title: None,
+            command: vec!["x".into()],
+        };
+        let t0 = std::time::Instant::now();
+        let r = request(
+            &format!("foreman-test-missing-{}", std::process::id()),
+            &req,
+        );
+        assert!(r.is_err());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "missing pipe must fail fast, not wait CONNECT_TIMEOUT"
+        );
     }
 
     #[test]
@@ -257,9 +344,13 @@ mod tests {
         std::thread::spawn(move || serve(&p2, tx));
         // Fake GUI thread: answer the first request.
         std::thread::spawn(move || {
-            let CtrlMsg::Open(req, reply) =
+            let CtrlMsg::Open(req, reply, sent) =
                 rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             assert_eq!(req.command, vec!["cmd.exe", "/c", "echo hi"]);
+            assert!(
+                sent.elapsed() < REPLY_TIMEOUT,
+                "server stamps requests when queued"
+            );
             let _ = reply.send(OpenReply {
                 ok: true,
                 terminal: Some("t9".into()),

@@ -456,9 +456,9 @@ impl Default for Keymap {
     /// The in-code defaults — a faithful, exhaustive reproduction of the Phase 1
     /// `resolve` match. If you add a `Command`, add its default binding here.
     fn default() -> Self {
-        use egui::Key as K;
         use Command::*;
         use Dir::*;
+        use egui::Key as K;
 
         // Helper closures keep the table terse and unambiguous about modifiers.
         let plain = |k: K| Chord::new(k, false, false, false);
@@ -605,7 +605,7 @@ fn default_canonical(command: Command) -> Option<Chord> {
     use egui::Key as K;
     match command {
         Command::Help => Some(Chord::new(K::Questionmark, false, true, false)), // Shift+? (typed form)
-        Command::NewProject => Some(Chord::new(K::P, false, true, false)),       // Shift+P
+        Command::NewProject => Some(Chord::new(K::P, false, true, false)),      // Shift+P
         _ => None,
     }
 }
@@ -950,7 +950,10 @@ mod tests {
 
     #[test]
     fn pretty_prints_modifiers_and_arrows() {
-        assert_eq!(Chord::new(K::ArrowRight, true, true, false).pretty(), "Ctrl+Shift+→");
+        assert_eq!(
+            Chord::new(K::ArrowRight, true, true, false).pretty(),
+            "Ctrl+Shift+→"
+        );
         assert_eq!(Chord::new(K::Comma, true, false, false).pretty(), "Ctrl+,");
         assert_eq!(Chord::new(K::C, false, false, false).pretty(), "C");
     }

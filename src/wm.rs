@@ -230,8 +230,16 @@ fn resolve_zone(
     match raw {
         Some(Zone::Top) => {
             let p = (((held - (TOP_HOLD - GROW_LEAD)) / GROW_LEAD) as f32).clamp(0.0, 1.0);
-            let ov = lerp_rect(zone_rect(Zone::Top, asz, split), zone_rect(Zone::Max, asz, split), p);
-            let committed = if held >= TOP_HOLD { Zone::Max } else { Zone::Top };
+            let ov = lerp_rect(
+                zone_rect(Zone::Top, asz, split),
+                zone_rect(Zone::Max, asz, split),
+                p,
+            );
+            let committed = if held >= TOP_HOLD {
+                Zone::Max
+            } else {
+                Zone::Top
+            };
             (Some(committed), Some(ov))
         }
         Some(z) => (Some(z), Some(zone_rect(z, asz, split))),
@@ -353,12 +361,20 @@ enum Act {
     CloseTab(WinId, usize),
     /// Merge the source window's tabs onto the target window's stack, then remove
     /// the source. Fired when a window's titlebar is dropped onto another window.
-    Merge { src: WinId, dst: WinId },
+    Merge {
+        src: WinId,
+        dst: WinId,
+    },
     /// Detach tab `idx` of window `id` into a new floating window at `pos` (local).
     /// `grab` transfers the in-progress pointer drag onto the new window's title so
     /// it keeps following the cursor (live drag-out); set false for a drop-release
     /// detach where no drag continues.
-    Untab { id: WinId, idx: usize, pos: egui::Pos2, grab: bool },
+    Untab {
+        id: WinId,
+        idx: usize,
+        pos: egui::Pos2,
+        grab: bool,
+    },
 }
 
 pub struct WindowManager {
@@ -543,37 +559,83 @@ impl WindowManager {
         }
     }
 
-    /// Handle a control-channel open request (desktop manager only).
-    pub fn handle_open(&mut self, req: crate::control::OpenRequest, ctx: &egui::Context) -> crate::control::OpenReply {
-        use crate::control::OpenReply;
-        if req.command.is_empty() || req.command[0].is_empty() {
-            return OpenReply::err("empty command");
+    /// Drain-side handler for one control message (desktop manager only).
+    /// Enforces both halves of the reply-timeout contract:
+    /// - a request the pipe server already timed out on is dropped unexecuted
+    ///   (the client was told "foreman did not respond"; spawning now would
+    ///   open a terminal the dispatcher believes failed, and its retry would
+    ///   create a duplicate);
+    /// - if the server times out between our age check and the reply (the
+    ///   receiver is gone), the just-spawned terminal is closed again so the
+    ///   failure the client saw stays true.
+    pub fn handle_ctrl(&mut self, msg: crate::control::CtrlMsg, ctx: &egui::Context) {
+        let crate::control::CtrlMsg::Open(req, reply, sent) = msg;
+        if sent.elapsed() >= crate::control::REPLY_TIMEOUT {
+            return;
         }
-        let pid = match self.resolve_project(req.project.as_deref()) {
-            Ok(id) => id,
-            Err(e) => return OpenReply::err(e),
-        };
-        let win = self.windows.iter_mut().find(|w| w.id == pid).expect("resolved");
-        let Content::Project(child) = &mut win.tabs[win.active].content else {
-            return OpenReply::err("not a project"); // unreachable after resolve
-        };
-        match child.add_terminal_cmd(
-            &req.command,
-            req.cwd.as_deref().map(std::path::Path::new),
-            req.title.as_deref(),
-            ctx,
-        ) {
-            Ok(tid) => OpenReply {
+        let res = self.open_dispatch(req, ctx);
+        let undo = res.as_ref().ok().copied();
+        if reply.send(Self::open_reply(res)).is_err() {
+            if let Some((pid, tid)) = undo {
+                self.close_terminal(pid, tid);
+            }
+        }
+    }
+
+    fn open_reply(res: Result<(WinId, WinId), String>) -> crate::control::OpenReply {
+        use crate::control::OpenReply;
+        match res {
+            Ok((pid, tid)) => OpenReply {
                 ok: true,
                 terminal: Some(format!("t{tid}")),
                 project: Some(format!("p{pid}")),
                 error: None,
             },
-            Err(e) => OpenReply::err(format!("spawn failed: {e}")),
+            Err(e) => OpenReply::err(e),
+        }
+    }
+
+    /// Resolve + spawn for a dispatch request; returns (project id, terminal id).
+    fn open_dispatch(
+        &mut self,
+        req: crate::control::OpenRequest,
+        ctx: &egui::Context,
+    ) -> Result<(WinId, WinId), String> {
+        if req.command.is_empty() || req.command[0].is_empty() {
+            return Err("empty command".into());
+        }
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let win = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == pid)
+            .expect("resolved");
+        let Content::Project(child) = &mut win.tabs[win.active].content else {
+            return Err("not a project".into()); // unreachable after resolve
+        };
+        child
+            .add_terminal_cmd(
+                &req.command,
+                req.cwd.as_deref().map(std::path::Path::new),
+                req.title.as_deref(),
+                ctx,
+            )
+            .map(|tid| (pid, tid))
+            .map_err(|e| format!("spawn failed: {e}"))
+    }
+
+    /// Close terminal `tid` inside project `pid` (the dispatch undo path).
+    fn close_terminal(&mut self, pid: WinId, tid: WinId) {
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid) {
+            if let Content::Project(child) = &mut win.tabs[win.active].content {
+                child.close(tid);
+            }
         }
     }
 
     /// Spawn an explicit command (agent dispatch) as a terminal in this manager.
+    /// The session opens with a dim banner line (see [`dispatch_banner`]) so the
+    /// pane announces itself before a silent worker produces any output.
     fn add_terminal_cmd(
         &mut self,
         argv: &[String],
@@ -583,9 +645,12 @@ impl WindowManager {
     ) -> std::io::Result<WinId> {
         let env = self.term_env(self.next);
         let cwd = cwd.or(self.cwd.as_deref());
-        let s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
+        let mut s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
+        s.inject_note(&dispatch_banner(argv));
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
-        let title = title.map(str::to_string).unwrap_or_else(|| format!("agent · {}", argv[0]));
+        let title = title
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("agent · {}", argv[0]));
         // push_win focuses the new window; a dispatched agent must never yank
         // the keyboard out from under the user mid-keystroke (fire-and-watch:
         // the new terminal is to LOOK at, not type into). Keep focus where it
@@ -662,7 +727,9 @@ impl WindowManager {
             // leader never reaches a PTY.
             let leader = self.keymap.leader;
             let hit = ui.input(|i| {
-                i.events.iter().any(|e| Self::event_chord(e) == Some(leader))
+                i.events
+                    .iter()
+                    .any(|e| Self::event_chord(e) == Some(leader))
             });
             if hit {
                 self.armed = true;
@@ -1039,7 +1106,11 @@ impl WindowManager {
     /// pops back to floating at its pre-snap rect.
     fn snap_dir(&mut self, d: Dir) {
         let Some(id) = self.focused else { return };
-        let cur = self.windows.iter().find(|w| w.id == id).and_then(|w| w.snap);
+        let cur = self
+            .windows
+            .iter()
+            .find(|w| w.id == id)
+            .and_then(|w| w.snap);
         match compose_zone(cur, d) {
             Some(zone) => self.snap_or_tab(id, zone),
             None => {
@@ -1203,7 +1274,13 @@ impl WindowManager {
     /// Returns whether any window in this manager was interacted with this frame.
     /// The parent uses this to propagate focus upward: clicking a sub-window in a
     /// background project bubbles up and switches the desktop to that project.
-    pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect, active: bool, base: egui::Id) -> bool {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        active: bool,
+        base: egui::Id,
+    ) -> bool {
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
         self.last_area = area.size();
@@ -1265,9 +1342,15 @@ impl WindowManager {
             let ctl_w = if is_project { 116.0 } else { 88.0 };
 
             // --- title drag (interact first, then we know final position) ---
-            let drag_rect =
-                egui::Rect::from_min_size(scr.min, egui::vec2((scr.width() - ctl_w).max(0.0), TITLE_H));
-            let dr = ui.interact(drag_rect, base.with((id, "drag")), egui::Sense::click_and_drag());
+            let drag_rect = egui::Rect::from_min_size(
+                scr.min,
+                egui::vec2((scr.width() - ctl_w).max(0.0), TITLE_H),
+            );
+            let dr = ui.interact(
+                drag_rect,
+                base.with((id, "drag")),
+                egui::Sense::click_and_drag(),
+            );
             if dr.drag_started() || dr.clicked() {
                 acts.push(Act::Focus(id));
             }
@@ -1283,8 +1366,11 @@ impl WindowManager {
                     )
                     .size()
                     .x;
-                let name_rect = egui::Rect::from_min_size(scr.min, egui::vec2(title_w + 22.0, TITLE_H));
-                let on_name = dr.interact_pointer_pos().is_some_and(|p| name_rect.contains(p));
+                let name_rect =
+                    egui::Rect::from_min_size(scr.min, egui::vec2(title_w + 22.0, TITLE_H));
+                let on_name = dr
+                    .interact_pointer_pos()
+                    .is_some_and(|p| name_rect.contains(p));
                 if on_name {
                     self.renaming = Some(id);
                     self.rename_buf = self.windows[i].title().to_string();
@@ -1300,8 +1386,7 @@ impl WindowManager {
                     // double-click/restore, it returns to its pre-snap size; we re-anchor
                     // the restored rect under the cursor so the title stays grabbed.
                     if w.snap.is_some() {
-                        if let (Some(pr), Some(p)) =
-                            (w.prev.take(), ui.ctx().pointer_latest_pos())
+                        if let (Some(pr), Some(p)) = (w.prev.take(), ui.ctx().pointer_latest_pos())
                         {
                             let local = p - area.min.to_vec2();
                             let frac = if w.rect.width() > 0.0 {
@@ -1326,8 +1411,7 @@ impl WindowManager {
                 // window's stack. While hovering a merge target we suppress the snap
                 // overlay and instead highlight the target (handled at paint time).
                 let pointer = ui.ctx().pointer_latest_pos();
-                let over_target =
-                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
+                let over_target = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
                 if let Some(tgt) = over_target {
                     merge_hint = Some(tgt);
                     self.dwell_zone = None;
@@ -1356,8 +1440,7 @@ impl WindowManager {
                 let pointer = ui.ctx().pointer_latest_pos();
                 // A drop onto another window merges (tabs) onto it and wins over the
                 // snap: the dragged window is consumed, so we skip snapping entirely.
-                let merge_dst =
-                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
+                let merge_dst = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
                 if let Some(dst_i) = merge_dst {
                     let dst = self.windows[dst_i].id;
                     acts.push(Act::Merge { src: id, dst });
@@ -1421,11 +1504,7 @@ impl WindowManager {
             } else {
                 (TITLE_BG, TITLE_BG_FOCUS)
             };
-            p.rect_filled(
-                title_rect,
-                cr,
-                if is_focus { tbg_focus } else { tbg },
-            );
+            p.rect_filled(title_rect, cr, if is_focus { tbg_focus } else { tbg });
             // Right edge of the title/tab area; the project shell chips anchor here
             // so they never overlap a multi-tab bar. Set by each titlebar branch.
             let title_end_x;
@@ -1504,10 +1583,8 @@ impl WindowManager {
                         // few, and cycling still reaches the rest.
                         break;
                     }
-                    let chip = egui::Rect::from_min_size(
-                        egui::pos2(cx, cy),
-                        egui::vec2(chip_w, chip_h),
-                    );
+                    let chip =
+                        egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(chip_w, chip_h));
                     let chip_resp = ui.interact(
                         chip,
                         base.with((id, "tab", ti)),
@@ -1553,11 +1630,17 @@ impl WindowManager {
                     let xstroke = egui::Stroke::new(1.2, xcol);
                     let pp = ui.painter();
                     pp.line_segment(
-                        [egui::pos2(xc.x - xs, xc.y - xs), egui::pos2(xc.x + xs, xc.y + xs)],
+                        [
+                            egui::pos2(xc.x - xs, xc.y - xs),
+                            egui::pos2(xc.x + xs, xc.y + xs),
+                        ],
                         xstroke,
                     );
                     pp.line_segment(
-                        [egui::pos2(xc.x - xs, xc.y + xs), egui::pos2(xc.x + xs, xc.y - xs)],
+                        [
+                            egui::pos2(xc.x - xs, xc.y + xs),
+                            egui::pos2(xc.x + xs, xc.y - xs),
+                        ],
                         xstroke,
                     );
                     if xresp.clicked() {
@@ -1646,13 +1729,15 @@ impl WindowManager {
                         break;
                     }
                     let r = egui::Rect::from_min_size(egui::pos2(kx, ky), egui::vec2(kw, kh));
-                    let kresp = ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
+                    let kresp =
+                        ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
                     let kbg = if kresp.hovered() {
                         egui::Color32::from_rgb(72, 82, 76)
                     } else {
                         egui::Color32::from_rgb(45, 51, 48)
                     };
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(3), kbg);
+                    ui.painter()
+                        .rect_filled(r, egui::CornerRadius::same(3), kbg);
                     ui.painter().text(
                         r.center(),
                         egui::Align2::CENTER_CENTER,
@@ -1799,14 +1884,90 @@ impl WindowManager {
             type Ci = egui::CursorIcon;
             // (key, rect, left, right, top, bottom, cursor)
             let handles: [(&str, egui::Rect, bool, bool, bool, bool, Ci); 8] = [
-                ("w", egui::Rect::from_min_max(egui::pos2(x0, y0 + bnd), egui::pos2(x0 + bnd, y1 - bnd)), true, false, false, false, Ci::ResizeWest),
-                ("e", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y0 + bnd), egui::pos2(x1, y1 - bnd)), false, true, false, false, Ci::ResizeEast),
-                ("n", egui::Rect::from_min_max(egui::pos2(x0 + bnd, y0), egui::pos2(x1 - bnd, y0 + bnd)), false, false, true, false, Ci::ResizeNorth),
-                ("s", egui::Rect::from_min_max(egui::pos2(x0 + bnd, y1 - bnd), egui::pos2(x1 - bnd, y1)), false, false, false, true, Ci::ResizeSouth),
-                ("nw", egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + bnd, y0 + bnd)), true, false, true, false, Ci::ResizeNorthWest),
-                ("ne", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y0), egui::pos2(x1, y0 + bnd)), false, true, true, false, Ci::ResizeNorthEast),
-                ("sw", egui::Rect::from_min_max(egui::pos2(x0, y1 - bnd), egui::pos2(x0 + bnd, y1)), true, false, false, true, Ci::ResizeSouthWest),
-                ("se", egui::Rect::from_min_max(egui::pos2(x1 - bnd, y1 - bnd), egui::pos2(x1, y1)), false, true, false, true, Ci::ResizeSouthEast),
+                (
+                    "w",
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, y0 + bnd),
+                        egui::pos2(x0 + bnd, y1 - bnd),
+                    ),
+                    true,
+                    false,
+                    false,
+                    false,
+                    Ci::ResizeWest,
+                ),
+                (
+                    "e",
+                    egui::Rect::from_min_max(
+                        egui::pos2(x1 - bnd, y0 + bnd),
+                        egui::pos2(x1, y1 - bnd),
+                    ),
+                    false,
+                    true,
+                    false,
+                    false,
+                    Ci::ResizeEast,
+                ),
+                (
+                    "n",
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0 + bnd, y0),
+                        egui::pos2(x1 - bnd, y0 + bnd),
+                    ),
+                    false,
+                    false,
+                    true,
+                    false,
+                    Ci::ResizeNorth,
+                ),
+                (
+                    "s",
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0 + bnd, y1 - bnd),
+                        egui::pos2(x1 - bnd, y1),
+                    ),
+                    false,
+                    false,
+                    false,
+                    true,
+                    Ci::ResizeSouth,
+                ),
+                (
+                    "nw",
+                    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + bnd, y0 + bnd)),
+                    true,
+                    false,
+                    true,
+                    false,
+                    Ci::ResizeNorthWest,
+                ),
+                (
+                    "ne",
+                    egui::Rect::from_min_max(egui::pos2(x1 - bnd, y0), egui::pos2(x1, y0 + bnd)),
+                    false,
+                    true,
+                    true,
+                    false,
+                    Ci::ResizeNorthEast,
+                ),
+                (
+                    "sw",
+                    egui::Rect::from_min_max(egui::pos2(x0, y1 - bnd), egui::pos2(x0 + bnd, y1)),
+                    true,
+                    false,
+                    false,
+                    true,
+                    Ci::ResizeSouthWest,
+                ),
+                (
+                    "se",
+                    egui::Rect::from_min_max(egui::pos2(x1 - bnd, y1 - bnd), egui::pos2(x1, y1)),
+                    false,
+                    true,
+                    false,
+                    true,
+                    Ci::ResizeSouthEast,
+                ),
             ];
             for (key, hr, hl, hrr, ht, hb, cursor) in handles {
                 let resp = ui.interact(hr, base.with((id, "rsz", key)), egui::Sense::drag());
@@ -1904,7 +2065,10 @@ impl WindowManager {
 
         // --- merge (tab) drop hint: highlight the target window while hovering ---
         if let Some(j) = merge_hint {
-            let r = self.windows[j].rect.translate(area.min.to_vec2()).intersect(area);
+            let r = self.windows[j]
+                .rect
+                .translate(area.min.to_vec2())
+                .intersect(area);
             let p = ui.painter_at(area);
             p.rect_filled(r, egui::CornerRadius::same(8), SNAP_FILL);
             p.rect_stroke(
@@ -2106,7 +2270,10 @@ impl WindowManager {
 
         // (key, value). Empty value = section header; empty both = spacer.
         let mut rows: Vec<(String, String)> = Vec::new();
-        rows.push(("Leader".into(), format!("{}  (then a command)", self.keymap.leader.pretty())));
+        rows.push((
+            "Leader".into(),
+            format!("{}  (then a command)", self.keymap.leader.pretty()),
+        ));
         for &g in Group::ALL {
             rows.push((String::new(), String::new()));
             rows.push((format!("{} (after leader)", g.title()), String::new()));
@@ -2236,6 +2403,20 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
 }
 
+/// One dim line injected into a dispatched terminal at spawn, so the pane is
+/// never blank while a silent worker (`claude -p`) runs. Truncated so a long
+/// task prompt can't flood the pane.
+fn dispatch_banner(argv: &[String]) -> String {
+    let full = argv.join(" ");
+    // 15-char prefix + 60 + "… ──" = 79 chars: fits the 80-col spawn-time grid.
+    if full.chars().count() > 60 {
+        let head: String = full.chars().take(60).collect();
+        format!("── dispatched: {head}… ──")
+    } else {
+        format!("── dispatched: {full} ──")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2448,110 @@ mod tests {
         });
         wm.focused = Some(id);
         id
+    }
+
+    // --- agent-dispatch drain semantics (handle_ctrl) ---
+
+    // A dispatch message targeting the focused project, plus the receiver the
+    // pipe server would be holding. `sent` backdates the server-side timestamp.
+    fn dispatch_msg(
+        sent: std::time::Instant,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::OpenRequest {
+            cmd: "open".into(),
+            project: None,
+            cwd: None,
+            title: Some("agent · test".into()),
+            command: vec!["cmd.exe".into(), "/c".into(), "exit 0".into()],
+        };
+        (crate::control::CtrlMsg::Open(req, rtx, sent), rrx)
+    }
+
+    fn project_terminal_count(wm: &WindowManager) -> usize {
+        let pid = wm.focused.expect("a focused project");
+        let win = wm.windows.iter().find(|w| w.id == pid).unwrap();
+        let Content::Project(child) = &win.tabs[win.active].content else {
+            panic!("focused window is not a project")
+        };
+        child.windows.len()
+    }
+
+    #[test]
+    fn dispatch_banner_shows_command_and_truncates_long_prompts() {
+        let argv: Vec<String> = ["claude", "-p", "task"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dispatch_banner(&argv), "── dispatched: claude -p task ──");
+        // A 500-char prompt must not flood the pane — and truncation must not
+        // split a multi-byte char (the title convention uses "·" freely).
+        let long: Vec<String> = vec!["claude".into(), "-p".into(), "é".repeat(500)];
+        let b = dispatch_banner(&long);
+        assert!(
+            // The grid is 80 cols until the first render; the banner must not wrap.
+            b.chars().count() <= 80,
+            "banner too long: {} chars",
+            b.chars().count()
+        );
+        assert!(
+            b.ends_with("… ──"),
+            "truncated banner ends with ellipsis: {b:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_dispatch_spawns_and_replies() {
+        let mut wm = WindowManager::new();
+        push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        let (msg, rrx) = dispatch_msg(std::time::Instant::now());
+        wm.handle_ctrl(msg, &ctx);
+        let reply = rrx.try_recv().expect("reply must be sent");
+        assert!(reply.ok);
+        // The protocol promises "tN"/"pN"-formatted ids (epic § protocol).
+        assert!(reply.terminal.is_some_and(|t| t.starts_with('t')));
+        assert!(reply.project.is_some_and(|p| p.starts_with('p')));
+        assert_eq!(project_terminal_count(&wm), 1);
+    }
+
+    #[test]
+    fn stale_dispatch_is_dropped_without_spawning() {
+        let mut wm = WindowManager::new();
+        push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        // The pipe server gave up on this request REPLY_TIMEOUT ago and told the
+        // client "foreman did not respond"; executing it now would open a
+        // terminal the dispatcher believes failed (a retry then duplicates it).
+        let sent = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = dispatch_msg(sent);
+        wm.handle_ctrl(msg, &ctx);
+        assert!(rrx.try_recv().is_err(), "no reply for an abandoned request");
+        assert_eq!(
+            project_terminal_count(&wm),
+            0,
+            "stale request must not spawn"
+        );
+    }
+
+    #[test]
+    fn orphaned_reply_undoes_the_spawn() {
+        let mut wm = WindowManager::new();
+        push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        let (msg, rrx) = dispatch_msg(std::time::Instant::now());
+        // Server timed out between our age check and the reply: receiver gone.
+        drop(rrx);
+        wm.handle_ctrl(msg, &ctx);
+        assert_eq!(
+            project_terminal_count(&wm),
+            0,
+            "client was told the dispatch failed; the terminal must not survive"
+        );
     }
 
     #[test]
@@ -2309,7 +2594,13 @@ mod tests {
         use Zone::*;
         // (current snap, Left, Right, Up, Down) — `None` = floating. Mirrors the
         // design table exactly so a regression in the state machine is obvious.
-        let rows: &[(Option<Zone>, Option<Zone>, Option<Zone>, Option<Zone>, Option<Zone>)] = &[
+        let rows: &[(
+            Option<Zone>,
+            Option<Zone>,
+            Option<Zone>,
+            Option<Zone>,
+            Option<Zone>,
+        )] = &[
             (None, Some(Left), Some(Right), Some(Top), Some(Bottom)),
             (Some(Max), Some(Left), Some(Right), Some(Top), Some(Bottom)),
             (Some(Left), None, Some(Right), Some(Tl), Some(Bl)),
@@ -2431,9 +2722,17 @@ mod tests {
         wm.cycle_tab(true);
         assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 2);
         wm.cycle_tab(true);
-        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 0, "wraps");
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().active,
+            0,
+            "wraps"
+        );
         wm.cycle_tab(false);
-        assert_eq!(wm.windows.iter().find(|w| w.id == id).unwrap().active, 2, "back wraps");
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().active,
+            2,
+            "back wraps"
+        );
     }
 
     #[test]

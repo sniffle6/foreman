@@ -79,6 +79,14 @@ command directly (not wrapped in a shell). It snaps/tabs like any terminal
 but deliberately does NOT take focus — a dispatch must never move the
 keyboard out from under the user. Title: `agent · <label>`.
 
+The pane opens with a dim `── dispatched: <command> ──` banner injected
+into the emulator (not the PTY) at spawn, truncated to one 80-col line. A
+`claude -p` worker prints nothing until it finishes, so without the banner
+an empty pane reads as hung; with it, silence reads as "working". Injecting
+in foreman (vs an `echo` wrapper in the dispatch command) avoids cmd.exe
+quoting hazards — task prompts containing `&` or quotes would split or
+break a `cmd /c "echo … & claude …"` wrapper.
+
 - **Exit:** when the process ends, the terminal stays open with scrollback
   and the title gains `exited (code)`. In fire-and-watch the terminal IS the
   record — closing is manual.
@@ -90,7 +98,13 @@ keyboard out from under the user. Title: `agent · <label>`.
 ### 5. Claude as first client
 
 A small skill/CLAUDE.md note teaches Claude: "to dispatch a visible agent,
-run `foreman open --title \"agent · <label>\" -- claude -p \"<task>\"`".
+run `foreman open --title \"agent · <label>\" -- claude \"<task>\"`" —
+interactive mode, because `claude -p` prints NOTHING until it finishes
+(verified: `--verbose` does not change this; only
+`--output-format stream-json` streams, as raw JSON), which reads as a hung
+terminal for the whole run. Interactive workers stream live and accept
+steering/permission answers in their own pane; `-p` remains the
+fire-and-forget option when nobody is watching.
 Model-agnostic by construction — a codex variant is the same line with a
 different command.
 
@@ -105,8 +119,16 @@ different command.
   they pass an explicit `--project`.
 - **One foreman instance per machine** (v1). First instance owns the pipe.
 - **One request in flight at a time.** The pipe thread handles connections
-  serially (a dispatch can hold it for up to 5s); a concurrent client may
-  get a busy/connect error and should just retry.
+  serially (a dispatch can hold it for up to 5s). Concurrent clients do NOT
+  error: `interprocess` waits on a busy pipe (`WaitNamedPipeW`), so they
+  queue, bounded by the client's 10s connect deadline (`CONNECT_TIMEOUT`) —
+  a wedged server surfaces as a clear timeout error instead of an infinite
+  hang.
+- **A timed-out request never executes.** If the GUI doesn't drain within 5s
+  (`REPLY_TIMEOUT`), the server tells the client "foreman did not respond" —
+  and the GUI drops the stale request (or closes the terminal if the timeout
+  raced the spawn). The client's failure report is always true, so a
+  retrying dispatcher can't create duplicate terminals.
 - **The pipe is a command-execution surface.** Security boundary v1 is the
   pipe's default same-user ACL — anything running as you can open terminals.
   That's the same trust level as the shell itself.
@@ -125,7 +147,8 @@ different command.
 - `src/control.rs` — pipe server thread, protocol types, arg parsing, client mode.
 - `src/main.rs` — argv split (subcommand → client, else GUI); drain the
   control channel each frame and route to the desktop `WindowManager`.
-- `src/wm.rs` — `handle_open` (request → project → spawn), `add_terminal_cmd`,
-  project resolution, env injection, exited-title refresh.
+- `src/wm.rs` — `handle_ctrl` (drain: stale-drop → project → spawn → reply,
+  with orphaned-spawn undo), `add_terminal_cmd`, project resolution, env
+  injection, exited-title refresh.
 - `src/terminal.rs` — command sessions (vs shell sessions), env injection,
   exited-state title.

@@ -2,7 +2,7 @@ use eframe::egui;
 use eframe::egui::text::LayoutJob;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -11,7 +11,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 pub const FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 pub const BG: egui::Color32 = egui::Color32::from_rgb(20, 18, 15);
@@ -210,7 +210,11 @@ impl Session {
         })
     }
 
-    fn spawn_with(cmd: CommandBuilder, shell: Shell, ctx: egui::Context) -> std::io::Result<Session> {
+    fn spawn_with(
+        cmd: CommandBuilder,
+        shell: Shell,
+        ctx: egui::Context,
+    ) -> std::io::Result<Session> {
         let (cols, rows) = (80usize, 24usize);
         let pty = native_pty_system();
         let pair = pty
@@ -296,8 +300,10 @@ impl Session {
     }
 
     fn cell_at(&self, rect: egui::Rect, cw: f32, rh: f32, pos: egui::Pos2) -> (usize, usize) {
-        let col = (((pos.x - rect.min.x) / cw).floor() as i64).clamp(0, self.cols as i64 - 1) as usize;
-        let row = (((pos.y - rect.min.y) / rh).floor() as i64).clamp(0, self.rows as i64 - 1) as usize;
+        let col =
+            (((pos.x - rect.min.x) / cw).floor() as i64).clamp(0, self.cols as i64 - 1) as usize;
+        let row =
+            (((pos.y - rect.min.y) / rh).floor() as i64).clamp(0, self.rows as i64 - 1) as usize;
         (row, col)
     }
 
@@ -321,7 +327,11 @@ impl Session {
                 break;
             }
             let c0 = if row == s.0 { s.1 } else { 0 };
-            let c1 = if row == e.0 { e.1 } else { g_cols.saturating_sub(1) };
+            let c1 = if row == e.0 {
+                e.1
+            } else {
+                g_cols.saturating_sub(1)
+            };
             let mut line = String::new();
             for col in c0..=c1.min(g_cols.saturating_sub(1)) {
                 let ch = grid[Line(row as i32 - off)][Column(col)].c;
@@ -333,6 +343,15 @@ impl Session {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// Write a synthetic note into the emulator (NOT the PTY): renders as a
+    /// dim line in the pane. Used to announce a dispatched command before the
+    /// child produces output — a `claude -p` worker is silent until done, and
+    /// an empty pane reads as hung.
+    pub fn inject_note(&mut self, text: &str) {
+        let bytes = format!("\x1b[2m{text}\x1b[0m\r\n").into_bytes();
+        self.parser.advance(&mut self.term, &bytes);
     }
 
     fn pump(&mut self) {
@@ -502,9 +521,17 @@ impl Session {
         self.pump();
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, active: bool, resp: &egui::Response) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        active: bool,
+        resp: &egui::Response,
+    ) {
         let font = egui::FontId::monospace(13.0);
-        let probe = ui.painter().layout_no_wrap("M".to_string(), font.clone(), FG);
+        let probe = ui
+            .painter()
+            .layout_no_wrap("M".to_string(), font.clone(), FG);
         let cw = probe.rect.width().max(1.0);
         let rh = probe.rect.height().max(1.0);
         let cols = ((rect.width() / cw).floor() as usize).clamp(2, 600);
@@ -571,23 +598,25 @@ impl Session {
             let mut run = String::new();
             let mut run_fg = FG;
             let mut run_bg: Option<egui::Color32> = None;
-            let flush =
-                |job: &mut LayoutJob, run: &mut String, fg: egui::Color32, bg: Option<egui::Color32>| {
-                    if run.is_empty() {
-                        return;
-                    }
-                    job.append(
-                        run,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::monospace(13.0),
-                            color: fg,
-                            background: bg.unwrap_or(egui::Color32::TRANSPARENT),
-                            ..Default::default()
-                        },
-                    );
-                    run.clear();
-                };
+            let flush = |job: &mut LayoutJob,
+                         run: &mut String,
+                         fg: egui::Color32,
+                         bg: Option<egui::Color32>| {
+                if run.is_empty() {
+                    return;
+                }
+                job.append(
+                    run,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::monospace(13.0),
+                        color: fg,
+                        background: bg.unwrap_or(egui::Color32::TRANSPARENT),
+                        ..Default::default()
+                    },
+                );
+                run.clear();
+            };
             for col in 0..ncols {
                 let cell = &grid[Line(row as i32 - off)][Column(col)];
                 let inverse = cell.flags.contains(Flags::INVERSE);
@@ -624,7 +653,11 @@ impl Session {
                 let hl = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 70);
                 for row in s.0..=e.0 {
                     let c0 = if row == s.0 { s.1 } else { 0 };
-                    let c1 = if row == e.0 { e.1 } else { self.cols.saturating_sub(1) };
+                    let c1 = if row == e.0 {
+                        e.1
+                    } else {
+                        self.cols.saturating_sub(1)
+                    };
                     if c1 < c0 {
                         continue;
                     }
@@ -660,7 +693,10 @@ impl Session {
             let thumb_y = (rect.min.y + track_h * top_frac).min(rect.max.y - thumb_h);
             let w = 4.0;
             painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(rect.max.x - w, thumb_y), egui::vec2(w, thumb_h)),
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.max.x - w, thumb_y),
+                    egui::vec2(w, thumb_h),
+                ),
                 egui::CornerRadius::same(2),
                 egui::Color32::from_rgba_unmultiplied(231, 169, 63, 150),
             );
@@ -675,7 +711,11 @@ mod tests {
     #[test]
     fn spawn_argv_runs_a_plain_exe() {
         let ctx = egui::Context::default();
-        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         // cmd.exe sends a DSR (ESC[6n) at startup waiting for the terminal to reply.
         // pump() reads PTY output and writes back any pending device-status replies;
@@ -712,9 +752,31 @@ mod tests {
     }
 
     #[test]
+    fn inject_note_renders_a_banner_line_in_the_grid() {
+        let ctx = egui::Context::default();
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.inject_note("dispatched: claude -p task");
+        let grid = s.term.grid();
+        let row: String = (0..40).map(|c| grid[Line(0)][Column(c)].c).collect();
+        assert!(
+            row.contains("dispatched: claude -p task"),
+            "banner not in first grid row: {row:?}"
+        );
+    }
+
+    #[test]
     fn exit_is_noted_exactly_once() {
         let ctx = egui::Context::default();
-        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         let mut noted = None;
         for _ in 0..100 {

@@ -189,10 +189,13 @@ impl SettingsView {
                 ui.input(|i| {
                     if i.key_pressed(egui::Key::Enter) {
                         // Confirmed replace.
-                        km.rebind(match row {
-                            Row::Command(c) => c,
-                            Row::Leader => unreachable!("leader never enters conflict"),
-                        }, chord);
+                        km.rebind(
+                            match row {
+                                Row::Command(c) => c,
+                                Row::Leader => unreachable!("leader never enters conflict"),
+                            },
+                            chord,
+                        );
                         changed = true;
                         self.mode = Mode::Idle;
                         self.message = Some(format!("{} reassigned.", chord.pretty()));
@@ -341,8 +344,10 @@ impl SettingsView {
 
             // Row background + selection highlight via an allocated strip.
             let row_h = 24.0;
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Sense::click(),
+            );
             if resp.clicked() {
                 acts.push(RowAct::Select(idx));
             }
@@ -354,7 +359,9 @@ impl SettingsView {
             // Per-row capture / conflict inline state.
             let capturing = matches!(self.mode, Mode::Capturing { row: r } if r == row);
             let conflict = match &self.mode {
-                Mode::Conflict { row: r, existing, .. } if *r == row => Some(*existing),
+                Mode::Conflict {
+                    row: r, existing, ..
+                } if *r == row => Some(*existing),
                 _ => None,
             };
 
@@ -396,10 +403,15 @@ impl SettingsView {
 
             // Status text (chord, or capture/conflict prompt).
             let status = if capturing {
-                egui::RichText::new("press keys…").color(BORDER_FOCUS).strong()
+                egui::RichText::new("press keys…")
+                    .color(BORDER_FOCUS)
+                    .strong()
             } else if let Some(existing) = conflict {
-                egui::RichText::new(format!("conflicts with \"{}\" — replace?", existing.label()))
-                    .color(DANGER)
+                egui::RichText::new(format!(
+                    "conflicts with \"{}\" — replace?",
+                    existing.label()
+                ))
+                .color(DANGER)
             } else {
                 egui::RichText::new(chord_str)
                     .color(if is_sel { BORDER_FOCUS } else { TEXT })
