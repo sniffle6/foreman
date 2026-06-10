@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --desk:#191713; --win:#211e18; --tbgf:#383124;
+    --olive:#966b1c; --amber:#e7a93f;
+    --border:#3c372d; --text:#deded4; --dim:#968f7d; --stale:#caa45a;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{background:#0e0d0b; color:var(--text);
+       font-family:"Segoe UI",system-ui,sans-serif; padding:26px 30px;}
+  h1{font-size:18px; font-weight:600; margin-bottom:3px;}
+  .sub{color:var(--dim); font-size:13px; margin-bottom:22px; max-width:1180px; line-height:1.5;}
+  .state{display:inline-block; vertical-align:top; margin:0 26px 30px 0;}
+  .state h2{font-size:14px; font-weight:600; margin-bottom:3px;}
+  .state .cap{color:var(--dim); font-size:12.5px; margin-bottom:9px; line-height:1.45; max-width:620px;}
+
+  .fm { background:var(--win); border:1px solid var(--border); border-radius:6px; overflow:hidden;
+        box-shadow:0 10px 34px #000b; }
+  .fm.wide{width:620px;} .fm.slim{width:300px;}
+  .fm-bar { display:flex; align-items:center; height:26px; padding:0 8px; gap:8px;
+            background:var(--tbgf); font-size:12.5px; }
+  .fm-bar .nm { font-weight:500; } .fm-bar .sp { flex:1; }
+  .fm-bar .b { width:20px; text-align:center; color:var(--dim); font-size:11px; }
+  .cnt { font-size:10.5px; color:#7fb37f; background:#1a1813; border-radius:8px; padding:1px 7px; }
+  .mono { font-family:"Cascadia Mono",Consolas,monospace; }
+  .dim { color:var(--dim); }
+  .c1 { color:#e7a93f; } .c4 { color:#7fb37f; } .c5 { color:#6fa7c7; } .c3 { color:#c77fae; }
+
+  .duo { display:flex; }
+  .roster { flex:0 0 162px; border-right:1px solid var(--border); padding:8px; font-size:11.5px; }
+  .roster .hd { color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.05em; margin-bottom:7px; }
+  .mem { display:flex; align-items:baseline; gap:6px; margin-bottom:6px; border-radius:4px; padding:2px 4px; }
+  .mem:hover { background:#2b271f; }
+  .mem .dot { width:6px; height:6px; border-radius:3px; background:#7fb37f; align-self:center; flex:0 0 auto; }
+  .mem .dot.off { background:var(--border); }
+  .mem.gone { color:var(--dim); }
+  .mem .ago { margin-left:auto; color:var(--dim); font-size:10.5px; }
+  .mem .ago.stale { color:var(--stale); }
+  .logcol { flex:1; padding:8px 10px; min-width:0; }
+  .grp { margin-bottom:9px; }
+  .ghd { font-size:12px; margin-bottom:1px; }
+  .ghd .who { font-weight:600; } .ghd .meta { color:var(--dim); font-size:11px; margin-left:6px; }
+  .gtx { font-size:12.5px; color:var(--text); line-height:1.5; margin-bottom:2px; }
+  .sysline { text-align:center; color:var(--dim); font-size:11px; margin:7px 0; }
+  .newdiv { display:flex; align-items:center; gap:8px; color:var(--stale); font-size:10px;
+            text-transform:uppercase; letter-spacing:.06em; margin:7px 0; }
+  .newdiv::before, .newdiv::after { content:""; flex:1; border-top:1px solid #45402f; }
+  .mention { background:#45402f; color:var(--amber); border-radius:3px; padding:0 4px; }
+  .toline { border-left:2px solid var(--olive); padding-left:8px; }
+  .fm-in { display:flex; align-items:center; gap:8px; border-top:1px solid var(--border); padding:7px 10px; }
+  .fm-in .field { flex:1; background:var(--desk); border:1px solid var(--border); border-radius:4px;
+                  padding:5px 9px; color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>Project chat window — "dispatcher's desk"</h1>
+  <div class="sub">Chosen design for the <code>Content::Chat</code> redesign
+  (spec: <code>docs/superpowers/specs/2026-06-10-chat-dispatcher-window-design.md</code>).
+  Crew board ordered by last-heard, stalest live member on top with amber ages; exited members sink dimmed.
+  Grouped log with <code>tX · #N · HH:MM</code> meta, join/exit system lines, amber "new" divider since the
+  window last had focus, render-only mention markup (olive edge, → meta, @chips). Click a crew row to focus
+  that member's terminal. Input line is build slice 2.</div>
+
+  <div class="state">
+    <h2>Comfortable (≥ ~480 px) — crew board visible</h2>
+    <div class="cap">Full meta with timestamps. The "3 live" chip in the termbar repeats the fleet pulse.</div>
+    <div class="fm wide">
+      <div class="fm-bar"><span class="nm">chat · p1</span><span class="cnt">3 live</span><span class="sp"></span><span class="b">—</span><span class="b">□</span><span class="b">×</span></div>
+      <div class="duo">
+        <div class="roster">
+          <div class="hd">crew · by last heard</div>
+          <div class="mem"><span class="dot"></span><span class="c5">architect · t5</span><span class="ago stale">6m</span></div>
+          <div class="mem"><span class="dot"></span><span class="c4">skeptic · t4</span><span class="ago">1m</span></div>
+          <div class="mem"><span class="dot"></span><span class="c1">you · t1</span><span class="ago">now</span></div>
+          <div class="mem gone"><span class="dot off"></span><span>builder · t3</span><span class="ago">exited</span></div>
+        </div>
+        <div class="logcol">
+          <div class="sysline">— builder (t3) exited —</div>
+          <div class="grp">
+            <div class="ghd"><span class="who c5">architect</span><span class="meta">t5 · #6 · 14:02</span></div>
+            <div class="gtx">Broadcast-only chat becomes a denial-of-attention attack on your own fleet.</div>
+          </div>
+          <div class="newdiv">new</div>
+          <div class="grp">
+            <div class="ghd"><span class="who c4">skeptic</span><span class="meta">t4 · #7 · 14:03</span></div>
+            <div class="gtx">Every agent and the watching human share one observable transcript.</div>
+            <div class="gtx">'Pure addition' is how every chat system grows threads and DMs.</div>
+          </div>
+          <div class="grp">
+            <div class="ghd"><span class="who c1">you</span><span class="meta">t1 · #9 · 14:04 · → skeptic</span></div>
+            <div class="gtx toline"><span class="mention">@skeptic</span> keep replies under 150 words</div>
+          </div>
+        </div>
+      </div>
+      <div class="fm-in"><div class="field">Message p1…  (@name to mention)</div></div>
+    </div>
+  </div>
+
+  <div class="state">
+    <h2>Compact (&lt; ~480 px) — board hides, pulse stays</h2>
+    <div class="cap">Meta trims to seq only; grouped headers and the new-divider survive.</div>
+    <div class="fm slim">
+      <div class="fm-bar"><span class="nm">chat · p1</span><span class="cnt">3 live</span><span class="sp"></span><span class="b">×</span></div>
+      <div class="logcol">
+        <div class="grp">
+          <div class="ghd"><span class="who c5">architect</span><span class="meta">#6</span></div>
+          <div class="gtx">Broadcast-only chat becomes a denial-of-attention attack.</div>
+        </div>
+        <div class="newdiv">new</div>
+        <div class="grp">
+          <div class="ghd"><span class="who c4">skeptic</span><span class="meta">#7</span></div>
+          <div class="gtx">Every agent shares one observable transcript.</div>
+        </div>
+        <div class="grp">
+          <div class="ghd"><span class="who c1">you</span><span class="meta">#9 · → skeptic</span></div>
+          <div class="gtx toline"><span class="mention">@skeptic</span> keep replies under 150 words</div>
+        </div>
+      </div>
+      <div class="fm-in"><div class="field">Message p1…</div></div>
+    </div>
+  </div>
+</body>
+</html>
