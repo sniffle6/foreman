@@ -227,8 +227,10 @@ so multi-line content lands as one paste block, then a **separate `\r`** to
 submit. ESC is stripped from the payload itself (added during
 implementation review, mirroring alacritty's paste hygiene) so a crafted
 `ESC[201~` inside the text cannot escape the paste block into live
-keystrokes. The bracketed-paste guards are applied unconditionally (pending
-ConPTY verification in Task 8).
+keystrokes. The bracketed-paste guards are applied unconditionally —
+live-verified on ConPTY (2026-06-10): claude sessions honor the markers
+(multi-line lands as one input block), so the unconditional wrap is the
+recorded v1 decision.
 
 ### Chat viewer window
 
