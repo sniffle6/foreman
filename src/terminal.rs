@@ -238,12 +238,21 @@ impl Session {
         let (s, e) = if a <= b { (a, b) } else { (b, a) };
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
+        // Selection coords were cached on an earlier frame; the grid may have shrunk
+        // since (TUI alt-screen/resize), so clamp every index to the grid's REAL
+        // bounds — both Line and Column panic if indexed out of range (same hazard
+        // the render loop in `show` guards against).
+        let g_cols = grid.columns();
+        let g_lines = grid.screen_lines();
         let mut out = String::new();
         for row in s.0..=e.0 {
+            if row >= g_lines {
+                break;
+            }
             let c0 = if row == s.0 { s.1 } else { 0 };
-            let c1 = if row == e.0 { e.1 } else { self.cols.saturating_sub(1) };
+            let c1 = if row == e.0 { e.1 } else { g_cols.saturating_sub(1) };
             let mut line = String::new();
-            for col in c0..=c1.min(self.cols - 1) {
+            for col in c0..=c1.min(g_cols.saturating_sub(1)) {
                 let ch = grid[Line(row as i32 - off)][Column(col)].c;
                 line.push(if ch == '\0' { ' ' } else { ch });
             }
@@ -478,9 +487,16 @@ impl Session {
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
         let hist = grid.history_size();
+        // `pump()` advanced the parser THIS frame, so the grid's real size can
+        // momentarily differ from the cached cols/rows (alt-screen swap, reset, or
+        // column-mode from a full-screen TUI like `claude`). Index against the
+        // grid's ACTUAL bounds: a stale index panics, and a panic across the winit
+        // callback aborts the whole process.
+        let ncols = self.cols.min(grid.columns());
+        let nrows = self.rows.min(grid.screen_lines());
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
-        for row in 0..self.rows {
+        for row in 0..nrows {
             let mut run = String::new();
             let mut run_fg = FG;
             let mut run_bg: Option<egui::Color32> = None;
@@ -501,7 +517,7 @@ impl Session {
                     );
                     run.clear();
                 };
-            for col in 0..self.cols {
+            for col in 0..ncols {
                 let cell = &grid[Line(row as i32 - off)][Column(col)];
                 let inverse = cell.flags.contains(Flags::INVERSE);
                 let mut fg = resolve(cell.fg).unwrap_or(FG);
