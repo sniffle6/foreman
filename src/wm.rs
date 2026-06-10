@@ -289,14 +289,14 @@ impl Content {
                 let fit = (((rect.height() - 2.0 * pad) / line_h).floor() as usize).max(1);
                 // Borrow stays scoped to this arm — never held across recursion
                 // into other windows' show() (post paths borrow_mut the log).
-                let log = log.borrow();
-                let msgs = log.msgs();
-                let start = msgs.len().saturating_sub(fit);
-                for (i, m) in msgs[start..].iter().enumerate() {
+                // tail_rows expands multi-line messages into physical rows so
+                // later messages are never overpainted.
+                let rows = log.borrow().tail_rows(fit);
+                for (i, row) in rows.iter().enumerate() {
                     p.text(
                         egui::pos2(rect.min.x + pad, rect.min.y + pad + i as f32 * line_h),
                         egui::Align2::LEFT_TOP,
-                        m.line(),
+                        row,
                         font.clone(),
                         TEXT,
                     );

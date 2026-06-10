@@ -59,13 +59,15 @@ Pick the mode based on whether the worker needs to receive coordination:
 
 ## Chat usage
 
-Post to the project room (same-project only):
+Post to the project room (same-project only). Invoke via `FOREMAN_EXE`
+since the exe directory is not on PATH inside spawned shells
+(PowerShell: `& $env:FOREMAN_EXE chat "…"`; bash: `"$FOREMAN_EXE" chat "…"`):
 
-    foreman chat "message text"                # post a message
-    foreman chat --history                     # read last 20 messages
-    foreman chat --history 50                  # read last 50 messages
-    foreman chat --project p2 "message"        # override env project
-    foreman chat -- --message-starting-with-dashes   # -- ends flag parsing
+    & $env:FOREMAN_EXE chat "message text"                # post a message
+    & $env:FOREMAN_EXE chat --history                     # read last 20 messages
+    & $env:FOREMAN_EXE chat --history 50                  # read last 50 messages
+    & $env:FOREMAN_EXE chat --project p2 "message"        # override env project
+    & $env:FOREMAN_EXE chat -- --message-starting-with-dashes   # -- ends flag parsing
 
 `foreman chat` reads `FOREMAN_PROJECT_ID` and `FOREMAN_TERMINAL_ID` from
 the environment automatically. Calling it outside a foreman terminal
@@ -85,8 +87,10 @@ agent.** It tells the agent how to parse incoming chat and when to respond:
 
 > You are in a project chat. Messages arrive as `[chat p1 #N] tX: …`.
 > Only respond when a message is relevant to your task — most messages need
-> no reply. Post with `foreman chat "…"`. Check `foreman chat --history`
-> after long heads-down stretches.
+> no reply. Post with `& $env:FOREMAN_EXE chat "…"` (the agent reads the
+> `FOREMAN_EXE` env var; expansion syntax varies by shell — PowerShell uses
+> `& $env:FOREMAN_EXE`, bash uses `"$FOREMAN_EXE"`). Check
+> `& $env:FOREMAN_EXE chat --history` after long heads-down stretches.
 
 The framing format (`[chat p1 #14] t2: text`) gives the agent provenance
 (project, seq number, sender terminal id) so it can reference earlier
@@ -99,7 +103,10 @@ messages and know which project it is in.
 End the worker's prompt with:
 
 > When you have a result, post your summary with
-> `foreman chat "<summary>"` before exiting.
+> `& $env:FOREMAN_EXE chat "<summary>"` before exiting.
+> (PowerShell: `& $env:FOREMAN_EXE chat "…"`; bash: `"$FOREMAN_EXE" chat "…"`.
+> The exe directory is not on PATH inside spawned shells — always invoke via
+> the `FOREMAN_EXE` env var.)
 
 This ensures the orchestrator (and any peer workers) see the outcome in the
 chat log even if nobody is watching the worker's terminal directly.

@@ -169,6 +169,10 @@ CLI grammar:
 foreman chat [--project P] [--history [N]] [--] <message words...>
 ```
 
+Workers invoke the CLI via the `FOREMAN_EXE` env var since the exe
+directory is not on PATH inside spawned shells (e.g. PowerShell:
+`& $env:FOREMAN_EXE chat "…"`; bash: `"$FOREMAN_EXE" chat "…"`).
+
 - `foreman chat "message"` — post to the project room.
 - `foreman chat --history [N]` — read the last N messages (default: 20,
   matching `DEFAULT_HISTORY`). Omitting N uses the default.

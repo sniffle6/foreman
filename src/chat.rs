@@ -56,6 +56,24 @@ impl ChatLog {
         let start = self.msgs.len().saturating_sub(n);
         self.msgs[start..].iter().map(ChatMsg::line).collect()
     }
+
+    /// Last `fit` PHYSICAL rows for the viewer, oldest first: a multi-line
+    /// message occupies one row per line, so later messages are never
+    /// overpainted. (`tail_lines` stays message-per-entry for `--history`.)
+    pub fn tail_rows(&self, fit: usize) -> Vec<String> {
+        let mut rows = Vec::with_capacity(fit);
+        'outer: for m in self.msgs.iter().rev() {
+            let line = m.line();
+            for l in line.rsplit('\n') {
+                rows.push(l.to_string());
+                if rows.len() == fit {
+                    break 'outer;
+                }
+            }
+        }
+        rows.reverse();
+        rows
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +113,17 @@ mod tests {
         assert_eq!(log.tail_lines(2), vec!["#4 t1: m4", "#5 t1: m5"]);
         assert_eq!(log.tail_lines(99).len(), 5);
         assert!(ChatLog::new().tail_lines(3).is_empty());
+    }
+
+    #[test]
+    fn tail_rows_splits_multiline_messages_into_physical_rows() {
+        let mut log = ChatLog::new();
+        log.post("t1", "a\nb");
+        log.post("t2", "c");
+        // full window: 3 physical rows, oldest first
+        assert_eq!(log.tail_rows(10), vec!["#1 t1: a", "b", "#2 t2: c"]);
+        // tail-fit: the last 2 physical rows
+        assert_eq!(log.tail_rows(2), vec!["b", "#2 t2: c"]);
+        assert!(ChatLog::new().tail_rows(3).is_empty());
     }
 }
