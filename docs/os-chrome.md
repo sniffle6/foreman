@@ -9,16 +9,25 @@ app is fully chromeless and the content runs edge to edge.
 
 ## How to use it
 
-- **Reveal the bar:** push the pointer into the top ~6px of the window and hold
-  for ~200ms. The dwell stops the bar popping up when you're just reaching for an
-  in-app titlebar near the top.
-- **Hide it:** move the pointer back down past the bar. It fades out.
+- **Reveal the bar:** rest the pointer on the painted window border at the top
+  edge for ~200ms. The hover zone is exactly the border (`CHROME_REVEAL =
+  APP_BORDER_W`, 7px), so the visible frame doubles as the reveal target and
+  resizing the border retunes the hover zone with it. The dwell stops the bar
+  popping up when you're just reaching for an in-app titlebar near the top.
+- **Hide it:** move the pointer back down past the bar. It retracts upward
+  (the reveal slides it down from the top edge, like a drawer).
 - **Move the window:** drag the revealed bar (hands off to the OS move loop, so
   Aero Snap drag-to-edge still works). Double-click toggles maximize.
 - **Resize the window:** grab the outer 5px rim of the window on any edge or
   corner — an invisible handle replaces the native resize border. The cursor
   changes to the usual resize arrows. Disabled while maximized.
 - Win+Arrow snapping works as before (it never needed decorations).
+- A 7px painted frame (`APP_BORDER`, same color as the revealed bar) marks the
+  window edge when windowed — undecorated windows lose the native border.
+  Drawn with a layer painter, which paints without registering a widget (so no
+  Area-style input blocking); skipped when maximized, like native apps. The
+  desktop area is shrunk by the same width when windowed so content sits
+  inside the frame, never under it.
 
 ## Why
 

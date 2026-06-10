@@ -32,27 +32,42 @@ impl Default for App {
 // own title bar, revealed only while the pointer dwells at the very top edge of
 // the app window, plus an invisible perimeter rim that restores edge-resize.
 const CHROME_H: f32 = 30.0; // revealed bar height
-const CHROME_REVEAL: f32 = 6.0; // pointer must be this close to the top edge...
-const CHROME_DWELL: f64 = 0.2; // ...for this long (s) before the bar shows
+const CHROME_REVEAL: f32 = APP_BORDER_W; // the visible border is the hover target...
+const CHROME_DWELL: f64 = 0.2; // ...rest on it this long (s) before the bar shows
 const CHROME_GRAB: f32 = 5.0; // outer rim that acts as the OS resize handle
 const CHROME_BTN_W: f32 = 42.0;
+const APP_BORDER_W: f32 = 7.0; // visible frame around the undecorated window
+const APP_BORDER: egui::Color32 = CHROME_BG; // frame matches the revealed bar
 
-const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(30, 27, 22);
+const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(46, 42, 35);
 const CHROME_BORDER: egui::Color32 = egui::Color32::from_rgb(60, 55, 45);
 const CHROME_TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const CHROME_DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
-const CHROME_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(56, 49, 36);
+const CHROME_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 63, 50);
 const CHROME_CLOSE_HOVER: egui::Color32 = egui::Color32::from_rgb(196, 43, 28);
 
 impl App {
     /// Hover-revealed replacement for the native title bar. Hidden until the
-    /// pointer dwells in the topmost couple of pixels (so heading for an in-app
-    /// titlebar near the top doesn't trigger it), then overlays the content.
+    /// pointer rests on the painted window border at the top edge (the dwell
+    /// keeps a stray brush past it from triggering), then overlays the content.
     fn show_os_chrome(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         if !maximized {
             Self::os_resize_rim(ctx, screen);
+            // Visible frame replacing the native border lost with decorations.
+            // A layer painter only paints — it registers no widget, so unlike
+            // an Area it can span the whole screen without blocking input.
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("app_border"),
+            ))
+            .rect_stroke(
+                screen,
+                0.0,
+                egui::Stroke::new(APP_BORDER_W, APP_BORDER),
+                egui::StrokeKind::Inside,
+            );
         }
 
         let (pointer, any_down, now) =
@@ -82,7 +97,7 @@ impl App {
             }
         }
 
-        let t = ctx.animate_bool(egui::Id::new("os_chrome_fade"), self.chrome_open);
+        let t = ctx.animate_bool(egui::Id::new("os_chrome_slide"), self.chrome_open);
         if t <= 0.0 {
             return;
         }
@@ -91,11 +106,15 @@ impl App {
             .order(egui::Order::Foreground)
             .movable(false)
             .fixed_pos(screen.min)
+            .constrain(false) // content rides above the top edge mid-slide
             .interactable(self.chrome_open)
             .show(ctx, |ui| {
-                ui.set_opacity(t);
-                let bar =
-                    egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), CHROME_H));
+                // Slide in from the top edge: the bar parks above the window
+                // and drops down as t goes 0 -> 1 (retracts on close).
+                let bar = egui::Rect::from_min_size(
+                    egui::pos2(screen.min.x, screen.min.y - (1.0 - t) * CHROME_H),
+                    egui::vec2(screen.width(), CHROME_H),
+                );
                 // When windowed, the topmost rim belongs to the resize handle —
                 // keep the bar's interactive rects out of it.
                 let rim = if maximized { 0.0 } else { CHROME_GRAB };
@@ -291,7 +310,13 @@ impl eframe::App for App {
             self.started = true;
         }
 
-        let area = ui.available_rect_before_wrap();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let mut area = ui.available_rect_before_wrap();
+        if !maximized {
+            // The painted frame strokes the outer APP_BORDER_W inside the
+            // window edge; keep the desktop inside it, not under it.
+            area = area.shrink(APP_BORDER_W);
+        }
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
 
         self.show_os_chrome(&ctx);
