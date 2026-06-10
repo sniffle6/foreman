@@ -161,6 +161,20 @@ fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+/// Bracketed-paste wrapper (`ESC[200~ … ESC[201~`): multi-line text lands in
+/// the target's input box as one paste block instead of submitting per line
+/// (spec: agent-group-chat §3).
+pub fn paste_wrap(text: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(text.len() + 12);
+    v.extend_from_slice(b"\x1b[200~");
+    // Strip ESC so a quoted `ESC[201~` can't terminate the block early and
+    // turn the rest of the message into live keystrokes (alacritty does the
+    // same to paste payloads).
+    v.extend(text.bytes().filter(|&b| b != 0x1b));
+    v.extend_from_slice(b"\x1b[201~");
+    v
+}
+
 impl Session {
     pub fn spawn(
         shell: Shell,
@@ -361,6 +375,20 @@ impl Session {
     /// real width.
     pub fn inject_note(&mut self, text: &str) {
         self.pending_note = Some(text.to_string());
+    }
+
+    /// Deliver chat text into this session's stdin: bracketed paste, then a
+    /// separate `\r` to submit (spec: agent-group-chat §3).
+    /// Empty text is a no-op — a bare `\r` would submit the target's
+    /// half-typed input. Paste markers are sent unconditionally; whether to
+    /// gate on the child's bracketed-paste mode (DECSET 2004) is decided
+    /// after live verification on ConPTY.
+    pub fn inject_input(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.send(&paste_wrap(text));
+        self.send(b"\r");
     }
 
     fn pump(&mut self) {
@@ -885,6 +913,58 @@ mod tests {
             row0.contains("dispatched: claude -p task"),
             "note not flushed on no-op resize: {row0:?}"
         );
+    }
+
+    #[test]
+    fn paste_wrap_brackets_text_without_submitting() {
+        let b = paste_wrap("line1\nline2");
+        assert_eq!(b, b"\x1b[200~line1\nline2\x1b[201~".to_vec());
+        assert!(!b.ends_with(b"\r"), "submit must be a separate write");
+    }
+
+    #[test]
+    fn paste_wrap_neutralizes_embedded_paste_end() {
+        let b = paste_wrap("a\x1b[201~rm -rf\r");
+        // only the two framing markers may contain ESC
+        let interior = &b[6..b.len() - 6];
+        assert!(
+            !interior.contains(&0x1b),
+            "payload ESC must be stripped: {b:?}"
+        );
+    }
+
+    #[test]
+    fn inject_input_reaches_child_stdin() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        // `cmd /c pause` blocks until any key arrives on stdin. If the injected
+        // bytes reach the child, pause consumes one and the process exits.
+        // Wait until pause's prompt has rendered — proof the startup DSR
+        // exchange resolved and the child is now blocked reading stdin
+        // (bytes injected before that get eaten by the DSR scan).
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            s.pump();
+            if !grid_row(&s, 0, 80).trim().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready,
+                "pause prompt never rendered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        s.inject_input("hello room");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.exited().is_none() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pause never saw the injected input"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
