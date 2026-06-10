@@ -843,8 +843,9 @@ impl WindowManager {
             "chat_post on a tag-less (desktop?) manager — routing bug"
         );
         let project = self.tag.as_deref().unwrap_or("p?");
+        let name = display_name(sender.title()).to_string();
         let mut log = self.chat.borrow_mut();
-        let msg = log.post(&format!("t{from}"), text);
+        let msg = log.post(&format!("t{from}"), &name, text);
         Ok(msg.frame(project))
     }
 
@@ -2617,6 +2618,12 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     let x = rect.min.x.clamp(0.0, (area.x - w).max(0.0));
     let y = rect.min.y.clamp(0.0, (area.y - h).max(0.0));
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+}
+
+/// A tab's display name for chat purposes: the title minus the one-shot
+/// exit marker `refresh_exit_titles` appends.
+fn display_name(title: &str) -> &str {
+    title.split("  ·  exited").next().unwrap_or(title).trim()
 }
 
 /// Parse a "t4"-style terminal id.
