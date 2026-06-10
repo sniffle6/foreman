@@ -134,6 +134,152 @@ different command.
   That's the same trust level as the shell itself.
 - Workers run with the dispatcher's user/permissions; there is no sandbox.
 
+## Group chat (`chat` verb)
+
+Status: **built** (2026-06-10).
+
+Agents running inside a foreman project can coordinate — discuss design,
+divide work, report results — in a shared **project chat room**. Posts are
+broadcast-injected into every other member's terminal as typed input (push
+delivery). A read-only chat subwindow lets the human watch the room.
+
+### Protocol
+
+Same pipe, same `REPLY_TIMEOUT`, same stale-request dropping as `open`.
+Post and history are two separate request shapes; exactly one of `text` or
+`history` must be set per request:
+
+```json
+{ "cmd": "chat", "project": "p1", "from": "t2", "text": "taking the parser refactor" }
+{ "ok": true }
+
+{ "cmd": "chat", "project": "p1", "from": "t2", "history": 20 }
+{ "ok": true, "history": ["#12 t1: split the work by module", "#13 t3: I'll take src/wm.rs"] }
+```
+
+`project` and `from` are filled **automatically** by the client from
+`FOREMAN_PROJECT_ID` / `FOREMAN_TERMINAL_ID`. Having both or neither
+`text`/`history` is a client-side parse error (exit 2, no pipe call made).
+The reply's `history` field is skipped in serialization when `None`, so
+normal post replies stay minimal.
+
+CLI grammar:
+
+```
+foreman chat [--project P] [--history [N]] [--] <message words...>
+```
+
+- `foreman chat "message"` — post to the project room.
+- `foreman chat --history [N]` — read the last N messages (default: 20,
+  matching `DEFAULT_HISTORY`). Omitting N uses the default.
+- `--` ends flag parsing: everything after it is the message verbatim. Use
+  it when the message text starts with `--` or contains flag-like words.
+- The first non-flag, non-`--` positional word also ends flag parsing; the
+  rest of the slice is the message as-is, so flag-like text inside a
+  message body is never re-interpreted.
+
+### Room and membership
+
+One room per project. The log lives on the **project's** nested
+`WindowManager` as an `Rc<RefCell<ChatLog>>` — an in-memory
+append-only `Vec<ChatMsg>` where each message carries `seq`, `from`, and
+`text`. Seq starts at 1 and only grows (seq = `len + 1`). The log dies when
+foreman exits; project IDs are runtime-scoped anyway.
+
+**Membership is a `chat_member: bool` on each `Tab`** (not `Win`):
+
+- Terminals spawned via `open` (agent dispatch) auto-join on creation —
+  they are agents by construction.
+- Any other terminal (e.g. a hand-opened Claude session) joins on its
+  **first post** — orchestrators enter the moment they announce anything.
+- `--history` reads do **not** join; reading is free.
+- The flag lives on the `Tab`, so it travels with its terminal through
+  merges and untabs. Broadcast delivers to **all** member tabs (not just
+  active ones); background tabs stay drained via keepalive.
+- Sender identity still resolves via Win id (active tab) — the same
+  staleness family as terminal-id resolution elsewhere.
+
+### Delivery
+
+On a post the GUI thread:
+
+1. Drops the request unexecuted if stale (same age check as `open`).
+2. Resolves the project, validates the request.
+3. Appends to the log and sets the sender's `chat_member` flag on its
+   active tab (join-on-first-post).
+4. Sends the success reply **before** injecting. An injection cannot be
+   undone; bytes only flow once the client is guaranteed to hear "ok".
+   A dead reply channel means the log may have appended, but bytes must
+   not flow — the post stays in history (append-only; duplicate-on-retry
+   is accepted v1 behavior), but is not injected.
+5. Injects the framed message into every member tab in the project
+   **except the sender's active tab**, skipping exited sessions.
+
+**Framing:** `[chat p1 #14] t2: <text>`. Provenance plus seq so agents can
+reference earlier messages.
+
+**Bracketed paste:** delivery wraps the payload in `ESC[200~ … ESC[201~`
+so multi-line content lands as one paste block, then a **separate `\r`** to
+submit. ESC is stripped from the payload itself (added during
+implementation review, mirroring alacritty's paste hygiene) so a crafted
+`ESC[201~` inside the text cannot escape the paste block into live
+keystrokes. The bracketed-paste guards are applied unconditionally (pending
+ConPTY verification in Task 8).
+
+### Chat viewer window
+
+A read-only viewer any project can open to watch the room:
+
+- **Leader+G** (default chord; data-driven like all other bindings, so the
+  user file merge keeps working).
+- **Singleton per project**: re-invoking the chord focuses the existing
+  window rather than opening a second one. If the window was minimized or
+  buried under another tab, the reopen resurfaces it (unminimizes and
+  makes the chat tab active) before focusing.
+- Closing the viewer window does not touch the log. The room is the log.
+- The window is a **viewer, not a member** — it renders the log directly
+  and is never injected into. It uses `Content::Chat(Rc<RefCell<ChatLog>>)`,
+  sharing the log pointer with the project manager.
+- Renders `#seq from: text` lines, newest at the bottom, auto-tailed to
+  fit the visible height. Updates live: posts arrive on the GUI thread,
+  which always calls `ctx.request_repaint()` after a chat dispatch.
+
+### Gotchas
+
+- **`from`/`project` are guardrails, not authentication.** They prevent
+  confused agents from posting to the wrong room or mis-identifying
+  themselves — nothing more. Any same-user process can open the pipe and
+  claim any `from`. Same trust boundary as `open`.
+- **DSR fresh-spawn hazard.** Bytes injected into a just-spawned member
+  before its shell's startup DSR handshake resolves get eaten by the DSR
+  reply scan. The GUI pumps every session every frame, so one frame of
+  separation normally suffices — but a post broadcast the same instant a
+  member spawns can be silently lost to that member. The message stays in
+  the log and history; only that member's injection is dropped.
+- **Untab makes the terminal's own id stale.** Untab moves the `Tab` struct
+  intact, so membership survives — but the detached terminal lands in a
+  window with a **new** id, while its `FOREMAN_TERMINAL_ID` env var (stamped
+  at spawn from the original window id) still names the old one. Its next
+  post resolves `from` through that stale id: join and sender-exclusion act
+  on whatever terminal now sits in the old window's active tab. Same Win-id
+  staleness family as the sender-identity caveat in the membership section.
+- **Orphaned post on timed-out reply.** If the GUI sends the "ok" reply and
+  then immediately dies before the inject, or if the log appended before a
+  dead-channel abort, the message exists in history but no bytes flowed.
+  A retrying client creates a duplicate log entry. Both are accepted v1.
+- **Message storms** are bounded by prompt convention (§5 of the spec)
+  only — every post is a user-turn for every other member, and members may
+  respond to responses. This is model behavior, not a code guarantee.
+  Revisit (rate limits, @-mentions) only if it bites in practice.
+- **Empty injection is a no-op at the Session level.** A bare `\r` would
+  submit half-typed input. Empty messages are rejected server-side at
+  `chat_post` ("empty message" — `foreman chat ""` parses fine client-side
+  and travels the pipe; only the no-args case errors before sending). The
+  Session-level empty-injection guard is defense-in-depth behind that.
+- **Tab-merged projects go stale** (same as `open`): after merging project
+  B's tab onto project A, B's old `pN` id no longer resolves and chatters
+  inside B get an error until they pass an explicit `--project`.
+
 ## Out of scope (v1)
 
 - **Round-trip**: `status`/`wait` verbs and a result-file convention are

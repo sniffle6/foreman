@@ -33,3 +33,73 @@ is recoverable at `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
   for results; tell the user the agent is running and where.
 - Nothing is Claude-specific: any CLI works after `--` (codex, plain
   commands, build scripts).
+
+---
+
+## Worker mode choice
+
+Pick the mode based on whether the worker needs to receive coordination:
+
+**Fire-and-forget (`claude -p "<prompt>"`):**
+- Cannot *receive* chat mid-run — print mode does not read stdin.
+- *Can* post (`foreman chat` is a process spawn, not a stdin read).
+- The pane stays silent under the dispatch banner until the final answer.
+- Pattern: end the prompt with "post your result with
+  `foreman chat \"<summary>\"` before exiting." The human sees the result
+  arrive in their own session's chat, not just the worker's scrollback.
+
+**Steerable/collaborative (`claude "<prompt>"`):**
+- Receives every post as typed input — the project chat broadcasts directly
+  into the worker's PTY.
+- Does not auto-exit; the session stays open when the task is done.
+- To stop it: post an instruction addressed to it in the chat, or include
+  exit-when-done language in the initial prompt.
+
+---
+
+## Chat usage
+
+Post to the project room (same-project only):
+
+    foreman chat "message text"                # post a message
+    foreman chat --history                     # read last 20 messages
+    foreman chat --history 50                  # read last 50 messages
+    foreman chat --project p2 "message"        # override env project
+    foreman chat -- --message-starting-with-dashes   # -- ends flag parsing
+
+`foreman chat` reads `FOREMAN_PROJECT_ID` and `FOREMAN_TERMINAL_ID` from
+the environment automatically. Calling it outside a foreman terminal
+(env vars unset) is an immediate error (exit 2, no pipe call).
+
+History output is one line per message, oldest first:
+
+    #12 t1: split the work by module
+    #13 t3: I'll take src/wm.rs
+
+---
+
+## Standing convention — inject into every dispatched prompt
+
+**Copy this paragraph verbatim into every prompt sent to a dispatched
+agent.** It tells the agent how to parse incoming chat and when to respond:
+
+> You are in a project chat. Messages arrive as `[chat p1 #N] tX: …`.
+> Only respond when a message is relevant to your task — most messages need
+> no reply. Post with `foreman chat "…"`. Check `foreman chat --history`
+> after long heads-down stretches.
+
+The framing format (`[chat p1 #14] t2: text`) gives the agent provenance
+(project, seq number, sender terminal id) so it can reference earlier
+messages and know which project it is in.
+
+---
+
+## Fire-and-forget reporting pattern
+
+End the worker's prompt with:
+
+> When you have a result, post your summary with
+> `foreman chat "<summary>"` before exiting.
+
+This ensures the orchestrator (and any peer workers) see the outcome in the
+chat log even if nobody is watching the worker's terminal directly.
