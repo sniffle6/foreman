@@ -782,9 +782,16 @@ impl WindowManager {
         // was; the window still spawns on top visually (z from next_slot).
         let prev_focus = self.focused;
         self.push_win(id, title, rect, Content::Terminal(s));
-        // Dispatched agents auto-join the project chat room (spec §2).
+        // Dispatched agents auto-join the project chat room (spec §2) — and
+        // the transcript records it.
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.tabs[w.active].chat_member = true;
+            // (`title` was moved into push_win — read it back off the window)
+            self.chat.borrow_mut().sys(
+                crate::chat::ChatKind::Joined,
+                &format!("t{id}"),
+                display_name(w.title()),
+            );
         } else {
             debug_assert!(false, "just-pushed window {id} missing");
         }
@@ -837,6 +844,7 @@ impl WindowManager {
             .iter_mut()
             .find(|w| w.id == from)
             .ok_or_else(|| format!("no such terminal: t{from}"))?;
+        let newly_joined = !sender.tabs[sender.active].chat_member;
         sender.tabs[sender.active].chat_member = true;
         debug_assert!(
             self.tag.is_some(),
@@ -846,6 +854,11 @@ impl WindowManager {
         // .to_string() drops the &mut Win borrow before the RefCell borrow below
         let name = display_name(sender.title()).to_string();
         let mut log = self.chat.borrow_mut();
+        if newly_joined {
+            // join-on-first-post: the sysline lands BEFORE the post so the
+            // transcript reads join-then-speak
+            log.sys(crate::chat::ChatKind::Joined, &format!("t{from}"), &name);
+        }
         let msg = log.post(&format!("t{from}"), &name, text);
         Ok(msg.frame(project))
     }
@@ -1474,11 +1487,21 @@ impl WindowManager {
     /// Append an `exited (code)` marker to terminals whose process ended. Runs
     /// over every tab (not just visible ones) so background agents update too.
     fn refresh_exit_titles(&mut self) {
+        let chat = Rc::clone(&self.chat);
         for w in &mut self.windows {
+            let wid = w.id;
             for t in &mut w.tabs {
                 match &mut t.content {
                     Content::Terminal(s) => {
                         if let Some(code) = s.exit_to_note() {
+                            if t.chat_member {
+                                // Name must be read BEFORE the marker is appended.
+                                chat.borrow_mut().sys(
+                                    crate::chat::ChatKind::Exited,
+                                    &format!("t{wid}"),
+                                    display_name(&t.title),
+                                );
+                            }
                             t.title.push_str(&format!("  ·  exited ({code})"));
                         }
                     }
@@ -3156,6 +3179,95 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_emits_a_joined_entry() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let t = wm
+            .add_terminal_cmd(&argv, None, Some("worker A"), &ctx)
+            .unwrap();
+        let log = wm.chat.borrow();
+        let m = log.msgs().last().expect("no joined entry");
+        assert_eq!(m.kind, crate::chat::ChatKind::Joined);
+        assert_eq!(m.from, format!("t{t}"));
+        assert_eq!(m.name, "worker A");
+    }
+
+    #[test]
+    fn first_post_emits_joined_before_the_post() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let t = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        // simulate a hand-opened terminal: not yet a member
+        let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
+        w.tabs[w.active].chat_member = false;
+        wm.chat_post(t, "hello").unwrap();
+        let log = wm.chat.borrow();
+        let kinds: Vec<_> = log.msgs().iter().map(|m| m.kind).collect();
+        // dispatch auto-join from add_terminal_cmd, then the simulated
+        // un-join means: Joined (dispatch), Joined (first post), Post
+        assert_eq!(
+            &kinds[kinds.len() - 2..],
+            &[crate::chat::ChatKind::Joined, crate::chat::ChatKind::Post]
+        );
+        drop(log);
+        // second post: member already — no second Joined
+        wm.chat_post(t, "again").unwrap();
+        let log = wm.chat.borrow();
+        assert_eq!(log.msgs().last().unwrap().kind, crate::chat::ChatKind::Post);
+        let joins = log
+            .msgs()
+            .iter()
+            .filter(|m| m.kind == crate::chat::ChatKind::Joined && m.from == format!("t{t}"))
+            .count();
+        assert_eq!(joins, 2, "one from dispatch, one from first post — not three");
+    }
+
+    #[test]
+    fn member_exit_emits_an_exited_entry_nonmember_does_not() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let member = wm.add_terminal_cmd(&argv, None, Some("worker A"), &ctx).unwrap();
+        let outsider = wm.add_terminal_cmd(&argv, None, Some("plain"), &ctx).unwrap();
+        let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
+        w.tabs[w.active].chat_member = false;
+        // wait for both `cmd /c exit 0` children to end — pumping keepalive()
+        // each pass, or the startup DSR query leaves cmd.exe hung forever
+        // (the documented trap; same pattern as the broadcast tests above)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut done = 0;
+            for id in [member, outsider] {
+                let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                s.keepalive();
+                if s.exited().is_some() {
+                    done += 1;
+                }
+            }
+            if done == 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "children never exited");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        wm.refresh_exit_titles();
+        let log = wm.chat.borrow();
+        let exits: Vec<_> = log
+            .msgs()
+            .iter()
+            .filter(|m| m.kind == crate::chat::ChatKind::Exited)
+            .collect();
+        assert_eq!(exits.len(), 1, "only the member's exit is recorded");
+        assert_eq!(exits[0].from, format!("t{member}"));
+        assert_eq!(exits[0].name, "worker A", "name captured before the exit marker lands");
+    }
+
+    #[test]
     fn chat_post_validates_joins_and_frames() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
@@ -3172,13 +3284,15 @@ mod tests {
         assert!(wm.chat_post(t, "").is_err(), "empty message rejected");
         assert!(wm.chat_post(999, "hi").is_err(), "unknown sender rejected");
         let framed = wm.chat_post(t, "hello room").unwrap();
-        assert_eq!(framed, format!("[chat p1 #1] t{t}: hello room"));
+        // seq 3: dispatch Joined (1), first-post Joined (2), then the post —
+        // system entries share the seq space but stay out of --history
+        assert_eq!(framed, format!("[chat p1 #3] t{t}: hello room"));
         let w = wm.windows.iter().find(|w| w.id == t).unwrap();
         assert!(
             w.tabs[w.active].chat_member,
             "posting joins the sender's active tab"
         );
-        assert_eq!(wm.chat_history(10), vec![format!("#1 t{t}: hello room")]);
+        assert_eq!(wm.chat_history(10), vec![format!("#3 t{t}: hello room")]);
     }
 
     #[test]
