@@ -94,6 +94,10 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
         let Ok(conn) = conn else { continue };
         let mut conn = BufReader::new(conn);
         let mut line = String::new();
+        // No read timeout: a client that connects and never sends a newline
+        // parks this loop, serializing the (single-threaded) pipe. The GUI is
+        // unaffected — only dispatch stalls. Accepted for v1; revisit if a
+        // wedged client ever shows up in practice.
         if conn.read_line(&mut line).is_err() {
             continue;
         }
@@ -108,7 +112,8 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
             }
             Err(e) => OpenReply::err(format!("bad request: {e}")),
         };
-        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+        let mut out =
+            serde_json::to_string(&reply).expect("OpenReply is always serializable");
         out.push('\n');
         let _ = conn.get_mut().write_all(out.as_bytes());
     }
@@ -223,7 +228,8 @@ mod tests {
         std::thread::spawn(move || serve(&p2, tx));
         // Fake GUI thread: answer the first request.
         std::thread::spawn(move || {
-            let CtrlMsg::Open(req, reply) = rx.recv().unwrap();
+            let CtrlMsg::Open(req, reply) =
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
             assert_eq!(req.command, vec!["cmd.exe", "/c", "echo hi"]);
             let _ = reply.send(OpenReply {
                 ok: true,
