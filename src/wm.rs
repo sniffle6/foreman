@@ -302,6 +302,8 @@ impl Content {
                         TEXT,
                     );
                 }
+                // Watermark bookkeeping must run even in this interim arm — Task 4's rewrite keeps it as its final statement.
+                view.on_frame(active);
                 false
             }
         }
@@ -851,6 +853,7 @@ impl WindowManager {
                     continue;
                 }
                 let Content::Terminal(s) = &mut t.content else { continue };
+                // Merged member tabs in one window share term_tag(wid) — both rows get the same id and last-heard. Same accepted staleness family as the rest of chat identity (Tab doc).
                 rows.push(crate::chat::CrewRow {
                     win: wid,
                     tab: i,
@@ -1585,8 +1588,8 @@ impl WindowManager {
         }
 
         // Fill the chat viewer's crew rows / title chip before any window
-        // draws. Each nested project manager refreshes its own room; on the
-        // desktop manager this is a no-op (no viewer).
+        // draws. Project managers refresh their own viewer; on the desktop
+        // manager this scans windows once and finds no viewer.
         self.refresh_chat_view();
 
         self.pump_commands(ui, active);
@@ -3458,7 +3461,7 @@ mod tests {
         let log = Rc::new(RefCell::new(crate::chat::ChatLog::new()));
         log.borrow_mut().post("t1", "a", "before-open");
         let mut v = crate::chat::ChatView::new(Rc::clone(&log));
-        assert_eq!(v.last_seen, 1, "creation watermark = current tail (no NEW backlog)");
+        assert_eq!(v.last_seen, 1, "creation watermark = current tail (backlog pre-dates the window open)");
         v.on_frame(true); // focused
         log.borrow_mut().post("t1", "a", "while-focused");
         v.on_frame(true);
