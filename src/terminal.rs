@@ -143,7 +143,7 @@ pub struct Session {
     rx: Receiver<Vec<u8>>,
     resp: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn Write + Send>,
-    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     exit: Option<u32>,
     pub shell: Shell,
@@ -214,7 +214,7 @@ impl Session {
                 pixel_height: 0,
             })
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -256,7 +256,7 @@ impl Session {
             rx,
             resp,
             writer,
-            master: Some(pair.master),
+            master: pair.master,
             child,
             exit: None,
             shell,
@@ -337,14 +337,12 @@ impl Session {
         // Reflow under a preserved scroll offset points the viewport at stale
         // content; snap back to the live prompt like a normal terminal.
         self.term.scroll_display(Scroll::Bottom);
-        if let Some(m) = self.master.as_ref() {
-            let _ = m.resize(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        }
+        let _ = self.master.resize(PtySize {
+            rows: rows as u16,
+            cols: cols as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
     }
 
     fn send(&mut self, bytes: &[u8]) {
