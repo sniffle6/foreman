@@ -26,6 +26,31 @@ const BORDER_W: f32 = 0.75; // uniform window border width; focus is shown by co
 const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
+// Chat viewer palette. Sender colors are assigned by terminal-id hash —
+// stable for a given id, distinct enough across a small fleet.
+const CHAT_COLORS: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(231, 169, 63),  // amber (also the human "you")
+    egui::Color32::from_rgb(127, 179, 127), // green
+    egui::Color32::from_rgb(111, 167, 199), // blue
+    egui::Color32::from_rgb(199, 127, 174), // pink
+    egui::Color32::from_rgb(180, 160, 100), // sand
+    egui::Color32::from_rgb(140, 170, 160), // sage
+];
+const CHAT_STALE: egui::Color32 = egui::Color32::from_rgb(202, 164, 90);
+const CHAT_LIVE: egui::Color32 = egui::Color32::from_rgb(127, 179, 127);
+const CHAT_EDGE: egui::Color32 = egui::Color32::from_rgb(150, 107, 28);
+const CHAT_MENTION_BG: egui::Color32 = egui::Color32::from_rgb(69, 64, 47);
+const CHAT_BOARD_W: f32 = 160.0;
+const CHAT_BOARD_MIN_W: f32 = 480.0; // window narrower than this hides the board
+
+fn chat_color(id: &str) -> egui::Color32 {
+    if id == "you" {
+        return CHAT_COLORS[0];
+    }
+    let n: u64 = id.trim_start_matches('t').parse().unwrap_or(0);
+    CHAT_COLORS[(n as usize) % CHAT_COLORS.len()]
+}
+
 const TITLE_H: f32 = 26.0;
 
 // Leader (prefix) key — tmux-style. After it is pressed the next chord is a
@@ -284,25 +309,219 @@ impl Content {
             Content::Chat(view) => {
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, WIN_BG);
-                let font = egui::FontId::monospace(13.0);
-                let line_h = 17.0;
-                let pad = 6.0;
-                let fit = (((rect.height() - 2.0 * pad) / line_h).floor() as usize).max(1);
-                // Borrow stays scoped to this arm — never held across recursion
-                // into other windows' show() (post paths borrow_mut the log).
-                // tail_rows expands multi-line messages into physical rows so
-                // later messages are never overpainted.
-                let rows = view.log.borrow().tail_rows(fit);
-                for (i, row) in rows.iter().enumerate() {
-                    p.text(
-                        egui::pos2(rect.min.x + pad, rect.min.y + pad + i as f32 * line_h),
-                        egui::Align2::LEFT_TOP,
-                        row,
-                        font.clone(),
-                        TEXT,
+                let pad = 8.0;
+                let meta_font = egui::FontId::proportional(11.0);
+                let body_font = egui::FontId::proportional(12.5);
+                let compact = rect.width() < CHAT_BOARD_MIN_W;
+
+                // ---- crew board (comfortable widths only) ----
+                let mut log_left = rect.min.x;
+                if !compact {
+                    let board = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.min.x + CHAT_BOARD_W, rect.max.y),
                     );
+                    log_left = board.max.x;
+                    p.line_segment(
+                        [egui::pos2(board.max.x, rect.min.y), egui::pos2(board.max.x, rect.max.y)],
+                        egui::Stroke::new(1.0, BORDER),
+                    );
+                    p.text(
+                        egui::pos2(board.min.x + pad, board.min.y + pad),
+                        egui::Align2::LEFT_TOP,
+                        "CREW · BY LAST HEARD",
+                        egui::FontId::proportional(9.5),
+                        DIM,
+                    );
+                    let now = std::time::SystemTime::now();
+                    let row_h = 20.0;
+                    let mut y = board.min.y + pad + 16.0;
+                    for r in &view.crew {
+                        let row = egui::Rect::from_min_size(
+                            egui::pos2(board.min.x + 4.0, y),
+                            egui::vec2(board.width() - 8.0, row_h),
+                        );
+                        let hovered = resp.hovered()
+                            && resp.hover_pos().is_some_and(|p| row.contains(p));
+                        if hovered {
+                            p.rect_filled(row, 3.0, TITLE_BG);
+                        }
+                        if hovered && resp.clicked() {
+                            view.click = Some((r.win, r.tab));
+                        }
+                        let dot = if r.exited { BORDER } else { CHAT_LIVE };
+                        p.circle_filled(egui::pos2(row.min.x + 7.0, row.center().y), 3.0, dot);
+                        let name_col = if r.exited { DIM } else { chat_color(&r.id) };
+                        p.text(
+                            egui::pos2(row.min.x + 16.0, row.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{} · {}", r.name, r.id),
+                            egui::FontId::proportional(11.5),
+                            name_col,
+                        );
+                        let (age, stale) = if r.exited {
+                            ("exited".to_string(), false)
+                        } else {
+                            match r.last.and_then(|t| now.duration_since(t).ok()) {
+                                Some(d) => crate::chat::age_label(d),
+                                None => ("—".to_string(), false),
+                            }
+                        };
+                        p.text(
+                            egui::pos2(row.max.x - 4.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            age,
+                            egui::FontId::proportional(10.5),
+                            if stale { CHAT_STALE } else { DIM },
+                        );
+                        y += row_h;
+                        if y + row_h > board.max.y {
+                            break; // board overflow: clip; the log is the priority
+                        }
+                    }
                 }
-                // Watermark bookkeeping must run even in this interim arm — Task 4's rewrite keeps it as its final statement.
+
+                // ---- log: layout pass (galleys + heights), then paint ----
+                let log_rect = egui::Rect::from_min_max(
+                    egui::pos2(log_left + pad, rect.min.y + pad),
+                    egui::pos2(rect.max.x - pad, rect.max.y - pad),
+                );
+                let wrap = (log_rect.width() - 10.0).max(40.0);
+                // Borrow stays scoped — never held across recursion into other
+                // windows' show() (post paths borrow_mut the log).
+                let blocks = {
+                    let log = view.log.borrow();
+                    crate::chat::build_blocks(log.msgs(), view.last_seen, compact)
+                };
+                enum Painted {
+                    Galley(std::sync::Arc<egui::Galley>, egui::Color32, f32 /*indent*/, bool /*edge*/),
+                    Centered(std::sync::Arc<egui::Galley>),
+                    MetaPair(std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>, egui::Color32),
+                    Rule(egui::Color32, Option<std::sync::Arc<egui::Galley>>),
+                    Gap(f32),
+                }
+                let mut items: Vec<Painted> = Vec::new();
+                let mut total = 0.0f32;
+                for b in &blocks {
+                    match b {
+                        crate::chat::ChatBlock::Sys(s) => {
+                            let g = p.layout(s.clone(), meta_font.clone(), DIM, wrap);
+                            total += g.size().y + 6.0;
+                            items.push(Painted::Centered(g));
+                            items.push(Painted::Gap(6.0));
+                        }
+                        crate::chat::ChatBlock::Divider => {
+                            let g = p.layout("NEW".into(), egui::FontId::proportional(9.0), CHAT_STALE, wrap);
+                            total += 14.0;
+                            items.push(Painted::Rule(CHAT_STALE, Some(g)));
+                        }
+                        crate::chat::ChatBlock::Header { name, id, meta } => {
+                            let gn = p.layout_no_wrap(name.clone(), egui::FontId::proportional(12.0), chat_color(id));
+                            let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), DIM);
+                            total += gn.size().y + 2.0 + 4.0; // header + breathing room above
+                            items.push(Painted::Gap(4.0));
+                            items.push(Painted::MetaPair(gn, gm, chat_color(id)));
+                        }
+                        crate::chat::ChatBlock::Text { text, to } => {
+                            // Mention chips: lay the body out as a LayoutJob so
+                            // @tokens get their own colored sections inline.
+                            let mut job = egui::text::LayoutJob::default();
+                            job.wrap.max_width = wrap;
+                            for (i, word) in text.split(' ').enumerate() {
+                                let lead = if i == 0 { "" } else { " " };
+                                let (col, bg) = if word.starts_with('@') && word.len() > 1 {
+                                    (CHAT_COLORS[0], CHAT_MENTION_BG)
+                                } else {
+                                    (TEXT, egui::Color32::TRANSPARENT)
+                                };
+                                job.append(
+                                    &format!("{lead}{word}"),
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: body_font.clone(),
+                                        color: col,
+                                        background: bg,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            let g = p.layout_job(job);
+                            total += g.size().y + 2.0;
+                            items.push(Painted::Galley(g, TEXT, if to.is_some() { 10.0 } else { 0.0 }, to.is_some()));
+                            items.push(Painted::Gap(2.0));
+                        }
+                    }
+                }
+
+                // Scroll: stick-to-bottom by default; a wheel-up unsticks and
+                // the view then holds its CONTENT position while new messages
+                // arrive (autoscroll paused); wheeling back to the bottom
+                // re-sticks. Offset is measured from the top so an unstuck
+                // view doesn't slide as `total` grows.
+                let max = (total - log_rect.height()).max(0.0);
+                if resp.hovered() {
+                    let dy = ui.input(|i| i.smooth_scroll_delta.y);
+                    if dy != 0.0 {
+                        let cur = if view.stick { max } else { view.scroll };
+                        view.scroll = (cur - dy).clamp(0.0, max);
+                        view.stick = view.scroll >= max - 1.0;
+                    }
+                }
+                let offset = if view.stick { max } else { view.scroll.min(max) };
+                let mut y = log_rect.min.y - offset;
+                for it in items {
+                    match it {
+                        Painted::Gap(h) => y += h,
+                        Painted::Centered(g) => {
+                            let h = g.size().y;
+                            let x = log_rect.center().x - g.size().x / 2.0;
+                            p.galley(egui::pos2(x, y), g, DIM);
+                            y += h;
+                        }
+                        Painted::Rule(col, label) => {
+                            let mid = y + 7.0;
+                            p.line_segment(
+                                [egui::pos2(log_rect.min.x, mid), egui::pos2(log_rect.max.x, mid)],
+                                egui::Stroke::new(1.0, CHAT_MENTION_BG),
+                            );
+                            if let Some(g) = label {
+                                let w = g.size().x;
+                                let lx = log_rect.center().x - w / 2.0;
+                                p.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(lx - 4.0, y),
+                                        egui::vec2(w + 8.0, 14.0),
+                                    ),
+                                    0.0,
+                                    WIN_BG,
+                                );
+                                p.galley(egui::pos2(lx, y + 1.0), g, col);
+                            }
+                            y += 14.0;
+                        }
+                        Painted::MetaPair(gn, gm, _col) => {
+                            let h = gn.size().y;
+                            let nw = gn.size().x;
+                            p.galley(egui::pos2(log_rect.min.x, y), gn, TEXT);
+                            p.galley(egui::pos2(log_rect.min.x + nw + 6.0, y + 1.5), gm, DIM);
+                            y += h + 2.0;
+                        }
+                        Painted::Galley(g, col, indent, edge) => {
+                            let h = g.size().y;
+                            if edge {
+                                p.line_segment(
+                                    [
+                                        egui::pos2(log_rect.min.x + 2.0, y),
+                                        egui::pos2(log_rect.min.x + 2.0, y + h),
+                                    ],
+                                    egui::Stroke::new(2.0, CHAT_EDGE),
+                                );
+                            }
+                            p.galley(egui::pos2(log_rect.min.x + indent, y), g, col);
+                            y += h;
+                        }
+                    }
+                }
                 view.on_frame(active);
                 false
             }

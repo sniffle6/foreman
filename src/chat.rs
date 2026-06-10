@@ -131,23 +131,66 @@ impl ChatLog {
         lines
     }
 
-    /// Last `fit` PHYSICAL rows for the viewer, oldest first: a multi-line
-    /// message occupies one row per line, so later messages are never
-    /// overpainted. (`tail_lines` stays message-per-entry for `--history`.)
-    pub fn tail_rows(&self, fit: usize) -> Vec<String> {
-        let mut rows = Vec::with_capacity(fit);
-        'outer: for m in self.msgs.iter().rev().filter(|m| m.kind == ChatKind::Post) {
-            let line = m.line();
-            for l in line.rsplit('\n') {
-                rows.push(l.to_string());
-                if rows.len() == fit {
-                    break 'outer;
+}
+
+/// What the viewer paints, in order. Pure data so grouping/divider/meta
+/// logic is testable without egui.
+pub enum ChatBlock {
+    /// "— architect (t5) joined —"
+    Sys(String),
+    /// The amber NEW rule.
+    Divider,
+    /// Sender header for a run of consecutive messages.
+    Header { name: String, id: String, meta: String },
+    /// One message body under the current header.
+    Text { text: String, to: Option<String> },
+}
+
+/// Flatten the log into paint order. `last_seen` is the NEW watermark;
+/// `compact` trims meta to the seq (narrow windows).
+pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<ChatBlock> {
+    let mut out = Vec::new();
+    let mut current: Option<&str> = None; // sender of the open group
+    let mut divider_done = false;
+    for m in msgs {
+        if !divider_done && m.seq > last_seen {
+            out.push(ChatBlock::Divider);
+            divider_done = true;
+            current = None; // a divider breaks the group like a sys line
+        }
+        match m.kind {
+            ChatKind::Joined | ChatKind::Exited => {
+                let verb = if m.kind == ChatKind::Joined { "joined" } else { "exited" };
+                out.push(ChatBlock::Sys(format!("— {} ({}) {verb} —", m.name, m.from)));
+                current = None;
+            }
+            ChatKind::Post => {
+                if current != Some(m.from.as_str()) || m.to.is_some() {
+                    let mut meta = if compact {
+                        format!("#{}", m.seq)
+                    } else {
+                        let t: chrono::DateTime<chrono::Local> = m.at.into();
+                        format!("{} · #{} · {}", m.from, m.seq, t.format("%H:%M"))
+                    };
+                    if let Some(to) = &m.to {
+                        meta.push_str(&format!(" · → {to}"));
+                    }
+                    out.push(ChatBlock::Header {
+                        name: m.name.clone(),
+                        id: m.from.clone(),
+                        meta,
+                    });
                 }
+                // A targeted message stands alone: the next message re-headers.
+                current = if m.to.is_some() { None } else { Some(m.from.as_str()) };
+                out.push(ChatBlock::Text {
+                    text: m.text.clone(),
+                    to: m.to.clone(),
+                });
             }
         }
-        rows.reverse();
-        rows
     }
+    out
 }
 
 /// One crew-board row, assembled by the owning project manager each frame.
@@ -329,15 +372,71 @@ mod tests {
         assert_eq!(order, vec!["t4", "t5", "t1", "t3"]);
     }
 
+    fn msg(seq: u64, from: &str, text: &str, kind: ChatKind) -> ChatMsg {
+        ChatMsg {
+            seq,
+            from: from.to_string(),
+            name: format!("name-{from}"),
+            text: text.to_string(),
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(seq * 60),
+            to: None,
+            kind,
+        }
+    }
+
     #[test]
-    fn tail_rows_splits_multiline_messages_into_physical_rows() {
-        let mut log = ChatLog::new();
-        log.post("t1", "a", "a\nb");
-        log.post("t2", "b", "c");
-        // full window: 3 physical rows, oldest first
-        assert_eq!(log.tail_rows(10), vec!["#1 t1: a", "b", "#2 t2: c"]);
-        // tail-fit: the last 2 physical rows
-        assert_eq!(log.tail_rows(2), vec!["b", "#2 t2: c"]);
-        assert!(ChatLog::new().tail_rows(3).is_empty());
+    fn build_blocks_groups_consecutive_senders() {
+        let msgs = vec![
+            msg(1, "t4", "a", ChatKind::Post),
+            msg(2, "t4", "b", ChatKind::Post),
+            msg(3, "t5", "c", ChatKind::Post),
+        ];
+        let blocks = build_blocks(&msgs, 3, true);
+        let shape: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                ChatBlock::Header { .. } => "H",
+                ChatBlock::Text { .. } => "T",
+                ChatBlock::Sys(_) => "S",
+                ChatBlock::Divider => "D",
+            })
+            .collect();
+        assert_eq!(shape, vec!["H", "T", "T", "H", "T"]);
+    }
+
+    #[test]
+    fn build_blocks_sys_lines_break_groups_and_render_labels() {
+        let msgs = vec![
+            msg(1, "t4", "a", ChatKind::Post),
+            msg(2, "t5", "", ChatKind::Joined),
+            msg(3, "t4", "b", ChatKind::Post),
+        ];
+        let blocks = build_blocks(&msgs, 3, true);
+        assert!(matches!(&blocks[2], ChatBlock::Sys(s) if s == "— name-t5 (t5) joined —"));
+        // t4 gets a fresh header after the sys line even though it also sent #1
+        assert!(matches!(&blocks[3], ChatBlock::Header { .. }));
+    }
+
+    #[test]
+    fn build_blocks_places_divider_and_formats_meta() {
+        let mut m3 = msg(3, "t5", "c", ChatKind::Post);
+        m3.to = Some("skeptic".to_string());
+        let msgs = vec![msg(1, "t4", "a", ChatKind::Post), m3];
+        // compact: seq only (+ arrow)
+        let blocks = build_blocks(&msgs, 1, true);
+        assert!(matches!(&blocks[0], ChatBlock::Header { meta, .. } if meta == "#1"));
+        assert!(matches!(&blocks[2], ChatBlock::Divider), "divider above first seq > last_seen");
+        assert!(matches!(&blocks[3], ChatBlock::Header { meta, .. } if meta == "#3 · → skeptic"));
+        assert!(matches!(&blocks[4], ChatBlock::Text { to: Some(t), .. } if t == "skeptic"));
+        // comfortable: id · seq · HH:MM (don't assert the clock digits — tz-dependent)
+        // last_seen 0 => everything is new, so the divider sits at blocks[0]
+        // and the first header lands at blocks[1].
+        let blocks = build_blocks(&msgs, 0, false);
+        assert!(matches!(&blocks[0], ChatBlock::Divider));
+        assert!(matches!(&blocks[1], ChatBlock::Header { meta, .. }
+            if meta.starts_with("t4 · #1 · ") && meta.len() == "t4 · #1 · 00:00".len()));
+        // nothing new => no divider
+        let blocks = build_blocks(&msgs, 99, true);
+        assert!(!blocks.iter().any(|b| matches!(b, ChatBlock::Divider)));
     }
 }
