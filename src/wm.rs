@@ -709,6 +709,9 @@ enum ChatOutcome {
         pid: WinId,
         from: WinId,
         framed: String,
+        /// `None` = broadcast; `Some` = deliver only to these windows
+        /// (`you` already filtered out — a pure-@you post is `Some(vec![])`).
+        targets: Option<Vec<WinId>>,
     },
     History(Vec<String>),
 }
@@ -945,7 +948,7 @@ impl WindowManager {
                     // log, not the audience) — only the injection is skipped.
                     // A retrying client may therefore duplicate a history line;
                     // accepted v1.
-                    Ok(ChatOutcome::Posted { pid, from, framed }) => {
+                    Ok(ChatOutcome::Posted { pid, from, framed, targets }) => {
                         let ok = OpenReply {
                             ok: true,
                             terminal: None,
@@ -954,7 +957,7 @@ impl WindowManager {
                             history: None,
                         };
                         if reply.send(ok).is_ok() {
-                            self.chat_broadcast_in(pid, from, &framed);
+                            self.chat_broadcast_in(pid, from, &framed, targets.as_deref());
                         }
                         ctx.request_repaint(); // log changed either way (viewer)
                     }
@@ -1023,19 +1026,19 @@ impl WindowManager {
             (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
             (Some(text), None) => {
                 let from = term_id(&req.from)?;
-                let framed = child.chat_post(from, text)?;
-                Ok(ChatOutcome::Posted { pid, from, framed })
+                let (framed, targets) = child.chat_post(from, text, &req.to)?;
+                Ok(ChatOutcome::Posted { pid, from, framed, targets })
             }
             _ => Err("chat needs exactly one of text/history".into()),
         }
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
-    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str) {
+    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str, targets: Option<&[WinId]>) {
         if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
             && let Content::Project(child) = &mut win.tabs[win.active].content
         {
-            child.chat_broadcast(Some(from), framed);
+            child.chat_broadcast(Some(from), framed, targets);
         }
     }
 
@@ -1227,19 +1230,84 @@ impl WindowManager {
         }
         if let Some(text) = pending {
             if let Some(framed) = self.chat_post_human(&text) {
-                self.chat_broadcast(None, &framed);
+                self.chat_broadcast(None, &framed, None);
             }
         }
     }
 
+    /// Resolve + validate mention targets against this project's members
+    /// (mentions spec §5) — call BEFORE any mutation: a failed post must not
+    /// append and must not join-on-first-post. `sender` None = the human
+    /// (`you` then counts as self-mention). Returns the terminal WinIds to
+    /// deliver to; `you` is valid markup but resolves to no terminal.
+    fn validate_chat_targets(
+        &mut self,
+        sender: Option<WinId>,
+        targets: &[String],
+    ) -> Result<Vec<WinId>, String> {
+        let mut ids = Vec::new();
+        for t in targets {
+            if t == "you" {
+                if sender.is_none() {
+                    return Err("cannot mention yourself".into());
+                }
+                continue;
+            }
+            let id = term_id(t)?;
+            let win = self
+                .windows
+                .iter_mut()
+                .find(|w| w.id == id)
+                .ok_or_else(|| format!("no such terminal: {t}"))?;
+            if Some(id) == sender {
+                return Err("cannot mention yourself".into());
+            }
+            let (mut member, mut alive) = (false, false);
+            for tab in &mut win.tabs {
+                if !tab.chat_member {
+                    continue;
+                }
+                member = true;
+                if let Content::Terminal(s) = &mut tab.content
+                    && s.exited().is_none()
+                {
+                    alive = true;
+                }
+            }
+            if !member {
+                return Err(format!("{t} is not a chat member"));
+            }
+            if !alive {
+                return Err(format!("{t} has exited"));
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
     /// Post into this project's chat: validate the sender, append, join the
-    /// sender (spec §2: join-on-first-post). Returns the framed injection line.
-    /// Injection itself is `chat_broadcast` — kept separate because the reply
-    /// must be sent BEFORE bytes flow (spec §3: reply-before-inject).
-    fn chat_post(&mut self, from: WinId, text: &str) -> Result<String, String> {
+    /// sender (spec §2: join-on-first-post). Targets (`--to` flags + leading
+    /// inline mentions) validate all-or-nothing BEFORE the join/append, so a
+    /// failed post mutates nothing (mentions spec §5). Returns the framed
+    /// injection line plus the resolved delivery filter for `chat_broadcast`
+    /// (`None` = broadcast). Injection itself is `chat_broadcast` — kept
+    /// separate because the reply must be sent BEFORE bytes flow (spec §3:
+    /// reply-before-inject).
+    fn chat_post(
+        &mut self,
+        from: WinId,
+        text: &str,
+        to_flags: &[String],
+    ) -> Result<(String, Option<Vec<WinId>>), String> {
         if text.is_empty() {
             return Err("empty message".into());
         }
+        let targets = crate::chat::effective_targets(to_flags, text);
+        let resolved = if targets.is_empty() {
+            None
+        } else {
+            Some(self.validate_chat_targets(Some(from), &targets)?)
+        };
         let sender = self
             .windows
             .iter_mut()
@@ -1261,8 +1329,8 @@ impl WindowManager {
             // transcript reads join-then-speak
             log.sys(crate::chat::ChatKind::Joined, &from_tag, &name);
         }
-        let msg = log.post(&from_tag, &name, text);
-        Ok(msg.frame(project))
+        let msg = log.post_to(&from_tag, &name, text, targets);
+        Ok((msg.frame(project), resolved))
     }
 
     /// The pane's reserved sender identity — can never collide with a "tN"
@@ -1289,8 +1357,15 @@ impl WindowManager {
     /// tabs receive too: keepalive keeps their PTYs drained, and chat's
     /// whole point is that members never have to poll. `None` = the human
     /// posting from the chat pane; excludes nobody.
-    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str) {
+    /// `targets`: None = broadcast; Some(ids) = only those windows' member
+    /// tabs; Some(&[]) injects nobody (a pure @you post).
+    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str, targets: Option<&[WinId]>) {
         for w in self.windows.iter_mut() {
+            if let Some(t) = targets
+                && !t.contains(&w.id)
+            {
+                continue;
+            }
             let active = w.active;
             let is_sender = Some(w.id) == from;
             for (i, tab) in w.tabs.iter_mut().enumerate() {
@@ -3643,7 +3718,7 @@ mod tests {
         // simulate a hand-opened terminal: not yet a member
         let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
         w.tabs[w.active].chat_member = false;
-        wm.chat_post(t, "hello").unwrap();
+        wm.chat_post(t, "hello", &[]).unwrap();
         let log = wm.chat.borrow();
         let kinds: Vec<_> = log.msgs().iter().map(|m| m.kind).collect();
         // dispatch auto-join from add_terminal_cmd, then the simulated
@@ -3658,7 +3733,7 @@ mod tests {
         );
         drop(log);
         // second post: member already — no second Joined
-        wm.chat_post(t, "again").unwrap();
+        wm.chat_post(t, "again", &[]).unwrap();
         let log = wm.chat.borrow();
         assert_eq!(log.msgs().last().unwrap().kind, crate::chat::ChatKind::Post);
         let joins = log
@@ -3725,9 +3800,9 @@ mod tests {
             w.tabs[w.active].chat_member = false;
         }
 
-        assert!(wm.chat_post(t, "").is_err(), "empty message rejected");
-        assert!(wm.chat_post(999, "hi").is_err(), "unknown sender rejected");
-        let framed = wm.chat_post(t, "hello room").unwrap();
+        assert!(wm.chat_post(t, "", &[]).is_err(), "empty message rejected");
+        assert!(wm.chat_post(999, "hi", &[]).is_err(), "unknown sender rejected");
+        let framed = wm.chat_post(t, "hello room", &[]).unwrap().0;
         // seq 3: dispatch Joined (1), first-post Joined (2), then the post —
         // system entries share the seq space but stay out of --history
         assert_eq!(framed, format!("[chat p1 #3] t{t}: hello room"));
@@ -4029,7 +4104,7 @@ mod tests {
             w.tabs[w.active].chat_member = false;
         }
 
-        let framed = wm.chat_post(sender, "go").unwrap();
+        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
 
         // Pump every session each iteration: keepalive() answers the startup
         // DSR (the documented trap — bytes injected before a child's DSR scan
@@ -4047,7 +4122,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_broadcast(Some(sender), &framed);
+            wm.chat_broadcast(Some(sender), &framed, None);
             // positive signal: the member exits because bytes hit its stdin
             let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
@@ -4286,7 +4361,7 @@ mod tests {
             });
             w.active = 1; // shell in front, member behind
         }
-        let framed = wm.chat_post(sender, "go").unwrap();
+        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
 
         // Same re-broadcast + pump-everything pattern as
         // chat_broadcast_hits_members_only_excluding_sender (the DSR trap):
@@ -4301,7 +4376,7 @@ mod tests {
                     }
                 }
             }
-            wm.chat_broadcast(Some(sender), &framed);
+            wm.chat_broadcast(Some(sender), &framed, None);
             // positive signal: the background member tab exits
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
             let Content::Terminal(s) = &mut w.tabs[0].content else {
@@ -4336,5 +4411,161 @@ mod tests {
             s.exited().is_none(),
             "foreground non-member shell must not be injected"
         );
+    }
+
+    // --- chat @-mentions v2: targeted delivery + validation ---
+
+    #[test]
+    fn chat_targeted_broadcast_hits_only_the_target() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        // all run `cmd /c pause`: any stdin byte makes them exit
+        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let target = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let bystander = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        // bystander IS a member — only the target filter may exclude it
+        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            wm.chat_broadcast(Some(sender), &framed, Some(&[target]));
+            let w = wm.windows.iter_mut().find(|w| w.id == target).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "target never received the bytes");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // member bystander + sender saw nothing (kept pumped so a wrongful
+        // injection would surface), and Some(&[]) injects nobody at all
+        wm.chat_broadcast(Some(sender), &framed, Some(&[]));
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < grace {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        for (id, who) in [(sender, "sender"), (bystander, "member bystander")] {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+            assert!(s.exited().is_none(), "{who} must not be injected");
+        }
+    }
+
+    #[test]
+    fn targeted_post_validates_all_or_nothing_before_any_mutation() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let outsider = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
+            w.tabs[w.active].chat_member = false;
+        }
+        let len_before = wm.chat.borrow().msgs().len();
+
+        // unknown id — names it; one bad target fails a multi-target post entirely
+        let e = wm.chat_post(sender, "go", &[term_tag(member), "t99".into()]).unwrap_err();
+        assert!(e.contains("no such terminal: t99"), "{e}");
+        // self-mention
+        let e = wm.chat_post(sender, "go", &[term_tag(sender)]).unwrap_err();
+        assert!(e.contains("cannot mention yourself"), "{e}");
+        // non-member
+        let e = wm.chat_post(sender, "go", &[term_tag(outsider)]).unwrap_err();
+        assert!(e.contains("is not a chat member"), "{e}");
+        // nothing appended by any failed post
+        assert_eq!(wm.chat.borrow().msgs().len(), len_before);
+        // inline mentions count too: a leading @ with a bad id fails the post
+        let e = wm.chat_post(sender, "@t99 go", &[]).unwrap_err();
+        assert!(e.contains("no such terminal: t99"), "{e}");
+    }
+
+    #[test]
+    fn failed_targeted_post_does_not_join_the_sender() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        {
+            // make the sender a NON-member so a successful post would join it
+            let w = wm.windows.iter_mut().find(|w| w.id == sender).unwrap();
+            w.tabs[w.active].chat_member = false;
+        }
+        // dispatch already logged one Joined sysline; a failed post adds nothing
+        let len_before = wm.chat.borrow().msgs().len();
+        let _ = wm.chat_post(sender, "go", &["t99".into()]).unwrap_err();
+        let w = wm.windows.iter().find(|w| w.id == sender).unwrap();
+        assert!(!w.tabs[w.active].chat_member, "failed post must not join");
+        assert_eq!(
+            wm.chat.borrow().msgs().len(),
+            len_before,
+            "no Joined sysline either"
+        );
+    }
+
+    #[test]
+    fn targeted_post_resolves_targets_and_frames_the_arrow() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+
+        // flags first, then inline, deduped; `you` resolves to no terminal
+        let (framed, targets) = wm.chat_post(sender, "@you go", &[term_tag(member)]).unwrap();
+        let mtag = term_tag(member);
+        let stag = term_tag(sender);
+        assert!(framed.contains(&format!("{stag}→{mtag},you: @you go")), "{framed}");
+        assert_eq!(targets, Some(vec![member]));
+        // pure-@you: Some(empty) — targeted, deliver to nobody
+        let (framed, targets) = wm.chat_post(sender, "@you need eyes", &[]).unwrap();
+        assert!(framed.contains(&format!("{stag}→you: @you need eyes")), "{framed}");
+        assert_eq!(targets, Some(vec![]));
+        // untargeted: None — broadcast
+        let (_, targets) = wm.chat_post(sender, "plain", &[]).unwrap();
+        assert_eq!(targets, None);
+    }
+
+    #[test]
+    fn targeting_an_exited_member_errors() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let victim = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        // kill the victim by injecting a byte (pause exits on any stdin), pumping
+        // through the DSR window like the broadcast tests
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            {
+                let w = wm.windows.iter_mut().find(|w| w.id == victim).unwrap();
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                s.inject_input("x");
+                if s.exited().is_some() {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "victim never exited");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let e = wm.chat_post(sender, "go", &[term_tag(victim)]).unwrap_err();
+        assert!(e.contains("has exited"), "{e}");
     }
 }
