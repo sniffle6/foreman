@@ -158,6 +158,11 @@ pub struct Session {
     // When to send the deferred chat-submit `\r`; fired by pump(). See
     // inject_input for why the submit cannot ride with the paste.
     pending_submit: Option<std::time::Instant>,
+    // Latches true once the startup DSR (`ESC[6n`) has been answered — the
+    // point after which injected input is no longer eaten by the device-status
+    // scan. Catch-up replay and cursor advance gate on this (chat handshake
+    // contract: the cursor advances only on inject into a READY session).
+    ready: bool,
 }
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
@@ -307,7 +312,15 @@ impl Session {
             sel_head: None,
             pending_note: None,
             pending_submit: None,
+            ready: false,
         })
+    }
+
+    /// Has the startup DSR exchange resolved? Once true, injected chat input
+    /// reaches the child instead of being swallowed by the device-status scan.
+    /// Latched by [`Session::pump`] on the first reply flushed back to the PTY.
+    pub fn ready(&self) -> bool {
+        self.ready
     }
 
     /// Exit code of the child process, once it has ended. Cached — `try_wait`
@@ -423,6 +436,9 @@ impl Session {
         if !reply.is_empty() {
             let _ = self.writer.write_all(&reply);
             let _ = self.writer.flush();
+            // First device-status reply flushed back = the startup DSR scan is
+            // done; input injected from here on reaches the child (see `ready`).
+            self.ready = true;
         }
         // Deferred chat submit (see inject_input).
         if let Some(due) = self.pending_submit
@@ -962,6 +978,28 @@ mod tests {
             !interior.contains(&0x1b),
             "payload ESC must be stripped: {b:?}"
         );
+    }
+
+    #[test]
+    fn session_latches_ready_after_dsr_is_answered() {
+        let ctx = egui::Context::default();
+        // `pause` keeps the child alive past the DSR exchange so we can observe
+        // the latch (cmd /c exit could race to exit first).
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        assert!(!s.ready(), "freshly spawned: not ready until DSR is answered");
+        // cmd.exe sends ESC[6n at startup; pump() flushes the reply back to the
+        // PTY — that first flush is the readiness latch.
+        let mut became_ready = false;
+        for _ in 0..200 {
+            s.pump();
+            if s.ready() {
+                became_ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(became_ready, "session never became ready (DSR never answered)");
     }
 
     #[test]
