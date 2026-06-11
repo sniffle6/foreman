@@ -1896,6 +1896,8 @@ impl WindowManager {
 
     /// Append an `exited (code)` marker to terminals whose process ended. Runs
     /// over every tab (not just visible ones) so background agents update too.
+    /// Entry point is the desktop manager (gated in `show`); project managers
+    /// are reached through the `Content::Project` recursion below.
     fn refresh_exit_titles(&mut self) {
         let chat = Rc::clone(&self.chat);
         for w in &mut self.windows {
