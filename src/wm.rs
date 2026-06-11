@@ -474,7 +474,7 @@ impl Content {
                             }
                             let g = p.layout_job(job);
                             total += g.size().y + 2.0;
-                            items.push(Painted::Galley(g, TEXT, if to.is_some() { 10.0 } else { 0.0 }, to.is_some()));
+                            items.push(Painted::Galley(g, TEXT, if to.is_empty() { 0.0 } else { 10.0 }, !to.is_empty()));
                             items.push(Painted::Gap(2.0));
                         }
                     }

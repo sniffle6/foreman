@@ -41,15 +41,27 @@ pub struct ChatMsg {
     pub name: String,
     pub text: String, // empty for system entries
     pub at: SystemTime,
-    /// Mention target — render-only until v2 mention delivery sets it.
-    pub to: Option<String>,
+    /// Delivery targets (`t3` / the reserved `you`). Empty = broadcast.
+    /// Set by v2 mention delivery; the viewer renders arrow meta + olive edge.
+    pub to: Vec<String>,
     pub kind: ChatKind,
 }
 
 impl ChatMsg {
+    /// `t1` (broadcast) or `t1→t2,t3` (targeted) — the sender tag shared by
+    /// injection framing and history lines. Untargeted output is byte-identical
+    /// to v1: agents and tests parse it.
+    fn from_tag(&self) -> String {
+        if self.to.is_empty() {
+            self.from.clone()
+        } else {
+            format!("{}→{}", self.from, self.to.join(","))
+        }
+    }
+
     /// History/window line: `#14 t2: text`.
     pub fn line(&self) -> String {
-        format!("#{} {}: {}", self.seq, self.from, self.text)
+        format!("#{} {}: {}", self.seq, self.from_tag(), self.text)
     }
 
     /// Injection framing with provenance: `[chat p1 #14] t2: text` —
@@ -58,7 +70,7 @@ impl ChatMsg {
     pub fn frame(&self, project: &str) -> String {
         format!(
             "[chat {project} #{}] {}: {}",
-            self.seq, self.from, self.text
+            self.seq, self.from_tag(), self.text
         )
     }
 }
@@ -75,17 +87,23 @@ impl ChatLog {
     }
 
     pub fn post(&mut self, from: &str, name: &str, text: &str) -> &ChatMsg {
-        self.push(from, name, text, ChatKind::Post)
+        self.push(from, name, text, ChatKind::Post, Vec::new())
+    }
+
+    /// Post with delivery targets (mentions spec §4). `to` is stored verbatim
+    /// (ids incl. the reserved `you`); resolution happened at the call site.
+    pub fn post_to(&mut self, from: &str, name: &str, text: &str, to: Vec<String>) -> &ChatMsg {
+        self.push(from, name, text, ChatKind::Post, to)
     }
 
     /// Append a membership event (join/exit). Text stays empty; the viewer
     /// derives the display line from kind + name + id.
     pub fn sys(&mut self, kind: ChatKind, from: &str, name: &str) -> &ChatMsg {
         debug_assert!(kind != ChatKind::Post, "use post() for user messages");
-        self.push(from, name, "", kind)
+        self.push(from, name, "", kind, Vec::new())
     }
 
-    fn push(&mut self, from: &str, name: &str, text: &str, kind: ChatKind) -> &ChatMsg {
+    fn push(&mut self, from: &str, name: &str, text: &str, kind: ChatKind, to: Vec<String>) -> &ChatMsg {
         let name = if name.trim().is_empty() { from } else { name };
         let msg = ChatMsg {
             seq: self.msgs.len() as u64 + 1,
@@ -93,7 +111,7 @@ impl ChatLog {
             name: name.to_string(),
             text: text.to_string(),
             at: SystemTime::now(),
-            to: None,
+            to,
             kind,
         };
         self.msgs.push(msg);
@@ -143,7 +161,7 @@ pub enum ChatBlock {
     /// Sender header for a run of consecutive messages.
     Header { name: String, id: String, meta: String },
     /// One message body under the current header.
-    Text { text: String, to: Option<String> },
+    Text { text: String, to: Vec<String> },
 }
 
 /// Flatten the log into paint order. `last_seen` is the NEW watermark;
@@ -165,15 +183,15 @@ pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<Chat
                 current = None;
             }
             ChatKind::Post => {
-                if current != Some(m.from.as_str()) || m.to.is_some() {
+                if current != Some(m.from.as_str()) || !m.to.is_empty() {
                     let mut meta = if compact {
                         format!("#{}", m.seq)
                     } else {
                         let t: chrono::DateTime<chrono::Local> = m.at.into();
                         format!("{} · #{} · {}", m.from, m.seq, t.format("%H:%M"))
                     };
-                    if let Some(to) = &m.to {
-                        meta.push_str(&format!(" · → {to}"));
+                    if !m.to.is_empty() {
+                        meta.push_str(&format!(" · → {}", m.to.join(",")));
                     }
                     out.push(ChatBlock::Header {
                         name: m.name.clone(),
@@ -182,7 +200,7 @@ pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<Chat
                     });
                 }
                 // A targeted message stands alone: the next message re-headers.
-                current = if m.to.is_some() { None } else { Some(m.from.as_str()) };
+                current = if m.to.is_empty() { Some(m.from.as_str()) } else { None };
                 out.push(ChatBlock::Text {
                     text: m.text.clone(),
                     to: m.to.clone(),
@@ -287,7 +305,7 @@ mod tests {
         let m = log.post("t2", "architect", "hi");
         assert_eq!(m.name, "architect");
         assert_eq!(m.kind, ChatKind::Post);
-        assert_eq!(m.to, None);
+        assert!(m.to.is_empty());
         assert!(m.at >= before && m.at <= SystemTime::now());
         // blank display name falls back to the id
         let m = log.post("t9", "  ", "hi");
@@ -385,7 +403,7 @@ mod tests {
             name: format!("name-{from}"),
             text: text.to_string(),
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(seq * 60),
-            to: None,
+            to: Vec::new(),
             kind,
         }
     }
@@ -424,16 +442,28 @@ mod tests {
     }
 
     #[test]
+    fn targeted_frame_and_line_carry_the_arrow() {
+        let mut log = ChatLog::new();
+        let m = log.post_to("t1", "boss", "go", vec!["t2".into(), "t3".into()]);
+        assert_eq!(m.line(), "#1 t1→t2,t3: go");
+        assert_eq!(m.frame("p1"), "[chat p1 #1] t1→t2,t3: go");
+        // untargeted stays byte-identical (regression — v1 agents parse this)
+        let m = log.post("t2", "worker", "ok");
+        assert_eq!(m.line(), "#2 t2: ok");
+        assert_eq!(m.frame("p1"), "[chat p1 #2] t2: ok");
+    }
+
+    #[test]
     fn build_blocks_places_divider_and_formats_meta() {
         let mut m3 = msg(3, "t5", "c", ChatKind::Post);
-        m3.to = Some("skeptic".to_string());
+        m3.to = vec!["t4".to_string(), "you".to_string()];
         let msgs = vec![msg(1, "t4", "a", ChatKind::Post), m3];
         // compact: seq only (+ arrow)
         let blocks = build_blocks(&msgs, 1, true);
         assert!(matches!(&blocks[0], ChatBlock::Header { meta, .. } if meta == "#1"));
         assert!(matches!(&blocks[2], ChatBlock::Divider), "divider above first seq > last_seen");
-        assert!(matches!(&blocks[3], ChatBlock::Header { meta, .. } if meta == "#3 · → skeptic"));
-        assert!(matches!(&blocks[4], ChatBlock::Text { to: Some(t), .. } if t == "skeptic"));
+        assert!(matches!(&blocks[3], ChatBlock::Header { meta, .. } if meta == "#3 · → t4,you"));
+        assert!(matches!(&blocks[4], ChatBlock::Text { to, .. } if to == &["t4", "you"]));
         // comfortable: id · seq · HH:MM (don't assert the clock digits — tz-dependent)
         // last_seen 0 => everything is new, so the divider sits at blocks[0]
         // and the first header lands at blocks[1].
