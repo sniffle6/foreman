@@ -568,8 +568,9 @@ impl Content {
                 if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     view.pending_post = Some(std::mem::take(&mut view.input));
                     te.request_focus(); // keep typing; multi-post sessions are the norm
-                }
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) && te.has_focus() {
+                // Escape defocuses the field at frame start (egui Focus::begin_pass),
+                // so detect it as lost_focus + Escape — has_focus() is already false here.
+                } else if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     view.input.clear();
                 }
                 false
