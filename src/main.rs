@@ -371,6 +371,7 @@ fn main() -> eframe::Result {
         std::process::exit(control::client_main(&args[1..]));
     }
     install_panic_logger();
+    skills_install::install();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || control::serve(control::PIPE, tx));
     let opts = eframe::NativeOptions {

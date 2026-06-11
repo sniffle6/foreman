@@ -14,7 +14,6 @@ const MANAGED_NOTICE: &str = "<!-- managed by foreman; edits are overwritten on 
 /// The exact bytes foreman wants on disk for a skill: the embedded body with
 /// trailing whitespace trimmed, then the managed-by notice on its own line.
 /// Deterministic so the on-disk byte-compare in `write_skill_if_changed` is stable.
-#[allow(dead_code)]
 fn rendered_content(raw: &str) -> String {
     format!("{}\n{}\n", raw.trim_end(), MANAGED_NOTICE)
 }
@@ -22,7 +21,6 @@ fn rendered_content(raw: &str) -> String {
 /// Resolve `<claude-config>/skills`. Prefers a non-empty `CLAUDE_CONFIG_DIR`
 /// (matching Claude Code's own precedence); otherwise `<userprofile>/.claude`.
 /// Returns `None` only when neither is usable.
-#[allow(dead_code)]
 fn resolve_skills_dir(claude_config: Option<&str>, userprofile: Option<&str>) -> Option<PathBuf> {
     let base = match claude_config {
         Some(v) if !v.trim().is_empty() => PathBuf::from(v),
@@ -35,7 +33,6 @@ fn resolve_skills_dir(claude_config: Option<&str>, userprofile: Option<&str>) ->
 /// from `rendered_content(raw)`. Returns `true` when it wrote. The write is
 /// atomic: a temp file in the same directory is renamed over the target, so a
 /// `claude` session scanning the dir never sees a half-written skill.
-#[allow(dead_code)]
 fn write_skill_if_changed(skills_dir: &Path, name: &str, raw: &str) -> io::Result<bool> {
     let want = rendered_content(raw);
     let dir = skills_dir.join(name);
@@ -54,7 +51,6 @@ fn write_skill_if_changed(skills_dir: &Path, name: &str, raw: &str) -> io::Resul
 
 /// Delete any obsolete skill directories named in `names` from `skills_dir`.
 /// Returns the names actually removed. Missing dirs are skipped silently.
-#[allow(dead_code)]
 fn remove_obsolete(skills_dir: &Path, names: &[&str]) -> io::Result<Vec<String>> {
     let mut removed = Vec::new();
     for &name in names {
@@ -89,7 +85,6 @@ pub struct InstallReport {
 
 /// Ensure `skills_dir` exists, drop obsolete skills, then write each bundled
 /// skill that is missing or stale.
-#[allow(dead_code)]
 fn install_into(skills_dir: &Path) -> io::Result<InstallReport> {
     std::fs::create_dir_all(skills_dir)?;
     let removed = remove_obsolete(skills_dir, OBSOLETE_SKILLS)?;
@@ -100,6 +95,36 @@ fn install_into(skills_dir: &Path) -> io::Result<InstallReport> {
         }
     }
     Ok(InstallReport { written, removed })
+}
+
+/// Resolve `<claude-config>/skills` from the live environment.
+fn config_skills_dir() -> Option<PathBuf> {
+    resolve_skills_dir(
+        std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
+    )
+}
+
+/// Best-effort: install the bundled skills into the user's Claude config dir so
+/// agents in any project can discover dispatch/chat. Never panics; every failure
+/// is logged to stderr and the app continues — the env wiring works regardless.
+pub fn install() {
+    let Some(dir) = config_skills_dir() else {
+        eprintln!("foreman: skill install skipped (no CLAUDE_CONFIG_DIR or USERPROFILE)");
+        return;
+    };
+    match install_into(&dir) {
+        Ok(r) if !r.written.is_empty() || !r.removed.is_empty() => {
+            eprintln!(
+                "foreman: skills updated in {} (wrote {:?}, removed {:?})",
+                dir.display(),
+                r.written,
+                r.removed
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("foreman: skill install failed: {e}"),
+    }
 }
 
 #[cfg(test)]
