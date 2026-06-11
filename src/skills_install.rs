@@ -52,6 +52,21 @@ fn write_skill_if_changed(skills_dir: &Path, name: &str, raw: &str) -> io::Resul
     Ok(true)
 }
 
+/// Delete any obsolete skill directories named in `names` from `skills_dir`.
+/// Returns the names actually removed. Missing dirs are skipped silently.
+#[allow(dead_code)]
+fn remove_obsolete(skills_dir: &Path, names: &[&str]) -> io::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    for &name in names {
+        let dir = skills_dir.join(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            removed.push(name.to_string());
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +151,16 @@ mod tests {
         std::fs::remove_dir_all(dir.join("foreman-chat")).unwrap();
         assert!(write_skill_if_changed(&dir, "foreman-chat", "x").unwrap());
         assert!(dir.join("foreman-chat").join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn remove_obsolete_deletes_named_leaves_others() {
+        let dir = temp("obsolete");
+        std::fs::create_dir_all(dir.join("old-skill")).unwrap();
+        std::fs::create_dir_all(dir.join("keep")).unwrap();
+        let removed = remove_obsolete(&dir, &["old-skill", "never-existed"]).unwrap();
+        assert_eq!(removed, vec!["old-skill".to_string()]);
+        assert!(!dir.join("old-skill").exists());
+        assert!(dir.join("keep").exists());
     }
 }
