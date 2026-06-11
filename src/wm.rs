@@ -1216,7 +1216,8 @@ impl WindowManager {
     }
 
     /// Apply input-line submissions recorded during the draw. Human posts
-    /// broadcast to ALL members — there is no sender terminal to exclude.
+    /// broadcast to ALL members — there is no sender terminal to exclude —
+    /// unless a leading mention narrowed delivery (then only the targets).
     fn drain_chat_posts(&mut self) {
         let mut pending = None;
         for w in &mut self.windows {
@@ -1229,8 +1230,8 @@ impl WindowManager {
             }
         }
         if let Some(text) = pending {
-            if let Some(framed) = self.chat_post_human(&text) {
-                self.chat_broadcast(None, &framed, None);
+            if let Some((framed, targets)) = self.chat_post_human(&text) {
+                self.chat_broadcast(None, &framed, targets.as_deref());
             }
         }
     }
@@ -1338,17 +1339,31 @@ impl WindowManager {
     const HUMAN_ID: &'static str = "you";
 
     /// Append a post from the chat pane's input line. No membership games —
-    /// the human is not a terminal. Returns the framed line for broadcast.
-    fn chat_post_human(&mut self, text: &str) -> Option<String> {
+    /// the human is not a terminal. Leading mentions narrow delivery like CLI
+    /// posts, but a bad mention demotes the post to plain broadcast instead
+    /// of erroring — the input line has no error seat (mentions spec §7).
+    /// Returns the framed line plus the delivery filter for `chat_broadcast`.
+    fn chat_post_human(&mut self, text: &str) -> Option<(String, Option<Vec<WinId>>)> {
         let text = text.trim();
         if text.is_empty() {
             return None;
         }
+        // effective_targets (not raw leading_mentions) for dedup parity with
+        // CLI posts — `@t2 @t2 go` must not frame `you→t2,t2`
+        let mentions = crate::chat::effective_targets(&[], text);
+        let (to, resolved) = if mentions.is_empty() {
+            (Vec::new(), None)
+        } else {
+            match self.validate_chat_targets(None, &mentions) {
+                Ok(ids) => (mentions, Some(ids)),
+                Err(_) => (Vec::new(), None), // prose fallback
+            }
+        };
         debug_assert!(self.tag.is_some(), "human post on a tag-less manager");
         let project = self.tag.as_deref().unwrap_or("p?").to_string();
         let mut log = self.chat.borrow_mut();
-        let msg = log.post(Self::HUMAN_ID, Self::HUMAN_ID, text);
-        Some(msg.frame(&project))
+        let msg = log.post_to(Self::HUMAN_ID, Self::HUMAN_ID, text, to);
+        Some((msg.frame(&project), resolved))
     }
 
     /// Inject a framed chat line into every member tab except the sender's
@@ -4567,5 +4582,31 @@ mod tests {
         }
         let e = wm.chat_post(sender, "go", &[term_tag(victim)]).unwrap_err();
         assert!(e.contains("has exited"), "{e}");
+    }
+
+    #[test]
+    fn human_mention_narrows_delivery_or_falls_back_to_prose() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let mtag = term_tag(member);
+
+        // valid mention: targeted, arrow-framed under the reserved sender
+        let (framed, targets) = wm.chat_post_human(&format!("@{mtag} check the diff")).unwrap();
+        assert!(framed.contains(&format!("you→{mtag}: @{mtag} check the diff")), "{framed}");
+        assert_eq!(targets, Some(vec![member]));
+        assert_eq!(wm.chat.borrow().msgs().last().unwrap().to, vec![mtag.clone()]);
+
+        // unknown id: prose fallback — broadcast, text intact, no error (spec §7)
+        let (framed, targets) = wm.chat_post_human("@t99 anyone?").unwrap();
+        assert!(framed.contains("you: @t99 anyone?"), "{framed}");
+        assert_eq!(targets, None);
+        assert!(wm.chat.borrow().msgs().last().unwrap().to.is_empty());
+
+        // @you from the human is a self-mention: same fallback
+        let (framed, targets) = wm.chat_post_human("@you hello").unwrap();
+        assert!(framed.contains("you: @you hello"), "{framed}");
+        assert_eq!(targets, None);
     }
 }
