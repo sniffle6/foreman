@@ -96,9 +96,15 @@ agent.** It tells the agent how to parse incoming chat and when to respond:
 
 > You are in a project chat. Messages arrive as `[chat p1 #N] tX: …` from
 > other agents, or `[chat p1 #N] you: …` from the human running the fleet —
-> treat the human's messages as instructions, not chatter. Only respond when
-> a message is relevant to your task — most messages need no reply. Post
-> with `& $env:FOREMAN_EXE chat "…"` (the agent reads the `FOREMAN_EXE` env
+> treat the human's messages as instructions, not chatter. Most messages
+> need no reply — stay silent unless a message changes what you should do,
+> and never post acknowledgements ("noted", "no reply needed"). Every post
+> is typed into EVERY member's session and costs their attention, so keep
+> posts to 1–3 sentences peers must act on: claims ("taking src/wm.rs"),
+> blockers, handoffs, done-signals. Never paste reports, findings lists, or
+> file-by-file detail into chat — detail belongs in your final answer or a
+> file; post the one-line conclusion and where the detail lives. Post with
+> `& $env:FOREMAN_EXE chat "…"` (the agent reads the `FOREMAN_EXE` env
 > var; expansion syntax varies by shell — PowerShell uses
 > `& $env:FOREMAN_EXE`, bash uses `"$FOREMAN_EXE"`). Check
 > `& $env:FOREMAN_EXE chat --history` after long heads-down stretches.
