@@ -1,0 +1,4 @@
+interface:
+  display_name: "Foreman Chat"
+  short_description: "Coordinate Foreman agents through chat"
+  default_prompt: "Use $foreman-chat to post to or read the Foreman project chat."

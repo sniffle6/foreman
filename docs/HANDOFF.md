@@ -81,6 +81,10 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
   `clamp`. `show(ui, area, active, base)` is the whole thing.
 - `src/main.rs` — eframe `App`: toolbar (`+ project`, `+ terminal in project`) +
   the desktop `WindowManager`.
+- `src/skills_install.rs` — embeds and best-effort installs the
+  `foreman-dispatch`/`foreman-chat` skills into Claude and Codex global skill
+  dirs at GUI startup. Claude sources live in `.claude/skills/`; Codex sources
+  live in `.codex/skills/`. Keep the paired skill copies semantically synced.
 
 ### Coordinate model (matters for new work)
 Each `WindowManager` works in its own `area: Rect`. Window rects are **local**

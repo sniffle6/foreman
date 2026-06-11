@@ -1,0 +1,4 @@
+interface:
+  display_name: "Foreman Dispatch"
+  short_description: "Spawn visible workers inside Foreman"
+  default_prompt: "Use $foreman-dispatch to launch a visible worker in this Foreman project."

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Foreman Build Screenshot"
+  short_description: "Build Foreman and capture win.png"
+  default_prompt: "Use $build-screenshot to build Foreman and capture a verification screenshot."
+
+policy:
+  allow_implicit_invocation: false

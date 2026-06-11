@@ -67,10 +67,11 @@ pointed zone, and tabs it onto the occupant if that zone is taken.
   (mirrors the `dirpicker.rs` pattern), edits the live `Keymap` and signals the
   wm when to persist.
 - `src/skills_install.rs` — on startup, embeds (`include_str!`) and installs the
-  `foreman-dispatch`/`foreman-chat` skills into `<CLAUDE_CONFIG_DIR|~/.claude>\skills`
-  so agents in any project (incl. external repos) can discover them. Source of
-  truth stays `.claude/skills/`; edit a skill there + rebuild to propagate.
-  Best-effort — failures are logged, never block launch.
+  `foreman-dispatch`/`foreman-chat` skills into Claude and Codex global skill
+  dirs so agents in any project (incl. external repos) can discover them. Source
+  skill copies live in `.claude/skills/` and `.codex/skills/`; keep them in sync
+  when behavior changes, then rebuild to propagate. Best-effort — failures are
+  logged, never block launch.
 
 Subsystem docs: `docs/project-directories.md`,
 `docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
