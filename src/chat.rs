@@ -211,6 +211,40 @@ pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<Chat
     out
 }
 
+/// Is `id` a well-formed mention target — `t<digits>` or the reserved `you`?
+/// Format only; existence/membership is the server's check (spec §5).
+pub fn valid_chat_target(id: &str) -> bool {
+    id == "you"
+        || id
+            .strip_prefix('t')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Leading-mention extraction (mentions spec §3): whitespace-separated tokens
+/// at the START of the text matching `@t<digits>` or `@you`; stops at the
+/// first non-mention token. Mentions stay in the text — this is a pure read.
+pub fn leading_mentions(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map_while(|tok| {
+            tok.strip_prefix('@')
+                .filter(|id| valid_chat_target(id))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Flag targets first, then inline mentions, deduped keeping first occurrence
+/// (spec §3) — the order is what framing renders and tests assert.
+pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in to_flags.iter().cloned().chain(leading_mentions(text)) {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// One crew-board row, assembled by the owning project manager each frame.
 /// `win`/`tab` locate the member for click-to-focus. Identity is the hosting
 /// window's id — the same active-tab staleness family as the rest of chat.
@@ -475,5 +509,27 @@ mod tests {
         // nothing new => no divider
         let blocks = build_blocks(&msgs, 99, true);
         assert!(!blocks.iter().any(|b| matches!(b, ChatBlock::Divider)));
+    }
+
+    #[test]
+    fn leading_mentions_take_only_the_leading_run() {
+        assert_eq!(leading_mentions("@t3 take the parser"), vec!["t3"]);
+        assert_eq!(leading_mentions("@t2 @you go"), vec!["t2", "you"]);
+        // stops at the first non-mention token — later @s are prose
+        assert_eq!(leading_mentions("@t2 hello @t3"), vec!["t2"]);
+        // mid-prose mentions never target
+        assert!(leading_mentions("per @t3's report, done").is_empty());
+        // non-id @tokens are prose, and stop extraction
+        assert!(leading_mentions("@bogus @t2 hi").is_empty());
+        assert!(leading_mentions("@t hi").is_empty()); // no digits
+        assert!(leading_mentions("").is_empty());
+    }
+
+    #[test]
+    fn effective_targets_union_flags_then_inline_deduped() {
+        let flags = vec!["t3".to_string()];
+        assert_eq!(effective_targets(&flags, "@t2 @t3 go"), vec!["t3", "t2"]);
+        assert!(effective_targets(&[], "plain broadcast").is_empty());
+        assert_eq!(effective_targets(&[], "@you need eyes"), vec!["you"]);
     }
 }
