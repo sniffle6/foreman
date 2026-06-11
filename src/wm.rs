@@ -368,13 +368,6 @@ impl Content {
                         } else {
                             format!("{} · {}", r.name, r.id)
                         };
-                        p.text(
-                            egui::pos2(row.min.x + 16.0, row.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            egui::FontId::proportional(11.5),
-                            name_col,
-                        );
                         let (age, stale) = if r.exited {
                             ("exited".to_string(), false)
                         } else {
@@ -383,12 +376,30 @@ impl Content {
                                 None => ("—".to_string(), false),
                             }
                         };
-                        p.text(
+                        // Age paints first so the label can truncate into the
+                        // space that's left — an unconstrained p.text label runs
+                        // straight under the age column on long tab titles.
+                        let age_rect = p.text(
                             egui::pos2(row.max.x - 4.0, row.center().y),
                             egui::Align2::RIGHT_CENTER,
                             age,
                             egui::FontId::proportional(10.5),
                             if stale { CHAT_STALE } else { DIM },
+                        );
+                        let label_x = row.min.x + 16.0;
+                        let mut job = egui::text::LayoutJob::simple_singleline(
+                            label,
+                            egui::FontId::proportional(11.5),
+                            name_col,
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(
+                            (age_rect.min.x - 6.0 - label_x).max(0.0),
+                        );
+                        let g = p.layout_job(job);
+                        p.galley(
+                            egui::pos2(label_x, row.center().y - g.size().y * 0.5),
+                            g,
+                            name_col,
                         );
                         y += row_h;
                         if y + row_h > board.max.y {
