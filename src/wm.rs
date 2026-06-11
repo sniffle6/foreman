@@ -712,6 +712,8 @@ enum ChatOutcome {
         /// `None` = broadcast; `Some` = deliver only to these windows
         /// (`you` already filtered out — a pure-@you post is `Some(vec![])`).
         targets: Option<Vec<WinId>>,
+        /// The posted message's seq — returned to the sender as its ack handle.
+        seq: Option<u64>,
     },
     History(Vec<String>),
 }
@@ -941,6 +943,7 @@ impl WindowManager {
                             project: None,
                             error: None,
                             history: Some(lines),
+                            seq: None,
                         });
                     }
                     // Unlike open's spawn-undo, a post whose reply channel died
@@ -948,13 +951,14 @@ impl WindowManager {
                     // log, not the audience) — only the injection is skipped.
                     // A retrying client may therefore duplicate a history line;
                     // accepted v1.
-                    Ok(ChatOutcome::Posted { pid, from, framed, targets }) => {
+                    Ok(ChatOutcome::Posted { pid, from, framed, targets, seq }) => {
                         let ok = OpenReply {
                             ok: true,
                             terminal: None,
                             project: None,
                             error: None,
                             history: None,
+                            seq,
                         };
                         if reply.send(ok).is_ok() {
                             self.chat_broadcast_in(pid, from, &framed, targets.as_deref());
@@ -975,6 +979,7 @@ impl WindowManager {
                 project: Some(format!("p{pid}")),
                 error: None,
                 history: None,
+                seq: None,
             },
             Err(e) => OpenReply::err(e),
         }
@@ -1026,8 +1031,8 @@ impl WindowManager {
             (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
             (Some(text), None) => {
                 let from = term_id(&req.from)?;
-                let (framed, targets) = child.chat_post(from, text, &req.to)?;
-                Ok(ChatOutcome::Posted { pid, from, framed, targets })
+                let (framed, targets, seq) = child.chat_post_re(from, text, &req.to, req.re)?;
+                Ok(ChatOutcome::Posted { pid, from, framed, targets, seq: Some(seq) })
             }
             _ => Err("chat needs exactly one of text/history".into()),
         }
@@ -1300,6 +1305,20 @@ impl WindowManager {
         text: &str,
         to_flags: &[String],
     ) -> Result<(String, Option<Vec<WinId>>), String> {
+        let (framed, targets, _seq) = self.chat_post_re(from, text, to_flags, None)?;
+        Ok((framed, targets))
+    }
+
+    /// Post carrying a handshake back-pointer (`--re`); returns the framed line,
+    /// the delivery filter, and the posted seq (the sender's ack handle). The
+    /// no-`re` [`Self::chat_post`] wraps this for the common case.
+    fn chat_post_re(
+        &mut self,
+        from: WinId,
+        text: &str,
+        to_flags: &[String],
+        re: Option<u64>,
+    ) -> Result<(String, Option<Vec<WinId>>, u64), String> {
         if text.is_empty() {
             return Err("empty message".into());
         }
@@ -1330,8 +1349,8 @@ impl WindowManager {
             // transcript reads join-then-speak
             log.sys(crate::chat::ChatKind::Joined, &from_tag, &name);
         }
-        let msg = log.post_to(&from_tag, &name, text, targets);
-        Ok((msg.frame(project), resolved))
+        let msg = log.post_re(&from_tag, &name, text, targets, re);
+        Ok((msg.frame(project), resolved, msg.seq))
     }
 
     /// The pane's reserved sender identity — can never collide with a "tN"
@@ -4202,6 +4221,8 @@ mod tests {
             to: Vec::new(),
             text: text.map(str::to_string),
             history,
+            re: None,
+            expect_ack: false,
         }
     }
 

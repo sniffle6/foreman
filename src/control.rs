@@ -42,6 +42,11 @@ pub struct OpenReply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<String>>, // chat --history results
+    /// The posted message's seq — the sender's handle to watch for an ack when
+    /// it armed `--await-ack`. Set only on a successful post reply; skipped on
+    /// the wire when None so v1 replies stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl OpenReply {
@@ -52,8 +57,15 @@ impl OpenReply {
             project: None,
             error: Some(msg.into()),
             history: None,
+            seq: None,
         }
     }
+}
+
+/// serde `skip_serializing_if` for a `bool` that defaults false — keeps
+/// `expect_ack` off the wire on plain posts (no built-in for this).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Project chat post or history read (spec: agent-group-chat §1). Exactly one
@@ -78,6 +90,16 @@ pub struct ChatRequest {
     pub text: Option<String>,
     #[serde(default)]
     pub history: Option<usize>,
+    /// Handshake back-pointer (`--re N`): the seq this post replies to. The
+    /// server decides whether it actually closes a handshake (cited post must
+    /// be a `Post` whose to-set includes `from`). Skipped when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub re: Option<u64>,
+    /// Sender is arming an ack-wait on this post (`--await-ack`): a missing-ack
+    /// timeout is pushed back to `from`. Requires a delivery target. Skipped
+    /// when false so plain posts stay byte-identical to v1.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expect_ack: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -233,6 +255,8 @@ pub fn parse_chat_args(
     let mut project = default_project;
     let mut history: Option<usize> = None;
     let mut to: Vec<String> = Vec::new();
+    let mut re: Option<u64> = None;
+    let mut expect_ack = false;
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -263,6 +287,18 @@ pub fn parse_chat_args(
                 to.push(id.to_string());
                 i += 2;
             }
+            "--re" => {
+                let v = args.get(i + 1).ok_or("--re needs a seq number")?;
+                re = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--re needs a seq number, got: {v}"))?,
+                );
+                i += 2;
+            }
+            "--await-ack" => {
+                expect_ack = true;
+                i += 1;
+            }
             "--" => {
                 // explicit end of flags: everything after is the message verbatim
                 words.extend_from_slice(&args[i + 1..]);
@@ -281,17 +317,33 @@ pub fn parse_chat_args(
         }
     }
     match (words.is_empty(), history) {
-        (false, None) => Ok(ChatRequest {
-            cmd: "chat".into(),
-            project,
-            from,
-            to,
-            text: Some(words.join(" ")),
-            history: None,
-        }),
+        (false, None) => {
+            let text = words.join(" ");
+            // You await an ack FROM someone — a target (flag or leading @) is
+            // required. Mirrors --to validation: client-side, before any pipe call.
+            if expect_ack && crate::chat::effective_targets(&to, &text).is_empty() {
+                return Err(
+                    "--await-ack needs a target (--to tN or a leading @tN): you await an ack from someone"
+                        .into(),
+                );
+            }
+            Ok(ChatRequest {
+                cmd: "chat".into(),
+                project,
+                from,
+                to,
+                text: Some(text),
+                history: None,
+                re,
+                expect_ack,
+            })
+        }
         (true, Some(n)) => {
             if !to.is_empty() {
                 return Err("--to and --history are mutually exclusive".into());
+            }
+            if re.is_some() || expect_ack {
+                return Err("--re/--await-ack are post-only, not valid with --history".into());
             }
             Ok(ChatRequest {
                 cmd: "chat".into(),
@@ -300,6 +352,8 @@ pub fn parse_chat_args(
                 to: Vec::new(),
                 text: None,
                 history: Some(n),
+                re: None,
+                expect_ack: false,
             })
         }
         (true, None) => Err("nothing to do: give a message or --history".into()),
@@ -402,9 +456,11 @@ mod tests {
             project: Some("p1".into()),
             error: None,
             history: None,
+            seq: None,
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(!s.contains("error"));
+        assert!(!s.contains("seq"));
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), ok);
         assert_eq!(OpenReply::err("boom").error.as_deref(), Some("boom"));
     }
@@ -529,6 +585,7 @@ mod tests {
                         project: Some("p1".into()),
                         error: None,
                         history: None,
+                        seq: None,
                     });
                 }
                 _ => panic!("expected CtrlMsg::Open"),
@@ -576,6 +633,7 @@ mod tests {
             project: None,
             error: None,
             history: None,
+            seq: None,
         };
         assert!(!serde_json::to_string(&ok).unwrap().contains("history"));
         // history reply roundtrips
@@ -585,6 +643,7 @@ mod tests {
             project: None,
             error: None,
             history: Some(vec!["#1 t2: hi".into()]),
+            seq: None,
         };
         let s = serde_json::to_string(&h).unwrap();
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), h);
@@ -677,6 +736,7 @@ mod tests {
                         project: None,
                         error: None,
                         history: None,
+                        seq: None,
                     });
                 }
                 _ => panic!("expected CtrlMsg::Chat"),
@@ -689,6 +749,8 @@ mod tests {
             to: Vec::new(),
             text: Some("hello".into()),
             history: None,
+            re: None,
+            expect_ack: false,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -743,5 +805,99 @@ mod tests {
         let req = parse_chat_args(&s(&["--to", "t3", "go"]), None, Some("t2".into())).unwrap();
         let back: ChatRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back.to, vec!["t3"]);
+    }
+
+    #[test]
+    fn parse_chat_args_handles_re_and_await_ack() {
+        // --re N rides with a targeted reply
+        let req = parse_chat_args(
+            &s(&["--re", "19", "--to", "t6", "on", "it"]),
+            Some("p1".into()),
+            Some("t7".into()),
+        )
+        .unwrap();
+        assert_eq!(req.re, Some(19));
+        assert_eq!(req.to, vec!["t6"]);
+        assert_eq!(req.text.as_deref(), Some("on it"));
+        assert!(!req.expect_ack);
+        // --await-ack arms the wait; target via --to
+        let req = parse_chat_args(
+            &s(&["--await-ack", "--to", "t7", "build", "X"]),
+            None,
+            Some("t2".into()),
+        )
+        .unwrap();
+        assert!(req.expect_ack);
+        assert_eq!(req.to, vec!["t7"]);
+        // --await-ack target can be an inline leading @mention (no --to flag)
+        let req = parse_chat_args(&s(&["--await-ack", "@t7", "build", "X"]), None, Some("t2".into()))
+            .unwrap();
+        assert!(req.expect_ack);
+        assert_eq!(req.text.as_deref(), Some("@t7 build X"));
+    }
+
+    #[test]
+    fn parse_chat_args_rejects_bad_handshake_input() {
+        // --await-ack with no target at all (you await an ack FROM someone)
+        let e = parse_chat_args(&s(&["--await-ack", "ship", "it"]), None, Some("t2".into()))
+            .unwrap_err();
+        assert!(e.contains("await-ack"), "{e}");
+        // --re needs a numeric value
+        assert!(parse_chat_args(&s(&["--re"]), None, Some("t2".into())).is_err());
+        assert!(parse_chat_args(&s(&["--re", "abc", "hi"]), None, Some("t2".into())).is_err());
+        // handshake flags are post-only: not with --history
+        assert!(
+            parse_chat_args(&s(&["--await-ack", "--to", "t7", "--history"]), None, Some("t2".into()))
+                .is_err()
+        );
+        assert!(parse_chat_args(&s(&["--re", "5", "--history"]), None, Some("t2".into())).is_err());
+    }
+
+    #[test]
+    fn chat_request_handshake_fields_are_wire_compatible() {
+        // a plain post serializes away re + expect_ack (byte-identical to v1)
+        let req = parse_chat_args(&s(&["hi"]), Some("p1".into()), Some("t2".into())).unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"re\""), "{json}");
+        assert!(!json.contains("expect_ack"), "{json}");
+        // a v1 request (no re/expect_ack keys) still parses
+        let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hi"}"#;
+        let req: ChatRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.re, None);
+        assert!(!req.expect_ack);
+        // set fields roundtrip
+        let req = parse_chat_args(
+            &s(&["--re", "9", "--await-ack", "--to", "t6", "go"]),
+            None,
+            Some("t7".into()),
+        )
+        .unwrap();
+        let back: ChatRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.re, Some(9));
+        assert!(back.expect_ack);
+    }
+
+    #[test]
+    fn open_reply_seq_omitted_when_none() {
+        let r = OpenReply {
+            ok: true,
+            terminal: None,
+            project: None,
+            error: None,
+            history: None,
+            seq: None,
+        };
+        assert!(!serde_json::to_string(&r).unwrap().contains("seq"));
+        let r = OpenReply {
+            ok: true,
+            terminal: None,
+            project: None,
+            error: None,
+            history: None,
+            seq: Some(42),
+        };
+        let back: OpenReply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.seq, Some(42));
     }
 }

@@ -44,6 +44,11 @@ pub struct ChatMsg {
     /// Delivery targets (`t3` / the reserved `you`). Empty = broadcast.
     /// Set by v2 mention delivery; the viewer renders arrow meta + olive edge.
     pub to: Vec<String>,
+    /// Handshake back-pointer (`--re <seq>`): the seq this post replies to.
+    /// When the cited post is a `Post` whose to-set includes this sender, the
+    /// reply counts as an ack. Rendered as a ` (re #N)` suffix; the post's own
+    /// `seq` stays the leading authoritative id. None on plain posts.
+    pub re: Option<u64>,
     pub kind: ChatKind,
 }
 
@@ -59,18 +64,27 @@ impl ChatMsg {
         }
     }
 
-    /// History/window line: `#14 t2: text`.
+    /// Additive ` (re #N)` suffix when this post replies to one; empty
+    /// otherwise, so untargeted/non-reply lines stay byte-identical to v1.
+    fn re_suffix(&self) -> String {
+        match self.re {
+            Some(r) => format!(" (re #{r})"),
+            None => String::new(),
+        }
+    }
+
+    /// History/window line: `#14 t2: text` (or `#14 t2→t6 (re #9): text`).
     pub fn line(&self) -> String {
-        format!("#{} {}: {}", self.seq, self.from_tag(), self.text)
+        format!("#{} {}{}: {}", self.seq, self.from_tag(), self.re_suffix(), self.text)
     }
 
     /// Injection framing with provenance: `[chat p1 #14] t2: text` —
     /// receivers can tell agent chat from their human, and the seq lets
-    /// them reference earlier messages.
+    /// them reference earlier messages. A reply adds ` (re #N)`.
     pub fn frame(&self, project: &str) -> String {
         format!(
-            "[chat {project} #{}] {}: {}",
-            self.seq, self.from_tag(), self.text
+            "[chat {project} #{}] {}{}: {}",
+            self.seq, self.from_tag(), self.re_suffix(), self.text
         )
     }
 }
@@ -87,23 +101,46 @@ impl ChatLog {
     }
 
     pub fn post(&mut self, from: &str, name: &str, text: &str) -> &ChatMsg {
-        self.push(from, name, text, ChatKind::Post, Vec::new())
+        self.push(from, name, text, ChatKind::Post, Vec::new(), None)
     }
 
     /// Post with delivery targets (mentions spec §4). `to` is stored verbatim
     /// (ids incl. the reserved `you`); resolution happened at the call site.
     pub fn post_to(&mut self, from: &str, name: &str, text: &str, to: Vec<String>) -> &ChatMsg {
-        self.push(from, name, text, ChatKind::Post, to)
+        self.push(from, name, text, ChatKind::Post, to, None)
+    }
+
+    /// Post carrying a handshake back-pointer (`--re <seq>`). `to` and `re` are
+    /// both stored verbatim; whether the `re` actually closes a handshake is the
+    /// caller's check (the cited post must be a `Post` with this sender in its
+    /// to-set). See [`ChatMsg::re`].
+    pub fn post_re(
+        &mut self,
+        from: &str,
+        name: &str,
+        text: &str,
+        to: Vec<String>,
+        re: Option<u64>,
+    ) -> &ChatMsg {
+        self.push(from, name, text, ChatKind::Post, to, re)
     }
 
     /// Append a membership event (join/exit). Text stays empty; the viewer
     /// derives the display line from kind + name + id.
     pub fn sys(&mut self, kind: ChatKind, from: &str, name: &str) -> &ChatMsg {
         debug_assert!(kind != ChatKind::Post, "use post() for user messages");
-        self.push(from, name, "", kind, Vec::new())
+        self.push(from, name, "", kind, Vec::new(), None)
     }
 
-    fn push(&mut self, from: &str, name: &str, text: &str, kind: ChatKind, to: Vec<String>) -> &ChatMsg {
+    fn push(
+        &mut self,
+        from: &str,
+        name: &str,
+        text: &str,
+        kind: ChatKind,
+        to: Vec<String>,
+        re: Option<u64>,
+    ) -> &ChatMsg {
         let name = if name.trim().is_empty() { from } else { name };
         let msg = ChatMsg {
             seq: self.msgs.len() as u64 + 1,
@@ -112,6 +149,7 @@ impl ChatLog {
             text: text.to_string(),
             at: SystemTime::now(),
             to,
+            re,
             kind,
         };
         self.msgs.push(msg);
@@ -243,6 +281,46 @@ pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Resolution of one awaited handoff (`--await-ack`). The GUI-side ack-registry
+/// computes this each tick from the delivery cursor (did the post reach the
+/// awaited member?) and the log (did a matching `--re` reply appear?). The two
+/// timed-out states map to t4/t5's two layers and DIFFERENT human/agent actions.
+// Consumed by the ack-registry tick — built in the delivery-cursor mechanism
+// step (see docs/contracts/chat-handshake-contract.md). Tested now; wired next.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckState {
+    /// Within the window, no resolution yet — keep waiting.
+    Pending,
+    /// Timed out and the cursor never reached the post's seq for the member:
+    /// the handoff never landed → resend / restart that member.
+    NeverLanded,
+    /// Timed out, delivered, but no `--re` reply: the member has it and is
+    /// presumably still working → nudge, do NOT resend.
+    LandedUnacked,
+    /// The awaited member replied with a matching `--re` → done. Wins even past
+    /// the timeout (a late ack still resolves).
+    Acked,
+}
+
+/// Pure resolution of one awaited handoff. `delivered` = the cursor has reached
+/// the post's seq for the awaited member; `acked` = a matching `--re` reply
+/// exists; `timed_out` = the ack window has elapsed. An ack always wins; before
+/// timeout with no ack we keep waiting; on timeout the cursor splits never-landed
+/// from landed-unacked.
+#[allow(dead_code)] // wired into the ack-registry tick next (see AckState).
+pub fn resolve_ack(delivered: bool, acked: bool, timed_out: bool) -> AckState {
+    if acked {
+        AckState::Acked
+    } else if !timed_out {
+        AckState::Pending
+    } else if delivered {
+        AckState::LandedUnacked
+    } else {
+        AckState::NeverLanded
+    }
 }
 
 /// One crew-board row, assembled by the owning project manager each frame.
@@ -438,6 +516,7 @@ mod tests {
             text: text.to_string(),
             at: SystemTime::UNIX_EPOCH + Duration::from_secs(seq * 60),
             to: Vec::new(),
+            re: None,
             kind,
         }
     }
@@ -531,5 +610,36 @@ mod tests {
         assert_eq!(effective_targets(&flags, "@t2 @t3 go"), vec!["t3", "t2"]);
         assert!(effective_targets(&[], "plain broadcast").is_empty());
         assert_eq!(effective_targets(&[], "@you need eyes"), vec!["you"]);
+    }
+
+    #[test]
+    fn re_renders_as_suffix_and_keeps_own_seq_leading() {
+        let mut log = ChatLog::new();
+        log.post("t6", "proto", "need GET /orders shape"); // #1
+        let m = log.post_re("t7", "mech", "status is an enum", vec!["t6".into()], Some(1));
+        // own #N stays leading authoritative; (re #N) is an additive suffix
+        assert_eq!(m.line(), "#2 t7→t6 (re #1): status is an enum");
+        assert_eq!(m.frame("p1"), "[chat p1 #2] t7→t6 (re #1): status is an enum");
+    }
+
+    #[test]
+    fn re_none_is_byte_identical_to_v1() {
+        let mut log = ChatLog::new();
+        let m = log.post("t2", "worker", "ok");
+        assert_eq!(m.line(), "#1 t2: ok");
+        assert_eq!(m.frame("p1"), "[chat p1 #1] t2: ok");
+    }
+
+    #[test]
+    fn resolve_ack_covers_the_four_states() {
+        // an ack wins regardless of delivery / timeout (a late ack still resolves)
+        assert_eq!(resolve_ack(true, true, true), AckState::Acked);
+        assert_eq!(resolve_ack(false, true, false), AckState::Acked);
+        // before timeout, no ack yet => keep waiting
+        assert_eq!(resolve_ack(true, false, false), AckState::Pending);
+        assert_eq!(resolve_ack(false, false, false), AckState::Pending);
+        // on timeout the cursor splits the two transport layers
+        assert_eq!(resolve_ack(true, false, true), AckState::LandedUnacked);
+        assert_eq!(resolve_ack(false, false, true), AckState::NeverLanded);
     }
 }
