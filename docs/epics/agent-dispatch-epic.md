@@ -188,8 +188,8 @@ directory is not on PATH inside spawned shells (e.g. PowerShell:
 One room per project. The log lives on the **project's** nested
 `WindowManager` as an `Rc<RefCell<ChatLog>>` — an in-memory
 append-only `Vec<ChatMsg>` where each entry carries `seq`, `from`, `name`
-(stamped at post time), `text`, `at`, a render-only mention target `to`, and
-a `kind` (post vs join/exit). Seq starts at 1 and only grows (seq = `len + 1`). The log dies when
+(stamped at post time), `text`, `at`, delivery targets `to` (set by v2
+mentions), and a `kind` (post vs join/exit). Seq starts at 1 and only grows (seq = `len + 1`). The log dies when
 foreman exits; project IDs are runtime-scoped anyway.
 
 **Membership is a `chat_member: bool` on each `Tab`** (not `Win`):
@@ -238,6 +238,27 @@ keystrokes. The bracketed-paste guards are applied unconditionally —
 live-verified on ConPTY (2026-06-10): claude sessions honor the markers
 (multi-line lands as one input block), so the unconditional wrap is the
 recorded v1 decision.
+
+### Mentions (v2 — delivery filter)
+
+Status: **built** (2026-06-10). Spec:
+`docs/superpowers/specs/2026-06-10-chat-mentions-impl-design.md`.
+
+- `--to tX` (repeatable, `@`-prefix tolerated) or a leading run of `@tX` /
+  `@you` tokens in the text narrow PTY delivery to those terminals. Every
+  message still lands in the one shared log — mentions never gate visibility.
+- Targets validate all-or-nothing at send time, before the log append and
+  before join-on-first-post: unknown id, exited member, non-member, or
+  self-mention fails the whole post (`ok:false`, CLI exit 1). The request's
+  `to` field carries flag targets only; the server extracts inline mentions.
+- Targeted framing/history: `[chat p1 #15] t1→t2,t3: text` / `#15 t1→t2,t3:
+  text`; untargeted output is byte-identical to v1.
+- `@you` is valid markup that delivers to no PTY — flags the human via the
+  chat window without waking an agent.
+- The chat window's input line targets with leading `@tX` too; its failures
+  fall back to plain broadcast (prose) instead of erroring.
+- ChatMsg's `to` is now `Vec<String>` and set by delivery — no longer
+  render-only.
 
 ### Chat viewer window — the dispatcher's desk
 
@@ -370,10 +391,11 @@ separate, undecided idea.
   then immediately dies before the inject, or if the log appended before a
   dead-channel abort, the message exists in history but no bytes flowed.
   A retrying client creates a duplicate log entry. Both are accepted v1.
-- **Message storms** are bounded by prompt convention (§5 of the spec)
-  only — every post is a user-turn for every other member, and members may
-  respond to responses. This is model behavior, not a code guarantee.
-  Revisit (rate limits, @-mentions) only if it bites in practice.
+- **Message storms** are bounded by prompt convention (§5 of the spec) plus
+  targeted delivery (mentions, v2) — every broadcast post is still a
+  user-turn for every other member, and members may respond to responses.
+  The convention is model behavior, not a code guarantee. Rate limits remain
+  unbuilt; revisit only if storms bite in practice.
 - **Empty injection is a no-op at the Session level.** A bare `\r` would
   submit half-typed input. Empty messages are rejected server-side at
   `chat_post` ("empty message" — `foreman chat ""` parses fine client-side

@@ -1,7 +1,9 @@
 # Project Chat @-Mentions — v2 Design (Agent-Debate Consensus)
 
 **Date:** 2026-06-10
-**Status:** Drafted — consensus reached, not yet approved or scheduled.
+**Status:** Drafted — consensus reached; rows 1–4 and 6 implemented 2026-06-10
+(see `2026-06-10-chat-mentions-impl-design.md`). Row 5 (quiescence gating)
+still needs its own spike.
 **NOT uniformly shovel-ready:** decision-table rows 1–4 and 6 are ready to
 implement; row 5 (quiescence gating) is design-settled but its core
 mechanism is an **unsolved problem** — see the warning after the TL;DR.

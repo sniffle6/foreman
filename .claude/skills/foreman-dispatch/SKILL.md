@@ -77,6 +77,27 @@ since the exe directory is not on PATH inside spawned shells
     & $env:FOREMAN_EXE chat --project p2 "message"        # override env project
     & $env:FOREMAN_EXE chat -- --message-starting-with-dashes   # -- ends flag parsing
 
+Target a message so it interrupts ONLY the named terminals (everyone still
+sees it in history and the chat window — mentions filter delivery, not
+visibility):
+
+    & $env:FOREMAN_EXE chat --to t3 "rebase first, then rerun"   # flag form
+    & $env:FOREMAN_EXE chat "@t3 rebase first, then rerun"       # leading-@ sugar
+    & $env:FOREMAN_EXE chat --to t2 --to t3 "you two own src/wm.rs"  # multi-target
+    & $env:FOREMAN_EXE chat "@you tests are red, need a decision"    # flag the human
+
+Mention rules:
+
+- Only a LEADING run of `@tX` / `@you` tokens targets — `@t3` mid-sentence is
+  prose and never narrows delivery. `--` does not suppress a leading mention.
+- Targeted frames read `[chat p1 #N] t1→t2,t3: text`. If your id is right of
+  the arrow, the message was addressed to you specifically — act on it.
+- Bad targets fail the WHOLE post loudly (unknown id, exited terminal,
+  non-member, yourself). On a stale-id error, re-read `--history` — the
+  transcript is the roster; a respawned worker has a new id.
+- `@you` reaches the human through the chat window without interrupting any
+  agent — the cheapest way to flag something for the fleet runner.
+
 `foreman chat` reads `FOREMAN_PROJECT_ID` and `FOREMAN_TERMINAL_ID` from
 the environment automatically. Calling it outside a foreman terminal
 (env vars unset) is an immediate error (exit 2, no pipe call).
@@ -103,7 +124,9 @@ agent.** It tells the agent how to parse incoming chat and when to respond:
 > posts to 1–3 sentences peers must act on: claims ("taking src/wm.rs"),
 > blockers, handoffs, done-signals. Never paste reports, findings lists, or
 > file-by-file detail into chat — detail belongs in your final answer or a
-> file; post the one-line conclusion and where the detail lives. Post with
+> file; post the one-line conclusion and where the detail lives. When only
+> some members need to act, target them (`chat --to t3 "…"` or a leading
+> `@t3`) — a broadcast wakes every member and costs their attention. Post with
 > `& $env:FOREMAN_EXE chat "…"` (the agent reads the `FOREMAN_EXE` env
 > var; expansion syntax varies by shell — PowerShell uses
 > `& $env:FOREMAN_EXE`, bash uses `"$FOREMAN_EXE"`). Check
