@@ -3,6 +3,7 @@ mod control;
 mod dirpicker;
 mod keymap;
 mod settings;
+mod skills_install;
 mod terminal;
 mod wm;
 
