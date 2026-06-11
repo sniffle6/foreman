@@ -4117,7 +4117,7 @@ mod tests {
             }
         }
         wm.drain_chat_posts();
-        {
+        let framed = {
             let log = wm.chat.borrow();
             let m = log
                 .msgs()
@@ -4126,21 +4126,29 @@ mod tests {
                 .expect("post missing");
             assert_eq!(m.from, "you");
             assert_eq!(m.name, "you");
-            assert!(
-                m.frame("p1")
-                    .starts_with(&format!("[chat p1 #{}] you: go", m.seq))
-            );
-        }
-        // BOTH members exit — the human excludes nobody
+            let framed = m.frame("p1");
+            assert!(framed.starts_with(&format!("[chat p1 #{}] you: go", m.seq)));
+            framed
+        };
+        // BOTH members exit — the human excludes nobody. Bytes injected before a
+        // child's startup DSR scan resolves get eaten (the documented trap; see
+        // chat_broadcast_hits_members_only_excluding_sender), so pump every session
+        // and RE-SEND the broadcast each iteration until both stdins have seen it —
+        // deterministic instead of racing spawn latency.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
+            for w in wm.windows.iter_mut() {
+                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                    s.keepalive();
+                }
+            }
+            wm.chat_broadcast(None, &framed, None);
             let mut done = 0;
             for id in [a, b] {
                 let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
                 let Content::Terminal(s) = &mut w.tabs[w.active].content else {
                     panic!()
                 };
-                s.keepalive();
                 if s.exited().is_some() {
                     done += 1;
                 }
