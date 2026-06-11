@@ -237,7 +237,35 @@ impl Session {
             }
             c
         };
-        Self::spawn_with(build(argv), Shell::Cmd, ctx.clone()).or_else(|_| {
+        // Anything that routes through cmd.exe re-parses the whole command
+        // line: a newline ENDS the command (the rest would execute as
+        // follow-up cmd commands) and an embedded `"` flips its quote state.
+        // Batch shims can never receive such args — refuse loudly instead of
+        // silently truncating/injecting. Two routes hit cmd: CreateProcess
+        // silently wraps an explicit .cmd/.bat target, and the bare-name npm
+        // shim falls back to `cmd /c` below.
+        let unsafe_for_cmd = argv.iter().any(|a| a.contains(['\n', '\r', '"']));
+        let refuse = |e: String| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} runs via a cmd-shim ({e}) which cannot carry newlines or \" in \
+                     arguments — flatten the prompt to one quote-free line or install \
+                     the tool as a native exe",
+                    argv[0]
+                ),
+            )
+        };
+        let is_batch = std::path::Path::new(&argv[0])
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("cmd") || x.eq_ignore_ascii_case("bat"));
+        if unsafe_for_cmd && is_batch {
+            return Err(refuse("batch file".into()));
+        }
+        Self::spawn_with(build(argv), Shell::Cmd, ctx.clone()).or_else(|e| {
+            if unsafe_for_cmd {
+                return Err(refuse(format!("not directly spawnable: {e}")));
+            }
             let mut wrapped = vec!["cmd.exe".to_string(), "/c".to_string()];
             wrapped.extend_from_slice(argv);
             Self::spawn_with(build(&wrapped), Shell::Cmd, ctx)
@@ -853,6 +881,34 @@ mod tests {
         let ctx = egui::Context::default();
         let argv = vec![shim.to_string_lossy().to_string()];
         assert!(Session::spawn_argv(&argv, None, &[], ctx).is_ok());
+    }
+
+    #[test]
+    fn spawn_argv_refuses_cmd_fallback_for_unsafe_args() {
+        // cmd.exe re-parses the whole line on the fallback: a newline ends
+        // the command (the remainder would EXECUTE as follow-up commands)
+        // and an embedded quote flips its quote state. Refuse loudly rather
+        // than silently truncate/inject.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("fake-agent.cmd");
+        std::fs::write(&shim, "@echo shim ran\r\n@exit 0\r\n").unwrap();
+        let shim = shim.to_string_lossy().to_string();
+        let ctx = egui::Context::default();
+        for bad in ["line one\nline two", "cr only\rtail", "say \"hi\""] {
+            // Explicit .cmd path: CreateProcess silently wraps it in cmd.exe,
+            // so the pre-spawn guard must refuse.
+            let argv = vec![shim.clone(), bad.to_string()];
+            match Session::spawn_argv(&argv, None, &[], ctx.clone()) {
+                Ok(_) => panic!("{bad:?} rode the silent cmd wrap"),
+                Err(e) => assert!(e.to_string().contains("cmd-shim"), "{bad:?}: {e}"),
+            }
+            // Bare name with no native exe: the cmd /c fallback must refuse.
+            let argv = vec!["no-such-tool-xyzzy".to_string(), bad.to_string()];
+            match Session::spawn_argv(&argv, None, &[], ctx.clone()) {
+                Ok(_) => panic!("{bad:?} rode the cmd /c fallback"),
+                Err(e) => assert!(e.to_string().contains("cmd-shim"), "{bad:?}: {e}"),
+            }
+        }
     }
 
     #[test]
