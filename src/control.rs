@@ -718,7 +718,7 @@ mod tests {
         let e = parse_chat_args(&s(&["--to", "bogus", "hi"]), None, Some("t2".into())).unwrap_err();
         assert!(e.contains("bogus"), "{e}");
         let e = parse_chat_args(&s(&["--to", "t", "hi"]), None, Some("t2".into())).unwrap_err();
-        assert!(e.contains("t"), "{e}");
+        assert!(e.contains("bad --to target: t ("), "{e}");
         // --to needs a value
         assert!(parse_chat_args(&s(&["--to"]), None, Some("t2".into())).is_err());
         // mutually exclusive with --history
