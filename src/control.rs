@@ -105,6 +105,20 @@ pub struct StatusRequest {
     pub project: Option<String>, // "p2"; None = ALL projects (no focused fallback)
 }
 
+/// Close terminal panes in one project. Self-close is resolved CLIENT-side:
+/// bare `foreman close` puts the caller's own FOREMAN_TERMINAL_ID into
+/// `terminals` (and requires FOREMAN_PROJECT_ID — a tN is only unique within
+/// its project), so the server never sees an empty list. Validation is
+/// all-or-nothing: any unknown/non-terminal id fails the whole request and
+/// nothing closes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CloseRequest {
+    pub cmd: String, // always "close"
+    #[serde(default)]
+    pub project: Option<String>, // "p1"; None = focused project
+    pub terminals: Vec<String>, // "tN" ids; client guarantees non-empty
+}
+
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
 /// `default_project` is the dispatcher's own project (from FOREMAN_PROJECT_ID).
 pub fn parse_open_args(
@@ -161,6 +175,7 @@ pub enum CtrlMsg {
     Open(OpenRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Chat(ChatRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Status(StatusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Close(CloseRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
@@ -207,6 +222,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
                     .map_err(|e| format!("bad request: {e}")),
                 "status" => serde_json::from_str::<StatusRequest>(&line)
                     .map(|r| CtrlMsg::Status(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                "close" => serde_json::from_str::<CloseRequest>(&line)
+                    .map(|r| CtrlMsg::Close(r, rtx, now))
                     .map_err(|e| format!("bad request: {e}")),
                 other => Err(format!("unknown cmd: {other}")),
             },
@@ -379,6 +397,66 @@ pub fn parse_status_args(args: &[String]) -> Result<StatusRequest, String> {
     })
 }
 
+/// Parse `foreman close` args: `[tN ...] [--project P]`. No ids = self-close
+/// (see [`CloseRequest`]): requires BOTH env vars and refuses an explicit
+/// `--project` (a bare close must mean "my own pane", never a guess into
+/// another project).
+pub fn parse_close_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<CloseRequest, String> {
+    let mut project = None;
+    let mut explicit_project = false;
+    let mut terminals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                explicit_project = true;
+                i += 2;
+            }
+            t if t
+                .strip_prefix('t')
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) =>
+            {
+                terminals.push(t.to_string());
+                i += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("bad terminal id: {other} (expected tN)")),
+        }
+    }
+    if terminals.is_empty() {
+        // self-close: the caller's own identity, never a cross-project guess
+        if explicit_project {
+            return Err(
+                "--project needs explicit terminal ids; bare close closes your own terminal".into(),
+            );
+        }
+        let me =
+            self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
+        let proj = default_project.ok_or(
+            "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
+        )?;
+        return Ok(CloseRequest {
+            cmd: "close".into(),
+            project: Some(proj),
+            terminals: vec![me],
+        });
+    }
+    Ok(CloseRequest {
+        cmd: "close".into(),
+        project: if explicit_project {
+            project
+        } else {
+            default_project
+        },
+        terminals,
+    })
+}
+
 const HELP: &str = "\
 foreman — a desktop for running fleets of AI-agent terminals
 
@@ -388,8 +466,9 @@ USAGE
   foreman chat [flags] [--] <message...>    post to the project chat room
   foreman chat [--project P] --history [N]  read the last N room lines (default 20)
   foreman status [--project P]              list projects + terminals (running/exited)
+  foreman close [tN ...] [--project P]      close terminals (no ids: your own pane)
   foreman help | --help | -h                this text (also: open --help, chat --help,
-                                            status --help)
+                                            status --help, close --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -444,12 +523,25 @@ when there are none. --project pN filters to one project (unknown pN is
 an error).
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
+const HELP_CLOSE: &str = "\
+foreman close [tN ...] [--project P]
+
+Close terminal panes. With ids: close those terminals in project P
+(default: your FOREMAN_PROJECT_ID, else the focused project). ANY unknown
+or non-terminal id fails the whole request and nothing closes. With no
+ids: close YOUR OWN pane (requires FOREMAN_TERMINAL_ID and
+FOREMAN_PROJECT_ID; --project is not allowed) — closing kills the pane's
+process tree, you included, so post any done-signal FIRST and do not
+expect to see the reply. Reply: {\"ok\":true,\"project\":\"pN\"}.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("open") => open_main(&args[1..]),
         Some("chat") => chat_main(&args[1..]),
         Some("status") => status_main(&args[1..]),
+        Some("close") => close_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -459,6 +551,7 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("       foreman chat [--project P] [--to T]... [--re N] [--] <message...>");
             eprintln!("       foreman chat [--project P] --history [N]");
             eprintln!("       foreman status [--project P]");
+            eprintln!("       foreman close [tN ...] [--project P]");
             eprintln!("       foreman help");
             2
         }
@@ -513,6 +606,26 @@ fn status_main(args: &[String]) -> i32 {
         }
     };
     report("foreman status", request(PIPE, &req))
+}
+
+fn close_main(args: &[String]) -> i32 {
+    // before env/parsing: help must work outside a foreman terminal
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_CLOSE}");
+        return 0;
+    }
+    let req = match parse_close_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman close: {e}");
+            return 2;
+        }
+    };
+    report("foreman close", request(PIPE, &req))
 }
 
 /// Print the pipe reply (or the connection failure) the way all subcommands do.
@@ -597,6 +710,117 @@ mod tests {
         assert_eq!(client_main(&s(&["chat", "-h"])), 0);
         assert_eq!(client_main(&s(&["status", "--help"])), 0);
         assert_eq!(client_main(&s(&["status", "-h"])), 0);
+        assert_eq!(client_main(&s(&["close", "--help"])), 0);
+        assert_eq!(client_main(&s(&["close", "-h"])), 0);
+    }
+
+    #[test]
+    fn parse_close_args_resolves_self_from_env() {
+        // bare close = self-close: both env vars required
+        let req = parse_close_args(&s(&[]), Some("p1".into()), Some("t4".into())).unwrap();
+        assert_eq!(req.terminals, vec!["t4"]);
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        // missing project env: refuse (tN is only unique within its project)
+        let e = parse_close_args(&s(&[]), None, Some("t4".into())).unwrap_err();
+        assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
+        // missing terminal env: refuse
+        let e = parse_close_args(&s(&[]), Some("p1".into()), None).unwrap_err();
+        assert!(e.contains("FOREMAN_TERMINAL_ID"), "{e}");
+        // bare close with an explicit --project is a client error
+        assert!(
+            parse_close_args(
+                &s(&["--project", "p2"]),
+                Some("p1".into()),
+                Some("t4".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_close_args_collects_ids_and_project() {
+        let req =
+            parse_close_args(&s(&["t3", "t5"]), Some("p1".into()), Some("t4".into())).unwrap();
+        assert_eq!(req.terminals, vec!["t3", "t5"]);
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        // explicit --project beats the env default
+        let req = parse_close_args(
+            &s(&["--project", "p2", "t3"]),
+            Some("p1".into()),
+            Some("t4".into()),
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        // ids with no env at all: ok, server resolves the focused project
+        let req = parse_close_args(&s(&["t3"]), None, None).unwrap();
+        assert_eq!(req.project, None);
+        assert_eq!(req.terminals, vec!["t3"]);
+    }
+
+    #[test]
+    fn parse_close_args_rejects_bad_input() {
+        let e = parse_close_args(&s(&["bogus"]), None, None).unwrap_err();
+        assert!(e.contains("bogus"), "{e}");
+        let e = parse_close_args(&s(&["t"]), None, None).unwrap_err();
+        assert!(e.contains("bad terminal id: t "), "{e}");
+        assert!(parse_close_args(&s(&["--project"]), None, None).is_err());
+        let e = parse_close_args(&s(&["--nope", "t3"]), None, None).unwrap_err();
+        assert!(e.contains("--nope"), "{e}");
+    }
+
+    #[test]
+    fn close_request_wire_roundtrips() {
+        let req = CloseRequest {
+            cmd: "close".into(),
+            project: Some("p1".into()),
+            terminals: vec!["t3".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""terminals":["t3"]"#), "{json}");
+        let back: CloseRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn close_pipe_roundtrip() {
+        let pipe = format!("foreman-test-close-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Close(req, reply, _) => {
+                    assert_eq!(req.terminals, vec!["t3"]);
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: Some("p1".into()),
+                        error: None,
+                        history: None,
+                        seq: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Close"),
+            }
+        });
+        let req = CloseRequest {
+            cmd: "close".into(),
+            project: None,
+            terminals: vec!["t3".into()],
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply");
+        assert!(reply.ok);
+        assert_eq!(reply.project.as_deref(), Some("p1"));
     }
 
     #[test]

@@ -1022,6 +1022,39 @@ impl WindowManager {
                     Err(e) => OpenReply::err(e),
                 });
             }
+            CtrlMsg::Close(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                match self.close_dispatch(&req) {
+                    Err(e) => {
+                        let _ = reply.send(OpenReply::err(e));
+                    }
+                    Ok((pid, tids)) => {
+                        let ok = OpenReply {
+                            ok: true,
+                            terminal: None,
+                            project: Some(format!("p{pid}")),
+                            error: None,
+                            history: None,
+                            seq: None,
+                        };
+                        // Reply BEFORE closing (chat's reply-before-inject
+                        // pattern): a self-close kills the caller's own
+                        // process tree, so the reply must be on the channel
+                        // before its PTY drops. If the receiver is gone the
+                        // client was already told foreman didn't respond —
+                        // skip the close entirely (ids are never reused, so
+                        // a retry errs loudly instead of double-closing).
+                        if reply.send(ok).is_ok() {
+                            for tid in tids {
+                                self.close_terminal(pid, tid);
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1165,6 +1198,46 @@ impl WindowManager {
             lines.push("no projects".into());
         }
         Ok(lines)
+    }
+
+    /// Validate a close request WITHOUT executing it (D5: atomic and loud).
+    /// Every id must name an existing terminal window in the project or the
+    /// WHOLE request fails and nothing closes. A window whose tabs hold no
+    /// `Content::Terminal` (the chat viewer) is refused. Exited terminals
+    /// are valid targets; duplicates are allowed. Closing a window closes
+    /// ALL its merged tabs — terminal identity is the window id, shared by
+    /// merged tabs (same identity family as chat). Execution is the caller's
+    /// job via [`Self::close_terminal`], AFTER the reply is delivered.
+    fn close_dispatch(
+        &self,
+        req: &crate::control::CloseRequest,
+    ) -> Result<(WinId, Vec<WinId>), String> {
+        if req.terminals.is_empty() {
+            return Err("no terminals to close".into());
+        }
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
+        let Content::Project(child) = &win.tabs[win.active].content else {
+            return Err("not a project".into()); // unreachable after resolve
+        };
+        let mut tids = Vec::new();
+        for spec in &req.terminals {
+            let tid = term_id(spec)?;
+            let w = child
+                .windows
+                .iter()
+                .find(|w| w.id == tid)
+                .ok_or_else(|| format!("no such terminal: {spec}"))?;
+            if !w
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content, Content::Terminal(_)))
+            {
+                return Err(format!("not a terminal: {spec}"));
+            }
+            tids.push(tid);
+        }
+        Ok((pid, tids))
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
@@ -4788,6 +4861,161 @@ mod tests {
             rrx.try_recv().is_err(),
             "stale request must be dropped unanswered (client already saw a timeout)"
         );
+    }
+
+    // --- close verb: validated, reply-before-close terminal teardown ---
+
+    // A close message plus the receiver the pipe server would be holding.
+    fn close_msg(
+        project: Option<&str>,
+        terminals: &[&str],
+        sent: std::time::Instant,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::CloseRequest {
+            cmd: "close".into(),
+            project: project.map(str::to_string),
+            terminals: terminals.iter().map(|t| t.to_string()).collect(),
+        };
+        (crate::control::CtrlMsg::Close(req, rtx, sent), rrx)
+    }
+
+    // Does project p1's child manager still hold window `id`?
+    fn child_has_win(d: &WindowManager, id: WinId) -> bool {
+        let win = d.windows.iter().find(|w| w.id == 1).unwrap();
+        let Content::Project(child) = &win.tabs[win.active].content else {
+            panic!()
+        };
+        child.windows.iter().any(|w| w.id == id)
+    }
+
+    #[test]
+    fn close_closes_listed_terminals_and_replies_project() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = close_msg(Some("p1"), &[&ta], std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no close reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.project.as_deref(), Some("p1"));
+        assert!(!child_has_win(&d, a), "closed terminal must be gone");
+        assert!(child_has_win(&d, b), "unlisted terminal must survive");
+    }
+
+    #[test]
+    fn close_unknown_terminal_fails_whole_request_and_closes_nothing() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = close_msg(Some("p1"), &[&ta, "t99"], std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no close reply");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("no such terminal: t99"));
+        // atomic: the valid id must NOT have been closed
+        assert!(child_has_win(&d, a), "valid id must survive a failed batch");
+        assert!(child_has_win(&d, b));
+    }
+
+    #[test]
+    fn close_refuses_non_terminal_window() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        // open the chat viewer inside the project's child manager
+        let viewer = {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            child.open_chat_window();
+            child.windows.last().unwrap().id
+        };
+        let tv = format!("t{viewer}");
+        let (msg, rrx) = close_msg(Some("p1"), &[&tv], std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no close reply");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("not a terminal"));
+        assert!(child_has_win(&d, viewer), "the viewer must survive");
+    }
+
+    #[test]
+    fn close_skips_execution_when_reply_orphaned() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = close_msg(Some("p1"), &[&ta], std::time::Instant::now());
+        // server timed out between the age check and the reply: receiver gone
+        drop(rrx);
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            child_has_win(&d, a),
+            "client was told foreman didn't respond; the close must be skipped"
+        );
+    }
+
+    #[test]
+    fn stale_close_is_dropped() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let stale = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = close_msg(Some("p1"), &[&ta], stale);
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            rrx.try_recv().is_err(),
+            "stale request must be dropped unanswered"
+        );
+        assert!(child_has_win(&d, a), "stale request must not close");
+        assert!(child_has_win(&d, b));
+    }
+
+    #[test]
+    fn close_exited_terminal_succeeds() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let t = {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            child.add_terminal_cmd(&argv, None, None, &ctx).unwrap()
+        };
+        // pump until the child process has actually exited (the DSR trap:
+        // cmd.exe hangs on its startup query until keepalive answers it)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            let w = child.windows.iter_mut().find(|w| w.id == t).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            s.keepalive();
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never exited");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let tt = format!("t{t}");
+        let (msg, rrx) = close_msg(Some("p1"), &[&tt], std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no close reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert!(!child_has_win(&d, t), "exited terminal must close cleanly");
     }
 
     #[test]
