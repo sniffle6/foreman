@@ -80,11 +80,15 @@ and you both stop."
 
 - Membership: dispatched workers auto-join; any other terminal joins on its
   first post; `--history` never joins. `-p` workers can post but not receive.
-- Interactive workers don't auto-exit — give exit-when-done language or stop
-  them with a targeted post.
+- Interactive workers never auto-exit, and a claude worker cannot close its
+  own pane — "done" means it posts the done-signal and goes idle; the human
+  closes panes. Steer or stop a runaway worker with a targeted post.
 - A post fired the same instant a worker spawns can be silently eaten by its
   shell's startup handshake (it stays in history). Don't front-load a kickoff
   post into the same second as a dispatch.
 - Seq gaps in `--history` are normal (join/exit events consume seqs).
 - Quoting: prompts via here-strings (above); inside chat messages avoid
   literal `"` characters; `--` ends flag parsing for dash-leading messages.
+  If a dispatch errors naming a cmd-shim, claude is an npm `.cmd` shim —
+  multi-line worker prompts need a native claude install (see
+  foreman-dispatch).

@@ -35,10 +35,14 @@ and pass the variable — this is the entire quoting story:
 
 ## Quoting facts (verified in Session::spawn_argv — do not re-verify)
 
-- Foreman passes argv **per-argument**, even on the npm-shim `cmd /c` retry.
-  Spaces, `&`, `|`, `$`, backticks in prompts arrive intact.
-- The one risky character is a literal `"` INSIDE a prompt — rephrase or use
-  single quotes in the prompt text.
+- Foreman passes argv **per-argument**. With a natively-installed `claude`
+  (an `.exe`) the prompt arrives intact — newlines, spaces, `&`, `|`, `$`,
+  `"`, backticks, everything.
+- npm-installed `claude` is a `.cmd` shim routed through cmd.exe, which
+  cannot carry newlines or `"` inside arguments — foreman REFUSES that
+  dispatch loudly (`{"ok":false,…}` naming the cmd-shim) rather than
+  truncate it. On that error: flatten the prompt to one `"`-free line, or
+  have the user install claude natively.
 - PowerShell itself is the bigger hazard: in a double-quoted string,
   backticks ESCAPE and `$` expands. The here-string pattern above sidesteps
   all of it. Never hand-escape a long prompt inline.
