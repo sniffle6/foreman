@@ -1139,17 +1139,19 @@ impl WindowManager {
                 r.last = log.last_activity(&r.id);
             }
         }
-        // The pane identity itself sits on the board — the human is crew too.
-        rows.push(crate::chat::CrewRow {
-            win: 0, // no window: click is a no-op (id 0 never matches; ids start at 1)
+        crate::chat::sort_crew(&mut rows);
+        let n_live = rows.iter().filter(|r| !r.exited).count();
+        // The pane identity sits between live members and the exited — it is
+        // "your seat", not fleet status, and never counts toward the live chip.
+        let pos = rows.iter().take_while(|r| !r.exited).count();
+        rows.insert(pos, crate::chat::CrewRow {
+            win: 0, // no window: click is a no-op (ids start at 1)
             tab: 0,
             id: Self::HUMAN_ID.to_string(),
             name: Self::HUMAN_ID.to_string(),
             exited: false,
             last: self.chat.borrow().last_activity(Self::HUMAN_ID),
         });
-        crate::chat::sort_crew(&mut rows);
-        let n_live = rows.iter().filter(|r| !r.exited).count();
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 if let Content::Chat(v) = &mut t.content {
@@ -2685,6 +2687,8 @@ impl WindowManager {
             && self.picker.is_none()
             && self.renaming.is_none()
             && self.settings.is_none()
+            // Any focused text field (chat input, rename) owns the keyboard — leader stays dormant.
+            && ui.ctx().memory(|m| m.focused().is_none())
         {
             if let Some(cmd) = self.pump_leader(ui) {
                 self.dispatch(cmd, ui);
@@ -3796,10 +3800,10 @@ mod tests {
             .iter()
             .find(|t| matches!(t.content, Content::Chat(_)))
             .unwrap();
-        assert_eq!(tab.title, "chat · 2 live");
+        assert_eq!(tab.title, "chat · 1 live", "the you-row must not inflate the live count");
         let Content::Chat(v) = &tab.content else { panic!() };
         assert_eq!(v.crew.len(), 2, "the member + the human pane identity");
-        // index by id, not position — the human row may sort above or below
+        // index by id, not position, for the member assertions
         let m = v
             .crew
             .iter()
@@ -3808,10 +3812,11 @@ mod tests {
         assert_eq!(m.name, "worker A");
         assert!(!m.exited);
         assert!(m.last.is_some(), "joined entry counts as heard");
-        let h = v.crew.iter().find(|r| r.id == "you").expect("human row missing");
-        assert_eq!(h.name, "you");
-        assert!(!h.exited);
-        assert_eq!(h.win, 0, "human row has no window — click must be a no-op");
+        // the you-row sits AFTER the live members (here: index 1, one live member)
+        assert_eq!(v.crew[1].id, "you");
+        assert_eq!(v.crew[1].name, "you");
+        assert!(!v.crew[1].exited);
+        assert_eq!(v.crew[1].win, 0, "human row has no window — click must be a no-op");
     }
 
     #[test]
@@ -3923,6 +3928,48 @@ mod tests {
         }
         wm.drain_chat_posts();
         assert_eq!(wm.chat.borrow().msgs().len(), 0);
+    }
+
+    #[test]
+    fn leader_stays_dormant_while_a_widget_holds_focus() {
+        let mut wm = WindowManager::new();
+        // not as_desktop(): that loads the user's keybindings file from disk
+        wm.desktop = true;
+        let leader = wm.keymap.leader;
+        let field = egui::Id::new("some-text-field");
+        let ctx = egui::Context::default();
+        let leader_event = || egui::Event::Key {
+            key: leader.key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: leader.ctrl,
+                shift: leader.shift,
+                alt: leader.alt,
+                ..Default::default()
+            },
+        };
+        // frame 1: a widget holds keyboard focus — the leader chord must NOT arm
+        let mut input = egui::RawInput::default();
+        input.events.push(leader_event());
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ctx.memory_mut(|m| m.request_focus(field));
+                wm.pump_commands(ui, true);
+            });
+        });
+        assert!(!wm.armed, "leader must stay dormant while a field has focus");
+        // frame 2: focus released — the same chord arms (positive control)
+        let mut input = egui::RawInput::default();
+        input.events.push(leader_event());
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ctx.memory_mut(|m| m.surrender_focus(field));
+                wm.pump_commands(ui, true);
+            });
+        });
+        assert!(wm.armed, "without focus the leader must arm");
     }
 
     #[test]
