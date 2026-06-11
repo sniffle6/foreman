@@ -1,5 +1,16 @@
 # Chat handshake (#1) — remaining work
 
+> **STATUS 2026-06-11: deferred; inert surface removed.** Live skill testing
+> showed the ack problem is mitigated in practice (the eaten-post window is
+> avoided by the documented dispatch-then-pause rule; a human or dispatcher
+> agent watches the room), so finishing the registry isn't currently
+> justified — while an accepted-but-inert `--await-ack` flag was a lying API
+> surface. Removed: the `--await-ack` CLI flag, `ChatRequest.expect_ack`, and
+> the unconsumed `AckState`/`resolve_ack` state machine (recover them from
+> git at increment-1 commit `4607001`). Kept and working: `--re N` threading,
+> `OpenReply.seq`, and the `Session.ready` latch from increment 2. If
+> unattended fleets ever need self-healing handoffs, restart here.
+
 Handoff note for finishing feature #1 (handoff handshake + delivery-cursor
 backstop + catch-up replay). The agreed design is in
 `chat-handshake-contract.md` (read that first); this file is just "what's done,

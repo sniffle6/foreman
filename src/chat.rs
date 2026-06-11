@@ -310,46 +310,6 @@ pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
     out
 }
 
-/// Resolution of one awaited handoff (`--await-ack`). The GUI-side ack-registry
-/// computes this each tick from the delivery cursor (did the post reach the
-/// awaited member?) and the log (did a matching `--re` reply appear?). The two
-/// timed-out states map to t4/t5's two layers and DIFFERENT human/agent actions.
-// Consumed by the ack-registry tick — built in the delivery-cursor mechanism
-// step (see docs/contracts/chat-handshake-contract.md). Tested now; wired next.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AckState {
-    /// Within the window, no resolution yet — keep waiting.
-    Pending,
-    /// Timed out and the cursor never reached the post's seq for the member:
-    /// the handoff never landed → resend / restart that member.
-    NeverLanded,
-    /// Timed out, delivered, but no `--re` reply: the member has it and is
-    /// presumably still working → nudge, do NOT resend.
-    LandedUnacked,
-    /// The awaited member replied with a matching `--re` → done. Wins even past
-    /// the timeout (a late ack still resolves).
-    Acked,
-}
-
-/// Pure resolution of one awaited handoff. `delivered` = the cursor has reached
-/// the post's seq for the awaited member; `acked` = a matching `--re` reply
-/// exists; `timed_out` = the ack window has elapsed. An ack always wins; before
-/// timeout with no ack we keep waiting; on timeout the cursor splits never-landed
-/// from landed-unacked.
-#[allow(dead_code)] // wired into the ack-registry tick next (see AckState).
-pub fn resolve_ack(delivered: bool, acked: bool, timed_out: bool) -> AckState {
-    if acked {
-        AckState::Acked
-    } else if !timed_out {
-        AckState::Pending
-    } else if delivered {
-        AckState::LandedUnacked
-    } else {
-        AckState::NeverLanded
-    }
-}
-
 /// One crew-board row, assembled by the owning project manager each frame.
 /// `win`/`tab` locate the member for click-to-focus. Identity is the hosting
 /// window's id — the same active-tab staleness family as the rest of chat.
@@ -687,18 +647,5 @@ mod tests {
         let m = log.post("t2", "worker", "ok");
         assert_eq!(m.line(), "#1 t2: ok");
         assert_eq!(m.frame("p1"), "[chat p1 #1] t2: ok");
-    }
-
-    #[test]
-    fn resolve_ack_covers_the_four_states() {
-        // an ack wins regardless of delivery / timeout (a late ack still resolves)
-        assert_eq!(resolve_ack(true, true, true), AckState::Acked);
-        assert_eq!(resolve_ack(false, true, false), AckState::Acked);
-        // before timeout, no ack yet => keep waiting
-        assert_eq!(resolve_ack(true, false, false), AckState::Pending);
-        assert_eq!(resolve_ack(false, false, false), AckState::Pending);
-        // on timeout the cursor splits the two transport layers
-        assert_eq!(resolve_ack(true, false, true), AckState::LandedUnacked);
-        assert_eq!(resolve_ack(false, false, true), AckState::NeverLanded);
     }
 }

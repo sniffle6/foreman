@@ -4356,7 +4356,6 @@ mod tests {
             text: text.map(str::to_string),
             history,
             re: None,
-            expect_ack: false,
         }
     }
 

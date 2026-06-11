@@ -42,9 +42,9 @@ pub struct OpenReply {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<String>>, // chat --history results
-    /// The posted message's seq — the sender's handle to watch for an ack when
-    /// it armed `--await-ack`. Set only on a successful post reply; skipped on
-    /// the wire when None so v1 replies stay byte-identical.
+    /// The posted message's seq — what a later reply cites via `--re`. Set
+    /// only on a successful post reply; skipped on the wire when None so v1
+    /// replies stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 }
@@ -60,12 +60,6 @@ impl OpenReply {
             seq: None,
         }
     }
-}
-
-/// serde `skip_serializing_if` for a `bool` that defaults false — keeps
-/// `expect_ack` off the wire on plain posts (no built-in for this).
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// Project chat post or history read (spec: agent-group-chat §1). Exactly one
@@ -95,11 +89,6 @@ pub struct ChatRequest {
     /// be a `Post` whose to-set includes `from`). Skipped when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<u64>,
-    /// Sender is arming an ack-wait on this post (`--await-ack`): a missing-ack
-    /// timeout is pushed back to `from`. Requires a delivery target. Skipped
-    /// when false so plain posts stay byte-identical to v1.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub expect_ack: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -256,7 +245,6 @@ pub fn parse_chat_args(
     let mut history: Option<usize> = None;
     let mut to: Vec<String> = Vec::new();
     let mut re: Option<u64> = None;
-    let mut expect_ack = false;
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -295,10 +283,6 @@ pub fn parse_chat_args(
                 );
                 i += 2;
             }
-            "--await-ack" => {
-                expect_ack = true;
-                i += 1;
-            }
             "--" => {
                 // explicit end of flags: everything after is the message verbatim
                 words.extend_from_slice(&args[i + 1..]);
@@ -319,14 +303,6 @@ pub fn parse_chat_args(
     match (words.is_empty(), history) {
         (false, None) => {
             let text = words.join(" ");
-            // You await an ack FROM someone — a target (flag or leading @) is
-            // required. Mirrors --to validation: client-side, before any pipe call.
-            if expect_ack && crate::chat::effective_targets(&to, &text).is_empty() {
-                return Err(
-                    "--await-ack needs a target (--to tN or a leading @tN): you await an ack from someone"
-                        .into(),
-                );
-            }
             Ok(ChatRequest {
                 cmd: "chat".into(),
                 project,
@@ -335,15 +311,14 @@ pub fn parse_chat_args(
                 text: Some(text),
                 history: None,
                 re,
-                expect_ack,
             })
         }
         (true, Some(n)) => {
             if !to.is_empty() {
                 return Err("--to and --history are mutually exclusive".into());
             }
-            if re.is_some() || expect_ack {
-                return Err("--re/--await-ack are post-only, not valid with --history".into());
+            if re.is_some() {
+                return Err("--re is post-only, not valid with --history".into());
             }
             Ok(ChatRequest {
                 cmd: "chat".into(),
@@ -353,7 +328,6 @@ pub fn parse_chat_args(
                 text: None,
                 history: Some(n),
                 re: None,
-                expect_ack: false,
             })
         }
         (true, None) => Err("nothing to do: give a message or --history".into()),
@@ -750,7 +724,6 @@ mod tests {
             text: Some("hello".into()),
             history: None,
             re: None,
-            expect_ack: false,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -810,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_chat_args_handles_re_and_await_ack() {
+    fn parse_chat_args_handles_re() {
         // --re N rides with a targeted reply
         let req = parse_chat_args(
             &s(&["--re", "19", "--to", "t6", "on", "it"]),
@@ -821,63 +794,39 @@ mod tests {
         assert_eq!(req.re, Some(19));
         assert_eq!(req.to, vec!["t6"]);
         assert_eq!(req.text.as_deref(), Some("on it"));
-        assert!(!req.expect_ack);
-        // --await-ack arms the wait; target via --to
+        // works with an inline leading @mention too (no --to flag)
         let req = parse_chat_args(
-            &s(&["--await-ack", "--to", "t7", "build", "X"]),
+            &s(&["--re", "19", "@t6", "on", "it"]),
             None,
-            Some("t2".into()),
+            Some("t7".into()),
         )
         .unwrap();
-        assert!(req.expect_ack);
-        assert_eq!(req.to, vec!["t7"]);
-        // --await-ack target can be an inline leading @mention (no --to flag)
-        let req = parse_chat_args(
-            &s(&["--await-ack", "@t7", "build", "X"]),
-            None,
-            Some("t2".into()),
-        )
-        .unwrap();
-        assert!(req.expect_ack);
-        assert_eq!(req.text.as_deref(), Some("@t7 build X"));
+        assert_eq!(req.re, Some(19));
+        assert_eq!(req.text.as_deref(), Some("@t6 on it"));
     }
 
     #[test]
-    fn parse_chat_args_rejects_bad_handshake_input() {
-        // --await-ack with no target at all (you await an ack FROM someone)
-        let e = parse_chat_args(&s(&["--await-ack", "ship", "it"]), None, Some("t2".into()))
-            .unwrap_err();
-        assert!(e.contains("await-ack"), "{e}");
+    fn parse_chat_args_rejects_bad_re_input() {
         // --re needs a numeric value
         assert!(parse_chat_args(&s(&["--re"]), None, Some("t2".into())).is_err());
         assert!(parse_chat_args(&s(&["--re", "abc", "hi"]), None, Some("t2".into())).is_err());
-        // handshake flags are post-only: not with --history
-        assert!(
-            parse_chat_args(
-                &s(&["--await-ack", "--to", "t7", "--history"]),
-                None,
-                Some("t2".into())
-            )
-            .is_err()
-        );
+        // post-only: not with --history
         assert!(parse_chat_args(&s(&["--re", "5", "--history"]), None, Some("t2".into())).is_err());
     }
 
     #[test]
-    fn chat_request_handshake_fields_are_wire_compatible() {
-        // a plain post serializes away re + expect_ack (byte-identical to v1)
+    fn chat_request_re_is_wire_compatible() {
+        // a plain post serializes away `re` (byte-identical to v1)
         let req = parse_chat_args(&s(&["hi"]), Some("p1".into()), Some("t2".into())).unwrap();
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"re\""), "{json}");
-        assert!(!json.contains("expect_ack"), "{json}");
-        // a v1 request (no re/expect_ack keys) still parses
+        // a v1 request (no `re` key) still parses
         let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hi"}"#;
         let req: ChatRequest = serde_json::from_str(v1).unwrap();
         assert_eq!(req.re, None);
-        assert!(!req.expect_ack);
-        // set fields roundtrip
+        // a set `re` roundtrips
         let req = parse_chat_args(
-            &s(&["--re", "9", "--await-ack", "--to", "t6", "go"]),
+            &s(&["--re", "9", "--to", "t6", "go"]),
             None,
             Some("t7".into()),
         )
@@ -885,7 +834,6 @@ mod tests {
         let back: ChatRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back.re, Some(9));
-        assert!(back.expect_ack);
     }
 
     #[test]
