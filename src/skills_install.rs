@@ -67,6 +67,41 @@ fn remove_obsolete(skills_dir: &Path, names: &[&str]) -> io::Result<Vec<String>>
     Ok(removed)
 }
 
+const DISPATCH_SKILL: &str = include_str!("../.claude/skills/foreman-dispatch/SKILL.md");
+const CHAT_SKILL: &str = include_str!("../.claude/skills/foreman-chat/SKILL.md");
+
+/// (directory name, embedded SKILL.md body). The directory name MUST match the
+/// `name:` in each skill's frontmatter so Claude Code discovers it.
+const SKILLS: &[(&str, &str)] = &[
+    ("foreman-dispatch", DISPATCH_SKILL),
+    ("foreman-chat", CHAT_SKILL),
+];
+
+/// Old skill directory names to delete on install (the rename/removal hook).
+/// Empty until a shipped skill is renamed or dropped.
+const OBSOLETE_SKILLS: &[&str] = &[];
+
+#[derive(Debug, Default, PartialEq)]
+pub struct InstallReport {
+    pub written: Vec<&'static str>,
+    pub removed: Vec<String>,
+}
+
+/// Ensure `skills_dir` exists, drop obsolete skills, then write each bundled
+/// skill that is missing or stale.
+#[allow(dead_code)]
+fn install_into(skills_dir: &Path) -> io::Result<InstallReport> {
+    std::fs::create_dir_all(skills_dir)?;
+    let removed = remove_obsolete(skills_dir, OBSOLETE_SKILLS)?;
+    let mut written = Vec::new();
+    for &(name, raw) in SKILLS {
+        if write_skill_if_changed(skills_dir, name, raw)? {
+            written.push(name);
+        }
+    }
+    Ok(InstallReport { written, removed })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +197,21 @@ mod tests {
         assert_eq!(removed, vec!["old-skill".to_string()]);
         assert!(!dir.join("old-skill").exists());
         assert!(dir.join("keep").exists());
+    }
+
+    #[test]
+    fn install_into_writes_both_then_is_idempotent() {
+        let dir = temp("install-into");
+        let first = install_into(&dir).unwrap();
+        assert_eq!(first.written, vec!["foreman-dispatch", "foreman-chat"]);
+        assert!(dir.join("foreman-dispatch").join("SKILL.md").exists());
+        assert!(dir.join("foreman-chat").join("SKILL.md").exists());
+        // second run: nothing changes
+        let second = install_into(&dir).unwrap();
+        assert!(
+            second.written.is_empty(),
+            "expected no rewrites, got {:?}",
+            second.written
+        );
     }
 }
