@@ -4109,6 +4109,7 @@ mod tests {
             cmd: "chat".into(),
             project: Some("p1".into()),
             from: format!("t{from}"),
+            to: Vec::new(),
             text: text.map(str::to_string),
             history,
         }

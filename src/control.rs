@@ -68,6 +68,12 @@ pub struct ChatRequest {
     #[serde(default)]
     pub project: Option<String>, // "p1"; None = focused project
     pub from: String, // "t2"
+    /// Delivery targets from `--to` flags (mentions spec §1). Inline leading-@
+    /// mentions are NOT carried here — they ride in `text` and the server
+    /// extracts them. Empty = no explicit targets; skipped on the wire so
+    /// untargeted requests stay byte-identical to v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub to: Vec<String>,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
@@ -226,6 +232,7 @@ pub fn parse_chat_args(
     let from = self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
     let mut project = default_project;
     let mut history: Option<usize> = None;
+    let mut to: Vec<String> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -246,6 +253,15 @@ pub fn parse_chat_args(
                         i += 1;
                     }
                 }
+            }
+            "--to" => {
+                let v = args.get(i + 1).ok_or("--to needs a value (tN or you)")?;
+                let id = v.strip_prefix('@').unwrap_or(v);
+                if !crate::chat::valid_chat_target(id) {
+                    return Err(format!("bad --to target: {v} (expected tN or you)"));
+                }
+                to.push(id.to_string());
+                i += 2;
             }
             "--" => {
                 // explicit end of flags: everything after is the message verbatim
@@ -269,16 +285,23 @@ pub fn parse_chat_args(
             cmd: "chat".into(),
             project,
             from,
+            to,
             text: Some(words.join(" ")),
             history: None,
         }),
-        (true, Some(n)) => Ok(ChatRequest {
-            cmd: "chat".into(),
-            project,
-            from,
-            text: None,
-            history: Some(n),
-        }),
+        (true, Some(n)) => {
+            if !to.is_empty() {
+                return Err("--to and --history are mutually exclusive".into());
+            }
+            Ok(ChatRequest {
+                cmd: "chat".into(),
+                project,
+                from,
+                to: Vec::new(),
+                text: None,
+                history: Some(n),
+            })
+        }
         (true, None) => Err("nothing to do: give a message or --history".into()),
         (false, Some(_)) => Err("--history and a message are mutually exclusive".into()),
     }
@@ -663,6 +686,7 @@ mod tests {
             cmd: "chat".into(),
             project: Some("p1".into()),
             from: "t2".into(),
+            to: Vec::new(),
             text: Some("hello".into()),
             history: None,
         };
@@ -677,5 +701,47 @@ mod tests {
             }
         }
         assert!(reply.expect("no reply").ok);
+    }
+
+    #[test]
+    fn parse_chat_args_collects_to_targets() {
+        // repeatable, leading @ stripped, you allowed
+        let req = parse_chat_args(
+            &s(&["--to", "t3", "--to", "@you", "go"]),
+            Some("p1".into()),
+            Some("t2".into()),
+        )
+        .unwrap();
+        assert_eq!(req.to, vec!["t3", "you"]);
+        assert_eq!(req.text.as_deref(), Some("go"));
+        // bad format is a client-side error naming the value
+        let e = parse_chat_args(&s(&["--to", "bogus", "hi"]), None, Some("t2".into())).unwrap_err();
+        assert!(e.contains("bogus"), "{e}");
+        let e = parse_chat_args(&s(&["--to", "t", "hi"]), None, Some("t2".into())).unwrap_err();
+        assert!(e.contains("t"), "{e}");
+        // --to needs a value
+        assert!(parse_chat_args(&s(&["--to"]), None, Some("t2".into())).is_err());
+        // mutually exclusive with --history
+        let e = parse_chat_args(&s(&["--to", "t3", "--history"]), None, Some("t2".into())).unwrap_err();
+        assert!(e.contains("mutually exclusive"), "{e}");
+        // a plain post carries no targets
+        let req = parse_chat_args(&s(&["hi"]), None, Some("t2".into())).unwrap();
+        assert!(req.to.is_empty());
+    }
+
+    #[test]
+    fn chat_request_to_is_wire_compatible_with_v1() {
+        // empty to serializes away — untargeted requests are byte-identical to v1
+        let req = parse_chat_args(&s(&["hi"]), Some("p1".into()), Some("t2".into())).unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"to\""), "{json}");
+        // a v1 request (no `to` key) still parses
+        let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hi"}"#;
+        let req: ChatRequest = serde_json::from_str(v1).unwrap();
+        assert!(req.to.is_empty());
+        // targets roundtrip
+        let req = parse_chat_args(&s(&["--to", "t3", "go"]), None, Some("t2".into())).unwrap();
+        let back: ChatRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back.to, vec!["t3"]);
     }
 }
