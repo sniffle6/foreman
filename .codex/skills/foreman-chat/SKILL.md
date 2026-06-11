@@ -47,6 +47,12 @@ Targeting rules:
 Interactive workers can receive chat. `codex exec` workers cannot, because they
 are non-interactive and exit on completion.
 
+Provider mix rule: when dispatching agents into a Foreman chat room, use BOTH
+providers by default no matter whether the orchestrator is Codex or Claude.
+Codex workers own research and review. Claude workers own implementation and
+verification. Depart from this only if the user explicitly requests one provider
+or one CLI is unavailable.
+
 For Codex on Windows, prefer compact one-line, quote-free worker prompts unless
 the `codex` command is a native executable. The npm shim cannot carry newlines or
 literal `"` through Foreman's dispatch path.
@@ -54,8 +60,10 @@ literal `"` through Foreman's dispatch path.
 Example:
 
 ```powershell
-$w1 = 'You are in a Foreman project chat. Messages arrive as [chat p1 #N] tX: text or [chat p1 #N] you: text from the human. Stay silent unless a message changes what you should do. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Use --history only to catch up after heads-down work. When done, post one line ending with @you if the human must act.'
-& $env:FOREMAN_EXE open --title "agent - review" -- codex $w1
+$research = 'You are the Codex research/review worker in this Foreman chat. Research unknowns, inspect designs/diffs, and review implementation for risks. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
+$impl = 'You are the Claude implementation/verification worker in this Foreman chat. Make the code or doc changes and run verification. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
+& $env:FOREMAN_EXE open --title "codex - research" -- codex $research
+& $env:FOREMAN_EXE open --title "claude - implement" -- claude $impl
 ```
 
 Record the returned terminal id (`t3`, `t4`, etc.). Ids are assigned by Foreman.

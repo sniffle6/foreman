@@ -61,4 +61,5 @@ and pass the variable — this is the entire quoting story:
   `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
 
 **Coordinating multiple workers, or anything involving the project chat
-room? → use the foreman-chat skill.**
+room? → use the foreman-chat skill.** It carries the mixed-provider rule:
+Codex for research/review, Claude for implementation/verification.

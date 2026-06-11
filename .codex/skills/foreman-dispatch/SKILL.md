@@ -75,4 +75,5 @@ Examples:
 ```
 
 Coordinating multiple workers, posting updates, or using `@tN` targeting goes
-through the `foreman-chat` skill.
+through the `foreman-chat` skill. It carries the mixed-provider rule: Codex for
+research/review, Claude for implementation/verification.

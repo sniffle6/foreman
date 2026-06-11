@@ -36,6 +36,12 @@ posts through the project's chat window.
 
 ## Recipe: dispatch a team that discusses in chat
 
+Provider mix rule: when dispatching agents into a Foreman chat room, use BOTH
+providers by default no matter whether the orchestrator is Claude or Codex.
+Codex workers own research and review. Claude workers own implementation and
+verification. Depart from this only if the user explicitly requests one provider
+or one CLI is unavailable.
+
 1. Build each worker's prompt from the template below (here-string — never
    inline-escape):
 
@@ -61,8 +67,14 @@ posts through the project's chat window.
        post a one-line done-signal ending with @you if the human must act.
        '@
 
-2. Dispatch one per worker — interactive mode, NOT `-p` (print mode cannot
-   receive chat): `& $env:FOREMAN_EXE open --title "agent · ux" -- claude $w1`
+2. Dispatch one per worker — interactive mode, NOT `-p`/`exec` (non-interactive
+   workers cannot receive chat). Use a mixed-provider split:
+
+       $research = 'You are the Codex research/review worker in this Foreman chat. Research unknowns, inspect designs/diffs, and review implementation for risks. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
+       $impl = 'You are the Claude implementation/verification worker in this Foreman chat. Make the code or doc changes and run verification. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
+       & $env:FOREMAN_EXE open --title "codex · research" -- codex $research
+       & $env:FOREMAN_EXE open --title "claude · implement" -- claude $impl
+
 3. **Record each reply's `terminal` id** (`t3`, `t4`…). Ids are assigned by
    foreman — never invent names or predict ids; address workers by the ids
    the replies gave you.
@@ -89,6 +101,6 @@ and you both stop."
 - Seq gaps in `--history` are normal (join/exit events consume seqs).
 - Quoting: prompts via here-strings (above); inside chat messages avoid
   literal `"` characters; `--` ends flag parsing for dash-leading messages.
-  If a dispatch errors naming a cmd-shim, claude is an npm `.cmd` shim —
-  multi-line worker prompts need a native claude install (see
-  foreman-dispatch).
+  If a dispatch errors naming a cmd-shim, that CLI is an npm `.cmd` shim —
+  multi-line worker prompts need a native install, or a flattened one-line,
+  quote-free prompt (see foreman-dispatch).
