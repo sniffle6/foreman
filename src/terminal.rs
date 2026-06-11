@@ -987,7 +987,10 @@ mod tests {
         // the latch (cmd /c exit could race to exit first).
         let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
-        assert!(!s.ready(), "freshly spawned: not ready until DSR is answered");
+        assert!(
+            !s.ready(),
+            "freshly spawned: not ready until DSR is answered"
+        );
         // cmd.exe sends ESC[6n at startup; pump() flushes the reply back to the
         // PTY — that first flush is the readiness latch.
         let mut became_ready = false;
@@ -999,7 +1002,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(became_ready, "session never became ready (DSR never answered)");
+        assert!(
+            became_ready,
+            "session never became ready (DSR never answered)"
+        );
     }
 
     #[test]

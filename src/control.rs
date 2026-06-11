@@ -784,7 +784,8 @@ mod tests {
         // --to needs a value
         assert!(parse_chat_args(&s(&["--to"]), None, Some("t2".into())).is_err());
         // mutually exclusive with --history
-        let e = parse_chat_args(&s(&["--to", "t3", "--history"]), None, Some("t2".into())).unwrap_err();
+        let e =
+            parse_chat_args(&s(&["--to", "t3", "--history"]), None, Some("t2".into())).unwrap_err();
         assert!(e.contains("mutually exclusive"), "{e}");
         // a plain post carries no targets
         let req = parse_chat_args(&s(&["hi"]), None, Some("t2".into())).unwrap();
@@ -803,7 +804,8 @@ mod tests {
         assert!(req.to.is_empty());
         // targets roundtrip
         let req = parse_chat_args(&s(&["--to", "t3", "go"]), None, Some("t2".into())).unwrap();
-        let back: ChatRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let back: ChatRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back.to, vec!["t3"]);
     }
 
@@ -830,8 +832,12 @@ mod tests {
         assert!(req.expect_ack);
         assert_eq!(req.to, vec!["t7"]);
         // --await-ack target can be an inline leading @mention (no --to flag)
-        let req = parse_chat_args(&s(&["--await-ack", "@t7", "build", "X"]), None, Some("t2".into()))
-            .unwrap();
+        let req = parse_chat_args(
+            &s(&["--await-ack", "@t7", "build", "X"]),
+            None,
+            Some("t2".into()),
+        )
+        .unwrap();
         assert!(req.expect_ack);
         assert_eq!(req.text.as_deref(), Some("@t7 build X"));
     }
@@ -847,8 +853,12 @@ mod tests {
         assert!(parse_chat_args(&s(&["--re", "abc", "hi"]), None, Some("t2".into())).is_err());
         // handshake flags are post-only: not with --history
         assert!(
-            parse_chat_args(&s(&["--await-ack", "--to", "t7", "--history"]), None, Some("t2".into()))
-                .is_err()
+            parse_chat_args(
+                &s(&["--await-ack", "--to", "t7", "--history"]),
+                None,
+                Some("t2".into())
+            )
+            .is_err()
         );
         assert!(parse_chat_args(&s(&["--re", "5", "--history"]), None, Some("t2".into())).is_err());
     }

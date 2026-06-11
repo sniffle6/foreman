@@ -29,7 +29,7 @@ const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 // Chat viewer palette. Sender colors are assigned by terminal-id hash —
 // stable for a given id, distinct enough across a small fleet.
 const CHAT_COLORS: [egui::Color32; 6] = [
-    egui::Color32::from_rgb(231, 169, 63),  // amber (also the human "you")
+    egui::Color32::from_rgb(231, 169, 63), // amber (also the human "you")
     egui::Color32::from_rgb(127, 179, 127), // green
     egui::Color32::from_rgb(111, 167, 199), // blue
     egui::Color32::from_rgb(199, 127, 174), // pink
@@ -317,7 +317,8 @@ impl Content {
                 );
                 let p = ui.painter_at(rect);
                 p.rect_filled(rect, 0.0, WIN_BG);
-                let rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
+                let rect =
+                    egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
                 let pad = 8.0;
                 let meta_font = egui::FontId::proportional(11.0);
                 let body_font = egui::FontId::proportional(12.5);
@@ -332,7 +333,10 @@ impl Content {
                     );
                     log_left = board.max.x;
                     p.line_segment(
-                        [egui::pos2(board.max.x, rect.min.y), egui::pos2(board.max.x, rect.max.y)],
+                        [
+                            egui::pos2(board.max.x, rect.min.y),
+                            egui::pos2(board.max.x, rect.max.y),
+                        ],
                         egui::Stroke::new(1.0, BORDER),
                     );
                     p.text(
@@ -350,8 +354,8 @@ impl Content {
                             egui::pos2(board.min.x + 4.0, y),
                             egui::vec2(board.width() - 8.0, row_h),
                         );
-                        let hovered = resp.hovered()
-                            && resp.hover_pos().is_some_and(|p| row.contains(p));
+                        let hovered =
+                            resp.hovered() && resp.hover_pos().is_some_and(|p| row.contains(p));
                         if hovered {
                             p.rect_filled(row, 3.0, TITLE_BG);
                         }
@@ -421,7 +425,12 @@ impl Content {
                     crate::chat::build_blocks(log.msgs(), view.last_seen, compact)
                 };
                 enum Painted {
-                    Galley(std::sync::Arc<egui::Galley>, egui::Color32, f32 /*indent*/, bool /*edge*/),
+                    Galley(
+                        std::sync::Arc<egui::Galley>,
+                        egui::Color32,
+                        f32,  /*indent*/
+                        bool, /*edge*/
+                    ),
                     Centered(std::sync::Arc<egui::Galley>),
                     MetaPair(std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>),
                     Rule(Option<std::sync::Arc<egui::Galley>>),
@@ -438,12 +447,21 @@ impl Content {
                             items.push(Painted::Gap(6.0));
                         }
                         crate::chat::ChatBlock::Divider => {
-                            let g = p.layout("NEW".into(), egui::FontId::proportional(9.0), CHAT_STALE, wrap);
+                            let g = p.layout(
+                                "NEW".into(),
+                                egui::FontId::proportional(9.0),
+                                CHAT_STALE,
+                                wrap,
+                            );
                             total += 14.0;
                             items.push(Painted::Rule(Some(g)));
                         }
                         crate::chat::ChatBlock::Header { name, id, meta } => {
-                            let gn = p.layout_no_wrap(name.clone(), egui::FontId::proportional(12.0), chat_color(id));
+                            let gn = p.layout_no_wrap(
+                                name.clone(),
+                                egui::FontId::proportional(12.0),
+                                chat_color(id),
+                            );
                             let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), DIM);
                             total += gn.size().y + 2.0 + 4.0; // header + breathing room above
                             items.push(Painted::Gap(4.0));
@@ -474,7 +492,12 @@ impl Content {
                             }
                             let g = p.layout_job(job);
                             total += g.size().y + 2.0;
-                            items.push(Painted::Galley(g, TEXT, if to.is_empty() { 0.0 } else { 10.0 }, !to.is_empty()));
+                            items.push(Painted::Galley(
+                                g,
+                                TEXT,
+                                if to.is_empty() { 0.0 } else { 10.0 },
+                                !to.is_empty(),
+                            ));
                             items.push(Painted::Gap(2.0));
                         }
                     }
@@ -494,7 +517,11 @@ impl Content {
                         view.stick = view.scroll >= max - 1.0;
                     }
                 }
-                let offset = if view.stick { max } else { view.scroll.min(max) };
+                let offset = if view.stick {
+                    max
+                } else {
+                    view.scroll.min(max)
+                };
                 let mut y = log_rect.min.y - offset;
                 for it in items {
                     match it {
@@ -509,7 +536,10 @@ impl Content {
                             let mid = y + 7.0;
                             // The rule is intentionally dim (mockup: 1px #45402f); the amber NEW label is the affordance.
                             p.line_segment(
-                                [egui::pos2(log_rect.min.x, mid), egui::pos2(log_rect.max.x, mid)],
+                                [
+                                    egui::pos2(log_rect.min.x, mid),
+                                    egui::pos2(log_rect.max.x, mid),
+                                ],
                                 egui::Stroke::new(1.0, CHAT_MENTION_BG),
                             );
                             if let Some(g) = label {
@@ -558,7 +588,10 @@ impl Content {
                 // under the strip.
                 p.rect_filled(input_rect, 0.0, WIN_BG);
                 p.line_segment(
-                    [input_rect.min, egui::pos2(input_rect.max.x, input_rect.min.y)],
+                    [
+                        input_rect.min,
+                        egui::pos2(input_rect.max.x, input_rect.min.y),
+                    ],
                     egui::Stroke::new(1.0, BORDER),
                 );
                 let te_rect = input_rect.shrink2(egui::vec2(8.0, 5.0));
@@ -951,7 +984,13 @@ impl WindowManager {
                     // log, not the audience) — only the injection is skipped.
                     // A retrying client may therefore duplicate a history line;
                     // accepted v1.
-                    Ok(ChatOutcome::Posted { pid, from, framed, targets, seq }) => {
+                    Ok(ChatOutcome::Posted {
+                        pid,
+                        from,
+                        framed,
+                        targets,
+                        seq,
+                    }) => {
                         let ok = OpenReply {
                             ok: true,
                             terminal: None,
@@ -1032,14 +1071,26 @@ impl WindowManager {
             (Some(text), None) => {
                 let from = term_id(&req.from)?;
                 let (framed, targets, seq) = child.chat_post_re(from, text, &req.to, req.re)?;
-                Ok(ChatOutcome::Posted { pid, from, framed, targets, seq: Some(seq) })
+                Ok(ChatOutcome::Posted {
+                    pid,
+                    from,
+                    framed,
+                    targets,
+                    seq: Some(seq),
+                })
             }
             _ => Err("chat needs exactly one of text/history".into()),
         }
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
-    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str, targets: Option<&[WinId]>) {
+    fn chat_broadcast_in(
+        &mut self,
+        pid: WinId,
+        from: WinId,
+        framed: &str,
+        targets: Option<&[WinId]>,
+    ) {
         if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
             && let Content::Project(child) = &mut win.tabs[win.active].content
         {
@@ -1147,7 +1198,9 @@ impl WindowManager {
                 if !t.chat_member {
                     continue;
                 }
-                let Content::Terminal(s) = &mut t.content else { continue };
+                let Content::Terminal(s) = &mut t.content else {
+                    continue;
+                };
                 // Merged member tabs in one window share term_tag(wid) — both rows get the same id and last-heard. Same accepted staleness family as the rest of chat identity (Tab doc).
                 rows.push(crate::chat::CrewRow {
                     win: wid,
@@ -1170,14 +1223,17 @@ impl WindowManager {
         // The pane identity sits between live members and the exited — it is
         // "your seat", not fleet status, and never counts toward the live chip.
         let pos = rows.iter().take_while(|r| !r.exited).count();
-        rows.insert(pos, crate::chat::CrewRow {
-            win: 0, // no window: click is a no-op (ids start at 1)
-            tab: 0,
-            id: Self::HUMAN_ID.to_string(),
-            name: Self::HUMAN_ID.to_string(),
-            exited: false,
-            last: self.chat.borrow().last_activity(Self::HUMAN_ID),
-        });
+        rows.insert(
+            pos,
+            crate::chat::CrewRow {
+                win: 0, // no window: click is a no-op (ids start at 1)
+                tab: 0,
+                id: Self::HUMAN_ID.to_string(),
+                name: Self::HUMAN_ID.to_string(),
+                exited: false,
+                last: self.chat.borrow().last_activity(Self::HUMAN_ID),
+            },
+        );
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 if let Content::Chat(v) = &mut t.content {
@@ -3732,7 +3788,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
         let t = wm
             .add_terminal_cmd(&argv, None, Some("worker A"), &ctx)
             .unwrap();
@@ -3748,7 +3808,9 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let t = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let t = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         // simulate a hand-opened terminal: not yet a member
         let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
         w.tabs[w.active].chat_member = false;
@@ -3775,7 +3837,10 @@ mod tests {
             .iter()
             .filter(|m| m.kind == crate::chat::ChatKind::Joined && m.from == format!("t{t}"))
             .count();
-        assert_eq!(joins, 2, "one from dispatch, one from first post — not three");
+        assert_eq!(
+            joins, 2,
+            "one from dispatch, one from first post — not three"
+        );
     }
 
     #[test]
@@ -3783,9 +3848,17 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "exit 0".to_string()];
-        let member = wm.add_terminal_cmd(&argv, None, Some("worker A"), &ctx).unwrap();
-        let outsider = wm.add_terminal_cmd(&argv, None, Some("plain"), &ctx).unwrap();
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 0".to_string(),
+        ];
+        let member = wm
+            .add_terminal_cmd(&argv, None, Some("worker A"), &ctx)
+            .unwrap();
+        let outsider = wm
+            .add_terminal_cmd(&argv, None, Some("plain"), &ctx)
+            .unwrap();
         let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
         w.tabs[w.active].chat_member = false;
         // wait for both `cmd /c exit 0` children to end — pumping keepalive()
@@ -3796,7 +3869,9 @@ mod tests {
             let mut done = 0;
             for id in [member, outsider] {
                 let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
-                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                    panic!()
+                };
                 s.keepalive();
                 if s.exited().is_some() {
                     done += 1;
@@ -3805,7 +3880,10 @@ mod tests {
             if done == 2 {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "children never exited");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "children never exited"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         wm.refresh_exit_titles();
@@ -3817,7 +3895,10 @@ mod tests {
             .collect();
         assert_eq!(exits.len(), 1, "only the member's exit is recorded");
         assert_eq!(exits[0].from, format!("t{member}"));
-        assert_eq!(exits[0].name, "worker A", "name captured before the exit marker lands");
+        assert_eq!(
+            exits[0].name, "worker A",
+            "name captured before the exit marker lands"
+        );
     }
 
     #[test]
@@ -3835,7 +3916,10 @@ mod tests {
         }
 
         assert!(wm.chat_post(t, "", &[]).is_err(), "empty message rejected");
-        assert!(wm.chat_post(999, "hi", &[]).is_err(), "unknown sender rejected");
+        assert!(
+            wm.chat_post(999, "hi", &[]).is_err(),
+            "unknown sender rejected"
+        );
         let framed = wm.chat_post(t, "hello room", &[]).unwrap().0;
         // seq 3: dispatch Joined (1), first-post Joined (2), then the post —
         // system entries share the seq space but stay out of --history
@@ -3913,8 +3997,12 @@ mod tests {
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
         wm.last_area = egui::vec2(800.0, 600.0);
-        let a = wm.add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx).unwrap();
-        let b = wm.add_terminal_cmd(&pause_argv(), None, Some("plain"), &ctx).unwrap();
+        let a = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx)
+            .unwrap();
+        let b = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("plain"), &ctx)
+            .unwrap();
         let w = wm.windows.iter_mut().find(|w| w.id == b).unwrap();
         w.tabs[w.active].chat_member = false;
         wm.open_chat_window();
@@ -3929,8 +4017,13 @@ mod tests {
             .iter()
             .find(|t| matches!(t.content, Content::Chat(_)))
             .unwrap();
-        assert_eq!(tab.title, "chat · 1 live", "the you-row must not inflate the live count");
-        let Content::Chat(v) = &tab.content else { panic!() };
+        assert_eq!(
+            tab.title, "chat · 1 live",
+            "the you-row must not inflate the live count"
+        );
+        let Content::Chat(v) = &tab.content else {
+            panic!()
+        };
         assert_eq!(v.crew.len(), 2, "the member + the human pane identity");
         // index by id, not position, for the member assertions
         let m = v
@@ -3945,7 +4038,10 @@ mod tests {
         assert_eq!(v.crew[1].id, "you");
         assert_eq!(v.crew[1].name, "you");
         assert!(!v.crew[1].exited);
-        assert_eq!(v.crew[1].win, 0, "human row has no window — click must be a no-op");
+        assert_eq!(
+            v.crew[1].win, 0,
+            "human row has no window — click must be a no-op"
+        );
     }
 
     #[test]
@@ -3954,7 +4050,9 @@ mod tests {
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
         wm.last_area = egui::vec2(800.0, 600.0);
-        let t = wm.add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx).unwrap();
+        let t = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx)
+            .unwrap();
         wm.open_chat_window();
         let chat_id = wm.focused.expect("open focuses the viewer");
         // simulate the render arm recording a click on worker A's row
@@ -3989,7 +4087,11 @@ mod tests {
             }
         }
         wm.drain_chat_clicks();
-        assert_eq!(wm.focused, Some(chat_id), "stale tab index is a silent no-op");
+        assert_eq!(
+            wm.focused,
+            Some(chat_id),
+            "stale tab index is a silent no-op"
+        );
     }
 
     #[test]
@@ -3999,8 +4101,12 @@ mod tests {
         wm.tag = Some("p1".to_string());
         wm.last_area = egui::vec2(800.0, 600.0);
         // both members run `cmd /c pause`: ANY stdin byte makes them exit
-        let a = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let b = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let a = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let b = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         wm.open_chat_window();
         // simulate the input line submitting
         for w in &mut wm.windows {
@@ -4020,7 +4126,10 @@ mod tests {
                 .expect("post missing");
             assert_eq!(m.from, "you");
             assert_eq!(m.name, "you");
-            assert!(m.frame("p1").starts_with(&format!("[chat p1 #{}] you: go", m.seq)));
+            assert!(
+                m.frame("p1")
+                    .starts_with(&format!("[chat p1 #{}] you: go", m.seq))
+            );
         }
         // BOTH members exit — the human excludes nobody
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4028,7 +4137,9 @@ mod tests {
             let mut done = 0;
             for id in [a, b] {
                 let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
-                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                    panic!()
+                };
                 s.keepalive();
                 if s.exited().is_some() {
                     done += 1;
@@ -4037,7 +4148,10 @@ mod tests {
             if done == 2 {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "a member never got the post");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a member never got the post"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -4088,7 +4202,10 @@ mod tests {
                 wm.pump_commands(ui, true);
             });
         });
-        assert!(!wm.armed, "leader must stay dormant while a field has focus");
+        assert!(
+            !wm.armed,
+            "leader must stay dormant while a field has focus"
+        );
         // frame 2: focus released — the same chord arms (positive control)
         let mut input = egui::RawInput::default();
         input.events.push(leader_event());
@@ -4106,16 +4223,25 @@ mod tests {
         let log = Rc::new(RefCell::new(crate::chat::ChatLog::new()));
         log.borrow_mut().post("t1", "a", "before-open");
         let mut v = crate::chat::ChatView::new(Rc::clone(&log));
-        assert_eq!(v.last_seen, 1, "creation watermark = current tail (backlog pre-dates the window open)");
+        assert_eq!(
+            v.last_seen, 1,
+            "creation watermark = current tail (backlog pre-dates the window open)"
+        );
         v.on_frame(true); // focused
         log.borrow_mut().post("t1", "a", "while-focused");
         v.on_frame(true);
         assert_eq!(v.last_seen, 1, "watermark holds while focused");
         v.on_frame(false); // focus left
-        assert_eq!(v.last_seen, 2, "watermark catches up on the focus-loss edge");
+        assert_eq!(
+            v.last_seen, 2,
+            "watermark catches up on the focus-loss edge"
+        );
         log.borrow_mut().post("t1", "a", "while-unfocused");
         v.on_frame(false);
-        assert_eq!(v.last_seen, 2, "unfocused arrivals stay above the watermark");
+        assert_eq!(
+            v.last_seen, 2,
+            "unfocused arrivals stay above the watermark"
+        );
     }
 
     #[test]
@@ -4457,9 +4583,15 @@ mod tests {
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
         // all run `cmd /c pause`: any stdin byte makes them exit
-        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let target = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let bystander = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let target = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let bystander = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         // bystander IS a member — only the target filter may exclude it
         let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
 
@@ -4472,11 +4604,16 @@ mod tests {
             }
             wm.chat_broadcast(Some(sender), &framed, Some(&[target]));
             let w = wm.windows.iter_mut().find(|w| w.id == target).unwrap();
-            let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
             if s.exited().is_some() {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "target never received the bytes");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "target never received the bytes"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // member bystander + sender saw nothing (kept pumped so a wrongful
@@ -4493,7 +4630,9 @@ mod tests {
         }
         for (id, who) in [(sender, "sender"), (bystander, "member bystander")] {
             let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
-            let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
             assert!(s.exited().is_none(), "{who} must not be injected");
         }
     }
@@ -4503,9 +4642,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let outsider = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let member = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let outsider = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         {
             let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
             w.tabs[w.active].chat_member = false;
@@ -4513,13 +4658,17 @@ mod tests {
         let len_before = wm.chat.borrow().msgs().len();
 
         // unknown id — names it; one bad target fails a multi-target post entirely
-        let e = wm.chat_post(sender, "go", &[term_tag(member), "t99".into()]).unwrap_err();
+        let e = wm
+            .chat_post(sender, "go", &[term_tag(member), "t99".into()])
+            .unwrap_err();
         assert!(e.contains("no such terminal: t99"), "{e}");
         // self-mention
         let e = wm.chat_post(sender, "go", &[term_tag(sender)]).unwrap_err();
         assert!(e.contains("cannot mention yourself"), "{e}");
         // non-member
-        let e = wm.chat_post(sender, "go", &[term_tag(outsider)]).unwrap_err();
+        let e = wm
+            .chat_post(sender, "go", &[term_tag(outsider)])
+            .unwrap_err();
         assert!(e.contains("is not a chat member"), "{e}");
         // nothing appended by any failed post
         assert_eq!(wm.chat.borrow().msgs().len(), len_before);
@@ -4533,7 +4682,9 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         {
             // make the sender a NON-member so a successful post would join it
             let w = wm.windows.iter_mut().find(|w| w.id == sender).unwrap();
@@ -4556,18 +4707,30 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let member = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
 
         // flags first, then inline, deduped; `you` resolves to no terminal
-        let (framed, targets) = wm.chat_post(sender, "@you go", &[term_tag(member)]).unwrap();
+        let (framed, targets) = wm
+            .chat_post(sender, "@you go", &[term_tag(member)])
+            .unwrap();
         let mtag = term_tag(member);
         let stag = term_tag(sender);
-        assert!(framed.contains(&format!("{stag}→{mtag},you: @you go")), "{framed}");
+        assert!(
+            framed.contains(&format!("{stag}→{mtag},you: @you go")),
+            "{framed}"
+        );
         assert_eq!(targets, Some(vec![member]));
         // pure-@you: Some(empty) — targeted, deliver to nobody
         let (framed, targets) = wm.chat_post(sender, "@you need eyes", &[]).unwrap();
-        assert!(framed.contains(&format!("{stag}→you: @you need eyes")), "{framed}");
+        assert!(
+            framed.contains(&format!("{stag}→you: @you need eyes")),
+            "{framed}"
+        );
         assert_eq!(targets, Some(vec![]));
         // untargeted: None — broadcast
         let (_, targets) = wm.chat_post(sender, "plain", &[]).unwrap();
@@ -4579,8 +4742,12 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let sender = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
-        let victim = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let sender = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let victim = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         // kill the victim by injecting a byte (pause exits on any stdin), pumping
         // through the DSR window like the broadcast tests
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4592,7 +4759,9 @@ mod tests {
             }
             {
                 let w = wm.windows.iter_mut().find(|w| w.id == victim).unwrap();
-                let Content::Terminal(s) = &mut w.tabs[w.active].content else { panic!() };
+                let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                    panic!()
+                };
                 s.inject_input("x");
                 if s.exited().is_some() {
                     break;
@@ -4610,14 +4779,24 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let member = wm.add_terminal_cmd(&pause_argv(), None, None, &ctx).unwrap();
+        let member = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
         let mtag = term_tag(member);
 
         // valid mention: targeted, arrow-framed under the reserved sender
-        let (framed, targets) = wm.chat_post_human(&format!("@{mtag} check the diff")).unwrap();
-        assert!(framed.contains(&format!("you→{mtag}: @{mtag} check the diff")), "{framed}");
+        let (framed, targets) = wm
+            .chat_post_human(&format!("@{mtag} check the diff"))
+            .unwrap();
+        assert!(
+            framed.contains(&format!("you→{mtag}: @{mtag} check the diff")),
+            "{framed}"
+        );
         assert_eq!(targets, Some(vec![member]));
-        assert_eq!(wm.chat.borrow().msgs().last().unwrap().to, vec![mtag.clone()]);
+        assert_eq!(
+            wm.chat.borrow().msgs().last().unwrap().to,
+            vec![mtag.clone()]
+        );
 
         // unknown id: prose fallback — broadcast, text intact, no error (spec §7)
         let (framed, targets) = wm.chat_post_human("@t99 anyone?").unwrap();

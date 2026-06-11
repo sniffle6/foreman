@@ -75,7 +75,13 @@ impl ChatMsg {
 
     /// History/window line: `#14 t2: text` (or `#14 t2→t6 (re #9): text`).
     pub fn line(&self) -> String {
-        format!("#{} {}{}: {}", self.seq, self.from_tag(), self.re_suffix(), self.text)
+        format!(
+            "#{} {}{}: {}",
+            self.seq,
+            self.from_tag(),
+            self.re_suffix(),
+            self.text
+        )
     }
 
     /// Injection framing with provenance: `[chat p1 #14] t2: text` —
@@ -84,7 +90,10 @@ impl ChatMsg {
     pub fn frame(&self, project: &str) -> String {
         format!(
             "[chat {project} #{}] {}{}: {}",
-            self.seq, self.from_tag(), self.re_suffix(), self.text
+            self.seq,
+            self.from_tag(),
+            self.re_suffix(),
+            self.text
         )
     }
 }
@@ -168,7 +177,11 @@ impl ChatLog {
 
     /// When `from` was last heard from (any entry kind) — crew-board ages.
     pub fn last_activity(&self, from: &str) -> Option<SystemTime> {
-        self.msgs.iter().rev().find(|m| m.from == from).map(|m| m.at)
+        self.msgs
+            .iter()
+            .rev()
+            .find(|m| m.from == from)
+            .map(|m| m.at)
     }
 
     /// Last `n` POSTS as display lines, oldest first — the `--history` verb.
@@ -186,7 +199,6 @@ impl ChatLog {
         lines.reverse();
         lines
     }
-
 }
 
 /// What the viewer paints, in order. Pure data so grouping/divider/meta
@@ -197,7 +209,11 @@ pub enum ChatBlock {
     /// The amber NEW rule.
     Divider,
     /// Sender header for a run of consecutive messages.
-    Header { name: String, id: String, meta: String },
+    Header {
+        name: String,
+        id: String,
+        meta: String,
+    },
     /// One message body under the current header.
     Text { text: String, to: Vec<String> },
 }
@@ -216,8 +232,15 @@ pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<Chat
         }
         match m.kind {
             ChatKind::Joined | ChatKind::Exited => {
-                let verb = if m.kind == ChatKind::Joined { "joined" } else { "exited" };
-                out.push(ChatBlock::Sys(format!("— {} ({}) {verb} —", m.name, m.from)));
+                let verb = if m.kind == ChatKind::Joined {
+                    "joined"
+                } else {
+                    "exited"
+                };
+                out.push(ChatBlock::Sys(format!(
+                    "— {} ({}) {verb} —",
+                    m.name, m.from
+                )));
                 current = None;
             }
             ChatKind::Post => {
@@ -238,7 +261,11 @@ pub fn build_blocks(msgs: &[ChatMsg], last_seen: u64, compact: bool) -> Vec<Chat
                     });
                 }
                 // A targeted message stands alone: the next message re-headers.
-                current = if m.to.is_empty() { Some(m.from.as_str()) } else { None };
+                current = if m.to.is_empty() {
+                    Some(m.from.as_str())
+                } else {
+                    None
+                };
                 out.push(ChatBlock::Text {
                     text: m.text.clone(),
                     to: m.to.clone(),
@@ -339,9 +366,7 @@ pub struct CrewRow {
 /// never-heard counting as oldest; exited members sink to the bottom.
 pub fn sort_crew(rows: &mut [CrewRow]) {
     rows.sort_by(|a, b| {
-        a.exited
-            .cmp(&b.exited)
-            .then_with(|| a.last.cmp(&b.last)) // None sorts before Some(_) = oldest first
+        a.exited.cmp(&b.exited).then_with(|| a.last.cmp(&b.last)) // None sorts before Some(_) = oldest first
     });
 }
 
@@ -467,7 +492,11 @@ mod tests {
         assert_eq!(log.last_activity("t4"), None);
         log.sys(ChatKind::Joined, "t4", "skeptic");
         let joined_at = log.msgs().last().unwrap().at;
-        assert_eq!(log.last_activity("t4"), Some(joined_at), "never-posted member uses join time");
+        assert_eq!(
+            log.last_activity("t4"),
+            Some(joined_at),
+            "never-posted member uses join time"
+        );
         log.post("t4", "skeptic", "hi");
         let posted_at = log.msgs().last().unwrap().at;
         assert_eq!(log.last_activity("t4"), Some(posted_at));
@@ -475,12 +504,30 @@ mod tests {
 
     #[test]
     fn age_label_boundaries() {
-        assert_eq!(age_label(Duration::from_secs(0)), ("now".to_string(), false));
-        assert_eq!(age_label(Duration::from_secs(59)), ("now".to_string(), false));
-        assert_eq!(age_label(Duration::from_secs(60)), ("1m".to_string(), false));
-        assert_eq!(age_label(Duration::from_secs(299)), ("4m".to_string(), false));
-        assert_eq!(age_label(Duration::from_secs(300)), ("5m".to_string(), true));
-        assert_eq!(age_label(Duration::from_secs(3600)), ("1h".to_string(), true));
+        assert_eq!(
+            age_label(Duration::from_secs(0)),
+            ("now".to_string(), false)
+        );
+        assert_eq!(
+            age_label(Duration::from_secs(59)),
+            ("now".to_string(), false)
+        );
+        assert_eq!(
+            age_label(Duration::from_secs(60)),
+            ("1m".to_string(), false)
+        );
+        assert_eq!(
+            age_label(Duration::from_secs(299)),
+            ("4m".to_string(), false)
+        );
+        assert_eq!(
+            age_label(Duration::from_secs(300)),
+            ("5m".to_string(), true)
+        );
+        assert_eq!(
+            age_label(Duration::from_secs(3600)),
+            ("1h".to_string(), true)
+        );
     }
 
     fn row(id: &str, exited: bool, last_secs_ago: Option<u64>) -> CrewRow {
@@ -574,7 +621,10 @@ mod tests {
         // compact: seq only (+ arrow)
         let blocks = build_blocks(&msgs, 1, true);
         assert!(matches!(&blocks[0], ChatBlock::Header { meta, .. } if meta == "#1"));
-        assert!(matches!(&blocks[2], ChatBlock::Divider), "divider above first seq > last_seen");
+        assert!(
+            matches!(&blocks[2], ChatBlock::Divider),
+            "divider above first seq > last_seen"
+        );
         assert!(matches!(&blocks[3], ChatBlock::Header { meta, .. } if meta == "#3 · → t4,you"));
         assert!(matches!(&blocks[4], ChatBlock::Text { to, .. } if to == &["t4", "you"]));
         // comfortable: id · seq · HH:MM (don't assert the clock digits — tz-dependent)
@@ -616,10 +666,19 @@ mod tests {
     fn re_renders_as_suffix_and_keeps_own_seq_leading() {
         let mut log = ChatLog::new();
         log.post("t6", "proto", "need GET /orders shape"); // #1
-        let m = log.post_re("t7", "mech", "status is an enum", vec!["t6".into()], Some(1));
+        let m = log.post_re(
+            "t7",
+            "mech",
+            "status is an enum",
+            vec!["t6".into()],
+            Some(1),
+        );
         // own #N stays leading authoritative; (re #N) is an additive suffix
         assert_eq!(m.line(), "#2 t7→t6 (re #1): status is an enum");
-        assert_eq!(m.frame("p1"), "[chat p1 #2] t7→t6 (re #1): status is an enum");
+        assert_eq!(
+            m.frame("p1"),
+            "[chat p1 #2] t7→t6 (re #1): status is an enum"
+        );
     }
 
     #[test]
