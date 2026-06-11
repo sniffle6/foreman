@@ -354,12 +354,16 @@ git commit -m "Chat mentions: --to flag and wire-compatible ChatRequest.to"
 
 ---
 
-### Task 4: Delivery filter — `chat_broadcast` targets
+### Task 4: Targeted delivery — broadcast filter + server validation (one task, one commit)
 
 **Files:**
-- Modify: `src/wm.rs` (`chat_broadcast`, `chat_broadcast_in`, `drain_chat_posts`, `handle_ctrl` — call sites only; plus tests)
+- Modify: `src/wm.rs` (`chat_broadcast`, `chat_broadcast_in`, `validate_chat_targets` NEW, `chat_post`, `ChatOutcome`, `chat_dispatch`, `handle_ctrl`, `drain_chat_posts`, tests)
 
-- [ ] **Step 1: Write the failing test** (in `src/wm.rs` `mod tests`, modeled on `chat_broadcast_hits_members_only_excluding_sender` — reuse its pump/deadline pattern exactly; the DSR trap is real)
+The broadcast filter and the validation that produces targets are one behavior —
+splitting them would leave a dead parameter and signature churn between commits
+(grug-review finding, 2026-06-10).
+
+- [ ] **Step 1: Write the failing tests** (in `src/wm.rs` `mod tests`; the first is modeled on `chat_broadcast_hits_members_only_excluding_sender` — reuse its pump/deadline pattern exactly; the DSR trap is real)
 
 ```rust
 #[test]
@@ -410,64 +414,11 @@ fn chat_targeted_broadcast_hits_only_the_target() {
 }
 ```
 
-NOTE: this test calls `chat_post(sender, "go", &[])` with the Task 5 signature and uses `.0` on its result. Until Task 5 lands, write it as `wm.chat_post(sender, "go").unwrap()` and adjust in Task 5 — OR (preferred, fewer edits) implement Tasks 4+5 against the new signatures and accept that this test only compiles after both steps of THIS task are done. The plan takes the first route: use the current `chat_post(sender, "go")` here; Task 5 Step 3 updates this call site.
+(This test is written against the NEW `chat_post` signature implemented in
+Step 3 below — it compiles once the whole task's implementation lands, which is
+the point of the merged task.)
 
-- [ ] **Step 2: Run to verify failure**
-
-Run: `cargo test --lib wm::tests::chat_targeted_broadcast 2>&1 | Select-Object -Last 10`
-Expected: compile error — `chat_broadcast` takes 2 args.
-
-- [ ] **Step 3: Implement**
-
-`chat_broadcast` — add the parameter and the filter at the top of the window loop (doc comment gains one line: `targets: None = broadcast; Some(ids) = only those windows' member tabs; Some(&[]) injects nobody (a pure @you post)`):
-```rust
-    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str, targets: Option<&[WinId]>) {
-        for w in self.windows.iter_mut() {
-            if let Some(t) = targets
-                && !t.contains(&w.id)
-            {
-                continue;
-            }
-            // …existing body unchanged…
-```
-
-`chat_broadcast_in` passes through:
-```rust
-    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str, targets: Option<&[WinId]>) {
-        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
-            && let Content::Project(child) = &mut win.tabs[win.active].content
-        {
-            child.chat_broadcast(Some(from), framed, targets);
-        }
-    }
-```
-
-Call sites updated mechanically (real targets arrive in Tasks 5–6):
-- `handle_ctrl`: `self.chat_broadcast_in(pid, from, &framed, None);`
-- `drain_chat_posts`: `self.chat_broadcast(None, &framed, None);`
-- existing tests calling `chat_broadcast(...)`: append `, None`.
-
-- [ ] **Step 4: Run the full suite**
-
-Run: `cargo test 2>&1 | Select-Object -Last 5`
-Expected: all pass. The new PTY test takes a few seconds — normal.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/wm.rs
-git commit -m "Chat mentions: target filter on chat_broadcast (None = broadcast)"
-```
-
----
-
-### Task 5: Server validation + targeted post path
-
-**Files:**
-- Modify: `src/wm.rs` (`validate_chat_targets` NEW, `chat_post`, `ChatOutcome`, `chat_dispatch`, `handle_ctrl`, tests)
-
-- [ ] **Step 1: Write the failing tests** (in `src/wm.rs` `mod tests`)
-
+More failing tests, same step:
 ```rust
 #[test]
 fn targeted_post_validates_all_or_nothing_before_any_mutation() {
@@ -574,9 +525,36 @@ fn targeting_an_exited_member_errors() {
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --lib wm::tests::targeted 2>&1 | Select-Object -Last 10`
-Expected: compile errors (`chat_post` takes 2 args, returns `String`).
+Expected: compile errors (`chat_broadcast` takes 2 args; `chat_post` takes 2 args and returns `String`).
 
 - [ ] **Step 3: Implement**
+
+`chat_broadcast` — add the parameter and the filter at the top of the window loop (doc comment gains one line: `targets: None = broadcast; Some(ids) = only those windows' member tabs; Some(&[]) injects nobody (a pure @you post)`):
+```rust
+    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str, targets: Option<&[WinId]>) {
+        for w in self.windows.iter_mut() {
+            if let Some(t) = targets
+                && !t.contains(&w.id)
+            {
+                continue;
+            }
+            // …existing body unchanged…
+```
+
+`chat_broadcast_in` passes through:
+```rust
+    fn chat_broadcast_in(&mut self, pid: WinId, from: WinId, framed: &str, targets: Option<&[WinId]>) {
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
+            && let Content::Project(child) = &mut win.tabs[win.active].content
+        {
+            child.chat_broadcast(Some(from), framed, targets);
+        }
+    }
+```
+
+`drain_chat_posts` passes `None` for now (real human targets arrive in Task 5):
+`self.chat_broadcast(None, &framed, None);` — and existing tests calling
+`chat_broadcast(...)` append `, None`.
 
 New helper in `impl WindowManager` (near `chat_post`; `&mut self` because `Session::exited` polls):
 ```rust
@@ -675,9 +653,9 @@ New helper in `impl WindowManager` (near `chat_post`; `&mut self` because `Sessi
             }
 ```
 
-`handle_ctrl` Posted arm: destructure `targets` and pass `targets.as_deref()` to `chat_broadcast_in` (replacing Task 4's `None`).
+`handle_ctrl` Posted arm: destructure `targets` and pass `targets.as_deref()` to `chat_broadcast_in` (whose signature gained the param above).
 
-Update Task 4's test call site to `wm.chat_post(sender, "go", &[]).unwrap().0`, and the other existing `chat_post(` test callers (e.g. `chat_broadcast_hits_members_only_excluding_sender`, `first_post_emits_joined_before_the_post`, `chat_post_replies_ok_then_broadcasts` if it calls directly) the same way: add `, &[]` and take `.0` where they want the framed string.
+Update existing `chat_post(` test callers (e.g. `chat_broadcast_hits_members_only_excluding_sender`, `first_post_emits_joined_before_the_post`, `chat_post_replies_ok_then_broadcasts` if it calls directly): add `, &[]` and take `.0` where they want the framed string.
 
 - [ ] **Step 4: Run the full suite**
 
@@ -688,12 +666,12 @@ Expected: all pass.
 
 ```powershell
 git add src/wm.rs
-git commit -m "Chat mentions: all-or-nothing target validation; targeted post delivery"
+git commit -m "Chat mentions: targeted delivery — broadcast filter + all-or-nothing validation"
 ```
 
 ---
 
-### Task 6: Human input line — extraction with prose fallback
+### Task 5: Human input line — extraction with prose fallback
 
 **Files:**
 - Modify: `src/wm.rs` (`chat_post_human`, `drain_chat_posts`, tests)
@@ -742,7 +720,9 @@ Expected: compile error — `chat_post_human` returns `Option<String>`.
         if text.is_empty() {
             return None;
         }
-        let mentions = crate::chat::leading_mentions(text);
+        // effective_targets (not raw leading_mentions) for dedup parity with
+        // CLI posts — `@t2 @t2 go` must not frame `you→t2,t2`
+        let mentions = crate::chat::effective_targets(&[], text);
         let (to, resolved) = if mentions.is_empty() {
             (Vec::new(), None)
         } else {
@@ -784,7 +764,7 @@ git commit -m "Chat mentions: human input line targets via leading @, prose fall
 
 ---
 
-### Task 7: Docs — SKILL.md convention + epic
+### Task 6: Docs — SKILL.md convention + epic
 
 **Files:**
 - Modify: `.claude/skills/foreman-dispatch/SKILL.md`
@@ -873,7 +853,7 @@ git commit -m "Chat mentions: teach the dispatch skill; epic + spec status"
 
 ---
 
-### Task 8: Full verification (main session — needs the GUI)
+### Task 7: Full verification (main session — needs the GUI)
 
 - [ ] **Step 1: Full suite**
 
@@ -906,10 +886,11 @@ Expected: ~110+ passed, 0 failed.
 
 ## Self-review notes (already applied)
 
-- Spec coverage: §1→Task 3, §2→Task 3, §3→Task 2, §4→Task 1, §5→Task 5,
-  §6→Task 4, §7→Task 6, §8→Task 7, §9→Tasks 1–6 tests + Task 8 live verify.
+- Spec coverage: §1→Task 3, §2→Task 3, §3→Task 2, §4→Task 1, §5→Task 4,
+  §6→Task 4, §7→Task 5, §8→Task 6, §9→Tasks 1–5 tests + Task 7 live verify.
 - Untargeted byte-identity is regression-locked by Task 1 Step 1 (and v1's
   existing frame/line tests, which stay untouched and passing).
-- Type consistency: `chat_post` returns `(String, Option<Vec<WinId>>)` from
-  Task 5 on; Task 4 writes its test against the pre-change signature and Task
-  5 updates that call site (called out in both tasks).
+- Grug-reviewed 2026-06-10 (Fable 5): merged the original Tasks 4+5 (the
+  broadcast filter and its only producer are one behavior — the split left a
+  dead parameter and cross-task signature churn); human path uses
+  `effective_targets` for dedup parity with CLI posts.
