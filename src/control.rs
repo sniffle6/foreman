@@ -335,21 +335,78 @@ pub fn parse_chat_args(
     }
 }
 
+const HELP: &str = "\
+foreman — a desktop for running fleets of AI-agent terminals
+
+USAGE
+  foreman                                   launch the GUI (no arguments)
+  foreman open [flags] -- <command...>      spawn a command in a new visible terminal
+  foreman chat [flags] [--] <message...>    post to the project chat room
+  foreman chat [--project P] --history [N]  read the last N room lines (default 20)
+  foreman help | --help | -h                this text (also: open --help, chat --help)
+
+Subcommands talk to the RUNNING foreman instance over its control pipe; they
+print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
+unreachable), or 2 (bad arguments).
+
+ENVIRONMENT (injected into every foreman-spawned terminal)
+  FOREMAN=1            you are inside a foreman terminal
+  FOREMAN_EXE          path to this binary — dispatch via & $env:FOREMAN_EXE
+  FOREMAN_PROJECT_ID   your project (the default for open/chat)
+  FOREMAN_TERMINAL_ID  your terminal id (the chat sender; required to post)";
+
+const HELP_OPEN: &str = "\
+foreman open [--project P] [--title T] [--cwd D] -- <command...>
+
+Spawn <command...> in a new visible terminal of project P (default: your
+FOREMAN_PROJECT_ID, else the focused project). Everything after -- is passed
+per-argument; nothing is shell-interpreted. Reply on stdout:
+  {\"ok\":true,\"terminal\":\"tN\",\"project\":\"pN\"}
+Ids are assigned by foreman — record \"terminal\", it is how the worker is
+addressed in chat. The reply is NOT the command's output or result.
+A target that is a .cmd/.bat shim (npm installs) cannot receive newlines
+or \" in arguments — foreman refuses such dispatches loudly.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_CHAT: &str = "\
+foreman chat [--project P] [--to T]... [--re N] [--] <message...>
+foreman chat [--project P] --history [N]
+
+Post <message...> to project P's chat room (default: FOREMAN_PROJECT_ID), or
+read the last N lines (default 20). Flags come first; the first non-flag word
+starts the message. Posting requires FOREMAN_TERMINAL_ID (be inside a foreman
+terminal); --history works for any caller and never joins the room.
+  --to tN|you   deliver-interrupt only those members (repeatable); a leading
+                @tN/@you run in the message does the same
+  --re N        mark the post as a reply to room seq N
+  --            end flag parsing (post a message that starts with -)
+Replies: a post prints {\"ok\":true,\"seq\":N}; history prints line per line.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("open") => open_main(&args[1..]),
         Some("chat") => chat_main(&args[1..]),
+        Some("help" | "--help" | "-h") => {
+            println!("{HELP}");
+            0
+        }
         _ => {
             eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
-            eprintln!("       foreman chat [--project P] <message...>");
+            eprintln!("       foreman chat [--project P] [--to T]... [--re N] [--] <message...>");
             eprintln!("       foreman chat [--project P] --history [N]");
+            eprintln!("       foreman help");
             2
         }
     }
 }
 
 fn open_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_OPEN}");
+        return 0;
+    }
     let req = match parse_open_args(args, std::env::var("FOREMAN_PROJECT_ID").ok()) {
         Ok(r) => r,
         Err(e) => {
@@ -361,6 +418,11 @@ fn open_main(args: &[String]) -> i32 {
 }
 
 fn chat_main(args: &[String]) -> i32 {
+    // before env/parsing: help must work outside a foreman terminal
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_CHAT}");
+        return 0;
+    }
     let req = match parse_chat_args(
         args,
         std::env::var("FOREMAN_PROJECT_ID").ok(),
@@ -441,6 +503,27 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn help_prints_and_exits_zero_everywhere() {
+        // top level: --help / -h / help
+        assert_eq!(client_main(&s(&["--help"])), 0);
+        assert_eq!(client_main(&s(&["-h"])), 0);
+        assert_eq!(client_main(&s(&["help"])), 0);
+        // per verb, first argument — must work OUTSIDE a foreman terminal
+        // (no FOREMAN_* env), so the check precedes env reads and parsing
+        assert_eq!(client_main(&s(&["open", "--help"])), 0);
+        assert_eq!(client_main(&s(&["open", "-h"])), 0);
+        assert_eq!(client_main(&s(&["chat", "--help"])), 0);
+        assert_eq!(client_main(&s(&["chat", "-h"])), 0);
+    }
+
+    #[test]
+    fn help_is_not_swallowed_as_message_text() {
+        // a message that IS "--help" still posts via the -- escape
+        let req = parse_chat_args(&s(&["--", "--help"]), None, Some("t2".into())).unwrap();
+        assert_eq!(req.text.as_deref(), Some("--help"));
     }
 
     #[test]
