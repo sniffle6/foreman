@@ -187,8 +187,9 @@ directory is not on PATH inside spawned shells (e.g. PowerShell:
 
 One room per project. The log lives on the **project's** nested
 `WindowManager` as an `Rc<RefCell<ChatLog>>` — an in-memory
-append-only `Vec<ChatMsg>` where each message carries `seq`, `from`, and
-`text`. Seq starts at 1 and only grows (seq = `len + 1`). The log dies when
+append-only `Vec<ChatMsg>` where each entry carries `seq`, `from`, `name`
+(stamped at post time), `text`, `at`, a render-only mention target `to`, and
+a `kind` (post vs join/exit). Seq starts at 1 and only grows (seq = `len + 1`). The log dies when
 foreman exits; project IDs are runtime-scoped anyway.
 
 **Membership is a `chat_member: bool` on each `Tab`** (not `Win`):

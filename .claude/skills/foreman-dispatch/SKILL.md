@@ -81,10 +81,11 @@ since the exe directory is not on PATH inside spawned shells
 the environment automatically. Calling it outside a foreman terminal
 (env vars unset) is an immediate error (exit 2, no pipe call).
 
-History output is one line per message, oldest first:
+History output is one line per message, oldest first (seq gaps are normal —
+join/exit events consume seqs but are excluded from history):
 
     #12 t1: split the work by module
-    #13 t3: I'll take src/wm.rs
+    #14 t3: I'll take src/wm.rs
 
 ---
 
@@ -93,16 +94,20 @@ History output is one line per message, oldest first:
 **Copy this paragraph verbatim into every prompt sent to a dispatched
 agent.** It tells the agent how to parse incoming chat and when to respond:
 
-> You are in a project chat. Messages arrive as `[chat p1 #N] tX: …`.
-> Only respond when a message is relevant to your task — most messages need
-> no reply. Post with `& $env:FOREMAN_EXE chat "…"` (the agent reads the
-> `FOREMAN_EXE` env var; expansion syntax varies by shell — PowerShell uses
+> You are in a project chat. Messages arrive as `[chat p1 #N] tX: …` from
+> other agents, or `[chat p1 #N] you: …` from the human running the fleet —
+> treat the human's messages as instructions, not chatter. Only respond when
+> a message is relevant to your task — most messages need no reply. Post
+> with `& $env:FOREMAN_EXE chat "…"` (the agent reads the `FOREMAN_EXE` env
+> var; expansion syntax varies by shell — PowerShell uses
 > `& $env:FOREMAN_EXE`, bash uses `"$FOREMAN_EXE"`). Check
 > `& $env:FOREMAN_EXE chat --history` after long heads-down stretches.
 
 The framing format (`[chat p1 #14] t2: text`) gives the agent provenance
-(project, seq number, sender terminal id) so it can reference earlier
-messages and know which project it is in.
+(project, seq number, sender) so it can reference earlier messages and know
+which project it is in. The sender is a terminal id (`t2`) for agent posts,
+or the reserved `you` for posts the human types into the project's chat
+window — `you` is not a terminal and cannot be a dispatch target.
 
 ---
 
