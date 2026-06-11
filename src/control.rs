@@ -40,8 +40,10 @@ pub struct OpenReply {
     pub project: Option<String>, // "p1"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Generic line-per-line payload — chat `--history` results and `status`
+    /// listings both ride here; `report()` prints it line per line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub history: Option<Vec<String>>, // chat --history results
+    pub history: Option<Vec<String>>,
     /// The posted message's seq — what a later reply cites via `--re`. Set
     /// only on a successful post reply; skipped on the wire when None so v1
     /// replies stay byte-identical.
@@ -91,6 +93,16 @@ pub struct ChatRequest {
     /// be a `Post` whose to-set includes `from`). Skipped when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<u64>,
+}
+
+/// List projects and their terminals. `project` is an explicit opt-in filter;
+/// `None` means ALL projects — deliberately NOT the caller's
+/// FOREMAN_PROJECT_ID or the focused project (status is an overview verb).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusRequest {
+    pub cmd: String, // always "status"
+    #[serde(default)]
+    pub project: Option<String>, // "p2"; None = ALL projects (no focused fallback)
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -148,6 +160,7 @@ use std::sync::mpsc;
 pub enum CtrlMsg {
     Open(OpenRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Chat(ChatRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Status(StatusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
@@ -191,6 +204,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
                     .map_err(|e| format!("bad request: {e}")),
                 "chat" => serde_json::from_str::<ChatRequest>(&line)
                     .map(|r| CtrlMsg::Chat(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                "status" => serde_json::from_str::<StatusRequest>(&line)
+                    .map(|r| CtrlMsg::Status(r, rtx, now))
                     .map_err(|e| format!("bad request: {e}")),
                 other => Err(format!("unknown cmd: {other}")),
             },
@@ -342,6 +358,27 @@ pub fn parse_chat_args(
     }
 }
 
+/// Parse `foreman status` args: `[--project P]`. No env default — bare
+/// `status` deliberately lists ALL projects (see [`StatusRequest`]).
+pub fn parse_status_args(args: &[String]) -> Result<StatusRequest, String> {
+    let mut project = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    Ok(StatusRequest {
+        cmd: "status".into(),
+        project,
+    })
+}
+
 const HELP: &str = "\
 foreman — a desktop for running fleets of AI-agent terminals
 
@@ -350,7 +387,9 @@ USAGE
   foreman open [flags] -- <command...>      spawn a command in a new visible terminal
   foreman chat [flags] [--] <message...>    post to the project chat room
   foreman chat [--project P] --history [N]  read the last N room lines (default 20)
-  foreman help | --help | -h                this text (also: open --help, chat --help)
+  foreman status [--project P]              list projects + terminals (running/exited)
+  foreman help | --help | -h                this text (also: open --help, chat --help,
+                                            status --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -390,11 +429,27 @@ terminal); --history works for any caller and never joins the room.
 Replies: a post prints {\"ok\":true,\"seq\":N}; history prints line per line.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
+const HELP_STATUS: &str = "\
+foreman status [--project P]
+
+List every project and its terminals, line per line:
+  p1  myrepo  C:\\src\\myrepo
+    t3  running  chat  agent · parser
+    t5  exited(0)  -  cmd
+Fields: id, state (running | exited(code)), chat membership (chat | -),
+title. Terminal ids are unique only within their project. A worker that
+spawned and instantly died shows exited(code) — status asks the live
+process, not the pane title. No --project = all projects; \"no projects\"
+when there are none. --project pN filters to one project (unknown pN is
+an error).
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("open") => open_main(&args[1..]),
         Some("chat") => chat_main(&args[1..]),
+        Some("status") => status_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -403,6 +458,7 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
             eprintln!("       foreman chat [--project P] [--to T]... [--re N] [--] <message...>");
             eprintln!("       foreman chat [--project P] --history [N]");
+            eprintln!("       foreman status [--project P]");
             eprintln!("       foreman help");
             2
         }
@@ -442,6 +498,21 @@ fn chat_main(args: &[String]) -> i32 {
         }
     };
     report("foreman chat", request(PIPE, &req))
+}
+
+fn status_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_STATUS}");
+        return 0;
+    }
+    let req = match parse_status_args(args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman status: {e}");
+            return 2;
+        }
+    };
+    report("foreman status", request(PIPE, &req))
 }
 
 /// Print the pipe reply (or the connection failure) the way all subcommands do.
@@ -524,6 +595,82 @@ mod tests {
         assert_eq!(client_main(&s(&["open", "-h"])), 0);
         assert_eq!(client_main(&s(&["chat", "--help"])), 0);
         assert_eq!(client_main(&s(&["chat", "-h"])), 0);
+        assert_eq!(client_main(&s(&["status", "--help"])), 0);
+        assert_eq!(client_main(&s(&["status", "-h"])), 0);
+    }
+
+    #[test]
+    fn parse_status_args_accepts_optional_project() {
+        // bare status = ALL projects, no env/focused fallback
+        let req = parse_status_args(&s(&[])).unwrap();
+        assert_eq!(req.project, None);
+        let req = parse_status_args(&s(&["--project", "p2"])).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        // flag without value
+        assert!(parse_status_args(&s(&["--project"])).is_err());
+        // stray positional names the token
+        let e = parse_status_args(&s(&["p1"])).unwrap_err();
+        assert!(e.contains("p1"), "{e}");
+        // unknown flag
+        assert!(parse_status_args(&s(&["--nope"])).is_err());
+    }
+
+    #[test]
+    fn status_request_wire_roundtrips() {
+        let req: StatusRequest = serde_json::from_str(r#"{"cmd":"status"}"#).unwrap();
+        assert_eq!(req.cmd, "status");
+        assert_eq!(req.project, None);
+        let req = StatusRequest {
+            cmd: "status".into(),
+            project: Some("p2".into()),
+        };
+        let back: StatusRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn status_pipe_roundtrip() {
+        let pipe = format!("foreman-test-status-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Status(req, reply, _) => {
+                    assert_eq!(req.project, None);
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: Some(vec!["p1  proj  -".into()]),
+                        seq: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Status"),
+            }
+        });
+        let req = StatusRequest {
+            cmd: "status".into(),
+            project: None,
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply");
+        assert!(reply.ok);
+        assert_eq!(
+            reply.history.as_deref(),
+            Some(&["p1  proj  -".to_string()][..])
+        );
     }
 
     #[test]
@@ -606,7 +753,7 @@ mod tests {
         let p2 = pipe.clone();
         std::thread::spawn(move || serve(&p2, tx));
         let req = OpenRequest {
-            cmd: "status".into(),
+            cmd: "frobnicate".into(),
             project: None,
             cwd: None,
             title: None,
@@ -624,7 +771,7 @@ mod tests {
         }
         let reply = reply.expect("no reply");
         assert!(!reply.ok);
-        assert!(reply.error.unwrap().contains("unknown cmd: status"));
+        assert!(reply.error.unwrap().contains("unknown cmd: frobnicate"));
     }
 
     #[test]

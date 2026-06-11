@@ -1006,6 +1006,22 @@ impl WindowManager {
                     }
                 }
             }
+            CtrlMsg::Status(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(match self.status_dispatch(&req) {
+                    Ok(lines) => OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: Some(lines),
+                        seq: None,
+                    },
+                    Err(e) => OpenReply::err(e),
+                });
+            }
         }
     }
 
@@ -1086,6 +1102,69 @@ impl WindowManager {
             }
             _ => Err("chat needs exactly one of text/history".into()),
         }
+    }
+
+    /// Build the `status` listing: one header line per project window, one
+    /// line per terminal TAB inside it (`Content::Chat`/nested projects are
+    /// skipped). Merged tabs in one window share the window's `tN` id —
+    /// status emits one line per tab, duplicating the shared id, same
+    /// identity family as chat. `None` project = every desktop window whose
+    /// ACTIVE tab is a project (the same visibility rule as
+    /// `resolve_project`); a filter that doesn't resolve is an error, not an
+    /// empty list. Running/exited truth comes from `Session::exited()`
+    /// (try_wait on the live process), never from the `"  ·  exited (code)"`
+    /// title stamp — titles are cleaned with `display_name`.
+    fn status_dispatch(
+        &mut self,
+        req: &crate::control::StatusRequest,
+    ) -> Result<Vec<String>, String> {
+        let filter = match req.project.as_deref() {
+            Some(spec) => Some(self.resolve_project(Some(spec))?),
+            None => None,
+        };
+        let mut lines = Vec::new();
+        for w in self.windows.iter_mut() {
+            if let Some(pid) = filter
+                && w.id != pid
+            {
+                continue;
+            }
+            // title read (and detached) BEFORE the mutable content borrow
+            let name = display_name(&w.tabs[w.active].title).to_string();
+            let Content::Project(child) = &mut w.tabs[w.active].content else {
+                continue; // resolve_project guarantees this never skips a filtered pid
+            };
+            let cwd = child
+                .cwd
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".into());
+            lines.push(format!("p{}  {}  {}", w.id, name, cwd));
+            for win in child.windows.iter_mut() {
+                let wid = win.id;
+                for tab in win.tabs.iter_mut() {
+                    let Content::Terminal(s) = &mut tab.content else {
+                        continue;
+                    };
+                    let state = match s.exited() {
+                        Some(code) => format!("exited({code})"),
+                        None => "running".into(),
+                    };
+                    let member = if tab.chat_member { "chat" } else { "-" };
+                    lines.push(format!(
+                        "  t{}  {}  {}  {}",
+                        wid,
+                        state,
+                        member,
+                        display_name(&tab.title)
+                    ));
+                }
+            }
+        }
+        if filter.is_none() && lines.is_empty() {
+            lines.push("no projects".into());
+        }
+        Ok(lines)
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
@@ -4551,6 +4630,160 @@ mod tests {
             crate::control::CtrlMsg::Chat(chat_req(a, Some("late"), None), rtx, stale),
             &ctx,
         );
+        assert!(
+            rrx.try_recv().is_err(),
+            "stale request must be dropped unanswered (client already saw a timeout)"
+        );
+    }
+
+    // --- status verb: project/terminal listing over the control pipe ---
+
+    // A status message plus the receiver the pipe server would be holding.
+    fn status_msg(
+        project: Option<&str>,
+        sent: std::time::Instant,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::StatusRequest {
+            cmd: "status".into(),
+            project: project.map(str::to_string),
+        };
+        (crate::control::CtrlMsg::Status(req, rtx, sent), rrx)
+    }
+
+    #[test]
+    fn status_lists_projects_terminals_and_membership() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        let (msg, rrx) = status_msg(None, std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no status reply");
+        assert!(r.ok, "{:?}", r.error);
+        let lines = r.history.expect("status rides the history field");
+        assert_eq!(lines.len(), 3, "project header + two terminals: {lines:?}");
+        assert!(lines[0].starts_with("p1  proj"), "{}", lines[0]);
+        for (line, id) in [(&lines[1], a), (&lines[2], b)] {
+            assert!(
+                line.starts_with(&format!("  t{id}  running  chat")),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_reports_instantly_exited_terminal_with_code() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "exit 7".to_string(),
+        ];
+        let t = {
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
+            child.add_terminal_cmd(&argv, None, None, &ctx).unwrap()
+        };
+        // Poll with fresh Status requests until the child process has died
+        // and status reports the code — pumping keepalive so the startup DSR
+        // query can't park cmd.exe (the documented trap), and refreshing exit
+        // titles so the title-stamp path is exercised (display_name must
+        // strip it from the status line).
+        let want = format!("  t{t}  exited(7)  chat  agent · cmd.exe");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+                let Content::Project(child) = &mut win.tabs[win.active].content else {
+                    panic!()
+                };
+                for w in child.windows.iter_mut() {
+                    for tab in w.tabs.iter_mut() {
+                        if let Content::Terminal(s) = &mut tab.content {
+                            s.keepalive();
+                        }
+                    }
+                }
+            }
+            d.refresh_exit_titles();
+            let (msg, rrx) = status_msg(None, std::time::Instant::now());
+            d.handle_ctrl(msg, &ctx);
+            let r = rrx.try_recv().expect("no status reply");
+            assert!(r.ok, "{:?}", r.error);
+            let lines = r.history.expect("lines");
+            let line = lines
+                .iter()
+                .find(|l| l.starts_with(&format!("  t{t}  ")))
+                .expect("the worker's line");
+            if *line == want {
+                // status asked the live process, and the title stamp
+                // ("  ·  exited (7)") never leaks into the listing
+                assert!(!line.contains("·  exited ("), "{line}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "status never reported exited(7); last line: {line}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn status_filters_by_project_and_rejects_unknown() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        // second project (p2) with one terminal of its own
+        let mut child2 = WindowManager::new();
+        child2.tag = Some("p2".to_string());
+        child2
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        d.push_win(2, "other".into(), rect, Content::Project(Box::new(child2)));
+
+        // --project p1 lists only p1's header + its two terminals
+        let (msg, rrx) = status_msg(Some("p1"), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no status reply");
+        assert!(r.ok, "{:?}", r.error);
+        let lines = r.history.expect("lines");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with("p1  "), "{}", lines[0]);
+        assert!(
+            lines.iter().all(|l| !l.starts_with("p2")),
+            "p2 must be filtered out: {lines:?}"
+        );
+
+        // unknown project is an error, not an empty list
+        let (msg, rrx) = status_msg(Some("p99"), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no error reply");
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("no such project: p99"));
+
+        // bare status on an empty desktop says so (ok, not an error)
+        let mut empty = WindowManager::new().as_desktop();
+        let (msg, rrx) = status_msg(None, std::time::Instant::now());
+        empty.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no reply");
+        assert!(r.ok);
+        assert_eq!(r.history.as_deref(), Some(&["no projects".to_string()][..]));
+    }
+
+    #[test]
+    fn stale_status_is_dropped() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        let stale = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = status_msg(None, stale);
+        d.handle_ctrl(msg, &ctx);
         assert!(
             rrx.try_recv().is_err(),
             "stale request must be dropped unanswered (client already saw a timeout)"
