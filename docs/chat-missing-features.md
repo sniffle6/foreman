@@ -53,6 +53,14 @@ filter-by-kind (#9) below exist to make steering *possible* once the room is bus
 ## Layer 1 — Transport (fix these first)
 
 ### 1. Handoff handshake — the assignee replies, and that reply IS the ack  ← the keystone
+
+> **Status 2026-06-11: partially built, then deliberately deferred.** `--re N`
+> threading and `OpenReply.seq` are live; the `--await-ack` registry surface
+> was built inert and removed (see the status note in
+> `contracts/chat-handshake-remaining-work.md` — recovery point `4607001`).
+> The social half — "the reply IS the ack" — works today via `--re` plus
+> worker-prompt norms; only the automated missing-ack backstop is deferred.
+
 A handoff is not done when the message is *sent*. It is done when the assignee
 *replies in chat*. The verification is a real chat response, not a silent flag.
 
