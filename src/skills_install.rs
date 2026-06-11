@@ -6,7 +6,8 @@
 //! is ever renamed or dropped, add its OLD directory name there so stale copies
 //! are deleted from every machine on next launch.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 const MANAGED_NOTICE: &str = "<!-- managed by foreman; edits are overwritten on launch -->";
 
@@ -28,6 +29,27 @@ fn resolve_skills_dir(claude_config: Option<&str>, userprofile: Option<&str>) ->
         _ => PathBuf::from(userprofile?).join(".claude"),
     };
     Some(base.join("skills"))
+}
+
+/// Write `<skills_dir>/<name>/SKILL.md` iff it is missing or its bytes differ
+/// from `rendered_content(raw)`. Returns `true` when it wrote. The write is
+/// atomic: a temp file in the same directory is renamed over the target, so a
+/// `claude` session scanning the dir never sees a half-written skill.
+#[allow(dead_code)]
+fn write_skill_if_changed(skills_dir: &Path, name: &str, raw: &str) -> io::Result<bool> {
+    let want = rendered_content(raw);
+    let dir = skills_dir.join(name);
+    let file = dir.join("SKILL.md");
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        if existing == want {
+            return Ok(false);
+        }
+    }
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join("SKILL.md.tmp");
+    std::fs::write(&tmp, want.as_bytes())?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -65,5 +87,54 @@ mod tests {
     fn resolve_none_when_nothing_usable() {
         assert!(resolve_skills_dir(None, None).is_none());
         assert!(resolve_skills_dir(Some(""), None).is_none());
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("foreman-skills-test-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn writes_when_missing_then_skips_when_current() {
+        let dir = temp("write-skip");
+        let raw = "# Hi\nbody";
+        assert!(write_skill_if_changed(&dir, "foreman-dispatch", raw).unwrap());
+        let file = dir.join("foreman-dispatch").join("SKILL.md");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            rendered_content(raw)
+        );
+        // up-to-date second run does not rewrite
+        assert!(!write_skill_if_changed(&dir, "foreman-dispatch", raw).unwrap());
+        // no leftover temp file
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("foreman-dispatch"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tmp: {leftovers:?}");
+    }
+
+    #[test]
+    fn rewrites_when_content_differs() {
+        let dir = temp("rewrite");
+        write_skill_if_changed(&dir, "foreman-chat", "old").unwrap();
+        assert!(write_skill_if_changed(&dir, "foreman-chat", "new").unwrap());
+        let file = dir.join("foreman-chat").join("SKILL.md");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            rendered_content("new")
+        );
+    }
+
+    #[test]
+    fn recreates_when_deleted() {
+        let dir = temp("recreate");
+        write_skill_if_changed(&dir, "foreman-chat", "x").unwrap();
+        std::fs::remove_dir_all(dir.join("foreman-chat")).unwrap();
+        assert!(write_skill_if_changed(&dir, "foreman-chat", "x").unwrap());
+        assert!(dir.join("foreman-chat").join("SKILL.md").exists());
     }
 }
