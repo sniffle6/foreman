@@ -331,7 +331,15 @@ separate, undecided idea.
   (chat input, rename): `pump_commands` gates on
   `memory.focused().is_none()`. This is a global input-routing change,
   not chat-local — without it, Ctrl+B while typing a message would arm
-  command mode.
+  command mode. Flip side (live-verified): after posting, the input
+  keeps focus (multi-post flow), so chords stay dead until Escape or a
+  click elsewhere — typing-mode vs command-mode, like the rename field.
+  Escape both defocuses AND clears the draft (one keypress does both;
+  accepted).
+- **NEW divider can sit above your own just-typed post** — the watermark
+  only advances on focus loss, and your post arrives while the viewer is
+  focused. Spec-correct, mildly odd; revisit only if it grates (would
+  need own-post special-casing).
 - **Esc-clear is `lost_focus` + Escape, not `has_focus` + Escape:** egui
   defocuses the field at frame start on Escape (`Focus::begin_pass`), so
   `has_focus()` is already false by the time the arm runs.

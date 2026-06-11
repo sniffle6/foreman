@@ -361,10 +361,17 @@ impl Content {
                         let dot = if r.exited { BORDER } else { CHAT_LIVE };
                         p.circle_filled(egui::pos2(row.min.x + 7.0, row.center().y), 3.0, dot);
                         let name_col = if r.exited { DIM } else { chat_color(&r.id) };
+                        // The pane identity has name == id ("you") — a bare
+                        // label beats the silly-looking "you · you".
+                        let label = if r.name == r.id {
+                            r.name.clone()
+                        } else {
+                            format!("{} · {}", r.name, r.id)
+                        };
                         p.text(
                             egui::pos2(row.min.x + 16.0, row.center().y),
                             egui::Align2::LEFT_CENTER,
-                            format!("{} · {}", r.name, r.id),
+                            label,
                             egui::FontId::proportional(11.5),
                             name_col,
                         );
