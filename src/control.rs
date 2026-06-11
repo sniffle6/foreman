@@ -65,7 +65,8 @@ impl OpenReply {
 /// Project chat post or history read (spec: agent-group-chat §1). Exactly one
 /// of `text` (post) / `history` (read last N) must be set — the client
 /// enforces this; the server treats `history` as the discriminator. `from` is
-/// the sender's own terminal id from its env. As with `open`, this is a
+/// the sender's own terminal id from its env: required to post, optional and
+/// ignored on history reads (any caller may read). As with `open`, this is a
 /// guardrail against confused agents, NOT a security boundary — any local
 /// process can speak to the pipe and claim any `from`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -73,7 +74,8 @@ pub struct ChatRequest {
     pub cmd: String, // always "chat"
     #[serde(default)]
     pub project: Option<String>, // "p1"; None = focused project
-    pub from: String, // "t2"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>, // "t2"; posts always carry it
     /// Delivery targets from `--to` flags (mentions spec §1). Inline leading-@
     /// mentions are NOT carried here — they ride in `text` and the server
     /// extracts them. Empty = no explicit targets; skipped on the wire so
@@ -240,7 +242,6 @@ pub fn parse_chat_args(
     default_project: Option<String>,
     self_terminal: Option<String>,
 ) -> Result<ChatRequest, String> {
-    let from = self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
     let mut project = default_project;
     let mut history: Option<usize> = None;
     let mut to: Vec<String> = Vec::new();
@@ -302,6 +303,10 @@ pub fn parse_chat_args(
     }
     match (words.is_empty(), history) {
         (false, None) => {
+            // posting needs a sender identity; reading history does not
+            let from = Some(
+                self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?,
+            );
             let text = words.join(" ");
             Ok(ChatRequest {
                 cmd: "chat".into(),
@@ -323,7 +328,9 @@ pub fn parse_chat_args(
             Ok(ChatRequest {
                 cmd: "chat".into(),
                 project,
-                from,
+                // include the sender when available, omit otherwise — history
+                // works for any caller (FOREMAN_TERMINAL_ID not required)
+                from: self_terminal,
                 to: Vec::new(),
                 text: None,
                 history: Some(n),
@@ -677,7 +684,7 @@ mod tests {
             r#"{"cmd":"chat","project":"p1","from":"t2","text":"taking the parser"}"#,
         )
         .unwrap();
-        assert_eq!(req.from, "t2");
+        assert_eq!(req.from.as_deref(), Some("t2"));
         assert_eq!(req.text.as_deref(), Some("taking the parser"));
         assert_eq!(req.history, None);
         let s = serde_json::to_string(&req).unwrap();
@@ -716,7 +723,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.project.as_deref(), Some("p1"));
-        assert_eq!(req.from, "t2");
+        assert_eq!(req.from.as_deref(), Some("t2"));
         assert_eq!(req.text.as_deref(), Some("taking the parser"));
         assert_eq!(req.history, None);
         // history with explicit N
@@ -777,6 +784,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_chat_args_history_allows_missing_terminal_id() {
+        // HELP_CHAT promises "--history works for any caller" — no terminal id needed
+        let req = parse_chat_args(&s(&["--history"]), None, None).unwrap();
+        assert_eq!(req.history, Some(20));
+        assert_eq!(req.from, None);
+        // inside a terminal, history still carries the sender
+        let req = parse_chat_args(&s(&["--history"]), None, Some("t2".into())).unwrap();
+        assert_eq!(req.from.as_deref(), Some("t2"));
+        // posting still requires the terminal id
+        assert!(parse_chat_args(&s(&["hi"]), None, None).is_err());
+    }
+
+    #[test]
+    fn chat_history_request_is_wire_compatible_without_from() {
+        // a from-less history request serializes with no "from" key at all
+        let req = parse_chat_args(&s(&["--history"]), None, None).unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"from\""), "{json}");
+        // a v1 post (from always present) still parses with from set
+        let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hi"}"#;
+        let req: ChatRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.from.as_deref(), Some("t2"));
+        // a from-less history request parses with from == None
+        let req: ChatRequest = serde_json::from_str(r#"{"cmd":"chat","history":5}"#).unwrap();
+        assert_eq!(req.from, None);
+        assert_eq!(req.history, Some(5));
+    }
+
+    #[test]
     fn chat_pipe_roundtrip() {
         let pipe = format!("foreman-test-chat-{}", std::process::id());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -785,7 +821,7 @@ mod tests {
         std::thread::spawn(move || {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
                 CtrlMsg::Chat(req, reply, _) => {
-                    assert_eq!(req.from, "t2");
+                    assert_eq!(req.from.as_deref(), Some("t2"));
                     assert_eq!(req.text.as_deref(), Some("hello"));
                     let _ = reply.send(OpenReply {
                         ok: true,
@@ -802,7 +838,7 @@ mod tests {
         let req = ChatRequest {
             cmd: "chat".into(),
             project: Some("p1".into()),
-            from: "t2".into(),
+            from: Some("t2".into()),
             to: Vec::new(),
             text: Some("hello".into()),
             history: None,

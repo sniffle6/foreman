@@ -1069,7 +1069,12 @@ impl WindowManager {
         match (&req.text, req.history) {
             (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
             (Some(text), None) => {
-                let from = term_id(&req.from)?;
+                // history reads are anonymous; a post must name its sender
+                let from = term_id(
+                    req.from
+                        .as_deref()
+                        .ok_or("posting requires a sender (FOREMAN_TERMINAL_ID)")?,
+                )?;
                 let (framed, targets, seq) = child.chat_post_re(from, text, &req.to, req.re)?;
                 Ok(ChatOutcome::Posted {
                     pid,
@@ -4351,7 +4356,7 @@ mod tests {
         crate::control::ChatRequest {
             cmd: "chat".into(),
             project: Some("p1".into()),
-            from: format!("t{from}"),
+            from: Some(format!("t{from}")),
             to: Vec::new(),
             text: text.map(str::to_string),
             history,
@@ -4472,6 +4477,67 @@ mod tests {
         assert!(
             !w.tabs[w.active].chat_member,
             "reading history must not join the room"
+        );
+    }
+
+    #[test]
+    fn chat_history_works_without_from_and_post_without_from_errors() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        // seed one post so history has a line
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(
+                chat_req(a, Some("hi"), None),
+                rtx,
+                std::time::Instant::now(),
+            ),
+            &ctx,
+        );
+        assert!(rrx.try_recv().expect("post reply").ok);
+        let snapshot = |d: &WindowManager| {
+            let win = d.windows.iter().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &win.tabs[win.active].content else {
+                panic!()
+            };
+            let members: Vec<bool> = child
+                .windows
+                .iter()
+                .flat_map(|w| w.tabs.iter().map(|t| t.chat_member))
+                .collect();
+            (child.chat.borrow().msgs().len(), members)
+        };
+        let before = snapshot(&d);
+        // history with from: None — must succeed (any caller may read)
+        let mut req = chat_req(a, None, Some(5));
+        req.from = None;
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(req, rtx, std::time::Instant::now()),
+            &ctx,
+        );
+        let r = rrx.try_recv().expect("no history reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.history.as_deref().map(|h| h.len()), Some(1));
+        // post with from: None — refused loudly, nothing mutated
+        let mut req = chat_req(a, Some("hi"), None);
+        req.from = None;
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Chat(req, rtx, std::time::Instant::now()),
+            &ctx,
+        );
+        let r = rrx.try_recv().expect("no post reply");
+        assert!(!r.ok);
+        let e = r.error.unwrap();
+        assert!(
+            e.contains("sender") && e.contains("FOREMAN_TERMINAL_ID"),
+            "{e}"
+        );
+        assert_eq!(
+            snapshot(&d),
+            before,
+            "failed from-less post must not append or change membership"
         );
     }
 
