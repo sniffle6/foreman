@@ -56,7 +56,9 @@ and pass the variable — this is the entire quoting story:
 - The reply JSON (`{"ok":true,"terminal":"t3","project":"p1"}`) gives the new
   terminal's id — **ids are assigned by foreman; you cannot pick or predict
   them.** It is NOT the worker's result: fire-and-watch, do not poll. Tell
-  the user the agent is running and where.
+  the user the agent is running and where. Check on a worker with
+  `& $env:FOREMAN_EXE status` — it lists every terminal as running or
+  exited(code); never poll the pane.
 - A `-p` worker's scrolled-away transcript is recoverable at
   `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
 

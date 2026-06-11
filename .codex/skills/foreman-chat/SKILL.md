@@ -86,6 +86,6 @@ and both stop."
   Wait for the open reply and give the pane a moment before a kickoff post.
 - Sequence gaps in `--history` are normal; join/exit events consume sequence ids.
 - Avoid literal `"` in chat messages. Use `--` before dash-leading messages.
-- A worker cannot close its own pane. Done means it posts the done-signal and
-  idles; the human closes the pane.
+- A worker may close its own pane with & $env:FOREMAN_EXE close AFTER posting
+  its done-signal (close kills its process tree). The human closes anything left.
 - Steer or stop a runaway worker with a targeted post.

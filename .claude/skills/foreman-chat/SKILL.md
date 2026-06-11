@@ -92,9 +92,10 @@ and you both stop."
 
 - Membership: dispatched workers auto-join; any other terminal joins on its
   first post; `--history` never joins. `-p` workers can post but not receive.
-- Interactive workers never auto-exit, and a claude worker cannot close its
-  own pane — "done" means it posts the done-signal and goes idle; the human
-  closes panes. Steer or stop a runaway worker with a targeted post.
+- Interactive workers never auto-exit. A finished worker posts its done-signal,
+  then may close its OWN pane with & $env:FOREMAN_EXE close (kills its whole
+  process tree - the post must come first); the human closes whatever is left.
+  Steer or stop a runaway worker with a targeted post.
 - A post fired the same instant a worker spawns can be silently eaten by its
   shell's startup handshake (it stays in history). Don't front-load a kickoff
   post into the same second as a dispatch.
