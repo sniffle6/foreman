@@ -141,7 +141,8 @@ Status: **built** (2026-06-10).
 Agents running inside a foreman project can coordinate — discuss design,
 divide work, report results — in a shared **project chat room**. Posts are
 broadcast-injected into every other member's terminal as typed input (push
-delivery). A read-only chat subwindow lets the human watch the room.
+delivery). A chat subwindow — the dispatcher's desk — lets the human watch
+the room and post into it.
 
 ### Protocol
 
@@ -205,7 +206,7 @@ foreman exits; project IDs are runtime-scoped anyway.
 
 ### Delivery
 
-On a post the GUI thread:
+On a post via the pipe (`chat` verb) the GUI thread:
 
 1. Drops the request unexecuted if stale (same age check as `open`).
 2. Resolves the project, validates the request.
@@ -237,23 +238,105 @@ live-verified on ConPTY (2026-06-10): claude sessions honor the markers
 (multi-line lands as one input block), so the unconditional wrap is the
 recorded v1 decision.
 
-### Chat viewer window
+### Chat viewer window — the dispatcher's desk
 
-A read-only viewer any project can open to watch the room:
+Rebuilt 2026-06-10 from a bare `#N tX: text` tail into a window you run a
+fleet from. Spec:
+`docs/superpowers/specs/2026-06-10-chat-dispatcher-window-design.md`;
+committed visual reference: `_chat_mockup.html` (repo root).
 
-- **Leader+G** (default chord; data-driven like all other bindings, so the
-  user file merge keeps working).
-- **Singleton per project**: re-invoking the chord focuses the existing
-  window rather than opening a second one. If the window was minimized or
-  buried under another tab, the reopen resurfaces it (unminimizes and
-  makes the chat tab active) before focusing.
-- Closing the viewer window does not touch the log. The room is the log.
-- The window is a **viewer, not a member** — it renders the log directly
-  and is never injected into. It uses `Content::Chat(Rc<RefCell<ChatLog>>)`,
-  sharing the log pointer with the project manager.
-- Renders `#seq from: text` lines, newest at the bottom, auto-tailed to
-  fit the visible height. Updates live: posts arrive on the GUI thread,
-  which always calls `ctx.request_repaint()` after a chat dispatch.
+**Shape** — crew board left (~160 px), grouped log right, input line
+bottom, `chat · N live` count chip in the title bar at every size:
+
+- **Crew board:** every member tab, labeled by its live tab title. Live
+  members sort stalest-first by last-heard — the quiet ones float to the
+  top because they're who you check on. Ages are relative (`now`/`3m`/`1h`)
+  and go amber past 5 min (`STALE_AFTER`). Exited members sink to the
+  bottom, dimmed, age replaced by `exited` — they stay listed because their
+  `#N` references still resolve. Last-heard derives from the log (latest
+  entry of any kind, so a fresh dispatch shows its join age). Clicking a
+  row focuses that member's terminal.
+- **Log:** consecutive posts from one sender group under a colored name
+  header with dim meta `tX · #N · HH:MM`; bodies soft-wrap, never clip.
+  Below ~480 px window width (`CHAT_BOARD_MIN_W`) the board hides and the
+  meta trims to `#N` — the seq always survives because agents cite it.
+  Stick-to-bottom scrolling: wheel-up pauses autoscroll and holds the
+  content position while new messages arrive; wheeling back to the tail
+  re-sticks.
+- **Mention markup is render-only** (olive left edge, `→ name` in the
+  meta, `@word` chips): nothing sets a message's `to` until v2 mention
+  delivery (`2026-06-10-chat-mentions-design.md`) lands. The viewer code
+  is written once.
+- Still true from v1: **Leader+G** (data-driven binding, user-file merge
+  keeps working), singleton per project (reopen unminimizes, re-activates
+  the chat tab, focuses), closing never touches the log, the viewer itself
+  is never injected into, and it updates live (chat dispatches end in
+  `ctx.request_repaint()`).
+
+**View state and frame discipline.** `Content::Chat` now carries a
+`ChatView` (`src/chat.rs`): the shared `Rc<RefCell<ChatLog>>` plus
+per-window view state — crew rows, NEW watermark, scroll/stick, input
+text, pending click/post. The owning project manager mutates at fixed
+points in the frame:
+
+- `refresh_chat_view` fills the crew rows and title chip **before** the
+  draw loop; the render arm only paints.
+- Crew clicks and input submissions are recorded **on the view** during
+  the draw and drained **after** `apply_acts` (`drain_chat_clicks` /
+  `drain_chat_posts`). Content never mutates sibling windows mid-draw —
+  and drain-after-acts is load-bearing: the same click that hits a crew
+  row also pushes `Act::Focus` for the chat window itself, so draining
+  last is what lets the member, not the viewer, end up focused.
+
+**System entries.** Joins (dispatch auto-join and join-on-first-post) and
+member exits (detected by the existing exit-title refresh path) are
+`ChatKind` log entries with seqs — `— architect (t5) joined —` in the
+viewer. They are NEVER injected into PTYs and are excluded from
+`--history`: agents asked for messages, not furniture. The resulting seq
+gaps in history output are intentional — seqs exist to be cited, not to
+be dense.
+
+**NEW divider.** An amber `NEW` rule above the first message whose seq
+exceeds the watermark. The watermark advances on the focus-LOSS edge
+only, so everything that arrived during a focused stretch stays marked
+until you look away and come back. It is created at the current tail —
+opening the window is the act of looking, so the backlog isn't "new". No
+unread counts, just the rule.
+
+**The human posts as `you`.** The input line appends under the reserved
+sender id `you` (can never collide with a `tX`) and broadcasts to **all**
+member tabs — there is no sender terminal to exclude. The framing
+`[chat p1 #N] you: text` comes free from the frozen `frame()`; the
+protocol is untouched. The `you` crew row sits between the live members
+and the exited — it's your seat, not fleet status — and never counts
+toward the live chip. Enter posts and keeps focus (multi-post sessions
+are the norm); Esc clears.
+
+**Names.** Display names are stamped into the message at post time from
+the sender's tab title (blank falls back to the id), so retitling a
+window later never rewrites history. Injection framing still uses the
+bare `tX` — unchanged protocol; real names in the framing stay a
+separate, undecided idea.
+
+**Viewer gotchas:**
+
+- **Crew identity is the hosting window id** (`term_tag(w.id)`): member
+  tabs merged into one window share an id and a last-heard. Same
+  staleness family as terminal-id resolution everywhere else. Stale click
+  targets (window closed, tab merged away) are silent no-ops.
+- **The title chip clobbers a manual rename** of the chat tab every
+  frame — accepted; the chip IS the title.
+- **Leader is now dormant while any egui widget holds keyboard focus**
+  (chat input, rename): `pump_commands` gates on
+  `memory.focused().is_none()`. This is a global input-routing change,
+  not chat-local — without it, Ctrl+B while typing a message would arm
+  command mode.
+- **Esc-clear is `lost_focus` + Escape, not `has_focus` + Escape:** egui
+  defocuses the field at frame start on Escape (`Focus::begin_pass`), so
+  `has_focus()` is already false by the time the arm runs.
+- **Scaling:** the viewer rebuilds blocks and galleys every frame. Fine
+  at current log sizes; needs a dirty flag / galley cache when logs get
+  long.
 
 ### Gotchas
 
@@ -306,6 +389,10 @@ A read-only viewer any project can open to watch the room:
   control channel each frame and route to the desktop `WindowManager`.
 - `src/wm.rs` — `handle_ctrl` (drain: stale-drop → project → spawn → reply,
   with orphaned-spawn undo), `add_terminal_cmd`, project resolution, env
-  injection, exited-title refresh.
+  injection, exited-title refresh; chat post/broadcast paths, viewer render
+  arm, `refresh_chat_view` / `drain_chat_clicks` / `drain_chat_posts`.
+- `src/chat.rs` — pure chat model, testable without egui: `ChatLog` /
+  `ChatMsg` / `ChatKind`, crew rows + sort, `ChatView` (per-window viewer
+  state), `build_blocks` (paint-order flatten).
 - `src/terminal.rs` — command sessions (vs shell sessions), env injection,
   exited-state title.
