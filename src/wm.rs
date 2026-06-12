@@ -67,8 +67,6 @@ const MIN_TILE: f32 = 120.0; // smallest a tiled pane may shrink to when draggin
 const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
 const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 const SNAP_GAP: f32 = 0.0; // inset of zones from the area edge; 0 = windows tile edge-to-edge
-const TOP_HOLD: f64 = 0.4; // hold in the top zone this long (s) → escalate to maximize
-const GROW_LEAD: f64 = 0.25; // overlay grows top-half → full over the last GROW_LEAD secs
 
 // A cardinal direction for directional focus / snap commands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
@@ -92,36 +90,6 @@ pub(crate) enum Zone {
     Br,
 }
 
-// pointer position as a fraction of the area → target zone (ports `detectZone`).
-fn detect_zone(fx: f32, fy: f32) -> Option<Zone> {
-    const T: f32 = 0.085; // edge band
-    const C: f32 = 0.22; // corner band on the cross axis
-    if fy < T {
-        if fx < C {
-            return Some(Zone::Tl);
-        }
-        if fx > 1.0 - C {
-            return Some(Zone::Tr);
-        }
-        return Some(Zone::Top); // holding here escalates to Max (see resolve_zone)
-    }
-    if fy > 1.0 - T {
-        if fx < C {
-            return Some(Zone::Bl);
-        }
-        if fx > 1.0 - C {
-            return Some(Zone::Br);
-        }
-        return Some(Zone::Bottom);
-    }
-    if fx < T {
-        return Some(Zone::Left);
-    }
-    if fx > 1.0 - T {
-        return Some(Zone::Right);
-    }
-    None
-}
 
 // True once a dragged tab chip has left its window's titlebar far enough to count
 // as a drag-out (untab): well below/above the title row, or past either side edge.
@@ -178,39 +146,6 @@ fn interior_edges(zone: Zone) -> (bool, bool, bool, bool) {
         Zone::Bl => (false, true, true, false),
         Zone::Br => (true, false, true, false),
         Zone::Max => (false, false, false, false),
-    }
-}
-
-fn lerp_rect(a: egui::Rect, b: egui::Rect, t: f32) -> egui::Rect {
-    egui::Rect::from_min_max(a.min + (b.min - a.min) * t, a.max + (b.max - a.max) * t)
-}
-
-// Given the raw drag zone and how long it's been held, return the zone to commit
-// plus the overlay rect to preview (local coords). The Top zone escalates to Max
-// after TOP_HOLD seconds, the overlay growing top-half → full over GROW_LEAD.
-fn resolve_zone(
-    raw: Option<Zone>,
-    held: f64,
-    asz: egui::Vec2,
-    split: egui::Vec2,
-) -> (Option<Zone>, Option<egui::Rect>) {
-    match raw {
-        Some(Zone::Top) => {
-            let p = (((held - (TOP_HOLD - GROW_LEAD)) / GROW_LEAD) as f32).clamp(0.0, 1.0);
-            let ov = lerp_rect(
-                zone_rect(Zone::Top, asz, split),
-                zone_rect(Zone::Max, asz, split),
-                p,
-            );
-            let committed = if held >= TOP_HOLD {
-                Zone::Max
-            } else {
-                Zone::Top
-            };
-            (Some(committed), Some(ov))
-        }
-        Some(z) => (Some(z), Some(zone_rect(z, asz, split))),
-        None => (None, None),
     }
 }
 
@@ -696,8 +631,6 @@ pub struct WindowManager {
     z: u64,
     focused: Option<WinId>,
     next: WinId,
-    dwell_zone: Option<Zone>, // raw zone the drag is currently hovering
-    dwell_start: f64,         // time (s) the current dwell_zone was entered
     // Fractional position (0..1) of the tiling dividers. Snapped windows lay out
     // from these, so dragging a shared edge moves the divider for every tile on it.
     split: egui::Vec2,
@@ -756,8 +689,6 @@ impl WindowManager {
             z: 1,
             focused: None,
             next: 1,
-            dwell_zone: None,
-            dwell_start: 0.0,
             split: egui::vec2(0.5, 0.5),
             cwd: None,
             tag: None,
@@ -2370,12 +2301,20 @@ impl WindowManager {
                 }
             }
             if dr.dragged() {
+                let popped =
+                    self.tree.contains(id) || self.zoomed == Some(id) || {
+                        let w = &self.windows[i];
+                        w.snap.is_some()
+                    };
+                if self.tree.contains(id) || self.zoomed == Some(id) {
+                    self.detach(id);
+                }
                 {
                     let w = &mut self.windows[i];
-                    // Dragging pops a snapped/maximized window back to floating. Like
-                    // double-click/restore, it returns to its pre-snap size; we re-anchor
+                    // Dragging tears a tiled/zoomed/snapped window out to floating. Like
+                    // double-click/restore, it returns to its pre-tile size; we re-anchor
                     // the restored rect under the cursor so the title stays grabbed.
-                    if w.snap.is_some() {
+                    if popped {
                         if let (Some(pr), Some(p)) = (w.prev.take(), ui.ctx().pointer_latest_pos())
                         {
                             let local = p - area.min.to_vec2();
@@ -2404,73 +2343,49 @@ impl WindowManager {
                 let over_target = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
                 if let Some(tgt) = over_target {
                     merge_hint = Some(tgt);
-                    self.dwell_zone = None;
-                } else {
-                    // --- snap: detect zone under the pointer (relative to area) ---
-                    // The top zone escalates to maximize the longer you hold it; the
-                    // overlay grows from top-half to full to telegraph the switch.
-                    if let Some(p) = pointer {
-                        let fx = (p.x - area.min.x) / asz.x;
-                        let fy = (p.y - area.min.y) / asz.y;
-                        let now = ui.input(|inp| inp.time);
-                        let raw = detect_zone(fx, fy);
-                        if raw != self.dwell_zone {
-                            self.dwell_zone = raw;
-                            self.dwell_start = now;
-                        }
-                        let held = now - self.dwell_start;
-                        let (_committed, overlay) = resolve_zone(raw, held, asz, self.split);
-                        if let Some(r) = overlay {
-                            snap_overlay = Some(r.translate(area.min.to_vec2()));
-                        }
+                } else if let Some(p) = pointer {
+                    // Tree drop hint: leaf edges split, leaf centers tab-merge,
+                    // area edge bands split the root. Painted like the old snap overlay.
+                    if let Some((_, hint)) = self.tree.drop_target(p, area, SNAP_GAP) {
+                        snap_overlay = Some(hint);
                     }
                 }
             }
             if dr.drag_stopped() {
                 let pointer = ui.ctx().pointer_latest_pos();
-                // A drop onto another window merges (tabs) onto it and wins over the
-                // snap: the dragged window is consumed, so we skip snapping entirely.
+                // A drop onto another window's titlebar merges (tabs) onto it and wins
+                // over the tree drop: the dragged window is consumed entirely.
                 let merge_dst = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
                 if let Some(dst_i) = merge_dst {
                     let dst = self.windows[dst_i].id;
                     acts.push(Act::Merge { src: id, dst });
                 } else if let Some(p) = pointer {
-                    // commit the snap on release, applying the hold-to-maximize escalation
-                    let fx = (p.x - area.min.x) / asz.x;
-                    let fy = (p.y - area.min.y) / asz.y;
-                    let now = ui.input(|inp| inp.time);
-                    let raw = detect_zone(fx, fy);
-                    let held = if raw == self.dwell_zone {
-                        now - self.dwell_start
-                    } else {
-                        0.0
-                    };
-                    let (committed, _) = resolve_zone(raw, held, asz, self.split);
-                    if let Some(zone) = committed {
-                        // If another window already holds this zone, tab onto it
-                        // instead of stacking a second window in the same slot
-                        // (mirrors `snap_or_tab` / the keyboard snap path). Deferred
-                        // as a merge — like the titlebar-drop path above — so we
-                        // never remove a window mid-render and invalidate `order`.
-                        let occupant = self
-                            .windows
-                            .iter()
-                            .find(|w| w.id != id && w.snap == Some(zone))
-                            .map(|w| w.id);
-                        if let Some(dst) = occupant {
-                            acts.push(Act::Merge { src: id, dst });
-                        } else {
-                            let split = self.split;
-                            let w = &mut self.windows[i];
-                            // remember the free-floating rect so restore/un-snap works
-                            w.prev = Some(w.rect);
-                            w.snap = Some(zone);
-                            w.rect = zone_rect(zone, asz, split);
-                            scr = w.rect.translate(area.min.to_vec2());
+                    if let Some((target, _)) = self.tree.drop_target(p, area, SNAP_GAP) {
+                        match target {
+                            crate::layout::DropTarget::Tab(dst) => {
+                                acts.push(Act::Merge { src: id, dst });
+                            }
+                            crate::layout::DropTarget::Split(t, side) => {
+                                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                                    if w.prev.is_none() {
+                                        w.prev = Some(w.rect);
+                                    }
+                                }
+                                self.tree.insert_split(t, id, side);
+                            }
+                            crate::layout::DropTarget::Root(side) => {
+                                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                                    if w.prev.is_none() {
+                                        w.prev = Some(w.rect);
+                                    }
+                                }
+                                self.tree.insert_root(id, side);
+                            }
                         }
+                        // Rect refits from the tree next frame (one frame at the drop
+                        // position — invisible at 60fps; intentionally no immediate set).
                     }
                 }
-                self.dwell_zone = None;
             }
 
             let title_rect = egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H));
