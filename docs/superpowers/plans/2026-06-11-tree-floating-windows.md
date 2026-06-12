@@ -24,7 +24,7 @@
 
 ## Branch / worktree
 
-Executing on branch `feature/tiling-tree` in the worktree `.claude/worktrees/tiling-tree`, based on `feature/agent-dispatch` HEAD (`0d8e580`) — NOT `main`: main lacks the chat/dispatch wm.rs code this plan's anchors were read from, and basing on main would have made the eventual merge a conflict factory. This branch must land after (or be merged into) `feature/agent-dispatch`. The user's uncommitted WIP in the main checkout (`src/terminal.rs`, `docs/terminal-selection.md`) is not included — **do not touch it**.
+Executing on branch `feature/tiling-tree` in the MAIN checkout (`H:\claude code\foreman`). History: `feature/agent-dispatch` was fast-forward-merged into `main` (user decision, 2026-06-11) and this branch sits directly on the merged `main` (`0d8e580`), so Serena's project root and the working tree now agree — Serena symbol tools are safe to use again. The earlier worktree (`.claude/worktrees/tiling-tree`) is retired; its directory may linger until file locks release (gitignored, harmless). `docs/terminal-selection.md` remains untracked pending the selection-rewrite recovery.
 
 ## Build / test loop (Windows, PowerShell, GNU toolchain)
 
