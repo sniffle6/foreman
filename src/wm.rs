@@ -3242,7 +3242,11 @@ impl WindowManager {
         rows.push((String::new(), String::new()));
         rows.push((
             "  Drag".into(),
-            "drag a header \u{2014} leaf edges split, centers stack as tabs, screen edges make a column".into(),
+            "tiled: tear out, hints place it \u{2014} floating: free move".into(),
+        ));
+        rows.push((
+            "  Shift+Drag".into(),
+            "floating window shows drop hints and snaps into the tree".into(),
         ));
         rows.push((String::new(), String::new()));
         rows.push((

@@ -38,14 +38,21 @@ Keyboard (after the `Ctrl+B` leader):
 
 Mouse:
 
-- **Drag a header** of a tiled window → it tears out of the tree instantly
-  (siblings absorb the space) and floats under the cursor.
-- **While dragging any window**, amber hints show what a drop would do:
+- **Float/tile toggle button** in every header, left of minimize (projects
+  keep `+` to its left). The icon shows the current state: 2×2 grid = tiled,
+  two offset squares = floating. Clicking toggles with the same semantics as
+  leader `F` — popping back in enters the tree at the leaf under the
+  window's center.
+- **Drag a tiled window's header** → it tears out of the tree instantly
+  (siblings absorb the space) and floats under the cursor. A tear-out drag
+  keeps its amber drop hints for the whole gesture:
   - edge half of a tile → split that tile on that side
   - center of a tile → merge as a tab onto that window
   - thin band at the area edge → split the whole root (full row/column)
   - drop on another window's **titlebar** → tab-merge (wins over tree hints)
-  - drop anywhere else → stays floating
+- **Drag a floating window's header** → pure free move: no hints, nothing
+  happens on drop. Hold **Shift** at any point during the drag to enable the
+  full drop semantics above (hints light up while held).
 - **Drag a shared edge** between tiles → moves that divider (adjusts tree
   ratios; clamped so no tile drops below 10% of its split). Dragging the
   OUTER edge of a tile does nothing — tear-out lives on the header drag.
@@ -77,6 +84,14 @@ with multiple tabs IS a tabbed container sitting in the layout.
   test in `layout.rs`).
 - **At startup** the longer-axis rule sees pre-layout spawn rects (580×380 →
   "wide"), so early windows split `Right`. At runtime it uses live rects.
+- **Drop gating keys off where the drag STARTED**
+  (`WindowManager.drag_from_tree`), not current tree membership — after
+  tear-out the window is already floating, but that drag keeps its hints. A
+  per-frame `tree.contains` check would kill the hints one frame into every
+  tear-out.
+- **A tab dragged off a stack** becomes a new floating window mid-gesture
+  (`Act::Untab` + grab), so the rest of that drag is a free move — hold
+  Shift to snap it into the tree in the same gesture.
 
 ## Key files
 
