@@ -745,9 +745,34 @@ impl WindowManager {
         Some(id)
     }
 
+    /// Default placement for a freshly created window: split the anchor leaf
+    /// (the previously-focused tiled window) along its longer axis; with no
+    /// tiled anchor, enter at the root. The new window's floating rect is kept
+    /// in `prev` for a later tear-out.
+    pub(crate) fn tile_new(&mut self, id: WinId, anchor: Option<WinId>) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            if w.prev.is_none() {
+                w.prev = Some(w.rect);
+            }
+        }
+        match anchor.filter(|a| *a != id && self.tree.contains(*a)) {
+            Some(a) => {
+                let r = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == a)
+                    .map(|w| w.rect)
+                    .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area));
+                let side = if r.width() >= r.height() { Dir::Right } else { Dir::Down };
+                self.tree.insert_split(a, id, side);
+            }
+            None => self.tree.insert_root(id, Dir::Right),
+        }
+    }
+
     /// Add a new project window. It starts as a sandbox containing one terminal.
     /// TODO(status line): show repo / branch on the project titlebar.
-    pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) {
+    pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) -> WinId {
         let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
         let title = cwd
             .file_name()
@@ -757,8 +782,11 @@ impl WindowManager {
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{}", id));
         child.cwd = Some(cwd);
-        child.add_terminal(shell, ctx);
+        if let Some(tid) = child.add_terminal(shell, ctx) {
+            child.tile_new(tid, None);
+        }
         self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        id
     }
 
     /// Env injected into every PTY this manager spawns (spec: agent-dispatch).
@@ -1150,6 +1178,7 @@ impl WindowManager {
         // was; the window still spawns on top visually (z from next_slot).
         let prev_focus = self.focused;
         self.push_win(id, title, rect, Content::Terminal(s));
+        self.tile_new(id, prev_focus);
         // Dispatched agents auto-join the project chat room (spec §2) — and
         // the transcript records it.
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -1672,7 +1701,10 @@ impl WindowManager {
                         }
                         Command::Rename => child.begin_rename(),
                         Command::NewTerm => {
-                            child.add_terminal(Shell::PowerShell, &ctx);
+                            let anchor = child.focused;
+                            if let Some(nid) = child.add_terminal(Shell::PowerShell, &ctx) {
+                                child.tile_new(nid, anchor);
+                            }
                         }
                         Command::LastTerm => child.toggle_last(),
                         Command::TabCycle => child.cycle_tab(true),
@@ -3025,7 +3057,10 @@ impl WindowManager {
                 Act::AddTerm(id, shell) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         if let Content::Project(wm) = w.active_content() {
-                            wm.add_terminal(shell, ctx);
+                            let anchor = wm.focused;
+                            if let Some(nid) = wm.add_terminal(shell, ctx) {
+                                wm.tile_new(nid, anchor);
+                            }
                         }
                     }
                     self.focus(id);
@@ -3083,7 +3118,11 @@ impl WindowManager {
             match picker.show(ui) {
                 Outcome::Pending => self.picker = Some(picker),
                 Outcome::Cancelled => {}
-                Outcome::Accepted(path) => self.add_project(Shell::PowerShell, path, ctx),
+                Outcome::Accepted(path) => {
+                    let anchor = self.focused;
+                    let nid = self.add_project(Shell::PowerShell, path, ctx);
+                    self.tile_new(nid, anchor);
+                }
             }
         }
 
@@ -5193,5 +5232,26 @@ mod tests {
         wm.toggle_zoom(b);
         let after = wm.windows.iter().find(|w| w.id == b).unwrap().rect;
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn tile_new_splits_the_focused_leaf_else_roots() {
+        let mut wm = WindowManager::new();
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        let a = push(&mut wm, "A");
+        // no tiled anchor + empty tree → sole root leaf
+        wm.tile_new(a, None);
+        assert_eq!(wm.tree.leaves(), vec![a]);
+        // tiled anchor → new window splits the anchor's slot
+        let b = push(&mut wm, "B");
+        wm.tile_new(b, Some(a));
+        assert_eq!(wm.tree.leaves().len(), 2);
+        assert!(wm.tree.contains(b));
+        // anchor not tiled (floating) and tree non-empty → enters at root level
+        let c = push(&mut wm, "C");
+        let d = push(&mut wm, "D"); // d stays floating, used as a non-tiled anchor
+        wm.tile_new(c, Some(d));
+        assert!(wm.tree.contains(c));
+        assert!(!wm.tree.contains(d));
     }
 }

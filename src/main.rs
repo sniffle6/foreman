@@ -315,7 +315,8 @@ impl eframe::App for App {
         if !self.started {
             // Desktop hosts project windows; each project is its own sandbox.
             let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            self.desktop.add_project(Shell::PowerShell, dir, &ctx);
+            let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
+            self.desktop.tile_new(nid, None);
             self.started = true;
         }
 
