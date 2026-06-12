@@ -76,20 +76,6 @@ pub enum Dir {
     Down,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Zone {
-    Max,
-    Left,
-    Right,
-    Top,
-    Bottom,
-    Tl,
-    Tr,
-    Bl,
-    Br,
-}
-
-
 // True once a dragged tab chip has left its window's titlebar far enough to count
 // as a drag-out (untab): well below/above the title row, or past either side edge.
 // Shared by the live drag-out path and the release fallback so both agree.
@@ -97,41 +83,6 @@ fn tab_drag_off(p: egui::Pos2, scr: egui::Rect) -> bool {
     (p.y - scr.min.y).abs() > TITLE_H * 1.5 || p.x < scr.min.x || p.x > scr.max.x
 }
 
-// target rect for a zone in LOCAL coords, given the manager's split ratios.
-// `split` is the fractional position (0..1) of the vertical (x) and horizontal
-// (y) tiling dividers, so adjacent snapped windows share a movable edge. With
-// split = (0.5, 0.5) this reduces to the old fixed half/quarter tiling.
-fn zone_rect(zone: Zone, area: egui::Vec2, split: egui::Vec2) -> egui::Rect {
-    let g = SNAP_GAP;
-    let (w, h) = (area.x, area.y);
-    let divx = w * split.x; // vertical divider x
-    let divy = h * split.y; // horizontal divider y
-    let lx = g; // left column x
-    let lw = (divx - g * 1.5).max(1.0); // left column width
-    let rx = divx + g * 0.5; // right column x
-    let rw = (w - divx - g * 1.5).max(1.0);
-    let ty = g; // top row y
-    let th = (divy - g * 1.5).max(1.0);
-    let by = divy + g * 0.5; // bottom row y
-    let bh = (h - divy - g * 1.5).max(1.0);
-    let fw = (w - g * 2.0).max(1.0);
-    let fh = (h - g * 2.0).max(1.0);
-    let (x, y, sw, sh) = match zone {
-        Zone::Max => (g, g, fw, fh),
-        Zone::Top => (g, ty, fw, th),
-        Zone::Bottom => (g, by, fw, bh),
-        Zone::Left => (lx, g, lw, fh),
-        Zone::Right => (rx, g, rw, fh),
-        Zone::Tl => (lx, ty, lw, th),
-        Zone::Tr => (rx, ty, rw, th),
-        Zone::Bl => (lx, by, lw, bh),
-        Zone::Br => (rx, by, rw, bh),
-    };
-    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(sw, sh))
-}
-
-// Compose a directional snap onto the current snap state, per-axis. A window snap
-// is a horizontal pin (left/right/none) × a vertical pin (top/bottom/none);
 
 pub enum Content {
     Terminal(Session),
@@ -526,8 +477,7 @@ pub struct Win {
     pub rect: egui::Rect, // local coords (origin = manager area.min)
     pub z: u64,
     pub minimized: bool,
-    pub snap: Option<Zone>, // Some => tiled/maximized: refit to area each frame
-    pub prev: Option<egui::Rect>, // floating rect to restore to when un-snapped
+    pub prev: Option<egui::Rect>, // floating rect to restore when un-tiled/un-zoomed
 }
 
 impl Win {
@@ -615,9 +565,6 @@ pub struct WindowManager {
     z: u64,
     focused: Option<WinId>,
     next: WinId,
-    // Fractional position (0..1) of the tiling dividers. Snapped windows lay out
-    // from these, so dragging a shared edge moves the divider for every tile on it.
-    split: egui::Vec2,
     /// Working directory new terminals in this manager spawn into. `None` on the
     /// desktop (process cwd); `Some` on a project, set when the project is created.
     cwd: Option<PathBuf>,
@@ -673,7 +620,6 @@ impl WindowManager {
             z: 1,
             focused: None,
             next: 1,
-            split: egui::vec2(0.5, 0.5),
             cwd: None,
             tag: None,
             chat: Rc::new(RefCell::new(crate::chat::ChatLog::new())),
@@ -724,7 +670,6 @@ impl WindowManager {
             rect,
             z: self.z,
             minimized: false,
-            snap: None,
             prev: None,
         });
         self.focused = Some(id);
@@ -1871,7 +1816,6 @@ impl WindowManager {
             rect: egui::Rect::from_min_size(origin, size),
             z: self.z,
             minimized: false,
-            snap: None,
             prev: None,
         });
         self.focus(new_id);
@@ -2268,10 +2212,7 @@ impl WindowManager {
                 } else if let Some(r) = placements.get(&w.id) {
                     w.rect = *r;
                 } else {
-                    match w.snap {
-                        Some(z) => w.rect = zone_rect(z, asz, self.split),
-                        None => clamp(&mut w.rect, asz),
-                    }
+                    clamp(&mut w.rect, asz);
                 }
             }
             let mut scr = self.windows[i].rect.translate(area.min.to_vec2());
@@ -2317,17 +2258,13 @@ impl WindowManager {
                 }
             }
             if dr.dragged() {
-                let popped =
-                    self.tree.contains(id) || self.zoomed == Some(id) || {
-                        let w = &self.windows[i];
-                        w.snap.is_some()
-                    };
-                if self.tree.contains(id) || self.zoomed == Some(id) {
+                let popped = self.tree.contains(id) || self.zoomed == Some(id);
+                if popped {
                     self.detach(id);
                 }
                 {
                     let w = &mut self.windows[i];
-                    // Dragging tears a tiled/zoomed/snapped window out to floating. Like
+                    // Dragging tears a tiled/zoomed window out to floating. Like
                     // double-click/restore, it returns to its pre-tile size; we re-anchor
                     // the restored rect under the cursor so the title stays grabbed.
                     if popped {
@@ -2344,7 +2281,6 @@ impl WindowManager {
                                 pr.size(),
                             );
                         }
-                        w.snap = None;
                     }
                     w.rect = w.rect.translate(dr.drag_delta());
                     clamp(&mut w.rect, asz);
@@ -2411,9 +2347,9 @@ impl WindowManager {
             );
 
             // --- paint window ---
-            // Snapped/maximized windows square their corners so they tile flush to
+            // Tiled/zoomed windows square their corners so they tile flush to
             // the area edges and to each other (rounded corners would leave gaps).
-            let cr = if is_tiled || self.zoomed == Some(id) || self.windows[i].snap.is_some() {
+            let cr = if is_tiled || self.zoomed == Some(id) {
                 egui::CornerRadius::ZERO
             } else {
                 egui::CornerRadius::same(6)
@@ -3383,7 +3319,6 @@ mod tests {
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
             z: wm.z,
             minimized: false,
-            snap: None,
             prev: None,
         });
         wm.focused = Some(id);
@@ -5253,5 +5188,20 @@ mod tests {
         wm.tile_new(c, Some(d));
         assert!(wm.tree.contains(c));
         assert!(!wm.tree.contains(d));
+    }
+
+    #[test]
+    fn closing_a_tiled_window_collapses_its_slot() {
+        let mut wm = WindowManager::new();
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.tree.insert_root(a, Dir::Right);
+        wm.tree.insert_root(b, Dir::Right);
+        wm.close(a);
+        assert_eq!(wm.tree.leaves(), vec![b]);
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
+        let p = wm.tree.layout(local, 8.0);
+        assert!((p[0].1.width() - (1000.0 - 16.0)).abs() < 0.5, "b expanded to full inner width");
     }
 }
