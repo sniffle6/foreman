@@ -1980,11 +1980,17 @@ impl WindowManager {
         self.focus(new_id);
     }
 
-    /// Toggle the focused window between tiled and floating. Un-tiling restores
-    /// the remembered floating rect; re-tiling enters the tree where the window
-    /// currently sits (the leaf under its center, split along its longer axis).
+    /// Toggle the focused window between tiled and floating (leader F / Ctrl+F).
     fn toggle_float(&mut self) {
-        let Some(id) = self.focused else { return };
+        if let Some(id) = self.focused {
+            self.toggle_float_for(id);
+        }
+    }
+
+    /// Toggle `id` between tiled and floating. Un-tiling restores the remembered
+    /// floating rect; re-tiling enters the tree where the window currently sits
+    /// (the leaf under its center, split along its longer axis). Focuses `id`.
+    fn toggle_float_for(&mut self, id: WinId) {
         if self.tree.contains(id) {
             self.detach(id);
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -3684,6 +3690,24 @@ mod tests {
 
         // Second toggle: floating → tiled again.
         wm.toggle_float();
+        assert!(wm.tree.contains(a), "a re-entered the tree");
+    }
+
+    #[test]
+    fn toggle_float_for_targets_an_unfocused_window_and_focuses_it() {
+        // The header button acts on the clicked window, not the focused one.
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        wm.tree.insert_root(a, Dir::Right); // a tiled, b floating
+        wm.focus(b);
+
+        wm.toggle_float_for(a);
+        assert!(!wm.tree.contains(a), "a detached from tree");
+        assert_eq!(wm.focused, Some(a), "toggle focuses the toggled window");
+
+        wm.toggle_float_for(a);
         assert!(wm.tree.contains(a), "a re-entered the tree");
     }
 
