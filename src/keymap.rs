@@ -35,6 +35,8 @@ pub enum Command {
     TabPrev,
     /// Open (or focus) the focused project's chat viewer window.
     OpenChat,
+    /// Toggle the focused terminal between tiled (in the layout tree) and floating.
+    TermFloat,
     // project (outer) level
     ProjFocus(Dir),
     ProjSnap(Dir),
@@ -42,6 +44,8 @@ pub enum Command {
     CloseProject,
     NewProject,
     LastProject,
+    /// Toggle the focused project between tiled and floating (desktop level).
+    ProjFloat,
     // global
     Help,
     OpenSettings,
@@ -69,6 +73,7 @@ impl Command {
             CloseProject,
             NewProject,
             LastProject,
+            ProjFloat,
             // Terminals
             TermFocus(Left),
             TermFocus(Down),
@@ -90,6 +95,7 @@ impl Command {
             TabCycle,
             TabPrev,
             OpenChat,
+            TermFloat,
             // Actions
             Help,
             OpenSettings,
@@ -100,11 +106,10 @@ impl Command {
     pub fn group(self) -> Group {
         use Command::*;
         match self {
-            ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject => {
-                Group::Projects
-            }
+            ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject
+            | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
-            | LastTerm | TabCycle | TabPrev | OpenChat => Group::Terminals,
+            | LastTerm | TabCycle | TabPrev | OpenChat | TermFloat => Group::Terminals,
             Help | OpenSettings => Group::Actions,
         }
     }
@@ -129,6 +134,7 @@ impl Command {
             CloseProject => "Close project",
             NewProject => "New project (picker)",
             LastProject => "Toggle last project",
+            ProjFloat => "Float / re-tile project",
             TermFocus(d) => match d {
                 Dir::Left => "Focus terminal left",
                 Dir::Down => "Focus terminal down",
@@ -152,6 +158,7 @@ impl Command {
             NewTerm => "New terminal",
             Rename => "Rename focused window",
             LastTerm => "Toggle last terminal",
+            TermFloat => "Float / re-tile terminal",
             TabCycle => "Next tab / last terminal",
             TabPrev => "Previous tab",
             OpenChat => "Open project chat",
@@ -512,6 +519,10 @@ impl Default for Keymap {
         // --- project chat viewer (agent-group-chat §4) ---
         t.insert(plain(K::G), OpenChat);
 
+        // --- float toggle: tiled ⇄ floating ---
+        t.insert(plain(K::F), TermFloat);
+        t.insert(ctrl(K::F), ProjFloat);
+
         // --- tab cycle / last-focused toggle ---
         // `Tab` cycles tabs in the focused stack, falling back to the last-focused
         // toggle when the focused window is not a stack (handled in `dispatch`).
@@ -728,6 +739,19 @@ mod tests {
     }
 
     #[test]
+    fn float_toggle_defaults_are_f_and_ctrl_f() {
+        let km = Keymap::default();
+        assert_eq!(
+            km.resolve(Chord::new(K::F, false, false, false)),
+            Some(Command::TermFloat)
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::F, true, false, false)),
+            Some(Command::ProjFloat)
+        );
+    }
+
+    #[test]
     fn tab_bindings_are_cycle_prev_and_last_project() {
         let km = Keymap::default();
         assert_eq!(
@@ -783,8 +807,9 @@ mod tests {
 
     #[test]
     fn unbound_chord_resolves_none() {
+        // `F` gained a default (TermFloat); `Y` remains genuinely unbound.
         let km = Keymap::default();
-        assert_eq!(km.resolve(Chord::new(K::F, false, false, false)), None);
+        assert_eq!(km.resolve(Chord::new(K::Y, false, false, false)), None);
     }
 
     #[test]
