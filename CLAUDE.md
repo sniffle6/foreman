@@ -18,6 +18,7 @@ Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Mi
 cargo build 2>&1 | Select-Object -Last 20
 cargo run            # debug
 cargo run --release  # the "is it fast" build
+cargo test           # unit tests (layout tree, wm, chat — no GUI needed)
 ```
 
 The GUI can't be seen from the terminal — to verify visually, run the exe and
@@ -67,6 +68,14 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   drop targets/divider resize.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
   selection/clipboard, key routing, grid render.
+- `src/control.rs` — the `foreman` CLI + IPC control plane: `foreman
+  open/chat/status/close` run from inside any foreman terminal talk to the GUI.
+  Terminals get `FOREMAN=1`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`,
+  `FOREMAN_TERMINAL_ID` injected so agents can dispatch and self-target.
+- `src/chat.rs` — per-project chat room model (append-only log, pure data).
+  Posts are injected into every member terminal's PTY as typed input (push,
+  not poll); dispatched terminals auto-join, others join on first post.
+  Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
 - `src/dirpicker.rs` — keyboard-driven project directory picker.
 - `src/keymap.rs` — data-driven leader-key bindings. Defaults live in
   `Keymap::default` (in code); a user file at `%APPDATA%\foreman\keybindings.json`
@@ -84,6 +93,8 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
 
 Subsystem docs: `docs/tiling-tree.md` (two-state windows + layout tree),
 `docs/project-directories.md`,
+`docs/epics/agent-dispatch-epic.md` (control CLI + chat room; known gaps in
+`docs/chat-missing-features.md`),
 `docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
 `docs/epics/window-tabbing-split-epic.md` (tab-stacks; zone parts superseded).
 (`docs/foreman.md` is older narrative notes — prefer HANDOFF.md on any conflict.)

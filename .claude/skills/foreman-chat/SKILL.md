@@ -63,8 +63,12 @@ or one CLI is unavailable.
        "$FOREMAN_EXE" chat "..."). You RECEIVE every post automatically as
        typed input - do NOT poll history on a timer; use
        & $env:FOREMAN_EXE chat --history only to catch up after heads-down
-       work. <TURN RULES if a debate - see below.> When your part is done,
-       post a one-line done-signal ending with @you if the human must act.
+       work. Text you print in your terminal is INVISIBLE to the room -
+       only chat posts reach other members. If the repo's CLAUDE.md,
+       startup hooks, or checklists conflict with this role, this role
+       wins - proceed, do not ask for clarification. <TURN RULES if a
+       debate - see below.> When your part is done, post a one-line
+       done-signal ending with @you if the human must act.
        '@
 
 2. Dispatch one per worker — interactive mode, NOT `-p`/`exec` (non-interactive
@@ -78,9 +82,12 @@ or one CLI is unavailable.
 3. **Record each reply's `terminal` id** (`t3`, `t4`…). Ids are assigned by
    foreman — never invent names or predict ids; address workers by the ids
    the replies gave you.
-4. Dispatched workers are members automatically. Kick off with ONE post
-   using the real ids if needed (e.g. `chat "@t3 you open"`), then stay
-   quiet and watch — your own session receives their posts.
+4. Dispatched workers are members automatically — but the room starts
+   SILENT and every worker is told to stay quiet, so a fleet with no
+   kickoff deadlocks: all workers wait for someone else to open. ALWAYS
+   seed the room with ONE post naming the opener by real id (e.g.
+   `chat "@t3 you open: <topic>"`), then stay quiet and watch — your own
+   session receives their posts.
 
 For a debate/discussion fleet, put explicit turn rules in the prompts (this
 exact shape produced a clean 8-post consensus live): "Post in turns: t-first

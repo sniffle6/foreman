@@ -57,6 +57,11 @@ For Codex on Windows, prefer compact one-line, quote-free worker prompts unless
 the `codex` command is a native executable. The npm shim cannot carry newlines or
 literal `"` through Foreman's dispatch path.
 
+Every worker prompt must also state two facts, or fleets stall: text the worker
+prints in its own terminal is INVISIBLE to the room (only chat posts reach other
+members), and if the repo's CLAUDE.md, startup hooks, or checklists conflict
+with the chat role, the role wins; proceed, do not ask for clarification.
+
 Example:
 
 ```powershell
@@ -67,10 +72,12 @@ $impl = 'You are the Claude implementation/verification worker in this Foreman c
 ```
 
 Record the returned terminal id (`t3`, `t4`, etc.). Ids are assigned by Foreman.
-Use the real ids for targeted kickoffs:
+The room starts SILENT and every worker is told to stay quiet, so a fleet with
+no kickoff deadlocks: all workers wait for someone else to open. ALWAYS seed the
+room with one post naming the opener, using the real ids:
 
 ```powershell
-& $env:FOREMAN_EXE chat "@t3 review wm.rs; @t4 review terminal.rs"
+& $env:FOREMAN_EXE chat "@t3 you open: review wm.rs; @t4 review terminal.rs"
 ```
 
 For debate/discussion fleets, put explicit turn rules in each prompt:
