@@ -61,7 +61,6 @@ const TITLE_H: f32 = 26.0;
 const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
 const MIN_H: f32 = 140.0;
-const MIN_TILE: f32 = 120.0; // smallest a tiled pane may shrink to when dragging a split
 
 // snap overlay (amber, matches BORDER_FOCUS / web mockup --needs #e7a93f)
 const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
@@ -133,21 +132,6 @@ fn zone_rect(zone: Zone, area: egui::Vec2, split: egui::Vec2) -> egui::Rect {
 
 // Compose a directional snap onto the current snap state, per-axis. A window snap
 // is a horizontal pin (left/right/none) × a vertical pin (top/bottom/none);
-// Which edges of a snapped zone are interior — i.e. shared with a neighbouring
-// tile and thus draggable via the split divider: (left, right, top, bottom).
-fn interior_edges(zone: Zone) -> (bool, bool, bool, bool) {
-    match zone {
-        Zone::Left => (false, true, false, false),
-        Zone::Right => (true, false, false, false),
-        Zone::Top => (false, false, false, true),
-        Zone::Bottom => (false, false, true, false),
-        Zone::Tl => (false, true, false, true),
-        Zone::Tr => (true, false, false, true),
-        Zone::Bl => (false, true, true, false),
-        Zone::Br => (true, false, true, false),
-        Zone::Max => (false, false, false, false),
-    }
-}
 
 pub enum Content {
     Terminal(Session),
@@ -2886,29 +2870,27 @@ impl WindowManager {
                     continue;
                 }
                 let d = resp.drag_delta();
-                match self.windows[i].snap {
-                    Some(zone) => {
-                        let (il, ir, it, ib) = interior_edges(zone);
-                        let touches_outer =
-                            (hl && !il) || (hrr && !ir) || (ht && !it) || (hb && !ib);
-                        if touches_outer {
-                            let w = &mut self.windows[i];
-                            w.snap = None;
-                            w.prev = None;
-                            resize_floating(&mut w.rect, d, hl, hrr, ht, hb, asz);
-                        } else {
-                            // drag the shared divider(s); every tile on it refits next frame
-                            if hl || hrr {
-                                let lo = (MIN_TILE / asz.x).min(0.5);
-                                self.split.x = (self.split.x + d.x / asz.x).clamp(lo, 1.0 - lo);
-                            }
-                            if ht || hb {
-                                let lo = (MIN_TILE / asz.y).min(0.5);
-                                self.split.y = (self.split.y + d.y / asz.y).clamp(lo, 1.0 - lo);
-                            }
-                        }
+                if self.zoomed == Some(id) {
+                    continue; // zoomed windows render full-area; resizing is meaningless
+                }
+                if self.tree.contains(id) {
+                    // Tiled: each edge maps to the divider it shares with a neighbour
+                    // (resize_edge no-ops on outer edges). Corners drive both axes.
+                    let local = egui::Rect::from_min_size(egui::Pos2::ZERO, asz);
+                    if hl {
+                        self.tree.resize_edge(id, Dir::Left, d.x, local, SNAP_GAP);
                     }
-                    None => resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz),
+                    if hrr {
+                        self.tree.resize_edge(id, Dir::Right, d.x, local, SNAP_GAP);
+                    }
+                    if ht {
+                        self.tree.resize_edge(id, Dir::Up, d.y, local, SNAP_GAP);
+                    }
+                    if hb {
+                        self.tree.resize_edge(id, Dir::Down, d.y, local, SNAP_GAP);
+                    }
+                } else {
+                    resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz);
                 }
             }
         }
@@ -3703,7 +3685,6 @@ mod tests {
         wm.last_area = egui::vec2(1000.0, 800.0);
         wm.tree.insert_root(a, Dir::Right); // a is tiled
         wm.focus(a);
-        let original_rect = wm.windows.iter().find(|w| w.id == a).unwrap().rect;
 
         // First toggle: tiled → floating, rect restored.
         wm.toggle_float();
