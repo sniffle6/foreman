@@ -3146,8 +3146,8 @@ impl WindowManager {
         }
         rows.push((String::new(), String::new()));
         rows.push((
-            "  Corners".into(),
-            "snap, then snap a perpendicular direction \u{2192} quarter-screen tiles".into(),
+            "  Drag".into(),
+            "drag a header \u{2014} leaf edges split, centers stack as tabs, screen edges make a column".into(),
         ));
         rows.push((String::new(), String::new()));
         rows.push((
