@@ -613,6 +613,10 @@ pub struct WindowManager {
     tree: crate::layout::LayoutTree,
     /// tmux-style zoom: render this window full-area on top, tree untouched.
     zoomed: Option<WinId>,
+    /// The window whose in-flight header drag started tiled/zoomed (tear-out).
+    /// Such a drag keeps the tree drop hints without a modifier; a drag that
+    /// started floating is a free move unless Shift is held.
+    drag_from_tree: Option<WinId>,
 }
 
 impl WindowManager {
@@ -638,6 +642,7 @@ impl WindowManager {
             keymap: Keymap::default(),
             tree: Default::default(),
             zoomed: None,
+            drag_from_tree: None,
         }
     }
 
@@ -2269,6 +2274,7 @@ impl WindowManager {
                 let popped = self.tree.contains(id) || self.zoomed == Some(id);
                 if popped {
                     self.detach(id);
+                    self.drag_from_tree = Some(id);
                 }
                 {
                     let w = &mut self.windows[i];
@@ -2299,20 +2305,38 @@ impl WindowManager {
                 // Dropping a window's title onto another window tabs it onto that
                 // window's stack. While hovering a merge target we suppress the snap
                 // overlay and instead highlight the target (handled at paint time).
+                // Drop semantics are gated on drag origin: a tear-out (started
+                // tiled/zoomed) keeps its hints; a drag that started floating is
+                // a pure move unless Shift opts in. Checked live each frame so
+                // pressing/releasing Shift mid-drag lights hints up and down.
+                let snap_ok = self.drag_from_tree == Some(id)
+                    || ui.input(|inp| inp.modifiers.shift);
                 let pointer = ui.ctx().pointer_latest_pos();
-                let over_target = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
+                let over_target = if snap_ok {
+                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order))
+                } else {
+                    None
+                };
                 if let Some(tgt) = over_target {
                     merge_hint = Some(tgt);
-                } else if let Some(p) = pointer {
-                    // Tree drop hint: leaf edges split, leaf centers tab-merge,
-                    // area edge bands split the root. Painted like the old snap overlay.
-                    if let Some((_, hint)) = self.tree.drop_target(p, area, SNAP_GAP) {
-                        snap_overlay = Some(hint);
+                } else if snap_ok {
+                    if let Some(p) = pointer {
+                        // Tree drop hint: leaf edges split, leaf centers tab-merge,
+                        // area edge bands split the root. Painted like the old snap overlay.
+                        if let Some((_, hint)) = self.tree.drop_target(p, area, SNAP_GAP) {
+                            snap_overlay = Some(hint);
+                        }
                     }
                 }
             }
             if dr.drag_stopped() {
-                let pointer = ui.ctx().pointer_latest_pos();
+                // Drag origin decides drop rights (Shift overrides for floating
+                // drags). take() clears the flag at end-of-gesture either way.
+                let snap_ok = self.drag_from_tree.take() == Some(id)
+                    || ui.input(|inp| inp.modifiers.shift);
+                // Without drop rights the pointer counts as nowhere: no merge, no
+                // tree insert — the floating window simply stays where dropped.
+                let pointer = ui.ctx().pointer_latest_pos().filter(|_| snap_ok);
                 // A drop onto another window's titlebar merges (tabs) onto it and wins
                 // over the tree drop: the dragged window is consumed entirely.
                 let merge_dst = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
