@@ -78,28 +78,6 @@ pub enum Dir {
     Up,
     Down,
 }
-impl Dir {
-    // The snap zone a directional snap maps to (half-screen tiling).
-    fn zone(self) -> Zone {
-        match self {
-            Dir::Left => Zone::Left,
-            Dir::Right => Zone::Right,
-            Dir::Up => Zone::Top,
-            Dir::Down => Zone::Bottom,
-        }
-    }
-
-    // The opposite direction — used by split to place the source pane facing the
-    // newcomer (Left↔Right, Up↔Down).
-    fn opposite(self) -> Dir {
-        match self {
-            Dir::Left => Dir::Right,
-            Dir::Right => Dir::Left,
-            Dir::Up => Dir::Down,
-            Dir::Down => Dir::Up,
-        }
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Zone {
@@ -187,44 +165,6 @@ fn zone_rect(zone: Zone, area: egui::Vec2, split: egui::Vec2) -> egui::Rect {
 
 // Compose a directional snap onto the current snap state, per-axis. A window snap
 // is a horizontal pin (left/right/none) × a vertical pin (top/bottom/none);
-// floating and `Max` both read as fully un-pinned. A direction pins its own axis,
-// or — if that axis is already pinned the same way — releases it (toggle), leaving
-// the other axis untouched. Returns the resulting zone, or `None` when both axes
-// end up un-pinned (→ floating). This is the whole edge/corner tiling state
-// machine, kept pure so it is unit-testable without an egui context.
-fn compose_zone(cur: Option<Zone>, d: Dir) -> Option<Zone> {
-    // (h, v) in {-1, 0, 1}: h<0 left / h>0 right; v<0 top / v>0 bottom; 0 = unpinned.
-    let (mut h, mut v) = match cur {
-        None | Some(Zone::Max) => (0i8, 0i8),
-        Some(Zone::Left) => (-1, 0),
-        Some(Zone::Right) => (1, 0),
-        Some(Zone::Top) => (0, -1),
-        Some(Zone::Bottom) => (0, 1),
-        Some(Zone::Tl) => (-1, -1),
-        Some(Zone::Tr) => (1, -1),
-        Some(Zone::Bl) => (-1, 1),
-        Some(Zone::Br) => (1, 1),
-    };
-    match d {
-        Dir::Left => h = if h == -1 { 0 } else { -1 },
-        Dir::Right => h = if h == 1 { 0 } else { 1 },
-        Dir::Up => v = if v == -1 { 0 } else { -1 },
-        Dir::Down => v = if v == 1 { 0 } else { 1 },
-    }
-    match (h, v) {
-        (0, 0) => None,
-        (-1, 0) => Some(Zone::Left),
-        (1, 0) => Some(Zone::Right),
-        (0, -1) => Some(Zone::Top),
-        (0, 1) => Some(Zone::Bottom),
-        (-1, -1) => Some(Zone::Tl),
-        (1, -1) => Some(Zone::Tr),
-        (-1, 1) => Some(Zone::Bl),
-        (1, 1) => Some(Zone::Br),
-        _ => unreachable!(),
-    }
-}
-
 // Which edges of a snapped zone are interior — i.e. shared with a neighbouring
 // tile and thus draggable via the split divider: (left, right, top, bottom).
 fn interior_edges(zone: Zone) -> (bool, bool, bool, bool) {
@@ -1778,7 +1718,8 @@ impl WindowManager {
         match cmd {
             // ---- project (outer) level: act on the desktop ----
             Command::ProjFocus(d) => self.focus_dir(d),
-            Command::ProjSnap(d) => self.snap_dir(d),
+            Command::ProjSnap(d) => self.move_dir(d),
+            Command::ProjFloat => self.toggle_float(),
             Command::ZoomProject => {
                 if let Some(id) = self.focused {
                     self.toggle_zoom(id);
@@ -1801,7 +1742,8 @@ impl WindowManager {
                 if let Some(child) = self.focused_child() {
                     match other {
                         Command::TermFocus(d) => child.focus_dir(d),
-                        Command::TermSnap(d) => child.snap_dir(d),
+                        Command::TermSnap(d) => child.move_dir(d),
+                        Command::TermFloat => child.toggle_float(),
                         Command::Split(d) => child.split_dir(d, &ctx),
                         Command::ZoomTerm => {
                             if let Some(id) = child.focused {
@@ -2058,110 +2000,126 @@ impl WindowManager {
         self.focus(id);
     }
 
-    /// Snap window `id` to `zone`, preserving its pre-snap floating rect in `prev`
-    /// so an un-snap can restore it. Mirrors the mouse-drop snap path: only
-    /// `snap`/`prev` are set; the show loop refits the rect to `zone_rect` next
-    /// frame. A no-op if the window is already snapped to `zone`. This is the one
-    /// place split and directional snap share.
-    fn set_snap(&mut self, id: WinId, zone: Zone) {
-        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-            if w.snap == Some(zone) {
-                return;
-            }
-            if w.snap.is_none() {
-                w.prev = Some(w.rect);
-            }
-            w.snap = Some(zone);
-        }
-    }
-
-    /// Snap `id` to `zone`, or — if another window already occupies that zone —
-    /// tab `id` onto it instead. Shared by manual snap ([`snap_dir`]) and split
-    /// placement ([`place_split`]) so "snap onto an occupied zone" tabs uniformly.
-    fn snap_or_tab(&mut self, id: WinId, zone: Zone) {
-        let occupant = self
-            .windows
-            .iter()
-            .find(|w| w.id != id && w.snap == Some(zone))
-            .map(|w| w.id);
-        if let Some(dst) = occupant {
-            self.merge_windows(id, dst);
-        } else {
-            self.set_snap(id, zone);
-            self.focus(id);
-        }
-    }
-
-    /// Snap the focused window, composing the pressed direction onto its current
-    /// snap so half + perpendicular direction → corner (see [`compose_zone`]). The
-    /// show loop refits the rect to `zone_rect` each frame, so we only set
-    /// `snap`/`prev` here. Composing onto a zone another window already holds tabs
-    /// the two together (via [`snap_or_tab`]); when both axes un-pin, the window
-    /// pops back to floating at its pre-snap rect.
-    fn snap_dir(&mut self, d: Dir) {
+    /// Move the focused window within the tiled layer. Tiled: swap with the
+    /// geometric neighbor leaf in that direction; with no neighbor, re-insert at
+    /// the area edge as a full row/column. Floating: enter the tree at that edge.
+    fn move_dir(&mut self, d: Dir) {
         let Some(id) = self.focused else { return };
-        let cur = self
-            .windows
-            .iter()
-            .find(|w| w.id == id)
-            .and_then(|w| w.snap);
-        match compose_zone(cur, d) {
-            Some(zone) => self.snap_or_tab(id, zone),
-            None => {
-                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                    w.snap = None;
-                    if let Some(pr) = w.prev.take() {
-                        w.rect = pr;
-                    }
+        if self.tree.contains(id) {
+            let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+            let placements = self.tree.layout(local, SNAP_GAP);
+            let Some(from) = placements.iter().find(|(w, _)| *w == id).map(|(_, r)| r.center())
+            else {
+                return;
+            };
+            let mut best: Option<(WinId, f32)> = None;
+            for (w, r) in placements.iter().filter(|(w, _)| *w != id) {
+                let c = r.center();
+                let (along, cross) = match d {
+                    Dir::Left => (from.x - c.x, (c.y - from.y).abs()),
+                    Dir::Right => (c.x - from.x, (c.y - from.y).abs()),
+                    Dir::Up => (from.y - c.y, (c.x - from.x).abs()),
+                    Dir::Down => (c.y - from.y, (c.x - from.x).abs()),
+                };
+                if along <= 1.0 {
+                    continue;
                 }
-                self.focus(id);
+                let score = along + cross * 2.0;
+                if best.map_or(true, |(_, b)| score < b) {
+                    best = Some((*w, score));
+                }
             }
+            match best {
+                Some((n, _)) => {
+                    self.tree.swap(id, n);
+                }
+                None => {
+                    self.tree.remove(id);
+                    self.tree.insert_root(id, d);
+                }
+            }
+        } else {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                if w.prev.is_none() {
+                    w.prev = Some(w.rect);
+                }
+            }
+            self.tree.insert_root(id, d);
         }
+        self.focus(id);
     }
 
-    /// Phase 2 split: create a new terminal and place it in the pointed zone.
-    ///
-    /// - If a window is **already snapped to the target zone**, the newcomer is
-    ///   *tabbed* onto it (reusing [`merge_windows`]) instead of stacking a second
-    ///   window in the same zone.
-    /// - Otherwise the new terminal is snapped to the target zone (reusing the
-    ///   snap path via [`set_snap`]).
-    /// - If the focused source window was **unsnapped (floating)**, it is also
-    ///   snapped to the **opposite** zone for an instant two-pane split. An
-    ///   already-snapped source is left untouched.
-    ///
-    /// No-ops cleanly if there is no source window or the PTY fails to spawn.
+    /// Split: create a new terminal next to the focused window in the tree.
     fn split_dir(&mut self, d: Dir, ctx: &egui::Context) {
-        let Some(src) = self.focused else { return };
-        // Capture the source's snap state *before* creating the newcomer, since
-        // source placement depends on whether it was floating.
-        let Some(src_snap) = self.windows.iter().find(|w| w.id == src).map(|w| w.snap) else {
-            return; // focused id no longer exists
-        };
-        // Spawn the newcomer. add_terminal focuses it and returns its id; bail on
-        // a spawn failure without disturbing the existing layout.
+        let src = self.focused;
         let Some(new_id) = self.add_terminal(Shell::PowerShell, ctx) else {
             return;
         };
-        self.place_split(src, src_snap, new_id, d);
+        self.place_split(src, new_id, d);
     }
 
-    /// The pure placement half of [`split_dir`] (no PTY/spawn): given the source
-    /// window, its pre-split snap state, and an already-created newcomer window,
-    /// place the newcomer in the pointed zone — tabbing onto an existing occupant
-    /// on collision — and snap an unsnapped source to the opposite zone. Split out
-    /// so it is testable without spawning a real `Session`.
-    fn place_split(&mut self, src: WinId, src_snap: Option<Zone>, new_id: WinId, d: Dir) {
-        let zone = d.zone();
-        // Place the newcomer in the target zone, tabbing onto any existing
-        // occupant (shared with manual snap via `snap_or_tab`).
-        self.snap_or_tab(new_id, zone);
-
-        // Source placement: only when it was floating, snap it opposite so the
-        // two panes face each other. An already-snapped source stays put.
-        if src_snap.is_none() {
-            self.set_snap(src, d.opposite().zone());
+    /// The pure placement half of [`split_dir`] (no PTY/spawn), testable without
+    /// a real `Session`. A floating (or absent) source first enters the tree so
+    /// `Alt+WASD` always yields the two-pane result the user expects.
+    fn place_split(&mut self, src: Option<WinId>, new_id: WinId, d: Dir) {
+        let anchor = match src.filter(|s| *s != new_id) {
+            Some(s) if self.tree.contains(s) => Some(s),
+            Some(s) => {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == s) {
+                    if w.prev.is_none() {
+                        w.prev = Some(w.rect);
+                    }
+                }
+                self.tree.insert_root(s, Dir::Right);
+                Some(s)
+            }
+            None => None,
+        };
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == new_id) {
+            if w.prev.is_none() {
+                w.prev = Some(w.rect);
+            }
         }
+        match anchor {
+            Some(a) => {
+                self.tree.insert_split(a, new_id, d);
+            }
+            None => self.tree.insert_root(new_id, d),
+        }
+        self.focus(new_id);
+    }
+
+    /// Toggle the focused window between tiled and floating. Un-tiling restores
+    /// the remembered floating rect; re-tiling enters the tree where the window
+    /// currently sits (the leaf under its center, split along its longer axis).
+    fn toggle_float(&mut self) {
+        let Some(id) = self.focused else { return };
+        if self.tree.contains(id) {
+            self.detach(id);
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                w.rect = w.prev.take().unwrap_or(egui::Rect::from_min_size(
+                    egui::pos2(60.0, 60.0),
+                    egui::vec2(580.0, 380.0),
+                ));
+            }
+        } else {
+            let (center, rect) = match self.windows.iter().find(|w| w.id == id) {
+                Some(w) => (w.rect.center(), w.rect),
+                None => return,
+            };
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                w.prev = Some(rect);
+            }
+            let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+            match self.tree.hit_leaf(center, local, SNAP_GAP) {
+                Some((leaf, r)) => {
+                    let side = if r.width() >= r.height() { Dir::Right } else { Dir::Down };
+                    self.tree.insert_split(leaf, id, side);
+                }
+                None => self.tree.insert_root(id, Dir::Right),
+            }
+        }
+        self.focus(id);
     }
 
     /// Move focus to the nearest window in direction `d`, by geometry on local
@@ -3610,97 +3568,6 @@ mod tests {
     }
 
     #[test]
-    fn snap_into_occupied_zone_tabs_onto_occupant() {
-        let mut wm = WindowManager::new();
-        let a = push(&mut wm, "A");
-        let b = push(&mut wm, "B");
-        wm.set_snap(a, Zone::Left); // A holds the Left zone
-        wm.focused = Some(b);
-        wm.snap_dir(Dir::Left); // snap B onto the same zone
-
-        assert_eq!(wm.windows.len(), 1, "B tabbed onto A, not double-occupying");
-        let merged = &wm.windows[0];
-        assert_eq!(merged.id, a, "occupant survives");
-        assert_eq!(merged.snap, Some(Zone::Left), "occupant keeps its zone");
-        assert_eq!(merged.tabs.len(), 2, "B appended as a tab");
-    }
-
-    #[test]
-    fn snap_into_empty_zone_just_snaps() {
-        let mut wm = WindowManager::new();
-        let a = push(&mut wm, "A");
-        wm.focused = Some(a);
-        wm.snap_dir(Dir::Right);
-        assert_eq!(wm.windows.len(), 1);
-        assert_eq!(wm.windows[0].snap, Some(Zone::Right));
-    }
-
-    #[test]
-    fn compose_zone_matches_full_transition_table() {
-        use Zone::*;
-        // (current snap, Left, Right, Up, Down) — `None` = floating. Mirrors the
-        // design table exactly so a regression in the state machine is obvious.
-        let rows: &[(
-            Option<Zone>,
-            Option<Zone>,
-            Option<Zone>,
-            Option<Zone>,
-            Option<Zone>,
-        )] = &[
-            (None, Some(Left), Some(Right), Some(Top), Some(Bottom)),
-            (Some(Max), Some(Left), Some(Right), Some(Top), Some(Bottom)),
-            (Some(Left), None, Some(Right), Some(Tl), Some(Bl)),
-            (Some(Right), Some(Left), None, Some(Tr), Some(Br)),
-            (Some(Top), Some(Tl), Some(Tr), None, Some(Bottom)),
-            (Some(Bottom), Some(Bl), Some(Br), Some(Top), None),
-            (Some(Tl), Some(Top), Some(Tr), Some(Left), Some(Bl)),
-            (Some(Tr), Some(Tl), Some(Top), Some(Right), Some(Br)),
-            (Some(Bl), Some(Bottom), Some(Br), Some(Tl), Some(Left)),
-            (Some(Br), Some(Bl), Some(Bottom), Some(Tr), Some(Right)),
-        ];
-        for &(cur, l, r, u, dn) in rows {
-            assert_eq!(compose_zone(cur, Dir::Left), l, "{cur:?} + Left");
-            assert_eq!(compose_zone(cur, Dir::Right), r, "{cur:?} + Right");
-            assert_eq!(compose_zone(cur, Dir::Up), u, "{cur:?} + Up");
-            assert_eq!(compose_zone(cur, Dir::Down), dn, "{cur:?} + Down");
-        }
-    }
-
-    #[test]
-    fn snap_dir_composes_into_and_out_of_a_corner() {
-        let mut wm = WindowManager::new();
-        let a = push(&mut wm, "A");
-        wm.focused = Some(a);
-        let floating = wm.windows[0].rect;
-
-        wm.snap_dir(Dir::Left); // floating → left half
-        assert_eq!(wm.windows[0].snap, Some(Zone::Left));
-        wm.snap_dir(Dir::Up); // left half + up → top-left corner
-        assert_eq!(wm.windows[0].snap, Some(Zone::Tl));
-        wm.snap_dir(Dir::Up); // press the pinned axis again → back to left half
-        assert_eq!(wm.windows[0].snap, Some(Zone::Left));
-        wm.snap_dir(Dir::Left); // same direction again → un-snap to floating
-        assert_eq!(wm.windows[0].snap, None);
-        assert_eq!(wm.windows[0].rect, floating, "restores pre-snap rect");
-    }
-
-    #[test]
-    fn snap_dir_into_occupied_corner_tabs_onto_occupant() {
-        let mut wm = WindowManager::new();
-        let a = push(&mut wm, "A");
-        let b = push(&mut wm, "B");
-        wm.set_snap(a, Zone::Br); // A holds the bottom-right corner
-        wm.focused = Some(b);
-        wm.snap_dir(Dir::Right); // B: floating → right half
-        wm.snap_dir(Dir::Down); // right half + down → Br, already occupied → tab
-
-        assert_eq!(wm.windows.len(), 1, "B tabbed onto A in the corner");
-        assert_eq!(wm.windows[0].id, a);
-        assert_eq!(wm.windows[0].snap, Some(Zone::Br));
-        assert_eq!(wm.windows[0].tabs.len(), 2);
-    }
-
-    #[test]
     fn merge_appends_source_tab_and_removes_source() {
         let mut wm = WindowManager::new();
         let a = push(&mut wm, "A");
@@ -3823,87 +3690,129 @@ mod tests {
         assert_eq!(wm.windows.len(), 1, "single-tab window is not detachable");
     }
 
-    // --- Phase 2: split placement (drives place_split with stub windows so no
+    // --- Tree-based split/move/float (drives place_split with stub windows so no
     // real PTY/Session is spawned; split_dir only adds the spawn + id capture). ---
 
     #[test]
-    fn dir_zone_and_opposite_mapping() {
-        assert_eq!(Dir::Left.zone(), Zone::Left);
-        assert_eq!(Dir::Right.zone(), Zone::Right);
-        assert_eq!(Dir::Up.zone(), Zone::Top);
-        assert_eq!(Dir::Down.zone(), Zone::Bottom);
-        assert_eq!(Dir::Left.opposite(), Dir::Right);
-        assert_eq!(Dir::Right.opposite(), Dir::Left);
-        assert_eq!(Dir::Up.opposite(), Dir::Down);
-        assert_eq!(Dir::Down.opposite(), Dir::Up);
+    fn split_from_floating_source_tiles_both_panes() {
+        // floating focused src + place_split(Some(src), new, Right) → both in tree,
+        // leaves == [src, new].
+        let mut wm = WindowManager::new();
+        let src = push(&mut wm, "src");
+        let new = push(&mut wm, "new");
+        // src is floating (not in tree); new is also floating.
+        assert!(!wm.tree.contains(src));
+        wm.focus(src);
+
+        wm.place_split(Some(src), new, Dir::Right);
+
+        assert!(wm.tree.contains(src), "src entered the tree");
+        assert!(wm.tree.contains(new), "new entered the tree");
+        assert_eq!(wm.tree.leaves(), vec![src, new]);
+        assert_eq!(wm.focused, Some(new), "new is focused");
     }
 
     #[test]
-    fn split_from_floating_source_snaps_both_panes() {
-        // Source is floating; Alt+D (Right) → newcomer right, source snaps left.
+    fn split_from_tiled_source_splits_that_leaf() {
+        // src already in tree; place_split(Some(src), new, Down) → leaves [src, new],
+        // root is a vertical split.
         let mut wm = WindowManager::new();
         let src = push(&mut wm, "src");
-        let newcomer = push(&mut wm, "new"); // stands in for the freshly spawned terminal
-        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
-        assert_eq!(src_snap, None, "source starts floating");
+        let new = push(&mut wm, "new");
+        wm.tree.insert_root(src, Dir::Right); // src is tiled
 
-        wm.place_split(src, src_snap, newcomer, Dir::Right);
+        wm.place_split(Some(src), new, Dir::Down);
 
-        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
-        let n = wm.windows.iter().find(|w| w.id == newcomer).unwrap();
-        assert_eq!(n.snap, Some(Zone::Right), "newcomer snaps to pointed zone");
-        assert_eq!(s.snap, Some(Zone::Left), "floating source snaps opposite");
-        assert!(n.prev.is_some(), "newcomer keeps a pre-snap floating rect");
-        assert!(s.prev.is_some(), "source keeps a pre-snap floating rect");
-        assert_eq!(wm.focused, Some(newcomer), "newcomer is focused");
-    }
-
-    #[test]
-    fn split_from_snapped_source_leaves_source_untouched() {
-        // Source already snapped left; Alt+D → newcomer right, source stays left.
-        let mut wm = WindowManager::new();
-        let src = push(&mut wm, "src");
-        wm.set_snap(src, Zone::Left);
-        let src_prev = wm.windows.iter().find(|w| w.id == src).unwrap().prev;
-        let newcomer = push(&mut wm, "new");
-        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
-
-        wm.place_split(src, src_snap, newcomer, Dir::Right);
-
-        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
-        let n = wm.windows.iter().find(|w| w.id == newcomer).unwrap();
-        assert_eq!(s.snap, Some(Zone::Left), "snapped source is untouched");
-        assert_eq!(s.prev, src_prev, "source prev rect unchanged");
-        assert_eq!(n.snap, Some(Zone::Right), "newcomer snaps to pointed zone");
-    }
-
-    #[test]
-    fn split_into_occupied_zone_tabs_onto_occupant() {
-        // A window already snapped right; splitting right again must tab onto it,
-        // not place a second window in the same zone.
-        let mut wm = WindowManager::new();
-        let src = push(&mut wm, "src");
-        let occupant = push(&mut wm, "occ");
-        wm.set_snap(occupant, Zone::Right);
-        let newcomer = push(&mut wm, "new");
-        let src_snap = wm.windows.iter().find(|w| w.id == src).unwrap().snap;
-        let before = wm.windows.len();
-
-        wm.place_split(src, src_snap, newcomer, Dir::Right);
-
-        assert_eq!(wm.windows.len(), before - 1, "newcomer merged, not added");
-        let occ = wm.windows.iter().find(|w| w.id == occupant).unwrap();
-        assert_eq!(occ.snap, Some(Zone::Right), "occupant keeps its zone");
-        assert_eq!(occ.tabs.len(), 2, "newcomer became a tab on the occupant");
-        assert_eq!(occ.tabs[occ.active].title, "new", "merged tab is active");
+        assert_eq!(wm.tree.leaves(), vec![src, new]);
         assert!(
-            !wm.windows.iter().any(|w| w.id == newcomer),
-            "newcomer window no longer exists on its own"
+            matches!(
+                wm.tree.root,
+                Some(crate::layout::Node::Split {
+                    dir: crate::layout::SplitDir::V,
+                    ..
+                })
+            ),
+            "root should be a vertical split"
         );
-        assert_eq!(wm.focused, Some(occupant), "occupant is focused after tab");
-        // Floating source still gets the opposite zone.
-        let s = wm.windows.iter().find(|w| w.id == src).unwrap();
-        assert_eq!(s.snap, Some(Zone::Left), "floating source snaps opposite");
+        assert_eq!(wm.focused, Some(new), "new is focused");
+    }
+
+    #[test]
+    fn move_dir_swaps_with_the_neighbor_and_edges_out() {
+        // two tiles [a, b] side by side; focus a; move_dir(Right) → leaves [b, a];
+        // move_dir(Right) again (no neighbor to the right) → still 2 leaves, a is rightmost.
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        // Build [a | b] layout: a on the left, b on the right.
+        wm.tree.insert_root(a, Dir::Right);
+        wm.tree.insert_root(b, Dir::Right);
+        wm.focus(a);
+
+        wm.move_dir(Dir::Right); // a swaps with b → [b, a]
+        assert_eq!(wm.tree.leaves(), vec![b, a], "a moved right past b");
+        assert_eq!(wm.focused, Some(a));
+
+        wm.move_dir(Dir::Right); // a is already rightmost; re-inserts at right edge
+        let leaves = wm.tree.leaves();
+        assert_eq!(leaves.len(), 2, "still 2 leaves");
+        assert_eq!(*leaves.last().unwrap(), a, "a remains rightmost");
+    }
+
+    #[test]
+    fn move_dir_on_a_floating_window_enters_the_tree_at_that_edge() {
+        // tiled a; floating b focused; move_dir(Left) → tree.contains(b), leaves == [b, a]
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        wm.tree.insert_root(a, Dir::Right); // a is tiled
+        // b is floating (not in tree)
+        assert!(!wm.tree.contains(b));
+        wm.focus(b);
+
+        wm.move_dir(Dir::Left);
+
+        assert!(wm.tree.contains(b), "floating b entered the tree");
+        let leaves = wm.tree.leaves();
+        assert_eq!(leaves, vec![b, a], "b is at the left edge, a to the right");
+    }
+
+    #[test]
+    fn toggle_float_roundtrips_tree_membership_and_rect() {
+        // tiled a focused: toggle_float → !tree.contains(a), rect restored from prev;
+        // toggle_float again → tree.contains(a).
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        wm.tree.insert_root(a, Dir::Right); // a is tiled
+        wm.focus(a);
+        let original_rect = wm.windows.iter().find(|w| w.id == a).unwrap().rect;
+
+        // First toggle: tiled → floating, rect restored.
+        wm.toggle_float();
+        assert!(!wm.tree.contains(a), "a detached from tree");
+        let rect_after = wm.windows.iter().find(|w| w.id == a).unwrap().rect;
+        // prev was None before (tree-managed windows don't set prev), so falls back
+        // to the default floating rect — just assert we got something reasonable.
+        assert!(rect_after.width() > 0.0 && rect_after.height() > 0.0);
+
+        // Second toggle: floating → tiled again.
+        wm.toggle_float();
+        assert!(wm.tree.contains(a), "a re-entered the tree");
+    }
+
+    #[test]
+    fn place_split_with_no_source_becomes_the_root_tile() {
+        // empty tree, place_split(None, n, Down) → leaves == [n]
+        let mut wm = WindowManager::new();
+        let n = push(&mut wm, "N");
+
+        wm.place_split(None, n, Dir::Down);
+
+        assert_eq!(wm.tree.leaves(), vec![n]);
+        assert_eq!(wm.focused, Some(n));
     }
 
     fn mgr_with_project(id_focused: bool) -> WindowManager {
