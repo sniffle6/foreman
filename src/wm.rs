@@ -513,6 +513,8 @@ enum Act {
     Close(WinId),
     Min(WinId),
     Max(WinId),
+    /// Toggle window between tiled and floating (the header toggle button).
+    Float(WinId),
     Restore(WinId),
     /// Dispatch a terminal of `Shell` into project window `WinId`. Deferred like
     /// the rest: the header key is drawn mid-loop, but reaching into the project's
@@ -2223,7 +2225,7 @@ impl WindowManager {
             }
             let mut scr = self.windows[i].rect.translate(area.min.to_vec2());
             // Projects reserve extra right-side room for the "+" new-project button.
-            let ctl_w = if is_project { 116.0 } else { 88.0 };
+            let ctl_w = if is_project { 141.0 } else { 113.0 };
 
             // --- title drag (interact first, then we know final position) ---
             let drag_rect = egui::Rect::from_min_size(
@@ -2619,7 +2621,12 @@ impl WindowManager {
             let by = scr.min.y + 3.0;
             let bh = TITLE_H - 6.0;
             let mut bx = scr.max.x - 4.0 - 22.0;
-            for (role, danger) in [("close", true), ("max", false), ("min", false)] {
+            for (role, danger) in [
+                ("close", true),
+                ("max", false),
+                ("min", false),
+                ("float", false),
+            ] {
                 let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
                 let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
                 let bg = if resp.hovered() {
@@ -2653,6 +2660,48 @@ impl WindowManager {
                             egui::StrokeKind::Inside,
                         );
                     }
+                    "float" => {
+                        if is_tiled {
+                            // In the tree: 2×2 grid. Click pops it out to floating.
+                            p.rect_stroke(
+                                egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
+                                egui::CornerRadius::same(1),
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            p.line_segment(
+                                [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                                stroke,
+                            );
+                            p.line_segment(
+                                [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                stroke,
+                            );
+                        } else {
+                            // Floating: two offset squares. Click tiles it
+                            // (enters at the leaf under the window's center).
+                            let q = s * 0.8;
+                            let o = 1.5;
+                            p.rect_stroke(
+                                egui::Rect::from_center_size(
+                                    egui::pos2(c.x + o, c.y - o),
+                                    egui::vec2(q * 2.0, q * 2.0),
+                                ),
+                                egui::CornerRadius::same(1),
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            p.rect_stroke(
+                                egui::Rect::from_center_size(
+                                    egui::pos2(c.x - o, c.y + o),
+                                    egui::vec2(q * 2.0, q * 2.0),
+                                ),
+                                egui::CornerRadius::same(1),
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
                     _ => {
                         p.line_segment(
                             [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
@@ -2668,6 +2717,7 @@ impl WindowManager {
                     acts.push(match role {
                         "close" => Act::Close(id),
                         "max" => Act::Max(id),
+                        "float" => Act::Float(id),
                         _ => Act::Min(id),
                     });
                 }
@@ -3063,6 +3113,7 @@ impl WindowManager {
                     self.focus(id);
                 }
                 Act::Max(id) => self.toggle_zoom(id),
+                Act::Float(id) => self.toggle_float_for(id),
             }
         }
     }
