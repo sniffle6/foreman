@@ -1775,14 +1775,13 @@ impl WindowManager {
     /// project's child manager; project-level commands act on `self` (desktop).
     fn dispatch(&mut self, cmd: Command, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let asz_proj = self.last_area; // desktop area for project-level zoom
         match cmd {
             // ---- project (outer) level: act on the desktop ----
             Command::ProjFocus(d) => self.focus_dir(d),
             Command::ProjSnap(d) => self.snap_dir(d),
             Command::ZoomProject => {
                 if let Some(id) = self.focused {
-                    self.toggle_zoom(id, asz_proj);
+                    self.toggle_zoom(id);
                 }
             }
             Command::CloseProject => {
@@ -1800,14 +1799,13 @@ impl WindowManager {
             // ---- terminal (inner) level: act on the focused project's child ----
             other => {
                 if let Some(child) = self.focused_child() {
-                    let asz = child.last_area;
                     match other {
                         Command::TermFocus(d) => child.focus_dir(d),
                         Command::TermSnap(d) => child.snap_dir(d),
                         Command::Split(d) => child.split_dir(d, &ctx),
                         Command::ZoomTerm => {
                             if let Some(id) = child.focused {
-                                child.toggle_zoom(id, asz);
+                                child.toggle_zoom(id);
                             }
                         }
                         Command::CloseTerm => {
@@ -2036,22 +2034,26 @@ impl WindowManager {
         }
     }
 
-    /// Toggle maximize (zoom) for a window — mirrors the `Act::Max` handler.
-    fn toggle_zoom(&mut self, id: WinId, asz: egui::Vec2) {
-        let split = self.split;
-        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-            if w.snap == Some(Zone::Max) {
-                w.snap = None;
-                if let Some(pr) = w.prev.take() {
-                    w.rect = pr;
-                }
-            } else {
-                w.prev = Some(w.rect);
-                w.snap = Some(Zone::Max);
-                if asz.x > 1.0 && asz.y > 1.0 {
-                    w.rect = zone_rect(Zone::Max, asz, split);
+    /// tmux-style zoom: render the window full-area on top. The tree and other
+    /// windows are untouched; un-zoom restores instantly. A floating window's
+    /// rect round-trips via `prev`.
+    fn toggle_zoom(&mut self, id: WinId) {
+        if self.zoomed == Some(id) {
+            self.zoomed = None;
+            if !self.tree.contains(id) {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    if let Some(pr) = w.prev.take() {
+                        w.rect = pr;
+                    }
                 }
             }
+        } else {
+            if !self.tree.contains(id) {
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    w.prev = Some(w.rect);
+                }
+            }
+            self.zoomed = Some(id);
         }
         self.focus(id);
     }
@@ -3161,7 +3163,7 @@ impl WindowManager {
     /// Deferred window mutations collected during render, applied after the render
     /// borrow on `self.windows` is released so we never remove/retab a window
     /// mid-loop and invalidate the draw order.
-    fn apply_acts(&mut self, acts: Vec<Act>, asz: egui::Vec2, base: egui::Id, ctx: &egui::Context) {
+    fn apply_acts(&mut self, acts: Vec<Act>, _asz: egui::Vec2, base: egui::Id, ctx: &egui::Context) {
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
@@ -3214,22 +3216,7 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
-                Act::Max(id) => {
-                    let split = self.split;
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        if w.snap == Some(Zone::Max) {
-                            w.snap = None;
-                            if let Some(pr) = w.prev.take() {
-                                w.rect = pr;
-                            }
-                        } else {
-                            w.prev = Some(w.rect);
-                            w.snap = Some(Zone::Max);
-                            w.rect = zone_rect(Zone::Max, asz, split);
-                        }
-                    }
-                    self.focus(id);
-                }
+                Act::Max(id) => self.toggle_zoom(id),
             }
         }
     }
@@ -5382,5 +5369,24 @@ mod tests {
         let (framed, targets) = wm.chat_post_human("@you hello").unwrap();
         assert!(framed.contains("you: @you hello"), "{framed}");
         assert_eq!(targets, None);
+    }
+
+    #[test]
+    fn zoom_overlays_without_touching_the_tree_or_floating_rect() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "tiled");
+        wm.tree.insert_root(a, Dir::Right);
+        wm.toggle_zoom(a);
+        assert_eq!(wm.zoomed, Some(a));
+        assert!(wm.tree.contains(a)); // tree untouched
+        wm.toggle_zoom(a);
+        assert_eq!(wm.zoomed, None);
+        // floating window: rect must survive a zoom round-trip
+        let b = push(&mut wm, "float");
+        let before = wm.windows.iter().find(|w| w.id == b).unwrap().rect;
+        wm.toggle_zoom(b);
+        wm.toggle_zoom(b);
+        let after = wm.windows.iter().find(|w| w.id == b).unwrap().rect;
+        assert_eq!(before, after);
     }
 }
