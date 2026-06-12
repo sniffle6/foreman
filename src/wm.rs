@@ -802,6 +802,11 @@ pub struct WindowManager {
     /// consults it (the leader state machine runs there); child managers carry a
     /// default and never read it.
     keymap: Keymap,
+    /// The tiling tree: windows whose ids are leaves are *tiled* and take their
+    /// rect from `tree.layout()` each frame. Everything else floats.
+    tree: crate::layout::LayoutTree,
+    /// tmux-style zoom: render this window full-area on top, tree untouched.
+    zoomed: Option<WinId>,
 }
 
 impl WindowManager {
@@ -828,6 +833,8 @@ impl WindowManager {
             last_focused: None,
             last_area: egui::vec2(0.0, 0.0),
             keymap: Keymap::default(),
+            tree: Default::default(),
+            zoomed: None,
         }
     }
 
@@ -1853,8 +1860,19 @@ impl WindowManager {
         }
     }
 
+    /// Pull `id` out of the tiled layer entirely: drop its tree leaf (siblings
+    /// absorb the space) and clear zoom if it was the zoomed window. Safe no-op
+    /// for floating windows. Call before any close/minimize/merge-consume/tear-out.
+    fn detach(&mut self, id: WinId) {
+        self.tree.remove(id);
+        if self.zoomed == Some(id) {
+            self.zoomed = None;
+        }
+    }
+
     /// Remove an entire window (all of its tabs) and fix up focus.
     fn close(&mut self, id: WinId) {
+        self.detach(id);
         self.windows.retain(|w| w.id != id);
         if self.focused == Some(id) {
             self.focused = self.last_focused.take();
@@ -1912,6 +1930,7 @@ impl WindowManager {
         };
         // Remove the source first; recompute the destination index afterwards
         // since removal may shift it.
+        self.detach(src);
         let src_win = self.windows.remove(si);
         let di = self.windows.iter().position(|w| w.id == dst).unwrap_or(di);
         let dst_win = &mut self.windows[di];
@@ -2292,6 +2311,19 @@ impl WindowManager {
             .collect();
         order.sort_by_key(|&i| self.windows[i].z);
 
+        let placements: std::collections::HashMap<WinId, egui::Rect> = self
+            .tree
+            .layout(egui::Rect::from_min_size(egui::Pos2::ZERO, asz), SNAP_GAP)
+            .into_iter()
+            .collect();
+        // zoomed window renders last (on top of the tiles)
+        if let Some(zid) = self.zoomed {
+            if let Some(pos) = order.iter().position(|&i| self.windows[i].id == zid) {
+                let v = order.remove(pos);
+                order.push(v);
+            }
+        }
+
         let mut acts: Vec<Act> = vec![];
         // overlay rect (screen coords) for the snap zone of the window being dragged
         let mut snap_overlay: Option<egui::Rect> = None;
@@ -2317,15 +2349,22 @@ impl WindowManager {
             // drawn this frame. The active tab is pumped by its own render below.
             self.windows[i].keepalive_inactive();
 
-            // Re-fit to the (possibly resized) area every frame: snapped/maximized
-            // windows recompute to the new size; floating windows clamp back in.
-            // This also confines freshly-created windows whose default size is
-            // bigger than the area (e.g. a terminal spawned inside a small project).
+            // Re-fit to the (possibly resized) area every frame: tiled windows take
+            // their rect from the layout tree; snapped/maximized windows recompute to
+            // the new size; floating windows clamp back in.
+            let is_tiled = placements.contains_key(&id);
             {
+                let zoomed = self.zoomed;
                 let w = &mut self.windows[i];
-                match w.snap {
-                    Some(z) => w.rect = zone_rect(z, asz, self.split),
-                    None => clamp(&mut w.rect, asz),
+                if zoomed == Some(w.id) {
+                    w.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, asz).shrink(SNAP_GAP);
+                } else if let Some(r) = placements.get(&w.id) {
+                    w.rect = *r;
+                } else {
+                    match w.snap {
+                        Some(z) => w.rect = zone_rect(z, asz, self.split),
+                        None => clamp(&mut w.rect, asz),
+                    }
                 }
             }
             let mut scr = self.windows[i].rect.translate(area.min.to_vec2());
@@ -2483,7 +2522,7 @@ impl WindowManager {
             // --- paint window ---
             // Snapped/maximized windows square their corners so they tile flush to
             // the area edges and to each other (rounded corners would leave gaps).
-            let cr = if self.windows[i].snap.is_some() {
+            let cr = if is_tiled || self.zoomed == Some(id) || self.windows[i].snap.is_some() {
                 egui::CornerRadius::ZERO
             } else {
                 egui::CornerRadius::same(6)
@@ -3161,6 +3200,7 @@ impl WindowManager {
                     }
                 }
                 Act::Min(id) => {
+                    self.detach(id);
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         w.minimized = true;
                     }
