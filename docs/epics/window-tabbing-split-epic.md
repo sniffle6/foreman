@@ -1,5 +1,13 @@
 # Epic — Window Tabbing + Split (floating model)
 
+> **PARTIALLY SUPERSEDED (2026-06-11):** §1's "we are NOT building a BSP tile
+> tree" was reversed by the user — foreman now has a real layout tree with two
+> window states (tiled + floating); see `docs/tiling-tree.md` and
+> `docs/superpowers/plans/2026-06-11-tree-floating-windows.md`. The tab-stack
+> primitive (Phase 1) shipped and still describes live behavior; the zone-snap
+> specifics in Phases 2–3 (`Zone`, snap-on-collision, `compose_zone`) no longer
+> exist — split/move now operate on the tree.
+
 **Status:** designed, not started. Builds on the keyboard-control epic (leader +
 data-driven keymap already shipped). Phases are independent sessions, in order:
 **tabs → split → rebind** (split needs the tab primitive; the binding rework is a

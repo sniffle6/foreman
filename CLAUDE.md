@@ -47,15 +47,24 @@ and nested inside each project. Each project window's content is another
 are confined to their project. Focus cascades so exactly one terminal reads the
 keyboard. Window rects are **local** (relative to each manager's `area`).
 
-**Tabs** are a generic `Win` property restricted by *level, not zone*: any window
-can tab onto any other in the **same** `WindowManager` (so projects tab with
-projects, terminals with terminals). A one-tab stack is a normal window; dragging
-a tab out untabs it. **Split** (`Alt+WASD`) makes a new terminal, snaps it to the
-pointed zone, and tabs it onto the occupant if that zone is taken.
+**Two window states**: every window is either **tiled** (a leaf in the manager's
+`LayoutTree` of recursive H/V splits — `src/layout.rs`) or **floating**. Drag a
+header to tear a tile out; drop hints (leaf edge = split, leaf center = tab,
+area edge = root split) re-insert it. Leader `WASD` moves in the tree,
+`Alt+WASD` splits a new terminal in, `F`/`Ctrl+F` toggles float, `Z` zooms
+(overlay — the tree is untouched). New windows tile by default. Full doc:
+`docs/tiling-tree.md`.
+
+**Tabs** are a generic `Win` property restricted by *level*: any window can tab
+onto any other in the **same** `WindowManager` (so projects tab with projects,
+terminals with terminals). A one-tab stack is a normal window; dragging a tab
+out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
 
 - `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
 - `src/wm.rs` — the reusable window engine: drag/focus/z-order/min/max/resize/
-  close/snap, `Win`, `Content`, `Zone`/snap logic, per-frame re-fit.
+  close, `Win` (tab stack), `Content`, tree integration, per-frame re-fit.
+- `src/layout.rs` — the tiling tree (pure, unit-tested): insert/remove/layout/
+  drop targets/divider resize.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
   selection/clipboard, key routing, grid render.
 - `src/dirpicker.rs` — keyboard-driven project directory picker.
@@ -73,9 +82,10 @@ pointed zone, and tabs it onto the occupant if that zone is taken.
   when behavior changes, then rebuild to propagate. Best-effort — failures are
   logged, never block launch.
 
-Subsystem docs: `docs/project-directories.md`,
+Subsystem docs: `docs/tiling-tree.md` (two-state windows + layout tree),
+`docs/project-directories.md`,
 `docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
-`docs/epics/window-tabbing-split-epic.md` (tab-stacks + Alt+WASD split).
+`docs/epics/window-tabbing-split-epic.md` (tab-stacks; zone parts superseded).
 (`docs/foreman.md` is older narrative notes — prefer HANDOFF.md on any conflict.)
 
 ## Working agreement

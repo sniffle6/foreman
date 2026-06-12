@@ -46,16 +46,19 @@ as distinct.
 - **Window manager** (shared engine, used at desktop + project levels):
   - drag by titlebar, click-to-focus + raise (z-order), minimize→taskbar→restore,
     maximize/restore, resize (corner), close. Confined to the area.
-  - **Snap zones / split**: drag to an edge/corner → amber overlay → release to
-    snap. Left/right = side halves, **top = top-half, bottom = bottom-half**
-    (vertical stacking), corners = quarters.
-  - **Hold-to-maximize**: hold in the top zone ~0.6s and the overlay **grows from
-    top-half to full**, committing a maximize on release; quick drop = top-half.
-    Consts `TOP_HOLD` / `GROW_LEAD` in `wm.rs`.
-  - **Per-frame re-fit**: every window re-fits to its area each frame, so windows
-    are confined on creation AND everything reflows when the OS window resizes
-    (snapped/maximized recompute; floating clamp in). Snap state is
-    `Win.snap: Option<Zone>`.
+  - **Two window states — tiled + floating** (replaced the old 9-zone snap):
+    each manager owns a `LayoutTree` (`src/layout.rs`) of recursive H/V splits
+    with ratios; windows whose ids are tree leaves are tiled, everything else
+    floats. Drag a header to tear a tile out; while dragging, leaf edges show
+    split hints, leaf centers tab-merge, area edge bands split the root.
+    Leader `WASD` moves within the tree, `Alt+WASD` splits, `F`/`Ctrl+F`
+    toggles float. New windows tile by default (chat viewer stays floating).
+    Full doc: `docs/tiling-tree.md`.
+  - **Zoom (tmux-style)**: `Z` / titlebar max renders the window full-area on
+    top; the tree underneath is untouched (`WindowManager.zoomed`).
+  - **Per-frame re-fit**: every window re-fits each frame — tiled rects come
+    from `tree.layout()`, floating windows clamp into the area — so everything
+    reflows when the OS window resizes.
 - **Nesting**: desktop hosts **project** windows; each project is a nested
   `WindowManager` (`Content::Project(Box<WindowManager>)`) of terminals. Focus
   cascades so exactly ONE terminal (the focused one in the focused project) reads
@@ -74,11 +77,13 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
   `selection_text`, `cell_at`), `read_input` (keys + clipboard), `show(ui, rect,
   active, resp)` renders the grid + cursor + selection highlight. `read_clipboard`
   uses `arboard`; copy uses `ctx.copy_text`.
-- `src/wm.rs` — the reusable window engine. `WindowManager { windows, z, focused,
-  next, dwell_zone, dwell_start }`, `Win { id, title, rect (LOCAL coords), z,
-  minimized, snap: Option<Zone>, prev, content }`, `Content::{Terminal, Project}`.
-  `Zone` + `detect_zone` + `zone_rect` + `resolve_zone` (the hold-to-max logic) +
-  `clamp`. `show(ui, area, active, base)` is the whole thing.
+- `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
+  zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
+  z, minimized, prev }`, `Content::{Terminal, Project, Chat}`.
+  `show(ui, area, active, base)` is the whole thing.
+- `src/layout.rs` — the tiling tree (pure data + math, unit-tested): insert /
+  remove / rect layout / drop targets / divider resize. See
+  `docs/tiling-tree.md`.
 - `src/main.rs` — eframe `App`: toolbar (`+ project`, `+ terminal in project`) +
   the desktop `WindowManager`.
 - `src/skills_install.rs` — embeds and best-effort installs the

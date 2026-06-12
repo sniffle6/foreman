@@ -218,3 +218,12 @@ gotchas below.
 `bash` runs via `wsl.exe`. If it shows "WSL2 is not supported… enable Virtual
 Machine Platform", that's a Windows setup step (enable the feature + CPU
 virtualization in BIOS), not an app bug.
+
+## Tiling tree + floating (2026-06-11)
+
+Windows now have two states: tiled (a leaf in a recursive split tree per
+manager, i3-style — arbitrary ratios, no more 9-zone halves/quarters) or
+floating. Header-drag tears a tile out; drop hints re-insert (edge = split,
+center = tab-merge, area edge = root split). Leader WASD moves in the tree,
+Alt+WASD splits, F toggles float, Z zooms as an overlay. New windows tile by
+default. Details: `docs/tiling-tree.md`.
