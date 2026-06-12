@@ -24,7 +24,7 @@
 
 ## Branch / worktree
 
-Current branch `feature/agent-dispatch` has the user's uncommitted in-progress work (`src/terminal.rs`, `docs/terminal-selection.md`) — **do not touch it**. Execute this plan on a new branch `feature/tiling-tree` cut from `main`, in an isolated worktree (use superpowers:using-git-worktrees at execution start).
+Executing on branch `feature/tiling-tree` in the worktree `.claude/worktrees/tiling-tree`, based on `feature/agent-dispatch` HEAD (`0d8e580`) — NOT `main`: main lacks the chat/dispatch wm.rs code this plan's anchors were read from, and basing on main would have made the eventual merge a conflict factory. This branch must land after (or be merged into) `feature/agent-dispatch`. The user's uncommitted WIP in the main checkout (`src/terminal.rs`, `docs/terminal-selection.md`) is not included — **do not touch it**.
 
 ## Build / test loop (Windows, PowerShell, GNU toolchain)
 
