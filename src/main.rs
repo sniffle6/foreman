@@ -2,6 +2,7 @@ mod chat;
 mod control;
 mod dirpicker;
 mod keymap;
+mod layout;
 mod settings;
 mod skills_install;
 mod terminal;
