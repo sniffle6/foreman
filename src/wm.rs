@@ -2200,9 +2200,9 @@ impl WindowManager {
             // drawn this frame. The active tab is pumped by its own render below.
             self.windows[i].keepalive_inactive();
 
-            // Re-fit to the (possibly resized) area every frame: tiled windows take
-            // their rect from the layout tree; snapped/maximized windows recompute to
-            // the new size; floating windows clamp back in.
+            // Re-fit to the (possibly resized) area every frame: the zoomed window
+            // takes the full area, tiled windows take their rect from the layout
+            // tree, floating windows clamp back in.
             let is_tiled = placements.contains_key(&id);
             {
                 let zoomed = self.zoomed;
@@ -2733,9 +2733,9 @@ impl WindowManager {
             // --- resize: 8 invisible bands around the frame (4 edges + 4 corners) ---
             // Registered last so they take pointer priority over content/title in the
             // thin RESIZE_BAND frame. Floating windows resize freely on any edge; a
-            // snapped window's INTERIOR edge (shared with a neighbour) drags the tiling
-            // divider so both tiles resize together, while an OUTER edge pops it back to
-            // floating. Corners that touch any outer edge also pop to floating.
+            // tiled window's interior edge (shared with a neighbour) drags the tree
+            // divider so the tiles resize together, while outer edges are inert
+            // (tear-out lives on the header drag). Zoomed windows don't resize.
             let bnd = RESIZE_BAND;
             let (x0, y0, x1, y1) = (scr.min.x, scr.min.y, scr.max.x, scr.max.y);
             type Ci = egui::CursorIcon;
@@ -2829,7 +2829,21 @@ impl WindowManager {
             for (key, hr, hl, hrr, ht, hb, cursor) in handles {
                 let resp = ui.interact(hr, base.with((id, "rsz", key)), egui::Sense::drag());
                 if resp.hovered() || resp.dragged() {
-                    ui.ctx().set_cursor_icon(cursor);
+                    // Only advertise a resize that can actually happen: tiled
+                    // windows resize on interior dividers only; zoomed never.
+                    let usable = if self.zoomed == Some(id) {
+                        false
+                    } else if self.tree.contains(id) {
+                        (hl && self.tree.has_divider(id, Dir::Left))
+                            || (hrr && self.tree.has_divider(id, Dir::Right))
+                            || (ht && self.tree.has_divider(id, Dir::Up))
+                            || (hb && self.tree.has_divider(id, Dir::Down))
+                    } else {
+                        true
+                    };
+                    if usable {
+                        ui.ctx().set_cursor_icon(cursor);
+                    }
                 }
                 if resp.drag_started() {
                     acts.push(Act::Focus(id));

@@ -338,6 +338,40 @@ impl LayoutTree {
         true
     }
 
+    /// Whether leaf `id` has a draggable divider on `edge` — i.e. some ancestor
+    /// split runs on that axis and the edge is interior there. The resize-handle
+    /// cursor only advertises edges where this is true (outer edges are inert).
+    pub fn has_divider(&self, id: WinId, edge: Dir) -> bool {
+        let axis = SplitDir::of(edge);
+        fn holds(n: &Node, id: WinId) -> bool {
+            match n {
+                Node::Leaf(w) => *w == id,
+                Node::Split { children, .. } => children.iter().any(|c| holds(c, id)),
+            }
+        }
+        // None = subtree doesn't contain `id`; Some(found) = contains it, and
+        // `found` says whether a matching interior divider exists at or below.
+        fn go(n: &Node, id: WinId, edge: Dir, axis: SplitDir) -> Option<bool> {
+            let Node::Split { dir, children, .. } = n else {
+                return matches!(n, Node::Leaf(w) if *w == id).then_some(false);
+            };
+            let idx = children.iter().position(|c| holds(c, id))?;
+            if go(&children[idx], id, edge, axis) == Some(true) {
+                return Some(true);
+            }
+            let interior = *dir == axis
+                && match edge {
+                    Dir::Left | Dir::Up => idx > 0,
+                    Dir::Right | Dir::Down => idx < children.len() - 1,
+                };
+            Some(interior)
+        }
+        self.root
+            .as_ref()
+            .and_then(|r| go(r, id, edge, axis))
+            .unwrap_or(false)
+    }
+
     /// Drag the divider on `edge` of leaf `id` by `delta_px`. Resolves to the
     /// deepest ancestor split running on that axis where the edge is interior;
     /// outer edges (no such divider) return false. Both affected ratios are
@@ -679,5 +713,22 @@ mod tests {
         let p = t.layout(area(), 8.0);
         let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
         assert!(r2.width() >= 976.0 * MIN_RATIO - 0.5); // clamped, not crushed
+    }
+
+    #[test]
+    fn has_divider_reflects_interior_edges_only() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Right); // [1 | 2]
+        assert!(t.has_divider(1, Dir::Right));
+        assert!(t.has_divider(2, Dir::Left));
+        assert!(!t.has_divider(1, Dir::Left)); // outer
+        assert!(!t.has_divider(1, Dir::Up)); // no V split anywhere
+        assert!(!t.has_divider(99, Dir::Left)); // not in tree
+        t.insert_split(2, 3, Dir::Down); // right column = V[2, 3]
+        assert!(t.has_divider(2, Dir::Down));
+        assert!(t.has_divider(3, Dir::Up));
+        assert!(t.has_divider(3, Dir::Left)); // column's left edge is the root divider
+        assert!(!t.has_divider(3, Dir::Right)); // outer
     }
 }
