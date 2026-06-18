@@ -29,7 +29,7 @@ pub enum Node {
     Leaf(WinId),
     Split {
         dir: SplitDir,
-        ratios: Vec<f32>,   // same length as children, sums to 1.0
+        ratios: Vec<f32>, // same length as children, sums to 1.0
         children: Vec<Node>,
     },
 }
@@ -91,7 +91,11 @@ impl LayoutTree {
                     Dir::Left | Dir::Up => vec![new_leaf, old],
                     Dir::Right | Dir::Down => vec![old, new_leaf],
                 };
-                Node::Split { dir: SplitDir::of(side), ratios: vec![0.5, 0.5], children }
+                Node::Split {
+                    dir: SplitDir::of(side),
+                    ratios: vec![0.5, 0.5],
+                    children,
+                }
             }
         });
     }
@@ -103,7 +107,12 @@ impl LayoutTree {
     /// isn't in the tree. On an empty tree the new leaf becomes the root.
     pub fn insert_split(&mut self, target: WinId, id: WinId, side: Dir) -> bool {
         fn go(n: &mut Node, target: WinId, id: WinId, side: Dir) -> bool {
-            if let Node::Split { dir, ratios, children } = n {
+            if let Node::Split {
+                dir,
+                ratios,
+                children,
+            } = n
+            {
                 if *dir == SplitDir::of(side) {
                     if let Some(idx) = children
                         .iter()
@@ -129,7 +138,11 @@ impl LayoutTree {
                     Dir::Left | Dir::Up => vec![new_leaf, old],
                     Dir::Right | Dir::Down => vec![old, new_leaf],
                 };
-                *n = Node::Split { dir: SplitDir::of(side), ratios: vec![0.5, 0.5], children };
+                *n = Node::Split {
+                    dir: SplitDir::of(side),
+                    ratios: vec![0.5, 0.5],
+                    children,
+                };
                 return true;
             }
             false
@@ -154,7 +167,11 @@ impl LayoutTree {
                     None
                 }
                 Node::Leaf(w) => Some(Node::Leaf(w)),
-                Node::Split { dir, ratios, children } => {
+                Node::Split {
+                    dir,
+                    ratios,
+                    children,
+                } => {
                     let mut kept_c: Vec<Node> = Vec::new();
                     let mut kept_r: Vec<f32> = Vec::new();
                     for (c, r) in children.into_iter().zip(ratios) {
@@ -172,9 +189,11 @@ impl LayoutTree {
                             let mut flat_r: Vec<f32> = Vec::new();
                             for (c, r) in kept_c.into_iter().zip(kept_r) {
                                 match c {
-                                    Node::Split { dir: cd, ratios: cr, children: cc }
-                                        if cd == dir =>
-                                    {
+                                    Node::Split {
+                                        dir: cd,
+                                        ratios: cr,
+                                        children: cc,
+                                    } if cd == dir => {
                                         for (gc, gr) in cc.into_iter().zip(cr) {
                                             flat_c.push(gc);
                                             flat_r.push(gr * r);
@@ -190,7 +209,11 @@ impl LayoutTree {
                             for r in &mut flat_r {
                                 *r /= total;
                             }
-                            Some(Node::Split { dir, ratios: flat_r, children: flat_c })
+                            Some(Node::Split {
+                                dir,
+                                ratios: flat_r,
+                                children: flat_c,
+                            })
                         }
                     }
                 }
@@ -208,7 +231,11 @@ impl LayoutTree {
         fn walk(n: &Node, r: egui::Rect, gap: f32, out: &mut Vec<(WinId, egui::Rect)>) {
             match n {
                 Node::Leaf(w) => out.push((*w, r)),
-                Node::Split { dir, ratios, children } => {
+                Node::Split {
+                    dir,
+                    ratios,
+                    children,
+                } => {
                     let gaps = gap * (children.len() - 1) as f32;
                     match dir {
                         SplitDir::H => {
@@ -249,7 +276,12 @@ impl LayoutTree {
     }
 
     /// The leaf whose rect (expanded to cover half the gap) contains `p`.
-    pub fn hit_leaf(&self, p: egui::Pos2, area: egui::Rect, gap: f32) -> Option<(WinId, egui::Rect)> {
+    pub fn hit_leaf(
+        &self,
+        p: egui::Pos2,
+        area: egui::Rect,
+        gap: f32,
+    ) -> Option<(WinId, egui::Rect)> {
         self.layout(area, gap)
             .into_iter()
             .find(|(_, r)| r.expand(gap * 0.5 + 1.0).contains(p))
@@ -258,7 +290,12 @@ impl LayoutTree {
     /// What inserting a window at `p` would do, plus the hint rect to paint.
     /// Precedence: area edge band (root split) → leaf center (tab) → leaf
     /// nearest-edge (split). Empty tree: edge band makes the first tile.
-    pub fn drop_target(&self, p: egui::Pos2, area: egui::Rect, gap: f32) -> Option<(DropTarget, egui::Rect)> {
+    pub fn drop_target(
+        &self,
+        p: egui::Pos2,
+        area: egui::Rect,
+        gap: f32,
+    ) -> Option<(DropTarget, egui::Rect)> {
         const EDGE: f32 = 0.085; // same band feel as the old detect_zone
         let fx = (p.x - area.min.x) / area.width();
         let fy = (p.y - area.min.y) / area.height();
@@ -272,10 +309,18 @@ impl LayoutTree {
         }
         let half = |side: Dir| -> egui::Rect {
             match side {
-                Dir::Left => egui::Rect::from_min_max(inner.min, egui::pos2(inner.center().x, inner.max.y)),
-                Dir::Right => egui::Rect::from_min_max(egui::pos2(inner.center().x, inner.min.y), inner.max),
-                Dir::Up => egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.center().y)),
-                Dir::Down => egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.center().y), inner.max),
+                Dir::Left => {
+                    egui::Rect::from_min_max(inner.min, egui::pos2(inner.center().x, inner.max.y))
+                }
+                Dir::Right => {
+                    egui::Rect::from_min_max(egui::pos2(inner.center().x, inner.min.y), inner.max)
+                }
+                Dir::Up => {
+                    egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.center().y))
+                }
+                Dir::Down => {
+                    egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.center().y), inner.max)
+                }
             }
         };
         if fx < EDGE {
@@ -396,7 +441,12 @@ impl LayoutTree {
             gap: f32,
             addr: Vec<usize>,
         ) -> Option<(Vec<usize>, usize, f32)> {
-            let Node::Split { dir, ratios, children } = n else {
+            let Node::Split {
+                dir,
+                ratios,
+                children,
+            } = n
+            else {
                 return None;
             };
             fn holds(n: &Node, id: WinId) -> bool {
@@ -447,10 +497,14 @@ impl LayoutTree {
         // Pass 2: descend by address and adjust the two ratios.
         let mut node = self.root.as_mut().unwrap();
         for i in addr {
-            let Node::Split { children, .. } = node else { unreachable!() };
+            let Node::Split { children, .. } = node else {
+                unreachable!()
+            };
             node = &mut children[i];
         }
-        let Node::Split { ratios, .. } = node else { unreachable!() };
+        let Node::Split { ratios, .. } = node else {
+            unreachable!()
+        };
         let (a, b) = match edge {
             Dir::Left | Dir::Up => (idx - 1, idx),
             Dir::Right | Dir::Down => (idx, idx + 1),
@@ -512,7 +566,11 @@ mod tests {
         t.insert_split(1, 2, Dir::Right); // H split: [1, 2]
         t.insert_split(2, 3, Dir::Right); // same axis: [1, 2, 3], NOT nested
         match t.root.as_ref().unwrap() {
-            Node::Split { dir, ratios, children } => {
+            Node::Split {
+                dir,
+                ratios,
+                children,
+            } => {
                 assert_eq!(*dir, SplitDir::H);
                 assert_eq!(children.len(), 3);
                 assert!((ratios[0] - 0.5).abs() < 1e-4);
@@ -627,11 +685,17 @@ mod tests {
     fn drop_target_center_tabs_edges_split() {
         let mut t = LayoutTree::default();
         t.insert_root(1, Dir::Right);
-        let (tgt, _) = t.drop_target(egui::pos2(500.0, 400.0), area(), 8.0).unwrap();
+        let (tgt, _) = t
+            .drop_target(egui::pos2(500.0, 400.0), area(), 8.0)
+            .unwrap();
         assert_eq!(tgt, DropTarget::Tab(1));
-        let (tgt, _) = t.drop_target(egui::pos2(200.0, 400.0), area(), 8.0).unwrap();
+        let (tgt, _) = t
+            .drop_target(egui::pos2(200.0, 400.0), area(), 8.0)
+            .unwrap();
         assert_eq!(tgt, DropTarget::Split(1, Dir::Left));
-        let (tgt, _) = t.drop_target(egui::pos2(500.0, 700.0), area(), 8.0).unwrap();
+        let (tgt, _) = t
+            .drop_target(egui::pos2(500.0, 700.0), area(), 8.0)
+            .unwrap();
         assert_eq!(tgt, DropTarget::Split(1, Dir::Down));
     }
 
@@ -641,14 +705,19 @@ mod tests {
         t.insert_root(1, Dir::Right);
         let (tgt, _) = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
         assert_eq!(tgt, DropTarget::Root(Dir::Left));
-        let (tgt, _) = t.drop_target(egui::pos2(500.0, 795.0), area(), 8.0).unwrap();
+        let (tgt, _) = t
+            .drop_target(egui::pos2(500.0, 795.0), area(), 8.0)
+            .unwrap();
         assert_eq!(tgt, DropTarget::Root(Dir::Down));
     }
 
     #[test]
     fn drop_target_on_empty_tree_uses_edge_band_only() {
         let t = LayoutTree::default();
-        assert!(t.drop_target(egui::pos2(500.0, 400.0), area(), 8.0).is_none()); // center: nothing
+        assert!(
+            t.drop_target(egui::pos2(500.0, 400.0), area(), 8.0)
+                .is_none()
+        ); // center: nothing
         let (tgt, hint) = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
         assert!(matches!(tgt, DropTarget::Root(_)));
         assert!((hint.width() - 984.0).abs() < 0.01); // full inner area
@@ -708,8 +777,8 @@ mod tests {
         t.insert_root(1, Dir::Right);
         t.insert_split(1, 2, Dir::Right);
         assert!(!t.resize_edge(1, Dir::Left, 50.0, area(), 8.0)); // 1 owns no left divider
-        assert!(!t.resize_edge(1, Dir::Up, 50.0, area(), 8.0));   // no vertical split at all
-        t.resize_edge(1, Dir::Right, 100_000.0, area(), 8.0);     // absurd drag
+        assert!(!t.resize_edge(1, Dir::Up, 50.0, area(), 8.0)); // no vertical split at all
+        t.resize_edge(1, Dir::Right, 100_000.0, area(), 8.0); // absurd drag
         let p = t.layout(area(), 8.0);
         let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
         assert!(r2.width() >= 976.0 * MIN_RATIO - 0.5); // clamped, not crushed
