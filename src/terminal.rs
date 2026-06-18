@@ -16,6 +16,12 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 pub const FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 pub const BG: egui::Color32 = egui::Color32::from_rgb(20, 18, 15);
 
+/// Set by every PTY reader thread when it delivers output. The render loop reads
+/// and clears it each frame to keep a fast repaint cadence while any terminal is
+/// active, then fall back to a slow idle tick. Coarse on purpose — it only drives
+/// frame scheduling, never correctness.
+pub static PTY_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const PALETTE: [egui::Color32; 16] = [
     egui::Color32::from_rgb(43, 40, 36),
     egui::Color32::from_rgb(207, 91, 72),
@@ -311,6 +317,7 @@ impl Session {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
+                        PTY_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed);
                         ctx.request_repaint();
                     }
                 }

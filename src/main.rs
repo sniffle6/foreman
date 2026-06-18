@@ -21,6 +21,9 @@ struct App {
     chrome_hot_since: Option<f64>,
     /// Agent-dispatch requests from the control pipe thread.
     ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
+    /// Last time anything happened (input, PTY output, control msg). Drives the
+    /// adaptive repaint cadence: fast while recently active, slow when idle.
+    last_activity: Option<std::time::Instant>,
 }
 impl App {
     fn new(ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>) -> Self {
@@ -30,6 +33,7 @@ impl App {
             chrome_open: false,
             chrome_hot_since: None,
             ctrl,
+            last_activity: None,
         }
     }
 }
@@ -320,10 +324,12 @@ impl eframe::App for App {
             self.started = true;
         }
 
+        let mut ctrl_activity = false;
         while let Ok(msg) = self.ctrl.try_recv() {
             // Drops server-abandoned requests and undoes orphaned spawns; see
             // WindowManager::handle_ctrl for the reply-timeout contract.
             self.desktop.handle_ctrl(msg, &ctx);
+            ctrl_activity = true;
         }
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -337,10 +343,24 @@ impl eframe::App for App {
 
         self.show_os_chrome(&ctx);
 
-        // Also keeps the control-pipe drain alive: serve() has no Context to
-        // wake us, so dispatch latency rides on this unconditional repaint.
-        // If repainting ever becomes event-driven, hand serve() a Context.
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Adaptive repaint cadence. Reader threads call ctx.request_repaint() on
+        // every PTY chunk; that proxy-driven wake is immediate (~0.2ms) and
+        // carries the fast path for echoes. The timer below is only a backstop +
+        // control-pipe drain (serve() has no Context to wake us). Windows' ~15.6ms
+        // default timer granularity floors any request_repaint_after under it, so
+        // a tight value here just means "as soon as the OS allows"; we stay hot
+        // for a short tail after activity, then idle slowly to avoid pinning the
+        // CPU at 60fps across many terminals.
+        let pty = terminal::PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let input = ctx.input(|i| !i.events.is_empty());
+        if pty || input || ctrl_activity {
+            self.last_activity = Some(std::time::Instant::now());
+        }
+        let hot = self
+            .last_activity
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250));
+        let cadence = if hot { 4 } else { 100 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(cadence));
     }
 }
 
