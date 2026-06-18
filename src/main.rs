@@ -351,7 +351,7 @@ impl eframe::App for App {
         // here just means "as soon as the OS allows"; we stay hot for a short tail
         // after activity, then idle slowly to avoid pinning 60fps across many
         // terminals.
-        let pty = terminal::PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let pty = terminal::take_pty_output();
         let input = ctx.input(|i| !i.events.is_empty());
         if pty || input || ctrl_activity {
             self.last_activity = Some(std::time::Instant::now());
