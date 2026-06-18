@@ -181,7 +181,7 @@ pub enum CtrlMsg {
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
 /// GUI drains `tx`'s receiver each frame. One JSON line in, one JSON line out,
 /// per connection.
-pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
+pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) {
     let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else {
         return;
     };
@@ -235,6 +235,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
                 if tx.send(m).is_err() {
                     return; // GUI gone; stop serving
                 }
+                // Wake the (possibly idle) render loop so it drains this message
+                // and replies now, instead of waiting for the idle repaint tick.
+                ctx.request_repaint();
                 rrx.recv_timeout(REPLY_TIMEOUT)
                     .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
             }
@@ -786,7 +789,7 @@ mod tests {
         let pipe = format!("foreman-test-close-{}", std::process::id());
         let (tx, rx) = std::sync::mpsc::channel();
         let p2 = pipe.clone();
-        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
         std::thread::spawn(move || {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
                 CtrlMsg::Close(req, reply, _) => {
@@ -858,7 +861,7 @@ mod tests {
         let pipe = format!("foreman-test-status-{}", std::process::id());
         let (tx, rx) = std::sync::mpsc::channel();
         let p2 = pipe.clone();
-        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
         std::thread::spawn(move || {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
                 CtrlMsg::Status(req, reply, _) => {
@@ -975,7 +978,7 @@ mod tests {
         let pipe = format!("foreman-test-verb-{}", std::process::id());
         let (tx, _rx) = std::sync::mpsc::channel();
         let p2 = pipe.clone();
-        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
         let req = OpenRequest {
             cmd: "frobnicate".into(),
             project: None,
@@ -1004,7 +1007,7 @@ mod tests {
         let pipe = format!("foreman-test-{}", std::process::id());
         let (tx, rx) = std::sync::mpsc::channel();
         let p2 = pipe.clone();
-        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
         // Fake GUI thread: answer the first request.
         std::thread::spawn(move || {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
@@ -1188,7 +1191,7 @@ mod tests {
         let pipe = format!("foreman-test-chat-{}", std::process::id());
         let (tx, rx) = std::sync::mpsc::channel();
         let p2 = pipe.clone();
-        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
         std::thread::spawn(move || {
             match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
                 CtrlMsg::Chat(req, reply, _) => {

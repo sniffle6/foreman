@@ -343,14 +343,14 @@ impl eframe::App for App {
 
         self.show_os_chrome(&ctx);
 
-        // Adaptive repaint cadence. Reader threads call ctx.request_repaint() on
-        // every PTY chunk; that proxy-driven wake is immediate (~0.2ms) and
-        // carries the fast path for echoes. The timer below is only a backstop +
-        // control-pipe drain (serve() has no Context to wake us). Windows' ~15.6ms
-        // default timer granularity floors any request_repaint_after under it, so
-        // a tight value here just means "as soon as the OS allows"; we stay hot
-        // for a short tail after activity, then idle slowly to avoid pinning the
-        // CPU at 60fps across many terminals.
+        // Adaptive repaint cadence. The real fast paths are all event-driven and
+        // immediate (~0.2ms): reader threads request_repaint() on every PTY chunk,
+        // serve() does the same on every dispatch, and winit wakes us on input.
+        // The timer below is only an idle backstop. Windows' ~15.6ms default timer
+        // granularity floors any request_repaint_after under it, so a tight value
+        // here just means "as soon as the OS allows"; we stay hot for a short tail
+        // after activity, then idle slowly to avoid pinning 60fps across many
+        // terminals.
         let pty = terminal::PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed);
         let input = ctx.input(|i| !i.events.is_empty());
         if pty || input || ctrl_activity {
@@ -395,7 +395,6 @@ fn main() -> eframe::Result {
     install_panic_logger();
     skills_install::install();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || control::serve(control::PIPE, tx));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -405,6 +404,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Foreman",
         opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(rx)))),
+        Box::new(move |cc| {
+            // Spawn the control server here (not before run_native) so it can hold
+            // the egui Context and wake the render loop the instant a dispatch
+            // arrives, rather than waiting on the idle repaint tick.
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
+            Ok(Box::new(App::new(rx)))
+        }),
     )
 }
