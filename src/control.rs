@@ -164,6 +164,8 @@ pub fn parse_open_args(
 use interprocess::ConnectWaitMode;
 use interprocess::local_socket::{ConnectOptions, GenericNamespaced, ListenerOptions, prelude::*};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 /// One control request, the channel the GUI thread answers on, and when the
@@ -194,57 +196,79 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
             return;
         }
     };
+    // Each connection is handled on its own short-lived thread: read the request,
+    // hand it to the GUI, wait for the reply, write it back. A client that
+    // connects and stalls — or a slow GUI reply — then blocks only its own thread,
+    // never dispatch for everyone else (the flaw the single-threaded loop had).
+    // MAX_INFLIGHT bounds concurrent handlers so a flood of stalled clients can't
+    // spawn threads without limit; over the cap we reject fast. interprocess' sync
+    // stream exposes no clean read timeout, so a wedged handler is reclaimed only
+    // when its client goes away — acceptable because the cap bounds the leak.
+    const MAX_INFLIGHT: usize = 64;
+    let inflight = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let mut conn = BufReader::new(conn);
-        let mut line = String::new();
-        // No read timeout: a client that connects and never sends a newline
-        // parks this loop, serializing the (single-threaded) pipe. The GUI is
-        // unaffected — only dispatch stalls. Accepted for v1; revisit if a
-        // wedged client ever shows up in practice.
-        if conn.read_line(&mut line).is_err() {
+        if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+            let mut conn = BufReader::new(conn);
+            let mut out = serde_json::to_string(&OpenReply::err("foreman: control server busy"))
+                .expect("OpenReply is always serializable");
+            out.push('\n');
+            let _ = conn.get_mut().write_all(out.as_bytes());
             continue;
         }
-        #[derive(serde::Deserialize)]
-        struct Verb {
-            cmd: String,
-        }
-        let now = std::time::Instant::now();
-        let (rtx, rrx) = mpsc::channel();
-        let msg = match serde_json::from_str::<Verb>(&line) {
-            Err(e) => Err(format!("bad request: {e}")),
-            Ok(v) => match v.cmd.as_str() {
-                "open" => serde_json::from_str::<OpenRequest>(&line)
-                    .map(|r| CtrlMsg::Open(r, rtx, now))
-                    .map_err(|e| format!("bad request: {e}")),
-                "chat" => serde_json::from_str::<ChatRequest>(&line)
-                    .map(|r| CtrlMsg::Chat(r, rtx, now))
-                    .map_err(|e| format!("bad request: {e}")),
-                "status" => serde_json::from_str::<StatusRequest>(&line)
-                    .map(|r| CtrlMsg::Status(r, rtx, now))
-                    .map_err(|e| format!("bad request: {e}")),
-                "close" => serde_json::from_str::<CloseRequest>(&line)
-                    .map(|r| CtrlMsg::Close(r, rtx, now))
-                    .map_err(|e| format!("bad request: {e}")),
-                other => Err(format!("unknown cmd: {other}")),
-            },
-        };
-        let reply = match msg {
-            Err(e) => OpenReply::err(e),
-            Ok(m) => {
-                if tx.send(m).is_err() {
-                    return; // GUI gone; stop serving
+        inflight.fetch_add(1, Ordering::Relaxed);
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        let inflight = inflight.clone();
+        std::thread::spawn(move || {
+            let mut conn = BufReader::new(conn);
+            let mut line = String::new();
+            if conn.read_line(&mut line).is_ok() {
+                #[derive(serde::Deserialize)]
+                struct Verb {
+                    cmd: String,
                 }
-                // Wake the (possibly idle) render loop so it drains this message
-                // and replies now, instead of waiting for the idle repaint tick.
-                ctx.request_repaint();
-                rrx.recv_timeout(REPLY_TIMEOUT)
-                    .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
+                let now = std::time::Instant::now();
+                let (rtx, rrx) = mpsc::channel();
+                let msg = match serde_json::from_str::<Verb>(&line) {
+                    Err(e) => Err(format!("bad request: {e}")),
+                    Ok(v) => match v.cmd.as_str() {
+                        "open" => serde_json::from_str::<OpenRequest>(&line)
+                            .map(|r| CtrlMsg::Open(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "chat" => serde_json::from_str::<ChatRequest>(&line)
+                            .map(|r| CtrlMsg::Chat(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "status" => serde_json::from_str::<StatusRequest>(&line)
+                            .map(|r| CtrlMsg::Status(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "close" => serde_json::from_str::<CloseRequest>(&line)
+                            .map(|r| CtrlMsg::Close(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        other => Err(format!("unknown cmd: {other}")),
+                    },
+                };
+                let reply = match msg {
+                    Err(e) => OpenReply::err(e),
+                    Ok(m) => {
+                        if tx.send(m).is_err() {
+                            OpenReply::err("foreman is not accepting requests")
+                        } else {
+                            // Wake the (possibly idle) render loop so it drains this
+                            // message and replies now, not on the idle repaint tick.
+                            ctx.request_repaint();
+                            rrx.recv_timeout(REPLY_TIMEOUT)
+                                .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
+                        }
+                    }
+                };
+                let mut out =
+                    serde_json::to_string(&reply).expect("OpenReply is always serializable");
+                out.push('\n');
+                let _ = conn.get_mut().write_all(out.as_bytes());
             }
-        };
-        let mut out = serde_json::to_string(&reply).expect("OpenReply is always serializable");
-        out.push('\n');
-        let _ = conn.get_mut().write_all(out.as_bytes());
+            inflight.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 }
 
