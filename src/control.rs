@@ -31,7 +31,7 @@ pub struct OpenRequest {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenReply {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,17 +49,22 @@ pub struct OpenReply {
     /// replies stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// Per-cell attribute grid for `snapshot --attrs`. None (omitted on the
+    /// wire) unless `--attrs` was requested, so v1 replies stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<Vec<crate::inspect::CellData>>>,
+    /// Cursor position + shape for `snapshot --cursor`. None (omitted on the
+    /// wire) unless `--cursor` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<crate::inspect::CursorInfo>,
 }
 
 impl OpenReply {
     pub fn err(msg: impl Into<String>) -> Self {
         OpenReply {
             ok: false,
-            terminal: None,
-            project: None,
             error: Some(msg.into()),
-            history: None,
-            seq: None,
+            ..Default::default()
         }
     }
 }
@@ -138,7 +143,14 @@ pub struct SendRequest {
     pub settle_ms: Option<u64>,
 }
 
-/// Read the rendered viewport of a terminal as plain text rows.
+/// Serde skip predicate for boolean opt-in flags: omit `false` on the wire so a
+/// plain snapshot request/reply stays byte-identical to v1.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Read the rendered viewport of a terminal. Plain text by default; `attrs` and
+/// `cursor` are opt-ins that attach structured fields to the reply.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRequest {
     pub cmd: String, // always "snapshot"
@@ -146,6 +158,12 @@ pub struct SnapshotRequest {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<String>,
+    /// `--attrs`: include per-cell colors + style flags (`cells`) in the reply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub attrs: bool,
+    /// `--cursor`: include cursor position + shape (`cursor`) in the reply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -569,9 +587,10 @@ pub fn parse_send_args(
     })
 }
 
-/// Parse `foreman snapshot` args: `[--project P] [--terminal T]`. When
-/// `--terminal` is absent, fills from `self_terminal` (FOREMAN_TERMINAL_ID)
-/// and requires `self_project` (FOREMAN_PROJECT_ID).
+/// Parse `foreman snapshot` args: `[--project P] [--terminal T] [--attrs]
+/// [--cursor]`. When `--terminal` is absent, fills from `self_terminal`
+/// (FOREMAN_TERMINAL_ID) and requires `self_project` (FOREMAN_PROJECT_ID).
+/// `--attrs`/`--cursor` are valueless boolean opt-ins.
 pub fn parse_snapshot_args(
     args: &[String],
     default_project: Option<String>,
@@ -579,6 +598,8 @@ pub fn parse_snapshot_args(
 ) -> Result<SnapshotRequest, String> {
     let mut project = default_project;
     let mut terminal: Option<String> = None;
+    let mut attrs = false;
+    let mut cursor = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -589,6 +610,14 @@ pub fn parse_snapshot_args(
             "--terminal" => {
                 terminal = Some(args.get(i + 1).ok_or("--terminal needs a value")?.clone());
                 i += 2;
+            }
+            "--attrs" => {
+                attrs = true;
+                i += 1;
+            }
+            "--cursor" => {
+                cursor = true;
+                i += 1;
             }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => return Err(format!("unexpected argument: {other}")),
@@ -611,6 +640,8 @@ pub fn parse_snapshot_args(
         cmd: "snapshot".into(),
         project,
         terminal: Some(terminal),
+        attrs,
+        cursor,
     })
 }
 
@@ -709,12 +740,16 @@ prefixes combinable. Unknown name exits 2.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_SNAPSHOT: &str = "\
-foreman snapshot [--project P] [--terminal T]
+foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor]
 
-Read terminal T's rendered viewport as plain text (default: your own).
-One string per visible row, trailing spaces trimmed, printed line per line.
-Reply rides the same history field as status. A snapshot of a settled
-terminal (after foreman send) gives you the current screen state.
+Read terminal T's rendered viewport (default: your own).
+Default: plain text rows in the history field, one per visible row, trailing
+spaces trimmed, printed line per line — a settled terminal (after foreman send)
+gives you the current screen state. Opt-in structured fields:
+  --attrs   cells: per-cell fg/bg (RGB) + bold/italic/underline/strikethrough/
+            inverse/dim/wide flags.
+  --cursor  cursor: {row, col, shape}.
+With --attrs or --cursor the whole reply is printed as one JSON line instead.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 /// Subcommand entry point (no GUI). Returns the process exit code.
@@ -859,7 +894,11 @@ fn snapshot_main(args: &[String]) -> i32 {
 fn report(label: &str, res: std::io::Result<OpenReply>) -> i32 {
     match res {
         Ok(r) if r.ok => {
-            if let Some(lines) = &r.history {
+            if r.cells.is_some() || r.cursor.is_some() {
+                // Structured snapshot (--attrs/--cursor): emit the whole reply as
+                // JSON so the caller gets the cells/cursor payload, not just text.
+                println!("{}", serde_json::to_string(&r).unwrap_or_default());
+            } else if let Some(lines) = &r.history {
                 for l in lines {
                     println!("{l}");
                 }
@@ -906,13 +945,13 @@ mod tests {
             ok: true,
             terminal: Some("t4".into()),
             project: Some("p1".into()),
-            error: None,
-            history: None,
-            seq: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&ok).unwrap();
         assert!(!s.contains("error"));
         assert!(!s.contains("seq"));
+        assert!(!s.contains("cells"));
+        assert!(!s.contains("cursor"));
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), ok);
         assert_eq!(OpenReply::err("boom").error.as_deref(), Some("boom"));
     }
@@ -1022,11 +1061,8 @@ mod tests {
                     assert_eq!(req.terminals, vec!["t3"]);
                     let _ = reply.send(OpenReply {
                         ok: true,
-                        terminal: None,
                         project: Some("p1".into()),
-                        error: None,
-                        history: None,
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Close"),
@@ -1094,11 +1130,8 @@ mod tests {
                     assert_eq!(req.project, None);
                     let _ = reply.send(OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
                         history: Some(vec!["p1  proj  -".into()]),
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Status"),
@@ -1247,9 +1280,7 @@ mod tests {
                         ok: true,
                         terminal: Some("t9".into()),
                         project: Some("p1".into()),
-                        error: None,
-                        history: None,
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Open"),
@@ -1293,21 +1324,14 @@ mod tests {
         // ok-reply without history must not serialize the field
         let ok = OpenReply {
             ok: true,
-            terminal: None,
-            project: None,
-            error: None,
-            history: None,
-            seq: None,
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&ok).unwrap().contains("history"));
         // history reply roundtrips
         let h = OpenReply {
             ok: true,
-            terminal: None,
-            project: None,
-            error: None,
             history: Some(vec!["#1 t2: hi".into()]),
-            seq: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&h).unwrap();
         assert_eq!(serde_json::from_str::<OpenReply>(&s).unwrap(), h);
@@ -1425,11 +1449,7 @@ mod tests {
                     assert_eq!(req.text.as_deref(), Some("hello"));
                     let _ = reply.send(OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
-                        history: None,
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Chat"),
@@ -1559,20 +1579,13 @@ mod tests {
     fn open_reply_seq_omitted_when_none() {
         let r = OpenReply {
             ok: true,
-            terminal: None,
-            project: None,
-            error: None,
-            history: None,
-            seq: None,
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&r).unwrap().contains("seq"));
         let r = OpenReply {
             ok: true,
-            terminal: None,
-            project: None,
-            error: None,
-            history: None,
             seq: Some(42),
+            ..Default::default()
         };
         let back: OpenReply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.seq, Some(42));
@@ -1621,9 +1634,14 @@ mod tests {
             cmd: "snapshot".into(),
             project: None,
             terminal: Some("t3".into()),
+            attrs: false,
+            cursor: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"project\""), "{json}");
+        // false opt-in flags must serialize away (v1 byte-compat)
+        assert!(!json.contains("\"attrs\""), "{json}");
+        assert!(!json.contains("\"cursor\""), "{json}");
         let back: SnapshotRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
     }
@@ -1812,6 +1830,38 @@ mod tests {
         assert!(e.contains("terminal"), "{e}");
     }
 
+    #[test]
+    fn parse_snapshot_args_attrs_flag() {
+        let req =
+            parse_snapshot_args(&s(&["--terminal", "t2", "--attrs"]), Some("p1".into()), None)
+                .unwrap();
+        assert!(req.attrs, "expected attrs=true");
+        assert!(!req.cursor, "cursor defaults false");
+    }
+
+    #[test]
+    fn parse_snapshot_args_cursor_flag() {
+        let req =
+            parse_snapshot_args(&s(&["--terminal", "t2", "--cursor"]), Some("p1".into()), None)
+                .unwrap();
+        assert!(req.cursor, "expected cursor=true");
+        assert!(!req.attrs, "attrs defaults false");
+    }
+
+    #[test]
+    fn snapshot_reply_without_attrs_cursor_is_wire_compat() {
+        // A plain snapshot reply (no --attrs/--cursor) must omit the new keys, so
+        // it stays byte-identical to a v1 OpenReply.
+        let reply = OpenReply {
+            ok: true,
+            history: Some(vec!["row0".into()]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(!json.contains("\"cells\""), "cells must be absent: {json}");
+        assert!(!json.contains("\"cursor\""), "cursor must be absent: {json}");
+    }
+
     // ---- pipe roundtrips -----------------------------------------------------
 
     #[test]
@@ -1827,11 +1877,7 @@ mod tests {
                     assert_eq!(req.terminal.as_deref(), Some("t3"));
                     let _ = reply.send(OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
-                        history: None,
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Send"),
@@ -1870,11 +1916,8 @@ mod tests {
                     assert_eq!(req.terminal.as_deref(), Some("t3"));
                     let _ = reply.send(OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
                         history: Some(vec!["line one".into(), "line two".into()]),
-                        seq: None,
+                        ..Default::default()
                     });
                 }
                 _ => panic!("expected CtrlMsg::Snapshot"),
@@ -1884,6 +1927,8 @@ mod tests {
             cmd: "snapshot".into(),
             project: Some("p1".into()),
             terminal: Some("t3".into()),
+            attrs: false,
+            cursor: false,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -1901,5 +1946,62 @@ mod tests {
             r.history.as_deref(),
             Some(&["line one".to_string(), "line two".to_string()][..])
         );
+    }
+
+    #[test]
+    fn snapshot_pipe_roundtrip_with_attrs_carries_cells() {
+        // The structured (--attrs) path: a reply with cells survives the pipe.
+        let pipe = format!("foreman-test-snap-attrs-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Snapshot(req, reply, _) => {
+                    assert!(req.attrs, "request carries attrs flag");
+                    let cell = crate::inspect::CellData {
+                        ch: 'X',
+                        fg: [10, 20, 30],
+                        bg: None,
+                        bold: false,
+                        italic: false,
+                        underline: true,
+                        strikethrough: false,
+                        inverse: false,
+                        dim: false,
+                        wide: false,
+                    };
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        history: Some(vec!["X".into()]),
+                        cells: Some(vec![vec![cell]]),
+                        ..Default::default()
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Snapshot"),
+            }
+        });
+        let req = SnapshotRequest {
+            cmd: "snapshot".into(),
+            project: Some("p1".into()),
+            terminal: Some("t3".into()),
+            attrs: true,
+            cursor: false,
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let r = reply.expect("no reply");
+        assert!(r.ok);
+        let cells = r.cells.expect("cells present");
+        assert_eq!(cells[0][0].ch, 'X');
+        assert!(cells[0][0].underline);
     }
 }

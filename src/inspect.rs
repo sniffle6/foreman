@@ -7,9 +7,9 @@
 //! control plane. The interface is the test surface. `control.rs` and the GUI are
 //! thin adapters over these functions.
 //!
-//! `snapshot_cells` / per-cell attributes are deferred to the `--attrs` opt-in
-//! phase; this module is the default path: text, cursor, substring-match, and
-//! key encoding.
+//! Reads come in two flavours: plain text (`snapshot_text`) for the default
+//! path, and per-cell attributes (`snapshot_cells`) for the `--attrs` opt-in.
+//! Plus cursor, substring-match, and key encoding.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -29,11 +29,28 @@ pub struct Region {
 }
 
 /// Where the cursor is and what shape it's drawn as.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CursorInfo {
     pub row: i32,
     pub col: usize,
     pub shape: String, // "block" | "beam" | "underline" | "hollow" | "hidden"
+}
+
+/// Per-cell rendering data for the `--attrs` opt-in: the glyph, resolved
+/// foreground/background RGB, and the style flags. `bg` is `None` for the
+/// default (transparent) background.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CellData {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: Option<[u8; 3]>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub inverse: bool,
+    pub dim: bool,
+    pub wide: bool,
 }
 
 /// The rendered viewport as plain text — one string per row, trailing spaces
@@ -94,6 +111,61 @@ pub fn cursor_info<L: EventListener>(term: &Term<L>) -> CursorInfo {
 /// Does any row of the rendered viewport contain `pattern` (substring)?
 pub fn grid_contains<L: EventListener>(term: &Term<L>, pattern: &str) -> bool {
     snapshot_text(term, None).iter().any(|l| l.contains(pattern))
+}
+
+/// Per-cell attribute snapshot for the `--attrs` opt-in. Walks the grid exactly
+/// like [`snapshot_text`] (same region clamp, same `display_offset` row mapping,
+/// same wide-char spacer skip) but emits one [`CellData`] per kept cell instead
+/// of a flattened string. Colors resolve through the GUI palette
+/// ([`crate::terminal::resolve`]) so attrs reads match what's painted.
+pub fn snapshot_cells<L: EventListener>(
+    term: &Term<L>,
+    region: Option<Region>,
+) -> Vec<Vec<CellData>> {
+    let grid = term.grid();
+    let off = grid.display_offset() as i32;
+    let cols = grid.columns();
+    let screen_rows = grid.screen_lines();
+    let (r0, r1, c0, c1) = match region {
+        Some(r) => (
+            r.row.min(screen_rows),
+            (r.row + r.rows).min(screen_rows),
+            r.col.min(cols),
+            (r.col + r.cols).min(cols),
+        ),
+        None => (0, screen_rows, 0, cols),
+    };
+    let mut out = Vec::with_capacity(r1.saturating_sub(r0));
+    for row in r0..r1 {
+        let line = Line(row as i32 - off);
+        let mut row_cells = Vec::new();
+        let mut col = c0;
+        while col < c1 {
+            let cell = &grid[line][Column(col)];
+            // Skip the trailing spacer of a wide glyph (same rule as snapshot_text).
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                col += 1;
+                continue;
+            }
+            let fg = crate::terminal::resolve(cell.fg).unwrap_or(crate::terminal::FG);
+            let bg = crate::terminal::resolve(cell.bg).map(|c| [c.r(), c.g(), c.b()]);
+            row_cells.push(CellData {
+                ch: if cell.c == '\0' { ' ' } else { cell.c },
+                fg: [fg.r(), fg.g(), fg.b()],
+                bg,
+                bold: cell.flags.contains(Flags::BOLD),
+                italic: cell.flags.contains(Flags::ITALIC),
+                underline: cell.flags.contains(Flags::UNDERLINE),
+                strikethrough: cell.flags.contains(Flags::STRIKEOUT),
+                inverse: cell.flags.contains(Flags::INVERSE),
+                dim: cell.flags.contains(Flags::DIM),
+                wide: cell.flags.contains(Flags::WIDE_CHAR),
+            });
+            col += 1;
+        }
+        out.push(row_cells);
+    }
+    out
 }
 
 /// Map a single letter to its egui `Key` (case-insensitive).
@@ -236,6 +308,61 @@ mod tests {
         let rows = snapshot_text(&term, Some(Region { row: 0, col: 0, rows: 99, cols: 99 }));
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], "row0");
+    }
+
+    // ---- snapshot_cells ------------------------------------------------------
+    #[test]
+    fn snapshot_cells_plain_cell_has_no_flags() {
+        let term = term_with(b"A", 20, 1);
+        let grid = snapshot_cells(&term, None);
+        assert_eq!(grid.len(), 1);
+        let a = &grid[0][0];
+        assert_eq!(a.ch, 'A');
+        assert!(!a.bold);
+        assert!(!a.italic);
+        assert!(!a.underline);
+        assert!(!a.strikethrough);
+        assert!(!a.inverse);
+        assert!(!a.dim);
+        assert!(!a.wide);
+    }
+
+    #[test]
+    fn snapshot_cells_reports_underline() {
+        // ESC[4m turns underline on
+        let term = term_with(b"\x1b[4mU", 20, 1);
+        let grid = snapshot_cells(&term, None);
+        let u = grid[0].iter().find(|c| c.ch == 'U').expect("U cell");
+        assert!(u.underline);
+        assert!(!u.inverse);
+    }
+
+    #[test]
+    fn snapshot_cells_reports_inverse() {
+        // ESC[7m turns inverse (reverse video) on
+        let term = term_with(b"\x1b[7mI", 20, 1);
+        let grid = snapshot_cells(&term, None);
+        let i = grid[0].iter().find(|c| c.ch == 'I').expect("I cell");
+        assert!(i.inverse);
+        assert!(!i.underline);
+    }
+
+    #[test]
+    fn snapshot_cells_region_clamps_without_panic() {
+        let term = term_with(b"hi", 20, 3);
+        let grid = snapshot_cells(&term, Some(Region { row: 0, col: 0, rows: 99, cols: 99 }));
+        assert_eq!(grid.len(), 3);
+        assert_eq!(grid[0][0].ch, 'h');
+    }
+
+    #[test]
+    fn snapshot_cells_skips_wide_char_spacer() {
+        // A CJK glyph is one WIDE_CHAR cell + one WIDE_CHAR_SPACER; the spacer
+        // must be dropped, so the wide glyph appears once with wide=true.
+        let term = term_with("漢".as_bytes(), 20, 1);
+        let grid = snapshot_cells(&term, None);
+        let han = grid[0].iter().find(|c| c.ch == '漢').expect("wide glyph");
+        assert!(han.wide);
     }
 
     // ---- cursor_info ---------------------------------------------------------

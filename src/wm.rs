@@ -857,11 +857,8 @@ impl WindowManager {
                     Ok(ChatOutcome::History(lines)) => {
                         let _ = reply.send(OpenReply {
                             ok: true,
-                            terminal: None,
-                            project: None,
-                            error: None,
                             history: Some(lines),
-                            seq: None,
+                            ..Default::default()
                         });
                     }
                     // Unlike open's spawn-undo, a post whose reply channel died
@@ -878,11 +875,8 @@ impl WindowManager {
                     }) => {
                         let ok = OpenReply {
                             ok: true,
-                            terminal: None,
-                            project: None,
-                            error: None,
-                            history: None,
                             seq,
+                            ..Default::default()
                         };
                         if reply.send(ok).is_ok() {
                             self.chat_broadcast_in(pid, from, &framed, targets.as_deref());
@@ -898,11 +892,8 @@ impl WindowManager {
                 let _ = reply.send(match self.status_dispatch(&req) {
                     Ok(lines) => OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
                         history: Some(lines),
-                        seq: None,
+                        ..Default::default()
                     },
                     Err(e) => OpenReply::err(e),
                 });
@@ -918,11 +909,8 @@ impl WindowManager {
                     Ok((pid, tids)) => {
                         let ok = OpenReply {
                             ok: true,
-                            terminal: None,
                             project: Some(format!("p{pid}")),
-                            error: None,
-                            history: None,
-                            seq: None,
+                            ..Default::default()
                         };
                         // Reply BEFORE closing (chat's reply-before-inject
                         // pattern): a self-close kills the caller's own
@@ -954,11 +942,7 @@ impl WindowManager {
                             // Fire-and-forget: reply immediately, no settle wait.
                             let _ = reply.send(OpenReply {
                                 ok: true,
-                                terminal: None,
-                                project: None,
-                                error: None,
-                                history: None,
-                                seq: None,
+                                ..Default::default()
                             });
                         } else {
                             // Defer the reply: park a PendingSettle that
@@ -989,13 +973,12 @@ impl WindowManager {
                     return;
                 }
                 let _ = reply.send(match self.snapshot_dispatch(&req) {
-                    Ok(lines) => OpenReply {
+                    Ok((lines, cells, cursor)) => OpenReply {
                         ok: true,
-                        terminal: None,
-                        project: None,
-                        error: None,
                         history: Some(lines),
-                        seq: None,
+                        cells,
+                        cursor,
+                        ..Default::default()
                     },
                     Err(e) => OpenReply::err(e),
                 });
@@ -1010,9 +993,7 @@ impl WindowManager {
                 ok: true,
                 terminal: Some(format!("t{tid}")),
                 project: Some(format!("p{pid}")),
-                error: None,
-                history: None,
-                seq: None,
+                ..Default::default()
             },
             Err(e) => OpenReply::err(e),
         }
@@ -1298,11 +1279,7 @@ impl WindowManager {
         use crate::control::OpenReply;
         let ok_reply = || OpenReply {
             ok: true,
-            terminal: None,
-            project: None,
-            error: None,
-            history: None,
-            seq: None,
+            ..Default::default()
         };
         // mem::take so we can call &self methods (session_gen) while mutating
         // the list — the established borrow pattern in this file.
@@ -1374,14 +1351,27 @@ impl WindowManager {
         Ok((pid, tid))
     }
 
+    #[allow(clippy::type_complexity)]
     fn snapshot_dispatch(
         &mut self,
         req: &crate::control::SnapshotRequest,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Option<Vec<Vec<crate::inspect::CellData>>>,
+            Option<crate::inspect::CursorInfo>,
+        ),
+        String,
+    > {
         let terminal = req.terminal.as_deref().ok_or("snapshot: missing terminal")?;
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
         let session = self.session_mut(pid, tid)?;
-        Ok(session.snapshot_text(None))
+        // Each accessor pumps; calling them in sequence on the one &mut borrow is
+        // fine. text always; cells/cursor only when the opt-in flag is set.
+        let lines = session.snapshot_text(None);
+        let cells = req.attrs.then(|| session.snapshot_cells(None));
+        let cursor = req.cursor.then(|| session.cursor_info());
+        Ok((lines, cells, cursor))
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
@@ -5280,6 +5270,8 @@ mod tests {
             cmd: "snapshot".into(),
             project: project.map(str::to_string),
             terminal: Some(terminal.to_string()),
+            attrs: false,
+            cursor: false,
         };
         (crate::control::CtrlMsg::Snapshot(req, rtx, sent), rrx)
     }
@@ -5372,6 +5364,46 @@ mod tests {
             !r.history.as_ref().unwrap().is_empty(),
             "snapshot rows must be non-empty"
         );
+    }
+
+    #[test]
+    fn snapshot_attrs_and_cursor_opt_ins_populate_reply() {
+        // --attrs / --cursor flow through handle_ctrl into the structured fields;
+        // a default snapshot (no flags) leaves both None.
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+
+        let make = |attrs: bool, cursor: bool| {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            let req = crate::control::SnapshotRequest {
+                cmd: "snapshot".into(),
+                project: Some("p1".into()),
+                terminal: Some(ta.clone()),
+                attrs,
+                cursor,
+            };
+            (
+                crate::control::CtrlMsg::Snapshot(req, rtx, std::time::Instant::now()),
+                rrx,
+            )
+        };
+
+        // default: neither field set
+        let (msg, rrx) = make(false, false);
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no reply");
+        assert!(r.ok);
+        assert!(r.cells.is_none(), "no --attrs => no cells");
+        assert!(r.cursor.is_none(), "no --cursor => no cursor");
+
+        // both opt-ins
+        let (msg, rrx) = make(true, true);
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no reply");
+        assert!(r.ok);
+        assert!(r.cells.is_some(), "--attrs must populate cells");
+        assert!(r.cursor.is_some(), "--cursor must populate cursor");
     }
 
     #[test]

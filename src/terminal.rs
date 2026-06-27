@@ -54,7 +54,7 @@ fn indexed_rgb(i: u8) -> egui::Color32 {
     egui::Color32::from_rgb(comp(i / 36), comp((i / 6) % 6), comp(i % 6))
 }
 
-fn resolve(c: AnsiColor) -> Option<egui::Color32> {
+pub(crate) fn resolve(c: AnsiColor) -> Option<egui::Color32> {
     match c {
         AnsiColor::Spec(rgb) => Some(egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)),
         AnsiColor::Indexed(i) => Some(indexed_rgb(i)),
@@ -513,6 +513,21 @@ impl Session {
     pub fn snapshot_text(&mut self, region: Option<crate::inspect::Region>) -> Vec<String> {
         self.pump();
         crate::inspect::snapshot_text(&self.term, region)
+    }
+
+    /// Pump pending PTY output, then return per-cell attribute data (`--attrs`).
+    pub fn snapshot_cells(
+        &mut self,
+        region: Option<crate::inspect::Region>,
+    ) -> Vec<Vec<crate::inspect::CellData>> {
+        self.pump();
+        crate::inspect::snapshot_cells(&self.term, region)
+    }
+
+    /// Pump pending PTY output, then return the cursor position + shape (`--cursor`).
+    pub fn cursor_info(&mut self) -> crate::inspect::CursorInfo {
+        self.pump();
+        crate::inspect::cursor_info(&self.term)
     }
 
     fn pump(&mut self) {
