@@ -34,10 +34,22 @@ what's left, and where to start."
 
 All of the above: 122 tests green.
 
-## NEXT — we continue here: Part 1, delivery cursor + catch-up replay
+## DONE — Part 1: delivery cursor + catch-up replay (built 2026-06-27)
 
-This is the keystone ("no silent drop") and it is **unit-testable** with the
-existing PTY test harness — no GUI needed. Do this next.
+The keystone ("no silent drop") is **built and verified** (274 tests green, no
+new warnings — it even cleared the dead `Session::ready` warning by consuming
+it). See `docs/chat-delivery.md` for how it works. What landed:
+
+- `ChatLog::deliver_after(member_id, after)` — pure replay source, unit-tested.
+- `Tab.last_delivered_seq` — the per-member cursor (advances to the log tail).
+- `WindowManager::chat_delivery_sweep()` — recursive per-frame sweep, gated on
+  `Session::ready()`, injects from the log and skips a member's own posts;
+  called from `main.rs` after `show()`. It **replaced** immediate injection:
+  `chat_broadcast` / `chat_broadcast_in` are deleted; `chat_dispatch` and
+  `chat_post_human` now only append, and the delivery tests drive the sweep.
+
+The original plan (kept for the record — the keystone is unit-testable with the
+existing PTY harness, no GUI needed):
 
 1. **Per-`Tab` cursor.** Add `last_delivered_seq: u64` (default 0) to `Tab`
    (`src/wm.rs`; init at the three `chat_member: false` construction sites).

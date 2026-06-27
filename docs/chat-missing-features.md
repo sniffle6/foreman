@@ -60,6 +60,12 @@ filter-by-kind (#9) below exist to make steering *possible* once the room is bus
 > `contracts/chat-handshake-remaining-work.md` — recovery point `4607001`).
 > The social half — "the reply IS the ack" — works today via `--re` plus
 > worker-prompt norms; only the automated missing-ack backstop is deferred.
+>
+> **Update 2026-06-27: the delivery-cursor backstop is BUILT.** Per-member
+> cursor + ready-gated catch-up replay closes the silent DSR-fresh-spawn drop;
+> delivery is now a per-frame sweep, not immediate injection. See
+> `docs/chat-delivery.md`. Only Part 2 (the ack-registry + timeout notice +
+> crew-board badge, which need a GUI session) remains deferred.
 
 A handoff is not done when the message is *sent*. It is done when the assignee
 *replies in chat*. The verification is a real chat response, not a silent flag.

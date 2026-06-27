@@ -123,6 +123,13 @@ _Avoid_: channel, thread, log.
 A Session that belongs to a Project's Chat room.
 _Avoid_: participant, client.
 
+**Member id**:
+The stable identity a Member carries for its whole life — assigned when its
+Session spawns and unchanged by tabbing, untabbing, focusing, or moving. The same
+identity the agent reads as its own terminal id, so the room's view of "who" and
+the agent's view of "me" never disagree.
+_Avoid_: window id, tab id (a Win id can change; a Member id cannot).
+
 **Dispatcher / Worker**:
 Roles in a Chat room — the Dispatcher hands out work; a Worker is a Session
 dispatched to do it.
@@ -164,3 +171,11 @@ Quiescence settle's output stability), follows a single-row step while the user
 is actively editing, and holds far jumps and self-running animations. The caret
 is what Foreman paints; the cursor is the program's, owned by the grid model.
 _Avoid_: cursor (that's the model's), blink, debounce.
+
+**Outbox**:
+The Chat room's per-frame delivery decision: given which Members are Ready, it
+returns exactly the framed lines each one still needs and advances their delivery
+cursors — a pure step, so the delivery guarantee can be tested without a terminal.
+The engine only injects what the Outbox hands back; it never decides what to send.
+_Avoid_: queue, buffer, broadcast (broadcast is a targeting mode, not the delivery
+step).

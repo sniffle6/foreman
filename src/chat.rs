@@ -109,6 +109,10 @@ impl ChatLog {
         Self { msgs: Vec::new() }
     }
 
+    /// Plain broadcast post. Production posts route through [`Self::post_re`] /
+    /// [`Self::post_to`] (the room always carries a to-set / re), so this
+    /// convenience exists only for the log's own unit tests.
+    #[cfg(test)]
     pub fn post(&mut self, from: &str, name: &str, text: &str) -> &ChatMsg {
         self.push(from, name, text, ChatKind::Post, Vec::new(), None)
     }
@@ -198,6 +202,22 @@ impl ChatLog {
             .collect();
         lines.reverse();
         lines
+    }
+
+    /// Posts a member still needs: every `Post` with `seq > after` addressed
+    /// to `member_id` (`to` empty = broadcast, or `member_id` in `to`), oldest
+    /// first. System entries are never delivered. `after` is the member's
+    /// delivery cursor (`Tab::last_delivered_seq`); this is both the catch-up
+    /// replay source and the dedup boundary (chat handshake contract).
+    pub fn deliver_after(&self, member_id: &str, after: u64) -> Vec<&ChatMsg> {
+        self.msgs
+            .iter()
+            .filter(|m| {
+                m.kind == ChatKind::Post
+                    && m.seq > after
+                    && (m.to.is_empty() || m.to.iter().any(|t| t == member_id))
+            })
+            .collect()
     }
 }
 
@@ -310,12 +330,10 @@ pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
     out
 }
 
-/// One crew-board row, assembled by the owning project manager each frame.
-/// `win`/`tab` locate the member for click-to-focus. Identity is the hosting
-/// window's id — the same active-tab staleness family as the rest of chat.
+/// One crew-board row. Identity is the Member id (`"t4"` / `"you"`); the viewer
+/// renders by id/name/exited/last and resolves a click back to its window by id,
+/// so a row carries no window coordinates.
 pub struct CrewRow {
-    pub win: crate::wm::WinId,
-    pub tab: usize,
     pub id: String,   // "t4"
     pub name: String, // live tab title (exit marker stripped)
     pub exited: bool,
@@ -330,12 +348,12 @@ pub fn sort_crew(rows: &mut [CrewRow]) {
     });
 }
 
-/// Per-window viewer state behind `Content::Chat`. The log is shared with
-/// the project manager; everything else is this window's view of it.
+/// Per-window viewer state behind `Content::Chat`. The room is shared with
+/// the project manager; everything else is this window's view of it. The
+/// viewer PULLS crew rows and paint blocks from the room each draw (it owns
+/// no pushed snapshot) — the borrow stays scoped to the read.
 pub struct ChatView {
-    pub log: std::rc::Rc<std::cell::RefCell<ChatLog>>,
-    /// Refreshed by the owning manager before each draw (`refresh_chat_view`).
-    pub crew: Vec<CrewRow>,
+    pub room: std::rc::Rc<std::cell::RefCell<ChatRoom>>,
     /// NEW-divider watermark: highest seq seen while this window had focus.
     pub last_seen: u64,
     was_active: bool,
@@ -346,9 +364,10 @@ pub struct ChatView {
     /// holds its content position while new messages arrive — and scrolling
     /// back to the bottom re-sticks (spec: scrolling decision row).
     pub stick: bool,
-    /// Crew row clicked this frame; drained by the manager after the draw
-    /// loop (content must never mutate sibling windows mid-draw).
-    pub click: Option<(crate::wm::WinId, usize)>,
+    /// Member id (`tN`) of the crew row clicked this frame; drained by the
+    /// manager after the draw loop (content must never mutate sibling windows
+    /// mid-draw). The manager re-resolves the live terminal from the id.
+    pub click: Option<String>,
     /// In-progress input line text (slice 2).
     pub input: String,
     /// A submitted line awaiting the manager's drain (`drain_chat_posts`).
@@ -356,13 +375,12 @@ pub struct ChatView {
 }
 
 impl ChatView {
-    pub fn new(log: std::rc::Rc<std::cell::RefCell<ChatLog>>) -> Self {
+    pub fn new(room: std::rc::Rc<std::cell::RefCell<ChatRoom>>) -> Self {
         // Watermark starts at the current tail: opening the window is the
         // act of looking, so the backlog is not "new".
-        let last_seen = log.borrow().last_seq();
+        let last_seen = room.borrow().last_seq();
         Self {
-            log,
-            crew: Vec::new(),
+            room,
             last_seen,
             was_active: false,
             scroll: 0.0,
@@ -378,15 +396,638 @@ impl ChatView {
     /// stays marked NEW until the user looks away and comes back.
     pub fn on_frame(&mut self, active: bool) {
         if self.was_active && !active {
-            self.last_seen = self.log.borrow().last_seq();
+            self.last_seen = self.room.borrow().last_seq();
         }
         self.was_active = active;
+    }
+}
+
+/// One member's room-side state, keyed by the `tN`/`you` id.
+struct MemberState {
+    name: String,
+    /// Delivery cursor: the highest seq this member has been handed.
+    cursor: u64,
+    exited: bool,
+    is_human: bool,
+}
+
+/// A live member's presence as the wiring phase observes it each frame
+/// (terminal still running, ready to receive injected input, exit marker).
+pub struct LiveMember {
+    pub id: String,
+    pub name: String,
+    pub ready: bool,
+    pub exited: bool,
+}
+
+/// Lines to inject into one member's PTY this frame, in seq order.
+pub struct Delivery {
+    pub id: String,
+    pub lines: Vec<String>,
+}
+
+/// The validated, presence-aware room: a [`ChatLog`] plus a member registry.
+/// Composition over the log — all posting goes through [`ChatRoom::post`]
+/// (validation, auto-join) and all injection through [`ChatRoom::tick`]
+/// (presence reconcile + per-member outbox). The room owns no window ids;
+/// the wiring phase re-attaches window coordinates to the [`CrewRow`]s.
+pub struct ChatRoom {
+    log: ChatLog,
+    /// Members in join order — order drives delivery and pre-sort crew rows.
+    /// A `Vec` (not a map) keeps insertion order explicit and matches the
+    /// rest of the file's plain-data style; membership is small (a fleet).
+    members: Vec<(String, MemberState)>,
+}
+
+/// The human pseudo-member id, mirrored from `WindowManager::HUMAN_ID`.
+const HUMAN_ID: &str = "you";
+
+impl ChatRoom {
+    /// A fresh room with the human pre-registered as `you` (so the human is
+    /// always a valid mention target and never auto-joins on first post).
+    /// The project tag is NOT stored here — it is supplied per-frame to
+    /// [`ChatRoom::tick`], since the window manager may assign/rename the tag
+    /// after the room exists and the framed inject line must reflect the
+    /// current tag.
+    pub fn new() -> Self {
+        let mut room = Self {
+            log: ChatLog::new(),
+            members: Vec::new(),
+        };
+        room.members.push((
+            HUMAN_ID.to_string(),
+            MemberState {
+                name: HUMAN_ID.to_string(),
+                cursor: 0,
+                exited: false,
+                is_human: true,
+            },
+        ));
+        room
+    }
+
+    fn member(&self, id: &str) -> Option<&MemberState> {
+        self.members.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+    }
+
+    fn member_mut(&mut self, id: &str) -> Option<&mut MemberState> {
+        self.members
+            .iter_mut()
+            .find(|(k, _)| k == id)
+            .map(|(_, v)| v)
+    }
+
+    /// The single validated post path. Resolves delivery targets from `to`
+    /// + leading `@mentions`, validates them all-or-nothing (registered, not
+    /// self, not exited), auto-joins a new sender (with a `Joined` line
+    /// ordered before the post), then appends. Returns the new seq.
+    /// Strict: any bad target is an `Err` and mutates nothing — the human's
+    /// prose-fallback demotion is caller policy, not the model's.
+    pub fn post(
+        &mut self,
+        from: &str,
+        text: &str,
+        to: &[String],
+        re: Option<u64>,
+    ) -> Result<u64, String> {
+        if text.trim().is_empty() {
+            return Err("empty message".to_string());
+        }
+        let targets = effective_targets(to, text);
+        // Validate ALL targets before mutating anything (all-or-nothing).
+        for t in &targets {
+            if t == from {
+                return Err(format!("cannot target yourself ({t})"));
+            }
+            match self.member(t) {
+                None => return Err(format!("unknown member {t}")),
+                Some(m) if m.exited => return Err(format!("{t} has exited")),
+                Some(_) => {}
+            }
+        }
+        // Auto-join a new sender (never the pre-registered human), join line
+        // BEFORE the post so the transcript reads join-then-speak.
+        if from != HUMAN_ID && self.member(from).is_none() {
+            self.join(from, from);
+        }
+        let name = self
+            .member(from)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| from.to_string());
+        let seq = self
+            .log
+            .post_re(from, &name, text, targets, re)
+            .seq;
+        Ok(seq)
+    }
+
+    /// Idempotent join: register `id` (cursor 0, not exited, not human) and
+    /// append one `Joined` sys line; a second call for a present id is a
+    /// no-op. Used by dispatch auto-join.
+    pub fn join(&mut self, id: &str, name: &str) {
+        if self.member(id).is_some() {
+            return; // already a member: no duplicate Joined line
+        }
+        self.members.push((
+            id.to_string(),
+            MemberState {
+                name: name.to_string(),
+                cursor: 0,
+                exited: false,
+                is_human: false,
+            },
+        ));
+        self.log.sys(ChatKind::Joined, id, name);
+    }
+
+    /// Append a post from the chat pane's input line. The human (`you`) is
+    /// never a terminal: leading `@mentions` narrow delivery like a CLI post,
+    /// but an invalid mention (unknown, exited, or the human's own seat)
+    /// demotes the post to a plain broadcast instead of erroring — the input
+    /// line has no error seat. Text is kept verbatim. Returns the new seq, or
+    /// `None` for blank input. This is the human's policy half of [`Self::post`].
+    pub fn post_human(&mut self, text: &str) -> Option<u64> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mentions = effective_targets(&[], text);
+        let to = if !mentions.is_empty()
+            && mentions
+                .iter()
+                .all(|m| self.member(m).is_some_and(|s| !s.is_human && !s.exited))
+        {
+            mentions
+        } else {
+            Vec::new() // bad mention -> broadcast (prose fallback)
+        };
+        Some(self.log.post_to(HUMAN_ID, HUMAN_ID, text, to).seq)
+    }
+
+    /// Per-frame reconcile + outbox. Marks vanished/exited members exited
+    /// (one `Exited` line each), then for every ready live member hands it
+    /// the posts addressed to it since its cursor (excluding its own), as
+    /// framed lines, advancing its cursor to the tail. `project` is the
+    /// current window-manager tag, supplied per-frame so the framed inject
+    /// line (`[chat p1 #N] ...`) always reflects the live tag.
+    pub fn tick(&mut self, project: &str, live: &[LiveMember]) -> Vec<Delivery> {
+        // --- Refresh names: a present, non-human member tracks its live
+        // display name (terminal renames flow to the crew board). The human
+        // seat is never in `live` and is never touched.
+        for l in live {
+            if let Some(m) = self.member_mut(&l.id) {
+                if !m.is_human {
+                    m.name = l.name.clone();
+                }
+            }
+        }
+        // --- Reconcile presence: mark vanished/exited members (once each).
+        // A member is gone if it is absent from `live`, or present with
+        // exited == true. The human is never reconciled.
+        let newly_exited: Vec<String> = self
+            .members
+            .iter()
+            .filter(|(_, m)| !m.is_human && !m.exited)
+            .filter(|(id, _)| {
+                match live.iter().find(|l| &l.id == id) {
+                    None => true,             // session gone
+                    Some(l) => l.exited,      // session reports exit
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &newly_exited {
+            if let Some(m) = self.member_mut(id) {
+                m.exited = true;
+            }
+            let name = self.member(id).map(|m| m.name.clone()).unwrap_or_default();
+            self.log.sys(ChatKind::Exited, id, &name);
+        }
+
+        // --- Outbox: deliver to each ready, non-exited, registered live
+        // member the posts addressed to it past its cursor (skipping its own),
+        // then advance its cursor to the tail regardless.
+        let tail = self.log.last_seq();
+        let mut out = Vec::new();
+        for l in live {
+            if !l.ready || l.exited {
+                continue; // not ready / exited: cursor stays (catch-up later)
+            }
+            let Some(state) = self.member(&l.id) else {
+                continue; // unknown to the room
+            };
+            if state.exited {
+                continue; // just reconciled exited this tick
+            }
+            let cursor = state.cursor;
+            let lines: Vec<String> = self
+                .log
+                .deliver_after(&l.id, cursor)
+                .into_iter()
+                .filter(|m| m.from != l.id)
+                .map(|m| m.frame(project))
+                .collect();
+            if let Some(m) = self.member_mut(&l.id) {
+                m.cursor = tail; // advance even if nothing was addressed
+            }
+            if !lines.is_empty() {
+                out.push(Delivery {
+                    id: l.id.clone(),
+                    lines,
+                });
+            }
+        }
+        out
+    }
+
+    /// Presence rows for the crew board, ordered like `refresh_chat_view`:
+    /// live members stalest-first (never-heard oldest), the human seat between
+    /// live and exited, exited members last. Rows carry no window
+    /// coordinates — `win`/`tab` are placeholder 0 (the room owns no window
+    /// ids; the wiring phase re-attaches them). `now` is unused for ordering
+    /// (kept for parity with the caller, which may compute ages from it).
+    pub fn crew(&self, now: std::time::Instant) -> Vec<CrewRow> {
+        let _ = now;
+        // Real members (everything but the human seat), in registry order.
+        let mut rows: Vec<CrewRow> = self
+            .members
+            .iter()
+            .filter(|(_, m)| !m.is_human)
+            .map(|(id, m)| CrewRow {
+                id: id.clone(),
+                name: m.name.clone(),
+                exited: m.exited,
+                last: self.log.last_activity(id),
+            })
+            .collect();
+        sort_crew(&mut rows);
+        // The human seat sits between live members and the exited: it is "your
+        // seat", not fleet status.
+        let pos = rows.iter().take_while(|r| !r.exited).count();
+        rows.insert(
+            pos,
+            CrewRow {
+                id: HUMAN_ID.to_string(),
+                name: HUMAN_ID.to_string(),
+                exited: false,
+                last: self.log.last_activity(HUMAN_ID),
+            },
+        );
+        rows
+    }
+
+    /// Is `id` a registered member other than the human seat (`you`)?
+    /// True regardless of exited state — an exited terminal is still a member
+    /// (mirrors today's status output, which lists exited terminals).
+    pub fn is_member(&self, id: &str) -> bool {
+        self.member(id).is_some_and(|m| !m.is_human)
+    }
+
+    /// Seq of the most recent log entry (any kind). 0 on an empty room.
+    pub fn last_seq(&self) -> u64 {
+        self.log.last_seq()
+    }
+
+    /// Last `n` posts as display lines, oldest first (the `--history` verb).
+    pub fn history(&self, n: usize) -> Vec<String> {
+        self.log.tail_lines(n)
+    }
+
+    /// Viewer paint blocks for this room's log (NEW divider at `last_seen`).
+    pub fn blocks(&self, last_seen: u64, compact: bool) -> Vec<ChatBlock> {
+        build_blocks(self.log.msgs(), last_seen, compact)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ChatRoom -------------------------------------------------------
+
+    fn live(id: &str, ready: bool, exited: bool) -> LiveMember {
+        LiveMember {
+            id: id.to_string(),
+            name: id.to_string(),
+            ready,
+            exited,
+        }
+    }
+
+    #[test]
+    fn new_room_is_empty_with_human_preregistered() {
+        let room = ChatRoom::new();
+        assert_eq!(room.last_seq(), 0, "fresh log has no entries");
+        let you = room.member("you").expect("human pre-registered");
+        assert!(you.is_human);
+        assert!(!you.exited);
+        assert_eq!(you.cursor, 0);
+        assert_eq!(you.name, "you");
+    }
+
+    #[test]
+    fn room_post_rejects_empty_text() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        assert!(room.post("t1", "", &[], None).is_err());
+        assert!(room.post("t1", "   ", &[], None).is_err());
+        assert_eq!(room.last_seq(), 1, "only the join line, no post appended");
+    }
+
+    #[test]
+    fn room_post_returns_seq_and_appends() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        let seq = room.post("t1", "hello", &[], None).expect("ok");
+        assert_eq!(seq, 2, "join is #1, post is #2");
+        assert_eq!(room.last_seq(), 2);
+        assert_eq!(room.history(9), vec!["#2 t1: hello"]);
+    }
+
+    #[test]
+    fn room_post_resolves_flags_and_mentions_deduped() {
+        let mut room = ChatRoom::new();
+        for id in ["t1", "t2", "t3"] {
+            room.join(id, id);
+        }
+        // flags first, then inline @mentions, deduped keeping first.
+        let seq = room
+            .post("t1", "@t2 @t3 go", &["t3".to_string()], None)
+            .expect("ok");
+        let line = &room.blocks(0, true);
+        // assert via the framed delivery target order: t3 (flag) then t2 (inline)
+        assert_eq!(seq, 4); // 3 joins + this post
+        let _ = line;
+        // deliver_after sees the to-set; verify order through history line
+        assert_eq!(
+            room.history(1),
+            vec!["#4 t1→t3,t2: @t2 @t3 go"],
+            "flag target precedes inline mention, deduped; text kept verbatim"
+        );
+    }
+
+    #[test]
+    fn room_post_rejects_unknown_target_all_or_nothing() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        let before = room.last_seq();
+        assert!(room.post("t1", "@t9 hi", &[], None).is_err());
+        assert_eq!(room.last_seq(), before, "nothing appended on bad target");
+    }
+
+    #[test]
+    fn room_post_rejects_self_mention() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        assert!(
+            room.post("t1", "note", &["t1".to_string()], None).is_err(),
+            "a sender cannot target itself"
+        );
+        // the human mentioning itself is also a self-mention
+        assert!(room.post("you", "@you note", &[], None).is_err());
+    }
+
+    #[test]
+    fn room_post_rejects_exited_target() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        room.join("t2", "helper");
+        // mark t2 exited via a tick where it has vanished from live
+        room.tick("p1", &[live("t1", true, false)]);
+        let before = room.last_seq();
+        assert!(room.post("t1", "@t2 hi", &[], None).is_err());
+        assert_eq!(room.last_seq(), before);
+    }
+
+    #[test]
+    fn room_post_you_is_a_legal_target() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        assert!(room.post("t1", "@you eyes here", &[], None).is_ok());
+    }
+
+    #[test]
+    fn room_post_auto_joins_sender_join_before_post() {
+        let mut room = ChatRoom::new();
+        // t5 never joined; posting auto-joins it with a Joined line FIRST.
+        let seq = room.post("t5", "arrived", &[], None).expect("ok");
+        assert_eq!(seq, 2, "Joined is #1, the post is #2");
+        // the viewer sees a Joined sys entry then the post
+        let blocks = room.blocks(0, true);
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .map(|b| match b {
+                ChatBlock::Sys(_) => "S",
+                ChatBlock::Header { .. } => "H",
+                ChatBlock::Text { .. } => "T",
+                ChatBlock::Divider => "D",
+            })
+            .collect();
+        // D (last_seen 0) then S (join) then H,T (the post)
+        assert_eq!(kinds, vec!["D", "S", "H", "T"]);
+        assert!(room.member("t5").is_some());
+    }
+
+    #[test]
+    fn room_post_human_does_not_auto_join() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        room.post("you", "hi team", &[], None).expect("ok");
+        // no extra Joined line for the human: only t1's join + the post
+        assert_eq!(room.last_seq(), 2);
+    }
+
+    #[test]
+    fn room_post_human_narrows_on_valid_mention_and_demotes_on_bad() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        // a valid leading mention narrows delivery to t1
+        let seq = room.post_human("@t1 eyes here").expect("posted");
+        assert_eq!(seq, 2);
+        assert_eq!(room.history(1), vec!["#2 you→t1: @t1 eyes here"]);
+        // an unknown mention is NOT an error: demote to a plain broadcast,
+        // text kept verbatim (the input line has no error seat)
+        room.post_human("@t9 anyone?").expect("posted");
+        assert_eq!(room.history(1), vec!["#3 you: @t9 anyone?"]);
+        // the human's own seat is not a valid recipient -> also broadcast
+        room.post_human("@you note to self").expect("posted");
+        assert_eq!(room.history(1), vec!["#4 you: @you note to self"]);
+    }
+
+    #[test]
+    fn room_post_human_empty_is_none() {
+        let mut room = ChatRoom::new();
+        assert!(room.post_human("   ").is_none());
+        assert_eq!(room.last_seq(), 0, "blank input appends nothing");
+    }
+
+    #[test]
+    fn crew_orders_stalest_live_first_human_between_exited_last() {
+        let mut room = ChatRoom::new();
+        // Join in an order that does NOT match the final sort.
+        room.join("t1", "alpha");
+        room.join("t3", "gamma");
+        room.join("t5", "epsilon");
+        room.join("t4", "delta"); // will be exited
+        // Activity: t1 most recent, t5 older, t3 oldest (stalest). t4 never
+        // heard beyond its join, then exits.
+        room.post("t3", "old", &[], None).expect("ok"); // t3 speaks first
+        room.post("t5", "mid", &[], None).expect("ok");
+        room.post("t1", "new", &[], None).expect("ok"); // t1 most recent
+        room.post("you", "human spoke", &[], None).expect("ok");
+        // t4 vanishes -> exited.
+        room.tick("p1", &[
+            live("t1", true, false),
+            live("t3", true, false),
+            live("t5", true, false),
+        ]);
+        let rows = room.crew(std::time::Instant::now());
+        let order: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        // live stalest-first: t3 (oldest post) < t5 < t1; then `you`; t4 last.
+        assert_eq!(order, vec!["t3", "t5", "t1", "you", "t4"]);
+        // exited flag is carried through.
+        assert!(rows.iter().find(|r| r.id == "t4").unwrap().exited);
+        assert!(!rows.iter().find(|r| r.id == "you").unwrap().exited);
+    }
+
+    #[test]
+    fn tick_refreshes_member_name_from_live() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        // a present live member renames -> the room tracks it.
+        room.tick("p1", &[LiveMember {
+            id: "t1".to_string(),
+            name: "worker A".to_string(),
+            ready: true,
+            exited: false,
+        }]);
+        let row = room
+            .crew(std::time::Instant::now())
+            .into_iter()
+            .find(|r| r.id == "t1")
+            .expect("t1 row");
+        assert_eq!(row.name, "worker A");
+    }
+
+    #[test]
+    fn is_member_excludes_human_and_unknown_includes_exited() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "worker");
+        room.join("t2", "helper");
+        assert!(room.is_member("t1"), "joined id is a member");
+        assert!(!room.is_member("you"), "human seat is not a member");
+        assert!(!room.is_member("t9"), "unknown id is not a member");
+        // exit t2: still a member (status output lists exited terminals).
+        room.tick("p1", &[live("t1", true, false)]);
+        assert!(room.member("t2").unwrap().exited, "precondition: t2 exited");
+        assert!(room.is_member("t2"), "an exited terminal is still a member");
+    }
+
+    #[test]
+    fn join_is_idempotent() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.join("t1", "alpha-renamed");
+        // exactly one Joined line; the second call is a no-op (no rename either)
+        assert_eq!(room.last_seq(), 1);
+        assert_eq!(room.member("t1").unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn tick_delivers_each_post_exactly_once() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.join("t2", "beta");
+        room.post("t1", "broadcast", &[], None).expect("ok");
+        let d = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        // t2 gets the broadcast; t1 does not (its own post).
+        let t2 = d.iter().find(|x| x.id == "t2").expect("t2 delivery");
+        assert_eq!(t2.lines, vec!["[chat p1 #3] t1: broadcast"]);
+        assert!(d.iter().all(|x| x.id != "t1"), "sender excluded");
+        // a second tick with no new posts delivers nothing.
+        let d2 = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        assert!(d2.is_empty(), "cursor advanced; nothing re-delivered");
+    }
+
+    #[test]
+    fn tick_never_delivers_a_members_own_post() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.post("t1", "mine", &[], None).expect("ok");
+        let d = room.tick("p1", &[live("t1", true, false)]);
+        assert!(d.is_empty(), "t1 must not receive its own broadcast");
+    }
+
+    #[test]
+    fn tick_catch_up_holds_cursor_until_ready() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.join("t2", "beta");
+        room.post("t1", "hello", &[], None).expect("ok");
+        // t2 not ready: gets nothing, cursor must NOT advance.
+        let d = room.tick("p1", &[live("t1", true, false), live("t2", false, false)]);
+        assert!(d.iter().all(|x| x.id != "t2"));
+        // flip ready: the backlog arrives now.
+        let d = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        let t2 = d.iter().find(|x| x.id == "t2").expect("backlog");
+        assert_eq!(t2.lines, vec!["[chat p1 #3] t1: hello"]);
+    }
+
+    #[test]
+    fn tick_targeting_excludes_unaddressed_but_advances_cursor() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.join("t2", "beta");
+        room.join("t3", "gamma");
+        // a post addressed only to t2.
+        room.post("t1", "@t2 secret", &[], None).expect("ok");
+        let d = room.tick("p1", &[
+            live("t1", true, false),
+            live("t2", true, false),
+            live("t3", true, false),
+        ]);
+        assert!(d.iter().any(|x| x.id == "t2"), "t2 addressed");
+        assert!(d.iter().all(|x| x.id != "t3"), "t3 not addressed");
+        // t3's cursor still advanced: a later post is the only thing it sees.
+        room.post("t1", "everyone", &[], None).expect("ok");
+        let d = room.tick("p1", &[
+            live("t1", true, false),
+            live("t2", true, false),
+            live("t3", true, false),
+        ]);
+        let t3 = d.iter().find(|x| x.id == "t3").expect("t3 broadcast");
+        assert_eq!(
+            t3.lines,
+            vec!["[chat p1 #5] t1: everyone"],
+            "t3 never re-scans the post it was not addressed in"
+        );
+    }
+
+    #[test]
+    fn tick_marks_vanished_or_exited_member_once() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        room.join("t2", "beta");
+        let seq_before = room.last_seq();
+        // t2 vanishes from live entirely -> one Exited line.
+        room.tick("p1", &[live("t1", true, false)]);
+        assert_eq!(room.last_seq(), seq_before + 1, "exactly one Exited line");
+        let m = room.member("t2").unwrap();
+        assert!(m.exited);
+        // repeated ticks: no second Exited line.
+        room.tick("p1", &[live("t1", true, false)]);
+        room.tick("p1", &[live("t1", true, false), live("t2", false, true)]);
+        assert_eq!(room.last_seq(), seq_before + 1, "Exited is once-only");
+    }
+
+    #[test]
+    fn tick_never_marks_human_exited() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "alpha");
+        // human is never in `live`; it must never be marked exited.
+        room.tick("p1", &[live("t1", true, false)]);
+        assert!(!room.member("you").unwrap().exited);
+    }
 
     #[test]
     fn post_assigns_increasing_seq_from_one() {
@@ -493,8 +1134,6 @@ mod tests {
     fn row(id: &str, exited: bool, last_secs_ago: Option<u64>) -> CrewRow {
         let now = SystemTime::now();
         CrewRow {
-            win: 1,
-            tab: 0,
             id: id.to_string(),
             name: id.to_string(),
             exited,
@@ -647,5 +1286,27 @@ mod tests {
         let m = log.post("t2", "worker", "ok");
         assert_eq!(m.line(), "#1 t2: ok");
         assert_eq!(m.frame("p1"), "[chat p1 #1] t2: ok");
+    }
+
+    #[test]
+    fn deliver_after_returns_addressed_posts_past_cursor() {
+        let mut log = ChatLog::new();
+        log.post("t1", "a", "broadcast-1"); // #1 broadcast
+        log.post_to("t1", "a", "for t2", vec!["t2".into()]); // #2 -> t2
+        log.post_to("t1", "a", "for t3", vec!["t3".into()]); // #3 -> t3
+        log.sys(ChatKind::Joined, "t9", "late"); // #4 system entry
+        log.post("t1", "a", "broadcast-2"); // #5 broadcast
+
+        // t2 caught up through #1: sees the later broadcast #5 and its own
+        // targeted #2, never t3's #3, never the system entry #4.
+        let got: Vec<u64> = log.deliver_after("t2", 1).iter().map(|m| m.seq).collect();
+        assert_eq!(got, vec![2, 5]);
+
+        // cursor already at the tail: nothing left to deliver.
+        assert!(log.deliver_after("t2", 5).is_empty());
+
+        // from seq 0, t3 sees both broadcasts and its own targeted #3.
+        let got: Vec<u64> = log.deliver_after("t3", 0).iter().map(|m| m.seq).collect();
+        assert_eq!(got, vec![1, 3, 5]);
     }
 }

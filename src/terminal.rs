@@ -178,6 +178,11 @@ pub struct Session {
     exit: Option<u32>,
     exit_noted: bool,
     pub shell: Shell,
+    // The Session's stable Member id, stamped by the window manager at spawn
+    // (== the `t{id}` it injects as FOREMAN_TERMINAL_ID). Unlike a Win id it
+    // never changes — tabbing, untabbing, and moving leave it alone — so the
+    // chat room and the agent always agree on "who". 0 until stamped.
+    term_id: u64,
     cols: usize,
     rows: usize,
     sel_anchor: Option<(usize, usize)>, // (row, col) where a selection drag began
@@ -371,6 +376,7 @@ impl Session {
             exit: None,
             exit_noted: false,
             shell,
+            term_id: 0,
             cols,
             rows,
             sel_anchor: None,
@@ -381,6 +387,18 @@ impl Session {
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
         })
+    }
+
+    /// The Session's stable Member id (see the `term_id` field). 0 until the
+    /// window manager stamps it at spawn.
+    pub fn term_id(&self) -> u64 {
+        self.term_id
+    }
+
+    /// Stamp the stable Member id. The window manager calls this once, right
+    /// after spawn, with the same id it baked into FOREMAN_TERMINAL_ID.
+    pub fn set_term_id(&mut self, id: u64) {
+        self.term_id = id;
     }
 
     /// Has the startup DSR exchange resolved? Once true, injected chat input

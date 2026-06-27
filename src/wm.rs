@@ -198,7 +198,10 @@ impl Content {
                     let now = std::time::SystemTime::now();
                     let row_h = 20.0;
                     let mut y = board.min.y + pad + 16.0;
-                    for r in &view.crew {
+                    // Pull crew rows from the room; the borrow is dropped before
+                    // the paint loop (it borrows nothing else from the room).
+                    let crew = view.room.borrow().crew(std::time::Instant::now());
+                    for r in &crew {
                         let row = egui::Rect::from_min_size(
                             egui::pos2(board.min.x + 4.0, y),
                             egui::vec2(board.width() - 8.0, row_h),
@@ -209,7 +212,7 @@ impl Content {
                             p.rect_filled(row, 3.0, TITLE_BG);
                         }
                         if hovered && resp.clicked() {
-                            view.click = Some((r.win, r.tab));
+                            view.click = Some(r.id.clone());
                         }
                         let dot = if r.exited { BORDER } else { CHAT_LIVE };
                         p.circle_filled(egui::pos2(row.min.x + 7.0, row.center().y), 3.0, dot);
@@ -268,11 +271,8 @@ impl Content {
                 );
                 let wrap = (log_rect.width() - 10.0).max(40.0);
                 // Borrow stays scoped — never held across recursion into other
-                // windows' show() (post paths borrow_mut the log).
-                let blocks = {
-                    let log = view.log.borrow();
-                    crate::chat::build_blocks(log.msgs(), view.last_seen, compact)
-                };
+                // windows' show() (post paths borrow_mut the room).
+                let blocks = view.room.borrow().blocks(view.last_seen, compact);
                 enum Painted {
                     Galley(
                         std::sync::Arc<egui::Galley>,
@@ -497,12 +497,6 @@ impl Content {
 pub struct Tab {
     pub title: String,
     pub content: Content,
-    /// Member of this project's chat room (spec: agent-group-chat §2).
-    /// Dispatched terminals auto-join; others join on first post. Lives on
-    /// the Tab so membership travels with its terminal through tab
-    /// merges/untabs. Sender identity still resolves via Win id (active
-    /// tab) — same staleness family as terminal-id resolution.
-    pub chat_member: bool,
 }
 
 pub struct Win {
@@ -586,15 +580,10 @@ enum Act {
 }
 
 /// What a validated chat request resolved to. Posting is split from injection
-/// so the reply can be sent between the two (spec §3).
+/// so the reply (the ack handle) is sent before the per-frame
+/// `chat_delivery_sweep` injects the post (spec §3: reply-before-inject).
 enum ChatOutcome {
     Posted {
-        pid: WinId,
-        from: WinId,
-        framed: String,
-        /// `None` = broadcast; `Some` = deliver only to these windows
-        /// (`you` already filtered out — a pure-@you post is `Some(vec![])`).
-        targets: Option<Vec<WinId>>,
         /// The posted message's seq — returned to the sender as its ack handle.
         seq: Option<u64>,
     },
@@ -613,9 +602,10 @@ pub struct WindowManager {
     /// env-injected into its terminals so dispatchers can self-target. None on
     /// the desktop.
     tag: Option<String>,
-    /// This project's chat room (unused at desktop level). Shared with the
-    /// viewer window (`Content::Chat`), hence the Rc<RefCell<…>>.
-    pub chat: Rc<RefCell<crate::chat::ChatLog>>,
+    /// This project's chat room (a harmless empty room at desktop level —
+    /// `tick` no-ops with no members). Shared with the viewer window
+    /// (`Content::Chat`), hence the Rc<RefCell<…>>.
+    pub chat: Rc<RefCell<crate::chat::ChatRoom>>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -670,7 +660,7 @@ impl WindowManager {
             next: 1,
             cwd: None,
             tag: None,
-            chat: Rc::new(RefCell::new(crate::chat::ChatLog::new())),
+            chat: Rc::new(RefCell::new(crate::chat::ChatRoom::new())),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -711,11 +701,7 @@ impl WindowManager {
     fn push_win(&mut self, id: WinId, title: String, rect: egui::Rect, content: Content) {
         self.windows.push(Win {
             id,
-            tabs: vec![Tab {
-                title,
-                content,
-                chat_member: false,
-            }],
+            tabs: vec![Tab { title, content }],
             active: 0,
             rect,
             z: self.z,
@@ -729,8 +715,9 @@ impl WindowManager {
     /// if the PTY failed to spawn (the caller treats that as a no-op).
     pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
         let env = self.term_env(self.next);
-        let s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()).ok()?;
+        let mut s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()).ok()?;
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
+        s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
         self.push_win(
             id,
             format!("{}  ·  #{}", shell.label(), id),
@@ -866,22 +853,17 @@ impl WindowManager {
                     // log, not the audience) — only the injection is skipped.
                     // A retrying client may therefore duplicate a history line;
                     // accepted v1.
-                    Ok(ChatOutcome::Posted {
-                        pid,
-                        from,
-                        framed,
-                        targets,
-                        seq,
-                    }) => {
+                    Ok(ChatOutcome::Posted { seq }) => {
+                        // Reply-before-inject (spec §3): the ack handle returns
+                        // now; chat_delivery_sweep injects the post into each
+                        // ready member on a later frame.
                         let ok = OpenReply {
                             ok: true,
                             seq,
                             ..Default::default()
                         };
-                        if reply.send(ok).is_ok() {
-                            self.chat_broadcast_in(pid, from, &framed, targets.as_deref());
-                        }
-                        ctx.request_repaint(); // log changed either way (viewer)
+                        let _ = reply.send(ok);
+                        ctx.request_repaint(); // log changed (viewer + pending delivery)
                     }
                 }
             }
@@ -1045,19 +1027,12 @@ impl WindowManager {
             (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
             (Some(text), None) => {
                 // history reads are anonymous; a post must name its sender
-                let from = term_id(
-                    req.from
-                        .as_deref()
-                        .ok_or("posting requires a sender (FOREMAN_TERMINAL_ID)")?,
-                )?;
-                let (framed, targets, seq) = child.chat_post_re(from, text, &req.to, req.re)?;
-                Ok(ChatOutcome::Posted {
-                    pid,
-                    from,
-                    framed,
-                    targets,
-                    seq: Some(seq),
-                })
+                let from = req
+                    .from
+                    .as_deref()
+                    .ok_or("posting requires a sender (FOREMAN_TERMINAL_ID)")?;
+                let seq = child.chat_post(from, text, &req.to, req.re)?;
+                Ok(ChatOutcome::Posted { seq: Some(seq) })
             }
             _ => Err("chat needs exactly one of text/history".into()),
         }
@@ -1099,20 +1074,27 @@ impl WindowManager {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "-".into());
             lines.push(format!("p{}  {}  {}", w.id, name, cwd));
+            // Clone the room Rc before the terminal loop so membership reads
+            // don't borrow `child` a second time while it is borrowed mutably.
+            let room = Rc::clone(&child.chat);
             for win in child.windows.iter_mut() {
-                let wid = win.id;
                 for tab in win.tabs.iter_mut() {
                     let Content::Terminal(s) = &mut tab.content else {
                         continue;
                     };
+                    let tag = term_tag(s.term_id());
                     let state = match s.exited() {
                         Some(code) => format!("exited({code})"),
                         None => "running".into(),
                     };
-                    let member = if tab.chat_member { "chat" } else { "-" };
+                    let member = if room.borrow().is_member(&tag) {
+                        "chat"
+                    } else {
+                        "-"
+                    };
                     lines.push(format!(
-                        "  t{}  {}  {}  {}",
-                        wid,
+                        "  {}  {}  {}  {}",
+                        tag,
                         state,
                         member,
                         display_name(&tab.title)
@@ -1374,21 +1356,6 @@ impl WindowManager {
         Ok((lines, cells, cursor))
     }
 
-    /// Broadcast a framed post inside project `pid` (the after-reply half).
-    fn chat_broadcast_in(
-        &mut self,
-        pid: WinId,
-        from: WinId,
-        framed: &str,
-        targets: Option<&[WinId]>,
-    ) {
-        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid)
-            && let Content::Project(child) = &mut win.tabs[win.active].content
-        {
-            child.chat_broadcast(Some(from), framed, targets);
-        }
-    }
-
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
     fn close_terminal(&mut self, pid: WinId, tid: WinId) {
         if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid) {
@@ -1413,6 +1380,7 @@ impl WindowManager {
         let mut s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
         s.inject_note(&dispatch_banner(argv));
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
+        s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
         let title = title
             .map(str::to_string)
             .unwrap_or_else(|| format!("agent · {}", argv[0]));
@@ -1423,16 +1391,13 @@ impl WindowManager {
         let prev_focus = self.focused;
         self.push_win(id, title, rect, Content::Terminal(s));
         self.tile_new(id, prev_focus);
-        // Dispatched agents auto-join the project chat room (spec §2) — and
-        // the transcript records it.
-        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-            w.tabs[w.active].chat_member = true;
+        // Dispatched agents auto-join the project chat room (spec §2) — the
+        // room appends the Joined line; the transcript records it.
+        if let Some(w) = self.windows.iter().find(|w| w.id == id) {
             // (`title` was moved into push_win — read it back off the window)
-            self.chat.borrow_mut().sys(
-                crate::chat::ChatKind::Joined,
-                &term_tag(id),
-                display_name(w.title()),
-            );
+            self.chat
+                .borrow_mut()
+                .join(&term_tag(id), display_name(w.title()));
         } else {
             debug_assert!(false, "just-pushed window {id} missing");
         }
@@ -1472,79 +1437,11 @@ impl WindowManager {
         );
     }
 
-    /// Rebuild the chat viewer's crew rows and title chip. Runs before the
-    /// draw loop each frame (cheap: a handful of members). No-op when no
-    /// viewer window is open.
-    fn refresh_chat_view(&mut self) {
-        if !self
-            .windows
-            .iter()
-            .any(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
-        {
-            return;
-        }
-        let mut rows = Vec::new();
-        for w in &mut self.windows {
-            let wid = w.id;
-            for (i, t) in w.tabs.iter_mut().enumerate() {
-                if !t.chat_member {
-                    continue;
-                }
-                let Content::Terminal(s) = &mut t.content else {
-                    continue;
-                };
-                // Merged member tabs in one window share term_tag(wid) — both rows get the same id and last-heard. Same accepted staleness family as the rest of chat identity (Tab doc).
-                rows.push(crate::chat::CrewRow {
-                    win: wid,
-                    tab: i,
-                    id: term_tag(wid),
-                    name: display_name(&t.title).to_string(),
-                    exited: s.exited().is_some(),
-                    last: None,
-                });
-            }
-        }
-        {
-            let log = self.chat.borrow();
-            for r in &mut rows {
-                r.last = log.last_activity(&r.id);
-            }
-        }
-        crate::chat::sort_crew(&mut rows);
-        let n_live = rows.iter().filter(|r| !r.exited).count();
-        // The pane identity sits between live members and the exited — it is
-        // "your seat", not fleet status, and never counts toward the live chip.
-        let pos = rows.iter().take_while(|r| !r.exited).count();
-        rows.insert(
-            pos,
-            crate::chat::CrewRow {
-                win: 0, // no window: click is a no-op (ids start at 1)
-                tab: 0,
-                id: Self::HUMAN_ID.to_string(),
-                name: Self::HUMAN_ID.to_string(),
-                exited: false,
-                last: self.chat.borrow().last_activity(Self::HUMAN_ID),
-            },
-        );
-        for w in &mut self.windows {
-            for t in &mut w.tabs {
-                if let Content::Chat(v) = &mut t.content {
-                    // mem::take, not a move — the compiler can't see that the
-                    // singleton makes a second loop iteration unreachable.
-                    v.crew = std::mem::take(&mut rows);
-                    // Clobbers a user rename each frame — accepted: the chip
-                    // IS the title for the chat window.
-                    t.title = format!("chat · {n_live} live");
-                    return;
-                }
-            }
-        }
-    }
-
     /// Apply crew-board clicks recorded during the draw (content cannot
-    /// mutate sibling windows mid-loop). Stale targets (closed windows,
-    /// merged-away tabs) are dropped silently — same staleness family as
-    /// terminal-id resolution.
+    /// mutate sibling windows mid-loop). The recorded value is a member id
+    /// (`tN`); re-resolve the live terminal holding it and focus its window +
+    /// tab. Stale targets (closed windows, merged-away tabs, the human seat)
+    /// are dropped silently — same staleness family as terminal-id resolution.
     fn drain_chat_clicks(&mut self) {
         let mut req = None;
         for w in &mut self.windows {
@@ -1556,16 +1453,30 @@ impl WindowManager {
                 }
             }
         }
-        if let Some((win, tab)) = req {
-            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
-                if tab < w.tabs.len() {
-                    w.active = tab;
-                    w.minimized = false;
-                    self.focus(win);
+        let Some(id) = req else { return };
+        // Find the window + active-relative tab whose terminal's Member id matches.
+        let mut hit = None;
+        for w in &self.windows {
+            for (i, t) in w.tabs.iter().enumerate() {
+                if let Content::Terminal(s) = &t.content
+                    && term_tag(s.term_id()) == id
+                {
+                    hit = Some((w.id, i));
+                    break;
                 }
-                // else: tab merged/closed away — drop silently, same as a missing window
+            }
+            if hit.is_some() {
+                break;
             }
         }
+        if let Some((win, tab)) = hit {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
+                w.active = tab;
+                w.minimized = false;
+                self.focus(win);
+            }
+        }
+        // else: no live terminal for that id (human seat, or closed) — no-op.
     }
 
     /// Apply input-line submissions recorded during the draw. Human posts
@@ -1583,181 +1494,103 @@ impl WindowManager {
             }
         }
         if let Some(text) = pending {
-            if let Some((framed, targets)) = self.chat_post_human(&text) {
-                self.chat_broadcast(None, &framed, targets.as_deref());
-            }
+            // Append only; the per-frame chat_tick delivers it to each ready
+            // member next frame (catch-up replay closes the spawn-time drop).
+            let _ = self.chat_post_human(&text);
         }
     }
 
-    /// Resolve + validate mention targets against this project's members
-    /// (mentions spec §5) — call BEFORE any mutation: a failed post must not
-    /// append and must not join-on-first-post. `sender` None = the human
-    /// (`you` then counts as self-mention). Returns the terminal WinIds to
-    /// deliver to; `you` is valid markup but resolves to no terminal.
-    fn validate_chat_targets(
-        &mut self,
-        sender: Option<WinId>,
-        targets: &[String],
-    ) -> Result<Vec<WinId>, String> {
-        let mut ids = Vec::new();
-        for t in targets {
-            if t == "you" {
-                if sender.is_none() {
-                    return Err("cannot mention yourself".into());
-                }
-                continue;
-            }
-            let id = term_id(t)?;
-            let win = self
-                .windows
-                .iter_mut()
-                .find(|w| w.id == id)
-                .ok_or_else(|| format!("no such terminal: {t}"))?;
-            if Some(id) == sender {
-                return Err("cannot mention yourself".into());
-            }
-            let (mut member, mut alive) = (false, false);
-            for tab in &mut win.tabs {
-                if !tab.chat_member {
-                    continue;
-                }
-                member = true;
-                if let Content::Terminal(s) = &mut tab.content
-                    && s.exited().is_none()
-                {
-                    alive = true;
-                }
-            }
-            if !member {
-                return Err(format!("{t} is not a chat member"));
-            }
-            if !alive {
-                return Err(format!("{t} has exited"));
-            }
-            ids.push(id);
-        }
-        Ok(ids)
-    }
-
-    /// Post into this project's chat: validate the sender, append, join the
-    /// sender (spec §2: join-on-first-post). Targets (`--to` flags + leading
-    /// inline mentions) validate all-or-nothing BEFORE the join/append, so a
-    /// failed post mutates nothing (mentions spec §5). Returns the framed
-    /// injection line plus the resolved delivery filter for `chat_broadcast`
-    /// (`None` = broadcast). Injection itself is `chat_broadcast` — kept
-    /// separate because the reply must be sent BEFORE bytes flow (spec §3:
-    /// reply-before-inject).
+    /// Post into this project's chat on behalf of a terminal. `from` is the
+    /// sender's `tN` id string (`req.from`, required non-empty). Requires a live
+    /// terminal whose stable Member id matches `from` (else errors), then hands
+    /// the post to the room — which owns validation (all-or-nothing targets),
+    /// join-on-first-post, and append. Returns the posted seq (the sender's ack
+    /// handle). The room auto-joins the sender only on a *successful* post, so a
+    /// failed post mutates nothing. A new member's name lands as its id and is
+    /// refreshed to the live tab title by the next `chat_tick`. All mutation
+    /// lives in the frozen [`ChatRoom`]; nothing is injected here (the per-frame
+    /// `chat_tick` delivers, spec §3: reply-before-inject).
     fn chat_post(
         &mut self,
-        from: WinId,
+        from: &str,
         text: &str,
-        to_flags: &[String],
-    ) -> Result<(String, Option<Vec<WinId>>), String> {
-        let (framed, targets, _seq) = self.chat_post_re(from, text, to_flags, None)?;
-        Ok((framed, targets))
-    }
-
-    /// Post carrying a handshake back-pointer (`--re`); returns the framed line,
-    /// the delivery filter, and the posted seq (the sender's ack handle). The
-    /// no-`re` [`Self::chat_post`] wraps this for the common case.
-    fn chat_post_re(
-        &mut self,
-        from: WinId,
-        text: &str,
-        to_flags: &[String],
+        to: &[String],
         re: Option<u64>,
-    ) -> Result<(String, Option<Vec<WinId>>, u64), String> {
-        if text.is_empty() {
-            return Err("empty message".into());
+    ) -> Result<u64, String> {
+        // The sender must be a live terminal (history reads are anonymous, but
+        // a post names its origin). Resolve by stable Member id.
+        let exists = self.windows.iter().any(|w| {
+            w.tabs.iter().any(|t| {
+                matches!(&t.content, Content::Terminal(s) if term_tag(s.term_id()) == from)
+            })
+        });
+        if !exists {
+            return Err(format!("no such terminal: {from}"));
         }
-        let targets = crate::chat::effective_targets(to_flags, text);
-        let resolved = if targets.is_empty() {
-            None
-        } else {
-            Some(self.validate_chat_targets(Some(from), &targets)?)
-        };
-        let sender = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == from)
-            .ok_or_else(|| format!("no such terminal: t{from}"))?;
-        let newly_joined = !sender.tabs[sender.active].chat_member;
-        sender.tabs[sender.active].chat_member = true;
-        debug_assert!(
-            self.tag.is_some(),
-            "chat_post on a tag-less (desktop?) manager — routing bug"
-        );
-        let project = self.tag.as_deref().unwrap_or("p?");
-        // .to_string() drops the &mut Win borrow before the RefCell borrow below
-        let name = display_name(sender.title()).to_string();
-        let from_tag = term_tag(from);
-        let mut log = self.chat.borrow_mut();
-        if newly_joined {
-            // join-on-first-post: the sysline lands BEFORE the post so the
-            // transcript reads join-then-speak
-            log.sys(crate::chat::ChatKind::Joined, &from_tag, &name);
-        }
-        let msg = log.post_re(&from_tag, &name, text, targets, re);
-        Ok((msg.frame(project), resolved, msg.seq))
+        self.chat.borrow_mut().post(from, text, to, re)
     }
 
-    /// The pane's reserved sender identity — can never collide with a "tN"
-    /// terminal id (spec: chat-dispatcher-window §Slices).
-    const HUMAN_ID: &'static str = "you";
-
-    /// Append a post from the chat pane's input line. No membership games —
-    /// the human is not a terminal. Leading mentions narrow delivery like CLI
-    /// posts, but a bad mention demotes the post to plain broadcast instead
-    /// of erroring — the input line has no error seat (mentions spec §7).
-    /// Returns the framed line plus the delivery filter for `chat_broadcast`.
-    fn chat_post_human(&mut self, text: &str) -> Option<(String, Option<Vec<WinId>>)> {
-        let text = text.trim();
-        if text.is_empty() {
-            return None;
-        }
-        // effective_targets (not raw leading_mentions) for dedup parity with
-        // CLI posts — `@t2 @t2 go` must not frame `you→t2,t2`
-        let mentions = crate::chat::effective_targets(&[], text);
-        let (to, resolved) = if mentions.is_empty() {
-            (Vec::new(), None)
-        } else {
-            match self.validate_chat_targets(None, &mentions) {
-                Ok(ids) => (mentions, Some(ids)),
-                Err(_) => (Vec::new(), None), // prose fallback
-            }
-        };
-        debug_assert!(self.tag.is_some(), "human post on a tag-less manager");
-        let project = self.tag.as_deref().unwrap_or("p?").to_string();
-        let mut log = self.chat.borrow_mut();
-        let msg = log.post_to(Self::HUMAN_ID, Self::HUMAN_ID, text, to);
-        Some((msg.frame(&project), resolved))
+    /// Append a post from the chat pane's input line. The room owns the lenient
+    /// human policy: a bad mention demotes to a plain broadcast instead of
+    /// erroring (the input line has no error seat). Append only — `chat_tick`
+    /// delivers next frame. Returns the new seq, or `None` for blank input.
+    fn chat_post_human(&mut self, text: &str) -> Option<u64> {
+        self.chat.borrow_mut().post_human(text)
     }
 
-    /// Inject a framed chat line into every member tab except the sender's
-    /// active tab, skipping exited sessions and non-terminal content (the
-    /// chat viewer renders the log directly — never injected). Background
-    /// tabs receive too: keepalive keeps their PTYs drained, and chat's
-    /// whole point is that members never have to poll. `None` = the human
-    /// posting from the chat pane; excludes nobody.
-    /// `targets`: None = broadcast; Some(ids) = only those windows' member
-    /// tabs; Some(&[]) injects nobody (a pure @you post).
-    fn chat_broadcast(&mut self, from: Option<WinId>, framed: &str, targets: Option<&[WinId]>) {
+    /// Per-frame presence reconcile + catch-up delivery (chat handshake
+    /// contract). Walks the whole manager tree; in each project manager it
+    /// gathers the live members (id/name/ready/exited), hands them to the
+    /// room's [`ChatRoom::tick`] (which reconciles exits, refreshes names, and
+    /// returns the per-member outbox), then injects each delivered line into
+    /// its terminal. `tick`'s ready-gating + cursor is the whole DSR point: a
+    /// post appended while a member was still answering its startup device-
+    /// status query lands on the first frame the member is ready, exactly once.
+    /// Call once after the top-level `show()`, so every session pumped this
+    /// frame reports its current `ready()` state.
+    pub fn chat_tick(&mut self) {
+        // First pass: recurse into projects and collect this manager's live
+        // members (the `&mut s` for exited()/ready() forces a borrow we drop
+        // before touching the room).
+        let mut live = Vec::new();
         for w in self.windows.iter_mut() {
-            if let Some(t) = targets
-                && !t.contains(&w.id)
-            {
-                continue;
-            }
-            let active = w.active;
-            let is_sender = Some(w.id) == from;
-            for (i, tab) in w.tabs.iter_mut().enumerate() {
-                if (is_sender && i == active) || !tab.chat_member {
-                    continue;
+            for tab in w.tabs.iter_mut() {
+                match &mut tab.content {
+                    Content::Project(child) => child.chat_tick(), // each room owns its log
+                    Content::Terminal(s) => live.push(crate::chat::LiveMember {
+                        id: term_tag(s.term_id()),
+                        name: display_name(&tab.title).to_string(),
+                        ready: s.ready(),
+                        exited: s.exited().is_some(),
+                    }),
+                    Content::Chat(_) => {} // viewer, never a member
                 }
-                if let Content::Terminal(s) = &mut tab.content {
-                    if s.exited().is_none() {
-                        s.inject_input(framed);
+            }
+        }
+        // Desktop manager (no tag) hosts only projects; with no members the
+        // tick would no-op anyway, but skip the room borrow entirely.
+        let project = self.tag.as_deref().unwrap_or("p?").to_string();
+        // Reconcile + outbox, borrow dropped before injection.
+        let room = self.chat.clone();
+        let deliveries = room.borrow_mut().tick(&project, &live);
+        // Second pass: inject each delivery into its terminal. No room borrow
+        // is held here, and no session borrow spans the room borrow above.
+        for d in &deliveries {
+            for w in self.windows.iter_mut() {
+                let mut hit = false;
+                for tab in w.tabs.iter_mut() {
+                    if let Content::Terminal(s) = &mut tab.content
+                        && term_tag(s.term_id()) == d.id
+                    {
+                        for line in &d.lines {
+                            s.inject_input(line);
+                        }
+                        hit = true;
+                        break;
                     }
+                }
+                if hit {
+                    break;
                 }
             }
         }
@@ -1765,7 +1598,7 @@ impl WindowManager {
 
     /// Last `n` chat lines (the `--history` verb; reading does not join).
     fn chat_history(&self, n: usize) -> Vec<String> {
-        self.chat.borrow().tail_lines(n)
+        self.chat.borrow().history(n)
     }
 
     /// Where the picker opens: the focused project's cwd if there is one, else the
@@ -2407,21 +2240,14 @@ impl WindowManager {
     /// Entry point is the desktop manager (gated in `show`); project managers
     /// are reached through the `Content::Project` recursion below.
     fn refresh_exit_titles(&mut self) {
-        let chat = Rc::clone(&self.chat);
         for w in &mut self.windows {
-            let wid = w.id;
             for t in &mut w.tabs {
                 match &mut t.content {
                     Content::Terminal(s) => {
                         if let Some(code) = s.exit_to_note() {
-                            if t.chat_member {
-                                // Name must be read BEFORE the marker is appended.
-                                chat.borrow_mut().sys(
-                                    crate::chat::ChatKind::Exited,
-                                    &term_tag(wid),
-                                    display_name(&t.title),
-                                );
-                            }
+                            // The chat Exited line is emitted by chat_tick's
+                            // presence reconcile, not here — this only stamps
+                            // the one-shot title marker.
                             t.title.push_str(&format!("  ·  exited ({code})"));
                         }
                     }
@@ -2449,11 +2275,6 @@ impl WindowManager {
         if self.desktop {
             self.refresh_exit_titles();
         }
-
-        // Fill the chat viewer's crew rows / title chip before any window
-        // draws. Project managers refresh their own viewer; on the desktop
-        // manager this scans windows once and finds no viewer.
-        self.refresh_chat_view();
 
         self.pump_commands(ui, active);
 
@@ -3704,7 +3525,6 @@ mod tests {
             tabs: vec![Tab {
                 title: title.to_string(),
                 content: stub_content(),
-                chat_member: false,
             }],
             active: 0,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
@@ -3952,6 +3772,45 @@ mod tests {
         assert_eq!(wm.windows.len(), 1, "single-tab window is not detachable");
     }
 
+    // A Member's id is its Session's stable spawn-time id, NOT the mutable Win id.
+    // Untab allocates a new Win id; the detached terminal must keep its identity
+    // so chat delivery/self-exclusion/targeting don't break under it.
+    #[test]
+    fn term_id_survives_untab() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        let a = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("A"), &ctx)
+            .unwrap();
+        let b = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("B"), &ctx)
+            .unwrap();
+
+        let term_id_at = |wm: &WindowManager, win: WinId, tab: usize| -> u64 {
+            let w = wm.windows.iter().find(|w| w.id == win).unwrap();
+            match &w.tabs[tab].content {
+                Content::Terminal(s) => s.term_id(),
+                _ => panic!("not a terminal"),
+            }
+        };
+        // spawn stamps the Session with the id that also became its Win id.
+        assert_eq!(term_id_at(&wm, a, 0), a, "spawn stamps term_id");
+        assert_eq!(term_id_at(&wm, b, 0), b);
+
+        // Tab B onto A, then pull it back out: untab mints a NEW Win id.
+        wm.merge_windows(b, a); // A: [A, B]
+        let new_id = wm
+            .untab(a, 1, egui::pos2(500.0, 400.0))
+            .expect("untab detaches");
+        assert_ne!(new_id, b, "the detached tab lives in a brand-new Win id");
+        assert_eq!(
+            term_id_at(&wm, new_id, 0),
+            b,
+            "but the Member id is stable — it does not follow the Win id"
+        );
+    }
+
     // --- Tree-based split/move/float (drives place_split with stub windows so no
     // real PTY/Session is spawned; split_dir only adds the spawn + id capture). ---
 
@@ -4141,18 +4000,34 @@ mod tests {
         vec!["cmd.exe".into(), "/c".into(), "pause".into()]
     }
 
+    // Count Joined/Exited syslines for a member id by reading the room's paint
+    // blocks (the room exposes no raw msg list — blocks() is the read path).
+    // Sys lines render as "— {name} ({id}) joined|exited —".
+    fn sys_lines(wm: &WindowManager, id: &str, verb: &str) -> usize {
+        wm.chat
+            .borrow()
+            .blocks(0, true)
+            .iter()
+            .filter(|b| {
+                matches!(b, crate::chat::ChatBlock::Sys(s)
+                    if s.contains(&format!("({id}) {verb}")))
+            })
+            .count()
+    }
+
     #[test]
     fn dispatched_terminals_auto_join_chat() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
         let argv = vec![
             "cmd.exe".to_string(),
             "/c".to_string(),
             "exit 0".to_string(),
         ];
         let t = wm.add_terminal_cmd(&argv, None, None, &ctx).unwrap();
-        let w = wm.windows.iter().find(|w| w.id == t).unwrap();
-        assert!(w.tabs[w.active].chat_member);
+        // membership now lives in the room, not the Tab.
+        assert!(wm.chat.borrow().is_member(&term_tag(t)));
     }
 
     #[test]
@@ -4168,11 +4043,15 @@ mod tests {
         let t = wm
             .add_terminal_cmd(&argv, None, Some("worker A"), &ctx)
             .unwrap();
-        let log = wm.chat.borrow();
-        let m = log.msgs().last().expect("no joined entry");
-        assert_eq!(m.kind, crate::chat::ChatKind::Joined);
-        assert_eq!(m.from, format!("t{t}"));
-        assert_eq!(m.name, "worker A");
+        // exactly one Joined sysline for this member, carrying its name.
+        assert_eq!(sys_lines(&wm, &term_tag(t), "joined"), 1);
+        assert!(wm
+            .chat
+            .borrow()
+            .blocks(0, true)
+            .iter()
+            .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
+                if s.contains(&format!("worker A ({}) joined", term_tag(t))))));
     }
 
     #[test]
@@ -4183,35 +4062,22 @@ mod tests {
         let t = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        // simulate a hand-opened terminal: not yet a member
-        let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
-        w.tabs[w.active].chat_member = false;
-        wm.chat_post(t, "hello", &[]).unwrap();
-        let log = wm.chat.borrow();
-        let kinds: Vec<_> = log.msgs().iter().map(|m| m.kind).collect();
-        // dispatch auto-join from add_terminal_cmd, then the simulated
-        // un-join means: Joined (dispatch), Joined (first post), Post
+        // dispatch auto-joined once; posting is idempotent on an existing
+        // member — no second Joined line, just the Post.
+        wm.chat_post(&term_tag(t), "hello", &[], None).unwrap();
+        // history shows the post; blocks show the single join then the post.
+        assert_eq!(sys_lines(&wm, &term_tag(t), "joined"), 1);
+        assert_eq!(wm.chat_history(10), vec![format!("#2 t{t}: hello")]);
+        // a second post adds no Joined line and a second history entry.
+        wm.chat_post(&term_tag(t), "again", &[], None).unwrap();
         assert_eq!(
-            &kinds[kinds.len() - 3..],
-            &[
-                crate::chat::ChatKind::Joined, // dispatch auto-join
-                crate::chat::ChatKind::Joined, // first post joins
-                crate::chat::ChatKind::Post
-            ]
+            sys_lines(&wm, &term_tag(t), "joined"),
+            1,
+            "one Joined from dispatch — posting never re-joins"
         );
-        drop(log);
-        // second post: member already — no second Joined
-        wm.chat_post(t, "again", &[]).unwrap();
-        let log = wm.chat.borrow();
-        assert_eq!(log.msgs().last().unwrap().kind, crate::chat::ChatKind::Post);
-        let joins = log
-            .msgs()
-            .iter()
-            .filter(|m| m.kind == crate::chat::ChatKind::Joined && m.from == format!("t{t}"))
-            .count();
         assert_eq!(
-            joins, 2,
-            "one from dispatch, one from first post — not three"
+            wm.chat_history(10),
+            vec![format!("#2 t{t}: hello"), format!("#3 t{t}: again")]
         );
     }
 
@@ -4228,49 +4094,54 @@ mod tests {
         let member = wm
             .add_terminal_cmd(&argv, None, Some("worker A"), &ctx)
             .unwrap();
-        let outsider = wm
-            .add_terminal_cmd(&argv, None, Some("plain"), &ctx)
-            .unwrap();
-        let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
-        w.tabs[w.active].chat_member = false;
-        // wait for both `cmd /c exit 0` children to end — pumping keepalive()
+        // A hand-opened (non-dispatched) terminal: never joins. Push it as a
+        // plain window so the room never registers it (it stays on `pause`).
+        let outsider = {
+            let mut s =
+                Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            id
+        };
+        assert!(!wm.chat.borrow().is_member(&term_tag(outsider)));
+        // wait for the `cmd /c exit 0` member child to end — pumping keepalive()
         // each pass, or the startup DSR query leaves cmd.exe hung forever
         // (the documented trap; same pattern as the broadcast tests above)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let mut done = 0;
-            for id in [member, outsider] {
-                let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
-                let Content::Terminal(s) = &mut w.tabs[w.active].content else {
-                    panic!()
-                };
-                s.keepalive();
-                if s.exited().is_some() {
-                    done += 1;
-                }
-            }
-            if done == 2 {
+            let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            s.keepalive();
+            if s.exited().is_some() {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "children never exited"
+                "child never exited"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        wm.refresh_exit_titles();
-        let log = wm.chat.borrow();
-        let exits: Vec<_> = log
-            .msgs()
+        // chat_tick's presence reconcile emits the Exited line now. Keep the
+        // outsider's pwsh pumped so it never falsely looks gone.
+        for w in wm.windows.iter_mut() {
+            if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                s.keepalive();
+            }
+        }
+        wm.chat_tick();
+        // exactly one Exited line — the member's — and none for the non-member.
+        assert_eq!(sys_lines(&wm, &term_tag(member), "exited"), 1);
+        assert_eq!(sys_lines(&wm, &term_tag(outsider), "exited"), 0);
+        assert!(wm
+            .chat
+            .borrow()
+            .blocks(0, true)
             .iter()
-            .filter(|m| m.kind == crate::chat::ChatKind::Exited)
-            .collect();
-        assert_eq!(exits.len(), 1, "only the member's exit is recorded");
-        assert_eq!(exits[0].from, format!("t{member}"));
-        assert_eq!(
-            exits[0].name, "worker A",
-            "name captured before the exit marker lands"
-        );
+            .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
+                if s.contains(&format!("worker A ({}) exited", term_tag(member))))));
     }
 
     #[test]
@@ -4281,27 +4152,25 @@ mod tests {
         let t = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        // simulate a hand-opened (non-dispatched) terminal
-        {
-            let w = wm.windows.iter_mut().find(|w| w.id == t).unwrap();
-            w.tabs[w.active].chat_member = false;
-        }
+        let tag = term_tag(t);
 
-        assert!(wm.chat_post(t, "", &[]).is_err(), "empty message rejected");
+        // empty text is refused by the room; an unknown sender id has no live
+        // terminal so chat_post errors before touching the room.
         assert!(
-            wm.chat_post(999, "hi", &[]).is_err(),
+            wm.chat_post(&tag, "", &[], None).is_err(),
+            "empty message rejected"
+        );
+        assert!(
+            wm.chat_post("t999", "hi", &[], None).is_err(),
             "unknown sender rejected"
         );
-        let framed = wm.chat_post(t, "hello room", &[]).unwrap().0;
-        // seq 3: dispatch Joined (1), first-post Joined (2), then the post —
-        // system entries share the seq space but stay out of --history
-        assert_eq!(framed, format!("[chat p1 #3] t{t}: hello room"));
-        let w = wm.windows.iter().find(|w| w.id == t).unwrap();
-        assert!(
-            w.tabs[w.active].chat_member,
-            "posting joins the sender's active tab"
-        );
-        assert_eq!(wm.chat_history(10), vec![format!("#3 t{t}: hello room")]);
+        let seq = wm.chat_post(&tag, "hello room", &[], None).unwrap();
+        // seq 2: dispatch Joined (1), then the post — the join is idempotent so
+        // posting does not add a second Joined. System entries share the seq
+        // space but stay out of --history.
+        assert_eq!(seq, 2);
+        assert!(wm.chat.borrow().is_member(&tag), "the sender is a member");
+        assert_eq!(wm.chat_history(10), vec![format!("#2 t{t}: hello room")]);
     }
 
     #[test]
@@ -4349,7 +4218,6 @@ mod tests {
             w.tabs.push(Tab {
                 title: "shell".into(),
                 content: Content::Terminal(shell),
-                chat_member: false,
             });
             w.active = 1; // terminal in front, chat behind
         }
@@ -4363,8 +4231,11 @@ mod tests {
         assert_eq!(wm.focused, Some(id));
     }
 
+    // The viewer now PULLS crew rows from the room each draw — there is no
+    // pushed `crew` field or title chip. This re-expresses the old
+    // refresh_chat_view coverage against the room's crew() (the single source).
     #[test]
-    fn refresh_chat_view_builds_rows_and_title_chip() {
+    fn room_crew_lists_member_then_human_seat() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
@@ -4372,48 +4243,31 @@ mod tests {
         let a = wm
             .add_terminal_cmd(&pause_argv(), None, Some("worker A"), &ctx)
             .unwrap();
-        let b = wm
-            .add_terminal_cmd(&pause_argv(), None, Some("plain"), &ctx)
-            .unwrap();
-        let w = wm.windows.iter_mut().find(|w| w.id == b).unwrap();
-        w.tabs[w.active].chat_member = false;
-        wm.open_chat_window();
-        wm.refresh_chat_view();
-        let view_win = wm
-            .windows
-            .iter()
-            .find(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
-            .unwrap();
-        let tab = view_win
-            .tabs
-            .iter()
-            .find(|t| matches!(t.content, Content::Chat(_)))
-            .unwrap();
-        assert_eq!(
-            tab.title, "chat · 1 live",
-            "the you-row must not inflate the live count"
-        );
-        let Content::Chat(v) = &tab.content else {
-            panic!()
+        // a hand-opened (non-member) terminal: never registered with the room.
+        let _b = {
+            let mut s =
+                Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn plain");
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            id
         };
-        assert_eq!(v.crew.len(), 2, "the member + the human pane identity");
-        // index by id, not position, for the member assertions
-        let m = v
-            .crew
+        let crew = wm.chat.borrow().crew(std::time::Instant::now());
+        assert_eq!(crew.len(), 2, "the one member + the human pane identity");
+        // the live member row carries its name and last-heard.
+        let m = crew
             .iter()
-            .find(|r| r.id == format!("t{a}"))
+            .find(|r| r.id == term_tag(a))
             .expect("member row missing");
         assert_eq!(m.name, "worker A");
         assert!(!m.exited);
         assert!(m.last.is_some(), "joined entry counts as heard");
-        // the you-row sits AFTER the live members (here: index 1, one live member)
-        assert_eq!(v.crew[1].id, "you");
-        assert_eq!(v.crew[1].name, "you");
-        assert!(!v.crew[1].exited);
-        assert_eq!(
-            v.crew[1].win, 0,
-            "human row has no window — click must be a no-op"
-        );
+        // the non-member terminal contributes no row.
+        assert!(crew.iter().all(|r| r.id != term_tag(_b)));
+        // the human seat sits AFTER the live members (index 1).
+        assert_eq!(crew[1].id, "you");
+        assert_eq!(crew[1].name, "you");
+        assert!(!crew[1].exited);
     }
 
     #[test]
@@ -4427,42 +4281,33 @@ mod tests {
             .unwrap();
         wm.open_chat_window();
         let chat_id = wm.focused.expect("open focuses the viewer");
-        // simulate the render arm recording a click on worker A's row
-        for w in &mut wm.windows {
-            for tab in &mut w.tabs {
-                if let Content::Chat(v) = &mut tab.content {
-                    v.click = Some((t, 0));
+        // The click now carries a member id (tN); record a click on worker A.
+        let set_click = |wm: &mut WindowManager, id: Option<String>| {
+            for w in &mut wm.windows {
+                for tab in &mut w.tabs {
+                    if let Content::Chat(v) = &mut tab.content {
+                        v.click = id.clone();
+                    }
                 }
             }
-        }
+        };
+        set_click(&mut wm, Some(term_tag(t)));
         wm.drain_chat_clicks();
         assert_eq!(wm.focused, Some(t), "click focused the member");
         assert_ne!(wm.focused, Some(chat_id));
-        // stale target: must not panic or change focus
-        for w in &mut wm.windows {
-            for tab in &mut w.tabs {
-                if let Content::Chat(v) = &mut tab.content {
-                    v.click = Some((9999, 0));
-                }
-            }
-        }
+        // stale id with no live terminal: must not panic or change focus
+        set_click(&mut wm, Some("t9999".to_string()));
         wm.drain_chat_clicks();
         assert_eq!(wm.focused, Some(t), "stale click is a no-op");
-        // stale tab in a live window: also a silent no-op (focus must stay put)
+        // the human seat id resolves to no terminal: also a silent no-op
         wm.open_chat_window(); // refocuses the singleton viewer
         let chat_id = wm.focused.expect("viewer focused");
-        for w in &mut wm.windows {
-            for tab in &mut w.tabs {
-                if let Content::Chat(v) = &mut tab.content {
-                    v.click = Some((t, 5));
-                }
-            }
-        }
+        set_click(&mut wm, Some("you".to_string()));
         wm.drain_chat_clicks();
         assert_eq!(
             wm.focused,
             Some(chat_id),
-            "stale tab index is a silent no-op"
+            "the human seat has no terminal — a silent no-op"
         );
     }
 
@@ -4489,24 +4334,20 @@ mod tests {
             }
         }
         wm.drain_chat_posts();
-        let framed = {
-            let log = wm.chat.borrow();
-            let m = log
-                .msgs()
-                .iter()
-                .rfind(|m| m.kind == crate::chat::ChatKind::Post)
-                .expect("post missing");
-            assert_eq!(m.from, "you");
-            assert_eq!(m.name, "you");
-            let framed = m.frame("p1");
-            assert!(framed.starts_with(&format!("[chat p1 #{}] you: go", m.seq)));
-            framed
-        };
-        // BOTH members exit — the human excludes nobody. Bytes injected before a
-        // child's startup DSR scan resolves get eaten (the documented trap; see
-        // chat_broadcast_hits_members_only_excluding_sender), so pump every session
-        // and RE-SEND the broadcast each iteration until both stdins have seen it —
-        // deterministic instead of racing spawn latency.
+        {
+            // the human post lands under the reserved `you` id (history is the
+            // read path now; system entries are excluded from it).
+            let hist = wm.chat_history(10);
+            let last = hist.last().expect("post missing");
+            assert!(
+                last.ends_with(" you: go"),
+                "human post framed under `you`: {last}"
+            );
+        }
+        // BOTH members exit — the human is not a member, so its post is
+        // addressed to every member. chat_tick only delivers to ready()
+        // sessions, so pump every session each iteration (latching ready())
+        // then tick until both stdins have seen it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             for w in wm.windows.iter_mut() {
@@ -4514,7 +4355,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_broadcast(None, &framed, None);
+            wm.chat_tick();
             let mut done = 0;
             for id in [a, b] {
                 let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
@@ -4550,7 +4391,7 @@ mod tests {
             }
         }
         wm.drain_chat_posts();
-        assert_eq!(wm.chat.borrow().msgs().len(), 0);
+        assert_eq!(wm.chat.borrow().last_seq(), 0, "blank input appends nothing");
     }
 
     #[test]
@@ -4600,26 +4441,28 @@ mod tests {
 
     #[test]
     fn chat_view_watermark_moves_on_focus_loss_only() {
-        let log = Rc::new(RefCell::new(crate::chat::ChatLog::new()));
-        log.borrow_mut().post("t1", "a", "before-open");
-        let mut v = crate::chat::ChatView::new(Rc::clone(&log));
+        let room = Rc::new(RefCell::new(crate::chat::ChatRoom::new()));
+        // join t1 (Joined is #1), then a backlog post (#2) before the view opens.
+        room.borrow_mut().join("t1", "a");
+        room.borrow_mut().post("t1", "before-open", &[], None).unwrap();
+        let mut v = crate::chat::ChatView::new(Rc::clone(&room));
         assert_eq!(
-            v.last_seen, 1,
+            v.last_seen, 2,
             "creation watermark = current tail (backlog pre-dates the window open)"
         );
         v.on_frame(true); // focused
-        log.borrow_mut().post("t1", "a", "while-focused");
+        room.borrow_mut().post("t1", "while-focused", &[], None).unwrap(); // #3
         v.on_frame(true);
-        assert_eq!(v.last_seen, 1, "watermark holds while focused");
+        assert_eq!(v.last_seen, 2, "watermark holds while focused");
         v.on_frame(false); // focus left
         assert_eq!(
-            v.last_seen, 2,
+            v.last_seen, 3,
             "watermark catches up on the focus-loss edge"
         );
-        log.borrow_mut().post("t1", "a", "while-unfocused");
+        room.borrow_mut().post("t1", "while-unfocused", &[], None).unwrap(); // #4
         v.on_frame(false);
         assert_eq!(
-            v.last_seen, 2,
+            v.last_seen, 3,
             "unfocused arrivals stay above the watermark"
         );
     }
@@ -4636,25 +4479,28 @@ mod tests {
         let member = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let outsider = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
-        {
-            let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
-            w.tabs[w.active].chat_member = false;
-        }
+        // outsider is hand-opened (pushed plainly): never registered with the
+        // room, so the membership filter must skip it.
+        let outsider = {
+            let mut s =
+                Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            id
+        };
+        assert!(!wm.chat.borrow().is_member(&term_tag(outsider)));
 
-        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
+        wm.chat_post(&term_tag(sender), "go", &[], None).unwrap();
 
         // Pump every session each iteration: keepalive() answers the startup
         // DSR (the documented trap — bytes injected before a child's DSR scan
         // resolves get eaten by the scan, see terminal.rs's
-        // inject_input_reaches_child_stdin). wm.rs has no public grid access
-        // to wait for "prompt rendered", so instead of a timing-based sleep
-        // the broadcast is re-sent until the member's stdin sees it. That is
-        // deterministic and still proves the membership filter: every send
-        // skips the sender and the non-member, who are pumped too — so a
-        // wrongful injection into them WOULD make them exit below.
+        // inject_input_reaches_child_stdin). chat_tick only delivers to ready()
+        // members and never the sender's own post, so pumping latches ready()
+        // and the tick delivers. It still proves the membership filter: the
+        // sender and the non-member are pumped too — so a wrongful injection
+        // into them WOULD make them exit below.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             for w in wm.windows.iter_mut() {
@@ -4662,7 +4508,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_broadcast(Some(sender), &framed, None);
+            wm.chat_tick();
             // positive signal: the member exits because bytes hit its stdin
             let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
@@ -4759,19 +4605,28 @@ mod tests {
             &ctx,
         );
         assert!(rrx.try_recv().expect("no reply").ok);
-        // end-to-end: member b runs `cmd /c pause` and exits when bytes arrive
+        // end-to-end: member b runs `cmd /c pause` and exits when bytes arrive.
+        // The post was appended once above; each iteration pumps the child
+        // sessions (latching ready()) then chat_tick recurses into the project
+        // and delivers. The cursor + ready-gating make a re-send unnecessary.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
             let Content::Project(child) = &mut win.tabs[win.active].content else {
                 panic!()
             };
-            // Keep pumping so the broadcast bytes actually flush through.
+            // Keep pumping so each child session reports its current ready().
             for w in child.windows.iter_mut() {
                 if let Content::Terminal(s) = &mut w.tabs[w.active].content {
                     s.keepalive();
                 }
             }
+            // Drop the &mut d.windows borrow before ticking, then re-borrow.
+            d.chat_tick();
+            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &mut win.tabs[win.active].content else {
+                panic!()
+            };
             let w = child.windows.iter_mut().find(|w| w.id == b).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
                 panic!()
@@ -4782,17 +4637,6 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "member never received the post"
-            );
-            // If the one-shot broadcast may have been eaten by the DSR scan,
-            // re-send via another handle_ctrl call (plan deviation: noted in report).
-            let (rtx2, _rrx2) = std::sync::mpsc::channel();
-            d.handle_ctrl(
-                crate::control::CtrlMsg::Chat(
-                    chat_req(a, Some("go"), None),
-                    rtx2,
-                    std::time::Instant::now(),
-                ),
-                &ctx,
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -4813,17 +4657,16 @@ mod tests {
             &ctx,
         );
         rrx.try_recv().expect("post reply");
-        // make b a known terminal that is NOT a room member, so the
-        // does-not-join assertion below actually has something to catch
-        {
-            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
-            let Content::Project(child) = &mut win.tabs[win.active].content else {
+        // The history arm is anonymous (it ignores `from`) and must never
+        // append — capture the room's seq before and after to prove it.
+        let seq_before = {
+            let win = d.windows.iter().find(|w| w.id == 1).unwrap();
+            let Content::Project(child) = &win.tabs[win.active].content else {
                 panic!()
             };
-            let w = child.windows.iter_mut().find(|w| w.id == b).unwrap();
-            w.tabs[w.active].chat_member = false;
-        }
-        // history from a non-member: replies, does not error, does not join
+            child.chat.borrow().last_seq()
+        };
+        // history keyed by b: replies, does not error, does not append/join
         let (rtx, rrx) = std::sync::mpsc::channel();
         d.handle_ctrl(
             crate::control::CtrlMsg::Chat(
@@ -4836,14 +4679,14 @@ mod tests {
         let r = rrx.try_recv().expect("no history reply");
         assert!(r.ok);
         assert_eq!(r.history.as_deref().map(|h| h.len()), Some(1));
-        let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
-        let Content::Project(child) = &mut win.tabs[win.active].content else {
+        let win = d.windows.iter().find(|w| w.id == 1).unwrap();
+        let Content::Project(child) = &win.tabs[win.active].content else {
             panic!()
         };
-        let w = child.windows.iter().find(|w| w.id == b).unwrap();
-        assert!(
-            !w.tabs[w.active].chat_member,
-            "reading history must not join the room"
+        assert_eq!(
+            child.chat.borrow().last_seq(),
+            seq_before,
+            "reading history must not append a Joined (or anything)"
         );
     }
 
@@ -4867,12 +4710,17 @@ mod tests {
             let Content::Project(child) = &win.tabs[win.active].content else {
                 panic!()
             };
+            let room = child.chat.borrow();
             let members: Vec<bool> = child
                 .windows
                 .iter()
-                .flat_map(|w| w.tabs.iter().map(|t| t.chat_member))
+                .flat_map(|w| w.tabs.iter())
+                .filter_map(|t| match &t.content {
+                    Content::Terminal(s) => Some(room.is_member(&term_tag(s.term_id()))),
+                    _ => None,
+                })
                 .collect();
-            (child.chat.borrow().msgs().len(), members)
+            (room.last_seq(), members)
         };
         let before = snapshot(&d);
         // history with from: None — must succeed (any caller may read)
@@ -5539,20 +5387,23 @@ mod tests {
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
         // simulate a tab-merge: host window gains a foreground NON-member shell
-        // tab; the dispatched member terminal stays behind it as a background tab
+        // tab (its own distinct term_id, never joined); the dispatched member
+        // terminal stays behind it as a background tab.
         {
+            let shell_id = wm.next;
+            wm.next += 1;
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
-            let shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+            let mut shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+            shell.set_term_id(shell_id);
             w.tabs.push(Tab {
                 title: "shell".into(),
                 content: Content::Terminal(shell),
-                chat_member: false,
             });
             w.active = 1; // shell in front, member behind
         }
-        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
+        wm.chat_post(&term_tag(sender), "go", &[], None).unwrap();
 
-        // Same re-broadcast + pump-everything pattern as
+        // Same tick + pump-everything pattern as
         // chat_broadcast_hits_members_only_excluding_sender (the DSR trap):
         // every tab of every window is kept pumped, so a wrongful injection
         // into the foreground shell would make it exit below.
@@ -5565,7 +5416,7 @@ mod tests {
                     }
                 }
             }
-            wm.chat_broadcast(Some(sender), &framed, None);
+            wm.chat_tick();
             // positive signal: the background member tab exits
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
             let Content::Terminal(s) = &mut w.tabs[0].content else {
@@ -5619,8 +5470,10 @@ mod tests {
         let bystander = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        // bystander IS a member — only the target filter may exclude it
-        let framed = wm.chat_post(sender, "go", &[]).unwrap().0;
+        // bystander IS a member — only the post's target filter may exclude it.
+        // Targeting now comes from the POST: address it to `target` alone.
+        wm.chat_post(&term_tag(sender), "go", &[term_tag(target)], None)
+            .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -5629,7 +5482,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_broadcast(Some(sender), &framed, Some(&[target]));
+            wm.chat_tick();
             let w = wm.windows.iter_mut().find(|w| w.id == target).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
                 panic!()
@@ -5644,8 +5497,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // member bystander + sender saw nothing (kept pumped so a wrongful
-        // injection would surface), and Some(&[]) injects nobody at all
-        wm.chat_broadcast(Some(sender), &framed, Some(&[]));
+        // injection would surface), and a pure @you post delivers to nobody
+        wm.chat_post(&term_tag(sender), "@you go", &[], None).unwrap();
         let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
         while std::time::Instant::now() < grace {
             for w in wm.windows.iter_mut() {
@@ -5653,6 +5506,8 @@ mod tests {
                     s.keepalive();
                 }
             }
+            // tick on a ready frame: the @you post must deliver to nobody
+            wm.chat_tick();
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         for (id, who) in [(sender, "sender"), (bystander, "member bystander")] {
@@ -5675,57 +5530,70 @@ mod tests {
         let member = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let outsider = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
-        {
-            let w = wm.windows.iter_mut().find(|w| w.id == outsider).unwrap();
-            w.tabs[w.active].chat_member = false;
-        }
-        let len_before = wm.chat.borrow().msgs().len();
+        // outsider is hand-opened (pushed plainly): a live terminal the room
+        // never registered, so targeting it is an unknown-member error.
+        let outsider = {
+            let mut s =
+                Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            id
+        };
+        let seq_before = wm.chat.borrow().last_seq();
 
         // unknown id — names it; one bad target fails a multi-target post entirely
         let e = wm
-            .chat_post(sender, "go", &[term_tag(member), "t99".into()])
+            .chat_post(&term_tag(sender), "go", &[term_tag(member), "t99".into()], None)
             .unwrap_err();
-        assert!(e.contains("no such terminal: t99"), "{e}");
-        // self-mention
-        let e = wm.chat_post(sender, "go", &[term_tag(sender)]).unwrap_err();
-        assert!(e.contains("cannot mention yourself"), "{e}");
-        // non-member
+        assert!(e.contains("unknown member t99"), "{e}");
+        // self-mention (the room rejects targeting yourself)
         let e = wm
-            .chat_post(sender, "go", &[term_tag(outsider)])
+            .chat_post(&term_tag(sender), "go", &[term_tag(sender)], None)
             .unwrap_err();
-        assert!(e.contains("is not a chat member"), "{e}");
+        assert!(e.contains("cannot target yourself"), "{e}");
+        // non-member: the outsider id is not registered with the room
+        let e = wm
+            .chat_post(&term_tag(sender), "go", &[term_tag(outsider)], None)
+            .unwrap_err();
+        assert!(e.contains(&format!("unknown member {}", term_tag(outsider))), "{e}");
         // nothing appended by any failed post
-        assert_eq!(wm.chat.borrow().msgs().len(), len_before);
+        assert_eq!(wm.chat.borrow().last_seq(), seq_before);
         // inline mentions count too: a leading @ with a bad id fails the post
-        let e = wm.chat_post(sender, "@t99 go", &[]).unwrap_err();
-        assert!(e.contains("no such terminal: t99"), "{e}");
+        let e = wm.chat_post(&term_tag(sender), "@t99 go", &[], None).unwrap_err();
+        assert!(e.contains("unknown member t99"), "{e}");
     }
 
     #[test]
-    fn failed_targeted_post_does_not_join_the_sender() {
+    fn failed_targeted_post_does_not_append() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".to_string());
-        let sender = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
-        {
-            // make the sender a NON-member so a successful post would join it
-            let w = wm.windows.iter_mut().find(|w| w.id == sender).unwrap();
-            w.tabs[w.active].chat_member = false;
-        }
-        // dispatch already logged one Joined sysline; a failed post adds nothing
-        let len_before = wm.chat.borrow().msgs().len();
-        let _ = wm.chat_post(sender, "go", &["t99".into()]).unwrap_err();
-        let w = wm.windows.iter().find(|w| w.id == sender).unwrap();
-        assert!(!w.tabs[w.active].chat_member, "failed post must not join");
+        // A hand-opened (non-dispatched) terminal: not yet a room member, so a
+        // failed first post is the case that must not leave any trace.
+        let sender = {
+            let mut s =
+                Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn sender");
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            id
+        };
+        assert!(!wm.chat.borrow().is_member(&term_tag(sender)));
+        let seq_before = wm.chat.borrow().last_seq();
+        // a failing post (unknown target) must append nothing — the room
+        // validates all-or-nothing before any mutation.
+        let _ = wm
+            .chat_post(&term_tag(sender), "go", &["t99".into()], None)
+            .unwrap_err();
+        assert!(
+            !wm.chat.borrow().is_member(&term_tag(sender)),
+            "failed post must not join"
+        );
         assert_eq!(
-            wm.chat.borrow().msgs().len(),
-            len_before,
-            "no Joined sysline either"
+            wm.chat.borrow().last_seq(),
+            seq_before,
+            "no Joined sysline or post appended"
         );
     }
 
@@ -5740,28 +5608,27 @@ mod tests {
         let member = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-
-        // flags first, then inline, deduped; `you` resolves to no terminal
-        let (framed, targets) = wm
-            .chat_post(sender, "@you go", &[term_tag(member)])
-            .unwrap();
         let mtag = term_tag(member);
         let stag = term_tag(sender);
-        assert!(
-            framed.contains(&format!("{stag}→{mtag},you: @you go")),
-            "{framed}"
+
+        // flags first, then inline, deduped; `you` is a legal target. The
+        // arrow framing now reads off the room's history line.
+        wm.chat_post(&stag, "@you go", &[mtag.clone()], None)
+            .unwrap();
+        assert_eq!(
+            wm.chat_history(1),
+            vec![format!("#3 {stag}→{mtag},you: @you go")],
+            "flag target precedes inline mention, deduped"
         );
-        assert_eq!(targets, Some(vec![member]));
-        // pure-@you: Some(empty) — targeted, deliver to nobody
-        let (framed, targets) = wm.chat_post(sender, "@you need eyes", &[]).unwrap();
-        assert!(
-            framed.contains(&format!("{stag}→you: @you need eyes")),
-            "{framed}"
+        // pure-@you: targeted to the human seat alone
+        wm.chat_post(&stag, "@you need eyes", &[], None).unwrap();
+        assert_eq!(
+            wm.chat_history(1),
+            vec![format!("#4 {stag}→you: @you need eyes")]
         );
-        assert_eq!(targets, Some(vec![]));
-        // untargeted: None — broadcast
-        let (_, targets) = wm.chat_post(sender, "plain", &[]).unwrap();
-        assert_eq!(targets, None);
+        // untargeted: broadcast (no arrow)
+        wm.chat_post(&stag, "plain", &[], None).unwrap();
+        assert_eq!(wm.chat_history(1), vec![format!("#5 {stag}: plain")]);
     }
 
     #[test]
@@ -5797,7 +5664,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "victim never exited");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let e = wm.chat_post(sender, "go", &[term_tag(victim)]).unwrap_err();
+        // chat_tick's presence reconcile is what marks the victim exited in the
+        // room; until then the room still believes it is alive.
+        for w in wm.windows.iter_mut() {
+            if let Content::Terminal(s) = &mut w.tabs[w.active].content {
+                s.keepalive();
+            }
+        }
+        wm.chat_tick();
+        let e = wm
+            .chat_post(&term_tag(sender), "go", &[term_tag(victim)], None)
+            .unwrap_err();
         assert!(e.contains("has exited"), "{e}");
     }
 
@@ -5811,30 +5688,22 @@ mod tests {
             .unwrap();
         let mtag = term_tag(member);
 
-        // valid mention: targeted, arrow-framed under the reserved sender
-        let (framed, targets) = wm
-            .chat_post_human(&format!("@{mtag} check the diff"))
-            .unwrap();
-        assert!(
-            framed.contains(&format!("you→{mtag}: @{mtag} check the diff")),
-            "{framed}"
-        );
-        assert_eq!(targets, Some(vec![member]));
+        // valid mention: targeted, arrow-rendered under the reserved sender.
+        // The room owns the policy; the arrow reads off the history line.
+        wm.chat_post_human(&format!("@{mtag} check the diff"))
+            .expect("posted");
         assert_eq!(
-            wm.chat.borrow().msgs().last().unwrap().to,
-            vec![mtag.clone()]
+            wm.chat_history(1),
+            vec![format!("#2 you→{mtag}: @{mtag} check the diff")]
         );
 
         // unknown id: prose fallback — broadcast, text intact, no error (spec §7)
-        let (framed, targets) = wm.chat_post_human("@t99 anyone?").unwrap();
-        assert!(framed.contains("you: @t99 anyone?"), "{framed}");
-        assert_eq!(targets, None);
-        assert!(wm.chat.borrow().msgs().last().unwrap().to.is_empty());
+        wm.chat_post_human("@t99 anyone?").expect("posted");
+        assert_eq!(wm.chat_history(1), vec!["#3 you: @t99 anyone?".to_string()]);
 
-        // @you from the human is a self-mention: same fallback
-        let (framed, targets) = wm.chat_post_human("@you hello").unwrap();
-        assert!(framed.contains("you: @you hello"), "{framed}");
-        assert_eq!(targets, None);
+        // @you from the human is a self-mention: same fallback to broadcast
+        wm.chat_post_human("@you hello").expect("posted");
+        assert_eq!(wm.chat_history(1), vec!["#4 you: @you hello".to_string()]);
     }
 
     #[test]

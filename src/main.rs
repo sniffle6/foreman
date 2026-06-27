@@ -337,6 +337,11 @@ impl eframe::App for App {
             area = area.shrink(APP_BORDER_W);
         }
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        // Deliver chat now that every Session has pumped this frame: the room
+        // reconciles presence and injects each ready member's missed posts (a
+        // just-spawned member that wasn't ready when a post arrived gets it on
+        // this frame).
+        self.desktop.chat_tick();
         // Drive cross-frame `foreman send` settles now that every Session has
         // pumped this frame; pending entries reply when their terminal quiets.
         self.desktop.advance_settles(std::time::Instant::now());
