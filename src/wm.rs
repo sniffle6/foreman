@@ -352,25 +352,24 @@ impl Content {
                     }
                 }
 
-                // Scroll: stick-to-bottom by default; a wheel-up unsticks and
-                // the view then holds its CONTENT position while new messages
-                // arrive (autoscroll paused); wheeling back to the bottom
-                // re-sticks. Offset is measured from the top so an unstuck
-                // view doesn't slide as `total` grows.
-                let max = (total - log_rect.height()).max(0.0);
-                if resp.hovered() {
-                    let dy = ui.input(|i| i.smooth_scroll_delta.y);
-                    if dy != 0.0 {
-                        let cur = if view.stick { max } else { view.scroll };
-                        view.scroll = (cur - dy).clamp(0.0, max);
-                        view.stick = view.scroll >= max - 1.0;
-                    }
-                }
-                let offset = if view.stick {
-                    max
+                // Scroll: stick-to-bottom by default; the math (clamp, stick
+                // threshold, unstick-on-wheel-up, re-stick-at-bottom) lives in
+                // `chat::scroll_step` (pure + tested). Only read the wheel when
+                // the log is hovered.
+                let wheel_dy = if resp.hovered() {
+                    ui.input(|i| i.smooth_scroll_delta.y)
                 } else {
-                    view.scroll.min(max)
+                    0.0
                 };
+                let (scroll, stick, offset) = crate::chat::scroll_step(
+                    total,
+                    log_rect.height(),
+                    wheel_dy,
+                    view.scroll,
+                    view.stick,
+                );
+                view.scroll = scroll;
+                view.stick = stick;
                 let mut y = log_rect.min.y - offset;
                 for it in items {
                     match it {

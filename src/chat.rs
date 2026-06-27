@@ -33,6 +33,34 @@ pub fn age_label(d: Duration) -> (String, bool) {
     (label, stale)
 }
 
+/// Stick-to-bottom scroll step for the chat log. Pure so the fiddly parts
+/// (clamp, stick threshold, unstick-on-wheel-up, re-stick-at-bottom) are
+/// testable without a live egui `Context`.
+///
+/// `total` is the laid-out content height, `viewport_h` the visible height,
+/// `wheel_dy` this frame's vertical scroll delta (egui sign: positive scrolls
+/// toward the top; pass `0.0` when the log isn't hovered). `scroll` is the
+/// prior offset from the top of the log; `stick` whether the view was
+/// following the tail. Returns `(scroll, stick, offset)`, where `offset` is
+/// the px from the top to paint at. `scroll` is only rewritten on real wheel
+/// input, so a growing `total` never slides an unstuck view.
+pub fn scroll_step(
+    total: f32,
+    viewport_h: f32,
+    wheel_dy: f32,
+    mut scroll: f32,
+    mut stick: bool,
+) -> (f32, bool, f32) {
+    let max = (total - viewport_h).max(0.0);
+    if wheel_dy != 0.0 {
+        let cur = if stick { max } else { scroll };
+        scroll = (cur - wheel_dy).clamp(0.0, max);
+        stick = scroll >= max - 1.0;
+    }
+    let offset = if stick { max } else { scroll.min(max) };
+    (scroll, stick, offset)
+}
+
 pub struct ChatMsg {
     pub seq: u64,
     pub from: String, // "t2" (or the slice-2 human id "you")
@@ -1129,6 +1157,52 @@ mod tests {
             age_label(Duration::from_secs(3600)),
             ("1h".to_string(), true)
         );
+    }
+
+    #[test]
+    fn scroll_step_sticks_to_tail_as_content_grows() {
+        // Stuck + no wheel: offset tracks the bottom even as `total` grows.
+        let (scroll, stick, offset) = scroll_step(1000.0, 200.0, 0.0, 0.0, true);
+        assert_eq!((scroll, stick, offset), (0.0, true, 800.0));
+        let (_, stick, offset) = scroll_step(1200.0, 200.0, 0.0, 0.0, true);
+        assert_eq!((stick, offset), (true, 1000.0));
+    }
+
+    #[test]
+    fn scroll_step_no_overflow_pins_to_top() {
+        // Content shorter than the viewport: max is 0, nothing scrolls.
+        let (scroll, stick, offset) = scroll_step(100.0, 200.0, 50.0, 0.0, true);
+        assert_eq!((scroll, stick, offset), (0.0, true, 0.0));
+    }
+
+    #[test]
+    fn scroll_step_wheel_up_unsticks_and_holds() {
+        // A wheel-up (positive dy) off the bottom unsticks and moves up...
+        let (scroll, stick, offset) = scroll_step(1000.0, 200.0, 50.0, 0.0, true);
+        assert_eq!((scroll, stick, offset), (750.0, false, 750.0));
+        // ...and an unstuck view holds its position as `total` grows (no wheel).
+        let (scroll, stick, offset) = scroll_step(1200.0, 200.0, 0.0, 750.0, false);
+        assert_eq!((scroll, stick, offset), (750.0, false, 750.0));
+    }
+
+    #[test]
+    fn scroll_step_re_sticks_at_bottom() {
+        // Wheel-down past the bottom clamps to max and re-sticks.
+        let (scroll, stick, offset) = scroll_step(1000.0, 200.0, -100.0, 750.0, false);
+        assert_eq!((scroll, stick, offset), (800.0, true, 800.0));
+        // Boundary: landing within 1px of the bottom (max-1 == 799) re-sticks;
+        // a pixel short stays unstuck.
+        let (_, stick_near, _) = scroll_step(1000.0, 200.0, -2.0, 797.0, false);
+        assert!(stick_near, "799 >= max-1 re-sticks");
+        let (_, stick_off, _) = scroll_step(1000.0, 200.0, -1.0, 797.0, false);
+        assert!(!stick_off, "798 < max-1 stays unstuck");
+    }
+
+    #[test]
+    fn scroll_step_clamps_at_top() {
+        // Wheel-up past the top clamps at 0, stays unstuck.
+        let (scroll, stick, offset) = scroll_step(1000.0, 200.0, 100.0, 10.0, false);
+        assert_eq!((scroll, stick, offset), (0.0, false, 0.0));
     }
 
     fn row(id: &str, exited: bool, last_secs_ago: Option<u64>) -> CrewRow {
