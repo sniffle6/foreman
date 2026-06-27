@@ -30,7 +30,8 @@ jumping between the typing line and the status line while running Codex.)
 
 The strobe **teleports** the caret to a far row (status line / message area) and
 back, while real line movement steps by a single row (wrap, backspace up,
-newline down). So the painted caret position is gated (`inspect::cursor_to_draw`):
+newline down). So the painted caret position is gated by the Caret gate
+(`caret::CaretGate`):
 
 - **Cursor settled** (the *cursor* held the same cell for `CURSOR_SETTLE` =
   50ms) → adopt the model position outright. This is *cursor-position*
@@ -88,7 +89,14 @@ cursor, not the gated draw — it wants ground truth.
 
 ## Key files
 
-- `src/inspect.rs` — `cursor_to_draw` / `CursorDraw` (the pure gate; unit-tested)
-  and `cursor_info` (raw model cursor for inspection).
-- `src/terminal.rs` — `Session` fields `last_output_change` / `committed_cursor`,
-  `CURSOR_SETTLE`, the `pump()` stamp, and the caret paint in `show()`.
+- `src/caret.rs` — the **Caret gate**. `CaretGate` (owns the de-jitter state +
+  `CURSOR_SETTLE` / `INPUT_GRACE`) exposes `observe(model, now) -> CursorDraw`
+  and `note_input(now)`; `cursor_to_draw` is the private decision table.
+  Driven entirely through those two methods in unit tests by advancing an
+  injected `Instant` — both the decision table and the time-based derivation are
+  tested here.
+- `src/terminal.rs` — `Session` holds one `caret: CaretGate`; `read_input` calls
+  `note_input`, and `show()` builds a `CursorModel` and calls `observe`, then
+  owns the focus/scroll paint-gate and the egui drawing.
+- `src/inspect.rs` — `cursor_info` (raw model cursor for inspection — reports the
+  real cursor, never the gated draw).

@@ -1,3 +1,4 @@
+mod caret;
 mod chat;
 mod control;
 mod dirpicker;

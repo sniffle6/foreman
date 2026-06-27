@@ -154,3 +154,13 @@ Waiting until a Session has produced no new output for a short window before
 reading it — the default way `send` returns a settled screen instead of a
 mid-update race.
 _Avoid_: sleep, debounce, delay.
+
+**Caret gate**:
+The step that decides which cell the painted caret rests at, given a stream of
+cursor observations and the user's recent typing. It de-jitters a full-screen
+program that moves its cursor mid-redraw: it adopts a new resting cell only once
+the cursor has stopped moving for a beat (cursor stability, distinct from
+Quiescence settle's output stability), follows a single-row step while the user
+is actively editing, and holds far jumps and self-running animations. The caret
+is what Foreman paints; the cursor is the program's, owned by the grid model.
+_Avoid_: cursor (that's the model's), blink, debounce.

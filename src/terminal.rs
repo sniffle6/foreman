@@ -196,33 +196,11 @@ pub struct Session {
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
     output_gen: u64,
-    // The model cursor cell last observed while drawing, and when it last
-    // changed. The caret draw adopts a new position only once the cursor has
-    // held the same cell for `CURSOR_SETTLE` — *cursor* stability, not output
-    // quiescence, so a TUI that streams forever (a spinner) still lets the caret
-    // settle. See `inspect::cursor_to_draw`.
-    cursor_seen: (i32, usize),
-    cursor_moved_at: std::time::Instant,
-    // The de-jittered caret position actually painted (line, col). Updated from
-    // the live grid only once the cursor has settled; held otherwise.
-    committed_cursor: (i32, usize),
-    // When the user last sent keyboard input (stamped in read_input). The caret
-    // gate follows single-row moves immediately only within `INPUT_GRACE` of
-    // this, so user editing stays responsive while an autonomous animation (the
-    // startup gloss sweep) is held. `None` until the first keypress.
-    last_input_at: Option<std::time::Instant>,
+    // The Caret gate: decides which cell the painted caret rests at, de-jittering
+    // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
+    // state; fed every frame in show(). See `crate::caret`.
+    caret: crate::caret::CaretGate,
 }
-
-/// How long the model cursor must hold the same cell before the painted caret
-/// adopts that position. Comfortably past intra-redraw chunk gaps (a frame or
-/// two of scheduling jitter) yet short enough to feel instant between keystrokes.
-const CURSOR_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// How recently the user must have typed for the caret to follow single-row
-/// moves immediately. Long enough to cover an app's keystroke response (and to
-/// span auto-repeat while a key is held), short enough that an autonomous
-/// animation isn't mistaken for active editing.
-const INPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
 /// input arriving within the same few-ms burst as a paste INTO the paste, so
@@ -401,10 +379,7 @@ impl Session {
             pending_submit: None,
             ready: false,
             output_gen: 0,
-            cursor_seen: (0, 0),
-            cursor_moved_at: std::time::Instant::now(),
-            committed_cursor: (0, 0),
-            last_input_at: None,
+            caret: crate::caret::CaretGate::new(std::time::Instant::now()),
         })
     }
 
@@ -659,7 +634,7 @@ impl Session {
         }
         if !bytes.is_empty() {
             self.term.scroll_display(Scroll::Bottom);
-            self.last_input_at = Some(std::time::Instant::now());
+            self.caret.note_input(std::time::Instant::now());
             self.send(&bytes);
         }
 
@@ -745,32 +720,17 @@ impl Session {
             let c = self.term.renderable_content();
             (c.cursor.point.line.0, c.cursor.point.column.0, c.cursor.shape)
         };
-        // De-jitter the caret: a non-synchronized TUI moves the cursor all over
-        // the screen while it redraws, so adopt a new position only once output
-        // is quiet, holding the last committed spot meanwhile (see
-        // `inspect::cursor_to_draw`).
-        let now = std::time::Instant::now();
-        // Track *cursor-position* stability (not output activity): reset the
-        // timer only when the cursor actually moves to a new cell.
-        if (cur_line, cur_col) != self.cursor_seen {
-            self.cursor_seen = (cur_line, cur_col);
-            self.cursor_moved_at = now;
-        }
-        let cursor_settled = now.duration_since(self.cursor_moved_at) >= CURSOR_SETTLE;
-        let user_active = self
-            .last_input_at
-            .is_some_and(|t| now.duration_since(t) < INPUT_GRACE);
-        let cursor_draw = crate::inspect::cursor_to_draw(
-            self.committed_cursor,
-            cur_line,
-            cur_col,
-            cur_shape,
-            cursor_settled,
-            user_active,
+        // De-jitter the caret through the Caret gate: a non-synchronized TUI
+        // moves the cursor all over the screen while it redraws, so the gate
+        // holds the committed spot until the cursor settles. See `crate::caret`.
+        let cursor_draw = self.caret.observe(
+            crate::caret::CursorModel {
+                line: cur_line,
+                col: cur_col,
+                shape: cur_shape,
+            },
+            std::time::Instant::now(),
         );
-        if let crate::inspect::CursorDraw::At { line, col, .. } = cursor_draw {
-            self.committed_cursor = (line, col);
-        }
 
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
@@ -862,7 +822,7 @@ impl Session {
             }
         }
 
-        if let crate::inspect::CursorDraw::At { line, col, shape } = cursor_draw
+        if let crate::caret::CursorDraw::At { line, col, shape } = cursor_draw
             && active
             && line >= 0
             && off == 0
