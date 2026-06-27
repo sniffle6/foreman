@@ -1,6 +1,8 @@
 mod chat;
 mod control;
 mod dirpicker;
+mod input;
+mod inspect;
 mod keymap;
 mod layout;
 mod settings;
@@ -334,6 +336,9 @@ impl eframe::App for App {
             area = area.shrink(APP_BORDER_W);
         }
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        // Drive cross-frame `foreman send` settles now that every Session has
+        // pumped this frame; pending entries reply when their terminal quiets.
+        self.desktop.advance_settles(std::time::Instant::now());
 
         self.show_os_chrome(&ctx);
 

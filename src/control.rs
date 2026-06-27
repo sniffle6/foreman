@@ -119,6 +119,35 @@ pub struct CloseRequest {
     pub terminals: Vec<String>, // "tN" ids; client guarantees non-empty
 }
 
+/// Drive raw input into a terminal. `text` is written verbatim (UTF-8);
+/// `keys` are named key presses encoded through `inspect::parse_keys` with
+/// the session's live `TermMode`. Text first, then keys. `settle_ms` is
+/// parsed and stored but not yet honored (settle is the next phase).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SendRequest {
+    pub cmd: String, // always "send"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u64>,
+}
+
+/// Read the rendered viewport of a terminal as plain text rows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotRequest {
+    pub cmd: String, // always "snapshot"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+}
+
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
 /// `default_project` is the dispatcher's own project (from FOREMAN_PROJECT_ID).
 pub fn parse_open_args(
@@ -176,6 +205,8 @@ pub enum CtrlMsg {
     Chat(ChatRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Status(StatusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Close(CloseRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Send(SendRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
@@ -225,6 +256,12 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>) {
                     .map_err(|e| format!("bad request: {e}")),
                 "close" => serde_json::from_str::<CloseRequest>(&line)
                     .map(|r| CtrlMsg::Close(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                "send" => serde_json::from_str::<SendRequest>(&line)
+                    .map(|r| CtrlMsg::Send(r, rtx, now))
+                    .map_err(|e| format!("bad request: {e}")),
+                "snapshot" => serde_json::from_str::<SnapshotRequest>(&line)
+                    .map(|r| CtrlMsg::Snapshot(r, rtx, now))
                     .map_err(|e| format!("bad request: {e}")),
                 other => Err(format!("unknown cmd: {other}")),
             },
@@ -457,6 +494,126 @@ pub fn parse_close_args(
     })
 }
 
+/// Parse `foreman send` args: `[--project P] [--terminal T] [--text TXT]
+/// [--keys "K K …"]... [--settle-ms N]`. `--keys` splits its value on
+/// whitespace; repeatable `--keys` appends. When `--terminal` is absent,
+/// fills from `self_terminal` (FOREMAN_TERMINAL_ID) and requires
+/// `self_project` (FOREMAN_PROJECT_ID) — same self-target rule as `close`.
+/// Requires at least one of `--text` or `--keys`.
+/// NOTE: `settle_ms` is parsed but not yet honored (settle is the next phase).
+pub fn parse_send_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+    self_project: Option<String>,
+) -> Result<SendRequest, String> {
+    let mut project = default_project;
+    let mut terminal: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut keys: Vec<String> = Vec::new();
+    let mut settle_ms: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--terminal" => {
+                terminal = Some(args.get(i + 1).ok_or("--terminal needs a value")?.clone());
+                i += 2;
+            }
+            "--text" => {
+                text = Some(args.get(i + 1).ok_or("--text needs a value")?.clone());
+                i += 2;
+            }
+            "--keys" => {
+                let v = args.get(i + 1).ok_or("--keys needs a value")?;
+                keys.extend(v.split_whitespace().map(str::to_string));
+                i += 2;
+            }
+            "--settle-ms" => {
+                let v = args.get(i + 1).ok_or("--settle-ms needs a value")?;
+                settle_ms = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--settle-ms needs a number, got: {v}"))?,
+                );
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    if terminal.is_none() {
+        // self-target: both env vars required
+        let me = self_terminal
+            .ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
+        let proj = self_project.ok_or(
+            "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
+        )?;
+        terminal = Some(me);
+        if project.is_none() {
+            project = Some(proj);
+        }
+    }
+    if text.is_none() && keys.is_empty() {
+        return Err("nothing to send: give --text and/or --keys".into());
+    }
+    Ok(SendRequest {
+        cmd: "send".into(),
+        project,
+        terminal,
+        text,
+        keys,
+        settle_ms,
+    })
+}
+
+/// Parse `foreman snapshot` args: `[--project P] [--terminal T]`. When
+/// `--terminal` is absent, fills from `self_terminal` (FOREMAN_TERMINAL_ID)
+/// and requires `self_project` (FOREMAN_PROJECT_ID).
+pub fn parse_snapshot_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<SnapshotRequest, String> {
+    let mut project = default_project;
+    let mut terminal: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--terminal" => {
+                terminal = Some(args.get(i + 1).ok_or("--terminal needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    // Self-target only when we actually have a FOREMAN_TERMINAL_ID; otherwise fall
+    // through to the clear "--terminal is required" error — so `snapshot --project
+    // p1` with no `--terminal` doesn't misleadingly complain about not being inside
+    // a foreman terminal.
+    if terminal.is_none() && self_terminal.is_some() {
+        let proj = project.ok_or(
+            "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
+        )?;
+        terminal = self_terminal;
+        project = Some(proj);
+    }
+    let terminal = terminal
+        .ok_or("--terminal is required (or run inside a foreman terminal to target your own pane)")?;
+    Ok(SnapshotRequest {
+        cmd: "snapshot".into(),
+        project,
+        terminal: Some(terminal),
+    })
+}
+
 const HELP: &str = "\
 foreman — a desktop for running fleets of AI-agent terminals
 
@@ -467,8 +624,11 @@ USAGE
   foreman chat [--project P] --history [N]  read the last N room lines (default 20)
   foreman status [--project P]              list projects + terminals (running/exited)
   foreman close [tN ...] [--project P]      close terminals (no ids: your own pane)
+  foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
+  foreman snapshot [--project P] [--terminal T]       read the rendered viewport
   foreman help | --help | -h                this text (also: open --help, chat --help,
-                                            status --help, close --help)
+                                            status --help, close --help, send --help,
+                                            snapshot --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -535,6 +695,28 @@ process tree, you included, so post any done-signal FIRST and do not
 expect to see the reply. Reply: {\"ok\":true,\"project\":\"pN\"}.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
+const HELP_SEND: &str = "\
+foreman send [--project P] [--terminal T] [--text TXT] [--keys \"K K …\"] [--settle-ms N]
+
+Write input to terminal T (default: your own). --text is raw UTF-8 written
+verbatim (\\r = Enter). --keys is a space-separated sequence of named key
+presses encoded with the session's live TermMode. --text and --keys are
+additive: text first, then keys. --settle-ms N (not yet honored; settle is
+the next phase). Reply: {\"ok\":true} or {\"ok\":false,\"error\":\"...\"}.
+Key names: F1..F12, Up Down Left Right, Home End PageUp PageDown Insert
+Delete, Enter Tab Esc Backspace Space, single letters; Ctrl+/Alt+/Shift+
+prefixes combinable. Unknown name exits 2.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_SNAPSHOT: &str = "\
+foreman snapshot [--project P] [--terminal T]
+
+Read terminal T's rendered viewport as plain text (default: your own).
+One string per visible row, trailing spaces trimmed, printed line per line.
+Reply rides the same history field as status. A snapshot of a settled
+terminal (after foreman send) gives you the current screen state.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
@@ -542,6 +724,8 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("chat") => chat_main(&args[1..]),
         Some("status") => status_main(&args[1..]),
         Some("close") => close_main(&args[1..]),
+        Some("send") => send_main(&args[1..]),
+        Some("snapshot") => snapshot_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -552,6 +736,8 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("       foreman chat [--project P] --history [N]");
             eprintln!("       foreman status [--project P]");
             eprintln!("       foreman close [tN ...] [--project P]");
+            eprintln!("       foreman send [--project P] [--terminal T] --text TXT [--keys \"K\"] [--settle-ms N]");
+            eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman help");
             2
         }
@@ -626,6 +812,45 @@ fn close_main(args: &[String]) -> i32 {
         }
     };
     report("foreman close", request(PIPE, &req))
+}
+
+fn send_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_SEND}");
+        return 0;
+    }
+    let req = match parse_send_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman send: {e}");
+            return 2;
+        }
+    };
+    report("foreman send", request(PIPE, &req))
+}
+
+fn snapshot_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_SNAPSHOT}");
+        return 0;
+    }
+    let req = match parse_snapshot_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman snapshot: {e}");
+            return 2;
+        }
+    };
+    report("foreman snapshot", request(PIPE, &req))
 }
 
 /// Print the pipe reply (or the connection failure) the way all subcommands do.
@@ -712,6 +937,10 @@ mod tests {
         assert_eq!(client_main(&s(&["status", "-h"])), 0);
         assert_eq!(client_main(&s(&["close", "--help"])), 0);
         assert_eq!(client_main(&s(&["close", "-h"])), 0);
+        assert_eq!(client_main(&s(&["send", "--help"])), 0);
+        assert_eq!(client_main(&s(&["send", "-h"])), 0);
+        assert_eq!(client_main(&s(&["snapshot", "--help"])), 0);
+        assert_eq!(client_main(&s(&["snapshot", "-h"])), 0);
     }
 
     #[test]
@@ -1347,5 +1576,330 @@ mod tests {
         };
         let back: OpenReply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.seq, Some(42));
+    }
+
+    // ---- send / snapshot structs wire compatibility --------------------------
+
+    #[test]
+    fn send_request_omits_none_and_empty_fields() {
+        let req = SendRequest {
+            cmd: "send".into(),
+            project: None,
+            terminal: Some("t3".into()),
+            text: Some("ls\r".into()),
+            keys: vec![],
+            settle_ms: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"project\""), "{json}");
+        assert!(!json.contains("\"keys\""), "{json}"); // empty vec must vanish
+        assert!(!json.contains("\"settle_ms\""), "{json}");
+        let back: SendRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn send_request_with_keys_roundtrips() {
+        let req = SendRequest {
+            cmd: "send".into(),
+            project: Some("p1".into()),
+            terminal: Some("t3".into()),
+            text: None,
+            keys: vec!["Ctrl+C".into(), "Enter".into()],
+            settle_ms: Some(0),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""keys":["Ctrl+C","Enter"]"#), "{json}");
+        assert!(json.contains(r#""settle_ms":0"#), "{json}");
+        let back: SendRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn snapshot_request_omits_none_fields() {
+        let req = SnapshotRequest {
+            cmd: "snapshot".into(),
+            project: None,
+            terminal: Some("t3".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"project\""), "{json}");
+        let back: SnapshotRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    // ---- parse_send_args -----------------------------------------------------
+
+    #[test]
+    fn parse_send_args_text_only() {
+        let req = parse_send_args(
+            &s(&["--project", "p1", "--terminal", "t3", "--text", "hello\r"]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        assert_eq!(req.terminal.as_deref(), Some("t3"));
+        assert_eq!(req.text.as_deref(), Some("hello\r"));
+        assert!(req.keys.is_empty());
+        assert_eq!(req.settle_ms, None);
+    }
+
+    #[test]
+    fn parse_send_args_keys_split_on_whitespace() {
+        let req = parse_send_args(
+            &s(&[
+                "--project",
+                "p1",
+                "--terminal",
+                "t3",
+                "--keys",
+                "Ctrl+C Enter",
+            ]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.keys, vec!["Ctrl+C", "Enter"]);
+    }
+
+    #[test]
+    fn parse_send_args_repeated_keys_appends() {
+        let req = parse_send_args(
+            &s(&[
+                "--project",
+                "p1",
+                "--terminal",
+                "t3",
+                "--keys",
+                "Ctrl+C",
+                "--keys",
+                "Enter",
+                "--text",
+                "hi",
+            ]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.keys, vec!["Ctrl+C", "Enter"]);
+        assert_eq!(req.text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_send_args_self_target_from_env() {
+        let req = parse_send_args(
+            &s(&["--text", "x"]),
+            Some("p1".into()),
+            Some("t4".into()),
+            Some("p1".into()),
+        )
+        .unwrap();
+        assert_eq!(req.terminal.as_deref(), Some("t4"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn parse_send_args_self_target_requires_both_env_vars() {
+        // missing self_terminal
+        let e = parse_send_args(&s(&["--text", "x"]), Some("p1".into()), None, Some("p1".into()))
+            .unwrap_err();
+        assert!(e.contains("FOREMAN_TERMINAL_ID"), "{e}");
+        // missing self_project
+        let e =
+            parse_send_args(&s(&["--text", "x"]), Some("p1".into()), Some("t4".into()), None)
+                .unwrap_err();
+        assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
+    }
+
+    #[test]
+    fn parse_send_args_requires_text_or_keys() {
+        let e = parse_send_args(
+            &s(&["--project", "p1", "--terminal", "t3"]),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("nothing to send"), "{e}");
+    }
+
+    #[test]
+    fn parse_send_args_settle_ms_is_parsed() {
+        let req = parse_send_args(
+            &s(&[
+                "--project",
+                "p1",
+                "--terminal",
+                "t3",
+                "--text",
+                "x",
+                "--settle-ms",
+                "500",
+            ]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.settle_ms, Some(500));
+    }
+
+    #[test]
+    fn parse_send_args_rejects_bad_flags() {
+        // unknown flag
+        let e = parse_send_args(
+            &s(&["--project", "p1", "--terminal", "t3", "--nope", "--text", "x"]),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("--nope"), "{e}");
+        // flag without value
+        assert!(parse_send_args(&s(&["--terminal"]), None, None, None).is_err());
+        // bad settle-ms
+        assert!(
+            parse_send_args(
+                &s(&[
+                    "--project",
+                    "p1",
+                    "--terminal",
+                    "t3",
+                    "--text",
+                    "x",
+                    "--settle-ms",
+                    "abc"
+                ]),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    // ---- parse_snapshot_args -------------------------------------------------
+
+    #[test]
+    fn parse_snapshot_args_explicit_terminal() {
+        let req =
+            parse_snapshot_args(&s(&["--project", "p1", "--terminal", "t3"]), None, None).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        assert_eq!(req.terminal.as_deref(), Some("t3"));
+    }
+
+    #[test]
+    fn parse_snapshot_args_self_target() {
+        let req = parse_snapshot_args(&s(&[]), Some("p1".into()), Some("t4".into())).unwrap();
+        assert_eq!(req.terminal.as_deref(), Some("t4"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn parse_snapshot_args_self_target_requires_project() {
+        let e = parse_snapshot_args(&s(&[]), None, Some("t4".into())).unwrap_err();
+        assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
+    }
+
+    #[test]
+    fn parse_snapshot_args_requires_terminal() {
+        // no terminal flag and no self-target env
+        let e = parse_snapshot_args(&s(&["--project", "p1"]), None, None).unwrap_err();
+        assert!(e.contains("terminal"), "{e}");
+    }
+
+    // ---- pipe roundtrips -----------------------------------------------------
+
+    #[test]
+    fn send_pipe_roundtrip() {
+        let pipe = format!("foreman-test-send-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Send(req, reply, _) => {
+                    assert_eq!(req.text.as_deref(), Some("hello"));
+                    assert_eq!(req.terminal.as_deref(), Some("t3"));
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: None,
+                        seq: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Send"),
+            }
+        });
+        let req = SendRequest {
+            cmd: "send".into(),
+            project: Some("p1".into()),
+            terminal: Some("t3".into()),
+            text: Some("hello".into()),
+            keys: vec![],
+            settle_ms: None,
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(reply.expect("no reply").ok);
+    }
+
+    #[test]
+    fn snapshot_pipe_roundtrip() {
+        let pipe = format!("foreman-test-snap-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Snapshot(req, reply, _) => {
+                    assert_eq!(req.terminal.as_deref(), Some("t3"));
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: Some(vec!["line one".into(), "line two".into()]),
+                        seq: None,
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Snapshot"),
+            }
+        });
+        let req = SnapshotRequest {
+            cmd: "snapshot".into(),
+            project: Some("p1".into()),
+            terminal: Some("t3".into()),
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let r = reply.expect("no reply");
+        assert!(r.ok);
+        assert_eq!(
+            r.history.as_deref(),
+            Some(&["line one".to_string(), "line two".to_string()][..])
+        );
     }
 }

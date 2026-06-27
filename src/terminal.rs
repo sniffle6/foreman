@@ -83,6 +83,36 @@ fn resolve(c: AnsiColor) -> Option<egui::Color32> {
     }
 }
 
+/// Resolved per-cell display style: foreground/background after the inverse swap
+/// and dim, plus the line decorations. Pure, so the inverse/dim/flag logic is
+/// unit-tested apart from the egui painter; `show` turns this into a `TextFormat`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GlyphStyle {
+    fg: egui::Color32,
+    bg: Option<egui::Color32>,
+    underline: bool,
+    strikethrough: bool,
+}
+
+fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphStyle {
+    let mut fg = resolve(fg).unwrap_or(FG);
+    let mut bg = resolve(bg);
+    if flags.contains(Flags::INVERSE) {
+        let old_fg = fg;
+        fg = bg.unwrap_or(BG);
+        bg = Some(old_fg);
+    }
+    if flags.contains(Flags::DIM) {
+        fg = fg.gamma_multiply(0.7);
+    }
+    GlyphStyle {
+        fg,
+        bg,
+        underline: flags.contains(Flags::UNDERLINE),
+        strikethrough: flags.contains(Flags::STRIKEOUT),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Shell {
     Cmd,
@@ -163,6 +193,9 @@ pub struct Session {
     // scan. Catch-up replay and cursor advance gate on this (chat handshake
     // contract: the cursor advances only on inject into a READY session).
     ready: bool,
+    // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
+    // freshness signal the settle machinery polls to detect terminal activity.
+    output_gen: u64,
 }
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
@@ -341,6 +374,7 @@ impl Session {
             pending_note: None,
             pending_submit: None,
             ready: false,
+            output_gen: 0,
         })
     }
 
@@ -456,9 +490,35 @@ impl Session {
         self.pending_submit = Some(std::time::Instant::now() + SUBMIT_DELAY);
     }
 
+    /// Raw PTY write — bypasses bracketed-paste and the submit delay. Used by
+    /// `foreman send` to deliver pre-encoded bytes (text + key sequences).
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.send(bytes);
+    }
+
+    /// The terminal's current mode flags — used by `foreman send` to encode
+    /// named keys through the same path the live keyboard uses.
+    pub fn term_mode(&self) -> alacritty_terminal::term::TermMode {
+        *self.term.mode()
+    }
+
+    /// Counter bumped every time new PTY bytes arrive in `pump()`. The settle
+    /// machinery polls this to detect whether a terminal is still producing output.
+    pub fn output_gen(&self) -> u64 {
+        self.output_gen
+    }
+
+    /// Pump pending PTY output into the grid, then return the rendered viewport
+    /// as plain text rows (trailing spaces trimmed). Used by `foreman snapshot`.
+    pub fn snapshot_text(&mut self, region: Option<crate::inspect::Region>) -> Vec<String> {
+        self.pump();
+        crate::inspect::snapshot_text(&self.term, region)
+    }
+
     fn pump(&mut self) {
         while let Ok(bytes) = self.rx.try_recv() {
             self.parser.advance(&mut self.term, &bytes);
+            self.output_gen = self.output_gen.wrapping_add(1);
         }
         let reply = std::mem::take(&mut *self.resp.lock().unwrap());
         if !reply.is_empty() {
@@ -527,123 +587,46 @@ impl Session {
         let _ = self.writer.flush();
     }
 
+    /// Read this frame's keyboard input and apply it. The pure encoding lives in
+    /// `crate::input::process_input` (terminal-completeness epic, Phase 2); this is
+    /// the thin shell that supplies live state (term mode, selection), performs the
+    /// side effects (clipboard read, copy, interrupt, scroll), and writes the bytes
+    /// to the PTY.
     fn read_input(&mut self, ui: &egui::Ui) {
-        let mut out: Vec<u8> = Vec::new();
-        let mut paste_event = false;
-        let mut want_clip_paste = false; // Ctrl+Shift+V
-        let mut copy_action = 0u8; // 1 = Ctrl+C (copy if selection, else interrupt); 2 = Ctrl+Shift+C
-        let mut scroll: Option<Scroll> = None;
-        ui.input(|i| {
-            for ev in &i.events {
-                match ev {
-                    egui::Event::Text(t) => out.extend_from_slice(t.as_bytes()),
-                    egui::Event::Paste(s) => {
-                        out.extend_from_slice(s.as_bytes());
-                        paste_event = true;
-                    }
-                    // egui may deliver Ctrl+C/Ctrl+X as these instead of Key events.
-                    egui::Event::Copy | egui::Event::Cut => {
-                        if copy_action == 0 {
-                            copy_action = 1;
-                        }
-                    }
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let ctrl = modifiers.ctrl || modifiers.command;
-                        // Shift + Home/End/PageUp/PageDown scrolls the scrollback
-                        // instead of going to the shell.
-                        if modifiers.shift && !ctrl {
-                            match key {
-                                egui::Key::Home => {
-                                    scroll = Some(Scroll::Top);
-                                    continue;
-                                }
-                                egui::Key::End => {
-                                    scroll = Some(Scroll::Bottom);
-                                    continue;
-                                }
-                                egui::Key::PageUp => {
-                                    scroll = Some(Scroll::PageUp);
-                                    continue;
-                                }
-                                egui::Key::PageDown => {
-                                    scroll = Some(Scroll::PageDown);
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !ctrl {
-                            match key {
-                                egui::Key::Enter => out.push(b'\r'),
-                                egui::Key::Backspace => out.push(0x7f),
-                                egui::Key::Tab => out.push(b'\t'),
-                                egui::Key::Escape => out.push(0x1b),
-                                egui::Key::ArrowUp => out.extend_from_slice(b"\x1b[A"),
-                                egui::Key::ArrowDown => out.extend_from_slice(b"\x1b[B"),
-                                egui::Key::ArrowRight => out.extend_from_slice(b"\x1b[C"),
-                                egui::Key::ArrowLeft => out.extend_from_slice(b"\x1b[D"),
-                                egui::Key::Home => out.extend_from_slice(b"\x1b[H"),
-                                egui::Key::End => out.extend_from_slice(b"\x1b[F"),
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        // ctrl held — terminal-standard copy/paste + control codes
-                        match (key, modifiers.shift) {
-                            (egui::Key::C, false) => copy_action = 1,
-                            (egui::Key::C, true) => copy_action = 2,
-                            (egui::Key::V, _) => want_clip_paste = true,
-                            (egui::Key::X, _) => {}
-                            (k, false) => {
-                                let n = k.name();
-                                if n.len() == 1 {
-                                    let up = n.as_bytes()[0].to_ascii_uppercase();
-                                    if up.is_ascii_uppercase() {
-                                        out.push(up - 0x40);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-        if let Some(s) = scroll {
+        let mode = *self.term.mode();
+        let has_selection = match (self.sel_anchor, self.sel_head) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let outcome = ui.input(|i| crate::input::process_input(&i.events, mode, has_selection));
+
+        if let Some(s) = outcome.scroll {
             self.term.scroll_display(s);
         }
-        // Ctrl+Shift+V reads the clipboard directly; Ctrl+V/Shift+Insert come via Event::Paste.
-        if want_clip_paste && !paste_event {
+
+        let mut bytes = outcome.pty_bytes;
+        // Ctrl+Shift+V: the pure pass can't read the clipboard, so it flags the
+        // request and we wrap the text here through the same mode-gated helper.
+        if outcome.paste_clipboard {
             if let Some(txt) = read_clipboard() {
-                out.extend_from_slice(txt.as_bytes());
+                bytes.extend_from_slice(&crate::input::paste_seq(mode, &txt));
             }
         }
-        if !out.is_empty() {
+        if !bytes.is_empty() {
             self.term.scroll_display(Scroll::Bottom);
-            self.send(&out);
+            self.send(&bytes);
         }
-        match copy_action {
-            1 => {
-                if let Some(txt) = self.selection_text() {
-                    ui.ctx().copy_text(txt);
+
+        if outcome.copy {
+            if let Some(txt) = self.selection_text() {
+                ui.ctx().copy_text(txt);
+                if outcome.copy_clears {
                     self.sel_anchor = None;
                     self.sel_head = None;
-                } else {
-                    self.send(&[0x03]); // Ctrl+C with no selection = interrupt
                 }
             }
-            2 => {
-                if let Some(txt) = self.selection_text() {
-                    ui.ctx().copy_text(txt);
-                }
-            }
-            _ => {}
+        } else if outcome.interrupt {
+            self.send(&[0x03]); // Ctrl+C with no selection = interrupt
         }
     }
 
@@ -712,14 +695,11 @@ impl Session {
             }
         }
 
-        let (cur_line, cur_col, cur_visible) = {
+        let (cur_line, cur_col, cur_shape) = {
             let c = self.term.renderable_content();
-            (
-                c.cursor.point.line.0,
-                c.cursor.point.column.0,
-                c.cursor.shape != CursorShape::Hidden,
-            )
+            (c.cursor.point.line.0, c.cursor.point.column.0, c.cursor.shape)
         };
+        let cur_visible = cur_shape != CursorShape::Hidden;
 
         let grid = self.term.grid();
         let off = grid.display_offset() as i32;
@@ -735,22 +715,32 @@ impl Session {
         job.wrap.max_width = f32::INFINITY;
         for row in 0..nrows {
             let mut run = String::new();
-            let mut run_fg = FG;
-            let mut run_bg: Option<egui::Color32> = None;
-            let flush = |job: &mut LayoutJob,
-                         run: &mut String,
-                         fg: egui::Color32,
-                         bg: Option<egui::Color32>| {
+            let mut run_style = GlyphStyle {
+                fg: FG,
+                bg: None,
+                underline: false,
+                strikethrough: false,
+            };
+            let flush = |job: &mut LayoutJob, run: &mut String, st: GlyphStyle| {
                 if run.is_empty() {
                     return;
                 }
+                let line = |on: bool| {
+                    if on {
+                        egui::Stroke::new(1.0, st.fg)
+                    } else {
+                        egui::Stroke::NONE
+                    }
+                };
                 job.append(
                     run,
                     0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::monospace(13.0),
-                        color: fg,
-                        background: bg.unwrap_or(egui::Color32::TRANSPARENT),
+                        color: st.fg,
+                        background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
+                        underline: line(st.underline),
+                        strikethrough: line(st.strikethrough),
                         ..Default::default()
                     },
                 );
@@ -758,25 +748,14 @@ impl Session {
             };
             for col in 0..ncols {
                 let cell = &grid[Line(row as i32 - off)][Column(col)];
-                let inverse = cell.flags.contains(Flags::INVERSE);
-                let mut fg = resolve(cell.fg).unwrap_or(FG);
-                let mut bg = resolve(cell.bg);
-                if inverse {
-                    let nb = fg;
-                    fg = bg.unwrap_or(BG);
-                    bg = Some(nb);
-                }
-                if cell.flags.contains(Flags::DIM) {
-                    fg = fg.gamma_multiply(0.7);
-                }
-                if fg != run_fg || bg != run_bg {
-                    flush(&mut job, &mut run, run_fg, run_bg);
-                    run_fg = fg;
-                    run_bg = bg;
+                let style = glyph_style(cell.flags, cell.fg, cell.bg);
+                if style != run_style {
+                    flush(&mut job, &mut run, run_style);
+                    run_style = style;
                 }
                 run.push(if cell.c == '\0' { ' ' } else { cell.c });
             }
-            flush(&mut job, &mut run, run_fg, run_bg);
+            flush(&mut job, &mut run, run_style);
             job.append("\n", 0.0, egui::TextFormat::default());
         }
 
@@ -815,11 +794,19 @@ impl Session {
         if active && cur_visible && cur_line >= 0 && off == 0 {
             let cx = rect.min.x + cur_col as f32 * cw;
             let cy = rect.min.y + cur_line as f32 * rh;
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, rh)),
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgba_unmultiplied(231, 169, 63, 130),
-            );
+            let amber = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 130);
+            // Honor the shape the program asked for: beam (insert mode) and
+            // underline are thin bars; block and anything else fill the cell.
+            let cur_rect = match cur_shape {
+                CursorShape::Beam => {
+                    egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(2.0, rh))
+                }
+                CursorShape::Underline => {
+                    egui::Rect::from_min_size(egui::pos2(cx, cy + rh - 2.0), egui::vec2(cw, 2.0))
+                }
+                _ => egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, rh)),
+            };
+            painter.rect_filled(cur_rect, egui::CornerRadius::ZERO, amber);
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
@@ -846,6 +833,60 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(n: NamedColor) -> AnsiColor {
+        AnsiColor::Named(n)
+    }
+
+    #[test]
+    fn glyph_style_plain_is_default_fg_no_bg() {
+        let s = glyph_style(
+            Flags::empty(),
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert_eq!(s.fg, FG);
+        assert_eq!(s.bg, None);
+        assert!(!s.underline && !s.strikethrough);
+    }
+
+    #[test]
+    fn glyph_style_reads_underline_and_strikeout_flags() {
+        let s = glyph_style(
+            Flags::UNDERLINE | Flags::STRIKEOUT,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(s.underline, "UNDERLINE flag must set underline");
+        assert!(s.strikethrough, "STRIKEOUT flag must set strikethrough");
+    }
+
+    #[test]
+    fn glyph_style_inverse_swaps_fg_and_bg() {
+        // Default fg=FG, bg=None: inverse makes fg the background and bg the old fg.
+        let s = glyph_style(
+            Flags::INVERSE,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert_eq!(s.fg, BG);
+        assert_eq!(s.bg, Some(FG));
+    }
+
+    #[test]
+    fn glyph_style_dim_darkens_the_foreground() {
+        let plain = glyph_style(
+            Flags::empty(),
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        let dim = glyph_style(
+            Flags::DIM,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert_ne!(dim.fg, plain.fg, "DIM must darken the foreground");
+    }
 
     #[test]
     fn spawn_argv_runs_a_plain_exe() {

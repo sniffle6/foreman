@@ -1,0 +1,402 @@
+//! Pure input-encoding seam (terminal-completeness epic, Phase 2 / arch candidate A).
+//!
+//! Turns a Session's egui keyboard events into the exact bytes a terminal program
+//! expects — with no dependency on the GUI, the PTY, or the Session — so every
+//! encoding is a byte-equality unit test (the interface IS the test surface).
+//! `terminal.rs::read_input` is the thin shell that supplies live state (term
+//! mode, whether there is a selection), applies the side effects (clipboard read,
+//! copy, interrupt, scroll), and writes `pty_bytes` to the PTY.
+
+use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::term::TermMode;
+use eframe::egui::{Event, Key, Modifiers};
+
+/// What one frame of input decided. The shell applies these side effects in order.
+#[derive(Default, Debug)]
+pub struct InputOutcome {
+    /// Encoded key + (mode-gated) paste bytes, in event order, ready to write.
+    pub pty_bytes: Vec<u8>,
+    /// Copy the current selection to the clipboard.
+    pub copy: bool,
+    /// ...and drop the selection afterward (Ctrl+C / Copy / Cut, not Ctrl+Shift+C).
+    pub copy_clears: bool,
+    /// Ctrl+C with no selection ⇒ send SIGINT (0x03).
+    pub interrupt: bool,
+    /// Shift+Home/End/PageUp/PageDown scrolls the scrollback instead of the shell.
+    pub scroll: Option<Scroll>,
+    /// Ctrl+Shift+V — the pure pass can't read the clipboard, so it flags the
+    /// request; the shell reads it and wraps through `paste_seq`.
+    pub paste_clipboard: bool,
+}
+
+/// Decide what this frame's egui events mean for the terminal. Pure: real
+/// egui/alacritty types in, an `InputOutcome` out, no I/O.
+pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> InputOutcome {
+    let mut out = InputOutcome::default();
+    let mut saw_paste = false;
+    let mut want_clip_paste = false; // Ctrl+V family
+    let mut copy_or_interrupt = false; // Ctrl+C / Copy / Cut
+    let mut copy_only = false; // Ctrl+Shift+C
+
+    for ev in events {
+        match ev {
+            Event::Text(t) => out.pty_bytes.extend_from_slice(t.as_bytes()),
+            Event::Paste(s) => {
+                out.pty_bytes.extend_from_slice(&paste_seq(mode, s));
+                saw_paste = true;
+            }
+            // egui may deliver Ctrl+C / Ctrl+X as these instead of Key events.
+            Event::Copy | Event::Cut => copy_or_interrupt = true,
+            Event::Key { key, pressed: true, modifiers, .. } => {
+                let m = *modifiers;
+                let k = *key;
+                let ctrl = m.ctrl || m.command;
+                // Shift + Home/End/PageUp/PageDown scrolls the scrollback.
+                if m.shift && !ctrl {
+                    match k {
+                        Key::Home => {
+                            out.scroll = Some(Scroll::Top);
+                            continue;
+                        }
+                        Key::End => {
+                            out.scroll = Some(Scroll::Bottom);
+                            continue;
+                        }
+                        Key::PageUp => {
+                            out.scroll = Some(Scroll::PageUp);
+                            continue;
+                        }
+                        Key::PageDown => {
+                            out.scroll = Some(Scroll::PageDown);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                // Copy/paste policy chords (Ctrl held) — intercepted before encoding.
+                if ctrl {
+                    match (k, m.shift) {
+                        (Key::C, false) => {
+                            copy_or_interrupt = true;
+                            continue;
+                        }
+                        (Key::C, true) => {
+                            copy_only = true;
+                            continue;
+                        }
+                        (Key::V, _) => {
+                            want_clip_paste = true;
+                            continue;
+                        }
+                        (Key::X, _) => continue, // cut handled via Event::Cut
+                        _ => {}
+                    }
+                }
+                // Everything else → the pure encoder.
+                out.pty_bytes.extend_from_slice(&encode_key(k, m, mode));
+            }
+            _ => {}
+        }
+    }
+
+    // Ctrl+Shift+V reads the clipboard; Ctrl+V/Shift+Insert arrive as Event::Paste
+    // and are already handled above, so only flag a read when no paste event came.
+    if want_clip_paste && !saw_paste {
+        out.paste_clipboard = true;
+    }
+    if copy_or_interrupt {
+        if has_selection {
+            out.copy = true;
+            out.copy_clears = true;
+        } else {
+            out.interrupt = true; // Ctrl+C with no selection = interrupt
+        }
+    }
+    if copy_only && has_selection {
+        out.copy = true; // copy_clears stays false — Ctrl+Shift+C keeps the selection
+    }
+    out
+}
+
+/// Bracketed-paste wrap, gated on the app actually enabling it. ESC is always
+/// stripped from the payload so a quoted `ESC[201~` can't end the block early and
+/// turn the rest into live keystrokes.
+pub fn paste_seq(mode: TermMode, text: &str) -> Vec<u8> {
+    let body = text.bytes().filter(|&b| b != 0x1b);
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        let mut v = Vec::with_capacity(text.len() + 12);
+        v.extend_from_slice(b"\x1b[200~");
+        v.extend(body);
+        v.extend_from_slice(b"\x1b[201~");
+        v
+    } else {
+        body.collect()
+    }
+}
+
+/// xterm modifier parameter: `1 + shift + 2*alt + 4*ctrl`. `None` when no
+/// modifiers are held (caller emits the unparameterized form).
+fn mods_param(m: Modifiers) -> Option<u8> {
+    let ctrl = m.ctrl || m.command;
+    let bits = (m.shift as u8) | ((m.alt as u8) << 1) | ((ctrl as u8) << 2);
+    (bits != 0).then_some(1 + bits)
+}
+
+/// Encode one non-policy key press into PTY bytes. Honors DECCKM (application
+/// cursor keys) via `mode`, the CSI modifier param for special keys, Ctrl+letter
+/// control codes, and Alt-as-Meta. Returns empty for keys it does not map.
+pub(crate) fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Vec<u8> {
+    let ctrl = mods.ctrl || mods.command;
+    let app = mode.contains(TermMode::APP_CURSOR);
+    let param = mods_param(mods);
+
+    // Cursor / Home / End: SS3 (`ESC O x`) only when unmodified AND in app-cursor
+    // mode; CSI with the modifier param when modified; plain CSI otherwise.
+    let cursor = |fin: u8| -> Vec<u8> {
+        match param {
+            Some(p) => vec![0x1b, b'[', b'1', b';', b'0' + p, fin],
+            None if app => vec![0x1b, b'O', fin],
+            None => vec![0x1b, b'[', fin],
+        }
+    };
+    // Edit / page / F5+ keys: `ESC[<code>~`, with `;<param>` when modified.
+    let tilde = |code: &[u8]| -> Vec<u8> {
+        let mut v = vec![0x1b, b'['];
+        v.extend_from_slice(code);
+        if let Some(p) = param {
+            v.push(b';');
+            v.push(b'0' + p);
+        }
+        v.push(b'~');
+        v
+    };
+    // F1–F4: SS3 (`ESC O P..S`), CSI `1;<p> P..S` when modified.
+    let f1_4 = |fin: u8| -> Vec<u8> {
+        match param {
+            Some(p) => vec![0x1b, b'[', b'1', b';', b'0' + p, fin],
+            None => vec![0x1b, b'O', fin],
+        }
+    };
+
+    match key {
+        Key::ArrowUp => cursor(b'A'),
+        Key::ArrowDown => cursor(b'B'),
+        Key::ArrowRight => cursor(b'C'),
+        Key::ArrowLeft => cursor(b'D'),
+        Key::Home => cursor(b'H'),
+        Key::End => cursor(b'F'),
+        Key::Insert => tilde(b"2"),
+        Key::Delete => tilde(b"3"),
+        Key::PageUp => tilde(b"5"),
+        Key::PageDown => tilde(b"6"),
+        Key::F1 => f1_4(b'P'),
+        Key::F2 => f1_4(b'Q'),
+        Key::F3 => f1_4(b'R'),
+        Key::F4 => f1_4(b'S'),
+        Key::F5 => tilde(b"15"),
+        Key::F6 => tilde(b"17"),
+        Key::F7 => tilde(b"18"),
+        Key::F8 => tilde(b"19"),
+        Key::F9 => tilde(b"20"),
+        Key::F10 => tilde(b"21"),
+        Key::F11 => tilde(b"23"),
+        Key::F12 => tilde(b"24"),
+        Key::Enter => vec![b'\r'],
+        Key::Tab => vec![b'\t'],
+        Key::Backspace => vec![0x7f],
+        Key::Escape => vec![0x1b],
+        _ => {
+            let name = key.name();
+            let b = name.as_bytes();
+            if b.len() == 1 {
+                // Ctrl+letter → control code (0x01..0x1a).
+                if ctrl && !mods.alt {
+                    let up = b[0].to_ascii_uppercase();
+                    if up.is_ascii_uppercase() {
+                        return vec![up - 0x40];
+                    }
+                }
+                // Alt+letter → meta (ESC-prefixed); Alt suppresses the Text event,
+                // so case comes from Shift here.
+                if mods.alt && !ctrl && b[0].is_ascii_alphabetic() {
+                    let letter = if mods.shift {
+                        b[0].to_ascii_uppercase()
+                    } else {
+                        b[0].to_ascii_lowercase()
+                    };
+                    return vec![0x1b, letter];
+                }
+            }
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(ctrl: bool, alt: bool, shift: bool) -> Modifiers {
+        Modifiers { alt, ctrl, shift, mac_cmd: false, command: false }
+    }
+    fn none() -> Modifiers {
+        mods(false, false, false)
+    }
+    fn key_ev(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    // ---- mods_param ----------------------------------------------------------
+    #[test]
+    fn mods_param_none_when_unmodified() {
+        assert_eq!(mods_param(none()), None);
+    }
+    #[test]
+    fn mods_param_encodes_each_modifier() {
+        assert_eq!(mods_param(mods(true, false, false)), Some(5)); // ctrl
+        assert_eq!(mods_param(mods(false, false, true)), Some(2)); // shift
+        assert_eq!(mods_param(mods(false, true, false)), Some(3)); // alt
+        assert_eq!(mods_param(mods(true, false, true)), Some(6)); // ctrl+shift
+    }
+
+    // ---- encode_key: cursor keys + DECCKM ------------------------------------
+    #[test]
+    fn arrow_up_plain_is_csi() {
+        assert_eq!(encode_key(Key::ArrowUp, none(), TermMode::empty()), b"\x1b[A");
+    }
+    #[test]
+    fn arrow_up_in_app_cursor_mode_is_ss3() {
+        assert_eq!(encode_key(Key::ArrowUp, none(), TermMode::APP_CURSOR), b"\x1bOA");
+    }
+    #[test]
+    fn ctrl_arrow_right_uses_modifier_param() {
+        assert_eq!(encode_key(Key::ArrowRight, mods(true, false, false), TermMode::empty()), b"\x1b[1;5C");
+    }
+    #[test]
+    fn modified_arrow_is_csi_even_in_app_cursor_mode() {
+        // DECCKM only affects the UNMODIFIED form.
+        assert_eq!(encode_key(Key::ArrowUp, mods(true, false, false), TermMode::APP_CURSOR), b"\x1b[1;5A");
+    }
+    #[test]
+    fn home_end_follow_decckm() {
+        assert_eq!(encode_key(Key::Home, none(), TermMode::empty()), b"\x1b[H");
+        assert_eq!(encode_key(Key::Home, none(), TermMode::APP_CURSOR), b"\x1bOH");
+        assert_eq!(encode_key(Key::End, none(), TermMode::empty()), b"\x1b[F");
+    }
+
+    // ---- encode_key: function + edit keys ------------------------------------
+    #[test]
+    fn f1_through_f4_are_ss3() {
+        assert_eq!(encode_key(Key::F1, none(), TermMode::empty()), b"\x1bOP");
+        assert_eq!(encode_key(Key::F4, none(), TermMode::empty()), b"\x1bOS");
+    }
+    #[test]
+    fn f5_and_f12_are_tilde_sequences() {
+        assert_eq!(encode_key(Key::F5, none(), TermMode::empty()), b"\x1b[15~");
+        assert_eq!(encode_key(Key::F12, none(), TermMode::empty()), b"\x1b[24~");
+    }
+    #[test]
+    fn shift_f5_carries_the_modifier_param() {
+        assert_eq!(encode_key(Key::F5, mods(false, false, true), TermMode::empty()), b"\x1b[15;2~");
+    }
+    #[test]
+    fn delete_and_insert_and_page_keys() {
+        assert_eq!(encode_key(Key::Delete, none(), TermMode::empty()), b"\x1b[3~");
+        assert_eq!(encode_key(Key::Insert, none(), TermMode::empty()), b"\x1b[2~");
+        assert_eq!(encode_key(Key::PageUp, none(), TermMode::empty()), b"\x1b[5~");
+        assert_eq!(encode_key(Key::PageDown, none(), TermMode::empty()), b"\x1b[6~");
+    }
+
+    // ---- encode_key: control codes, meta, plain keys -------------------------
+    #[test]
+    fn ctrl_letter_is_a_control_code() {
+        assert_eq!(encode_key(Key::A, mods(true, false, false), TermMode::empty()), vec![0x01]);
+    }
+    #[test]
+    fn alt_letter_is_meta_esc_prefixed() {
+        assert_eq!(encode_key(Key::B, mods(false, true, false), TermMode::empty()), vec![0x1b, b'b']);
+        assert_eq!(encode_key(Key::B, mods(false, true, true), TermMode::empty()), vec![0x1b, b'B']);
+    }
+    #[test]
+    fn plain_control_keys() {
+        assert_eq!(encode_key(Key::Enter, none(), TermMode::empty()), vec![b'\r']);
+        assert_eq!(encode_key(Key::Tab, none(), TermMode::empty()), vec![b'\t']);
+        assert_eq!(encode_key(Key::Backspace, none(), TermMode::empty()), vec![0x7f]);
+        assert_eq!(encode_key(Key::Escape, none(), TermMode::empty()), vec![0x1b]);
+    }
+
+    // ---- paste_seq -----------------------------------------------------------
+    #[test]
+    fn paste_seq_wraps_only_when_bracketed_mode_set() {
+        assert_eq!(paste_seq(TermMode::BRACKETED_PASTE, "hi"), b"\x1b[200~hi\x1b[201~");
+        assert_eq!(paste_seq(TermMode::empty(), "hi"), b"hi");
+    }
+    #[test]
+    fn paste_seq_strips_esc_from_payload() {
+        // Embedded ESC[201~ must not survive to terminate the block early.
+        let out = paste_seq(TermMode::BRACKETED_PASTE, "a\x1b[201~b");
+        assert_eq!(out, b"\x1b[200~a[201~b\x1b[201~");
+    }
+
+    // ---- process_input: routing + policy -------------------------------------
+    #[test]
+    fn typed_text_passes_through() {
+        let out = process_input(&[Event::Text("a".into())], TermMode::empty(), false);
+        assert_eq!(out.pty_bytes, b"a");
+        assert!(!out.copy && !out.interrupt && out.scroll.is_none());
+    }
+    #[test]
+    fn arrow_routes_through_encoder() {
+        let out = process_input(&[key_ev(Key::ArrowUp, none())], TermMode::empty(), false);
+        assert_eq!(out.pty_bytes, b"\x1b[A");
+    }
+    #[test]
+    fn ctrl_c_with_selection_copies_and_clears() {
+        let out = process_input(&[key_ev(Key::C, mods(true, false, false))], TermMode::empty(), true);
+        assert!(out.copy && out.copy_clears && !out.interrupt);
+        assert!(out.pty_bytes.is_empty());
+    }
+    #[test]
+    fn ctrl_c_without_selection_interrupts() {
+        let out = process_input(&[key_ev(Key::C, mods(true, false, false))], TermMode::empty(), false);
+        assert!(out.interrupt && !out.copy);
+    }
+    #[test]
+    fn ctrl_shift_c_copies_without_clearing() {
+        let out = process_input(&[key_ev(Key::C, mods(true, false, true))], TermMode::empty(), true);
+        assert!(out.copy && !out.copy_clears && !out.interrupt);
+    }
+    #[test]
+    fn copy_event_copies_and_clears() {
+        let out = process_input(&[Event::Copy], TermMode::empty(), true);
+        assert!(out.copy && out.copy_clears);
+    }
+    #[test]
+    fn ctrl_shift_v_requests_clipboard_paste() {
+        let out = process_input(&[key_ev(Key::V, mods(true, false, true))], TermMode::empty(), false);
+        assert!(out.paste_clipboard);
+        assert!(out.pty_bytes.is_empty());
+    }
+    #[test]
+    fn paste_event_takes_precedence_over_ctrl_v_clipboard_read() {
+        // Ctrl+V also yields an Event::Paste; the event wins, no clipboard re-read.
+        let out = process_input(
+            &[key_ev(Key::V, mods(true, false, false)), Event::Paste("x".into())],
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, b"x");
+        assert!(!out.paste_clipboard);
+    }
+    #[test]
+    fn paste_event_is_bracketed_when_mode_set() {
+        let out = process_input(&[Event::Paste("x".into())], TermMode::BRACKETED_PASTE, false);
+        assert_eq!(out.pty_bytes, b"\x1b[200~x\x1b[201~");
+    }
+    #[test]
+    fn shift_pageup_scrolls_instead_of_sending() {
+        let out = process_input(&[key_ev(Key::PageUp, mods(false, false, true))], TermMode::empty(), false);
+        assert!(matches!(out.scroll, Some(Scroll::PageUp)));
+        assert!(out.pty_bytes.is_empty());
+    }
+}

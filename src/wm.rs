@@ -9,6 +9,45 @@ use std::rc::Rc;
 
 pub type WinId = u64;
 
+// Default quiescence window for `foreman send`: after writing input, wait this
+// long with no new PTY bytes before replying so a following snapshot reads
+// settled state. MAX_SETTLE_MS is a hard cap on the total wait; it stays under
+// control::REPLY_TIMEOUT (5s) so the pipe server's recv_timeout never fires
+// before a settle reply lands.
+const DEFAULT_SETTLE_MS: u64 = 120;
+const MAX_SETTLE_MS: u64 = 4000;
+
+// One pending `foreman send` settle: the terminal to watch, the channel to
+// answer, and the silence-timer state advanced each frame by `advance_settles`.
+struct PendingSettle {
+    pid: WinId,
+    tid: WinId,
+    reply: std::sync::mpsc::Sender<crate::control::OpenReply>,
+    last_gen: u64,
+    quiet_since: std::time::Instant,
+    deadline: std::time::Instant,
+    quiet_window: std::time::Duration,
+}
+
+/// One settle tick. If output arrived (gen changed) the quiet window restarts.
+/// Returns (updated last_gen, updated quiet_since, done).
+fn settle_tick(
+    last_gen: u64,
+    quiet_since: std::time::Instant,
+    deadline: std::time::Instant,
+    quiet_window: std::time::Duration,
+    current_gen: u64,
+    now: std::time::Instant,
+) -> (u64, std::time::Instant, bool) {
+    let (last_gen, quiet_since) = if current_gen != last_gen {
+        (current_gen, now)
+    } else {
+        (last_gen, quiet_since)
+    };
+    let done = now.duration_since(quiet_since) >= quiet_window || now >= deadline;
+    (last_gen, quiet_since, done)
+}
+
 const DESK_BG: egui::Color32 = egui::Color32::from_rgb(25, 23, 19);
 const WIN_BG: egui::Color32 = egui::Color32::from_rgb(33, 30, 24);
 const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
@@ -617,6 +656,9 @@ pub struct WindowManager {
     /// Such a drag keeps the tree drop hints without a modifier; a drag that
     /// started floating is a free move unless Shift is held.
     drag_from_tree: Option<WinId>,
+    /// Pending `foreman send` settle entries, serviced each frame by
+    /// `advance_settles` so the GUI never blocks waiting for a terminal to quiet.
+    pending_settles: Vec<PendingSettle>,
 }
 
 impl WindowManager {
@@ -643,6 +685,7 @@ impl WindowManager {
             tree: Default::default(),
             zoomed: None,
             drag_from_tree: None,
+            pending_settles: Vec::new(),
         }
     }
 
@@ -897,6 +940,66 @@ impl WindowManager {
                     }
                 }
             }
+            CtrlMsg::Send(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                match self.send_dispatch(&req) {
+                    Err(e) => {
+                        let _ = reply.send(OpenReply::err(e));
+                    }
+                    Ok((pid, tid)) => {
+                        let settle = req.settle_ms.unwrap_or(DEFAULT_SETTLE_MS);
+                        if settle == 0 {
+                            // Fire-and-forget: reply immediately, no settle wait.
+                            let _ = reply.send(OpenReply {
+                                ok: true,
+                                terminal: None,
+                                project: None,
+                                error: None,
+                                history: None,
+                                seq: None,
+                            });
+                        } else {
+                            // Defer the reply: park a PendingSettle that
+                            // advance_settles drains once the terminal quiets
+                            // (cross-frame so the GUI never blocks).
+                            let now = std::time::Instant::now();
+                            let quiet_window = std::time::Duration::from_millis(
+                                settle.min(MAX_SETTLE_MS),
+                            );
+                            let cur_gen = self.session_gen(pid, tid).unwrap_or(0);
+                            self.pending_settles.push(PendingSettle {
+                                pid,
+                                tid,
+                                reply,
+                                last_gen: cur_gen,
+                                quiet_since: now,
+                                deadline: now
+                                    + std::time::Duration::from_millis(MAX_SETTLE_MS),
+                                quiet_window,
+                            });
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            CtrlMsg::Snapshot(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(match self.snapshot_dispatch(&req) {
+                    Ok(lines) => OpenReply {
+                        ok: true,
+                        terminal: None,
+                        project: None,
+                        error: None,
+                        history: Some(lines),
+                        seq: None,
+                    },
+                    Err(e) => OpenReply::err(e),
+                });
+            }
         }
     }
 
@@ -1080,6 +1183,205 @@ impl WindowManager {
             tids.push(tid);
         }
         Ok((pid, tids))
+    }
+
+    /// Resolve a `(project, terminal)` pair to their `WinId`s.
+    /// `project` uses the existing `resolve_project` logic; `terminal` is
+    /// validated to exist in that project's child manager and to have at
+    /// least one `Content::Terminal` tab.
+    fn resolve_terminal(
+        &self,
+        project: Option<&str>,
+        terminal: &str,
+    ) -> Result<(WinId, WinId), String> {
+        let pid = self.resolve_project(project)?;
+        let tid = term_id(terminal)?;
+        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
+        let Content::Project(child) = &win.tabs[win.active].content else {
+            return Err("not a project".into()); // unreachable after resolve
+        };
+        let tw = child
+            .windows
+            .iter()
+            .find(|w| w.id == tid)
+            .ok_or_else(|| format!("no such terminal: {terminal}"))?;
+        if !tw
+            .tabs
+            .iter()
+            .any(|t| matches!(t.content, Content::Terminal(_)))
+        {
+            return Err(format!("not a terminal: {terminal}"));
+        }
+        Ok((pid, tid))
+    }
+
+    /// Get a mutable reference to the `Session` for the given (pid, tid).
+    /// Prefers the active tab if it's a `Content::Terminal`; otherwise the
+    /// first terminal tab. Uses immutable checks first to find the tab
+    /// index, then takes a single mutable borrow — satisfying the borrow
+    /// checker without unsafe.
+    fn session_mut(
+        &mut self,
+        pid: WinId,
+        tid: WinId,
+    ) -> Result<&mut crate::terminal::Session, String> {
+        // Immutable pass: find which tab index holds a terminal.
+        let tab_idx = {
+            let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
+            let Content::Project(child) = &win.tabs[win.active].content else {
+                return Err("not a project".into());
+            };
+            let tw = child
+                .windows
+                .iter()
+                .find(|w| w.id == tid)
+                .ok_or_else(|| format!("no such terminal: t{tid}"))?;
+            let active = tw.active;
+            if matches!(tw.tabs[active].content, Content::Terminal(_)) {
+                active
+            } else {
+                tw.tabs
+                    .iter()
+                    .position(|t| matches!(t.content, Content::Terminal(_)))
+                    .ok_or_else(|| format!("no terminal tab in t{tid}"))?
+            }
+        };
+        // Mutable pass: take the borrow with the known index.
+        let win = self.windows.iter_mut().find(|w| w.id == pid).expect("resolved");
+        let Content::Project(child) = &mut win.tabs[win.active].content else {
+            return Err("not a project".into());
+        };
+        let tw = child
+            .windows
+            .iter_mut()
+            .find(|w| w.id == tid)
+            .ok_or_else(|| format!("no such terminal: t{tid}"))?;
+        let Content::Terminal(s) = &mut tw.tabs[tab_idx].content else {
+            return Err(format!("tab {tab_idx} is not a terminal"));
+        };
+        Ok(s)
+    }
+
+    /// Read-only `output_gen` of the terminal at (pid, tid). Mirrors the
+    /// active-tab-preferred lookup of `session_mut` but takes `&self`, so the
+    /// settle machinery can poll freshness while iterating the pending list.
+    /// `None` if the project/terminal/terminal-tab no longer exists.
+    fn session_gen(&self, pid: WinId, tid: WinId) -> Option<u64> {
+        let win = self.windows.iter().find(|w| w.id == pid)?;
+        let Content::Project(child) = &win.tabs[win.active].content else {
+            return None;
+        };
+        let tw = child.windows.iter().find(|w| w.id == tid)?;
+        let active = tw.active;
+        let idx = if matches!(tw.tabs[active].content, Content::Terminal(_)) {
+            active
+        } else {
+            tw.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::Terminal(_)))?
+        };
+        let Content::Terminal(s) = &tw.tabs[idx].content else {
+            return None;
+        };
+        Some(s.output_gen())
+    }
+
+    /// Drive every pending settle one tick. Called each frame after `show()`
+    /// (so sessions have already pumped this frame). For each entry: if the
+    /// terminal is gone, reply ok and drop; otherwise `settle_tick` decides
+    /// whether the silence window elapsed (or the deadline passed) — when done,
+    /// reply ok and drop, else keep with the updated silence state.
+    pub fn advance_settles(&mut self, now: std::time::Instant) {
+        if self.pending_settles.is_empty() {
+            return;
+        }
+        use crate::control::OpenReply;
+        let ok_reply = || OpenReply {
+            ok: true,
+            terminal: None,
+            project: None,
+            error: None,
+            history: None,
+            seq: None,
+        };
+        // mem::take so we can call &self methods (session_gen) while mutating
+        // the list — the established borrow pattern in this file.
+        let mut settles = std::mem::take(&mut self.pending_settles);
+        settles.retain_mut(|ps| {
+            let current_gen = match self.session_gen(ps.pid, ps.tid) {
+                None => {
+                    let _ = ps.reply.send(ok_reply());
+                    return false;
+                }
+                Some(g) => g,
+            };
+            let (new_gen, new_qs, done) = settle_tick(
+                ps.last_gen,
+                ps.quiet_since,
+                ps.deadline,
+                ps.quiet_window,
+                current_gen,
+                now,
+            );
+            ps.last_gen = new_gen;
+            ps.quiet_since = new_qs;
+            if done {
+                let _ = ps.reply.send(ok_reply());
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_settles = settles;
+    }
+
+    fn send_dispatch(
+        &mut self,
+        req: &crate::control::SendRequest,
+    ) -> Result<(WinId, WinId), String> {
+        let terminal = req.terminal.as_deref().ok_or("send: missing terminal")?;
+        let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
+        // Read mode with an immutable borrow BEFORE taking the mutable session borrow.
+        let mode = {
+            let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
+            let Content::Project(child) = &win.tabs[win.active].content else {
+                return Err("not a project".into());
+            };
+            let tw = child.windows.iter().find(|w| w.id == tid).expect("resolved");
+            let active = tw.active;
+            let idx = if matches!(tw.tabs[active].content, Content::Terminal(_)) {
+                active
+            } else {
+                tw.tabs
+                    .iter()
+                    .position(|t| matches!(t.content, Content::Terminal(_)))
+                    .ok_or_else(|| format!("no terminal tab in t{tid}"))?
+            };
+            let Content::Terminal(s) = &tw.tabs[idx].content else {
+                return Err("not a terminal tab".into());
+            };
+            s.term_mode()
+        };
+        // Validate key names BEFORE any write (atomic — errors before side effects).
+        let key_bytes = crate::inspect::parse_keys(&req.keys, mode)?;
+        let session = self.session_mut(pid, tid)?;
+        if let Some(text) = &req.text {
+            session.feed(text.as_bytes());
+        }
+        if !key_bytes.is_empty() {
+            session.feed(&key_bytes);
+        }
+        Ok((pid, tid))
+    }
+
+    fn snapshot_dispatch(
+        &mut self,
+        req: &crate::control::SnapshotRequest,
+    ) -> Result<Vec<String>, String> {
+        let terminal = req.terminal.as_deref().ok_or("snapshot: missing terminal")?;
+        let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
+        let session = self.session_mut(pid, tid)?;
+        Ok(session.snapshot_text(None))
     }
 
     /// Broadcast a framed post inside project `pid` (the after-reply half).
@@ -4939,6 +5241,242 @@ mod tests {
         let r = rrx.try_recv().expect("no close reply");
         assert!(r.ok, "{:?}", r.error);
         assert!(!child_has_win(&d, t), "exited terminal must close cleanly");
+    }
+
+    // --- send / snapshot verbs ---
+
+    fn send_msg(
+        project: Option<&str>,
+        terminal: &str,
+        text: &str,
+        sent: std::time::Instant,
+        settle_ms: Option<u64>,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::SendRequest {
+            cmd: "send".into(),
+            project: project.map(str::to_string),
+            terminal: Some(terminal.to_string()),
+            text: Some(text.to_string()),
+            keys: vec![],
+            settle_ms,
+        };
+        (crate::control::CtrlMsg::Send(req, rtx, sent), rrx)
+    }
+
+    fn snapshot_msg(
+        project: Option<&str>,
+        terminal: &str,
+        sent: std::time::Instant,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::SnapshotRequest {
+            cmd: "snapshot".into(),
+            project: project.map(str::to_string),
+            terminal: Some(terminal.to_string()),
+        };
+        (crate::control::CtrlMsg::Snapshot(req, rtx, sent), rrx)
+    }
+
+    #[test]
+    fn send_replies_ok_for_valid_terminal() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = send_msg(Some("p1"), &ta, "hello", std::time::Instant::now(), Some(0));
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no send reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.history, None); // send does not return a snapshot
+    }
+
+    #[test]
+    fn send_with_settle_ms_zero_replies_immediately() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = send_msg(Some("p1"), &ta, "x", std::time::Instant::now(), Some(0));
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("settle_ms=0 must reply immediately");
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    #[test]
+    fn send_with_settle_defers_then_replies_after_deadline() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        // Default settle (None → DEFAULT_SETTLE_MS): no immediate reply — the
+        // request is parked on the pending list.
+        let (msg, rrx) = send_msg(Some("p1"), &ta, "x", std::time::Instant::now(), None);
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            rrx.try_recv().is_err(),
+            "settle send must NOT reply synchronously"
+        );
+        // Advance past the MAX_SETTLE_MS deadline → the settle fires.
+        let future = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+        d.advance_settles(future);
+        let r = rrx.try_recv().expect("settle must reply once the deadline passes");
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    #[test]
+    fn send_unknown_terminal_errors() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        let (msg, rrx) = send_msg(Some("p1"), "t99", "x", std::time::Instant::now(), Some(0));
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no send reply");
+        assert!(!r.ok);
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("t99"),
+            "{:?}",
+            r.error
+        );
+    }
+
+    #[test]
+    fn stale_send_is_dropped() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let stale = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = send_msg(Some("p1"), &ta, "x", stale, Some(0));
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            rrx.try_recv().is_err(),
+            "stale send must be dropped unanswered"
+        );
+    }
+
+    #[test]
+    fn snapshot_replies_history_some_and_nonempty() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let (msg, rrx) = snapshot_msg(Some("p1"), &ta, std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no snapshot reply");
+        assert!(r.ok, "{:?}", r.error);
+        // snapshot always returns Some(lines) — even an idle terminal has rows
+        assert!(r.history.is_some(), "snapshot must populate history field");
+        assert!(
+            !r.history.as_ref().unwrap().is_empty(),
+            "snapshot rows must be non-empty"
+        );
+    }
+
+    #[test]
+    fn snapshot_unknown_terminal_errors() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b) = chat_fixture(&ctx);
+        let (msg, rrx) = snapshot_msg(Some("p1"), "t99", std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no snapshot reply");
+        assert!(!r.ok);
+        assert!(
+            r.error.as_deref().unwrap_or("").contains("t99"),
+            "{:?}",
+            r.error
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_is_dropped() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let stale = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = snapshot_msg(Some("p1"), &ta, stale);
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            rrx.try_recv().is_err(),
+            "stale snapshot must be dropped unanswered"
+        );
+    }
+
+    // --- settle_tick pure logic ---
+
+    #[test]
+    fn settle_tick_not_done_within_window() {
+        let t0 = std::time::Instant::now();
+        let quiet_window = std::time::Duration::from_millis(120);
+        let deadline = t0 + std::time::Duration::from_millis(4000);
+        // gen unchanged, 50ms elapsed < 120ms window → not done
+        let (g, qs, done) = super::settle_tick(
+            5,
+            t0,
+            deadline,
+            quiet_window,
+            5, // current_gen == last_gen (no output)
+            t0 + std::time::Duration::from_millis(50),
+        );
+        assert_eq!(g, 5, "gen unchanged");
+        assert_eq!(qs, t0, "quiet_since unchanged");
+        assert!(!done, "should not be done yet");
+    }
+
+    #[test]
+    fn settle_tick_done_after_quiet_window() {
+        let t0 = std::time::Instant::now();
+        let quiet_window = std::time::Duration::from_millis(120);
+        let deadline = t0 + std::time::Duration::from_millis(4000);
+        // gen unchanged, 150ms elapsed > 120ms window → done
+        let (g, qs, done) = super::settle_tick(
+            5,
+            t0,
+            deadline,
+            quiet_window,
+            5,
+            t0 + std::time::Duration::from_millis(150),
+        );
+        assert_eq!(g, 5);
+        assert_eq!(qs, t0);
+        assert!(done, "should be done after quiet window");
+    }
+
+    #[test]
+    fn settle_tick_gen_change_resets_quiet_since() {
+        let t0 = std::time::Instant::now();
+        let quiet_window = std::time::Duration::from_millis(120);
+        let deadline = t0 + std::time::Duration::from_millis(4000);
+        // Gen changed at t0+150ms: quiet_since resets to now; not done even
+        // though we are past the original quiet window measured from t0.
+        let now = t0 + std::time::Duration::from_millis(150);
+        let (g, qs, done) = super::settle_tick(
+            5,
+            t0,
+            deadline,
+            quiet_window,
+            6, // current_gen != last_gen → output arrived
+            now,
+        );
+        assert_eq!(g, 6, "gen must update to current");
+        assert_eq!(qs, now, "quiet_since must reset to now");
+        assert!(!done, "just received output, should not be done");
+    }
+
+    #[test]
+    fn settle_tick_past_deadline_always_done() {
+        let t0 = std::time::Instant::now();
+        let quiet_window = std::time::Duration::from_millis(120);
+        // deadline already in the past
+        let deadline = t0 - std::time::Duration::from_millis(1);
+        // Even if gen just changed, deadline overrules
+        let now = t0;
+        let (g, qs, done) = super::settle_tick(5, t0, deadline, quiet_window, 6, now);
+        assert_eq!(g, 6);
+        assert_eq!(qs, now);
+        assert!(done, "past deadline must be done regardless of gen");
     }
 
     #[test]
