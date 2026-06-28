@@ -204,6 +204,31 @@ block (with `:set paste` or bracketed-paste-aware vim).
 
 ### Phase 3 — Mouse reporting to TUI apps · M · REJECTOR
 
+**Status: wheel/scroll forwarding built (2026-06-27), green (310 tests).** The
+*scroll* half of Phase 3 shipped; click/drag/motion reporting (below) is still
+designed-not-built. What landed:
+
+- `src/input.rs`: `WheelAction { Pty(Vec<u8>), Scrollback(Scroll) }` and the pure,
+  byte-tested `wheel_input(delta_lines, mode, col, row) -> WheelAction` (8 tests),
+  behind the existing input seam. Precedence: (1) any `MOUSE_MODE` flag → forward
+  the wheel as mouse events — SGR `ESC[<64/65;col;row M`, or legacy X10
+  `ESC[M`+3 offset-by-32 bytes — one event per line; (2) `ALT_SCREEN` +
+  `ALTERNATE_SCROLL` → arrow keys via `encode_key` (so APP_CURSOR is honored);
+  (3) else foreman's local scrollback (unchanged). This is why a full-screen TUI
+  (Claude, vim, less) finally scrolls — its alt screen has no foreman scrollback,
+  so the wheel must reach the app.
+- Adapter (`terminal.rs` wheel handler): the `Pty` (forwarding) branch is gated on
+  `active`, like the key path — hovering an unfocused pane must never inject
+  keys/mouse into it; the read-only `Scrollback` branch stays on any hovered pane.
+- Feel: a `Session.scroll_accum` carries the sub-line remainder of
+  `smooth_scroll_delta`, so gentle notches aren't rounded to zero (felt dead) and
+  fast flicks don't over-emit lines (lurch). `raw_scroll_delta` does not exist in
+  egui 0.34 — only the smoothed delta, hence the accumulator.
+
+Still to do for full Phase 3: click / drag / motion via the `encode_mouse` sibling
+fn, the Shift-override to force local selection, and suppressing text selection
+while an app holds the mouse.
+
 **Problem.** All mouse events are consumed for text selection / scroll
 (`terminal.rs:680-713`). There is no path that converts pointer events into mouse
 escape sequences, so vim/lazygit/htop/ranger get zero mouse input.
@@ -396,7 +421,7 @@ order):
 - [x] User paste is bracketed when the app supports it (Phase 2) — mode-gated `paste_seq`
 - [ ] Font family/size configurable; zoom keys work (Phase 7)
 - [ ] Bold / italic render with real font faces (Phase 1b)
-- [ ] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3)
+- [~] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3) — wheel/scroll forwarding done (2026-06-27); click/drag/motion + Shift-override still to do
 - [ ] Double-click word, triple-click line; CJK selection is correct (Phase 4)
 - [ ] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5)
 - [ ] Tab title follows OSC 0/2; bell gives feedback (Phase 6)

@@ -205,6 +205,10 @@ pub struct Session {
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
     caret: crate::caret::CaretGate,
+    /// Sub-line remainder of wheel scrolling. egui delivers a notch as smoothed
+    /// per-frame fractions; carrying the remainder keeps gentle scrolls from
+    /// rounding to nothing and fast flicks from over-emitting lines.
+    scroll_accum: f32,
 }
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
@@ -386,6 +390,7 @@ impl Session {
             ready: false,
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
+            scroll_accum: 0.0,
         })
     }
 
@@ -723,13 +728,44 @@ impl Session {
             self.read_input(ui);
         }
 
-        // Mouse-wheel scrollback (works whenever the pane is hovered).
+        // Mouse-wheel (works whenever the pane is hovered). On the alternate
+        // screen / under mouse reporting, foreman's own scrollback is empty, so
+        // the wheel is forwarded to the app (mouse events or arrow keys) via the
+        // pure `input::wheel_input` seam; otherwise it scrolls local scrollback.
         if resp.hovered() {
+            // egui delivers a wheel notch as smoothed per-frame fractions. Rounding
+            // each frame both drops gentle scrolls (→0) and over-emits fast ones, so
+            // accumulate the sub-line remainder and emit only whole lines.
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
             if dy != 0.0 {
-                let lines = (dy / rh).round() as i32;
+                self.scroll_accum += dy / rh;
+                let lines = self.scroll_accum.trunc() as i32;
+                self.scroll_accum -= lines as f32;
                 if lines != 0 {
-                    self.term.scroll_display(Scroll::Delta(lines));
+                    // pointer → 1-based viewport cell
+                    let (col, row) = match resp.hover_pos() {
+                        Some(p) => (
+                            (((p.x - rect.min.x) / cw).floor() as i32 + 1).clamp(1, cols as i32) as u16,
+                            (((p.y - rect.min.y) / rh).floor() as i32 + 1).clamp(1, rows as i32) as u16,
+                        ),
+                        None => (1, 1),
+                    };
+                    let mode = *self.term.mode();
+                    let action = crate::input::wheel_input(lines, mode, col, row);
+                    match action {
+                        // Forwarding writes INPUT to the app, so gate on `active`
+                        // (focus) like the key path — hovering an unfocused pane
+                        // must not inject keys/mouse into it. Scrollback is
+                        // read-only and stays available on any hovered pane.
+                        crate::input::WheelAction::Pty(b) => {
+                            if active {
+                                self.send(&b);
+                            }
+                        }
+                        crate::input::WheelAction::Scrollback(s) => {
+                            self.term.scroll_display(s);
+                        }
+                    }
                 }
             }
         }

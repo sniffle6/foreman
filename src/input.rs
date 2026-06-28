@@ -134,6 +134,79 @@ pub fn paste_seq(mode: TermMode, text: &str) -> Vec<u8> {
     }
 }
 
+/// What a mouse-wheel tick over the pane decided. Either bytes for the running
+/// app (mouse-report events or arrow keys, when the TUI wants them) or a
+/// scroll of foreman's own scrollback (the default when the app doesn't).
+#[derive(Debug)]
+pub enum WheelAction {
+    /// Forward to the app: SGR/X10 mouse events, or arrow keys (alt-scroll).
+    Pty(Vec<u8>),
+    /// Scroll foreman's local scrollback (today's behavior).
+    Scrollback(Scroll),
+}
+
+/// Decide what one wheel gesture means for the terminal under the pointer.
+///
+/// `delta_lines`: + = wheel up / toward older history, - = wheel down. `(col,
+/// row)`: the 1-based viewport cell under the pointer, used only for mouse
+/// encoding. Pure: same inputs → same bytes.
+///
+/// Precedence: (1) if the app is in any mouse-reporting mode, forward wheel as
+/// mouse events; (2) else if it's on the alternate screen with alternate-scroll
+/// enabled, translate the wheel to arrow keys (so pagers/TUIs scroll); (3) else
+/// scroll foreman's scrollback.
+pub fn wheel_input(delta_lines: i32, mode: TermMode, col: u16, row: u16) -> WheelAction {
+    if delta_lines == 0 {
+        return WheelAction::Scrollback(Scroll::Delta(0));
+    }
+    let up = delta_lines > 0;
+    let count = delta_lines.unsigned_abs() as usize;
+
+    // (1) Mouse reporting: emit one wheel event per line. Wheel up = button 64,
+    // wheel down = button 65 (xterm's wheel buttons). Wheel has no release.
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        let button: u16 = if up { 64 } else { 65 };
+        let mut bytes = Vec::new();
+        for _ in 0..count {
+            if mode.contains(TermMode::SGR_MOUSE) {
+                // ESC [ < button ; col ; row M   (press; ASCII decimal params)
+                bytes.extend_from_slice(b"\x1b[<");
+                bytes.extend_from_slice(button.to_string().as_bytes());
+                bytes.push(b';');
+                bytes.extend_from_slice(col.to_string().as_bytes());
+                bytes.push(b';');
+                bytes.extend_from_slice(row.to_string().as_bytes());
+                bytes.push(b'M');
+            } else {
+                // Legacy X10: ESC [ M then three bytes, each offset by 32 and
+                // clamped to a single byte so col/row past 223 saturate.
+                let enc = |v: u32| -> u8 { (32 + v).min(255) as u8 };
+                bytes.extend_from_slice(b"\x1b[M");
+                bytes.push(enc(button as u32));
+                bytes.push(enc(col as u32));
+                bytes.push(enc(row as u32));
+            }
+        }
+        return WheelAction::Pty(bytes);
+    }
+
+    // (2) Alternate screen + alternate-scroll: feed arrow keys. Reuse encode_key
+    // so APP_CURSOR (ESC O A vs ESC [ A) is honored exactly as for real arrows.
+    if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
+        let key = if up { Key::ArrowUp } else { Key::ArrowDown };
+        let no_mods = Modifiers::default();
+        let one = encode_key(key, no_mods, mode);
+        let mut bytes = Vec::with_capacity(one.len() * count);
+        for _ in 0..count {
+            bytes.extend_from_slice(&one);
+        }
+        return WheelAction::Pty(bytes);
+    }
+
+    // (3) Default: scroll foreman's own scrollback.
+    WheelAction::Scrollback(Scroll::Delta(delta_lines))
+}
+
 /// xterm modifier parameter: `1 + shift + 2*alt + 4*ctrl`. `None` when no
 /// modifiers are held (caller emits the unparameterized form).
 fn mods_param(m: Modifiers) -> Option<u8> {
@@ -398,5 +471,69 @@ mod tests {
         let out = process_input(&[key_ev(Key::PageUp, mods(false, false, true))], TermMode::empty(), false);
         assert!(matches!(out.scroll, Some(Scroll::PageUp)));
         assert!(out.pty_bytes.is_empty());
+    }
+
+    // ---- wheel_input ---------------------------------------------------------
+    // Scroll doesn't derive PartialEq, so match and read the inner delta.
+    fn scrollback_delta(a: WheelAction) -> i32 {
+        match a {
+            WheelAction::Scrollback(Scroll::Delta(d)) => d,
+            other => panic!("expected Scrollback(Delta), got {other:?}"),
+        }
+    }
+    fn pty(a: WheelAction) -> Vec<u8> {
+        match a {
+            WheelAction::Pty(b) => b,
+            other => panic!("expected Pty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wheel_primary_screen_scrolls_local_scrollback() {
+        assert_eq!(scrollback_delta(wheel_input(3, TermMode::empty(), 1, 1)), 3);
+        assert_eq!(scrollback_delta(wheel_input(-2, TermMode::empty(), 1, 1)), -2);
+    }
+    #[test]
+    fn wheel_alt_scroll_emits_arrow_keys() {
+        let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Up 3 → ArrowUp ×3 (plain CSI, since APP_CURSOR is off).
+        assert_eq!(pty(wheel_input(3, mode, 1, 1)), b"\x1b[A\x1b[A\x1b[A");
+        // Down 3 → ArrowDown ×3.
+        assert_eq!(pty(wheel_input(-3, mode, 1, 1)), b"\x1b[B\x1b[B\x1b[B");
+    }
+    #[test]
+    fn wheel_alt_scroll_honors_app_cursor_mode() {
+        let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL | TermMode::APP_CURSOR;
+        // SS3 form (ESC O A / ESC O B) when the app set DECCKM.
+        assert_eq!(pty(wheel_input(1, mode, 1, 1)), b"\x1bOA");
+        assert_eq!(pty(wheel_input(-1, mode, 1, 1)), b"\x1bOB");
+    }
+    #[test]
+    fn wheel_sgr_mouse_one_line() {
+        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
+        assert_eq!(pty(wheel_input(-1, mode, 5, 10)), b"\x1b[<65;5;10M");
+    }
+    #[test]
+    fn wheel_sgr_mouse_repeats_per_line() {
+        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(pty(wheel_input(2, mode, 5, 10)), b"\x1b[<64;5;10M\x1b[<64;5;10M");
+    }
+    #[test]
+    fn wheel_x10_mouse_one_line() {
+        let mode = TermMode::MOUSE_MODE; // no SGR → legacy X10 encoding
+        // ESC [ M then (32+button), (32+col), (32+row).
+        let expected = vec![0x1b, b'[', b'M', 32 + 64, 32 + 5, 32 + 10];
+        assert_eq!(pty(wheel_input(1, mode, 5, 10)), expected);
+    }
+    #[test]
+    fn wheel_mouse_mode_beats_alt_scroll() {
+        // Both mouse-reporting AND alt-scroll flags set → mouse wins.
+        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE | TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
+    }
+    #[test]
+    fn wheel_zero_delta_is_a_noop_scrollback() {
+        assert_eq!(scrollback_delta(wheel_input(0, TermMode::empty(), 1, 1)), 0);
     }
 }
