@@ -99,6 +99,27 @@ pub(crate) fn resolve(c: AnsiColor) -> Option<egui::Color32> {
     }
 }
 
+/// Answer an OSC color query (`ColorRequest`): map alacritty's color-table index
+/// to the RGB foreman actually paints. `index < 256` is a palette entry; the
+/// named slots `Foreground`/`Background`/`Cursor` sit at 256/257/258. Apps query
+/// these (OSC 10/11/12, OSC 4;N) to detect a light/dark background and theme
+/// themselves — without an answer they fall back to a guess.
+fn query_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
+    let c = if index < 256 {
+        indexed_rgb(index as u8)
+    } else if index == NamedColor::Background as usize {
+        BG
+    } else {
+        // Foreground, Cursor, and the rarer named slots all use our foreground.
+        FG
+    };
+    alacritty_terminal::vte::ansi::Rgb {
+        r: c.r(),
+        g: c.g(),
+        b: c.b(),
+    }
+}
+
 /// Resolved per-cell display style: foreground/background after the inverse swap
 /// and dim, plus the line decorations. Pure, so the inverse/dim/flag logic is
 /// unit-tested apart from the egui painter; `show` turns this into a `TextFormat`.
@@ -155,13 +176,38 @@ impl Shell {
 #[derive(Clone)]
 struct Listener {
     out: Arc<Mutex<Vec<u8>>>,
+    /// Latest OSC window title the program set (`ESC ] 0/2 ; … ST`). Used to tell
+    /// what's running in a *hand-launched* shell (e.g. `claude` typed at a prompt)
+    /// so the tab icon can follow it. `None` = no title / reset to default.
+    title: Arc<Mutex<Option<String>>>,
 }
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            if let Ok(mut b) = self.out.lock() {
-                b.extend_from_slice(text.as_bytes());
+        match event {
+            Event::PtyWrite(text) => {
+                if let Ok(mut b) = self.out.lock() {
+                    b.extend_from_slice(text.as_bytes());
+                }
             }
+            Event::Title(t) => {
+                if let Ok(mut slot) = self.title.lock() {
+                    *slot = Some(t);
+                }
+            }
+            Event::ResetTitle => {
+                if let Ok(mut slot) = self.title.lock() {
+                    *slot = None;
+                }
+            }
+            // An app asked for one of our colors (OSC 10/11/12, OSC 4;N). Reply
+            // with the real RGB via the PTY-write path, same as a device query.
+            Event::ColorRequest(index, format) => {
+                let reply = format(query_color(index));
+                if let Ok(mut b) = self.out.lock() {
+                    b.extend_from_slice(reply.as_bytes());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -188,12 +234,22 @@ pub struct Session {
     parser: Processor,
     rx: Receiver<Vec<u8>>,
     resp: Arc<Mutex<Vec<u8>>>,
+    /// Latest OSC title the running program set (shared with the `Listener`).
+    osc_title: Arc<Mutex<Option<String>>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     exit: Option<u32>,
     exit_noted: bool,
     pub shell: Shell,
+    /// The argv this terminal was dispatched with (agent commands spawned via
+    /// `spawn_argv`); `None` for a plain interactive shell. Drives the tab's
+    /// agent logo (claude/codex) — see `icon_kind`.
+    dispatch_argv: Option<Vec<String>>,
+    /// PID of the process we spawned into the PTY (the shell, or a dispatched
+    /// command). Root for the process-tree agent scan that catches a hand-typed
+    /// `claude`/`codex` — see `icon_kind`.
+    root_pid: Option<u32>,
     // The Session's stable Member id, stamped by the window manager at spawn
     // (== the `t{id}` it injects as FOREMAN_TERMINAL_ID). Unlike a Win id it
     // never changes — tabbing, untabbing, and moving leave it alone — so the
@@ -360,14 +416,49 @@ impl Session {
         if unsafe_for_cmd && is_batch {
             return Err(refuse("batch file".into()));
         }
-        Self::spawn_with(build(argv), Shell::Cmd, ctx.clone()).or_else(|e| {
+        let mut session = Self::spawn_with(build(argv), Shell::Cmd, ctx.clone()).or_else(|e| {
             if unsafe_for_cmd {
                 return Err(refuse(format!("not directly spawnable: {e}")));
             }
             let mut wrapped = vec!["cmd.exe".to_string(), "/c".to_string()];
             wrapped.extend_from_slice(argv);
             Self::spawn_with(build(&wrapped), Shell::Cmd, ctx)
-        })
+        })?;
+        // Remember what we dispatched so the tab can show the agent's logo.
+        session.dispatch_argv = Some(argv.to_vec());
+        Ok(session)
+    }
+
+    /// The latest OSC window title the running program set, if any.
+    pub fn osc_title(&self) -> Option<String> {
+        self.osc_title.lock().ok().and_then(|t| t.clone())
+    }
+
+    /// The icon for this terminal's tab, resolved in priority order:
+    /// 1. the dispatched agent's argv (instant, `foreman open claude …`),
+    /// 2. a hand-launched agent recognized from the program's OSC title (instant;
+    ///    works when the program sets a useful title, e.g. Claude),
+    /// 3. a hand-launched agent found in the OS process tree under the shell
+    ///    (throttled; catches agents that set a useless title, e.g. Codex),
+    /// 4. otherwise the shell's glyph.
+    pub fn icon_kind(&self) -> crate::icons::IconKind {
+        if let Some(k) = self
+            .dispatch_argv
+            .as_deref()
+            .and_then(crate::icons::IconKind::from_argv)
+        {
+            return k;
+        }
+        if let Some(k) = self
+            .osc_title()
+            .and_then(|t| crate::icons::IconKind::from_title(&t))
+        {
+            return k;
+        }
+        if let Some(k) = self.root_pid.and_then(crate::proc::agent_for) {
+            return k;
+        }
+        crate::icons::IconKind::for_shell(self.shell)
     }
 
     fn spawn_with(
@@ -389,6 +480,7 @@ impl Session {
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let root_pid = child.process_id();
         drop(pair.slave);
         let mut reader = pair
             .master
@@ -417,22 +509,29 @@ impl Session {
         });
 
         let resp = Arc::new(Mutex::new(Vec::new()));
+        let osc_title = Arc::new(Mutex::new(None));
         let term = Term::new(
             Config::default(),
             &Size { cols, rows },
-            Listener { out: resp.clone() },
+            Listener {
+                out: resp.clone(),
+                title: osc_title.clone(),
+            },
         );
         Ok(Session {
             term,
             parser: Processor::new(),
             rx,
             resp,
+            osc_title,
             writer,
             master: pair.master,
             child,
             exit: None,
             exit_noted: false,
             shell,
+            dispatch_argv: None,
+            root_pid,
             term_id: 0,
             cols,
             rows,
@@ -1012,6 +1111,36 @@ mod tests {
 
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
+    }
+
+    #[test]
+    fn listener_answers_color_request_into_the_pty_buffer() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let l = Listener {
+            out: out.clone(),
+            title: Arc::new(Mutex::new(None)),
+        };
+        // Stand-in for alacritty's formatter: echo the RGB it is handed.
+        let fmt = Arc::new(|c: alacritty_terminal::vte::ansi::Rgb| {
+            format!("R{}G{}B{}", c.r, c.g, c.b)
+        });
+        l.send_event(Event::ColorRequest(NamedColor::Background as usize, fmt));
+        let got = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(got, format!("R{}G{}B{}", BG.r(), BG.g(), BG.b()));
+    }
+
+    #[test]
+    fn query_color_maps_palette_and_named_slots() {
+        // Palette entry 0 → our black; OSC 4;0 callers get it back.
+        let p0 = query_color(0);
+        assert_eq!((p0.r, p0.g, p0.b), (PALETTE[0].r(), PALETTE[0].g(), PALETTE[0].b()));
+        // OSC 11 (background) → our BG; OSC 10 (foreground) / cursor → our FG.
+        let bg = query_color(NamedColor::Background as usize);
+        assert_eq!((bg.r, bg.g, bg.b), (BG.r(), BG.g(), BG.b()));
+        let fg = query_color(NamedColor::Foreground as usize);
+        assert_eq!((fg.r, fg.g, fg.b), (FG.r(), FG.g(), FG.b()));
+        let cur = query_color(NamedColor::Cursor as usize);
+        assert_eq!((cur.r, cur.g, cur.b), (FG.r(), FG.g(), FG.b()));
     }
 
     #[test]

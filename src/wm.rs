@@ -487,6 +487,16 @@ impl Content {
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
         }
     }
+
+    /// The tab icon for this content: the terminal's agent/shell logo, a folder
+    /// for a project, and none for the chat viewer.
+    fn icon_kind(&self) -> Option<crate::icons::IconKind> {
+        match self {
+            Content::Terminal(s) => Some(s.icon_kind()),
+            Content::Project(_) => Some(crate::icons::IconKind::Folder),
+            Content::Chat(_) => None,
+        }
+    }
 }
 
 /// One entry in a window's tab-stack: a title and the content it shows. The
@@ -778,6 +788,10 @@ impl WindowManager {
         let mut v = vec![
             ("FOREMAN".to_string(), "1".to_string()),
             ("FOREMAN_TERMINAL_ID".to_string(), format!("t{term_id}")),
+            // Advertise our real capabilities so cross-platform TUIs enable 24-bit
+            // color (Codex's input box, etc.). foreman renders truecolor.
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+            ("TERM".to_string(), "xterm-256color".to_string()),
         ];
         if let Some(t) = &self.tag {
             v.push(("FOREMAN_PROJECT_ID".to_string(), t.clone()));
@@ -2573,13 +2587,19 @@ impl WindowManager {
                 // dragging a chip off the bar detaches it (untab).
                 let ntabs = self.windows[i].tabs.len();
                 let tab_font = egui::FontId::proportional(11.5);
-                let chip_h = TITLE_H - 6.0;
-                let cy = scr.min.y + 3.0;
+                // Classic browser tabs: taller chips whose flat bottoms meet the
+                // content area, rounded only on top, each with a leading icon.
+                let chip_h = TITLE_H - 4.0;
+                let cy = scr.min.y + 4.0;
                 let mut cx = scr.min.x + 6.0;
                 let avail_end = scr.max.x - ctl_w;
+                let icon_disp = 14.0_f32; // icon box edge, in points
+                let icon_gap = 6.0_f32;
+                let left_pad = 8.0_f32;
                 for ti in 0..ntabs {
                     let is_active_tab = self.windows[i].active == ti;
                     let label = self.windows[i].tabs[ti].title.clone();
+                    let icon = self.windows[i].tabs[ti].content.icon_kind();
                     let tw = ui
                         .painter()
                         .layout_no_wrap(label.clone(), tab_font.clone(), TEXT)
@@ -2587,7 +2607,8 @@ impl WindowManager {
                         .x
                         .min(120.0);
                     let close_w = 16.0;
-                    let chip_w = tw + 12.0 + close_w;
+                    let icon_w = if icon.is_some() { icon_disp + icon_gap } else { 0.0 };
+                    let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
                     if cx + chip_w > avail_end && ti > 0 {
                         // Out of room: stop drawing further chips (rare; many tabs on
                         // a narrow window). The active tab is always within the first
@@ -2608,53 +2629,79 @@ impl WindowManager {
                     } else {
                         egui::Color32::from_rgb(38, 34, 27)
                     };
-                    p.rect_filled(chip, egui::CornerRadius::same(4), bg);
+                    // Rounded on top, flat on the bottom so the active tab reads as
+                    // joined to the content area below it (classic browser tabs).
+                    let radius = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                    p.rect_filled(chip, radius, bg);
                     if is_active_tab {
                         p.rect_stroke(
                             chip,
-                            egui::CornerRadius::same(4),
+                            radius,
                             egui::Stroke::new(1.0, BORDER_FOCUS),
                             egui::StrokeKind::Inside,
                         );
                     }
                     let txt_col = if is_active_tab && is_focus { TEXT } else { DIM };
+                    // Leading icon: agent logo / shell glyph / project folder.
+                    let mut label_x = cx + left_pad;
+                    if let Some(kind) = icon {
+                        let center =
+                            egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
+                        let icon_rect =
+                            egui::Rect::from_center_size(center, egui::vec2(icon_disp, icon_disp));
+                        let px = (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                        let tex = crate::icons::texture(ui.ctx(), kind, px);
+                        let tint = if is_active_tab && is_focus {
+                            kind.tint()
+                        } else {
+                            kind.tint().gamma_multiply(0.55)
+                        };
+                        p.image(
+                            tex.id(),
+                            icon_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            tint,
+                        );
+                        label_x += icon_disp + icon_gap;
+                    }
                     p.text(
-                        egui::pos2(cx + 7.0, cy + chip_h / 2.0),
+                        egui::pos2(label_x, cy + chip_h / 2.0),
                         egui::Align2::LEFT_CENTER,
                         &label,
                         tab_font.clone(),
                         txt_col,
                     );
-                    // per-tab close affordance (small ×)
+                    // Close affordance — shown only on the active or hovered tab
+                    // (browser-style), and interactable only when shown.
+                    let show_x = is_active_tab || chip_resp.hovered();
                     let xr = egui::Rect::from_min_size(
                         egui::pos2(cx + chip_w - close_w, cy),
                         egui::vec2(close_w, chip_h),
                     );
-                    let xresp = ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
-                    let xc = xr.center();
-                    let xs = 3.0;
-                    let xcol = if xresp.hovered() {
-                        egui::Color32::from_rgb(220, 120, 100)
+                    let xresp = if show_x {
+                        let r =
+                            ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
+                        let xc = xr.center();
+                        let xs = 3.0;
+                        let xcol = if r.hovered() {
+                            egui::Color32::from_rgb(220, 120, 100)
+                        } else {
+                            txt_col
+                        };
+                        let xstroke = egui::Stroke::new(1.2, xcol);
+                        p.line_segment(
+                            [egui::pos2(xc.x - xs, xc.y - xs), egui::pos2(xc.x + xs, xc.y + xs)],
+                            xstroke,
+                        );
+                        p.line_segment(
+                            [egui::pos2(xc.x - xs, xc.y + xs), egui::pos2(xc.x + xs, xc.y - xs)],
+                            xstroke,
+                        );
+                        Some(r)
                     } else {
-                        txt_col
+                        None
                     };
-                    let xstroke = egui::Stroke::new(1.2, xcol);
-                    let pp = ui.painter();
-                    pp.line_segment(
-                        [
-                            egui::pos2(xc.x - xs, xc.y - xs),
-                            egui::pos2(xc.x + xs, xc.y + xs),
-                        ],
-                        xstroke,
-                    );
-                    pp.line_segment(
-                        [
-                            egui::pos2(xc.x - xs, xc.y + xs),
-                            egui::pos2(xc.x + xs, xc.y - xs),
-                        ],
-                        xstroke,
-                    );
-                    if xresp.clicked() {
+                    if xresp.is_some_and(|r| r.clicked()) {
                         acts.push(Act::CloseTab(id, ti));
                     } else if chip_resp.clicked() {
                         acts.push(Act::SetTab(id, ti));
@@ -2705,14 +2752,39 @@ impl WindowManager {
                     )
                     .size()
                     .x;
+                // Leading icon, mirroring the tab chips so a single-window header
+                // reads consistently (agent logo / shell glyph / project folder).
+                let mut tx = scr.min.x + 11.0;
+                if let Some(kind) = self.windows[i].tabs[self.windows[i].active].content.icon_kind()
+                {
+                    let disp = 14.0_f32;
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(tx + disp / 2.0, scr.min.y + TITLE_H / 2.0),
+                        egui::vec2(disp, disp),
+                    );
+                    let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                    let tex = crate::icons::texture(ui.ctx(), kind, px);
+                    let tint = if is_focus {
+                        kind.tint()
+                    } else {
+                        kind.tint().gamma_multiply(0.55)
+                    };
+                    p.image(
+                        tex.id(),
+                        icon_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        tint,
+                    );
+                    tx += disp + 7.0;
+                }
                 p.text(
-                    egui::pos2(scr.min.x + 11.0, scr.min.y + TITLE_H / 2.0),
+                    egui::pos2(tx, scr.min.y + TITLE_H / 2.0),
                     egui::Align2::LEFT_CENTER,
                     self.windows[i].title(),
                     egui::FontId::proportional(12.5),
                     if is_focus { TEXT } else { DIM },
                 );
-                title_end_x = scr.min.x + 11.0 + tw + 14.0;
+                title_end_x = tx + tw + 14.0;
             }
 
             // --- dispatch keys (project headers only) ---

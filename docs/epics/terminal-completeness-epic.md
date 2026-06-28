@@ -454,6 +454,27 @@ Build/verify each per `docs/HANDOFF.md` §3 (kill app → `cargo build` →
 `cargo test` → run + the acid test). Don't claim a phase done without running its
 acid-test app.
 
+## Color capability advertisement (2026-06-28, built + green)
+
+Codex CLI rendered its grey input box in Windows Terminal but not in foreman.
+Root cause: foreman wasn't telling cross-platform TUIs it does 24-bit color.
+
+- **`term_env` now injects `COLORTERM=truecolor` + `TERM=xterm-256color`**
+  (`src/wm.rs`). Codex gates its truecolor styling (the grey input-box fill) on
+  `COLORTERM`; without it, it falls back to a flat theme. `COLORTERM` is the one
+  that fixed the box (verified by screenshot); `TERM` is the sensible companion.
+- **`Listener` now answers `Event::ColorRequest`** (`src/terminal.rs`). An app
+  can query a terminal's colors (OSC 10 fg / 11 bg / 12 cursor, OSC 4;N palette)
+  to detect a light/dark background and theme itself; foreman was *dropping*
+  those queries (alacritty surfaces them as `ColorRequest`, we ignored the
+  event). `query_color(index)` maps alacritty's color-table index to the RGB we
+  actually paint (`<256` = palette via `indexed_rgb`; 257 = `BG`; else `FG`) and
+  the reply rides the PTY-write path, same as the DSR answer. Two unit tests.
+
+Note: the cwd here is literally `H:\claude code\foreman`, so beware string
+matching — that "claude" lives in the *prompt*, never in the OSC title or a
+color reply, so it doesn't interfere.
+
 ## Key files
 
 - `src/terminal.rs` — `Session`, `show` (render + mouse + cursor), `read_input`
