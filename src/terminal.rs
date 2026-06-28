@@ -16,6 +16,22 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 pub const FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 pub const BG: egui::Color32 = egui::Color32::from_rgb(20, 18, 15);
 
+/// Coarse "some terminal produced output recently" signal for the render loop's
+/// adaptive cadence. Private — poke it only through [`note_pty_output`] /
+/// [`take_pty_output`]. Drives frame scheduling, never correctness.
+static PTY_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reader threads call this after delivering a PTY chunk.
+pub fn note_pty_output() {
+    PTY_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Render loop: whether any terminal produced output since the last call, clearing
+/// the flag so the next idle stretch can fall back to the slow tick.
+pub fn take_pty_output() -> bool {
+    PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 const PALETTE: [egui::Color32; 16] = [
     egui::Color32::from_rgb(43, 40, 36),
     egui::Color32::from_rgb(207, 91, 72),
@@ -193,6 +209,9 @@ pub struct Session {
     // When to send the deferred chat-submit `\r`; fired by pump(). See
     // inject_input for why the submit cannot ride with the paste.
     pending_submit: Option<std::time::Instant>,
+    // Chat input that arrived before `ready`; held here and flushed by pump()
+    // once the startup DSR scan resolves (see inject_input).
+    pending_inject: Vec<String>,
     // Latches true once the startup DSR (`ESC[6n`) has been answered — the
     // point after which injected input is no longer eaten by the device-status
     // scan. Catch-up replay and cursor advance gate on this (chat handshake
@@ -390,6 +409,7 @@ impl Session {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
+                        note_pty_output();
                         ctx.request_repaint();
                     }
                 }
@@ -420,6 +440,7 @@ impl Session {
             sel_head: None,
             pending_note: None,
             pending_submit: None,
+            pending_inject: Vec::new(),
             ready: false,
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
@@ -548,6 +569,12 @@ impl Session {
         if text.is_empty() {
             return;
         }
+        if !self.ready {
+            // Hold the post until the startup DSR scan resolves; a paste sent now
+            // gets swallowed by it. pump() flushes the queue once ready.
+            self.pending_inject.push(text.to_string());
+            return;
+        }
         self.send(&paste_wrap(text));
         self.pending_submit = Some(std::time::Instant::now() + SUBMIT_DELAY);
     }
@@ -604,6 +631,13 @@ impl Session {
             // First device-status reply flushed back = the startup DSR scan is
             // done; input injected from here on reaches the child (see `ready`).
             self.ready = true;
+        }
+        // Now that the scan is done, flush any post that arrived before readiness
+        // (inject_input held it). Ready is true here, so each reaches the child.
+        if self.ready && !self.pending_inject.is_empty() {
+            for text in std::mem::take(&mut self.pending_inject) {
+                self.inject_input(&text);
+            }
         }
         // Deferred chat submit (see inject_input).
         if let Some(due) = self.pending_submit
@@ -1248,10 +1282,54 @@ mod tests {
     }
 
     #[test]
+    fn inject_before_ready_is_queued_then_flushed() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        assert!(!s.ready(), "freshly spawned: not ready");
+        // A post during the startup window must be held, not pasted (a paste now
+        // gets eaten by the DSR scan), so no submit is armed yet.
+        s.inject_input("hello room");
+        assert!(
+            s.pending_submit.is_none(),
+            "injection before ready must not arm the submit"
+        );
+        assert!(
+            !s.pending_inject.is_empty(),
+            "injection before ready must be queued"
+        );
+        // The pump that latches readiness also flushes the held post.
+        let mut flushed = false;
+        for _ in 0..200 {
+            s.pump();
+            if s.ready() && s.pending_inject.is_empty() {
+                flushed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(flushed, "queued post never flushed after becoming ready");
+        assert!(
+            s.pending_submit.is_some(),
+            "flushing the queue arms the deferred submit"
+        );
+    }
+
+    #[test]
     fn inject_input_defers_the_submit_keypress() {
         let ctx = egui::Context::default();
         let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        // Injection now waits for readiness; clear the startup DSR scan first so
+        // this test exercises the submit-defer timing, not the readiness gate.
+        for _ in 0..200 {
+            s.pump();
+            if s.ready() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(s.ready(), "session never became ready");
         s.inject_input("hello");
         assert!(
             s.pending_submit.is_some(),

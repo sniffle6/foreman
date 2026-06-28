@@ -122,7 +122,6 @@ fn tab_drag_off(p: egui::Pos2, scr: egui::Rect) -> bool {
     (p.y - scr.min.y).abs() > TITLE_H * 1.5 || p.x < scr.min.x || p.x > scr.max.x
 }
 
-
 pub enum Content {
     Terminal(Session),
     /// A project window is a sandbox hosting its own nested WindowManager.
@@ -744,7 +743,11 @@ impl WindowManager {
                     .find(|w| w.id == a)
                     .map(|w| w.rect)
                     .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area));
-                let side = if r.width() >= r.height() { Dir::Right } else { Dir::Down };
+                let side = if r.width() >= r.height() {
+                    Dir::Right
+                } else {
+                    Dir::Down
+                };
                 self.tree.insert_split(a, id, side);
             }
             None => self.tree.insert_root(id, Dir::Right),
@@ -2030,7 +2033,10 @@ impl WindowManager {
         if self.tree.contains(id) {
             let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
             let placements = self.tree.layout(local, SNAP_GAP);
-            let Some(from) = placements.iter().find(|(w, _)| *w == id).map(|(_, r)| r.center())
+            let Some(from) = placements
+                .iter()
+                .find(|(w, _)| *w == id)
+                .map(|(_, r)| r.center())
             else {
                 return;
             };
@@ -2141,7 +2147,11 @@ impl WindowManager {
             let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
             match self.tree.hit_leaf(center, local, SNAP_GAP) {
                 Some((leaf, r)) => {
-                    let side = if r.width() >= r.height() { Dir::Right } else { Dir::Down };
+                    let side = if r.width() >= r.height() {
+                        Dir::Right
+                    } else {
+                        Dir::Down
+                    };
                     self.tree.insert_split(leaf, id, side);
                 }
                 None => self.tree.insert_root(id, Dir::Right),
@@ -2421,8 +2431,8 @@ impl WindowManager {
                 // tiled/zoomed) keeps its hints; a drag that started floating is
                 // a pure move unless Shift opts in. Checked live each frame so
                 // pressing/releasing Shift mid-drag lights hints up and down.
-                let snap_ok = self.drag_from_tree == Some(id)
-                    || ui.input(|inp| inp.modifiers.shift);
+                let snap_ok =
+                    self.drag_from_tree == Some(id) || ui.input(|inp| inp.modifiers.shift);
                 let pointer = ui.ctx().pointer_latest_pos();
                 let over_target = if snap_ok {
                     pointer.and_then(|p| self.merge_target_at(id, p, area, &order))
@@ -2444,8 +2454,8 @@ impl WindowManager {
             if dr.drag_stopped() {
                 // Drag origin decides drop rights (Shift overrides for floating
                 // drags). take() clears the flag at end-of-gesture either way.
-                let snap_ok = self.drag_from_tree.take() == Some(id)
-                    || ui.input(|inp| inp.modifiers.shift);
+                let snap_ok =
+                    self.drag_from_tree.take() == Some(id) || ui.input(|inp| inp.modifiers.shift);
                 // Without drop rights the pointer counts as nowhere: no merge, no
                 // tree insert — the floating window simply stays where dropped.
                 let pointer = ui.ctx().pointer_latest_pos().filter(|_| snap_ok);
@@ -3192,7 +3202,13 @@ impl WindowManager {
     /// Deferred window mutations collected during render, applied after the render
     /// borrow on `self.windows` is released so we never remove/retab a window
     /// mid-loop and invalidate the draw order.
-    fn apply_acts(&mut self, acts: Vec<Act>, _asz: egui::Vec2, base: egui::Id, ctx: &egui::Context) {
+    fn apply_acts(
+        &mut self,
+        acts: Vec<Act>,
+        _asz: egui::Vec2,
+        base: egui::Id,
+        ctx: &egui::Context,
+    ) {
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
@@ -5757,6 +5773,9 @@ mod tests {
         assert_eq!(wm.tree.leaves(), vec![b]);
         let local = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
         let p = wm.tree.layout(local, 8.0);
-        assert!((p[0].1.width() - (1000.0 - 16.0)).abs() < 0.5, "b expanded to full inner width");
+        assert!(
+            (p[0].1.width() - (1000.0 - 16.0)).abs() < 0.5,
+            "b expanded to full inner width"
+        );
     }
 }

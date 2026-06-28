@@ -33,6 +33,9 @@ struct App {
     /// written to disk only after a short debounce so a whole scroll gesture
     /// persists once, not once per notch.
     font_dirty_at: Option<std::time::Instant>,
+    /// Last time anything happened (input, PTY output, control msg). Drives the
+    /// adaptive repaint cadence: fast while recently active, slow when idle.
+    last_activity: Option<std::time::Instant>,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -48,6 +51,7 @@ impl App {
             ctrl,
             settings: config::Settings::load(),
             font_dirty_at: None,
+            last_activity: None,
         }
     }
 }
@@ -347,10 +351,12 @@ impl eframe::App for App {
             self.started = true;
         }
 
+        let mut ctrl_activity = false;
         while let Ok(msg) = self.ctrl.try_recv() {
             // Drops server-abandoned requests and undoes orphaned spawns; see
             // WindowManager::handle_ctrl for the reply-timeout contract.
             self.desktop.handle_ctrl(msg, &ctx);
+            ctrl_activity = true;
         }
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -389,10 +395,24 @@ impl eframe::App for App {
 
         self.show_os_chrome(&ctx);
 
-        // Also keeps the control-pipe drain alive: serve() has no Context to
-        // wake us, so dispatch latency rides on this unconditional repaint.
-        // If repainting ever becomes event-driven, hand serve() a Context.
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Adaptive repaint cadence. The real fast paths are all event-driven and
+        // immediate (~0.2ms): reader threads request_repaint() on every PTY chunk,
+        // serve() does the same on every dispatch, and winit wakes us on input.
+        // The timer below is only an idle backstop. Windows' ~15.6ms default timer
+        // granularity floors any request_repaint_after under it, so a tight value
+        // here just means "as soon as the OS allows"; we stay hot for a short tail
+        // after activity, then idle slowly to avoid pinning 60fps across many
+        // terminals.
+        let pty = terminal::take_pty_output();
+        let input = ctx.input(|i| !i.events.is_empty());
+        if pty || input || ctrl_activity {
+            self.last_activity = Some(std::time::Instant::now());
+        }
+        let hot = self
+            .last_activity
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250));
+        let cadence = if hot { 4 } else { 100 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(cadence));
     }
 }
 
@@ -427,7 +447,6 @@ fn main() -> eframe::Result {
     install_panic_logger();
     skills_install::install();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || control::serve(control::PIPE, tx));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -437,6 +456,13 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Foreman",
         opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(rx)))),
+        Box::new(move |cc| {
+            // Spawn the control server here (not before run_native) so it can hold
+            // the egui Context and wake the render loop the instant a dispatch
+            // arrives, rather than waiting on the idle repaint tick.
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
+            Ok(Box::new(App::new(rx)))
+        }),
     )
 }
