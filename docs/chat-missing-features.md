@@ -99,6 +99,12 @@ the drop you were closing).
 Append the log to a per-project file; reload on start; keep seq monotonic across
 restarts.
 
+> **Build plan: `docs/chat-persistence.md`** — designed 2026-06-27 (four-lens
+> debate, converged). Append-only JSONL, one narrow `ChatLog` (no trait),
+> synchronous write-on-post (no writer thread), one-forward-pass reload with
+> torn-tail discard. Read it before building; the seq-vs-Vec-length gotcha is
+> the non-obvious part.
+
 **Why it matters.** The log is an in-memory `Vec` — foreman exit or crash wipes
 it. Every cited `#N` then dangles mid-task, the delivery cursors reset, and a
 searchable/jumpable transcript is worthless if it evaporates on restart. This is
