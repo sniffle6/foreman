@@ -209,6 +209,10 @@ pub struct Session {
     /// per-frame fractions; carrying the remainder keeps gentle scrolls from
     /// rounding to nothing and fast flicks from over-emitting lines.
     scroll_accum: f32,
+    /// Sub-notch remainder of Ctrl+Scroll zooming. Same smoothing problem as
+    /// `scroll_accum`, but accumulated against the zoom notch size so a gentle
+    /// Ctrl+wheel still eventually steps the font and a fast flick doesn't lurch.
+    zoom_accum: f32,
 }
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
@@ -220,8 +224,37 @@ pub struct Session {
 /// still feeling instant.
 const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Smoothed-scroll points that equal one Ctrl+Scroll zoom notch. egui reports a
+/// wheel notch as ~50 points of `smooth_scroll_delta`, so dividing by this gives
+/// roughly one font step per physical notch.
+const ZOOM_NOTCH_PX: f32 = 50.0;
+
 fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// The live global terminal font size, parked in egui's per-context data so every
+/// `Session::show` reads the same value and any pane's Ctrl+Scroll handler can
+/// update it without threading a param through the recursive window managers. The
+/// app seeds it from `settings.json` each frame and reads it back to persist.
+#[derive(Clone, Copy)]
+struct FontSizeState(f32);
+
+fn font_size_id() -> egui::Id {
+    egui::Id::new("foreman::terminal_font_size")
+}
+
+/// Current global terminal font size (points), defaulting before the app seeds it.
+pub fn font_size(ctx: &egui::Context) -> f32 {
+    ctx.data_mut(|d| d.get_temp::<FontSizeState>(font_size_id()))
+        .map(|s| s.0)
+        .unwrap_or(crate::config::DEFAULT_FONT_SIZE)
+}
+
+/// Set the global terminal font size, clamped to the legible range.
+pub fn set_font_size(ctx: &egui::Context, px: f32) {
+    let px = px.clamp(crate::config::MIN_FONT_SIZE, crate::config::MAX_FONT_SIZE);
+    ctx.data_mut(|d| d.insert_temp(font_size_id(), FontSizeState(px)));
 }
 
 /// Bracketed-paste wrapper (`ESC[200~ … ESC[201~`): multi-line text lands in
@@ -391,6 +424,7 @@ impl Session {
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             scroll_accum: 0.0,
+            zoom_accum: 0.0,
         })
     }
 
@@ -647,6 +681,11 @@ impl Session {
             self.term.scroll_display(s);
         }
 
+        // Ctrl+0 resets the global terminal zoom to the default size.
+        if outcome.zoom_reset {
+            set_font_size(ui.ctx(), crate::config::DEFAULT_FONT_SIZE);
+        }
+
         let mut bytes = outcome.pty_bytes;
         // Ctrl+Shift+V: the pure pass can't read the clipboard, so it flags the
         // request and we wrap the text here through the same mode-gated helper.
@@ -694,7 +733,8 @@ impl Session {
         active: bool,
         resp: &egui::Response,
     ) {
-        let font = egui::FontId::monospace(13.0);
+        let font_px = font_size(ui.ctx());
+        let font = egui::FontId::monospace(font_px);
         let probe = ui
             .painter()
             .layout_no_wrap("M".to_string(), font.clone(), FG);
@@ -736,8 +776,21 @@ impl Session {
             // egui delivers a wheel notch as smoothed per-frame fractions. Rounding
             // each frame both drops gentle scrolls (→0) and over-emits fast ones, so
             // accumulate the sub-line remainder and emit only whole lines.
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
-            if dy != 0.0 {
+            let (dy, ctrl) =
+                ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl || i.modifiers.command));
+            if ctrl && dy != 0.0 {
+                // Ctrl+Scroll zooms the GLOBAL terminal font instead of scrolling.
+                // Accumulate against the notch size (same smoothing as line scroll)
+                // and step whole notches; the wheel is fully consumed here so it
+                // neither moves scrollback nor reaches the app.
+                self.zoom_accum += dy / ZOOM_NOTCH_PX;
+                let steps = self.zoom_accum.trunc();
+                self.zoom_accum -= steps;
+                if steps != 0.0 {
+                    let next = crate::input::zoom_step(font_size(ui.ctx()), steps);
+                    set_font_size(ui.ctx(), next);
+                }
+            } else if dy != 0.0 {
                 self.scroll_accum += dy / rh;
                 let lines = self.scroll_accum.trunc() as i32;
                 self.scroll_accum -= lines as f32;
@@ -821,7 +874,7 @@ impl Session {
                     run,
                     0.0,
                     egui::TextFormat {
-                        font_id: egui::FontId::monospace(13.0),
+                        font_id: egui::FontId::monospace(font_px),
                         color: st.fg,
                         background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
                         underline: line(st.underline),

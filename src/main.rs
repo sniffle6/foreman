@@ -1,5 +1,6 @@
 mod caret;
 mod chat;
+mod config;
 mod control;
 mod dirpicker;
 mod input;
@@ -24,7 +25,19 @@ struct App {
     chrome_hot_since: Option<f64>,
     /// Agent-dispatch requests from the control pipe thread.
     ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
+    /// Persisted app settings (terminal font size today). Seeded into egui's
+    /// per-context data each frame and read back to capture Ctrl+Scroll/Ctrl+0
+    /// zoom changes any pane made.
+    settings: config::Settings,
+    /// Set when the live font size diverged from `settings`; the change is
+    /// written to disk only after a short debounce so a whole scroll gesture
+    /// persists once, not once per notch.
+    font_dirty_at: Option<std::time::Instant>,
 }
+
+/// Wait this long after the last zoom change before writing `settings.json`.
+const FONT_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+
 impl App {
     fn new(ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>) -> Self {
         Self {
@@ -33,6 +46,8 @@ impl App {
             chrome_open: false,
             chrome_hot_since: None,
             ctrl,
+            settings: config::Settings::load(),
+            font_dirty_at: None,
         }
     }
 }
@@ -316,6 +331,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.started {
+            // Opt out of egui's built-in zoom so the terminal owns Ctrl+Scroll
+            // and Ctrl+0: otherwise egui diverts Ctrl+wheel into a whole-UI zoom
+            // (zeroing `smooth_scroll_delta`, so our handler sees nothing) and
+            // consumes Ctrl+0/Ctrl+± to scale all chrome. We want only the
+            // terminal *text* to resize, handled in `terminal.rs`.
+            ctx.options_mut(|o| {
+                o.zoom_with_keyboard = false;
+                o.input_options.zoom_modifier = egui::Modifiers::NONE;
+            });
             // Desktop hosts project windows; each project is its own sandbox.
             let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
@@ -336,7 +360,24 @@ impl eframe::App for App {
             // window edge; keep the desktop inside it, not under it.
             area = area.shrink(APP_BORDER_W);
         }
+        // Make the persisted font size the live value every pane reads this frame.
+        terminal::set_font_size(&ctx, self.settings.font_size);
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
+        // persist it after a debounce so a scroll gesture writes the file once.
+        let live = terminal::font_size(&ctx);
+        if live != self.settings.font_size {
+            self.settings.font_size = live;
+            self.font_dirty_at = Some(std::time::Instant::now());
+        }
+        if let Some(t) = self.font_dirty_at {
+            if t.elapsed() >= FONT_SAVE_DEBOUNCE {
+                if let Err(e) = self.settings.save() {
+                    eprintln!("foreman: could not save settings: {e}");
+                }
+                self.font_dirty_at = None;
+            }
+        }
         // Deliver chat now that every Session has pumped this frame: the room
         // reconciles presence and injects each ready member's missed posts (a
         // just-spawned member that wasn't ready when a post arrived gets it on

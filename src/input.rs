@@ -27,6 +27,9 @@ pub struct InputOutcome {
     /// Ctrl+Shift+V — the pure pass can't read the clipboard, so it flags the
     /// request; the shell reads it and wraps through `paste_seq`.
     pub paste_clipboard: bool,
+    /// Ctrl+0 — reset the global terminal font size to the default. The shell
+    /// applies it to the shared zoom value; nothing is sent to the PTY.
+    pub zoom_reset: bool,
 }
 
 /// Decide what this frame's egui events mean for the terminal. Pure: real
@@ -89,6 +92,12 @@ pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> I
                             continue;
                         }
                         (Key::X, _) => continue, // cut handled via Event::Cut
+                        // Ctrl+0: reset the global terminal zoom. Consumed here so
+                        // the shell never sees a stray NUL.
+                        (Key::Num0, false) => {
+                            out.zoom_reset = true;
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -116,6 +125,14 @@ pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> I
         out.copy = true; // copy_clears stays false — Ctrl+Shift+C keeps the selection
     }
     out
+}
+
+/// Ctrl+Scroll zoom step: move the terminal font size by `steps` whole wheel
+/// notches (sign = direction) and clamp to the legible range. Pure: same inputs →
+/// same size, so the clamp behavior is a unit test.
+pub fn zoom_step(cur: f32, steps: f32) -> f32 {
+    (cur + steps * crate::config::FONT_ZOOM_STEP)
+        .clamp(crate::config::MIN_FONT_SIZE, crate::config::MAX_FONT_SIZE)
 }
 
 /// Bracketed-paste wrap, gated on the app actually enabling it. ESC is always
@@ -471,6 +488,29 @@ mod tests {
         let out = process_input(&[key_ev(Key::PageUp, mods(false, false, true))], TermMode::empty(), false);
         assert!(matches!(out.scroll, Some(Scroll::PageUp)));
         assert!(out.pty_bytes.is_empty());
+    }
+
+    // ---- zoom ----------------------------------------------------------------
+    #[test]
+    fn ctrl_0_requests_zoom_reset_and_sends_nothing() {
+        let out = process_input(&[key_ev(Key::Num0, mods(true, false, false))], TermMode::empty(), false);
+        assert!(out.zoom_reset);
+        assert!(out.pty_bytes.is_empty());
+    }
+    #[test]
+    fn plain_0_types_through_without_reset() {
+        let out = process_input(&[key_ev(Key::Num0, none())], TermMode::empty(), false);
+        assert!(!out.zoom_reset);
+    }
+    #[test]
+    fn zoom_step_moves_by_whole_notches() {
+        assert_eq!(zoom_step(13.0, 1.0), 13.0 + crate::config::FONT_ZOOM_STEP);
+        assert_eq!(zoom_step(13.0, -2.0), 13.0 - 2.0 * crate::config::FONT_ZOOM_STEP);
+    }
+    #[test]
+    fn zoom_step_clamps_to_bounds() {
+        assert_eq!(zoom_step(crate::config::MIN_FONT_SIZE, -100.0), crate::config::MIN_FONT_SIZE);
+        assert_eq!(zoom_step(crate::config::MAX_FONT_SIZE, 100.0), crate::config::MAX_FONT_SIZE);
     }
 
     // ---- wheel_input ---------------------------------------------------------
