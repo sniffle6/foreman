@@ -25,6 +25,10 @@ The GUI can't be seen from the terminal — to verify visually, run the exe and
 screenshot the window, then `Read` the PNG. Full screenshot script is in
 `docs/HANDOFF.md` § 3.
 
+ Executables are built to `target/debug/foreman.exe` (debug) or `target/release/foreman.exe` (release).
+Unit tests cover layout tree, window manager, and chat model (integration tests need the GUI). Run
+`cargo test` or test individual modules with `cargo test --lib layout` / `::wm` / `::chat`.
+
 ## Gotchas (these already cost hours — do not rediscover)
 
 - **GNU toolchain, not MSVC:** `rustup default stable-gnu`.
@@ -105,3 +109,11 @@ Subsystem docs: `docs/tiling-tree.md` (two-state windows + layout tree),
 - Verify by building + screenshotting — don't claim it works without evidence.
 - Don't needlessly hijack the user's mouse/keyboard to test.
 - Commit only when asked.
+
+## Session Context
+
+**Memory system:** This project uses persistent memory at `C:\Users\sniff\.claude\projects\H--claude-code-foreman\memory\`.
+Session knowledge persists across conversations — check MEMORY.md in that directory to see what's been recorded.
+
+**Active work:** Currently working on `feat/browser-style-tabs` branch. See `docs/epics/window-tabbing-split-epic.md`
+for the full epic context. This branch targets full tab-stack integration across projects and terminals.
