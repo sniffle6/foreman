@@ -947,9 +947,8 @@ impl WindowManager {
                             // advance_settles drains once the terminal quiets
                             // (cross-frame so the GUI never blocks).
                             let now = std::time::Instant::now();
-                            let quiet_window = std::time::Duration::from_millis(
-                                settle.min(MAX_SETTLE_MS),
-                            );
+                            let quiet_window =
+                                std::time::Duration::from_millis(settle.min(MAX_SETTLE_MS));
                             let cur_gen = self.session_gen(pid, tid).unwrap_or(0);
                             self.pending_settles.push(PendingSettle {
                                 pid,
@@ -957,8 +956,7 @@ impl WindowManager {
                                 reply,
                                 last_gen: cur_gen,
                                 quiet_since: now,
-                                deadline: now
-                                    + std::time::Duration::from_millis(MAX_SETTLE_MS),
+                                deadline: now + std::time::Duration::from_millis(MAX_SETTLE_MS),
                                 quiet_window,
                             });
                         }
@@ -1226,7 +1224,11 @@ impl WindowManager {
             }
         };
         // Mutable pass: take the borrow with the known index.
-        let win = self.windows.iter_mut().find(|w| w.id == pid).expect("resolved");
+        let win = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == pid)
+            .expect("resolved");
         let Content::Project(child) = &mut win.tabs[win.active].content else {
             return Err("not a project".into());
         };
@@ -1322,7 +1324,11 @@ impl WindowManager {
             let Content::Project(child) = &win.tabs[win.active].content else {
                 return Err("not a project".into());
             };
-            let tw = child.windows.iter().find(|w| w.id == tid).expect("resolved");
+            let tw = child
+                .windows
+                .iter()
+                .find(|w| w.id == tid)
+                .expect("resolved");
             let active = tw.active;
             let idx = if matches!(tw.tabs[active].content, Content::Terminal(_)) {
                 active
@@ -1361,7 +1367,10 @@ impl WindowManager {
         ),
         String,
     > {
-        let terminal = req.terminal.as_deref().ok_or("snapshot: missing terminal")?;
+        let terminal = req
+            .terminal
+            .as_deref()
+            .ok_or("snapshot: missing terminal")?;
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
         let session = self.session_mut(pid, tid)?;
         // Each accessor pumps; calling them in sequence on the one &mut borrow is
@@ -1536,9 +1545,9 @@ impl WindowManager {
         // The sender must be a live terminal (history reads are anonymous, but
         // a post names its origin). Resolve by stable Member id.
         let exists = self.windows.iter().any(|w| {
-            w.tabs.iter().any(|t| {
-                matches!(&t.content, Content::Terminal(s) if term_tag(s.term_id()) == from)
-            })
+            w.tabs.iter().any(
+                |t| matches!(&t.content, Content::Terminal(s) if term_tag(s.term_id()) == from),
+            )
         });
         if !exists {
             return Err(format!("no such terminal: {from}"));
@@ -2365,6 +2374,40 @@ impl WindowManager {
                 }
             }
             let mut scr = self.windows[i].rect.translate(area.min.to_vec2());
+
+            // A lone, tiled, single-tab non-project window draws no chrome of its
+            // own: the parent frame is its only frame (tmux-style sole pane). Its
+            // content fills the whole area — no titlebar, controls, or border — and
+            // it can't be dragged or torn out (there is nothing to tear it from).
+            // This is what lets a project's tab/header flow straight into a single
+            // terminal with no redundant inner frame between them.
+            let bare = is_tiled
+                && self.windows.len() == 1
+                && self.windows[i].tabs.len() == 1
+                && !is_project;
+            if bare {
+                ui.painter_at(scr.intersect(area)).rect_filled(
+                    scr,
+                    egui::CornerRadius::ZERO,
+                    WIN_BG,
+                );
+                let cresp = ui.interact(
+                    scr,
+                    base.with((id, "content")),
+                    egui::Sense::click_and_drag(),
+                );
+                if cresp.clicked() {
+                    acts.push(Act::Focus(id));
+                }
+                let child_interacted = self.windows[i]
+                    .active_content()
+                    .show(ui, scr, is_focus, base, id, &cresp);
+                if child_interacted {
+                    acts.push(Act::Focus(id));
+                }
+                continue;
+            }
+
             // Projects reserve extra right-side room for the "+" new-project button.
             let ctl_w = if is_project { 141.0 } else { 113.0 };
 
@@ -2607,7 +2650,11 @@ impl WindowManager {
                         .x
                         .min(120.0);
                     let close_w = 16.0;
-                    let icon_w = if icon.is_some() { icon_disp + icon_gap } else { 0.0 };
+                    let icon_w = if icon.is_some() {
+                        icon_disp + icon_gap
+                    } else {
+                        0.0
+                    };
                     let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
                     if cx + chip_w > avail_end && ti > 0 {
                         // Out of room: stop drawing further chips (rare; many tabs on
@@ -2622,8 +2669,14 @@ impl WindowManager {
                         base.with((id, "tab", ti)),
                         egui::Sense::click_and_drag(),
                     );
+                    // Active tab matches the content directly below it so the chip
+                    // reads as joined to that area (classic browser tabs). Both
+                    // terminal tabs and project tabs flow into terminal content (a
+                    // lone subwindow renders bare, so the project's content top *is*
+                    // the terminal). Inactive tabs sit lighter (hover lighter still)
+                    // for an obvious active/inactive contrast.
                     let bg = if is_active_tab {
-                        if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }
+                        crate::terminal::BG
                     } else if chip_resp.hovered() {
                         egui::Color32::from_rgb(50, 45, 35)
                     } else {
@@ -2631,27 +2684,44 @@ impl WindowManager {
                     };
                     // Rounded on top, flat on the bottom so the active tab reads as
                     // joined to the content area below it (classic browser tabs).
-                    let radius = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                    let radius = egui::CornerRadius {
+                        nw: 6,
+                        ne: 6,
+                        sw: 0,
+                        se: 0,
+                    };
                     p.rect_filled(chip, radius, bg);
-                    if is_active_tab {
+                    // Project tabs get the focus-amber selection border (the same
+                    // colour as a focused subwindow's border) on three sides only —
+                    // the bottom edge is left open so the tab's colour flows straight
+                    // into the content below it. Terminal tabs need no border; their
+                    // bg-match into the content reads on its own.
+                    if is_active_tab && is_project {
+                        let tab_border = if is_focus { BORDER_FOCUS } else { BORDER };
                         p.rect_stroke(
                             chip,
                             radius,
-                            egui::Stroke::new(1.0, BORDER_FOCUS),
+                            egui::Stroke::new(BORDER_W, tab_border),
                             egui::StrokeKind::Inside,
                         );
+                        // Paint over the bottom edge with the tab bg, leaving an open
+                        // bottom so the colour continues into the header beneath.
+                        let open = egui::Rect::from_min_max(
+                            egui::pos2(chip.min.x, chip.max.y - 1.0),
+                            egui::pos2(chip.max.x, chip.max.y),
+                        );
+                        p.rect_filled(open, egui::CornerRadius::ZERO, bg);
                     }
-                    let txt_col = if is_active_tab && is_focus { TEXT } else { DIM };
+                    let txt_col = if is_active_tab { TEXT } else { DIM };
                     // Leading icon: agent logo / shell glyph / project folder.
                     let mut label_x = cx + left_pad;
                     if let Some(kind) = icon {
-                        let center =
-                            egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
+                        let center = egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
                         let icon_rect =
                             egui::Rect::from_center_size(center, egui::vec2(icon_disp, icon_disp));
                         let px = (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
-                        let tint = if is_active_tab && is_focus {
+                        let tint = if is_active_tab {
                             kind.tint()
                         } else {
                             kind.tint().gamma_multiply(0.55)
@@ -2679,8 +2749,7 @@ impl WindowManager {
                         egui::vec2(close_w, chip_h),
                     );
                     let xresp = if show_x {
-                        let r =
-                            ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
+                        let r = ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
                         let xc = xr.center();
                         let xs = 3.0;
                         let xcol = if r.hovered() {
@@ -2690,11 +2759,17 @@ impl WindowManager {
                         };
                         let xstroke = egui::Stroke::new(1.2, xcol);
                         p.line_segment(
-                            [egui::pos2(xc.x - xs, xc.y - xs), egui::pos2(xc.x + xs, xc.y + xs)],
+                            [
+                                egui::pos2(xc.x - xs, xc.y - xs),
+                                egui::pos2(xc.x + xs, xc.y + xs),
+                            ],
                             xstroke,
                         );
                         p.line_segment(
-                            [egui::pos2(xc.x - xs, xc.y + xs), egui::pos2(xc.x + xs, xc.y - xs)],
+                            [
+                                egui::pos2(xc.x - xs, xc.y + xs),
+                                egui::pos2(xc.x + xs, xc.y - xs),
+                            ],
                             xstroke,
                         );
                         Some(r)
@@ -2755,7 +2830,9 @@ impl WindowManager {
                 // Leading icon, mirroring the tab chips so a single-window header
                 // reads consistently (agent logo / shell glyph / project folder).
                 let mut tx = scr.min.x + 11.0;
-                if let Some(kind) = self.windows[i].tabs[self.windows[i].active].content.icon_kind()
+                if let Some(kind) = self.windows[i].tabs[self.windows[i].active]
+                    .content
+                    .icon_kind()
                 {
                     let disp = 14.0_f32;
                     let icon_rect = egui::Rect::from_center_size(
@@ -4132,13 +4209,14 @@ mod tests {
             .unwrap();
         // exactly one Joined sysline for this member, carrying its name.
         assert_eq!(sys_lines(&wm, &term_tag(t), "joined"), 1);
-        assert!(wm
-            .chat
-            .borrow()
-            .blocks(0, true)
-            .iter()
-            .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
-                if s.contains(&format!("worker A ({}) joined", term_tag(t))))));
+        assert!(
+            wm.chat
+                .borrow()
+                .blocks(0, true)
+                .iter()
+                .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
+                if s.contains(&format!("worker A ({}) joined", term_tag(t)))))
+        );
     }
 
     #[test]
@@ -4205,10 +4283,7 @@ mod tests {
             if s.exited().is_some() {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child never exited"
-            );
+            assert!(std::time::Instant::now() < deadline, "child never exited");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // chat_tick's presence reconcile emits the Exited line now. Keep the
@@ -4222,13 +4297,14 @@ mod tests {
         // exactly one Exited line — the member's — and none for the non-member.
         assert_eq!(sys_lines(&wm, &term_tag(member), "exited"), 1);
         assert_eq!(sys_lines(&wm, &term_tag(outsider), "exited"), 0);
-        assert!(wm
-            .chat
-            .borrow()
-            .blocks(0, true)
-            .iter()
-            .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
-                if s.contains(&format!("worker A ({}) exited", term_tag(member))))));
+        assert!(
+            wm.chat
+                .borrow()
+                .blocks(0, true)
+                .iter()
+                .any(|b| matches!(b, crate::chat::ChatBlock::Sys(s)
+                if s.contains(&format!("worker A ({}) exited", term_tag(member)))))
+        );
     }
 
     #[test]
@@ -4478,7 +4554,11 @@ mod tests {
             }
         }
         wm.drain_chat_posts();
-        assert_eq!(wm.chat.borrow().last_seq(), 0, "blank input appends nothing");
+        assert_eq!(
+            wm.chat.borrow().last_seq(),
+            0,
+            "blank input appends nothing"
+        );
     }
 
     #[test]
@@ -4531,14 +4611,18 @@ mod tests {
         let room = Rc::new(RefCell::new(crate::chat::ChatRoom::new()));
         // join t1 (Joined is #1), then a backlog post (#2) before the view opens.
         room.borrow_mut().join("t1", "a");
-        room.borrow_mut().post("t1", "before-open", &[], None).unwrap();
+        room.borrow_mut()
+            .post("t1", "before-open", &[], None)
+            .unwrap();
         let mut v = crate::chat::ChatView::new(Rc::clone(&room));
         assert_eq!(
             v.last_seen, 2,
             "creation watermark = current tail (backlog pre-dates the window open)"
         );
         v.on_frame(true); // focused
-        room.borrow_mut().post("t1", "while-focused", &[], None).unwrap(); // #3
+        room.borrow_mut()
+            .post("t1", "while-focused", &[], None)
+            .unwrap(); // #3
         v.on_frame(true);
         assert_eq!(v.last_seen, 2, "watermark holds while focused");
         v.on_frame(false); // focus left
@@ -4546,7 +4630,9 @@ mod tests {
             v.last_seen, 3,
             "watermark catches up on the focus-loss edge"
         );
-        room.borrow_mut().post("t1", "while-unfocused", &[], None).unwrap(); // #4
+        room.borrow_mut()
+            .post("t1", "while-unfocused", &[], None)
+            .unwrap(); // #4
         v.on_frame(false);
         assert_eq!(
             v.last_seen, 3,
@@ -5250,7 +5336,9 @@ mod tests {
         // Advance past the MAX_SETTLE_MS deadline → the settle fires.
         let future = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         d.advance_settles(future);
-        let r = rrx.try_recv().expect("settle must reply once the deadline passes");
+        let r = rrx
+            .try_recv()
+            .expect("settle must reply once the deadline passes");
         assert!(r.ok, "{:?}", r.error);
     }
 
@@ -5585,7 +5673,8 @@ mod tests {
         }
         // member bystander + sender saw nothing (kept pumped so a wrongful
         // injection would surface), and a pure @you post delivers to nobody
-        wm.chat_post(&term_tag(sender), "@you go", &[], None).unwrap();
+        wm.chat_post(&term_tag(sender), "@you go", &[], None)
+            .unwrap();
         let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
         while std::time::Instant::now() < grace {
             for w in wm.windows.iter_mut() {
@@ -5631,7 +5720,12 @@ mod tests {
 
         // unknown id — names it; one bad target fails a multi-target post entirely
         let e = wm
-            .chat_post(&term_tag(sender), "go", &[term_tag(member), "t99".into()], None)
+            .chat_post(
+                &term_tag(sender),
+                "go",
+                &[term_tag(member), "t99".into()],
+                None,
+            )
             .unwrap_err();
         assert!(e.contains("unknown member t99"), "{e}");
         // self-mention (the room rejects targeting yourself)
@@ -5643,11 +5737,16 @@ mod tests {
         let e = wm
             .chat_post(&term_tag(sender), "go", &[term_tag(outsider)], None)
             .unwrap_err();
-        assert!(e.contains(&format!("unknown member {}", term_tag(outsider))), "{e}");
+        assert!(
+            e.contains(&format!("unknown member {}", term_tag(outsider))),
+            "{e}"
+        );
         // nothing appended by any failed post
         assert_eq!(wm.chat.borrow().last_seq(), seq_before);
         // inline mentions count too: a leading @ with a bad id fails the post
-        let e = wm.chat_post(&term_tag(sender), "@t99 go", &[], None).unwrap_err();
+        let e = wm
+            .chat_post(&term_tag(sender), "@t99 go", &[], None)
+            .unwrap_err();
         assert!(e.contains("unknown member t99"), "{e}");
     }
 

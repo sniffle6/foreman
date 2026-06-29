@@ -110,7 +110,9 @@ pub fn cursor_info<L: EventListener>(term: &Term<L>) -> CursorInfo {
 
 /// Does any row of the rendered viewport contain `pattern` (substring)?
 pub fn grid_contains<L: EventListener>(term: &Term<L>, pattern: &str) -> bool {
-    snapshot_text(term, None).iter().any(|l| l.contains(pattern))
+    snapshot_text(term, None)
+        .iter()
+        .any(|l| l.contains(pattern))
 }
 
 /// Per-cell attribute snapshot for the `--attrs` opt-in. Walks the grid exactly
@@ -172,10 +174,32 @@ pub fn snapshot_cells<L: EventListener>(
 fn letter_key(c: char) -> Option<egui::Key> {
     use egui::Key::*;
     Some(match c.to_ascii_uppercase() {
-        'A' => A, 'B' => B, 'C' => C, 'D' => D, 'E' => E, 'F' => F, 'G' => G,
-        'H' => H, 'I' => I, 'J' => J, 'K' => K, 'L' => L, 'M' => M, 'N' => N,
-        'O' => O, 'P' => P, 'Q' => Q, 'R' => R, 'S' => S, 'T' => T, 'U' => U,
-        'V' => V, 'W' => W, 'X' => X, 'Y' => Y, 'Z' => Z,
+        'A' => A,
+        'B' => B,
+        'C' => C,
+        'D' => D,
+        'E' => E,
+        'F' => F,
+        'G' => G,
+        'H' => H,
+        'I' => I,
+        'J' => J,
+        'K' => K,
+        'L' => L,
+        'M' => M,
+        'N' => N,
+        'O' => O,
+        'P' => P,
+        'Q' => Q,
+        'R' => R,
+        'S' => S,
+        'T' => T,
+        'U' => U,
+        'V' => V,
+        'W' => W,
+        'X' => X,
+        'Y' => Y,
+        'Z' => Z,
         _ => return None,
     })
 }
@@ -199,8 +223,18 @@ fn key_from_name(name: &str) -> Option<egui::Key> {
         "PageDown" => PageDown,
         "Insert" | "Ins" => Insert,
         "Delete" | "Del" => Delete,
-        "F1" => F1, "F2" => F2, "F3" => F3, "F4" => F4, "F5" => F5, "F6" => F6,
-        "F7" => F7, "F8" => F8, "F9" => F9, "F10" => F10, "F11" => F11, "F12" => F12,
+        "F1" => F1,
+        "F2" => F2,
+        "F3" => F3,
+        "F4" => F4,
+        "F5" => F5,
+        "F6" => F6,
+        "F7" => F7,
+        "F8" => F8,
+        "F9" => F9,
+        "F10" => F10,
+        "F11" => F11,
+        "F12" => F12,
         _ if name.chars().count() == 1 => return letter_key(name.chars().next().unwrap()),
         _ => return None,
     })
@@ -305,7 +339,15 @@ mod tests {
     fn snapshot_text_region_clamps_without_panic() {
         let term = term_with(b"row0\r\nrow1", 20, 3);
         // a region larger than the grid must clamp, not panic
-        let rows = snapshot_text(&term, Some(Region { row: 0, col: 0, rows: 99, cols: 99 }));
+        let rows = snapshot_text(
+            &term,
+            Some(Region {
+                row: 0,
+                col: 0,
+                rows: 99,
+                cols: 99,
+            }),
+        );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], "row0");
     }
@@ -350,7 +392,15 @@ mod tests {
     #[test]
     fn snapshot_cells_region_clamps_without_panic() {
         let term = term_with(b"hi", 20, 3);
-        let grid = snapshot_cells(&term, Some(Region { row: 0, col: 0, rows: 99, cols: 99 }));
+        let grid = snapshot_cells(
+            &term,
+            Some(Region {
+                row: 0,
+                col: 0,
+                rows: 99,
+                cols: 99,
+            }),
+        );
         assert_eq!(grid.len(), 3);
         assert_eq!(grid[0][0].ch, 'h');
     }
@@ -401,7 +451,10 @@ mod tests {
 
     #[test]
     fn parse_keys_honors_app_cursor_mode() {
-        assert_eq!(parse_keys(&[s("Up")], TermMode::APP_CURSOR).unwrap(), b"\x1bOA");
+        assert_eq!(
+            parse_keys(&[s("Up")], TermMode::APP_CURSOR).unwrap(),
+            b"\x1bOA"
+        );
     }
 
     #[test]

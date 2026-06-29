@@ -8,7 +8,7 @@
 //! append-only chat log in `docs/chat-persistence.md` is a *different* problem —
 //! a growing event log, not a settings bag — and intentionally does not use this.)
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 
 /// Default terminal text size, in egui points. The size every pane starts at and
@@ -72,9 +72,8 @@ pub fn load_json<T: DeserializeOwned + Default>(file: &str) -> T {
 /// intact (a bare `write` could truncate it). Errors are returned, never panicked,
 /// so the caller can surface them.
 pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
-    let dir = config_dir().ok_or_else(|| {
-        "APPDATA is not set; cannot locate the config directory".to_string()
-    })?;
+    let dir = config_dir()
+        .ok_or_else(|| "APPDATA is not set; cannot locate the config directory".to_string())?;
     let path = dir.join(file);
     let tmp = dir.join(format!("{file}.tmp"));
     let json = serde_json::to_string_pretty(value)

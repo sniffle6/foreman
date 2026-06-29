@@ -41,11 +41,11 @@ impl IconKind {
     pub fn tint(self) -> egui::Color32 {
         match self {
             IconKind::Claude => egui::Color32::from_rgb(217, 119, 87), // Claude clay
-            IconKind::Codex => egui::Color32::from_rgb(236, 236, 236),  // near-white
+            IconKind::Codex => egui::Color32::from_rgb(236, 236, 236), // near-white
             IconKind::PowerShell => egui::Color32::from_rgb(83, 145, 254), // PS blue
-            IconKind::Cmd => egui::Color32::from_rgb(206, 206, 206),     // console gray
-            IconKind::Bash => egui::Color32::from_rgb(106, 190, 48),     // bash green
-            IconKind::Folder => egui::Color32::from_rgb(220, 180, 110),  // folder amber
+            IconKind::Cmd => egui::Color32::from_rgb(206, 206, 206),   // console gray
+            IconKind::Bash => egui::Color32::from_rgb(106, 190, 48),   // bash green
+            IconKind::Folder => egui::Color32::from_rgb(220, 180, 110), // folder amber
         }
     }
 
@@ -174,12 +174,18 @@ mod tests {
 
     #[test]
     fn argv_detection_matches_known_agents() {
-        assert_eq!(IconKind::from_argv(&["claude".into()]), Some(IconKind::Claude));
+        assert_eq!(
+            IconKind::from_argv(&["claude".into()]),
+            Some(IconKind::Claude)
+        );
         assert_eq!(
             IconKind::from_argv(&["npx".into(), "@anthropic-ai/claude-code".into()]),
             Some(IconKind::Claude)
         );
-        assert_eq!(IconKind::from_argv(&["codex".into()]), Some(IconKind::Codex));
+        assert_eq!(
+            IconKind::from_argv(&["codex".into()]),
+            Some(IconKind::Codex)
+        );
         assert_eq!(IconKind::from_argv(&["powershell.exe".into()]), None);
     }
 

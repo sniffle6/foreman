@@ -227,7 +227,10 @@ mod tests {
     fn settled_at(line: i32, col: usize, t0: Instant) -> CaretGate {
         let mut g = CaretGate::new(t0);
         g.observe(model(line, col), t0);
-        let d = g.observe(model(line, col), t0 + ms(CURSOR_SETTLE.as_millis() as u64 + 10));
+        let d = g.observe(
+            model(line, col),
+            t0 + ms(CURSOR_SETTLE.as_millis() as u64 + 10),
+        );
         assert_eq!(d, at(line, col), "gate should settle at start cell");
         g
     }

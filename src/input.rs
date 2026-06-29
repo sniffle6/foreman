@@ -50,7 +50,12 @@ pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> I
             }
             // egui may deliver Ctrl+C / Ctrl+X as these instead of Key events.
             Event::Copy | Event::Cut => copy_or_interrupt = true,
-            Event::Key { key, pressed: true, modifiers, .. } => {
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
                 let m = *modifiers;
                 let k = *key;
                 let ctrl = m.ctrl || m.command;
@@ -327,13 +332,25 @@ mod tests {
     use super::*;
 
     fn mods(ctrl: bool, alt: bool, shift: bool) -> Modifiers {
-        Modifiers { alt, ctrl, shift, mac_cmd: false, command: false }
+        Modifiers {
+            alt,
+            ctrl,
+            shift,
+            mac_cmd: false,
+            command: false,
+        }
     }
     fn none() -> Modifiers {
         mods(false, false, false)
     }
     fn key_ev(key: Key, modifiers: Modifiers) -> Event {
-        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
     }
 
     // ---- mods_param ----------------------------------------------------------
@@ -352,25 +369,40 @@ mod tests {
     // ---- encode_key: cursor keys + DECCKM ------------------------------------
     #[test]
     fn arrow_up_plain_is_csi() {
-        assert_eq!(encode_key(Key::ArrowUp, none(), TermMode::empty()), b"\x1b[A");
+        assert_eq!(
+            encode_key(Key::ArrowUp, none(), TermMode::empty()),
+            b"\x1b[A"
+        );
     }
     #[test]
     fn arrow_up_in_app_cursor_mode_is_ss3() {
-        assert_eq!(encode_key(Key::ArrowUp, none(), TermMode::APP_CURSOR), b"\x1bOA");
+        assert_eq!(
+            encode_key(Key::ArrowUp, none(), TermMode::APP_CURSOR),
+            b"\x1bOA"
+        );
     }
     #[test]
     fn ctrl_arrow_right_uses_modifier_param() {
-        assert_eq!(encode_key(Key::ArrowRight, mods(true, false, false), TermMode::empty()), b"\x1b[1;5C");
+        assert_eq!(
+            encode_key(Key::ArrowRight, mods(true, false, false), TermMode::empty()),
+            b"\x1b[1;5C"
+        );
     }
     #[test]
     fn modified_arrow_is_csi_even_in_app_cursor_mode() {
         // DECCKM only affects the UNMODIFIED form.
-        assert_eq!(encode_key(Key::ArrowUp, mods(true, false, false), TermMode::APP_CURSOR), b"\x1b[1;5A");
+        assert_eq!(
+            encode_key(Key::ArrowUp, mods(true, false, false), TermMode::APP_CURSOR),
+            b"\x1b[1;5A"
+        );
     }
     #[test]
     fn home_end_follow_decckm() {
         assert_eq!(encode_key(Key::Home, none(), TermMode::empty()), b"\x1b[H");
-        assert_eq!(encode_key(Key::Home, none(), TermMode::APP_CURSOR), b"\x1bOH");
+        assert_eq!(
+            encode_key(Key::Home, none(), TermMode::APP_CURSOR),
+            b"\x1bOH"
+        );
         assert_eq!(encode_key(Key::End, none(), TermMode::empty()), b"\x1b[F");
     }
 
@@ -387,38 +419,74 @@ mod tests {
     }
     #[test]
     fn shift_f5_carries_the_modifier_param() {
-        assert_eq!(encode_key(Key::F5, mods(false, false, true), TermMode::empty()), b"\x1b[15;2~");
+        assert_eq!(
+            encode_key(Key::F5, mods(false, false, true), TermMode::empty()),
+            b"\x1b[15;2~"
+        );
     }
     #[test]
     fn delete_and_insert_and_page_keys() {
-        assert_eq!(encode_key(Key::Delete, none(), TermMode::empty()), b"\x1b[3~");
-        assert_eq!(encode_key(Key::Insert, none(), TermMode::empty()), b"\x1b[2~");
-        assert_eq!(encode_key(Key::PageUp, none(), TermMode::empty()), b"\x1b[5~");
-        assert_eq!(encode_key(Key::PageDown, none(), TermMode::empty()), b"\x1b[6~");
+        assert_eq!(
+            encode_key(Key::Delete, none(), TermMode::empty()),
+            b"\x1b[3~"
+        );
+        assert_eq!(
+            encode_key(Key::Insert, none(), TermMode::empty()),
+            b"\x1b[2~"
+        );
+        assert_eq!(
+            encode_key(Key::PageUp, none(), TermMode::empty()),
+            b"\x1b[5~"
+        );
+        assert_eq!(
+            encode_key(Key::PageDown, none(), TermMode::empty()),
+            b"\x1b[6~"
+        );
     }
 
     // ---- encode_key: control codes, meta, plain keys -------------------------
     #[test]
     fn ctrl_letter_is_a_control_code() {
-        assert_eq!(encode_key(Key::A, mods(true, false, false), TermMode::empty()), vec![0x01]);
+        assert_eq!(
+            encode_key(Key::A, mods(true, false, false), TermMode::empty()),
+            vec![0x01]
+        );
     }
     #[test]
     fn alt_letter_is_meta_esc_prefixed() {
-        assert_eq!(encode_key(Key::B, mods(false, true, false), TermMode::empty()), vec![0x1b, b'b']);
-        assert_eq!(encode_key(Key::B, mods(false, true, true), TermMode::empty()), vec![0x1b, b'B']);
+        assert_eq!(
+            encode_key(Key::B, mods(false, true, false), TermMode::empty()),
+            vec![0x1b, b'b']
+        );
+        assert_eq!(
+            encode_key(Key::B, mods(false, true, true), TermMode::empty()),
+            vec![0x1b, b'B']
+        );
     }
     #[test]
     fn plain_control_keys() {
-        assert_eq!(encode_key(Key::Enter, none(), TermMode::empty()), vec![b'\r']);
+        assert_eq!(
+            encode_key(Key::Enter, none(), TermMode::empty()),
+            vec![b'\r']
+        );
         assert_eq!(encode_key(Key::Tab, none(), TermMode::empty()), vec![b'\t']);
-        assert_eq!(encode_key(Key::Backspace, none(), TermMode::empty()), vec![0x7f]);
-        assert_eq!(encode_key(Key::Escape, none(), TermMode::empty()), vec![0x1b]);
+        assert_eq!(
+            encode_key(Key::Backspace, none(), TermMode::empty()),
+            vec![0x7f]
+        );
+        assert_eq!(
+            encode_key(Key::Escape, none(), TermMode::empty()),
+            vec![0x1b]
+        );
     }
 
     // ---- paste_seq -----------------------------------------------------------
     #[test]
     fn paste_seq_wraps_only_when_bracketed_mode_set() {
-        assert_eq!(paste_seq(TermMode::BRACKETED_PASTE, "hi"), b"\x1b[200~hi\x1b[201~");
+        assert_eq!(
+            paste_seq(TermMode::BRACKETED_PASTE, "hi"),
+            b"\x1b[200~hi\x1b[201~"
+        );
         assert_eq!(paste_seq(TermMode::empty(), "hi"), b"hi");
     }
     #[test]
@@ -442,18 +510,30 @@ mod tests {
     }
     #[test]
     fn ctrl_c_with_selection_copies_and_clears() {
-        let out = process_input(&[key_ev(Key::C, mods(true, false, false))], TermMode::empty(), true);
+        let out = process_input(
+            &[key_ev(Key::C, mods(true, false, false))],
+            TermMode::empty(),
+            true,
+        );
         assert!(out.copy && out.copy_clears && !out.interrupt);
         assert!(out.pty_bytes.is_empty());
     }
     #[test]
     fn ctrl_c_without_selection_interrupts() {
-        let out = process_input(&[key_ev(Key::C, mods(true, false, false))], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::C, mods(true, false, false))],
+            TermMode::empty(),
+            false,
+        );
         assert!(out.interrupt && !out.copy);
     }
     #[test]
     fn ctrl_shift_c_copies_without_clearing() {
-        let out = process_input(&[key_ev(Key::C, mods(true, false, true))], TermMode::empty(), true);
+        let out = process_input(
+            &[key_ev(Key::C, mods(true, false, true))],
+            TermMode::empty(),
+            true,
+        );
         assert!(out.copy && !out.copy_clears && !out.interrupt);
     }
     #[test]
@@ -463,7 +543,11 @@ mod tests {
     }
     #[test]
     fn ctrl_shift_v_requests_clipboard_paste() {
-        let out = process_input(&[key_ev(Key::V, mods(true, false, true))], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::V, mods(true, false, true))],
+            TermMode::empty(),
+            false,
+        );
         assert!(out.paste_clipboard);
         assert!(out.pty_bytes.is_empty());
     }
@@ -471,7 +555,10 @@ mod tests {
     fn paste_event_takes_precedence_over_ctrl_v_clipboard_read() {
         // Ctrl+V also yields an Event::Paste; the event wins, no clipboard re-read.
         let out = process_input(
-            &[key_ev(Key::V, mods(true, false, false)), Event::Paste("x".into())],
+            &[
+                key_ev(Key::V, mods(true, false, false)),
+                Event::Paste("x".into()),
+            ],
             TermMode::empty(),
             false,
         );
@@ -480,12 +567,20 @@ mod tests {
     }
     #[test]
     fn paste_event_is_bracketed_when_mode_set() {
-        let out = process_input(&[Event::Paste("x".into())], TermMode::BRACKETED_PASTE, false);
+        let out = process_input(
+            &[Event::Paste("x".into())],
+            TermMode::BRACKETED_PASTE,
+            false,
+        );
         assert_eq!(out.pty_bytes, b"\x1b[200~x\x1b[201~");
     }
     #[test]
     fn shift_pageup_scrolls_instead_of_sending() {
-        let out = process_input(&[key_ev(Key::PageUp, mods(false, false, true))], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::PageUp, mods(false, false, true))],
+            TermMode::empty(),
+            false,
+        );
         assert!(matches!(out.scroll, Some(Scroll::PageUp)));
         assert!(out.pty_bytes.is_empty());
     }
@@ -493,7 +588,11 @@ mod tests {
     // ---- zoom ----------------------------------------------------------------
     #[test]
     fn ctrl_0_requests_zoom_reset_and_sends_nothing() {
-        let out = process_input(&[key_ev(Key::Num0, mods(true, false, false))], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::Num0, mods(true, false, false))],
+            TermMode::empty(),
+            false,
+        );
         assert!(out.zoom_reset);
         assert!(out.pty_bytes.is_empty());
     }
@@ -505,12 +604,21 @@ mod tests {
     #[test]
     fn zoom_step_moves_by_whole_notches() {
         assert_eq!(zoom_step(13.0, 1.0), 13.0 + crate::config::FONT_ZOOM_STEP);
-        assert_eq!(zoom_step(13.0, -2.0), 13.0 - 2.0 * crate::config::FONT_ZOOM_STEP);
+        assert_eq!(
+            zoom_step(13.0, -2.0),
+            13.0 - 2.0 * crate::config::FONT_ZOOM_STEP
+        );
     }
     #[test]
     fn zoom_step_clamps_to_bounds() {
-        assert_eq!(zoom_step(crate::config::MIN_FONT_SIZE, -100.0), crate::config::MIN_FONT_SIZE);
-        assert_eq!(zoom_step(crate::config::MAX_FONT_SIZE, 100.0), crate::config::MAX_FONT_SIZE);
+        assert_eq!(
+            zoom_step(crate::config::MIN_FONT_SIZE, -100.0),
+            crate::config::MIN_FONT_SIZE
+        );
+        assert_eq!(
+            zoom_step(crate::config::MAX_FONT_SIZE, 100.0),
+            crate::config::MAX_FONT_SIZE
+        );
     }
 
     // ---- wheel_input ---------------------------------------------------------
@@ -531,7 +639,10 @@ mod tests {
     #[test]
     fn wheel_primary_screen_scrolls_local_scrollback() {
         assert_eq!(scrollback_delta(wheel_input(3, TermMode::empty(), 1, 1)), 3);
-        assert_eq!(scrollback_delta(wheel_input(-2, TermMode::empty(), 1, 1)), -2);
+        assert_eq!(
+            scrollback_delta(wheel_input(-2, TermMode::empty(), 1, 1)),
+            -2
+        );
     }
     #[test]
     fn wheel_alt_scroll_emits_arrow_keys() {
@@ -557,7 +668,10 @@ mod tests {
     #[test]
     fn wheel_sgr_mouse_repeats_per_line() {
         let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
-        assert_eq!(pty(wheel_input(2, mode, 5, 10)), b"\x1b[<64;5;10M\x1b[<64;5;10M");
+        assert_eq!(
+            pty(wheel_input(2, mode, 5, 10)),
+            b"\x1b[<64;5;10M\x1b[<64;5;10M"
+        );
     }
     #[test]
     fn wheel_x10_mouse_one_line() {
@@ -569,7 +683,10 @@ mod tests {
     #[test]
     fn wheel_mouse_mode_beats_alt_scroll() {
         // Both mouse-reporting AND alt-scroll flags set → mouse wins.
-        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE | TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        let mode = TermMode::MOUSE_MODE
+            | TermMode::SGR_MOUSE
+            | TermMode::ALT_SCREEN
+            | TermMode::ALTERNATE_SCROLL;
         assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
     }
     #[test]

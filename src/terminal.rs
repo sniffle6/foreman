@@ -909,8 +909,12 @@ impl Session {
             // egui delivers a wheel notch as smoothed per-frame fractions. Rounding
             // each frame both drops gentle scrolls (→0) and over-emits fast ones, so
             // accumulate the sub-line remainder and emit only whole lines.
-            let (dy, ctrl) =
-                ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.ctrl || i.modifiers.command));
+            let (dy, ctrl) = ui.input(|i| {
+                (
+                    i.smooth_scroll_delta.y,
+                    i.modifiers.ctrl || i.modifiers.command,
+                )
+            });
             if ctrl && dy != 0.0 {
                 // Ctrl+Scroll zooms the GLOBAL terminal font instead of scrolling.
                 // Accumulate against the notch size (same smoothing as line scroll)
@@ -931,8 +935,10 @@ impl Session {
                     // pointer → 1-based viewport cell
                     let (col, row) = match resp.hover_pos() {
                         Some(p) => (
-                            (((p.x - rect.min.x) / cw).floor() as i32 + 1).clamp(1, cols as i32) as u16,
-                            (((p.y - rect.min.y) / rh).floor() as i32 + 1).clamp(1, rows as i32) as u16,
+                            (((p.x - rect.min.x) / cw).floor() as i32 + 1).clamp(1, cols as i32)
+                                as u16,
+                            (((p.y - rect.min.y) / rh).floor() as i32 + 1).clamp(1, rows as i32)
+                                as u16,
                         ),
                         None => (1, 1),
                     };
@@ -958,7 +964,11 @@ impl Session {
 
         let (cur_line, cur_col, cur_shape) = {
             let c = self.term.renderable_content();
-            (c.cursor.point.line.0, c.cursor.point.column.0, c.cursor.shape)
+            (
+                c.cursor.point.line.0,
+                c.cursor.point.column.0,
+                c.cursor.shape,
+            )
         };
         // De-jitter the caret through the Caret gate: a non-synchronized TUI
         // moves the cursor all over the screen while it redraws, so the gate
@@ -1121,9 +1131,8 @@ mod tests {
             title: Arc::new(Mutex::new(None)),
         };
         // Stand-in for alacritty's formatter: echo the RGB it is handed.
-        let fmt = Arc::new(|c: alacritty_terminal::vte::ansi::Rgb| {
-            format!("R{}G{}B{}", c.r, c.g, c.b)
-        });
+        let fmt =
+            Arc::new(|c: alacritty_terminal::vte::ansi::Rgb| format!("R{}G{}B{}", c.r, c.g, c.b));
         l.send_event(Event::ColorRequest(NamedColor::Background as usize, fmt));
         let got = String::from_utf8(out.lock().unwrap().clone()).unwrap();
         assert_eq!(got, format!("R{}G{}B{}", BG.r(), BG.g(), BG.b()));
@@ -1133,7 +1142,10 @@ mod tests {
     fn query_color_maps_palette_and_named_slots() {
         // Palette entry 0 → our black; OSC 4;0 callers get it back.
         let p0 = query_color(0);
-        assert_eq!((p0.r, p0.g, p0.b), (PALETTE[0].r(), PALETTE[0].g(), PALETTE[0].b()));
+        assert_eq!(
+            (p0.r, p0.g, p0.b),
+            (PALETTE[0].r(), PALETTE[0].g(), PALETTE[0].b())
+        );
         // OSC 11 (background) → our BG; OSC 10 (foreground) / cursor → our FG.
         let bg = query_color(NamedColor::Background as usize);
         assert_eq!((bg.r, bg.g, bg.b), (BG.r(), BG.g(), BG.b()));

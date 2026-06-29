@@ -38,8 +38,12 @@ struct ProcRow {
 /// → codex). Matching the *stem* — never the whole path — keeps a folder named
 /// "claude code" in a path from false-positiving (same rule as the OSC title).
 fn agent_of_row(row: &ProcRow) -> Option<IconKind> {
-    IconKind::from_title(&row.name)
-        .or_else(|| row.cmd.iter().skip(1).find_map(|arg| IconKind::from_title(arg)))
+    IconKind::from_title(&row.name).or_else(|| {
+        row.cmd
+            .iter()
+            .skip(1)
+            .find_map(|arg| IconKind::from_title(arg))
+    })
 }
 
 /// Does `pid` descend from `root` within `table`? Walks the parent chain up,
@@ -194,7 +198,12 @@ mod tests {
         // A plain build script that happens to live under "H:\claude code\…".
         let t = vec![
             row(100, 1, "powershell.exe", &["powershell"]),
-            row(200, 100, "node.exe", &["node", r"H:\claude code\foreman\build.js"]),
+            row(
+                200,
+                100,
+                "node.exe",
+                &["node", r"H:\claude code\foreman\build.js"],
+            ),
         ];
         assert_eq!(detect_agent(&t, 100), None);
     }

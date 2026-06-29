@@ -542,10 +542,7 @@ impl ChatRoom {
             .member(from)
             .map(|m| m.name.clone())
             .unwrap_or_else(|| from.to_string());
-        let seq = self
-            .log
-            .post_re(from, &name, text, targets, re)
-            .seq;
+        let seq = self.log.post_re(from, &name, text, targets, re).seq;
         Ok(seq)
     }
 
@@ -618,8 +615,8 @@ impl ChatRoom {
             .filter(|(_, m)| !m.is_human && !m.exited)
             .filter(|(id, _)| {
                 match live.iter().find(|l| &l.id == id) {
-                    None => true,             // session gone
-                    Some(l) => l.exited,      // session reports exit
+                    None => true,        // session gone
+                    Some(l) => l.exited, // session reports exit
                 }
             })
             .map(|(id, _)| id.clone())
@@ -904,11 +901,14 @@ mod tests {
         room.post("t1", "new", &[], None).expect("ok"); // t1 most recent
         room.post("you", "human spoke", &[], None).expect("ok");
         // t4 vanishes -> exited.
-        room.tick("p1", &[
-            live("t1", true, false),
-            live("t3", true, false),
-            live("t5", true, false),
-        ]);
+        room.tick(
+            "p1",
+            &[
+                live("t1", true, false),
+                live("t3", true, false),
+                live("t5", true, false),
+            ],
+        );
         let rows = room.crew(std::time::Instant::now());
         let order: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         // live stalest-first: t3 (oldest post) < t5 < t1; then `you`; t4 last.
@@ -923,12 +923,15 @@ mod tests {
         let mut room = ChatRoom::new();
         room.join("t1", "worker");
         // a present live member renames -> the room tracks it.
-        room.tick("p1", &[LiveMember {
-            id: "t1".to_string(),
-            name: "worker A".to_string(),
-            ready: true,
-            exited: false,
-        }]);
+        room.tick(
+            "p1",
+            &[LiveMember {
+                id: "t1".to_string(),
+                name: "worker A".to_string(),
+                ready: true,
+                exited: false,
+            }],
+        );
         let row = room
             .crew(std::time::Instant::now())
             .into_iter()
@@ -1009,20 +1012,26 @@ mod tests {
         room.join("t3", "gamma");
         // a post addressed only to t2.
         room.post("t1", "@t2 secret", &[], None).expect("ok");
-        let d = room.tick("p1", &[
-            live("t1", true, false),
-            live("t2", true, false),
-            live("t3", true, false),
-        ]);
+        let d = room.tick(
+            "p1",
+            &[
+                live("t1", true, false),
+                live("t2", true, false),
+                live("t3", true, false),
+            ],
+        );
         assert!(d.iter().any(|x| x.id == "t2"), "t2 addressed");
         assert!(d.iter().all(|x| x.id != "t3"), "t3 not addressed");
         // t3's cursor still advanced: a later post is the only thing it sees.
         room.post("t1", "everyone", &[], None).expect("ok");
-        let d = room.tick("p1", &[
-            live("t1", true, false),
-            live("t2", true, false),
-            live("t3", true, false),
-        ]);
+        let d = room.tick(
+            "p1",
+            &[
+                live("t1", true, false),
+                live("t2", true, false),
+                live("t3", true, false),
+            ],
+        );
         let t3 = d.iter().find(|x| x.id == "t3").expect("t3 broadcast");
         assert_eq!(
             t3.lines,

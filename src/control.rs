@@ -591,8 +591,8 @@ pub fn parse_send_args(
     }
     if terminal.is_none() {
         // self-target: both env vars required
-        let me = self_terminal
-            .ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
+        let me =
+            self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
         let proj = self_project.ok_or(
             "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
         )?;
@@ -661,8 +661,9 @@ pub fn parse_snapshot_args(
         terminal = self_terminal;
         project = Some(proj);
     }
-    let terminal = terminal
-        .ok_or("--terminal is required (or run inside a foreman terminal to target your own pane)")?;
+    let terminal = terminal.ok_or(
+        "--terminal is required (or run inside a foreman terminal to target your own pane)",
+    )?;
     Ok(SnapshotRequest {
         cmd: "snapshot".into(),
         project,
@@ -798,7 +799,9 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("       foreman chat [--project P] --history [N]");
             eprintln!("       foreman status [--project P]");
             eprintln!("       foreman close [tN ...] [--project P]");
-            eprintln!("       foreman send [--project P] [--terminal T] --text TXT [--keys \"K\"] [--settle-ms N]");
+            eprintln!(
+                "       foreman send [--project P] [--terminal T] --text TXT [--keys \"K\"] [--settle-ms N]"
+            );
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman help");
             2
@@ -1750,13 +1753,22 @@ mod tests {
     #[test]
     fn parse_send_args_self_target_requires_both_env_vars() {
         // missing self_terminal
-        let e = parse_send_args(&s(&["--text", "x"]), Some("p1".into()), None, Some("p1".into()))
-            .unwrap_err();
+        let e = parse_send_args(
+            &s(&["--text", "x"]),
+            Some("p1".into()),
+            None,
+            Some("p1".into()),
+        )
+        .unwrap_err();
         assert!(e.contains("FOREMAN_TERMINAL_ID"), "{e}");
         // missing self_project
-        let e =
-            parse_send_args(&s(&["--text", "x"]), Some("p1".into()), Some("t4".into()), None)
-                .unwrap_err();
+        let e = parse_send_args(
+            &s(&["--text", "x"]),
+            Some("p1".into()),
+            Some("t4".into()),
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
     }
 
@@ -1797,7 +1809,15 @@ mod tests {
     fn parse_send_args_rejects_bad_flags() {
         // unknown flag
         let e = parse_send_args(
-            &s(&["--project", "p1", "--terminal", "t3", "--nope", "--text", "x"]),
+            &s(&[
+                "--project",
+                "p1",
+                "--terminal",
+                "t3",
+                "--nope",
+                "--text",
+                "x",
+            ]),
             None,
             None,
             None,
@@ -1859,18 +1879,24 @@ mod tests {
 
     #[test]
     fn parse_snapshot_args_attrs_flag() {
-        let req =
-            parse_snapshot_args(&s(&["--terminal", "t2", "--attrs"]), Some("p1".into()), None)
-                .unwrap();
+        let req = parse_snapshot_args(
+            &s(&["--terminal", "t2", "--attrs"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap();
         assert!(req.attrs, "expected attrs=true");
         assert!(!req.cursor, "cursor defaults false");
     }
 
     #[test]
     fn parse_snapshot_args_cursor_flag() {
-        let req =
-            parse_snapshot_args(&s(&["--terminal", "t2", "--cursor"]), Some("p1".into()), None)
-                .unwrap();
+        let req = parse_snapshot_args(
+            &s(&["--terminal", "t2", "--cursor"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap();
         assert!(req.cursor, "expected cursor=true");
         assert!(!req.attrs, "attrs defaults false");
     }
@@ -1886,7 +1912,10 @@ mod tests {
         };
         let json = serde_json::to_string(&reply).unwrap();
         assert!(!json.contains("\"cells\""), "cells must be absent: {json}");
-        assert!(!json.contains("\"cursor\""), "cursor must be absent: {json}");
+        assert!(
+            !json.contains("\"cursor\""),
+            "cursor must be absent: {json}"
+        );
     }
 
     // ---- pipe roundtrips -----------------------------------------------------
