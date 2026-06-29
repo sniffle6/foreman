@@ -43,6 +43,11 @@ Unit tests cover layout tree, window manager, and chat model (integration tests 
 - **egui 0.34:** `App::ui(&mut Ui, ...)` (not `update`); go through the painter
   (`ui.painter().layout_no_wrap`) since `ui.fonts(|f|…)` needs `&mut`. Ctrl+C/V may
   arrive as `Event::Copy`/`Paste` — handle those AND key events.
+- **Resize+recall corruption is ConPTY's bug, not ours.** Narrowing past a wrapped
+  prompt then Up-arrow recall corrupts until Ctrl+L. It's NOT the double reflow in
+  `Session::resize` — it's ConPTY reflow divergence (microsoft/terminal #18725);
+  ConPTY reports a cursor inconsistent with its own repaint. "Let ConPTY own the
+  redraw" was tested and fails. Documented + don't re-derive: `docs/conpty-resize-reflow.md`.
 
 ## Architecture
 

@@ -748,6 +748,12 @@ impl Session {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
+        // Known limitation: narrowing past a wrapped prompt then recalling history
+        // (Up) corrupts the line until Ctrl+L. This is ConPTY's reflow diverging
+        // from our grid (microsoft/terminal #18725), NOT a double reflow here —
+        // ConPTY reports a cursor inconsistent with its own repaint. Letting
+        // ConPTY own the redraw does not help; only conhost-parity reflow would.
+        // See docs/conpty-resize-reflow.md before touching this.
         if cols < 2 || rows < 1 {
             return;
         }
