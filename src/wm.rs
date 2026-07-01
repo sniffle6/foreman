@@ -2557,6 +2557,30 @@ impl WindowManager {
                 egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
             );
 
+            // Non-project chrome is hover-revealed (same reveal rule as the
+            // terminal scrollbar): the content owns the full window rect — so
+            // the grid never resizes on hover — and the header paints OVER the
+            // top strip only while the pointer is on this window, or while a
+            // header gesture (move drag, tab tear-out, rename) is in flight so
+            // a fast pointer can't strand it mid-drag. The content INTERACT
+            // rect stays below the strip: whenever the pointer is up there the
+            // header is showing and owns that band, so nothing is lost.
+            let tab_dragging = (0..self.windows[i].tabs.len())
+                .any(|ti| ui.ctx().is_being_dragged(base.with((id, "tab", ti))));
+            let reveal_chrome = is_project
+                || is_renaming
+                || dr.dragged()
+                || tab_dragging
+                || ui.rect_contains_pointer(scr.intersect(area));
+            let content_paint = if is_project {
+                content_rect
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(scr.min.x + 1.0, scr.min.y + 1.0),
+                    egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
+                )
+            };
+
             // --- paint window ---
             // Tiled/zoomed windows square their corners so they tile flush to
             // the area edges and to each other (rounded corners would leave gaps).
@@ -2567,161 +2591,321 @@ impl WindowManager {
             };
             let p = ui.painter_at(scr.intersect(area));
             p.rect_filled(scr, cr, WIN_BG);
-            let (tbg, tbg_focus) = if is_project {
-                (PROJ_TITLE_BG, PROJ_TITLE_BG_FOCUS)
+
+            // --- content ---
+            // Painted BEFORE the header so the hover-revealed header overlays
+            // it. Terminals need click_and_drag (for text selection); projects
+            // only sense clicks so drags pass through to their own sub-windows.
+            let sense = if is_project {
+                egui::Sense::click()
             } else {
-                (TITLE_BG, TITLE_BG_FOCUS)
+                egui::Sense::click_and_drag()
             };
-            p.rect_filled(title_rect, cr, if is_focus { tbg_focus } else { tbg });
-            // Right edge of the title/tab area; the project shell chips anchor here
-            // so they never overlap a multi-tab bar. Set by each titlebar branch.
-            let title_end_x;
-            if is_renaming {
-                // Field box centered in the titlebar; `vertical_align(Center)` lets
-                // egui center the text within it, so no pixel-fudging is needed.
-                let te_h = TITLE_H - 8.0;
-                let te_rect = egui::Rect::from_min_size(
-                    egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
-                    egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
-                );
-                title_end_x = te_rect.max.x + 8.0;
-                // Theme the field to the dark/amber titlebar instead of egui's
-                // default light TextEdit: dark inset fill + amber edit-mode border.
-                p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
-                p.rect_stroke(
-                    te_rect,
-                    egui::CornerRadius::same(3),
-                    egui::Stroke::new(1.0, BORDER_FOCUS),
-                    egui::StrokeKind::Inside,
-                );
-                ui.visuals_mut().selection.bg_fill =
-                    egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
-                let resp = ui.put(
-                    te_rect,
-                    egui::TextEdit::singleline(&mut self.rename_buf)
-                        .id(base.with((id, "rename")))
-                        .font(egui::FontId::proportional(12.5))
-                        .text_color(TEXT)
-                        .vertical_align(egui::Align::Center)
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::symmetric(6, 0))
-                        .desired_width(te_rect.width()),
-                );
-                if self.rename_focus {
-                    resp.request_focus();
-                    self.rename_focus = false;
-                }
-                // Escape cancels; Enter or clicking away (lost focus) commits.
-                if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
-                    self.renaming = None;
-                } else if resp.lost_focus() {
-                    let t = self.rename_buf.trim().to_string();
-                    if !t.is_empty() {
-                        let a = self.windows[i].active;
-                        self.windows[i].tabs[a].title = t;
+            let cresp = ui.interact(content_rect, base.with((id, "content")), sense);
+            if cresp.clicked() {
+                acts.push(Act::Focus(id));
+            }
+            let child_interacted = self.windows[i].active_content().show(
+                ui,
+                content_paint,
+                is_focus,
+                base,
+                id,
+                &cresp,
+            );
+            if child_interacted {
+                // A sub-window inside this project was clicked: raise this project
+                // to focus so the keyboard cascade reaches it. This also makes
+                // `acts` non-empty, propagating the interaction further up.
+                acts.push(Act::Focus(id));
+            }
+
+            if reveal_chrome {
+                let (tbg, tbg_focus) = if is_project {
+                    (PROJ_TITLE_BG, PROJ_TITLE_BG_FOCUS)
+                } else {
+                    (TITLE_BG, TITLE_BG_FOCUS)
+                };
+                p.rect_filled(title_rect, cr, if is_focus { tbg_focus } else { tbg });
+                // Right edge of the title/tab area; the project shell chips anchor here
+                // so they never overlap a multi-tab bar. Set by each titlebar branch.
+                let title_end_x;
+                if is_renaming {
+                    // Field box centered in the titlebar; `vertical_align(Center)` lets
+                    // egui center the text within it, so no pixel-fudging is needed.
+                    let te_h = TITLE_H - 8.0;
+                    let te_rect = egui::Rect::from_min_size(
+                        egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
+                        egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
+                    );
+                    title_end_x = te_rect.max.x + 8.0;
+                    // Theme the field to the dark/amber titlebar instead of egui's
+                    // default light TextEdit: dark inset fill + amber edit-mode border.
+                    p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
+                    p.rect_stroke(
+                        te_rect,
+                        egui::CornerRadius::same(3),
+                        egui::Stroke::new(1.0, BORDER_FOCUS),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.visuals_mut().selection.bg_fill =
+                        egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
+                    let resp = ui.put(
+                        te_rect,
+                        egui::TextEdit::singleline(&mut self.rename_buf)
+                            .id(base.with((id, "rename")))
+                            .font(egui::FontId::proportional(12.5))
+                            .text_color(TEXT)
+                            .vertical_align(egui::Align::Center)
+                            .frame(egui::Frame::NONE)
+                            .margin(egui::Margin::symmetric(6, 0))
+                            .desired_width(te_rect.width()),
+                    );
+                    if self.rename_focus {
+                        resp.request_focus();
+                        self.rename_focus = false;
                     }
-                    self.renaming = None;
-                }
-            } else if self.windows[i].tabs.len() > 1 {
-                // --- tab bar (multi-tab stacks only) ---
-                // Drawn inside the titlebar (respecting TITLE_H): one chip per tab,
-                // active highlighted, each with a small close affordance. Chips are
-                // registered after the window-drag rect so they win pointer priority;
-                // dragging a chip off the bar detaches it (untab).
-                let ntabs = self.windows[i].tabs.len();
-                let tab_font = egui::FontId::proportional(11.5);
-                // Classic browser tabs: taller chips whose flat bottoms meet the
-                // content area, rounded only on top, each with a leading icon.
-                let chip_h = TITLE_H - 4.0;
-                let cy = scr.min.y + 4.0;
-                let mut cx = scr.min.x + 6.0;
-                let avail_end = scr.max.x - ctl_w;
-                let icon_disp = 14.0_f32; // icon box edge, in points
-                let icon_gap = 6.0_f32;
-                let left_pad = 8.0_f32;
-                for ti in 0..ntabs {
-                    let is_active_tab = self.windows[i].active == ti;
-                    let label = self.windows[i].tabs[ti].title.clone();
-                    let icon = self.windows[i].tabs[ti].content.icon_kind();
+                    // Escape cancels; Enter or clicking away (lost focus) commits.
+                    if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                        self.renaming = None;
+                    } else if resp.lost_focus() {
+                        let t = self.rename_buf.trim().to_string();
+                        if !t.is_empty() {
+                            let a = self.windows[i].active;
+                            self.windows[i].tabs[a].title = t;
+                        }
+                        self.renaming = None;
+                    }
+                } else if self.windows[i].tabs.len() > 1 {
+                    // --- tab bar (multi-tab stacks only) ---
+                    // Drawn inside the titlebar (respecting TITLE_H): one chip per tab,
+                    // active highlighted, each with a small close affordance. Chips are
+                    // registered after the window-drag rect so they win pointer priority;
+                    // dragging a chip off the bar detaches it (untab).
+                    let ntabs = self.windows[i].tabs.len();
+                    let tab_font = egui::FontId::proportional(11.5);
+                    // Classic browser tabs: taller chips whose flat bottoms meet the
+                    // content area, rounded only on top, each with a leading icon.
+                    let chip_h = TITLE_H - 4.0;
+                    let cy = scr.min.y + 4.0;
+                    let mut cx = scr.min.x + 6.0;
+                    let avail_end = scr.max.x - ctl_w;
+                    let icon_disp = 14.0_f32; // icon box edge, in points
+                    let icon_gap = 6.0_f32;
+                    let left_pad = 8.0_f32;
+                    for ti in 0..ntabs {
+                        let is_active_tab = self.windows[i].active == ti;
+                        let label = self.windows[i].tabs[ti].title.clone();
+                        let icon = self.windows[i].tabs[ti].content.icon_kind();
+                        let tw = ui
+                            .painter()
+                            .layout_no_wrap(label.clone(), tab_font.clone(), TEXT)
+                            .size()
+                            .x
+                            .min(120.0);
+                        let close_w = 16.0;
+                        let icon_w = if icon.is_some() {
+                            icon_disp + icon_gap
+                        } else {
+                            0.0
+                        };
+                        let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
+                        if cx + chip_w > avail_end && ti > 0 {
+                            // Out of room: stop drawing further chips (rare; many tabs on
+                            // a narrow window). The active tab is always within the first
+                            // few, and cycling still reaches the rest.
+                            break;
+                        }
+                        let chip = egui::Rect::from_min_size(
+                            egui::pos2(cx, cy),
+                            egui::vec2(chip_w, chip_h),
+                        );
+                        let chip_resp = ui.interact(
+                            chip,
+                            base.with((id, "tab", ti)),
+                            egui::Sense::click_and_drag(),
+                        );
+                        // Active tab matches the content directly below it so the chip
+                        // reads as joined to that area (classic browser tabs). Both
+                        // terminal tabs and project tabs flow into terminal content (a
+                        // lone subwindow renders bare, so the project's content top *is*
+                        // the terminal). Inactive tabs sit lighter (hover lighter still)
+                        // for an obvious active/inactive contrast.
+                        let bg = if is_active_tab {
+                            crate::terminal::BG
+                        } else if chip_resp.hovered() {
+                            egui::Color32::from_rgb(50, 45, 35)
+                        } else {
+                            egui::Color32::from_rgb(38, 34, 27)
+                        };
+                        // Rounded on top, flat on the bottom so the active tab reads as
+                        // joined to the content area below it (classic browser tabs).
+                        let radius = egui::CornerRadius {
+                            nw: 6,
+                            ne: 6,
+                            sw: 0,
+                            se: 0,
+                        };
+                        p.rect_filled(chip, radius, bg);
+                        // Project tabs get the focus-amber selection border (the same
+                        // colour as a focused subwindow's border) on three sides only —
+                        // the bottom edge is left open so the tab's colour flows straight
+                        // into the content below it. Terminal tabs need no border; their
+                        // bg-match into the content reads on its own.
+                        if is_active_tab && is_project {
+                            let tab_border = if is_focus { BORDER_FOCUS } else { BORDER };
+                            p.rect_stroke(
+                                chip,
+                                radius,
+                                egui::Stroke::new(BORDER_W, tab_border),
+                                egui::StrokeKind::Inside,
+                            );
+                            // Paint over the bottom edge with the tab bg, leaving an open
+                            // bottom so the colour continues into the header beneath.
+                            let open = egui::Rect::from_min_max(
+                                egui::pos2(chip.min.x, chip.max.y - 1.0),
+                                egui::pos2(chip.max.x, chip.max.y),
+                            );
+                            p.rect_filled(open, egui::CornerRadius::ZERO, bg);
+                        }
+                        let txt_col = if is_active_tab { TEXT } else { DIM };
+                        // Leading icon: agent logo / shell glyph / project folder.
+                        let mut label_x = cx + left_pad;
+                        if let Some(kind) = icon {
+                            let center =
+                                egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
+                            let icon_rect = egui::Rect::from_center_size(
+                                center,
+                                egui::vec2(icon_disp, icon_disp),
+                            );
+                            let px =
+                                (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                            let tex = crate::icons::texture(ui.ctx(), kind, px);
+                            let tint = if is_active_tab {
+                                kind.tint()
+                            } else {
+                                kind.tint().gamma_multiply(0.55)
+                            };
+                            p.image(
+                                tex.id(),
+                                icon_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                tint,
+                            );
+                            label_x += icon_disp + icon_gap;
+                        }
+                        p.text(
+                            egui::pos2(label_x, cy + chip_h / 2.0),
+                            egui::Align2::LEFT_CENTER,
+                            &label,
+                            tab_font.clone(),
+                            txt_col,
+                        );
+                        // Close affordance — shown only on the active or hovered tab
+                        // (browser-style), and interactable only when shown.
+                        let show_x = is_active_tab || chip_resp.hovered();
+                        let xr = egui::Rect::from_min_size(
+                            egui::pos2(cx + chip_w - close_w, cy),
+                            egui::vec2(close_w, chip_h),
+                        );
+                        let xresp = if show_x {
+                            let r =
+                                ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
+                            let xc = xr.center();
+                            let xs = 3.0;
+                            let xcol = if r.hovered() {
+                                egui::Color32::from_rgb(220, 120, 100)
+                            } else {
+                                txt_col
+                            };
+                            let xstroke = egui::Stroke::new(1.2, xcol);
+                            p.line_segment(
+                                [
+                                    egui::pos2(xc.x - xs, xc.y - xs),
+                                    egui::pos2(xc.x + xs, xc.y + xs),
+                                ],
+                                xstroke,
+                            );
+                            p.line_segment(
+                                [
+                                    egui::pos2(xc.x - xs, xc.y + xs),
+                                    egui::pos2(xc.x + xs, xc.y - xs),
+                                ],
+                                xstroke,
+                            );
+                            Some(r)
+                        } else {
+                            None
+                        };
+                        if xresp.is_some_and(|r| r.clicked()) {
+                            acts.push(Act::CloseTab(id, ti));
+                        } else if chip_resp.clicked() {
+                            acts.push(Act::SetTab(id, ti));
+                        } else if chip_resp.dragged() {
+                            // Live drag-out: the instant the pointer leaves the tab bar,
+                            // detach the tab into its own floating window and hand the
+                            // drag to that window (`grab`) so it pops to floating size and
+                            // follows the cursor immediately — no wait for release.
+                            if let Some(dp) = ui.ctx().pointer_latest_pos() {
+                                if tab_drag_off(dp, scr) {
+                                    let local = dp - area.min.to_vec2();
+                                    acts.push(Act::Untab {
+                                        id,
+                                        idx: ti,
+                                        pos: egui::pos2(local.x, local.y),
+                                        grab: true,
+                                    });
+                                }
+                            }
+                        } else if chip_resp.drag_stopped() {
+                            // Released without ever crossing off the bar (e.g. a tiny
+                            // flick the live path never caught): off → detach in place,
+                            // else just activate the tab.
+                            if let Some(dp) = ui.ctx().pointer_latest_pos() {
+                                if tab_drag_off(dp, scr) {
+                                    let local = dp - area.min.to_vec2();
+                                    acts.push(Act::Untab {
+                                        id,
+                                        idx: ti,
+                                        pos: egui::pos2(local.x, local.y),
+                                        grab: false,
+                                    });
+                                } else {
+                                    acts.push(Act::SetTab(id, ti));
+                                }
+                            }
+                        }
+                        cx += chip_w + 4.0;
+                    }
+                    title_end_x = cx + 6.0;
+                } else {
                     let tw = ui
                         .painter()
-                        .layout_no_wrap(label.clone(), tab_font.clone(), TEXT)
+                        .layout_no_wrap(
+                            self.windows[i].title().to_string(),
+                            egui::FontId::proportional(12.5),
+                            TEXT,
+                        )
                         .size()
-                        .x
-                        .min(120.0);
-                    let close_w = 16.0;
-                    let icon_w = if icon.is_some() {
-                        icon_disp + icon_gap
-                    } else {
-                        0.0
-                    };
-                    let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
-                    if cx + chip_w > avail_end && ti > 0 {
-                        // Out of room: stop drawing further chips (rare; many tabs on
-                        // a narrow window). The active tab is always within the first
-                        // few, and cycling still reaches the rest.
-                        break;
-                    }
-                    let chip =
-                        egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(chip_w, chip_h));
-                    let chip_resp = ui.interact(
-                        chip,
-                        base.with((id, "tab", ti)),
-                        egui::Sense::click_and_drag(),
-                    );
-                    // Active tab matches the content directly below it so the chip
-                    // reads as joined to that area (classic browser tabs). Both
-                    // terminal tabs and project tabs flow into terminal content (a
-                    // lone subwindow renders bare, so the project's content top *is*
-                    // the terminal). Inactive tabs sit lighter (hover lighter still)
-                    // for an obvious active/inactive contrast.
-                    let bg = if is_active_tab {
-                        crate::terminal::BG
-                    } else if chip_resp.hovered() {
-                        egui::Color32::from_rgb(50, 45, 35)
-                    } else {
-                        egui::Color32::from_rgb(38, 34, 27)
-                    };
-                    // Rounded on top, flat on the bottom so the active tab reads as
-                    // joined to the content area below it (classic browser tabs).
-                    let radius = egui::CornerRadius {
-                        nw: 6,
-                        ne: 6,
-                        sw: 0,
-                        se: 0,
-                    };
-                    p.rect_filled(chip, radius, bg);
-                    // Project tabs get the focus-amber selection border (the same
-                    // colour as a focused subwindow's border) on three sides only —
-                    // the bottom edge is left open so the tab's colour flows straight
-                    // into the content below it. Terminal tabs need no border; their
-                    // bg-match into the content reads on its own.
-                    if is_active_tab && is_project {
-                        let tab_border = if is_focus { BORDER_FOCUS } else { BORDER };
-                        p.rect_stroke(
-                            chip,
-                            radius,
-                            egui::Stroke::new(BORDER_W, tab_border),
-                            egui::StrokeKind::Inside,
+                        .x;
+                    // Leading icon, mirroring the tab chips so a single-window header
+                    // reads consistently (agent logo / shell glyph / project folder).
+                    let mut tx = scr.min.x + 11.0;
+                    if let Some(kind) = self.windows[i].tabs[self.windows[i].active]
+                        .content
+                        .icon_kind()
+                    {
+                        let disp = 14.0_f32;
+                        let icon_rect = egui::Rect::from_center_size(
+                            egui::pos2(tx + disp / 2.0, scr.min.y + TITLE_H / 2.0),
+                            egui::vec2(disp, disp),
                         );
-                        // Paint over the bottom edge with the tab bg, leaving an open
-                        // bottom so the colour continues into the header beneath.
-                        let open = egui::Rect::from_min_max(
-                            egui::pos2(chip.min.x, chip.max.y - 1.0),
-                            egui::pos2(chip.max.x, chip.max.y),
-                        );
-                        p.rect_filled(open, egui::CornerRadius::ZERO, bg);
-                    }
-                    let txt_col = if is_active_tab { TEXT } else { DIM };
-                    // Leading icon: agent logo / shell glyph / project folder.
-                    let mut label_x = cx + left_pad;
-                    if let Some(kind) = icon {
-                        let center = egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
-                        let icon_rect =
-                            egui::Rect::from_center_size(center, egui::vec2(icon_disp, icon_disp));
-                        let px = (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                        let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
-                        let tint = if is_active_tab {
+                        let tint = if is_focus {
                             kind.tint()
                         } else {
                             kind.tint().gamma_multiply(0.55)
@@ -2732,338 +2916,197 @@ impl WindowManager {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             tint,
                         );
-                        label_x += icon_disp + icon_gap;
+                        tx += disp + 7.0;
                     }
                     p.text(
-                        egui::pos2(label_x, cy + chip_h / 2.0),
+                        egui::pos2(tx, scr.min.y + TITLE_H / 2.0),
                         egui::Align2::LEFT_CENTER,
-                        &label,
-                        tab_font.clone(),
-                        txt_col,
-                    );
-                    // Close affordance — shown only on the active or hovered tab
-                    // (browser-style), and interactable only when shown.
-                    let show_x = is_active_tab || chip_resp.hovered();
-                    let xr = egui::Rect::from_min_size(
-                        egui::pos2(cx + chip_w - close_w, cy),
-                        egui::vec2(close_w, chip_h),
-                    );
-                    let xresp = if show_x {
-                        let r = ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
-                        let xc = xr.center();
-                        let xs = 3.0;
-                        let xcol = if r.hovered() {
-                            egui::Color32::from_rgb(220, 120, 100)
-                        } else {
-                            txt_col
-                        };
-                        let xstroke = egui::Stroke::new(1.2, xcol);
-                        p.line_segment(
-                            [
-                                egui::pos2(xc.x - xs, xc.y - xs),
-                                egui::pos2(xc.x + xs, xc.y + xs),
-                            ],
-                            xstroke,
-                        );
-                        p.line_segment(
-                            [
-                                egui::pos2(xc.x - xs, xc.y + xs),
-                                egui::pos2(xc.x + xs, xc.y - xs),
-                            ],
-                            xstroke,
-                        );
-                        Some(r)
-                    } else {
-                        None
-                    };
-                    if xresp.is_some_and(|r| r.clicked()) {
-                        acts.push(Act::CloseTab(id, ti));
-                    } else if chip_resp.clicked() {
-                        acts.push(Act::SetTab(id, ti));
-                    } else if chip_resp.dragged() {
-                        // Live drag-out: the instant the pointer leaves the tab bar,
-                        // detach the tab into its own floating window and hand the
-                        // drag to that window (`grab`) so it pops to floating size and
-                        // follows the cursor immediately — no wait for release.
-                        if let Some(dp) = ui.ctx().pointer_latest_pos() {
-                            if tab_drag_off(dp, scr) {
-                                let local = dp - area.min.to_vec2();
-                                acts.push(Act::Untab {
-                                    id,
-                                    idx: ti,
-                                    pos: egui::pos2(local.x, local.y),
-                                    grab: true,
-                                });
-                            }
-                        }
-                    } else if chip_resp.drag_stopped() {
-                        // Released without ever crossing off the bar (e.g. a tiny
-                        // flick the live path never caught): off → detach in place,
-                        // else just activate the tab.
-                        if let Some(dp) = ui.ctx().pointer_latest_pos() {
-                            if tab_drag_off(dp, scr) {
-                                let local = dp - area.min.to_vec2();
-                                acts.push(Act::Untab {
-                                    id,
-                                    idx: ti,
-                                    pos: egui::pos2(local.x, local.y),
-                                    grab: false,
-                                });
-                            } else {
-                                acts.push(Act::SetTab(id, ti));
-                            }
-                        }
-                    }
-                    cx += chip_w + 4.0;
-                }
-                title_end_x = cx + 6.0;
-            } else {
-                let tw = ui
-                    .painter()
-                    .layout_no_wrap(
-                        self.windows[i].title().to_string(),
+                        self.windows[i].title(),
                         egui::FontId::proportional(12.5),
-                        TEXT,
-                    )
-                    .size()
-                    .x;
-                // Leading icon, mirroring the tab chips so a single-window header
-                // reads consistently (agent logo / shell glyph / project folder).
-                let mut tx = scr.min.x + 11.0;
-                if let Some(kind) = self.windows[i].tabs[self.windows[i].active]
-                    .content
-                    .icon_kind()
-                {
-                    let disp = 14.0_f32;
-                    let icon_rect = egui::Rect::from_center_size(
-                        egui::pos2(tx + disp / 2.0, scr.min.y + TITLE_H / 2.0),
-                        egui::vec2(disp, disp),
-                    );
-                    let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
-                    let tex = crate::icons::texture(ui.ctx(), kind, px);
-                    let tint = if is_focus {
-                        kind.tint()
-                    } else {
-                        kind.tint().gamma_multiply(0.55)
-                    };
-                    p.image(
-                        tex.id(),
-                        icon_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        tint,
-                    );
-                    tx += disp + 7.0;
-                }
-                p.text(
-                    egui::pos2(tx, scr.min.y + TITLE_H / 2.0),
-                    egui::Align2::LEFT_CENTER,
-                    self.windows[i].title(),
-                    egui::FontId::proportional(12.5),
-                    if is_focus { TEXT } else { DIM },
-                );
-                title_end_x = tx + tw + 14.0;
-            }
-
-            // --- dispatch keys (project headers only) ---
-            // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
-            // a terminal of that shell *into this project*. Lives here (not the
-            // global bar) so the target site is unambiguous — the window you click.
-            if is_project {
-                let kh = TITLE_H - 10.0;
-                let ky = scr.min.y + 5.0;
-                let mut kx = title_end_x;
-                let key_font = egui::FontId::proportional(10.5);
-                for (label, shell) in [
-                    ("PS", Shell::PowerShell),
-                    ("CMD", Shell::Cmd),
-                    ("SH", Shell::Bash),
-                ] {
-                    let tw = ui
-                        .painter()
-                        .layout_no_wrap(label.to_owned(), key_font.clone(), TEXT)
-                        .size()
-                        .x;
-                    let kw = tw + 12.0;
-                    // keep keys from colliding with the window controls on narrow windows
-                    if kx + kw > scr.max.x - ctl_w {
-                        break;
-                    }
-                    let r = egui::Rect::from_min_size(egui::pos2(kx, ky), egui::vec2(kw, kh));
-                    let kresp =
-                        ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
-                    let kbg = if kresp.hovered() {
-                        egui::Color32::from_rgb(72, 82, 76)
-                    } else {
-                        egui::Color32::from_rgb(45, 51, 48)
-                    };
-                    ui.painter()
-                        .rect_filled(r, egui::CornerRadius::same(3), kbg);
-                    ui.painter().text(
-                        r.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        key_font.clone(),
                         if is_focus { TEXT } else { DIM },
                     );
-                    if kresp.clicked() {
-                        acts.push(Act::AddTerm(id, shell));
-                    }
-                    kx += kw + 5.0;
+                    title_end_x = tx + tw + 14.0;
                 }
-            }
 
-            // --- window controls ---
-            let by = scr.min.y + 3.0;
-            let bh = TITLE_H - 6.0;
-            let mut bx = scr.max.x - 4.0 - 22.0;
-            for (role, danger) in [
-                ("close", true),
-                ("max", false),
-                ("min", false),
-                ("float", false),
-            ] {
-                let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
-                let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
-                let bg = if resp.hovered() {
-                    if danger {
-                        egui::Color32::from_rgb(120, 45, 36)
+                // --- dispatch keys (project headers only) ---
+                // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
+                // a terminal of that shell *into this project*. Lives here (not the
+                // global bar) so the target site is unambiguous — the window you click.
+                if is_project {
+                    let kh = TITLE_H - 10.0;
+                    let ky = scr.min.y + 5.0;
+                    let mut kx = title_end_x;
+                    let key_font = egui::FontId::proportional(10.5);
+                    for (label, shell) in [
+                        ("PS", Shell::PowerShell),
+                        ("CMD", Shell::Cmd),
+                        ("SH", Shell::Bash),
+                    ] {
+                        let tw = ui
+                            .painter()
+                            .layout_no_wrap(label.to_owned(), key_font.clone(), TEXT)
+                            .size()
+                            .x;
+                        let kw = tw + 12.0;
+                        // keep keys from colliding with the window controls on narrow windows
+                        if kx + kw > scr.max.x - ctl_w {
+                            break;
+                        }
+                        let r = egui::Rect::from_min_size(egui::pos2(kx, ky), egui::vec2(kw, kh));
+                        let kresp =
+                            ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
+                        let kbg = if kresp.hovered() {
+                            egui::Color32::from_rgb(72, 82, 76)
+                        } else {
+                            egui::Color32::from_rgb(45, 51, 48)
+                        };
+                        ui.painter()
+                            .rect_filled(r, egui::CornerRadius::same(3), kbg);
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            key_font.clone(),
+                            if is_focus { TEXT } else { DIM },
+                        );
+                        if kresp.clicked() {
+                            acts.push(Act::AddTerm(id, shell));
+                        }
+                        kx += kw + 5.0;
+                    }
+                }
+
+                // --- window controls ---
+                let by = scr.min.y + 3.0;
+                let bh = TITLE_H - 6.0;
+                let mut bx = scr.max.x - 4.0 - 22.0;
+                for (role, danger) in [
+                    ("close", true),
+                    ("max", false),
+                    ("min", false),
+                    ("float", false),
+                ] {
+                    let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
+                    let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
+                    let bg = if resp.hovered() {
+                        if danger {
+                            egui::Color32::from_rgb(120, 45, 36)
+                        } else {
+                            egui::Color32::from_rgb(72, 64, 50)
+                        }
                     } else {
-                        egui::Color32::from_rgb(72, 64, 50)
-                    }
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
-                // Icons are drawn as vector strokes (not font glyphs) so all three
-                // share one optical center, size, and weight regardless of font.
-                let c = r.center();
-                let s = 4.0; // icon half-extent
-                let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
-                let p = ui.painter();
-                match role {
-                    "min" => {
-                        p.line_segment(
-                            [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
-                            stroke,
-                        );
-                    }
-                    "max" => {
-                        p.rect_stroke(
-                            egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
-                            egui::CornerRadius::same(1),
-                            stroke,
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    "float" => {
-                        if is_tiled {
-                            // In the tree: 2×2 grid. Click pops it out to floating.
+                        egui::Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
+                    // Icons are drawn as vector strokes (not font glyphs) so all three
+                    // share one optical center, size, and weight regardless of font.
+                    let c = r.center();
+                    let s = 4.0; // icon half-extent
+                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                    let p = ui.painter();
+                    match role {
+                        "min" => {
+                            p.line_segment(
+                                [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                stroke,
+                            );
+                        }
+                        "max" => {
                             p.rect_stroke(
                                 egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
                                 egui::CornerRadius::same(1),
                                 stroke,
                                 egui::StrokeKind::Inside,
                             );
+                        }
+                        "float" => {
+                            if is_tiled {
+                                // In the tree: 2×2 grid. Click pops it out to floating.
+                                p.rect_stroke(
+                                    egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
+                                    egui::CornerRadius::same(1),
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                p.line_segment(
+                                    [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                                    stroke,
+                                );
+                                p.line_segment(
+                                    [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                    stroke,
+                                );
+                            } else {
+                                // Floating: two offset squares. Click tiles it
+                                // (enters at the leaf under the window's center).
+                                let q = s * 0.8;
+                                let o = 1.5;
+                                p.rect_stroke(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(c.x + o, c.y - o),
+                                        egui::vec2(q * 2.0, q * 2.0),
+                                    ),
+                                    egui::CornerRadius::same(1),
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                p.rect_stroke(
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(c.x - o, c.y + o),
+                                        egui::vec2(q * 2.0, q * 2.0),
+                                    ),
+                                    egui::CornerRadius::same(1),
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
+                        _ => {
                             p.line_segment(
-                                [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
                                 stroke,
                             );
                             p.line_segment(
-                                [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
                                 stroke,
-                            );
-                        } else {
-                            // Floating: two offset squares. Click tiles it
-                            // (enters at the leaf under the window's center).
-                            let q = s * 0.8;
-                            let o = 1.5;
-                            p.rect_stroke(
-                                egui::Rect::from_center_size(
-                                    egui::pos2(c.x + o, c.y - o),
-                                    egui::vec2(q * 2.0, q * 2.0),
-                                ),
-                                egui::CornerRadius::same(1),
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                            p.rect_stroke(
-                                egui::Rect::from_center_size(
-                                    egui::pos2(c.x - o, c.y + o),
-                                    egui::vec2(q * 2.0, q * 2.0),
-                                ),
-                                egui::CornerRadius::same(1),
-                                stroke,
-                                egui::StrokeKind::Inside,
                             );
                         }
                     }
-                    _ => {
-                        p.line_segment(
-                            [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
-                            stroke,
-                        );
-                        p.line_segment(
-                            [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
-                            stroke,
-                        );
+                    if resp.clicked() {
+                        acts.push(match role {
+                            "close" => Act::Close(id),
+                            "max" => Act::Max(id),
+                            "float" => Act::Float(id),
+                            _ => Act::Min(id),
+                        });
+                    }
+                    bx -= 25.0;
+                }
+
+                // --- new-project button (project titlebars only) ---
+                // Sits just left of the window controls; spawns a sibling project on
+                // the desktop. Replaces the old global "+ project" header button.
+                if is_project {
+                    let r =
+                        egui::Rect::from_min_size(egui::pos2(bx - 4.0, by), egui::vec2(22.0, bh));
+                    let resp = ui.interact(r, base.with((id, "addproj")), egui::Sense::click());
+                    let bg = if resp.hovered() {
+                        egui::Color32::from_rgb(72, 64, 50)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
+                    let c = r.center();
+                    let s = 4.0;
+                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                    let p = ui.painter();
+                    p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
+                    p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+                    if resp.clicked() {
+                        acts.push(Act::OpenProjectPicker);
                     }
                 }
-                if resp.clicked() {
-                    acts.push(match role {
-                        "close" => Act::Close(id),
-                        "max" => Act::Max(id),
-                        "float" => Act::Float(id),
-                        _ => Act::Min(id),
-                    });
-                }
-                bx -= 25.0;
-            }
-
-            // --- new-project button (project titlebars only) ---
-            // Sits just left of the window controls; spawns a sibling project on
-            // the desktop. Replaces the old global "+ project" header button.
-            if is_project {
-                let r = egui::Rect::from_min_size(egui::pos2(bx - 4.0, by), egui::vec2(22.0, bh));
-                let resp = ui.interact(r, base.with((id, "addproj")), egui::Sense::click());
-                let bg = if resp.hovered() {
-                    egui::Color32::from_rgb(72, 64, 50)
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
-                let c = r.center();
-                let s = 4.0;
-                let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
-                let p = ui.painter();
-                p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
-                p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
-                if resp.clicked() {
-                    acts.push(Act::OpenProjectPicker);
-                }
-            }
-
-            // --- content ---
-            // Terminals need click_and_drag (for text selection); projects only
-            // sense clicks so drags pass through to their own sub-windows.
-            let sense = if is_project {
-                egui::Sense::click()
-            } else {
-                egui::Sense::click_and_drag()
-            };
-            let cresp = ui.interact(content_rect, base.with((id, "content")), sense);
-            if cresp.clicked() {
-                acts.push(Act::Focus(id));
-            }
-            let child_interacted =
-                self.windows[i]
-                    .active_content()
-                    .show(ui, content_rect, is_focus, base, id, &cresp);
-            if child_interacted {
-                // A sub-window inside this project was clicked: raise this project
-                // to focus so the keyboard cascade reaches it. This also makes
-                // `acts` non-empty, propagating the interaction further up.
-                acts.push(Act::Focus(id));
-            }
+            } // end reveal_chrome (hover-revealed header)
 
             // --- border + resize ---
             let border_col = if is_focus {

@@ -57,6 +57,27 @@ Mouse:
   ratios; clamped so no tile drops below 10% of its split). Dragging the
   OUTER edge of a tile does nothing — tear-out lives on the header drag.
 
+### Hover-revealed headers
+
+Terminal (and chat) windows don't show a titlebar all the time:
+
+- A **lone pane** (single tiled window, one tab, not a project) draws no
+  chrome at all, ever — the parent frame is its only frame (tmux-style sole
+  pane).
+- **Every other non-project window** hides its header until the mouse is over
+  that window — same reveal rule as the terminal scrollbar. The content owns
+  the FULL window rect (the grid never resizes on hover); the header paints
+  OVER the top strip while revealed. It also stays up mid-gesture (rename,
+  header drag, tab tear-out) so a fast pointer can't strand a drag.
+- **Projects keep persistent headers** — they carry the tab chips, the
+  PS/CMD/SH dispatch keys, and the `+` project button.
+
+Everything header-driven (tear-out drag, tab chips, window controls,
+double-click rename/maximize) works unchanged: mouse over the window and the
+header is there. While revealed it covers the top ~26px of terminal text,
+exactly like the scrollbar covers the right edge — move the mouse off and the
+text is back.
+
 New windows tile by default: they split the previously-focused tiled window
 along its longer axis, or become the root tile of an empty tree. The chat
 viewer window is the exception — it always opens floating.
