@@ -287,6 +287,10 @@ fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+fn clipboard_has_image() -> bool {
+    arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok())
+}
+
 /// The live global terminal font size, parked in egui's per-context data so every
 /// `Session::show` reads the same value and any pane's Ctrl+Scroll handler can
 /// update it without threading a param through the recursive window managers. The
@@ -806,6 +810,11 @@ impl Session {
         if outcome.paste_clipboard {
             if let Some(txt) = read_clipboard() {
                 bytes.extend_from_slice(&crate::input::paste_seq(mode, &txt));
+            } else if clipboard_has_image() {
+                // Image-only clipboard: forward raw Ctrl+V so agents (Claude,
+                // Codex) run their native clipboard-image paste. Plain shells
+                // see readline quoted-insert — harmless. (spec WS2)
+                bytes.push(0x16);
             }
         }
         if !bytes.is_empty() {

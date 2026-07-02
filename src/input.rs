@@ -56,10 +56,11 @@ pub fn process_input(
                     out.pty_bytes.extend_from_slice(t.as_bytes());
                 }
             }
-            Event::Paste(s) => {
+            Event::Paste(s) if !s.is_empty() => {
                 out.pty_bytes.extend_from_slice(&paste_seq(mode, s));
                 saw_paste = true;
             }
+            Event::Paste(_) => {} // empty paste (image-only clipboard) — fall through
             // egui may deliver Ctrl+C / Ctrl+X as these instead of Key events.
             Event::Copy | Event::Cut => copy_or_interrupt = true,
             Event::Key {
@@ -705,6 +706,24 @@ mod tests {
         );
         assert_eq!(out.pty_bytes, b"\x1b\x03");
         assert!(!out.copy && !out.interrupt);
+    }
+    #[test]
+    fn empty_paste_event_still_flags_clipboard_read() {
+        // With an image-only clipboard, egui may deliver Paste("") for Ctrl+V.
+        // The empty event must neither type anything nor satisfy the request —
+        // the shell then falls back to the clipboard (text, else image → 0x16).
+        let live = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[key_ev(Key::V, mods(true, false, false)), Event::Paste(String::new())],
+            live,
+            TermMode::empty(),
+            false,
+        );
+        assert!(out.paste_clipboard);
+        assert!(out.pty_bytes.is_empty());
     }
 
     // ---- zoom ----------------------------------------------------------------
