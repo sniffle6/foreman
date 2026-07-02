@@ -2594,6 +2594,13 @@ impl WindowManager {
                 .unwrap_or(false);
             let pinned = is_renaming || dr.dragged() || tab_dragging || menu_open;
             let reveal_chrome = pinned || ui.rect_contains_pointer(reveal_band(scr, area));
+            // Chrome alpha: 0→1 fade, same feel as the OS bar minus the slide
+            // (the band is reserved space; sliding would be motion for its
+            // own sake). Interacts stay inside `if reveal_chrome`, so a
+            // fading-out header never swallows a click.
+            let chrome_t = ui
+                .ctx()
+                .animate_bool(base.with((id, "chrome_t")), reveal_chrome);
             let content_paint = if is_project {
                 content_rect
             } else {
@@ -2642,7 +2649,8 @@ impl WindowManager {
                 acts.push(Act::Focus(id));
             }
 
-            if reveal_chrome {
+            if chrome_t > 0.0 {
+                let fade = |c: egui::Color32| c.gamma_multiply(chrome_t);
                 // Projects have NO title bg — quiet chrome (spec 2026-07-02):
                 // the band reads as window margin until revealed, and revealed
                 // chrome floats directly on WIN_BG. Terminals keep their fill.
@@ -2650,7 +2658,7 @@ impl WindowManager {
                     p.rect_filled(
                         title_rect,
                         cr,
-                        if is_focus { TITLE_BG_FOCUS } else { TITLE_BG },
+                        fade(if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }),
                     );
                 }
                 // Right edge of the title/tab area; the project shell chips anchor here
@@ -2667,11 +2675,11 @@ impl WindowManager {
                     title_end_x = te_rect.max.x + 8.0;
                     // Theme the field to the dark/amber titlebar instead of egui's
                     // default light TextEdit: dark inset fill + amber edit-mode border.
-                    p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
+                    p.rect_filled(te_rect, egui::CornerRadius::same(3), fade(WIN_BG));
                     p.rect_stroke(
                         te_rect,
                         egui::CornerRadius::same(3),
-                        egui::Stroke::new(1.0, BORDER_FOCUS),
+                        egui::Stroke::new(1.0, fade(BORDER_FOCUS)),
                         egui::StrokeKind::Inside,
                     );
                     ui.visuals_mut().selection.bg_fill =
@@ -2772,7 +2780,7 @@ impl WindowManager {
                             sw: 0,
                             se: 0,
                         };
-                        p.rect_filled(chip, radius, bg);
+                        p.rect_filled(chip, radius, fade(bg));
                         // Project tabs get the focus-amber selection border (the same
                         // colour as a focused subwindow's border) on three sides only —
                         // the bottom edge is left open so the tab's colour flows straight
@@ -2783,7 +2791,7 @@ impl WindowManager {
                             p.rect_stroke(
                                 chip,
                                 radius,
-                                egui::Stroke::new(BORDER_W, tab_border),
+                                egui::Stroke::new(BORDER_W, fade(tab_border)),
                                 egui::StrokeKind::Inside,
                             );
                             // Paint over the bottom edge with the tab bg, leaving an open
@@ -2792,7 +2800,7 @@ impl WindowManager {
                                 egui::pos2(chip.min.x, chip.max.y - 1.0),
                                 egui::pos2(chip.max.x, chip.max.y),
                             );
-                            p.rect_filled(open, egui::CornerRadius::ZERO, bg);
+                            p.rect_filled(open, egui::CornerRadius::ZERO, fade(bg));
                         }
                         let txt_col = if is_active_tab { TEXT } else { DIM };
                         // Leading icon: agent logo / shell glyph / project folder.
@@ -2807,11 +2815,11 @@ impl WindowManager {
                             let px =
                                 (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                             let tex = crate::icons::texture(ui.ctx(), kind, px);
-                            let tint = if is_active_tab {
+                            let tint = fade(if is_active_tab {
                                 kind.tint()
                             } else {
                                 kind.tint().gamma_multiply(0.55)
-                            };
+                            });
                             p.image(
                                 tex.id(),
                                 icon_rect,
@@ -2828,7 +2836,7 @@ impl WindowManager {
                             egui::Align2::LEFT_CENTER,
                             &label,
                             tab_font.clone(),
-                            txt_col,
+                            fade(txt_col),
                         );
                         // Close affordance — shown only on the active or hovered tab
                         // (browser-style), and interactable only when shown.
@@ -2847,7 +2855,7 @@ impl WindowManager {
                             } else {
                                 txt_col
                             };
-                            let xstroke = egui::Stroke::new(1.2, xcol);
+                            let xstroke = egui::Stroke::new(1.2, fade(xcol));
                             p.line_segment(
                                 [
                                     egui::pos2(xc.x - xs, xc.y - xs),
@@ -2866,9 +2874,9 @@ impl WindowManager {
                         } else {
                             None
                         };
-                        if xresp.is_some_and(|r| r.clicked()) {
+                        if reveal_chrome && xresp.is_some_and(|r| r.clicked()) {
                             acts.push(Act::CloseTab(id, ti));
-                        } else if chip_resp.clicked() {
+                        } else if reveal_chrome && chip_resp.clicked() {
                             acts.push(Act::SetTab(id, ti));
                         } else if chip_resp.dragged() {
                             // Live drag-out: the instant the pointer leaves the tab bar,
@@ -2931,11 +2939,11 @@ impl WindowManager {
                         );
                         let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
-                        let tint = if is_focus {
+                        let tint = fade(if is_focus {
                             kind.tint()
                         } else {
                             kind.tint().gamma_multiply(0.55)
-                        };
+                        });
                         p.image(
                             tex.id(),
                             icon_rect,
@@ -2949,7 +2957,7 @@ impl WindowManager {
                         egui::Align2::LEFT_CENTER,
                         self.windows[i].title(),
                         egui::FontId::proportional(12.5),
-                        if is_focus { TEXT } else { DIM },
+                        fade(if is_focus { TEXT } else { DIM }),
                     );
                     title_end_x = tx + tw + 14.0;
                 }
@@ -2987,12 +2995,13 @@ impl WindowManager {
                     } else {
                         egui::Color32::TRANSPARENT
                     };
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
+                    ui.painter()
+                        .rect_filled(r, egui::CornerRadius::same(4), fade(bg));
                     // Icons are drawn as vector strokes (not font glyphs) so all three
                     // share one optical center, size, and weight regardless of font.
                     let c = r.center();
                     let s = 4.0; // icon half-extent
-                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                    let stroke = egui::Stroke::new(1.4, fade(if is_focus { TEXT } else { DIM }));
                     let p = ui.painter();
                     match role {
                         "min" => {
@@ -3056,7 +3065,7 @@ impl WindowManager {
                                 p.circle_filled(
                                     egui::pos2(c.x + dx, c.y),
                                     1.2,
-                                    if is_focus { TEXT } else { DIM },
+                                    fade(if is_focus { TEXT } else { DIM }),
                                 );
                             }
                         }
@@ -3071,7 +3080,7 @@ impl WindowManager {
                             );
                         }
                     }
-                    if resp.clicked() {
+                    if reveal_chrome && resp.clicked() {
                         match role {
                             "close" => acts.push(Act::Close(id)),
                             "max" => acts.push(Act::Max(id)),
