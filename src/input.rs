@@ -93,8 +93,10 @@ pub fn process_input(
                         _ => {}
                     }
                 }
-                // Copy/paste policy chords (Ctrl held) — intercepted before encoding.
-                if ctrl {
+                // Copy/paste policy chords (Ctrl held) — intercepted before
+                // encoding. Ctrl+Alt combos fall through to the encoder
+                // (Codex binds paste-image to Ctrl+Alt+V).
+                if ctrl && !m.alt {
                     match (k, m.shift) {
                         (Key::C, false) => {
                             copy_or_interrupt = true;
@@ -330,6 +332,14 @@ pub(crate) fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Vec<u8> {
             let name = key.name();
             let b = name.as_bytes();
             if b.len() == 1 {
+                // Ctrl+Alt+letter → ESC + control code (meta over the ctrl
+                // code); Codex's paste-image needs Ctrl+Alt+V = 1b 16.
+                if ctrl && mods.alt {
+                    let up = b[0].to_ascii_uppercase();
+                    if up.is_ascii_uppercase() {
+                        return vec![0x1b, up - 0x40];
+                    }
+                }
                 // Ctrl+letter → control code (0x01..0x1a).
                 if ctrl && !mods.alt {
                     let up = b[0].to_ascii_uppercase();
@@ -661,6 +671,40 @@ mod tests {
         };
         let out = process_input(&[Event::Text("@".into())], live, TermMode::empty(), false);
         assert_eq!(out.pty_bytes, b"@");
+    }
+    #[test]
+    fn ctrl_alt_v_encodes_meta_ctrl_v_not_clipboard_paste() {
+        // Codex's second paste-image binding; must not be shadowed by the
+        // Ctrl+V clipboard chord.
+        let live = Modifiers {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[key_ev(Key::V, mods(true, true, false))],
+            live,
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b\x16");
+        assert!(!out.paste_clipboard);
+    }
+    #[test]
+    fn ctrl_alt_c_does_not_copy_or_interrupt() {
+        let live = Modifiers {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[key_ev(Key::C, mods(true, true, false))],
+            live,
+            TermMode::empty(),
+            true,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b\x03");
+        assert!(!out.copy && !out.interrupt);
     }
 
     // ---- zoom ----------------------------------------------------------------
