@@ -21,6 +21,10 @@ const MAX_PLACEMENTS: usize = 64;
 const MAX_SCROLL_KEEP: usize = 10_000;
 /// Ids we assign when the client omits i= (top bit dodges client-chosen ids).
 const ANON_BASE: u32 = 0x8000_0000;
+/// Decoded images are capped at 16M pixels (64 MiB RGBA) — a single image can
+/// never exceed the whole store quota, and dimension-bomb inputs are rejected
+/// before any large allocation.
+const MAX_PIXELS: u64 = 16_000_000;
 
 /// Term facts sampled at a cut (built by terminal.rs `term_view`).
 pub struct TermView {
@@ -441,11 +445,15 @@ impl Graphics {
                 _ => self.placements.clear(), // bare a=d / d=a: clear visible
             },
             Cmd::Query { header, payload } => {
-                if header.quiet < 2 {
-                    let ok = header.medium == b'd'
-                        && matches!(header.format, 24 | 32 | 100)
-                        && decode_image(&header, &payload).is_ok();
-                    reply(out, header.id, if ok { b"OK" } else { b"ENOTSUPPORTED" });
+                let ok = header.medium == b'd'
+                    && matches!(header.format, 24 | 32 | 100)
+                    && decode_image(&header, &payload).is_ok();
+                if ok {
+                    if header.quiet == 0 {
+                        reply(out, header.id, b"OK");
+                    }
+                } else if header.quiet < 2 {
+                    reply(out, header.id, b"ENOTSUPPORTED");
                 }
             }
             Cmd::Nop { reply: r } => {
@@ -457,7 +465,7 @@ impl Graphics {
         // Scroll-cull: placements far into history can never return to view.
         let hist = view.history_size;
         self.placements
-            .retain(|p| p.alt || hist.saturating_sub(p.history) < MAX_SCROLL_KEEP);
+            .retain(|p| p.alt || (p.history <= hist && hist - p.history < MAX_SCROLL_KEEP));
     }
 
     /// What's visible right now. `line` already accounts for scrollback offset;
@@ -468,10 +476,13 @@ impl Graphics {
             if p.alt != v.alt_screen {
                 continue;
             }
+            if !p.alt && p.history > v.history_size {
+                continue; // scrollback shrank out from under this anchor
+            }
             let line = if p.alt {
                 p.line as isize
             } else {
-                p.line as isize - (v.history_size - p.history) as isize
+                p.line as isize - v.history_size.saturating_sub(p.history) as isize
                     + v.display_offset as isize
             };
             if line >= v.screen_lines as isize || line < -300 {
@@ -524,20 +535,27 @@ fn decode_image(h: &Header, b64: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static 
     let data = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|_| "EBASE64")?;
-    let px = (h.pix_w as usize, h.pix_h as usize);
     match h.format {
         100 => decode_png(&data),
         32 => {
-            if px.0 == 0 || px.1 == 0 || data.len() != px.0 * px.1 * 4 {
+            if h.pix_w == 0 || h.pix_h == 0 || (h.pix_w as u64) * (h.pix_h as u64) > MAX_PIXELS {
+                return Err("EBADRAW");
+            }
+            let need = (h.pix_w as u64 * h.pix_h as u64 * 4) as usize;
+            if data.len() != need {
                 return Err("EBADRAW");
             }
             Ok((h.pix_w, h.pix_h, data))
         }
         24 => {
-            if px.0 == 0 || px.1 == 0 || data.len() != px.0 * px.1 * 3 {
+            if h.pix_w == 0 || h.pix_h == 0 || (h.pix_w as u64) * (h.pix_h as u64) > MAX_PIXELS {
                 return Err("EBADRAW");
             }
-            let mut rgba = Vec::with_capacity(px.0 * px.1 * 4);
+            let need = (h.pix_w as u64 * h.pix_h as u64 * 3) as usize;
+            if data.len() != need {
+                return Err("EBADRAW");
+            }
+            let mut rgba = Vec::with_capacity(need / 3 * 4);
             for p in data.chunks_exact(3) {
                 rgba.extend_from_slice(p);
                 rgba.push(255);
@@ -552,10 +570,16 @@ fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let mut dec = png::Decoder::new(data);
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().map_err(|_| "EBADPNG")?;
+    let (w, h) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PIXELS {
+        return Err("ETOOBIG");
+    }
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).map_err(|_| "EBADPNG")?;
     buf.truncate(info.buffer_size());
-    let (w, h) = (info.width, info.height);
     match info.color_type {
         png::ColorType::Rgba => Ok((w, h, buf)),
         png::ColorType::Rgb => {
@@ -848,5 +872,61 @@ mod tests {
         }
         assert!(!g.has_image(1), "oldest image evicted past the quota");
         assert!(g.has_image(17));
+    }
+
+    #[test]
+    fn history_shrink_never_panics_and_hides_stale_placements() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(1));
+        g.apply(TermView { cursor_col: 0, cursor_line: 5, alt_screen: false, history_size: 100 }, &mut out);
+        // Scrollback was cleared: history went backwards.
+        let v = ViewportView { alt_screen: false, history_size: 0, display_offset: 0, screen_lines: 40 };
+        assert!(g.visible(&v).is_empty());
+    }
+
+    #[test]
+    fn raw_dimension_bomb_is_rejected_without_panicking() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(b"\x1b_Ga=T,t=d,f=32,s=2147483649,v=2147483649,i=1;AAAA\x1b\\");
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(out, b"\x1b_Gi=1;EBADRAW\x1b\\");
+        assert!(!g.has_image(1));
+    }
+
+    #[test]
+    fn png_dimension_bomb_is_rejected_before_allocation() {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut c: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        }
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&100_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&100_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        let mut png_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(&ihdr);
+        png_bytes.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        png_bytes.extend_from_slice(&0u32.to_be_bytes()); // zero-length IDAT
+        png_bytes.extend_from_slice(b"IDAT");
+        png_bytes.extend_from_slice(&crc32(b"IDAT").to_be_bytes());
+        assert_eq!(decode_png(&png_bytes), Err("ETOOBIG"));
+    }
+
+    #[test]
+    fn query_with_q1_suppresses_the_ok_reply() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24,q=1;AAAA\x1b\\");
+        g.apply(view(0, 0), &mut out);
+        assert!(out.is_empty());
     }
 }
