@@ -34,7 +34,10 @@ overlap with `⋯` (which would open both hover menus at once).
   chip packing, the control-zone fence, the `+` clamp — contract-tested),
   the header paint branch that consumes it, `hover_menu`, the `+`/`⋯` menu
   wiring.
-- `src/terminal.rs` — `BG`, the shared surface color.
+- `src/theme.rs` — every color token in one place (`BG` the shared surface
+  color, the border/focus ladder, selection whites, app chrome greys, chat and
+  ANSI palettes). Static consts by design — no runtime theme system until a
+  second theme exists.
 - `docs/superpowers/specs/2026-07-02-quiet-project-chrome-design.md` — the
   approved design and its rejected alternatives (overlay band, two menus,
   whole-project reveal).

@@ -14,10 +14,12 @@ mod proc;
 mod settings;
 mod skills_install;
 mod terminal;
+mod theme;
 mod wm;
 
 use eframe::egui;
 use terminal::Shell;
+use theme::*;
 use wm::WindowManager;
 
 struct App {
@@ -70,14 +72,6 @@ const CHROME_DWELL: f64 = 0.2; // ...rest on it this long (s) before the bar sho
 const CHROME_GRAB: f32 = 5.0; // outer rim that acts as the OS resize handle
 const CHROME_BTN_W: f32 = 42.0;
 const APP_BORDER_W: f32 = 7.0; // visible frame around the undecorated window
-const APP_BORDER: egui::Color32 = CHROME_BG; // frame matches the revealed bar
-
-const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(42, 42, 42);
-const CHROME_BORDER: egui::Color32 = egui::Color32::from_rgb(58, 58, 58);
-const CHROME_TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
-const CHROME_DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
-const CHROME_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(66, 66, 66);
-const CHROME_CLOSE_HOVER: egui::Color32 = egui::Color32::from_rgb(196, 43, 28);
 
 impl App {
     /// Hover-revealed replacement for the native title bar. Hidden until the
@@ -195,7 +189,7 @@ impl App {
                     egui::Align2::LEFT_CENTER,
                     "Foreman",
                     egui::FontId::proportional(13.0),
-                    CHROME_DIM,
+                    DIM,
                 );
 
                 for (resp, glyph) in [
@@ -213,7 +207,7 @@ impl App {
                         };
                         p.rect_filled(resp.rect, 0.0, bg);
                     }
-                    let col = if hovered { CHROME_TEXT } else { CHROME_DIM };
+                    let col = if hovered { TEXT } else { DIM };
                     chrome_glyph(p, glyph, resp.rect.center(), maximized, col, bg);
                 }
             });

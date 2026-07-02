@@ -2,6 +2,7 @@ use crate::dirpicker::{DirPicker, Outcome};
 use crate::keymap::{Chord, Command, Keymap};
 use crate::settings::{Outcome as SettingsOutcome, SettingsView};
 use crate::terminal::{Session, Shell};
+use crate::theme::*;
 use eframe::egui;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -48,36 +49,8 @@ fn settle_tick(
     (last_gen, quiet_since, done)
 }
 
-const DESK_BG: egui::Color32 = egui::Color32::from_rgb(25, 23, 19);
-const WIN_BG: egui::Color32 = egui::Color32::from_rgb(33, 30, 24);
-const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
-const TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(56, 49, 36);
-// Project windows (the outer nesting level) get a subtly cooler, deeper titlebar
-// so the two levels read as distinct without breaking the warm-graphite look.
-const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 60, 60);
-const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 231, 231);
-// The focused project sits a step dimmer than focused terminals so the two
-// levels stay distinct at a glance even with thin borders (same brightness
-// ladder as the old amber scheme, re-based on neutral white).
-const PROJ_BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 const BORDER_W: f32 = 0.75; // uniform window border width; focus is shown by colour
-const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
-const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
 
-// Chat viewer palette. Sender colors are assigned by terminal-id hash —
-// stable for a given id, distinct enough across a small fleet.
-const CHAT_COLORS: [egui::Color32; 6] = [
-    egui::Color32::from_rgb(231, 169, 63), // amber (also the human "you")
-    egui::Color32::from_rgb(127, 179, 127), // green
-    egui::Color32::from_rgb(111, 167, 199), // blue
-    egui::Color32::from_rgb(199, 127, 174), // pink
-    egui::Color32::from_rgb(180, 160, 100), // sand
-    egui::Color32::from_rgb(140, 170, 160), // sage
-];
-const CHAT_STALE: egui::Color32 = egui::Color32::from_rgb(202, 164, 90);
-const CHAT_LIVE: egui::Color32 = egui::Color32::from_rgb(127, 179, 127);
-const CHAT_EDGE: egui::Color32 = egui::Color32::from_rgb(150, 107, 28);
-const CHAT_MENTION_BG: egui::Color32 = egui::Color32::from_rgb(69, 64, 47);
 const CHAT_BOARD_W: f32 = 160.0;
 const CHAT_BOARD_MIN_W: f32 = 480.0; // window narrower than this hides the board
 
@@ -100,9 +73,6 @@ const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize h
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
 const MIN_H: f32 = 140.0;
 
-// snap overlay (amber, web mockup --needs #e7a93f)
-const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
-const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 const SNAP_GAP: f32 = 0.0; // inset of zones from the area edge; 0 = windows tile edge-to-edge
 
 // A cardinal direction for directional focus / snap commands.
@@ -448,8 +418,7 @@ impl Content {
                     egui::Stroke::new(1.0, BORDER),
                     egui::StrokeKind::Inside,
                 );
-                ui.visuals_mut().selection.bg_fill =
-                    egui::Color32::from_rgba_unmultiplied(231, 231, 231, 90);
+                ui.visuals_mut().selection.bg_fill = SELECTION_TEXT_BG;
                 let te = ui.put(
                     te_rect,
                     egui::TextEdit::singleline(&mut view.input)
@@ -2429,7 +2398,7 @@ impl WindowManager {
                 ui.painter_at(scr.intersect(area)).rect_filled(
                     scr,
                     egui::CornerRadius::ZERO,
-                    crate::terminal::BG,
+                    BG,
                 );
                 let cresp = ui.interact(
                     scr,
@@ -2621,7 +2590,7 @@ impl WindowManager {
             // reserved (unfilled) title bands at both levels must blend into
             // the content below them, or they read as header bars even with
             // no fill.
-            p.rect_filled(scr, cr, crate::terminal::BG);
+            p.rect_filled(scr, cr, BG);
 
             // --- content ---
             // Painted BEFORE the header so the hover-revealed header overlays
@@ -2707,8 +2676,7 @@ impl WindowManager {
                         egui::Stroke::new(1.0, BORDER_FOCUS),
                         egui::StrokeKind::Inside,
                     );
-                    ui.visuals_mut().selection.bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(231, 231, 231, 90);
+                    ui.visuals_mut().selection.bg_fill = SELECTION_TEXT_BG;
                     let resp = ui.put(
                         te_rect,
                         egui::TextEdit::singleline(&mut self.rename_buf)
@@ -2760,7 +2728,7 @@ impl WindowManager {
                         // the terminal). Inactive tabs sit lighter (hover lighter still)
                         // for an obvious active/inactive contrast.
                         let bg = if is_active_tab {
-                            crate::terminal::BG
+                            BG
                         } else if chip_resp.hovered() {
                             egui::Color32::from_rgb(50, 45, 35)
                         } else {
@@ -2951,8 +2919,7 @@ impl WindowManager {
                     } else {
                         egui::Color32::TRANSPARENT
                     };
-                    ui.painter()
-                        .rect_filled(r, egui::CornerRadius::same(4), bg);
+                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
                     // Icons are drawn as vector strokes (not font glyphs) so all three
                     // share one optical center, size, and weight regardless of font.
                     let c = r.center();
@@ -3051,8 +3018,7 @@ impl WindowManager {
                 if is_project {
                     // The + after the name: create/open actions.
                     if let Some(pr) = hl.plus {
-                        let presp =
-                            ui.interact(pr, base.with((id, "plus")), egui::Sense::click());
+                        let presp = ui.interact(pr, base.with((id, "plus")), egui::Sense::click());
                         let pbg = if presp.hovered() {
                             egui::Color32::from_rgb(72, 64, 50)
                         } else {
@@ -3062,11 +3028,16 @@ impl WindowManager {
                             .rect_filled(pr, egui::CornerRadius::same(4), pbg);
                         let c = pr.center();
                         let s = 4.0;
-                        let stroke =
-                            egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                        let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
                         let p = ui.painter();
-                        p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
-                        p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+                        p.line_segment(
+                            [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                            stroke,
+                        );
+                        p.line_segment(
+                            [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                            stroke,
+                        );
                         if let Some(act) = hover_menu(
                             ui,
                             base.with((id, "plusmenu")),
@@ -3663,7 +3634,6 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
 }
 
-
 /// Hover-opened popup menu anchored to a header button. Paints rows in a
 /// Foreground `Area` and returns the clicked item's `Act`. Items carry their
 /// action with their label so callers can't mispair them (no positional
@@ -3777,11 +3747,7 @@ fn hover_menu(
 /// buttons for terminals. The one home for the 54/113 policy — the title
 /// drag strip and the fence both derive from it.
 const fn header_ctl_w(is_project: bool) -> f32 {
-    if is_project {
-        54.0
-    } else {
-        113.0
-    }
+    if is_project { 54.0 } else { 113.0 }
 }
 
 /// Caller-measured tab label (raw galley width — the module applies the
@@ -3838,9 +3804,16 @@ struct ChipLayout {
 }
 
 enum HeaderContentLayout {
-    Rename { field: egui::Rect },
-    Tabs { chips: Vec<ChipLayout> },
-    Title { icon: Option<egui::Rect>, text_pos: egui::Pos2 },
+    Rename {
+        field: egui::Rect,
+    },
+    Tabs {
+        chips: Vec<ChipLayout>,
+    },
+    Title {
+        icon: Option<egui::Rect>,
+        text_pos: egui::Pos2,
+    },
 }
 
 struct HeaderLayout {
@@ -3887,7 +3860,11 @@ fn header_layout(scr: egui::Rect, is_project: bool, spec: HeaderSpec<'_>) -> Hea
             let mut chips = Vec::new();
             for (idx, t) in tabs.iter().enumerate() {
                 let tw = t.label_w.min(120.0);
-                let icon_w = if t.has_icon { icon_disp + icon_gap } else { 0.0 };
+                let icon_w = if t.has_icon {
+                    icon_disp + icon_gap
+                } else {
+                    0.0
+                };
                 let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
                 if cx + chip_w > avail_end && idx > 0 {
                     // Out of room: stop packing (many tabs on a narrow
@@ -4538,11 +4515,7 @@ mod tests {
             let plus = hl.plus.expect("projects get a +");
             assert!(plus.max.x <= hl.avail_end, "+ crossed the fence (w={w})");
             for (role, r) in &hl.controls {
-                assert!(
-                    !plus.intersects(*r),
-                    "+ overlaps {} (w={w})",
-                    role.id_str()
-                );
+                assert!(!plus.intersects(*r), "+ overlaps {} (w={w})", role.id_str());
             }
         }
     }
@@ -6435,5 +6408,4 @@ mod tests {
             "b expanded to full inner width"
         );
     }
-
 }

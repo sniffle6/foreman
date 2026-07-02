@@ -149,7 +149,7 @@ pub fn snapshot_cells<L: EventListener>(
                 col += 1;
                 continue;
             }
-            let fg = crate::terminal::resolve(cell.fg).unwrap_or(crate::terminal::FG);
+            let fg = crate::terminal::resolve(cell.fg).unwrap_or(crate::theme::FG);
             let bg = crate::terminal::resolve(cell.bg).map(|c| [c.r(), c.g(), c.b()]);
             row_cells.push(CellData {
                 ch: if cell.c == '\0' { ' ' } else { cell.c },

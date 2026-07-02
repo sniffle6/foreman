@@ -75,7 +75,7 @@ pub fn plan(
         let mut runs: Vec<StyleRun> = Vec::new();
         let mut run = String::new();
         let mut run_style = GlyphStyle {
-            fg: crate::terminal::FG,
+            fg: crate::theme::FG,
             bg: None,
             underline: false,
             strikethrough: false,

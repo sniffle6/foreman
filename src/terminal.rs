@@ -14,8 +14,7 @@ use alacritty_terminal::term::{Config, Term, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-pub const FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
-pub const BG: egui::Color32 = egui::Color32::from_rgb(20, 18, 15);
+use crate::theme::*;
 
 /// Coarse "some terminal produced output recently" signal for the render loop's
 /// adaptive cadence. Private — poke it only through [`note_pty_output`] /
@@ -32,25 +31,6 @@ pub fn note_pty_output() {
 pub fn take_pty_output() -> bool {
     PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
-
-const PALETTE: [egui::Color32; 16] = [
-    egui::Color32::from_rgb(43, 40, 36),
-    egui::Color32::from_rgb(207, 91, 72),
-    egui::Color32::from_rgb(148, 163, 109),
-    egui::Color32::from_rgb(231, 169, 63),
-    egui::Color32::from_rgb(96, 143, 176),
-    egui::Color32::from_rgb(176, 122, 161),
-    egui::Color32::from_rgb(116, 176, 164),
-    egui::Color32::from_rgb(204, 198, 184),
-    egui::Color32::from_rgb(111, 106, 93),
-    egui::Color32::from_rgb(226, 97, 59),
-    egui::Color32::from_rgb(174, 189, 127),
-    egui::Color32::from_rgb(240, 197, 96),
-    egui::Color32::from_rgb(122, 167, 199),
-    egui::Color32::from_rgb(199, 155, 184),
-    egui::Color32::from_rgb(143, 199, 187),
-    egui::Color32::from_rgb(236, 231, 218),
-];
 
 fn indexed_rgb(i: u8) -> egui::Color32 {
     if (i as usize) < 16 {
@@ -1047,16 +1027,13 @@ impl Session {
         let galley = painter.layout_job(job);
         painter.galley(rect.min, galley, FG);
 
-        // selection highlight (translucent white over selected cells)
-        let hl = egui::Color32::from_rgba_unmultiplied(231, 231, 231, 70);
         for r in &plan.highlights {
-            painter.rect_filled(*r, egui::CornerRadius::ZERO, hl);
+            painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
         }
 
         // caret — the gate chose the cell; focus (`active`) gates whether we paint.
         if active && let Some(r) = plan.caret {
-            let amber = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 130);
-            painter.rect_filled(r, egui::CornerRadius::ZERO, amber);
+            painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
@@ -1067,7 +1044,7 @@ impl Session {
             painter.rect_filled(
                 r,
                 egui::CornerRadius::same(2),
-                egui::Color32::from_rgba_unmultiplied(231, 231, 231, 150),
+                SCROLL_THUMB,
             );
         }
     }

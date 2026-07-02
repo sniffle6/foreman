@@ -207,3 +207,12 @@ cursors — a pure step, so the delivery guarantee can be tested without a termi
 The engine only injects what the Outbox hands back; it never decides what to send.
 _Avoid_: queue, buffer, broadcast (broadcast is a targeting mode, not the delivery
 step).
+
+**Theme tokens**:
+Every named color lives as a const in `src/theme.rs`, glob-imported by its
+consumers — one place to restyle the app, and the future seam for real themes.
+Deliberately static: the consts become fields on a Theme struct only when a
+second theme actually lands; a switchable system today would be interface with
+nothing behind it.
+_Avoid_: palette (that's the ANSI 16-color table, one token among many),
+stylesheet, skin.

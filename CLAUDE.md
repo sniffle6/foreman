@@ -99,6 +99,9 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
 - `src/settings.rs` — in-app keybindings editor; a desktop-level modal overlay
   (mirrors the `dirpicker.rs` pattern), edits the live `Keymap` and signals the
   wm when to persist.
+- `src/theme.rs` — every color token (surfaces, border/focus ladder, selection,
+  app chrome, chat, ANSI palette) as consts, glob-imported by consumers. Static
+  by design — no runtime theme system until a second theme exists.
 - `src/skills_install.rs` — on startup, embeds (`include_str!`) and installs the
   `foreman-dispatch`/`foreman-chat` skills into Claude and Codex global skill
   dirs so agents in any project (incl. external repos) can discover them. Source

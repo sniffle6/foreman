@@ -9,16 +9,10 @@
 //! touches disk itself; the wm owns the keymap and the persistence trigger.
 
 use crate::keymap::{Chord, Command, Group, Keymap};
+use crate::theme::*;
 use eframe::egui;
 
 // Palette — kept in step with wm.rs so the overlay reads as part of the app.
-const WIN_BG: egui::Color32 = egui::Color32::from_rgb(33, 30, 24);
-const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
-const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
-const SEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 30);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(214, 102, 84);
-
 /// What the editor wants the caller to do after a frame.
 pub enum Outcome {
     /// Stay open, nothing to persist.
