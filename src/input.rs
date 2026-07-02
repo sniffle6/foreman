@@ -32,6 +32,10 @@ pub struct InputOutcome {
     pub zoom_reset: bool,
 }
 
+/// Decide what this frame's egui events mean for the terminal. Pure: real
+/// egui/alacritty types in, an `InputOutcome` out, no I/O. `mods` is the live
+/// frame modifier state (distinct from any per-event `Key` modifiers), used to
+/// tell a genuine Alt+letter Text event apart from AltGr.
 pub fn process_input(
     events: &[Event],
     mods: Modifiers,
@@ -717,7 +721,10 @@ mod tests {
             ..Default::default()
         };
         let out = process_input(
-            &[key_ev(Key::V, mods(true, false, false)), Event::Paste(String::new())],
+            &[
+                key_ev(Key::V, mods(true, false, false)),
+                Event::Paste(String::new()),
+            ],
             live,
             TermMode::empty(),
             false,
