@@ -761,6 +761,10 @@ impl WindowManager {
             // color (Codex's input box, etc.). foreman renders truecolor.
             ("COLORTERM".to_string(), "truecolor".to_string()),
             ("TERM".to_string(), "xterm-256color".to_string()),
+            // Kitty graphics: the narrowest signal that makes agents (Codex
+            // pets) pick the kitty protocol. TERM stays truthful — we implement
+            // the graphics subset in src/graphics.rs, not all of kitty.
+            ("KITTY_WINDOW_ID".to_string(), "1".to_string()),
         ];
         if let Some(t) = &self.tag {
             v.push(("FOREMAN_PROJECT_ID".to_string(), t.clone()));
