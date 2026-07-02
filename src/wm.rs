@@ -2643,12 +2643,16 @@ impl WindowManager {
             }
 
             if reveal_chrome {
-                let (tbg, tbg_focus) = if is_project {
-                    (PROJ_TITLE_BG, PROJ_TITLE_BG_FOCUS)
-                } else {
-                    (TITLE_BG, TITLE_BG_FOCUS)
-                };
-                p.rect_filled(title_rect, cr, if is_focus { tbg_focus } else { tbg });
+                // Projects have NO title bg — quiet chrome (spec 2026-07-02):
+                // the band reads as window margin until revealed, and revealed
+                // chrome floats directly on WIN_BG. Terminals keep their fill.
+                if !is_project {
+                    p.rect_filled(
+                        title_rect,
+                        cr,
+                        if is_focus { TITLE_BG_FOCUS } else { TITLE_BG },
+                    );
+                }
                 // Right edge of the title/tab area; the project shell chips anchor here
                 // so they never overlap a multi-tab bar. Set by each titlebar branch.
                 let title_end_x;
@@ -2950,65 +2954,29 @@ impl WindowManager {
                     title_end_x = tx + tw + 14.0;
                 }
 
-                // --- dispatch keys (project headers only) ---
-                // Compact "PS · CMD · SH" stamped after the title: clicking one spawns
-                // a terminal of that shell *into this project*. Lives here (not the
-                // global bar) so the target site is unambiguous — the window you click.
-                if is_project {
-                    let kh = TITLE_H - 10.0;
-                    let ky = scr.min.y + 5.0;
-                    let mut kx = title_end_x;
-                    let key_font = egui::FontId::proportional(10.5);
-                    for (label, shell) in [
-                        ("PS", Shell::PowerShell),
-                        ("CMD", Shell::Cmd),
-                        ("SH", Shell::Bash),
-                    ] {
-                        let tw = ui
-                            .painter()
-                            .layout_no_wrap(label.to_owned(), key_font.clone(), TEXT)
-                            .size()
-                            .x;
-                        let kw = tw + 12.0;
-                        // keep keys from colliding with the window controls on narrow windows
-                        if kx + kw > scr.max.x - ctl_w {
-                            break;
-                        }
-                        let r = egui::Rect::from_min_size(egui::pos2(kx, ky), egui::vec2(kw, kh));
-                        let kresp =
-                            ui.interact(r, base.with((id, "disp", label)), egui::Sense::click());
-                        let kbg = if kresp.hovered() {
-                            egui::Color32::from_rgb(72, 82, 76)
-                        } else {
-                            egui::Color32::from_rgb(45, 51, 48)
-                        };
-                        ui.painter()
-                            .rect_filled(r, egui::CornerRadius::same(3), kbg);
-                        ui.painter().text(
-                            r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            key_font.clone(),
-                            if is_focus { TEXT } else { DIM },
-                        );
-                        if kresp.clicked() {
-                            acts.push(Act::AddTerm(id, shell));
-                        }
-                        kx += kw + 5.0;
-                    }
-                }
-
                 // --- window controls ---
+                // Projects show only close + overflow (quiet chrome); the
+                // remaining actions live in the ⋯ menu. Terminals keep all
+                // four buttons.
+                let roles: &[(&str, bool)] = if is_project {
+                    &[("close", true), ("ovf", false)]
+                } else {
+                    &[
+                        ("close", true),
+                        ("max", false),
+                        ("min", false),
+                        ("float", false),
+                    ]
+                };
                 let by = scr.min.y + 3.0;
                 let bh = TITLE_H - 6.0;
                 let mut bx = scr.max.x - 4.0 - 22.0;
-                for (role, danger) in [
-                    ("close", true),
-                    ("max", false),
-                    ("min", false),
-                    ("float", false),
-                ] {
+                let mut ovf_rect = egui::Rect::NOTHING;
+                for (role, danger) in roles.iter().copied() {
                     let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
+                    if role == "ovf" {
+                        ovf_rect = r;
+                    }
                     let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
                     let bg = if resp.hovered() {
                         if danger {
@@ -3083,6 +3051,15 @@ impl WindowManager {
                                 );
                             }
                         }
+                        "ovf" => {
+                            for dx in [-4.0f32, 0.0, 4.0] {
+                                p.circle_filled(
+                                    egui::pos2(c.x + dx, c.y),
+                                    1.2,
+                                    if is_focus { TEXT } else { DIM },
+                                );
+                            }
+                        }
                         _ => {
                             p.line_segment(
                                 [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
@@ -3095,37 +3072,121 @@ impl WindowManager {
                         }
                     }
                     if resp.clicked() {
-                        acts.push(match role {
-                            "close" => Act::Close(id),
-                            "max" => Act::Max(id),
-                            "float" => Act::Float(id),
-                            _ => Act::Min(id),
-                        });
+                        match role {
+                            "close" => acts.push(Act::Close(id)),
+                            "max" => acts.push(Act::Max(id)),
+                            "float" => acts.push(Act::Float(id)),
+                            "ovf" => {
+                                let mid = base.with((id, "ovfmenu_open"));
+                                ui.ctx().data_mut(|d| {
+                                    let open = d.get_temp::<bool>(mid).unwrap_or(false);
+                                    d.insert_temp(mid, !open);
+                                });
+                            }
+                            _ => acts.push(Act::Min(id)),
+                        }
                     }
                     bx -= 25.0;
                 }
 
-                // --- new-project button (project titlebars only) ---
-                // Sits just left of the window controls; spawns a sibling project on
-                // the desktop. Replaces the old global "+ project" header button.
+                // --- ⋯ overflow menu (projects only) ---
+                // Open flag lives in transient egui memory: per-frame UI
+                // state, not model state — it must never reach Win/serde.
                 if is_project {
-                    let r =
-                        egui::Rect::from_min_size(egui::pos2(bx - 4.0, by), egui::vec2(22.0, bh));
-                    let resp = ui.interact(r, base.with((id, "addproj")), egui::Sense::click());
-                    let bg = if resp.hovered() {
-                        egui::Color32::from_rgb(72, 64, 50)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
-                    let c = r.center();
-                    let s = 4.0;
-                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
-                    let p = ui.painter();
-                    p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
-                    p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
-                    if resp.clicked() {
-                        acts.push(Act::OpenProjectPicker);
+                    let mid = base.with((id, "ovfmenu_open"));
+                    let open = ui.ctx().data(|d| d.get_temp::<bool>(mid)).unwrap_or(false);
+                    if open {
+                        let float_label = if is_tiled { "Float" } else { "Tile" };
+                        let labels = [
+                            "New PS terminal",
+                            "New CMD terminal",
+                            "New SH terminal",
+                            "New project",
+                            float_label,
+                            "Minimize",
+                            "Maximize",
+                        ];
+                        let font = egui::FontId::proportional(12.0);
+                        let row_h = 22.0;
+                        let pad = 10.0;
+                        let w = labels
+                            .iter()
+                            .map(|l| {
+                                ui.painter()
+                                    .layout_no_wrap((*l).to_owned(), font.clone(), TEXT)
+                                    .size()
+                                    .x
+                            })
+                            .fold(0.0f32, f32::max)
+                            + pad * 2.0;
+                        let origin = egui::pos2(
+                            (ovf_rect.right() - w).max(area.min.x),
+                            ovf_rect.bottom() + 2.0,
+                        );
+                        let panel = egui::Rect::from_min_size(
+                            origin,
+                            egui::vec2(w, row_h * labels.len() as f32 + 8.0),
+                        );
+                        egui::Area::new(base.with((id, "ovfmenu")))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(origin)
+                            .show(ui.ctx(), |mui| {
+                                let mp = mui.painter();
+                                mp.rect_filled(panel, egui::CornerRadius::same(4), TITLE_BG);
+                                mp.rect_stroke(
+                                    panel,
+                                    egui::CornerRadius::same(4),
+                                    egui::Stroke::new(1.0, BORDER),
+                                    egui::StrokeKind::Inside,
+                                );
+                                for (ri, label) in labels.iter().enumerate() {
+                                    let rr = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            panel.min.x,
+                                            panel.min.y + 4.0 + row_h * ri as f32,
+                                        ),
+                                        egui::vec2(w, row_h),
+                                    );
+                                    let rresp = mui.interact(
+                                        rr,
+                                        base.with((id, "ovfitem", ri)),
+                                        egui::Sense::click(),
+                                    );
+                                    if rresp.hovered() {
+                                        mui.painter().rect_filled(rr, 0.0, TITLE_BG_FOCUS);
+                                    }
+                                    mui.painter().text(
+                                        egui::pos2(rr.min.x + pad, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        *label,
+                                        font.clone(),
+                                        TEXT,
+                                    );
+                                    if rresp.clicked() {
+                                        match ri {
+                                            0 => acts.push(Act::AddTerm(id, Shell::PowerShell)),
+                                            1 => acts.push(Act::AddTerm(id, Shell::Cmd)),
+                                            2 => acts.push(Act::AddTerm(id, Shell::Bash)),
+                                            3 => acts.push(Act::OpenProjectPicker),
+                                            4 => acts.push(Act::Float(id)),
+                                            5 => acts.push(Act::Min(id)),
+                                            _ => acts.push(Act::Max(id)),
+                                        }
+                                        mui.ctx().data_mut(|d| d.insert_temp(mid, false));
+                                    }
+                                }
+                            });
+                        // Click anywhere outside menu + button, or Escape: close.
+                        let clicked_out = ui.input(|i| {
+                            i.pointer.any_click()
+                                && i.pointer
+                                    .latest_pos()
+                                    .is_some_and(|p| !panel.contains(p) && !ovf_rect.contains(p))
+                        });
+                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if clicked_out || esc {
+                            ui.ctx().data_mut(|d| d.insert_temp(mid, false));
+                        }
                     }
                 }
             } // end reveal_chrome (hover-revealed header)
