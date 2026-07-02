@@ -140,6 +140,20 @@ pub fn zoom_step(cur: f32, steps: f32) -> f32 {
         .clamp(crate::config::MIN_FONT_SIZE, crate::config::MAX_FONT_SIZE)
 }
 
+/// Accumulate a smoothed wheel delta and emit only whole steps. egui delivers a
+/// wheel notch as sub-frame fractions; dividing `delta` by `unit` (a line height
+/// for scrollback, the zoom notch for Ctrl+Scroll) and truncating both drops
+/// gentle scrolls (→0) and over-emits fast ones, so the caller carries the
+/// fractional part between frames. Returns `(whole_steps, remainder)`: apply
+/// `whole_steps` (sign = direction) and feed `remainder` back as the next
+/// frame's `accum`. Pure so the accumulate→trunc glue is unit-testable without a
+/// live egui `Context`.
+pub fn wheel_steps(accum: f32, delta: f32, unit: f32) -> (f32, f32) {
+    let acc = accum + delta / unit;
+    let steps = acc.trunc();
+    (steps, acc - steps)
+}
+
 /// Bracketed-paste wrap, gated on the app actually enabling it. ESC is always
 /// stripped from the payload so a quoted `ESC[201~` can't end the block early and
 /// turn the rest into live keystrokes.
@@ -692,5 +706,54 @@ mod tests {
     #[test]
     fn wheel_zero_delta_is_a_noop_scrollback() {
         assert_eq!(scrollback_delta(wheel_input(0, TermMode::empty(), 1, 1)), 0);
+    }
+
+    // ---- wheel_steps ---------------------------------------------------------
+    // The accumulate→trunc glue: egui delivers a wheel notch as smoothed
+    // per-frame fractions, so `show()` carries the sub-step remainder between
+    // frames and emits only whole steps. Feed each returned remainder back in as
+    // the next call's `accum`, exactly as the two call sites do.
+
+    #[test]
+    fn wheel_steps_gentle_scroll_accumulates_across_frames_to_one_step() {
+        // A quarter-unit per frame: three frames emit nothing; the fourth
+        // crosses one whole step and resets the carry.
+        let unit = 4.0;
+        let mut accum = 0.0;
+        for _ in 0..3 {
+            let (steps, rem) = wheel_steps(accum, 1.0, unit);
+            assert_eq!(steps, 0.0);
+            accum = rem;
+        }
+        let (steps, rem) = wheel_steps(accum, 1.0, unit);
+        assert_eq!(steps, 1.0);
+        assert_eq!(rem, 0.0);
+    }
+
+    #[test]
+    fn wheel_steps_fast_flick_emits_multiple_steps_without_over_emitting() {
+        // One fat frame worth 3.5 units emits exactly 3 whole steps and carries
+        // 0.5 — never rounds up to 4.
+        let (steps, rem) = wheel_steps(0.0, 14.0, 4.0);
+        assert_eq!(steps, 3.0);
+        assert_eq!(rem, 0.5);
+    }
+
+    #[test]
+    fn wheel_steps_remainder_carries_sign() {
+        // Scrolling the other way keeps a negative remainder so the next frame
+        // keeps accumulating downward instead of cancelling the carry.
+        let (steps, rem) = wheel_steps(0.0, -6.0, 4.0);
+        assert_eq!(steps, -1.0);
+        assert_eq!(rem, -0.5);
+    }
+
+    #[test]
+    fn wheel_steps_zero_delta_is_a_noop() {
+        // No wheel this frame: no steps, and the carried sub-unit remainder is
+        // returned untouched.
+        let (steps, rem) = wheel_steps(0.42, 0.0, 4.0);
+        assert_eq!(steps, 0.0);
+        assert_eq!(rem, 0.42);
     }
 }

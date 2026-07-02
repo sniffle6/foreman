@@ -3,6 +3,8 @@ mod chat;
 mod config;
 mod control;
 mod dirpicker;
+mod frame;
+mod geom;
 mod icons;
 mod input;
 mod inspect;

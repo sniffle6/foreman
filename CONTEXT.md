@@ -172,6 +172,24 @@ is actively editing, and holds far jumps and self-running animations. The caret
 is what Foreman paints; the cursor is the program's, owned by the grid model.
 _Avoid_: cursor (that's the model's), blink, debounce.
 
+**Cell metrics**:
+One frame's pixel↔cell geometry for a Session's pane — where the pane starts,
+how big a cell is, and how many cells fit. Every pointer→cell and cell→rect
+conversion goes through it, so out-of-bounds clamping is decided (and tested)
+in one place instead of at each paint or input site.
+_Avoid_: geometry (too broad), layout (that word belongs to the Layout tree),
+hit-testing.
+
+**Frame plan**:
+One frame's paint geometry and content for a Session's pane — the styled text
+runs, the selection-highlight rects, the caret rect, and the scrollback-thumb
+rect — computed purely from the grid, its Cell metrics, the selection, and the
+Caret gate's decision. `show()` only decides visibility (focus for the caret,
+hover for the thumb) and the paint style (colors, corner radii), then replays the
+plan. The grid walk is clamped to the grid's real bounds first, so a stale index
+can't panic and abort the process.
+_Avoid_: display list, render list, draw commands.
+
 **Outbox**:
 The Chat room's per-frame delivery decision: given which Members are Ready, it
 returns exactly the framed lines each one still needs and advances their delivery

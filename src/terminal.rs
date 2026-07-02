@@ -10,7 +10,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 pub const FG: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
@@ -124,14 +124,14 @@ fn query_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
 /// and dim, plus the line decorations. Pure, so the inverse/dim/flag logic is
 /// unit-tested apart from the egui painter; `show` turns this into a `TextFormat`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct GlyphStyle {
-    fg: egui::Color32,
-    bg: Option<egui::Color32>,
-    underline: bool,
-    strikethrough: bool,
+pub(crate) struct GlyphStyle {
+    pub(crate) fg: egui::Color32,
+    pub(crate) bg: Option<egui::Color32>,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
 }
 
-fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphStyle {
+pub(crate) fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphStyle {
     let mut fg = resolve(fg).unwrap_or(FG);
     let mut bg = resolve(bg);
     if flags.contains(Flags::INVERSE) {
@@ -587,14 +587,6 @@ impl Session {
         Some(code)
     }
 
-    fn cell_at(&self, rect: egui::Rect, cw: f32, rh: f32, pos: egui::Pos2) -> (usize, usize) {
-        let col =
-            (((pos.x - rect.min.x) / cw).floor() as i64).clamp(0, self.cols as i64 - 1) as usize;
-        let row =
-            (((pos.y - rect.min.y) / rh).floor() as i64).clamp(0, self.rows as i64 - 1) as usize;
-        (row, col)
-    }
-
     fn selection_text(&self) -> Option<String> {
         let (a, b) = (self.sel_anchor?, self.sel_head?);
         if a == b {
@@ -883,17 +875,18 @@ impl Session {
         let rows = ((rect.height() / rh).floor() as usize).clamp(1, 300);
         self.resize(cols, rows);
         self.pump();
+        let metrics = crate::geom::CellMetrics::new(rect, cw, rh, cols, rows);
         if active {
             // mouse text selection (the WM hands us the content-area drag)
             if resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let c = self.cell_at(rect, cw, rh, p);
+                    let c = metrics.cell_at(p);
                     self.sel_anchor = Some(c);
                     self.sel_head = Some(c);
                 }
             } else if resp.dragged() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    self.sel_head = Some(self.cell_at(rect, cw, rh, p));
+                    self.sel_head = Some(metrics.cell_at(p));
                 }
             } else if resp.clicked() {
                 self.sel_anchor = None;
@@ -926,26 +919,20 @@ impl Session {
                 // Accumulate against the notch size (same smoothing as line scroll)
                 // and step whole notches; the wheel is fully consumed here so it
                 // neither moves scrollback nor reaches the app.
-                self.zoom_accum += dy / ZOOM_NOTCH_PX;
-                let steps = self.zoom_accum.trunc();
-                self.zoom_accum -= steps;
+                let (steps, rem) = crate::input::wheel_steps(self.zoom_accum, dy, ZOOM_NOTCH_PX);
+                self.zoom_accum = rem;
                 if steps != 0.0 {
                     let next = crate::input::zoom_step(font_size(ui.ctx()), steps);
                     set_font_size(ui.ctx(), next);
                 }
             } else if dy != 0.0 {
-                self.scroll_accum += dy / rh;
-                let lines = self.scroll_accum.trunc() as i32;
-                self.scroll_accum -= lines as f32;
+                let (steps, rem) = crate::input::wheel_steps(self.scroll_accum, dy, rh);
+                self.scroll_accum = rem;
+                let lines = steps as i32;
                 if lines != 0 {
-                    // pointer → 1-based viewport cell
+                    // pointer → 1-based viewport cell (mouse-protocol order)
                     let (col, row) = match resp.hover_pos() {
-                        Some(p) => (
-                            (((p.x - rect.min.x) / cw).floor() as i32 + 1).clamp(1, cols as i32)
-                                as u16,
-                            (((p.y - rect.min.y) / rh).floor() as i32 + 1).clamp(1, rows as i32)
-                                as u16,
-                        ),
+                        Some(p) => metrics.mouse_cell(p),
                         None => (1, 1),
                     };
                     let mode = *self.term.mode();
@@ -988,30 +975,29 @@ impl Session {
             std::time::Instant::now(),
         );
 
-        let grid = self.term.grid();
-        let off = grid.display_offset() as i32;
-        let hist = grid.history_size();
-        // `pump()` advanced the parser THIS frame, so the grid's real size can
-        // momentarily differ from the cached cols/rows (alt-screen swap, reset, or
-        // column-mode from a full-screen TUI like `claude`). Index against the
-        // grid's ACTUAL bounds: a stale index panics, and a panic across the winit
-        // callback aborts the whole process.
-        let ncols = self.cols.min(grid.columns());
-        let nrows = self.rows.min(grid.screen_lines());
+        // Selection range in viewport coords: None unless both ends are set and
+        // distinct; ordered start<=end with the same swap the rest of the code uses.
+        let sel = match (self.sel_anchor, self.sel_head) {
+            (Some(a), Some(b)) if a != b => {
+                let (s, e) = if a <= b { (a, b) } else { (b, a) };
+                Some(crate::frame::SelRange { start: s, end: e })
+            }
+            _ => None,
+        };
+
+        // The frame's paint geometry + content (pure). show() only replays it here,
+        // deciding visibility (focus/hover) and the paint style (colors, radii).
+        let plan = crate::frame::plan(self.term.grid(), &metrics, sel, cursor_draw);
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
+
+        // Text: one TextFormat append per style run, a newline after each row.
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
-        for row in 0..nrows {
-            let mut run = String::new();
-            let mut run_style = GlyphStyle {
-                fg: FG,
-                bg: None,
-                underline: false,
-                strikethrough: false,
-            };
-            let flush = |job: &mut LayoutJob, run: &mut String, st: GlyphStyle| {
-                if run.is_empty() {
-                    return;
-                }
+        for runs in &plan.rows {
+            for r in runs {
+                let st = r.style;
                 let line = |on: bool| {
                     if on {
                         egui::Stroke::new(1.0, st.fg)
@@ -1020,7 +1006,7 @@ impl Session {
                     }
                 };
                 job.append(
-                    run,
+                    &r.text,
                     0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::monospace(font_px),
@@ -1031,89 +1017,31 @@ impl Session {
                         ..Default::default()
                     },
                 );
-                run.clear();
-            };
-            for col in 0..ncols {
-                let cell = &grid[Line(row as i32 - off)][Column(col)];
-                let style = glyph_style(cell.flags, cell.fg, cell.bg);
-                if style != run_style {
-                    flush(&mut job, &mut run, run_style);
-                    run_style = style;
-                }
-                run.push(if cell.c == '\0' { ' ' } else { cell.c });
             }
-            flush(&mut job, &mut run, run_style);
             job.append("\n", 0.0, egui::TextFormat::default());
         }
-
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
         let galley = painter.layout_job(job);
         painter.galley(rect.min, galley, FG);
 
         // selection highlight (translucent amber over selected cells)
-        if let (Some(a), Some(b)) = (self.sel_anchor, self.sel_head) {
-            if a != b {
-                let (s, e) = if a <= b { (a, b) } else { (b, a) };
-                let hl = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 70);
-                for row in s.0..=e.0 {
-                    let c0 = if row == s.0 { s.1 } else { 0 };
-                    let c1 = if row == e.0 {
-                        e.1
-                    } else {
-                        self.cols.saturating_sub(1)
-                    };
-                    if c1 < c0 {
-                        continue;
-                    }
-                    let x = rect.min.x + c0 as f32 * cw;
-                    let y = rect.min.y + row as f32 * rh;
-                    let w = (c1 - c0 + 1) as f32 * cw;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, rh)),
-                        egui::CornerRadius::ZERO,
-                        hl,
-                    );
-                }
-            }
+        let hl = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 70);
+        for r in &plan.highlights {
+            painter.rect_filled(*r, egui::CornerRadius::ZERO, hl);
         }
 
-        if let crate::caret::CursorDraw::At { line, col, shape } = cursor_draw
-            && active
-            && line >= 0
-            && off == 0
-        {
-            let cx = rect.min.x + col as f32 * cw;
-            let cy = rect.min.y + line as f32 * rh;
+        // caret — the gate chose the cell; focus (`active`) gates whether we paint.
+        if active && let Some(r) = plan.caret {
             let amber = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 130);
-            // Honor the shape the program asked for: beam (insert mode) and
-            // underline are thin bars; block and anything else fill the cell.
-            let cur_rect = match shape {
-                CursorShape::Beam => {
-                    egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(2.0, rh))
-                }
-                CursorShape::Underline => {
-                    egui::Rect::from_min_size(egui::pos2(cx, cy + rh - 2.0), egui::vec2(cw, 2.0))
-                }
-                _ => egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cw, rh)),
-            };
-            painter.rect_filled(cur_rect, egui::CornerRadius::ZERO, amber);
+            painter.rect_filled(r, egui::CornerRadius::ZERO, amber);
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
         // history and the user is scrolled back or hovering the pane.
-        let total = self.rows + hist;
-        if hist > 0 && total > self.rows && (off > 0 || resp.hovered()) {
-            let track_h = rect.height();
-            let thumb_h = (track_h * self.rows as f32 / total as f32).max(16.0);
-            let top_frac = (hist as i32 - off).max(0) as f32 / total as f32;
-            let thumb_y = (rect.min.y + track_h * top_frac).min(rect.max.y - thumb_h);
-            let w = 4.0;
+        if let Some(r) = plan.thumb
+            && (plan.scrolled_back || resp.hovered())
+        {
             painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(rect.max.x - w, thumb_y),
-                    egui::vec2(w, thumb_h),
-                ),
+                r,
                 egui::CornerRadius::same(2),
                 egui::Color32::from_rgba_unmultiplied(231, 169, 63, 150),
             );
