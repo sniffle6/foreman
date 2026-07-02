@@ -166,7 +166,7 @@ seam.
 | `a=T`, `t=d`, `f=100` (PNG) and `f=32/24` (raw RGBA/RGB) | Decode, place at cursor, sized c×r cells (computed from pixels + cell metrics when c/r absent) |
 | `m=0/1` chunking | Reassembled across APC sequences |
 | `a=d` (`d=I` by id; bare = clear visible) | Remove placements/data |
-| `a=q` query | Honest reply via existing `resp` buffer when `q<2` (OK only for what we support) |
+| `a=q` query | Honest reply when `q<2` (OK only for what we support), written straight to the PTY writer — NOT via the `resp` buffer, whose flush latches `ready` (DSR contract); a graphics reply must never fake readiness |
 | Anything else | Silently skipped — never corrupts, never replies unless `q<2` demands an error |
 
 Placement anchors: cursor cell at apply time; alt-screen placements are
