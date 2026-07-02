@@ -1092,6 +1092,12 @@ impl Session {
 
         // Kitty graphics overlay — images are pure overlay; the grid stays
         // text (spec: docs/superpowers/specs/2026-07-02-terminal-image-support-design.md).
+        // Drop textures whose image data is gone (deleted/evicted). Runs even
+        // when no placements are live — a delete of the LAST image must still
+        // release its texture (the paint block below is skipped entirely then).
+        if !self.textures.is_empty() {
+            self.textures.retain(|id, _| self.graphics.has_image(*id));
+        }
         if self.graphics.active() {
             let (alt, hist, off, lines) = {
                 let g = self.term.grid();
@@ -1149,8 +1155,6 @@ impl Session {
                     egui::Color32::WHITE,
                 );
             }
-            // Drop textures whose image data is gone (deleted/evicted).
-            self.textures.retain(|id, _| self.graphics.has_image(*id));
         }
 
         for r in &plan.highlights {
