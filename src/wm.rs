@@ -2575,21 +2575,25 @@ impl WindowManager {
                 egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
             );
 
-            // Non-project chrome is hover-revealed (same reveal rule as the
-            // terminal scrollbar): the content owns the full window rect — so
-            // the grid never resizes on hover — and the header paints OVER the
-            // top strip only while the pointer is on this window, or while a
-            // header gesture (move drag, tab tear-out, rename) is in flight so
-            // a fast pointer can't strand it mid-drag. The content INTERACT
-            // rect stays below the strip: whenever the pointer is up there the
-            // header is showing and owns that band, so nothing is lost.
+            // ALL window chrome (projects and terminals) is hover-revealed by
+            // ONE rule: the pointer must be in the title band, not merely on
+            // the window (spec 2026-07-02). Content owns the full window rect
+            // so grids never resize on hover; the header paints OVER the top
+            // strip while revealed. Header gestures (move drag, tab tear-out,
+            // rename, open overflow menu) pin it so a fast pointer can't
+            // strand it mid-drag. The content INTERACT rect stays below the
+            // strip: whenever the pointer is up there the header is showing
+            // and owns that band, so nothing is lost.
             let tab_dragging = (0..self.windows[i].tabs.len())
                 .any(|ti| ui.ctx().is_being_dragged(base.with((id, "tab", ti))));
-            let reveal_chrome = is_project
-                || is_renaming
-                || dr.dragged()
-                || tab_dragging
-                || ui.rect_contains_pointer(scr.intersect(area));
+            // Reveal pins: header gestures that must keep a fading header
+            // alive mid-flight, plus the project overflow menu while open.
+            let menu_open = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(base.with((id, "ovfmenu_open"))))
+                .unwrap_or(false);
+            let pinned = is_renaming || dr.dragged() || tab_dragging || menu_open;
+            let reveal_chrome = pinned || ui.rect_contains_pointer(reveal_band(scr, area));
             let content_paint = if is_project {
                 content_rect
             } else {
@@ -3693,6 +3697,16 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     let x = rect.min.x.clamp(0.0, (area.x - w).max(0.0));
     let y = rect.min.y.clamp(0.0, (area.y - h).max(0.0));
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+}
+
+/// The hover strip that reveals a window's chrome: the title band, clipped to
+/// the manager's visible area. Shared by projects and terminals — one reveal
+/// rule at both levels (spec 2026-07-02). The caller must test the pointer
+/// with `ui.rect_contains_pointer(reveal_band(..))`, which is layer-aware;
+/// a raw `band.contains(pointer)` would reveal chrome on windows occluded by
+/// a floating window above them.
+fn reveal_band(scr: egui::Rect, area: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H)).intersect(area)
 }
 
 /// A tab's display name for chat purposes: the title minus the one-shot
@@ -6052,5 +6066,21 @@ mod tests {
             (p[0].1.width() - (1000.0 - 16.0)).abs() < 0.5,
             "b expanded to full inner width"
         );
+    }
+
+    #[test]
+    fn reveal_band_is_the_title_strip_clipped_to_area() {
+        let scr = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 100.0));
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(500.0, 500.0));
+        let band = reveal_band(scr, area);
+        assert_eq!(band.min, egui::pos2(10.0, 10.0));
+        assert_eq!(band.width(), 200.0);
+        assert_eq!(band.height(), TITLE_H);
+
+        // A window hanging off the top of the area gets a clipped band.
+        let scr2 = egui::Rect::from_min_size(egui::pos2(10.0, -10.0), egui::vec2(200.0, 100.0));
+        let band2 = reveal_band(scr2, area);
+        assert_eq!(band2.min.y, 0.0);
+        assert_eq!(band2.height(), TITLE_H - 10.0);
     }
 }
