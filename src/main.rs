@@ -5,6 +5,7 @@ mod control;
 mod dirpicker;
 mod frame;
 mod geom;
+mod graphics;
 mod icons;
 mod input;
 mod inspect;
