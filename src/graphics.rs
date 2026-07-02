@@ -7,18 +7,21 @@
 //! to paint. Unsupported commands are skipped silently — the failure mode is
 //! "image doesn't show", never a corrupted pane.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 /// One APC sequence's buffered payload cap.
+#[allow(dead_code)]
 const MAX_APC: usize = 8 * 1024 * 1024;
 
 /// Byte offset in the fed chunk just past a completed command's `ESC \`.
 /// `pump` advances alacritty over `chunk[..offset]`, then samples the cursor.
+#[allow(dead_code)]
 pub struct Cut {
     pub offset: usize,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum Scan {
     #[default]
     Ground,
@@ -28,6 +31,7 @@ enum Scan {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct Graphics {
     scan: Scan,
     /// Current APC body (starting at its 'G'), buffered only for graphics APCs.
@@ -39,12 +43,14 @@ pub struct Graphics {
     pending: VecDeque<Cmd>,
 }
 
+#[allow(dead_code)]
 enum Cmd {
     /// Placeholder until Task 6 — a completed graphics APC body.
     #[allow(dead_code)]
     Raw(Vec<u8>),
 }
 
+#[allow(dead_code)]
 impl Graphics {
     /// Scan one PTY chunk. Ground state fast-skips via byte search, so plain
     /// text costs one memchr-style pass and zero allocations.
@@ -77,7 +83,7 @@ impl Graphics {
                 Scan::Apc => {
                     let end = chunk[i..]
                         .iter()
-                        .position(|&c| c == 0x1b)
+                        .position(|&c| matches!(c, 0x1b | 0x18 | 0x1a))
                         .map(|o| i + o)
                         .unwrap_or(chunk.len());
                     if i < end && !self.seen_first {
@@ -93,7 +99,8 @@ impl Graphics {
                         }
                     }
                     if end < chunk.len() {
-                        self.scan = Scan::ApcEsc;
+                        // ESC may be the ST; CAN/SUB abort the string like vte.
+                        self.scan = if chunk[end] == 0x1b { Scan::ApcEsc } else { Scan::Ground };
                         i = end + 1;
                     } else {
                         i = chunk.len();
@@ -200,5 +207,20 @@ mod tests {
         let cuts = g.feed(&input);
         assert!(cuts.is_empty());
         assert_eq!(g.pending_len(), 0);
+    }
+
+    #[test]
+    fn can_or_sub_aborts_the_apc_like_vte() {
+        for abort in [0x18u8, 0x1a] {
+            let mut g = Graphics::default();
+            // A stray CAN/SUB inside an APC aborts it; the following genuine
+            // sequence must still be seen (vte is back in Ground — so are we).
+            let mut input = b"\x1b_Gjunk".to_vec();
+            input.push(abort);
+            input.extend_from_slice(SEQ);
+            let cuts = g.feed(&input);
+            assert_eq!(cuts.len(), 1, "abort byte {abort:#x}");
+            assert_eq!(cuts[0].offset, input.len(), "abort byte {abort:#x}");
+        }
     }
 }
