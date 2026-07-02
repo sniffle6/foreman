@@ -7,11 +7,69 @@
 //! to paint. Unsupported commands are skipped silently — the failure mode is
 //! "image doesn't show", never a corrupted pane.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// One APC sequence's buffered payload cap.
 #[allow(dead_code)]
 const MAX_APC: usize = 8 * 1024 * 1024;
+
+/// Decoded-RGBA quota per session; oldest images evicted past this.
+const MAX_STORE: usize = 64 * 1024 * 1024;
+/// Placement cap — a misbehaving client can't accumulate unbounded overlays.
+const MAX_PLACEMENTS: usize = 64;
+/// Placements scrolled further than this into history are dropped for good.
+const MAX_SCROLL_KEEP: usize = 10_000;
+/// Ids we assign when the client omits i= (top bit dodges client-chosen ids).
+const ANON_BASE: u32 = 0x8000_0000;
+
+/// Term facts sampled at a cut (built by terminal.rs `term_view`).
+pub struct TermView {
+    pub cursor_col: usize,
+    pub cursor_line: usize,
+    pub alt_screen: bool,
+    pub history_size: usize,
+}
+
+/// Viewport facts sampled at paint time.
+pub struct ViewportView {
+    pub alt_screen: bool,
+    pub history_size: usize,
+    pub display_offset: usize,
+    pub screen_lines: usize,
+}
+
+/// One image to paint. `line` is a viewport row and may be negative (partially
+/// scrolled off the top). `cols`/`rows` of 0 = derive the span from pixels.
+#[allow(dead_code)]
+pub struct Placed<'a> {
+    pub id: u32,
+    pub r#gen: u64,
+    pub col: usize,
+    pub line: isize,
+    pub cols: u16,
+    pub rows: u16,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: &'a [u8],
+}
+
+struct Image {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    r#gen: u64,
+}
+
+struct Placement {
+    img: u32,
+    col: usize,
+    line: usize,
+    alt: bool,
+    /// history_size when placed — primary-screen placements scroll by the delta.
+    history: usize,
+    cols: u16,
+    rows: u16,
+}
 
 /// Byte offset in the fed chunk just past a completed command's `ESC \`.
 /// `pump` advances alacritty over `chunk[..offset]`, then samples the cursor.
@@ -43,6 +101,11 @@ pub struct Graphics {
     pending: VecDeque<Cmd>,
     /// Partial chunked transmit reassembly: (header, accumulated payload).
     chunk: Option<(Header, Vec<u8>)>,
+    images: HashMap<u32, Image>,
+    placements: Vec<Placement>,
+    next_anon: u32,
+    r#gen: u64,
+    store_bytes: usize,
 }
 
 #[derive(Default, Clone)]
@@ -322,9 +385,203 @@ impl Graphics {
         }
     }
 
+    /// Apply the next pending command using sampled term facts. Called exactly
+    /// once per `Cut`, in order (see terminal.rs `advance_scanned`).
+    pub fn apply(&mut self, view: TermView, out: &mut Vec<u8>) {
+        let Some(cmd) = self.pending.pop_front() else { return };
+        match cmd {
+            Cmd::Transmit { header, payload, display } => match decode_image(&header, &payload) {
+                Ok((w, h, rgba)) => {
+                    let id = header.id.unwrap_or_else(|| {
+                        self.next_anon = self.next_anon.wrapping_add(1);
+                        ANON_BASE | self.next_anon
+                    });
+                    self.r#gen += 1;
+                    self.store_bytes += rgba.len();
+                    if let Some(old) = self.images.insert(id, Image { rgba, w, h, r#gen: self.r#gen }) {
+                        self.store_bytes -= old.rgba.len();
+                    }
+                    self.evict_over_quota();
+                    if display {
+                        // Retransmit with the same id replaces its placement
+                        // (pets deletes first anyway; keeps rogue clients bounded).
+                        self.placements.retain(|p| p.img != id);
+                        self.placements.push(Placement {
+                            img: id,
+                            col: view.cursor_col,
+                            line: view.cursor_line,
+                            alt: view.alt_screen,
+                            history: view.history_size,
+                            cols: header.cols,
+                            rows: header.rows,
+                        });
+                        if self.placements.len() > MAX_PLACEMENTS {
+                            self.placements.remove(0);
+                        }
+                    }
+                    if header.quiet == 0 {
+                        reply(out, header.id, b"OK");
+                    }
+                }
+                Err(e) => {
+                    if header.quiet < 2 {
+                        reply(out, header.id, e.as_bytes());
+                    }
+                }
+            },
+            Cmd::Delete { spec, id } => match (spec, id) {
+                (b'I' | b'i', Some(id)) => {
+                    self.placements.retain(|p| p.img != id);
+                    if spec == b'I'
+                        && let Some(img) = self.images.remove(&id)
+                    {
+                        self.store_bytes -= img.rgba.len();
+                    }
+                }
+                _ => self.placements.clear(), // bare a=d / d=a: clear visible
+            },
+            Cmd::Query { header, payload } => {
+                if header.quiet < 2 {
+                    let ok = header.medium == b'd'
+                        && matches!(header.format, 24 | 32 | 100)
+                        && decode_image(&header, &payload).is_ok();
+                    reply(out, header.id, if ok { b"OK" } else { b"ENOTSUPPORTED" });
+                }
+            }
+            Cmd::Nop { reply: r } => {
+                if let Some(r) = r {
+                    out.extend_from_slice(&r);
+                }
+            }
+        }
+        // Scroll-cull: placements far into history can never return to view.
+        let hist = view.history_size;
+        self.placements
+            .retain(|p| p.alt || hist.saturating_sub(p.history) < MAX_SCROLL_KEEP);
+    }
+
+    /// What's visible right now. `line` already accounts for scrollback offset;
+    /// the painter clips partially-visible images.
+    pub fn visible(&self, v: &ViewportView) -> Vec<Placed<'_>> {
+        let mut out = Vec::new();
+        for p in &self.placements {
+            if p.alt != v.alt_screen {
+                continue;
+            }
+            let line = if p.alt {
+                p.line as isize
+            } else {
+                p.line as isize - (v.history_size - p.history) as isize
+                    + v.display_offset as isize
+            };
+            if line >= v.screen_lines as isize || line < -300 {
+                continue; // fully below, or absurdly far above (max rows is 300)
+            }
+            let Some(img) = self.images.get(&p.img) else { continue };
+            out.push(Placed {
+                id: p.img,
+                r#gen: img.r#gen,
+                col: p.col,
+                line,
+                cols: p.cols,
+                rows: p.rows,
+                w: img.w,
+                h: img.h,
+                rgba: &img.rgba,
+            });
+        }
+        out
+    }
+
+    /// Paint guard: `show` skips all image work when this is false.
+    pub fn active(&self) -> bool {
+        !self.placements.is_empty()
+    }
+
+    /// Texture-cache retention (terminal.rs drops textures for gone images).
+    pub fn has_image(&self, id: u32) -> bool {
+        self.images.contains_key(&id)
+    }
+
+    fn evict_over_quota(&mut self) {
+        while self.store_bytes > MAX_STORE && self.images.len() > 1 {
+            let Some((&id, _)) = self.images.iter().min_by_key(|(_, i)| i.r#gen) else { break };
+            if let Some(img) = self.images.remove(&id) {
+                self.store_bytes -= img.rgba.len();
+            }
+            self.placements.retain(|p| p.img != id);
+        }
+    }
+
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+}
+
+fn decode_image(h: &Header, b64: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| "EBASE64")?;
+    let px = (h.pix_w as usize, h.pix_h as usize);
+    match h.format {
+        100 => decode_png(&data),
+        32 => {
+            if px.0 == 0 || px.1 == 0 || data.len() != px.0 * px.1 * 4 {
+                return Err("EBADRAW");
+            }
+            Ok((h.pix_w, h.pix_h, data))
+        }
+        24 => {
+            if px.0 == 0 || px.1 == 0 || data.len() != px.0 * px.1 * 3 {
+                return Err("EBADRAW");
+            }
+            let mut rgba = Vec::with_capacity(px.0 * px.1 * 4);
+            for p in data.chunks_exact(3) {
+                rgba.extend_from_slice(p);
+                rgba.push(255);
+            }
+            Ok((h.pix_w, h.pix_h, rgba))
+        }
+        _ => Err("ENOTSUPPORTED"),
+    }
+}
+
+fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    let mut dec = png::Decoder::new(data);
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().map_err(|_| "EBADPNG")?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|_| "EBADPNG")?;
+    buf.truncate(info.buffer_size());
+    let (w, h) = (info.width, info.height);
+    match info.color_type {
+        png::ColorType::Rgba => Ok((w, h, buf)),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
+            for p in buf.chunks_exact(3) {
+                rgba.extend_from_slice(p);
+                rgba.push(255);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(buf.len() * 2);
+            for p in buf.chunks_exact(2) {
+                rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::Grayscale => {
+            let mut rgba = Vec::with_capacity(buf.len() * 4);
+            for &v in &buf {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+            Ok((w, h, rgba))
+        }
+        // Indexed is EXPANDed away by Transformations::EXPAND.
+        _ => Err("EBADPNG"),
     }
 }
 
@@ -458,5 +715,138 @@ mod tests {
         let mut g = Graphics::default();
         assert!(g.feed(b"\x1b_Gm=0;junkdata\x1b\\").is_empty());
         assert_eq!(g.pending_len(), 0);
+    }
+
+    use base64::Engine as _;
+
+    /// 2x2 raw RGBA red square, transmitted+displayed with the given id.
+    fn red_transmit(id: u32) -> Vec<u8> {
+        let rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4).flatten().collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+        format!("\x1b_Ga=T,t=d,f=32,s=2,v=2,c=2,r=1,q=2,i={id};{b64}\x1b\\").into_bytes()
+    }
+
+    fn view(col: usize, line: usize) -> TermView {
+        TermView { cursor_col: col, cursor_line: line, alt_screen: false, history_size: 0 }
+    }
+
+    const VP: ViewportView =
+        ViewportView { alt_screen: false, history_size: 0, display_offset: 0, screen_lines: 40 };
+
+    #[test]
+    fn transmit_places_at_the_sampled_cursor() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        assert_eq!(g.feed(&red_transmit(5)).len(), 1);
+        g.apply(view(3, 2), &mut out);
+        assert!(out.is_empty()); // q=2 — silent
+        let vis = g.visible(&VP);
+        assert_eq!(vis.len(), 1);
+        assert_eq!((vis[0].col, vis[0].line), (3, 2));
+        assert_eq!((vis[0].w, vis[0].h), (2, 2));
+        assert_eq!(vis[0].rgba[0..4], [255, 0, 0, 255]);
+        assert!(g.active());
+    }
+
+    #[test]
+    fn delete_by_id_removes_placement_and_frees_data() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(7));
+        g.apply(view(0, 0), &mut out);
+        g.feed(b"\x1b_Ga=d,d=I,i=7,q=2;\x1b\\");
+        g.apply(view(0, 0), &mut out);
+        assert!(g.visible(&VP).is_empty());
+        assert!(!g.has_image(7));
+        assert!(!g.active());
+    }
+
+    #[test]
+    fn primary_screen_placement_scrolls_with_history() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(1));
+        // placed at line 30 when history was 100
+        g.apply(TermView { cursor_col: 0, cursor_line: 30, alt_screen: false, history_size: 100 }, &mut out);
+        // 15 more lines scrolled into history since
+        let v = ViewportView { alt_screen: false, history_size: 115, display_offset: 0, screen_lines: 40 };
+        assert_eq!(g.visible(&v)[0].line, 15);
+        // scrolling back 5 lines shifts it back down
+        let v = ViewportView { alt_screen: false, history_size: 115, display_offset: 5, screen_lines: 40 };
+        assert_eq!(g.visible(&v)[0].line, 20);
+    }
+
+    #[test]
+    fn alt_screen_placements_only_show_on_the_alt_screen() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(2));
+        g.apply(TermView { cursor_col: 1, cursor_line: 1, alt_screen: true, history_size: 0 }, &mut out);
+        assert!(g.visible(&VP).is_empty()); // primary viewport
+        let alt = ViewportView { alt_screen: true, ..VP };
+        assert_eq!(g.visible(&alt).len(), 1);
+    }
+
+    #[test]
+    fn transmit_with_q0_replies_ok_and_bad_payload_replies_error() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        let rgba = [255u8, 0, 0, 255];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(rgba);
+        g.feed(format!("\x1b_Ga=T,t=d,f=32,s=1,v=1,i=5;{b64}\x1b\\").as_bytes());
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(out, b"\x1b_Gi=5;OK\x1b\\");
+        out.clear();
+        g.feed(b"\x1b_Ga=T,t=d,f=32,s=9,v=9,i=6;AAAA\x1b\\"); // wrong size for 9x9
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(out, b"\x1b_Gi=6;EBADRAW\x1b\\");
+    }
+
+    #[test]
+    fn codex_style_query_probe_gets_ok() {
+        // ratatui-image / codex probe: 1x1 f=24 with payload AAAA.
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(out, b"\x1b_Gi=31;OK\x1b\\");
+    }
+
+    #[test]
+    fn png_transmit_decodes() {
+        // A real PNG encoded in the test to avoid a fixture: 1x1 opaque white.
+        // Generated with the png crate itself so the bytes are always valid.
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, 1, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[255, 255, 255, 255]).unwrap();
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(format!("\x1b_Ga=T,t=d,f=100,c=4,r=2,q=2,i=8;{b64}\x1b\\").as_bytes());
+        g.apply(view(0, 0), &mut out);
+        let vis = g.visible(&VP);
+        assert_eq!((vis[0].w, vis[0].h), (1, 1));
+        assert_eq!((vis[0].cols, vis[0].rows), (4, 2));
+        assert_eq!(vis[0].rgba, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn store_quota_evicts_oldest_image() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        // Each image is 1024x1024 RGBA = 4 MiB decoded; 17 of them > 64 MiB.
+        let rgba = vec![128u8; 1024 * 1024 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+        for id in 1..=17u32 {
+            g.feed(format!("\x1b_Ga=T,t=d,f=32,s=1024,v=1024,q=2,i={id};{b64}\x1b\\").as_bytes());
+            g.apply(view(0, 0), &mut out);
+        }
+        assert!(!g.has_image(1), "oldest image evicted past the quota");
+        assert!(g.has_image(17));
     }
 }

@@ -1207,6 +1207,7 @@ dependencies = [
  "chrono",
  "eframe",
  "interprocess",
+ "png 0.17.16",
  "portable-pty",
  "resvg",
  "serde",
