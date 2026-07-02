@@ -76,6 +76,8 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   holds it alive.
 - `src/wm.rs` — the reusable window engine: drag/focus/z-order/min/max/resize/
   close, `Win` (tab stack), `Content`, tree integration, per-frame re-fit.
+  Chrome at both levels is band-hover-revealed with an alpha fade; project
+  headers are transparent with a `⋯` overflow menu (`docs/window-chrome.md`).
 - `src/layout.rs` — the tiling tree (pure, unit-tested): insert/remove/layout/
   drop targets/divider resize.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
