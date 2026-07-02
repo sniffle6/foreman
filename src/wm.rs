@@ -1883,6 +1883,28 @@ impl WindowManager {
         if self.last_focused == Some(id) {
             self.last_focused = None;
         }
+        // End an in-flight rename of this window: the rename editor lives in
+        // the (now gone) header, and a dangling `renaming` blocks focus for
+        // EVERY window until restart.
+        if self.renaming == Some(id) {
+            self.renaming = None;
+        }
+    }
+
+    /// Minimize a window to the taskbar. Like `close`, this ends an in-flight
+    /// rename of the window — its header (and the rename editor in it) stops
+    /// rendering, and a dangling `renaming` blocks focus for EVERY window.
+    fn minimize(&mut self, id: WinId) {
+        self.detach(id);
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+            w.minimized = true;
+        }
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
+        if self.renaming == Some(id) {
+            self.renaming = None;
+        }
     }
 
     /// True when this manager has no windows left and no modal is open (the
@@ -3460,15 +3482,7 @@ impl WindowManager {
                         }
                     }
                 }
-                Act::Min(id) => {
-                    self.detach(id);
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        w.minimized = true;
-                    }
-                    if self.focused == Some(id) {
-                        self.focused = None;
-                    }
-                }
+                Act::Min(id) => self.minimize(id),
                 Act::Restore(id) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         w.minimized = false;
@@ -4306,6 +4320,29 @@ mod tests {
         m.picker = Some(DirPicker::new(m.picker_start()));
         m.close(id);
         assert!(!m.deserted(), "picker may still create a project; no quit");
+    }
+
+    #[test]
+    fn closing_or_minimizing_a_renaming_window_clears_the_rename() {
+        // A dangling `renaming` blocks focus for EVERY window (is_focus
+        // requires renaming.is_none()), freezing the app until restart.
+        let mut m = WindowManager::new();
+        let (a, ra) = m.next_slot(egui::vec2(100.0, 100.0));
+        m.push_win(a, "one".into(), ra, stub_content());
+        let (b, rb) = m.next_slot(egui::vec2(100.0, 100.0));
+        m.push_win(b, "two".into(), rb, stub_content());
+
+        m.focus(a);
+        m.begin_rename();
+        assert_eq!(m.renaming, Some(a));
+        m.close(a);
+        assert!(m.renaming.is_none(), "close left a dangling rename");
+
+        m.focus(b);
+        m.begin_rename();
+        assert_eq!(m.renaming, Some(b));
+        m.minimize(b);
+        assert!(m.renaming.is_none(), "minimize left a dangling rename");
     }
 
     #[test]
