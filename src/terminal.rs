@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -257,8 +258,6 @@ pub struct Session {
     term_id: u64,
     cols: usize,
     rows: usize,
-    sel_anchor: Option<(usize, usize)>, // (row, col) where a selection drag began
-    sel_head: Option<(usize, usize)>,   // (row, col) current selection end
     // Dispatch banner queued by inject_note(); flushed (fitted to the real
     // width) by the first resize(). See inject_note for why it is deferred.
     pending_note: Option<String>,
@@ -344,6 +343,31 @@ pub fn paste_wrap(text: &str) -> Vec<u8> {
     v.extend(text.bytes().filter(|&b| b != 0x1b));
     v.extend_from_slice(b"\x1b[201~");
     v
+}
+
+fn sel_viewport_range(
+    range: SelectionRange,
+    display_offset: usize,
+    screen_lines: usize,
+    columns: usize,
+) -> Option<crate::frame::SelRange> {
+    let off = display_offset as i32;
+    let start_row = range.start.line.0 + off;
+    let end_row = range.end.line.0 + off;
+    if end_row < 0 || start_row >= screen_lines as i32 {
+        return None;
+    }
+    let start = if start_row < 0 {
+        (0, 0)
+    } else {
+        (start_row as usize, range.start.column.0)
+    };
+    let end = if end_row >= screen_lines as i32 {
+        (screen_lines.saturating_sub(1), columns.saturating_sub(1))
+    } else {
+        (end_row as usize, range.end.column.0)
+    };
+    Some(crate::frame::SelRange { start, end })
 }
 
 impl Session {
@@ -535,8 +559,6 @@ impl Session {
             term_id: 0,
             cols,
             rows,
-            sel_anchor: None,
-            sel_head: None,
             pending_note: None,
             pending_submit: None,
             pending_inject: Vec::new(),
@@ -585,44 +607,6 @@ impl Session {
         }
         self.exit_noted = true;
         Some(code)
-    }
-
-    fn selection_text(&self) -> Option<String> {
-        let (a, b) = (self.sel_anchor?, self.sel_head?);
-        if a == b {
-            return None;
-        }
-        let (s, e) = if a <= b { (a, b) } else { (b, a) };
-        let grid = self.term.grid();
-        let off = grid.display_offset() as i32;
-        // Selection coords were cached on an earlier frame; the grid may have shrunk
-        // since (TUI alt-screen/resize), so clamp every index to the grid's REAL
-        // bounds — both Line and Column panic if indexed out of range (same hazard
-        // the render loop in `show` guards against).
-        let g_cols = grid.columns();
-        let g_lines = grid.screen_lines();
-        let mut out = String::new();
-        for row in s.0..=e.0 {
-            if row >= g_lines {
-                break;
-            }
-            let c0 = if row == s.0 { s.1 } else { 0 };
-            let c1 = if row == e.0 {
-                e.1
-            } else {
-                g_cols.saturating_sub(1)
-            };
-            let mut line = String::new();
-            for col in c0..=c1.min(g_cols.saturating_sub(1)) {
-                let ch = grid[Line(row as i32 - off)][Column(col)].c;
-                line.push(if ch == '\0' { ' ' } else { ch });
-            }
-            out.push_str(line.trim_end());
-            if row != e.0 {
-                out.push('\n');
-            }
-        }
-        (!out.is_empty()).then_some(out)
     }
 
     /// Queue a synthetic note for the emulator (NOT the PTY): renders as a
@@ -795,6 +779,22 @@ impl Session {
         let _ = self.writer.flush();
     }
 
+    /// Pointer → buffer-coord selection point + cell side: the viewport cell
+    /// under the pixel, shifted into buffer space by the scrollback offset.
+    fn sel_point(&self, metrics: &crate::geom::CellMetrics, p: egui::Pos2) -> (Point, Side) {
+        let (row, col) = metrics.cell_at(p);
+        let point = viewport_to_point(
+            self.term.grid().display_offset(),
+            Point::new(row, Column(col)),
+        );
+        let side = if metrics.cell_right_half(p) {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        (point, side)
+    }
+
     /// Read this frame's keyboard input and apply it. The pure encoding lives in
     /// `crate::input::process_input` (terminal-completeness epic, Phase 2); this is
     /// the thin shell that supplies live state (term mode, selection), performs the
@@ -802,10 +802,12 @@ impl Session {
     /// to the PTY.
     fn read_input(&mut self, ui: &egui::Ui) {
         let mode = *self.term.mode();
-        let has_selection = match (self.sel_anchor, self.sel_head) {
-            (Some(a), Some(b)) => a != b,
-            _ => false,
-        };
+        let has_selection = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term))
+            .is_some();
         let outcome = ui.input(|i| crate::input::process_input(&i.events, mode, has_selection));
 
         if let Some(s) = outcome.scroll {
@@ -832,11 +834,10 @@ impl Session {
         }
 
         if outcome.copy {
-            if let Some(txt) = self.selection_text() {
+            if let Some(txt) = self.term.selection_to_string() {
                 ui.ctx().copy_text(txt);
                 if outcome.copy_clears {
-                    self.sel_anchor = None;
-                    self.sel_head = None;
+                    self.term.selection = None;
                 }
             }
         } else if outcome.interrupt {
@@ -878,19 +879,33 @@ impl Session {
         let metrics = crate::geom::CellMetrics::new(rect, cw, rh, cols, rows);
         if active {
             // mouse text selection (the WM hands us the content-area drag)
-            if resp.drag_started() {
+            if resp.triple_clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let c = metrics.cell_at(p);
-                    self.sel_anchor = Some(c);
-                    self.sel_head = Some(c);
+                    let (point, side) = self.sel_point(&metrics, p);
+                    self.term.selection = Some(Selection::new(SelectionType::Lines, point, side));
+                }
+            } else if resp.double_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let (point, side) = self.sel_point(&metrics, p);
+                    self.term.selection =
+                        Some(Selection::new(SelectionType::Semantic, point, side));
+                }
+            } else if resp.drag_started() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let (point, side) = self.sel_point(&metrics, p);
+                    self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
                 }
             } else if resp.dragged() {
                 if let Some(p) = resp.interact_pointer_pos() {
-                    self.sel_head = Some(metrics.cell_at(p));
+                    let (point, side) = self.sel_point(&metrics, p);
+                    if let Some(sel) = self.term.selection.as_mut() {
+                        sel.update(point, side);
+                    }
                 }
             } else if resp.clicked() {
-                self.sel_anchor = None;
-                self.sel_head = None;
+                // clicked() also fires on the frame a double/triple-click
+                // completes, so plain-click-clears must stay LAST in the chain.
+                self.term.selection = None;
             }
             if resp.secondary_clicked() {
                 if let Some(txt) = read_clipboard() {
@@ -975,15 +990,24 @@ impl Session {
             std::time::Instant::now(),
         );
 
-        // Selection range in viewport coords: None unless both ends are set and
-        // distinct; ordered start<=end with the same swap the rest of the code uses.
-        let sel = match (self.sel_anchor, self.sel_head) {
-            (Some(a), Some(b)) if a != b => {
-                let (s, e) = if a <= b { (a, b) } else { (b, a) };
-                Some(crate::frame::SelRange { start: s, end: e })
-            }
-            _ => None,
-        };
+        // Selection range in viewport coords: the ONE `term.selection` feeds both
+        // the copy text (`selection_to_string`) and this highlight range.
+        // `to_range` returns ordered buffer coords clamped to the live grid; the
+        // cull maps them onto the visible viewport.
+        let sel = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term))
+            .and_then(|r| {
+                let grid = self.term.grid();
+                sel_viewport_range(
+                    r,
+                    grid.display_offset(),
+                    grid.screen_lines(),
+                    grid.columns(),
+                )
+            });
 
         // The frame's paint geometry + content (pure). show() only replays it here,
         // deciding visibility (focus/hover) and the paint style (colors, radii).
@@ -1052,6 +1076,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::index::Line;
 
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
@@ -1482,5 +1508,196 @@ mod tests {
         assert_eq!(noted, Some(0));
         assert_eq!(s.exit_to_note(), None); // second note must not fire
         assert_eq!(s.exited(), Some(0)); // plain exited() still reports
+    }
+
+    fn sel_range((l0, c0): (i32, usize), (l1, c1): (i32, usize)) -> SelectionRange {
+        SelectionRange {
+            start: Point::new(Line(l0), Column(c0)),
+            end: Point::new(Line(l1), Column(c1)),
+            is_block: false,
+        }
+    }
+
+    #[test]
+    fn sel_viewport_range_passes_a_fully_visible_range_through() {
+        let r = sel_viewport_range(sel_range((1, 2), (3, 4)), 0, 10, 20).unwrap();
+        assert_eq!((r.start, r.end), ((1, 2), (3, 4)));
+    }
+
+    #[test]
+    fn sel_viewport_range_shifts_with_display_offset_so_selection_sticks_to_content() {
+        let r = sel_viewport_range(sel_range((1, 2), (3, 4)), 2, 10, 20).unwrap();
+        assert_eq!((r.start, r.end), ((3, 2), (5, 4)));
+    }
+
+    #[test]
+    fn sel_viewport_range_culls_a_start_above_the_viewport_to_the_origin() {
+        // The start row is scrolled off the top; its column no longer applies
+        // to the first visible row, which is mid-selection and fully covered.
+        let r = sel_viewport_range(sel_range((-3, 5), (1, 4)), 1, 10, 20).unwrap();
+        assert_eq!((r.start, r.end), ((0, 0), (2, 4)));
+    }
+
+    #[test]
+    fn sel_viewport_range_culls_an_end_below_the_viewport_to_the_last_cell() {
+        let r = sel_viewport_range(sel_range((3, 2), (12, 4)), 0, 10, 20).unwrap();
+        assert_eq!((r.start, r.end), ((3, 2), (9, 19)));
+    }
+
+    #[test]
+    fn sel_viewport_range_is_none_when_entirely_above_the_viewport() {
+        assert!(sel_viewport_range(sel_range((-5, 0), (-2, 4)), 0, 10, 20).is_none());
+    }
+
+    #[test]
+    fn sel_viewport_range_is_none_when_entirely_below_the_viewport() {
+        assert!(sel_viewport_range(sel_range((2, 0), (4, 4)), 20, 10, 20).is_none());
+    }
+
+    // ---- pins of alacritty's Selection semantics (the Phase 4 contract) ----
+
+    fn term_with(bytes: &[u8], cols: usize, rows: usize) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &Size { cols, rows }, VoidListener);
+        feed_term(&mut term, bytes);
+        term
+    }
+
+    fn feed_term(term: &mut Term<VoidListener>, bytes: &[u8]) {
+        let mut parser: Processor = Processor::new();
+        parser.advance(term, bytes);
+    }
+
+    fn select(
+        term: &mut Term<VoidListener>,
+        ty: SelectionType,
+        (l0, c0, s0): (i32, usize, Side),
+        head: Option<(i32, usize, Side)>,
+    ) {
+        let mut sel = Selection::new(ty, Point::new(Line(l0), Column(c0)), s0);
+        if let Some((l1, c1, s1)) = head {
+            sel.update(Point::new(Line(l1), Column(c1)), s1);
+        }
+        term.selection = Some(sel);
+    }
+
+    #[test]
+    fn simple_selection_copies_the_dragged_span() {
+        let mut term = term_with(b"hello world", 20, 4);
+        select(
+            &mut term,
+            SelectionType::Simple,
+            (0, 0, Side::Left),
+            Some((0, 4, Side::Right)),
+        );
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn semantic_selection_expands_to_word_boundaries() {
+        let mut term = term_with(b"cargo test --lib", 30, 4);
+        // double-click lands mid-"test"
+        select(&mut term, SelectionType::Semantic, (0, 7, Side::Left), None);
+        assert_eq!(term.selection_to_string().as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn semantic_selection_takes_a_whole_path() {
+        let mut term = term_with(b"see docs/epics/file.md here", 40, 4);
+        select(&mut term, SelectionType::Semantic, (0, 8, Side::Left), None);
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("docs/epics/file.md")
+        );
+    }
+
+    #[test]
+    fn lines_selection_takes_the_whole_line_with_a_trailing_newline() {
+        let mut term = term_with(b"alpha beta", 20, 4);
+        select(&mut term, SelectionType::Lines, (0, 4, Side::Left), None);
+        assert_eq!(term.selection_to_string().as_deref(), Some("alpha beta\n"));
+    }
+
+    #[test]
+    fn cjk_selection_copies_whole_glyphs_and_highlights_their_full_span() {
+        // 你 and 好 each occupy two columns (wide char + spacer), cols 0..=3.
+        let mut term = term_with("你好".as_bytes(), 20, 4);
+        select(
+            &mut term,
+            SelectionType::Simple,
+            (0, 0, Side::Left),
+            Some((0, 3, Side::Right)),
+        );
+        assert_eq!(term.selection_to_string().as_deref(), Some("你好"));
+        let range = term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&term))
+            .unwrap();
+        let vr = sel_viewport_range(range, 0, 4, 20).unwrap();
+        assert_eq!(
+            (vr.start, vr.end),
+            ((0, 0), (0, 3)),
+            "highlight spans both columns of each glyph"
+        );
+    }
+
+    #[test]
+    fn semantic_selection_expands_over_a_cjk_run() {
+        let mut term = term_with("你好 abc".as_bytes(), 20, 4);
+        // double-click on 好 (its wide cell is col 2)
+        select(&mut term, SelectionType::Semantic, (0, 2, Side::Left), None);
+        assert_eq!(term.selection_to_string().as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn selection_sticks_to_content_as_new_output_scrolls_it_into_history() {
+        let mut term = term_with(b"target", 10, 2);
+        select(
+            &mut term,
+            SelectionType::Simple,
+            (0, 0, Side::Left),
+            Some((0, 5, Side::Right)),
+        );
+        // Two more lines push "target" into scrollback; the Term rotates the
+        // selection's buffer points with it (the Q5 stick-to-content behavior).
+        feed_term(&mut term, b"\r\nnext\r\nmore");
+        assert_eq!(term.selection_to_string().as_deref(), Some("target"));
+    }
+
+    #[test]
+    fn out_of_bounds_selection_points_are_clamped_not_panicking() {
+        // Stale drag coords can outlive a grid shrink (alt-screen/resize);
+        // to_range must clamp them — Line/Column indexing panics otherwise and
+        // a panic in the winit callback aborts the process.
+        let mut term = term_with(b"hi", 4, 2);
+        select(
+            &mut term,
+            SelectionType::Semantic,
+            (50, 50, Side::Left),
+            Some((-50, 50, Side::Right)),
+        );
+        let _ = term.selection_to_string();
+        let _ = term.selection.as_ref().and_then(|s| s.to_range(&term));
+    }
+
+    #[test]
+    fn selection_survives_an_actual_grid_shrink_without_panicking() {
+        let mut term = term_with(b"0123456789 the quick brown fox", 40, 10);
+        select(
+            &mut term,
+            SelectionType::Simple,
+            (0, 35, Side::Left),
+            Some((8, 39, Side::Right)),
+        );
+        term.resize(Size { cols: 4, rows: 2 });
+        if let Some(r) = term.selection.as_ref().and_then(|s| s.to_range(&term)) {
+            let _ = sel_viewport_range(
+                r,
+                term.grid().display_offset(),
+                term.screen_lines(),
+                term.columns(),
+            );
+        }
+        let _ = term.selection_to_string();
     }
 }

@@ -190,6 +190,16 @@ plan. The grid walk is clamped to the grid's real bounds first, so a stale index
 can't panic and abort the process.
 _Avoid_: display list, render list, draw commands.
 
+**Selection cull**:
+The step that re-projects the selection onto the visible viewport for painting.
+The selection itself lives in the grid model (`term.selection`, buffer
+coordinates — one source feeding both the copied text and the highlight); the
+cull maps it to the rows actually on screen. An edge row that is scrolled out
+of view takes the full-row boundary (a start above the viewport becomes the
+origin cell, an end below it the bottom-right cell); a fully off-screen
+selection paints nothing.
+_Avoid_: clip (pixel-flavored), conversion (any coord math), re-anchoring.
+
 **Outbox**:
 The Chat room's per-frame delivery decision: given which Members are Ready, it
 returns exactly the framed lines each one still needs and advances their delivery

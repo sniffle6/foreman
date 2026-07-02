@@ -55,6 +55,11 @@ impl CellMetrics {
         (row, col)
     }
 
+    pub fn cell_right_half(&self, pos: egui::Pos2) -> bool {
+        let (_, col) = self.cell_at(pos);
+        pos.x >= self.rect.min.x + (col as f32 + 0.5) * self.cw
+    }
+
     /// Pointer → 1-based `(col, row)` for mouse reporting, clamped to
     /// `1..=cols`/`1..=rows`. Note the order: mouse protocols (SGR/X10) speak
     /// column-first, so this returns the opposite order to [`Self::cell_at`].
@@ -221,5 +226,22 @@ mod tests {
         assert_eq!(under.min, egui::pos2(10.0, 34.0));
         assert_eq!((under.width(), under.height()), (8.0, 2.0));
         assert_eq!(caret_rect(cell, CursorShape::Block), cell);
+    }
+
+    #[test]
+    fn cell_right_half_splits_a_cell_at_its_midpoint() {
+        let m = metrics();
+        // cell (0,0) spans x 10..18, midpoint 14
+        assert!(!m.cell_right_half(egui::pos2(13.9, 28.0)));
+        assert!(m.cell_right_half(egui::pos2(14.0, 28.0)));
+    }
+
+    #[test]
+    fn cell_right_half_follows_the_clamped_cell_outside_the_pane() {
+        let m = metrics();
+        // left of the pane clamps to col 0 and reads as its left half
+        assert!(!m.cell_right_half(egui::pos2(5.0, 28.0)));
+        // right of the pane clamps to the last col and reads as its right half
+        assert!(m.cell_right_half(egui::pos2(100.0, 28.0)));
     }
 }

@@ -422,7 +422,7 @@ order):
 - [ ] Font family/size configurable; zoom keys work (Phase 7)
 - [ ] Bold / italic render with real font faces (Phase 1b)
 - [~] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3) — wheel/scroll forwarding done (2026-06-27); click/drag/motion + Shift-override still to do
-- [ ] Double-click word, triple-click line; CJK selection is correct (Phase 4)
+- [x] Double-click word, triple-click line; CJK selection is correct (Phase 4) — alacritty `Selection` in `term.selection`, acid-tested (word/path/line highlights + CJK copy hex-verified); see `docs/terminal-selection.md`
 - [ ] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5)
 - [ ] Tab title follows OSC 0/2; bell gives feedback (Phase 6)
 - [ ] UI stays at frame rate under `yes` (Phase 9)

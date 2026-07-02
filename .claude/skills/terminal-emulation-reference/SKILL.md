@@ -110,16 +110,14 @@ Rules that already earned their scars:
 
 - **Never store screen rows** for anything that must track text across
   scrolling — capture in buffer space, convert at paint time. That is the
-  selection-v1 lesson (docs/terminal-selection.md:49-51). **Drift flag (as of
-  2026-07-01):** that doc describes a rewrite onto alacritty's
-  `Selection`/`SelectionType` API (`Selection::new`, `selection_to_string`),
-  but no commit on any ref ever contained that code (verify:
-  `git log -S "Selection::new" --oneline --all` → only the doc commit
-  `64a80b9`). The code at HEAD still stores viewport `(row, col)` tuples
-  (`sel_anchor`/`sel_head`, terminal.rs:260-261) with defensive clamping
-  (terminal.rs:598-616; frame.rs:106-125), so the highlight does *not* ride
-  scrollback. Trust the code, not that doc, and treat the alacritty-Selection
-  rewrite as designed-not-built.
+  selection-v1 lesson (docs/terminal-selection.md). **Drift resolved
+  (2026-07-01, Phase 4):** selection now lives in alacritty's own
+  `term.selection` (buffer coords; `Selection::new` / `update` /
+  `selection_to_string`), fed by `Session::sel_point` (pixel → buffer `Point`
+  + `Side`) and re-projected for paint by the pure `sel_viewport_range` cull.
+  Triple/double/drag/click map to Lines/Semantic/Simple/clear in `show()`.
+  The old `sel_anchor`/`sel_head` viewport tuples are deleted. Doc:
+  `docs/terminal-selection.md` (now matches the code).
 - **Out-of-range `Line`/`Column` indexing panics**, and a panic across the
   winit callback **aborts the whole process**. `pump()` can shrink the grid
   mid-frame (alt-screen swap, reset), so every grid walk clamps to the grid's
@@ -163,7 +161,7 @@ Two different things, per CONTEXT.md:
 | `term.scroll_display(Scroll::{Top,Bottom,PageUp,PageDown,Delta(i32)})` | scrollback control (keys, wheel, resize snap) |
 | `*term.mode()` → `TermMode` | flags consulted: `APP_CURSOR` (arrow encoding), `BRACKETED_PASTE` (paste gating), `MOUSE_MODE` (aggregate) + `SGR_MOUSE` (wheel encoding), `ALT_SCREEN` + `ALTERNATE_SCROLL` (wheel→arrows). Exposed as `Session::term_mode()` so `foreman send --keys` encodes through the same seam (wm.rs:1344, inspect.rs `parse_keys`) |
 | `term::cell::Flags` | INVERSE/DIM/UNDERLINE/STRIKEOUT in `glyph_style`; BOLD/ITALIC/WIDE_CHAR reported by `snapshot_cells`; WIDE_CHAR_SPACER skipped in text walks |
-| `Selection` / `SelectionType` | **NOT used** at HEAD — see the drift flag in §4 |
+| `Selection` / `SelectionType`, `term.selection`, `selection_to_string()`, `viewport_to_point` | Phase 4 selection: click chain + `sel_point` + `sel_viewport_range` cull (terminal.rs); fixture pins in terminal.rs tests |
 
 ## 7. Capability advertisement (COLORTERM/TERM) — do not drop
 
@@ -225,7 +223,7 @@ and constants drift; re-verify from `H:/claude code/foreman` (PowerShell 7+):
 | Ready latch + pending_inject flush | `git grep -n "ready = true" src/terminal.rs` and the tests `session_latches_ready_after_dsr_is_answered`, `inject_before_ready_is_queued_then_flushed` |
 | Key/mouse encodings byte-for-byte | `cargo test --lib input` (byte-equality tests; mind the shared target/ lock) |
 | Env advertisement | `git grep -n "COLORTERM" src/wm.rs` |
-| Selection drift (alacritty Selection still unused) | `git grep -n "Selection" src/ ; git log -S "Selection::new" --oneline --all` |
+| Selection wiring (alacritty Selection in use since Phase 4) | `git grep -n "term.selection" src/terminal.rs ; cargo test selection` |
 | Caret constants 50 ms / 150 ms | `git grep -n "CURSOR_SETTLE\|INPUT_GRACE" src/caret.rs` |
 | SUBMIT_DELAY 150 ms | `git grep -n "SUBMIT_DELAY" src/terminal.rs` |
 | Spacer-skip locations | `git grep -n "WIDE_CHAR_SPACER" src/` |
