@@ -41,13 +41,91 @@ pub struct Graphics {
     overflow: bool,
     /// Completed-but-unapplied commands, FIFO; one per emitted `Cut`.
     pending: VecDeque<Cmd>,
+    /// Partial chunked transmit reassembly: (header, accumulated payload).
+    chunk: Option<(Header, Vec<u8>)>,
+}
+
+#[derive(Default, Clone)]
+#[allow(dead_code)]
+struct Header {
+    action: u8,
+    medium: u8,
+    format: u32,
+    cols: u16,
+    rows: u16,
+    pix_w: u32,
+    pix_h: u32,
+    id: Option<u32>,
+    more: bool,
+    quiet: u8,
+    delete: u8,
 }
 
 #[allow(dead_code)]
 enum Cmd {
-    /// Placeholder until Task 6 — a completed graphics APC body.
     #[allow(dead_code)]
-    Raw(Vec<u8>),
+    Transmit {
+        header: Header,
+        payload: Vec<u8>,
+        display: bool,
+    },
+    #[allow(dead_code)]
+    Delete {
+        spec: u8,
+        id: Option<u32>,
+    },
+    #[allow(dead_code)]
+    Query {
+        header: Header,
+        payload: Vec<u8>,
+    },
+    #[allow(dead_code)]
+    Nop {
+        reply: Option<Vec<u8>>,
+    },
+}
+
+/// Kitty `k=v,k=v` header. Unknown keys are ignored — tolerance is the spec's
+/// safety story ("silently skip, never corrupt").
+#[allow(dead_code)]
+fn parse_header(h: &[u8]) -> Header {
+    let mut out = Header {
+        action: b't',
+        medium: b'd',
+        format: 32,
+        ..Default::default()
+    };
+    for kv in h.split(|&b| b == b',') {
+        let mut it = kv.splitn(2, |&b| b == b'=');
+        let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
+        let num = |v: &[u8]| std::str::from_utf8(v).ok().and_then(|s| s.parse::<u32>().ok());
+        match k {
+            b"a" => out.action = v.first().copied().unwrap_or(b't'),
+            b"t" => out.medium = v.first().copied().unwrap_or(b'd'),
+            b"f" => out.format = num(v).unwrap_or(32),
+            b"c" => out.cols = num(v).unwrap_or(0) as u16,
+            b"r" => out.rows = num(v).unwrap_or(0) as u16,
+            b"s" => out.pix_w = num(v).unwrap_or(0),
+            b"v" => out.pix_h = num(v).unwrap_or(0),
+            b"i" => out.id = num(v),
+            b"m" => out.more = num(v) == Some(1),
+            b"q" => out.quiet = num(v).unwrap_or(0) as u8,
+            b"d" => out.delete = v.first().copied().unwrap_or(b'a'),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn reply(out: &mut Vec<u8>, id: Option<u32>, msg: &[u8]) {
+    out.extend_from_slice(b"\x1b_G");
+    if let Some(id) = id {
+        out.extend_from_slice(format!("i={id}").as_bytes());
+    }
+    out.push(b';');
+    out.extend_from_slice(msg);
+    out.extend_from_slice(b"\x1b\\");
 }
 
 #[allow(dead_code)]
@@ -100,7 +178,11 @@ impl Graphics {
                     }
                     if end < chunk.len() {
                         // ESC may be the ST; CAN/SUB abort the string like vte.
-                        self.scan = if chunk[end] == 0x1b { Scan::ApcEsc } else { Scan::Ground };
+                        self.scan = if chunk[end] == 0x1b {
+                            Scan::ApcEsc
+                        } else {
+                            Scan::Ground
+                        };
                         i = end + 1;
                     } else {
                         i = chunk.len();
@@ -132,8 +214,75 @@ impl Graphics {
     /// Returns true when a command completed (caller emits a `Cut`).
     fn ingest_apc(&mut self) -> bool {
         let body = std::mem::take(&mut self.apc);
-        self.pending.push_back(Cmd::Raw(body));
-        true
+        let rest = &body[1..]; // strip the 'G' (guaranteed by is_graphics)
+        let (header, payload) = match rest.iter().position(|&b| b == b';') {
+            Some(p) => (&rest[..p], &rest[p + 1..]),
+            None => (rest, &rest[..0]),
+        };
+        let h = parse_header(header);
+
+        // Continuation of a chunked transmit: only m matters (codex sends bare
+        // `m=<flag>;<chunk>` continuations); finish on m=0.
+        if let Some((_, data)) = self.chunk.as_mut() {
+            if data.len() + payload.len() > MAX_APC {
+                self.chunk = None; // runaway chunk stream — drop it whole
+                return false;
+            }
+            data.extend_from_slice(payload);
+            if h.more {
+                return false;
+            }
+            let (first, data) = self.chunk.take().expect("checked above");
+            let display = first.action == b'T';
+            self.pending
+                .push_back(Cmd::Transmit {
+                    header: first,
+                    payload: data,
+                    display,
+                });
+            return true;
+        }
+
+        match h.action {
+            b'T' | b't' => {
+                if h.more {
+                    self.chunk = Some((h, payload.to_vec()));
+                    return false;
+                }
+                let display = h.action == b'T';
+                self.pending.push_back(Cmd::Transmit {
+                    header: h,
+                    payload: payload.to_vec(),
+                    display,
+                });
+                true
+            }
+            b'd' => {
+                self.pending.push_back(Cmd::Delete {
+                    spec: h.delete,
+                    id: h.id,
+                });
+                true
+            }
+            b'q' => {
+                self.pending.push_back(Cmd::Query {
+                    header: h,
+                    payload: payload.to_vec(),
+                });
+                true
+            }
+            _ => {
+                // Unsupported action: skip silently; honest error only when the
+                // client asked for responses (q<2 suppresses nothing... q=2 all).
+                let r = (h.quiet < 2).then(|| {
+                    let mut v = Vec::new();
+                    reply(&mut v, h.id, b"ENOTSUPPORTED");
+                    v
+                });
+                self.pending.push_back(Cmd::Nop { reply: r });
+                true
+            }
+        }
     }
 
     #[cfg(test)]
@@ -222,5 +371,35 @@ mod tests {
             assert_eq!(cuts.len(), 1, "abort byte {abort:#x}");
             assert_eq!(cuts[0].offset, input.len(), "abort byte {abort:#x}");
         }
+    }
+
+    // Codex chunk format: first chunk carries the full header + m=1,
+    // continuations are ESC_Gm=<flag>;<chunk>ESC\ (see codex image_protocol.rs).
+    #[test]
+    fn chunked_transmit_completes_only_on_the_final_chunk() {
+        let mut g = Graphics::default();
+        let c1 = g.feed(b"\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,i=9,m=1;cG5n\x1b\\");
+        assert!(c1.is_empty());
+        let c2 = g.feed(b"\x1b_Gm=1;cG5n\x1b\\");
+        assert!(c2.is_empty());
+        let c3 = g.feed(b"\x1b_Gm=0;cG5n\x1b\\");
+        assert_eq!(c3.len(), 1);
+        assert_eq!(g.pending_len(), 1);
+    }
+
+    #[test]
+    fn delete_by_id_parses_codex_format() {
+        let mut g = Graphics::default();
+        let cuts = g.feed(b"\x1b_Ga=d,d=I,i=7,q=2;\x1b\\");
+        assert_eq!(cuts.len(), 1);
+        assert_eq!(g.pending_len(), 1);
+    }
+
+    #[test]
+    fn unknown_action_queues_a_nop() {
+        let mut g = Graphics::default();
+        let cuts = g.feed(b"\x1b_Ga=z,q=2;\x1b\\");
+        assert_eq!(cuts.len(), 1); // one cut per completed command, even a nop
+        assert_eq!(g.pending_len(), 1);
     }
 }
