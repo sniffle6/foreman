@@ -32,9 +32,12 @@ pub struct InputOutcome {
     pub zoom_reset: bool,
 }
 
-/// Decide what this frame's egui events mean for the terminal. Pure: real
-/// egui/alacritty types in, an `InputOutcome` out, no I/O.
-pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> InputOutcome {
+pub fn process_input(
+    events: &[Event],
+    mods: Modifiers,
+    mode: TermMode,
+    has_selection: bool,
+) -> InputOutcome {
     let mut out = InputOutcome::default();
     let mut saw_paste = false;
     let mut want_clip_paste = false; // Ctrl+V family
@@ -43,7 +46,16 @@ pub fn process_input(events: &[Event], mode: TermMode, has_selection: bool) -> I
 
     for ev in events {
         match ev {
-            Event::Text(t) => out.pty_bytes.extend_from_slice(t.as_bytes()),
+            Event::Text(t) => {
+                // Windows egui delivers BOTH a Key event and a Text event for
+                // Alt+letter. encode_key already sends ESC+letter for alt
+                // (without ctrl), so the Text copy must be dropped — but AltGr
+                // arrives as Ctrl+Alt and must keep typing (intl layouts).
+                // Mirrors encode_key's meta condition exactly.
+                if !(mods.alt && !(mods.ctrl || mods.command)) {
+                    out.pty_bytes.extend_from_slice(t.as_bytes());
+                }
+            }
             Event::Paste(s) => {
                 out.pty_bytes.extend_from_slice(&paste_seq(mode, s));
                 saw_paste = true;
@@ -513,19 +525,30 @@ mod tests {
     // ---- process_input: routing + policy -------------------------------------
     #[test]
     fn typed_text_passes_through() {
-        let out = process_input(&[Event::Text("a".into())], TermMode::empty(), false);
+        let out = process_input(
+            &[Event::Text("a".into())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+        );
         assert_eq!(out.pty_bytes, b"a");
         assert!(!out.copy && !out.interrupt && out.scroll.is_none());
     }
     #[test]
     fn arrow_routes_through_encoder() {
-        let out = process_input(&[key_ev(Key::ArrowUp, none())], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::ArrowUp, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+        );
         assert_eq!(out.pty_bytes, b"\x1b[A");
     }
     #[test]
     fn ctrl_c_with_selection_copies_and_clears() {
         let out = process_input(
             &[key_ev(Key::C, mods(true, false, false))],
+            Modifiers::default(),
             TermMode::empty(),
             true,
         );
@@ -536,6 +559,7 @@ mod tests {
     fn ctrl_c_without_selection_interrupts() {
         let out = process_input(
             &[key_ev(Key::C, mods(true, false, false))],
+            Modifiers::default(),
             TermMode::empty(),
             false,
         );
@@ -545,6 +569,7 @@ mod tests {
     fn ctrl_shift_c_copies_without_clearing() {
         let out = process_input(
             &[key_ev(Key::C, mods(true, false, true))],
+            Modifiers::default(),
             TermMode::empty(),
             true,
         );
@@ -552,13 +577,19 @@ mod tests {
     }
     #[test]
     fn copy_event_copies_and_clears() {
-        let out = process_input(&[Event::Copy], TermMode::empty(), true);
+        let out = process_input(
+            &[Event::Copy],
+            Modifiers::default(),
+            TermMode::empty(),
+            true,
+        );
         assert!(out.copy && out.copy_clears);
     }
     #[test]
     fn ctrl_shift_v_requests_clipboard_paste() {
         let out = process_input(
             &[key_ev(Key::V, mods(true, false, true))],
+            Modifiers::default(),
             TermMode::empty(),
             false,
         );
@@ -573,6 +604,7 @@ mod tests {
                 key_ev(Key::V, mods(true, false, false)),
                 Event::Paste("x".into()),
             ],
+            Modifiers::default(),
             TermMode::empty(),
             false,
         );
@@ -583,6 +615,7 @@ mod tests {
     fn paste_event_is_bracketed_when_mode_set() {
         let out = process_input(
             &[Event::Paste("x".into())],
+            Modifiers::default(),
             TermMode::BRACKETED_PASTE,
             false,
         );
@@ -592,11 +625,42 @@ mod tests {
     fn shift_pageup_scrolls_instead_of_sending() {
         let out = process_input(
             &[key_ev(Key::PageUp, mods(false, false, true))],
+            Modifiers::default(),
             TermMode::empty(),
             false,
         );
         assert!(matches!(out.scroll, Some(Scroll::PageUp)));
         assert!(out.pty_bytes.is_empty());
+    }
+    #[test]
+    fn alt_letter_sends_meta_only_once_despite_text_event() {
+        // Windows egui delivers BOTH the Key event and a Text event for
+        // Alt+letter; only the ESC-prefixed meta byte may reach the PTY.
+        let live = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[
+                key_ev(Key::V, mods(false, true, false)),
+                Event::Text("v".into()),
+            ],
+            live,
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, b"\x1bv");
+    }
+    #[test]
+    fn altgr_text_still_types() {
+        // AltGr arrives as Ctrl+Alt on Windows; intl layouts must keep typing.
+        let live = Modifiers {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        let out = process_input(&[Event::Text("@".into())], live, TermMode::empty(), false);
+        assert_eq!(out.pty_bytes, b"@");
     }
 
     // ---- zoom ----------------------------------------------------------------
@@ -604,6 +668,7 @@ mod tests {
     fn ctrl_0_requests_zoom_reset_and_sends_nothing() {
         let out = process_input(
             &[key_ev(Key::Num0, mods(true, false, false))],
+            Modifiers::default(),
             TermMode::empty(),
             false,
         );
@@ -612,7 +677,12 @@ mod tests {
     }
     #[test]
     fn plain_0_types_through_without_reset() {
-        let out = process_input(&[key_ev(Key::Num0, none())], TermMode::empty(), false);
+        let out = process_input(
+            &[key_ev(Key::Num0, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+        );
         assert!(!out.zoom_reset);
     }
     #[test]

@@ -788,7 +788,8 @@ impl Session {
             .as_ref()
             .and_then(|s| s.to_range(&self.term))
             .is_some();
-        let outcome = ui.input(|i| crate::input::process_input(&i.events, mode, has_selection));
+        let outcome =
+            ui.input(|i| crate::input::process_input(&i.events, i.modifiers, mode, has_selection));
 
         if let Some(s) = outcome.scroll {
             self.term.scroll_display(s);
