@@ -54,8 +54,6 @@ const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
 const TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(56, 49, 36);
 // Project windows (the outer nesting level) get a subtly cooler, deeper titlebar
 // so the two levels read as distinct without breaking the warm-graphite look.
-const PROJ_TITLE_BG: egui::Color32 = egui::Color32::from_rgb(37, 41, 39);
-const PROJ_TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(48, 56, 52);
 const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 55, 45);
 const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 // The focused project gets a punchier, more saturated amber than focused terminals
@@ -2426,8 +2424,10 @@ impl WindowManager {
                 continue;
             }
 
-            // Projects reserve extra right-side room for the "+" new-project button.
-            let ctl_w = if is_project { 141.0 } else { 113.0 };
+            // Right-side control zone. Projects show only ✕ + ⋯ (quiet chrome);
+            // terminals keep four buttons. Sized per kind so the drag strip and
+            // the tab bar reclaim the space the old five-button row reserved.
+            let ctl_w = if is_project { 54.0 } else { 113.0 };
 
             // --- title drag (interact first, then we know final position) ---
             let drag_rect = egui::Rect::from_min_size(
@@ -2619,7 +2619,14 @@ impl WindowManager {
                 egui::CornerRadius::same(6)
             };
             let p = ui.painter_at(scr.intersect(area));
-            p.rect_filled(scr, cr, WIN_BG);
+            // Projects paint the terminal surface color, not chrome grey: the
+            // reserved (unfilled) title band must blend into the terminals
+            // below it, or it still reads as a header bar even with no fill.
+            p.rect_filled(
+                scr,
+                cr,
+                if is_project { crate::terminal::BG } else { WIN_BG },
+            );
 
             // --- content ---
             // Painted BEFORE the header so the hover-revealed header overlays
@@ -2661,9 +2668,6 @@ impl WindowManager {
                         fade(if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }),
                     );
                 }
-                // Right edge of the title/tab area; the project shell chips anchor here
-                // so they never overlap a multi-tab bar. Set by each titlebar branch.
-                let title_end_x;
                 if is_renaming {
                     // Field box centered in the titlebar; `vertical_align(Center)` lets
                     // egui center the text within it, so no pixel-fudging is needed.
@@ -2672,7 +2676,6 @@ impl WindowManager {
                         egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
                         egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
                     );
-                    title_end_x = te_rect.max.x + 8.0;
                     // Theme the field to the dark/amber titlebar instead of egui's
                     // default light TextEdit: dark inset fill + amber edit-mode border.
                     p.rect_filled(te_rect, egui::CornerRadius::same(3), fade(WIN_BG));
@@ -2914,17 +2917,7 @@ impl WindowManager {
                         }
                         cx += chip_w + 4.0;
                     }
-                    title_end_x = cx + 6.0;
                 } else {
-                    let tw = ui
-                        .painter()
-                        .layout_no_wrap(
-                            self.windows[i].title().to_string(),
-                            egui::FontId::proportional(12.5),
-                            TEXT,
-                        )
-                        .size()
-                        .x;
                     // Leading icon, mirroring the tab chips so a single-window header
                     // reads consistently (agent logo / shell glyph / project folder).
                     let mut tx = scr.min.x + 11.0;
@@ -2959,7 +2952,6 @@ impl WindowManager {
                         egui::FontId::proportional(12.5),
                         fade(if is_focus { TEXT } else { DIM }),
                     );
-                    title_end_x = tx + tw + 14.0;
                 }
 
                 // --- window controls ---
@@ -3128,14 +3120,18 @@ impl WindowManager {
                             })
                             .fold(0.0f32, f32::max)
                             + pad * 2.0;
-                        let origin = egui::pos2(
-                            (ovf_rect.right() - w).max(area.min.x),
-                            ovf_rect.bottom() + 2.0,
-                        );
-                        let panel = egui::Rect::from_min_size(
-                            origin,
-                            egui::vec2(w, row_h * labels.len() as f32 + 8.0),
-                        );
+                        let panel_h = row_h * labels.len() as f32 + 8.0;
+                        // Open below the ⋯; flip above it when the desktop
+                        // edge would clip the panel.
+                        let below = ovf_rect.bottom() + 2.0;
+                        let oy = if below + panel_h > area.max.y {
+                            (ovf_rect.top() - 2.0 - panel_h).max(area.min.y)
+                        } else {
+                            below
+                        };
+                        let origin =
+                            egui::pos2((ovf_rect.right() - w).max(area.min.x), oy);
+                        let panel = egui::Rect::from_min_size(origin, egui::vec2(w, panel_h));
                         egui::Area::new(base.with((id, "ovfmenu")))
                             .order(egui::Order::Foreground)
                             .fixed_pos(origin)
