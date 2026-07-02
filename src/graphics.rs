@@ -10,7 +10,6 @@
 use std::collections::{HashMap, VecDeque};
 
 /// One APC sequence's buffered payload cap.
-#[allow(dead_code)]
 const MAX_APC: usize = 8 * 1024 * 1024;
 
 /// Decoded-RGBA quota per session; oldest images evicted past this.
@@ -35,6 +34,7 @@ pub struct TermView {
 }
 
 /// Viewport facts sampled at paint time.
+#[allow(dead_code)] // constructed by the paint path landing in Task 9
 pub struct ViewportView {
     pub alt_screen: bool,
     pub history_size: usize,
@@ -44,7 +44,7 @@ pub struct ViewportView {
 
 /// One image to paint. `line` is a viewport row and may be negative (partially
 /// scrolled off the top). `cols`/`rows` of 0 = derive the span from pixels.
-#[allow(dead_code)]
+#[allow(dead_code)] // constructed by visible(); consumed by the paint path landing in Task 9
 pub struct Placed<'a> {
     pub id: u32,
     pub r#gen: u64,
@@ -59,31 +59,35 @@ pub struct Placed<'a> {
 
 struct Image {
     rgba: Vec<u8>,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     w: u32,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     h: u32,
     r#gen: u64,
 }
 
 struct Placement {
     img: u32,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     col: usize,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     line: usize,
     alt: bool,
     /// history_size when placed — primary-screen placements scroll by the delta.
     history: usize,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     cols: u16,
+    #[allow(dead_code)] // read by visible(), dark until Task 9
     rows: u16,
 }
 
 /// Byte offset in the fed chunk just past a completed command's `ESC \`.
 /// `pump` advances alacritty over `chunk[..offset]`, then samples the cursor.
-#[allow(dead_code)]
 pub struct Cut {
     pub offset: usize,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 enum Scan {
     #[default]
     Ground,
@@ -93,7 +97,6 @@ enum Scan {
 }
 
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct Graphics {
     scan: Scan,
     /// Current APC body (starting at its 'G'), buffered only for graphics APCs.
@@ -113,7 +116,6 @@ pub struct Graphics {
 }
 
 #[derive(Default, Clone)]
-#[allow(dead_code)]
 struct Header {
     action: u8,
     medium: u8,
@@ -130,25 +132,20 @@ struct Header {
     has_other: bool,
 }
 
-#[allow(dead_code)]
 enum Cmd {
-    #[allow(dead_code)]
     Transmit {
         header: Header,
         payload: Vec<u8>,
         display: bool,
     },
-    #[allow(dead_code)]
     Delete {
         spec: u8,
         id: Option<u32>,
     },
-    #[allow(dead_code)]
     Query {
         header: Header,
         payload: Vec<u8>,
     },
-    #[allow(dead_code)]
     Nop {
         reply: Option<Vec<u8>>,
     },
@@ -156,7 +153,6 @@ enum Cmd {
 
 /// Kitty `k=v,k=v` header. Unknown keys are ignored — tolerance is the spec's
 /// safety story ("silently skip, never corrupt").
-#[allow(dead_code)]
 fn parse_header(h: &[u8]) -> Header {
     let mut out = Header {
         action: b't',
@@ -213,7 +209,6 @@ fn parse_header(h: &[u8]) -> Header {
     out
 }
 
-#[allow(dead_code)]
 fn reply(out: &mut Vec<u8>, id: Option<u32>, msg: &[u8]) {
     out.extend_from_slice(b"\x1b_G");
     if let Some(id) = id {
@@ -224,7 +219,6 @@ fn reply(out: &mut Vec<u8>, id: Option<u32>, msg: &[u8]) {
     out.extend_from_slice(b"\x1b\\");
 }
 
-#[allow(dead_code)]
 impl Graphics {
     /// Scan one PTY chunk. Ground state fast-skips via byte search, so plain
     /// text costs one memchr-style pass and zero allocations.
@@ -470,6 +464,7 @@ impl Graphics {
 
     /// What's visible right now. `line` already accounts for scrollback offset;
     /// the painter clips partially-visible images.
+    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn visible(&self, v: &ViewportView) -> Vec<Placed<'_>> {
         let mut out = Vec::new();
         for p in &self.placements {
@@ -505,11 +500,13 @@ impl Graphics {
     }
 
     /// Paint guard: `show` skips all image work when this is false.
+    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn active(&self) -> bool {
         !self.placements.is_empty()
     }
 
     /// Texture-cache retention (terminal.rs drops textures for gone images).
+    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn has_image(&self, id: u32) -> bool {
         self.images.contains_key(&id)
     }

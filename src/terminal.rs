@@ -10,7 +10,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, viewport_to_point};
+use alacritty_terminal::term::{Config, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -210,6 +210,37 @@ impl Dimensions for Size {
     }
 }
 
+/// Advance the parser over `bytes`, splitting at graphics cuts so each command
+/// samples the cursor exactly where it completed in the stream (spec WS3).
+/// alacritty sees byte-identical input — only the advance() boundaries move,
+/// and chunk boundaries already occur anywhere. Zero cuts = today's code path.
+fn advance_scanned<L: EventListener>(
+    parser: &mut Processor,
+    term: &mut Term<L>,
+    graphics: &mut crate::graphics::Graphics,
+    bytes: &[u8],
+    replies: &mut Vec<u8>,
+) {
+    let cuts = graphics.feed(bytes);
+    let mut at = 0;
+    for cut in cuts {
+        parser.advance(term, &bytes[at..cut.offset]);
+        at = cut.offset;
+        graphics.apply(term_view(term), replies);
+    }
+    parser.advance(term, &bytes[at..]);
+}
+
+fn term_view<L: EventListener>(term: &Term<L>) -> crate::graphics::TermView {
+    let g = term.grid();
+    crate::graphics::TermView {
+        cursor_col: g.cursor.point.column.0,
+        cursor_line: g.cursor.point.line.0.max(0) as usize,
+        alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
+        history_size: g.history_size(),
+    }
+}
+
 pub struct Session {
     term: Term<Listener>,
     parser: Processor,
@@ -259,6 +290,9 @@ pub struct Session {
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
     caret: crate::caret::CaretGate,
+    /// Kitty graphics state: overlay images only — the grid stays pure text.
+    /// See src/graphics.rs and the spec.
+    graphics: crate::graphics::Graphics,
     /// Sub-line remainder of wheel scrolling. egui delivers a notch as smoothed
     /// per-frame fractions; carrying the remainder keeps gentle scrolls from
     /// rounding to nothing and fast flicks from over-emitting lines.
@@ -549,6 +583,7 @@ impl Session {
             ready: false,
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
+            graphics: crate::graphics::Graphics::default(),
             scroll_accum: 0.0,
             zoom_accum: 0.0,
         })
@@ -679,9 +714,23 @@ impl Session {
     }
 
     fn pump(&mut self) {
+        let mut greplies = Vec::new();
         while let Ok(bytes) = self.rx.try_recv() {
-            self.parser.advance(&mut self.term, &bytes);
+            advance_scanned(
+                &mut self.parser,
+                &mut self.term,
+                &mut self.graphics,
+                &bytes,
+                &mut greplies,
+            );
             self.output_gen = self.output_gen.wrapping_add(1);
+        }
+        // Graphics replies (a=q probes etc.) go straight back to the app — NOT
+        // via `resp`: that buffer's flush is what latches `ready` (the DSR
+        // contract), and a graphics reply must never fake readiness.
+        if !greplies.is_empty() {
+            let _ = self.writer.write_all(&greplies);
+            let _ = self.writer.flush();
         }
         let reply = std::mem::take(&mut *self.resp.lock().unwrap());
         if !reply.is_empty() {
@@ -1472,6 +1521,56 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn advance_scanned_places_at_the_cursor_where_the_command_completed() {
+        use base64::Engine as _;
+        let mut term = term_with(b"", 40, 10);
+        let mut parser: Processor = Processor::new();
+        let mut g = crate::graphics::Graphics::default();
+        let mut replies = Vec::new();
+
+        let rgba = [255u8, 0, 0, 255];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(rgba);
+        // Move to row 5, col 10 (1-based CUP), then place, then keep printing —
+        // all in ONE chunk. The placement must sample the moved cursor, and the
+        // trailing text must land where the app expects (grid untouched by APC).
+        let bytes =
+            format!("AB\x1b[5;10H\x1b_Ga=T,t=d,f=32,s=1,v=1,c=2,r=1,q=2,i=3;{b64}\x1b\\tail");
+        advance_scanned(
+            &mut parser,
+            &mut term,
+            &mut g,
+            bytes.as_bytes(),
+            &mut replies,
+        );
+
+        assert!(replies.is_empty());
+        let vp = crate::graphics::ViewportView {
+            alt_screen: false,
+            history_size: 0,
+            display_offset: 0,
+            screen_lines: 10,
+        };
+        let vis = g.visible(&vp);
+        assert_eq!(vis.len(), 1);
+        assert_eq!((vis[0].col, vis[0].line), (9, 4)); // CUP 5;10 is 0-based (4,9)
+
+        // grid_row(&Session, ..) doesn't apply here — this test drives a bare
+        // Term<VoidListener> (the sanctioned pure-parse pattern), not a Session.
+        let row = |line: i32| -> String {
+            (0..40)
+                .map(|c| {
+                    let ch = term.grid()[Line(line)][Column(c)].c;
+                    if ch == '\0' { ' ' } else { ch }
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert!(row(0).starts_with("AB"));
+        assert!(row(4).contains("tail")); // vte ignored the APC
     }
 
     #[test]
