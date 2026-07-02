@@ -547,6 +547,7 @@ impl Win {
 // Phase 2). Terminal-level variants act on the focused project's child manager;
 // project-level variants act on the desktop.
 
+#[derive(Clone)]
 enum Act {
     Focus(WinId),
     Close(WinId),
@@ -3109,42 +3110,37 @@ impl WindowManager {
                         let p = ui.painter();
                         p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
                         p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
-                        if let Some(ri) = hover_menu(
+                        if let Some(act) = hover_menu(
                             ui,
                             base.with((id, "plusmenu")),
                             pr,
                             area,
                             &[
-                                "New project",
-                                "New PS terminal",
-                                "New CMD terminal",
-                                "New SH terminal",
+                                ("New project", Act::OpenProjectPicker),
+                                ("New PS terminal", Act::AddTerm(id, Shell::PowerShell)),
+                                ("New CMD terminal", Act::AddTerm(id, Shell::Cmd)),
+                                ("New SH terminal", Act::AddTerm(id, Shell::Bash)),
                             ],
                             false,
                         ) {
-                            acts.push(match ri {
-                                0 => Act::OpenProjectPicker,
-                                1 => Act::AddTerm(id, Shell::PowerShell),
-                                2 => Act::AddTerm(id, Shell::Cmd),
-                                _ => Act::AddTerm(id, Shell::Bash),
-                            });
+                            acts.push(act);
                         }
                     }
                     // The ⋯ on the right: window controls for the project.
                     let float_label = if is_tiled { "Float" } else { "Tile" };
-                    if let Some(ri) = hover_menu(
+                    if let Some(act) = hover_menu(
                         ui,
                         base.with((id, "ovfmenu")),
                         ovf_rect,
                         area,
-                        &[float_label, "Minimize", "Maximize"],
+                        &[
+                            (float_label, Act::Float(id)),
+                            ("Minimize", Act::Min(id)),
+                            ("Maximize", Act::Max(id)),
+                        ],
                         true,
                     ) {
-                        acts.push(match ri {
-                            0 => Act::Float(id),
-                            1 => Act::Min(id),
-                            _ => Act::Max(id),
-                        });
+                        acts.push(act);
                     }
                 }
             } // end header chrome
@@ -3712,19 +3708,21 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 
 
 /// Hover-opened popup menu anchored to a header button. Paints rows in a
-/// Foreground `Area` and returns the clicked row index. Opens when the
-/// pointer rides the anchor (no click), closes on item click, Escape, or the
-/// pointer leaving the anchor+panel region (4 px slop bridges the gap). The
-/// open flag is transient egui memory — per-frame UI state, never model
-/// state. `align_right` right-aligns the panel to the anchor's right edge.
+/// Foreground `Area` and returns the clicked item's `Act`. Items carry their
+/// action with their label so callers can't mispair them (no positional
+/// index to keep in sync). Opens when the pointer rides the anchor (no
+/// click), closes on item click, Escape, or the pointer leaving the
+/// anchor+panel region (4 px slop bridges the gap). The open flag is
+/// transient egui memory — per-frame UI state, never model state.
+/// `align_right` right-aligns the panel to the anchor's right edge.
 fn hover_menu(
     ui: &mut egui::Ui,
     menu_id: egui::Id,
     anchor: egui::Rect,
     area: egui::Rect,
-    labels: &[&str],
+    items: &[(&str, Act)],
     align_right: bool,
-) -> Option<usize> {
+) -> Option<Act> {
     let open_id = menu_id.with("open");
     let was_open = ui
         .ctx()
@@ -3739,9 +3737,9 @@ fn hover_menu(
     let font = egui::FontId::proportional(12.0);
     let row_h = 22.0;
     let pad = 10.0;
-    let w = labels
+    let w = items
         .iter()
-        .map(|l| {
+        .map(|(l, _)| {
             ui.painter()
                 .layout_no_wrap((*l).to_owned(), font.clone(), TEXT)
                 .size()
@@ -3749,7 +3747,7 @@ fn hover_menu(
         })
         .fold(0.0f32, f32::max)
         + pad * 2.0;
-    let panel_h = row_h * labels.len() as f32 + 8.0;
+    let panel_h = row_h * items.len() as f32 + 8.0;
     // Below the anchor; flip above it at the bottom desktop edge.
     let below = anchor.bottom() + 2.0;
     let oy = if below + panel_h > area.max.y {
@@ -3776,7 +3774,7 @@ fn hover_menu(
                 egui::Stroke::new(1.0, BORDER),
                 egui::StrokeKind::Inside,
             );
-            for (ri, label) in labels.iter().enumerate() {
+            for (ri, (label, act)) in items.iter().enumerate() {
                 let rr = egui::Rect::from_min_size(
                     egui::pos2(panel.min.x, panel.min.y + 4.0 + row_h * ri as f32),
                     egui::vec2(w, row_h),
@@ -3793,7 +3791,7 @@ fn hover_menu(
                     TEXT,
                 );
                 if rresp.clicked() {
-                    clicked = Some(ri);
+                    clicked = Some(act.clone());
                 }
             }
         });
