@@ -27,7 +27,7 @@ behind those triage rows. Settled verdicts are enforced by
 | 1 | ConPTY resize/recall corruption | Upstream bug; wontfix; `Ctrl+L` heals | 2026-06-29 |
 | 2 | 9-zone snap system | Deleted; Layout tree replaced it | 2026-06-11 |
 | 3 | `--await-ack` | Removed same day as built ("lying API surface") | 2026-06-11 |
-| 4 | Selection rewrite | Doc describes code that never landed | open drift |
+| 4 | Selection rewrite | Doc described code that didn't exist for 3 weeks — until `b581240` built it | resolved 2026-07-02 |
 | 5 | Flaky chat broadcast test | Pre-Ready swallow; fixed in 3 stages | 2026-06-27 |
 | 6 | Input latency | 16 ms metronome, NOT vsync | 2026-06-18 |
 | 7 | Chat-room A/B experiment | Planned in full, never executed | abandoned |
@@ -151,25 +151,25 @@ plane would confirm a Member acknowledged a post.
   `64a80b9`, 2026-06-12) describes replacing v1 with `alacritty_terminal`'s
   `Selection` module in absolute buffer coordinates, with the lesson "Never
   store screen rows — that was the original bug."
-- **Verified truth (flagged drift):** that code **never landed on any branch**.
-  `git log --all -S "Selection::new"` and `-S "alacritty_terminal::selection"`
-  match only the doc commit itself. The tree plan records why: the doc was
-  "untracked pending the selection-rewrite recovery"
+- **The drift window (2026-06-12 → 2026-07-02):** for three weeks that code
+  existed **on no branch**. `git log --all -S "Selection::new"` matched only
+  the doc commit itself. The tree plan records why: the doc was "untracked
+  pending the selection-rewrite recovery"
   (`docs/superpowers/plans/2026-06-11-tree-floating-windows.md:27`) — the
   rewrite lived in a working tree that was lost; only the doc was recovered.
-- **Current code (as of 2026-07-01):** still hand-rolled —
-  `sel_anchor`/`sel_head: Option<(usize, usize)>` viewport cells
-  (`src/terminal.rs:260`), captured via `CellMetrics::cell_at`, copied by
-  `selection_text` which converts with the *current* `display_offset`
-  (`grid[Line(row as i32 - off)]`) and clamps to real grid bounds.
-  `docs/HANDOFF.md`'s module map describes this real implementation
-  (`sel_anchor`/`sel_head`/`selection_text`/`cell_at`) — on selection, HANDOFF
-  is right and the feature doc is fiction.
-- **Status:** open. The doc's coordinate *lesson* is genuine history; its
-  "How to use (in code)" section documents software that does not exist.
-  Whether today's implementation re-exhibits the scroll-pinning is unverified —
-  if you work here, test it first (**foreman-validation-and-qa**), and fix the
-  doc per **foreman-docs-and-writing**.
+  Throughout the window the real code stayed hand-rolled
+  `sel_anchor`/`sel_head: Option<(usize, usize)>` viewport cells, copied by a
+  `selection_text` that converted with the *current* `display_offset`.
+- **Resolution (`b581240`, 2026-07-02):** the rewrite finally landed —
+  selection migrated onto `alacritty_terminal`'s buffer-coordinate `Selection`
+  (`Selection::new`/`update`, `to_range`, `selection_to_string`), multi-click
+  Semantic/Lines and CJK handled; `sel_anchor`/`sel_head`/`selection_text`
+  deleted. The authority flip is the lesson: `docs/terminal-selection.md` went
+  from fiction to accurate, while `docs/HANDOFF.md`'s module map
+  (`sel_anchor`/`sel_head`/`selection_text`/`cell_at`) went from right to
+  stale on the same day. Authority labels don't track freshness; only code does.
+- **Status:** resolved. Current selection questions belong to
+  **terminal-emulation-reference** (updated with the migration).
 
 ## 5. Flaky chat broadcast test → the pre-Ready swallow (2026-06-11 → 2026-06-27)
 
@@ -255,12 +255,12 @@ incident record.
 | Artifact | What it says | Verified truth | Evidence |
 |----------|--------------|----------------|----------|
 | `docs/snap-tiling.md` | Zone snapping, present tense, no banner | Zones deleted `31a9120` (2026-06-11); the supersession sweep `b42e92e` updated 5 files and missed this one | `git show --stat b42e92e` |
-| `docs/terminal-selection.md` § How to use | alacritty `Selection` API in use | Never in any commit; code is hand-rolled `sel_anchor`/`sel_head` | battle 4 |
+| `docs/terminal-selection.md` § How to use | alacritty `Selection` API in use | Was fiction for 3 weeks (no commit had it); TRUE since `b581240` (2026-07-02) — HANDOFF's module map is now the stale one on selection | battle 4 |
 | `src/control.rs:130,548,763` + `foreman send --help` | "`--settle-ms` ... not yet honored (settle is the next phase)" | Honored: `DEFAULT_SETTLE_MS = 120`, `MAX_SETTLE_MS = 4000` (`src/wm.rs:17-18`), consumed at `src/wm.rs:938`, driven by `advance_settles` — the Quiescence settle works | `rg settle src/wm.rs` |
 | `docs/HANDOFF.md` § Coordinate model | "Snap/dwell use `ui.ctx().pointer_latest_pos()`..." | No `dwell`/`snap_or_tab` anywhere in `src/wm.rs` | `rg -e dwell -e snap_or_tab src/wm.rs` |
 | `docs/epics/window-tabbing-split-epic.md` | "**Status:** designed, not started" | Phase 1 tab-stacks shipped (its own 2026-06-11 banner admits it); browser-style tabs shipped `d4da700`/`31a3db4` | header vs git log |
-| `CLAUDE.md` § Session Context | "Currently working on `feat/browser-style-tabs`"; "check MEMORY.md in that directory" | Checkout is on `main`; that branch's tip `31a3db4` is an ancestor of `main`; the named memory directory **does not exist** | `git merge-base --is-ancestor`; `Test-Path` |
-| `.claude/agents/foreman-reviewer.md:45` | "Split (`Alt+WASD`) snaps a new terminal to a zone" | Zones deleted 2026-06-11; the reviewer agent teaches a dead system | `rg zone .claude/agents/` |
+| `CLAUDE.md` § Session Context | "Currently working on `feat/browser-style-tabs`"; "check MEMORY.md in that directory" | Checkout is on `main`; that branch's tip `31a3db4` is an ancestor of `main`. The memory directory was missing until 2026-07-02, when MEMORY.md was first written there — the branch claim is still stale | `git merge-base --is-ancestor`; `Test-Path` |
+| `.claude/agents/foreman-reviewer.md` (pre-2026-07-02) | "Split (`Alt+WASD`) snaps a new terminal to a zone" | Zones deleted 2026-06-11; the reviewer agent taught a dead system for 3 weeks until its 2026-07-02 rework | `rg 'snaps a new terminal to a zone' .claude/agents/` (now empty) |
 
 Meta-lesson: HANDOFF.md is *authoritative by declaration* (CLAUDE.md says it
 wins conflicts) yet has drifted in places itself — while on selection it is
@@ -361,7 +361,7 @@ claims before trusting them:
 | Experiments never committed (battle 1) | `git log --all -S "PSEUDOCONSOLE_RESIZE_QUIRK"` → only `5332757`; `rg portable-pty Cargo.toml` |
 | `origin/fix/terminal-reflow-on-resize` tips at `5332757` | `git log --oneline origin/fix/terminal-reflow-on-resize -1` |
 | `docs/snap-tiling.md` still bannerless | `Get-Content docs/snap-tiling.md -TotalCount 5` |
-| Selection rewrite still never landed | `git log --all -S "Selection::new"` → only `64a80b9`; `rg "sel_anchor" src/terminal.rs` |
+| Selection rewrite landed (battle 4 resolved) | `git log --all -S "Selection::new"` → `64a80b9` (doc) + `b581240` (code); `rg "sel_anchor" src/terminal.rs` (expect empty) |
 | `--settle-ms` honored but help still lies | `rg "not yet honored" src/control.rs`; `rg "DEFAULT_SETTLE_MS" src/wm.rs` |
 | Production `chat_broadcast` still deleted | `rg "fn chat_broadcast" src/wm.rs` → test fns only |
 | A/B prerequisites still unbuilt | `rg -e to_jsonl -e persist_chat_msg src/`; `Test-Path scripts` |

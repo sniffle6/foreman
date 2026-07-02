@@ -166,8 +166,9 @@ Rules, each backed by an in-tree precedent:
   concurrent conhost spawns); serializing "would only hide the race". Fix the
   test's delivery loop, not the scheduler.
 - **`VoidListener` is fine for driven `Term` fixtures, never for live
-  Sessions.** `inspect.rs` and `frame.rs` tests build `Term<VoidListener>` fed
-  fixed bytes — no PTY, no window, correct by design (src/inspect.rs:6). A live
+  Sessions.** The `inspect.rs`, `frame.rs`, and `terminal.rs` test modules
+  build `Term<VoidListener>` fed fixed bytes — no PTY, no window, correct by
+  design (src/inspect.rs:6). A live
   Session with `VoidListener` drops the DSR reply path: black screen, shell
   hangs forever (the CLAUDE.md "DSR trap"). Triage for that symptom:
   **foreman-debugging-playbook**.
@@ -242,5 +243,5 @@ drift-prone claims:
 | Acid-test list unchanged | `Get-Content docs/epics/terminal-completeness-epic.md \| Select-Object -Skip 36 -First 13` |
 | No CI config | `Test-Path .github` (expect `False`) |
 | Hook kill behavior | `Get-Content .claude/hooks/kill-foreman.ps1` |
-| VoidListener only in fixtures | `Select-String -Path src/*.rs -Pattern 'VoidListener'` (expect frame.rs + inspect.rs only) |
+| VoidListener only in fixtures | `Select-String -Path src/*.rs -Pattern 'VoidListener'` (expect hits only inside test modules/fixtures — frame.rs, inspect.rs, terminal.rs; none in live-Session code) |
 | Flake plan + fleet rules | `Get-Content docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md` |

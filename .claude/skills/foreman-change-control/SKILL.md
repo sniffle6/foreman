@@ -197,13 +197,14 @@ Hooks in `.claude/settings.json` (verified 2026-07-01):
 | PostToolUse | `Edit\|Write` | `.claude/hooks/cargo-fmt.ps1` | Runs `cargo fmt` only when the edited path ends in `.rs`; prepends `C:\w64devkit\bin` and cargo to PATH. Always exits 0 — it never blocks, so a fmt failure is silent. |
 
 **foreman-reviewer agent** (`.claude/agents/foreman-reviewer.md`, model sonnet):
-invoke after edits to `src/wm.rs` / `src/terminal.rs` / `src/keymap.rs` /
-`src/main.rs`. **Drift flag (as of 2026-07-01):** its landmine list still describes
-the zone-snap model deleted 2026-06-11 — "Split (`Alt+WASD`) snaps a new terminal
-to a zone and tabs onto the occupant if taken" (`foreman-reviewer.md:44-46`). In
-reality Alt+WASD splits a new Session into the Layout tree (`docs/tiling-tree.md`,
-CLAUDE.md). Treat its zone claims as stale; its DSR/egui-0.34/local-rect/focus
-landmines still match the code.
+invoke after edits to terminal-emulation code (`src/terminal.rs`, `input.rs`,
+`caret.rs`, `geom.rs`, `frame.rs`, `inspect.rs`), WM/layout code (`src/wm.rs`,
+`layout.rs`, `main.rs`), or control-plane/chat code (`src/control.rs`,
+`chat.rs`), and before commits/PRs touching them. Reworked 2026-07-02: the old
+zone-snap drift (it taught the model deleted 2026-06-11) is fixed; it now
+reviews per-subsystem against the Layout-tree model, wire-compat v1, ordering
+invariants, Ready gating, and the evidence gates, and routes to this skill
+library for depth.
 
 Build mechanics and the warning baseline → **foreman-build-and-env**. Symptom
 triage → **foreman-debugging-playbook**.
@@ -243,8 +244,9 @@ Select-String -Path "H:/claude code/foreman/src/skills_install.rs" -Pattern 'inc
 Get-Content "H:/claude code/foreman/.claude/settings.json"
 Get-Content "H:/claude code/foreman/.claude/hooks/kill-foreman.ps1"
 
-# foreman-reviewer zone-snap drift (fixed once this returns nothing)
-Select-String -Path "H:/claude code/foreman/.claude/agents/foreman-reviewer.md" -Pattern 'zone'
+# foreman-reviewer teaches no dead zone-snap system (expect empty; the file's
+# only 'zone' mentions are the guard telling reviewers zones were deleted)
+Select-String -Path "H:/claude code/foreman/.claude/agents/foreman-reviewer.md" -Pattern 'snaps a new terminal to a zone'
 
 # Commit conventions + trailer + the '@' cautionary tale
 git -C "H:/claude code/foreman" log --oneline -30

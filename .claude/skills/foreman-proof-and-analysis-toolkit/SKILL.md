@@ -321,26 +321,21 @@ not accidental. The cross-agreement test
 `mouse_cell_is_cell_at_plus_one_in_col_row_order` (`src/geom.rs:153-169`)
 pins them together, clamps included.
 
-**Worked example B — the selection-v1 failure, plus a doc trap (verified
-2026-07-01).** `docs/terminal-selection.md` recounts v1's failure mode:
-selection endpoints stored as screen-space `(row, col)` broke under scroll —
-the highlight stayed pinned to the screen while text moved, and the copy path
-read through the *current* scroll offset so highlight and copy disagreed.
-That failure story is the lesson: state the space first. **But flag the
-drift:** the same doc's "How to use (in code)" section describes a rewrite
-onto `alacritty_terminal`'s buffer-coordinate `Selection` API
-(`Selection::new`, `selection_to_string`, `point_at`) that is **not in any
-committed revision** — `git log --all -S "Selection::new" -- src/` finds
-nothing, and `sel_anchor` has been a viewport-space `Option<(usize, usize)>`
-from the initial commit `87464e4` through HEAD (`src/terminal.rs:260`;
-`SelRange` is explicitly documented as viewport coords at
-`src/frame.rs:28-33`). What HEAD actually does: highlight and copy both read
-text through the same `Line(row - off)` conversion each frame
-(`src/frame.rs:84`, `src/terminal.rs:617`), so they can no longer disagree
-with each other — but by code reading (not live-tested), the selection
-remains screen-anchored and does not ride with scrolled text as the doc
-claims. Treat that doc's implementation section as stale (trust map:
-**foreman-docs-and-writing**).
+**Worked example B — the selection-v1 failure (resolved 2026-07-02).**
+`docs/terminal-selection.md` recounts v1's failure mode: selection endpoints
+stored as screen-space `(row, col)` broke under scroll — the highlight stayed
+pinned to the screen while text moved, and the copy path read through the
+*current* scroll offset so highlight and copy disagreed. That failure story
+is the lesson: state the space first. The buffer-coordinate rewrite the doc
+described was fiction for three weeks (no committed revision had it) until
+`b581240` (2026-07-02) landed it: selection now lives in
+`alacritty_terminal`'s buffer-space `Selection` (`Selection::new`/`update`,
+`to_range`), `sel_anchor`/`sel_head`/`selection_text` are deleted, and the
+seam boundary demonstrates the recipe — `sel_point` converts
+viewport→buffer on the way in, `sel_viewport_range` converts buffer→viewport
+on the way out, so `frame.rs`'s `SelRange` stays deliberately viewport-space
+(`src/frame.rs:28-33`) while storage is buffer-space. Every crossing names
+its space; that is the "state the space first" rule, enforced at a seam.
 
 **Done when:** every function involved names its space in its doc comment,
 the clamp behavior is unit-tested, and paired readers have a cross-agreement
@@ -519,7 +514,7 @@ and constants below drift; re-verify before trusting. Run from the repo root
 | Caret constants (50 ms / 150 ms) | `git grep -n "CURSOR_SETTLE\|INPUT_GRACE" -- src/caret.rs` |
 | Ready gate + inject queue | `git grep -n "pending_inject\|ready = true" -- src/terminal.rs` |
 | Wire-compat test inventory | `git grep -n "wire_compat\|wire_compatible\|omits_none" -- src/control.rs` |
-| Selection still viewport-space (doc-drift claim) | `git grep -n "sel_anchor" -- src/terminal.rs`; `git log --all --oneline -S "Selection::new" -- src/` (empty = drift claim stands) |
+| Selection buffer-space since `b581240` | `git log --all --oneline -S "Selection::new" -- src/` → `b581240`; `git grep -n "sel_anchor" -- src/terminal.rs` (expect empty) |
 | `compose_zone` historical table | `git show e438a83:src/wm.rs \| Select-String compose_zone` |
 | Reader-thread / send() tee points | `git grep -n "try_clone_reader\|fn send(&mut self" -- src/terminal.rs` |
 | Test count (353 at `7fda1c2`) | `git show -s 7fda1c2` (commit message); recount with `cargo test` only when the build lock is free |
