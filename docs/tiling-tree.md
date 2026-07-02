@@ -8,6 +8,13 @@ Every window in foreman is in one of two states:
   fill the whole area, and reflow when siblings come and go.
 - **Floating** — classic overlapping window with z-order, drag, resize.
 
+Floating windows are a strict upper layer: a float always paints above every
+tiled window, and clicking/focusing a tile never raises it above a float.
+`z` (raise on focus) only reorders windows *within* a layer — in practice that
+means among floats, since tiles never overlap each other. Zoom still renders on
+top of everything (it is an overlay, not a z change). See
+`WindowManager::draw_order` in `src/wm.rs`.
+
 This works at BOTH levels of the recursive compositor: projects tile on the
 desktop, terminals tile inside their project. Same engine, same rules.
 

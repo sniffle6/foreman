@@ -1651,6 +1651,22 @@ impl WindowManager {
         self.focused = Some(id);
     }
 
+    /// Back-to-front draw order. Floating windows form a strict upper layer:
+    /// a float always paints above every tiled window, no matter how recently
+    /// the tile was focused — `z` orders windows only *within* each layer.
+    /// Minimized windows are skipped. (Zoom is layered on top separately by
+    /// `show`.)
+    fn draw_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.windows.len())
+            .filter(|&i| !self.windows[i].minimized)
+            .collect();
+        order.sort_by_key(|&i| {
+            let w = &self.windows[i];
+            (!self.tree.contains(w.id), w.z)
+        });
+        order
+    }
+
     // --- leader / command mode (desktop only) -------------------------------
 
     /// Run the leader state machine for one frame. Returns the command chord to
@@ -2188,14 +2204,10 @@ impl WindowManager {
     /// the one minimizing (dominant-axis distance, then cross-axis distance).
     fn focus_dir(&mut self, d: Dir) {
         let Some(cur) = self.focused else {
-            // No focus yet: focus the top-most visible window.
-            if let Some(id) = self
-                .windows
-                .iter()
-                .filter(|w| !w.minimized)
-                .max_by_key(|w| w.z)
-                .map(|w| w.id)
-            {
+            // No focus yet: focus the top-most visible window. Draw order is
+            // layered (floats above tiles), so "topmost" is its last entry —
+            // NOT the max raw `z`, which a buried tile can hold.
+            if let Some(id) = self.draw_order().last().map(|&i| self.windows[i].id) {
                 self.focus(id);
             }
             return;
@@ -2315,10 +2327,7 @@ impl WindowManager {
 
         let focused = self.focused;
         let asz = area.size();
-        let mut order: Vec<usize> = (0..self.windows.len())
-            .filter(|&i| !self.windows[i].minimized)
-            .collect();
-        order.sort_by_key(|&i| self.windows[i].z);
+        let mut order = self.draw_order();
 
         let placements: std::collections::HashMap<WinId, egui::Rect> = self
             .tree
@@ -5952,6 +5961,31 @@ mod tests {
         wm.toggle_zoom(b);
         let after = wm.windows.iter().find(|w| w.id == b).unwrap().rect;
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn floats_always_paint_above_tiled_windows() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "tiled-a");
+        let b = push(&mut wm, "tiled-b");
+        wm.tree.insert_root(a, Dir::Right);
+        wm.tree.insert_root(b, Dir::Right);
+        let f = push(&mut wm, "float-1");
+        let g = push(&mut wm, "float-2");
+        // Focusing a tiled window bumps its z past both floats…
+        wm.focus(a);
+        let ids: Vec<WinId> = wm.draw_order().iter().map(|&i| wm.windows[i].id).collect();
+        // …but floats still paint last (top layer); z orders only within layers.
+        assert_eq!(ids, vec![b, a, f, g]);
+        // No-focus fallback lands on the true topmost window (float g), not
+        // the max raw z (tile a holds a stale higher z).
+        wm.focused = None;
+        wm.focus_dir(Dir::Right);
+        assert_eq!(wm.focused, Some(g));
+        // Raise-on-focus reorders within the float layer only.
+        wm.focus(f);
+        let ids: Vec<WinId> = wm.draw_order().iter().map(|&i| wm.windows[i].id).collect();
+        assert_eq!(ids, vec![b, a, g, f]);
     }
 
     #[test]
