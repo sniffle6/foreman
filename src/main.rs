@@ -72,11 +72,11 @@ const CHROME_BTN_W: f32 = 42.0;
 const APP_BORDER_W: f32 = 7.0; // visible frame around the undecorated window
 const APP_BORDER: egui::Color32 = CHROME_BG; // frame matches the revealed bar
 
-const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(46, 42, 35);
-const CHROME_BORDER: egui::Color32 = egui::Color32::from_rgb(60, 55, 45);
+const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(42, 42, 42);
+const CHROME_BORDER: egui::Color32 = egui::Color32::from_rgb(58, 58, 58);
 const CHROME_TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const CHROME_DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
-const CHROME_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 63, 50);
+const CHROME_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(66, 66, 66);
 const CHROME_CLOSE_HOVER: egui::Color32 = egui::Color32::from_rgb(196, 43, 28);
 
 impl App {

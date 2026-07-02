@@ -54,11 +54,12 @@ const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
 const TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(56, 49, 36);
 // Project windows (the outer nesting level) get a subtly cooler, deeper titlebar
 // so the two levels read as distinct without breaking the warm-graphite look.
-const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 55, 45);
-const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
-// The focused project gets a punchier, more saturated amber than focused terminals
-// so the selected project reads at a glance even with thin borders.
-const PROJ_BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(150, 107, 28);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(60, 60, 60);
+const BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(231, 231, 231);
+// The focused project sits a step dimmer than focused terminals so the two
+// levels stay distinct at a glance even with thin borders (same brightness
+// ladder as the old amber scheme, re-based on neutral white).
+const PROJ_BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 const BORDER_W: f32 = 0.75; // uniform window border width; focus is shown by colour
 const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
@@ -99,7 +100,7 @@ const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize h
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
 const MIN_H: f32 = 140.0;
 
-// snap overlay (amber, matches BORDER_FOCUS / web mockup --needs #e7a93f)
+// snap overlay (amber, web mockup --needs #e7a93f)
 const SNAP_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 169, 63, 33); // ~13% alpha
 const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 const SNAP_GAP: f32 = 0.0; // inset of zones from the area edge; 0 = windows tile edge-to-edge
@@ -448,7 +449,7 @@ impl Content {
                     egui::StrokeKind::Inside,
                 );
                 ui.visuals_mut().selection.bg_fill =
-                    egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
+                    egui::Color32::from_rgba_unmultiplied(231, 231, 231, 90);
                 let te = ui.put(
                     te_rect,
                     egui::TextEdit::singleline(&mut view.input)
@@ -2707,7 +2708,7 @@ impl WindowManager {
                         egui::StrokeKind::Inside,
                     );
                     ui.visuals_mut().selection.bg_fill =
-                        egui::Color32::from_rgba_unmultiplied(231, 169, 63, 90);
+                        egui::Color32::from_rgba_unmultiplied(231, 231, 231, 90);
                     let resp = ui.put(
                         te_rect,
                         egui::TextEdit::singleline(&mut self.rename_buf)

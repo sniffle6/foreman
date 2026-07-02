@@ -1047,8 +1047,8 @@ impl Session {
         let galley = painter.layout_job(job);
         painter.galley(rect.min, galley, FG);
 
-        // selection highlight (translucent amber over selected cells)
-        let hl = egui::Color32::from_rgba_unmultiplied(231, 169, 63, 70);
+        // selection highlight (translucent white over selected cells)
+        let hl = egui::Color32::from_rgba_unmultiplied(231, 231, 231, 70);
         for r in &plan.highlights {
             painter.rect_filled(*r, egui::CornerRadius::ZERO, hl);
         }
@@ -1067,7 +1067,7 @@ impl Session {
             painter.rect_filled(
                 r,
                 egui::CornerRadius::same(2),
-                egui::Color32::from_rgba_unmultiplied(231, 169, 63, 150),
+                egui::Color32::from_rgba_unmultiplied(231, 231, 231, 150),
             );
         }
     }
