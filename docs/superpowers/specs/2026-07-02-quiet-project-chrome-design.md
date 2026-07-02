@@ -1,7 +1,8 @@
 # Quiet Project Chrome — Design
 
-**Status:** awaiting user review. Three judgment calls were made while the user
-was away (marked ⚖ below); each is a one-line change if overridden.
+**Status:** approved by user 2026-07-02, with one modification: the reveal
+rule is SHARED by projects and terminals (terminals switch from
+anywhere-on-window reveal to the same top-band rule).
 
 ## Goal
 
@@ -22,19 +23,22 @@ invisible until you reach for it, and calm even when revealed.
 
 ## Design (Approach A — recommended and specced)
 
-### 1. Reveal rule ⚖
+### 1. Reveal rule — ONE predicate, both levels (user-approved)
 
-Projects drop the `is_project` escape hatch and get their own trigger: pointer
-inside the **title band** (`title_rect`, the top `TITLE_H` strip), with the
-existing pins (move drag, rename, tab tear-out) plus a new pin: **overflow menu
-open**. No dwell — reveal is immediate (the OS bar's dwell exists to guard
-accidental brushes at the screen edge; a project band has no such hazard).
+One shared predicate for projects AND terminals: chrome reveals when the
+pointer is inside the **title band** (`title_rect`, the top `TITLE_H` strip),
+pinned visible by: move drag in flight, rename in progress, tab tear-out in
+flight, or overflow menu open. No dwell — reveal is immediate (the OS bar's
+dwell exists to guard accidental brushes at the screen edge; a title band has
+no such hazard).
 
-⚖ *User's message said "hovered over that project" (whole-project reveal, the
-terminal rule). Rejected here because the pointer usually parks in the project
-you're working in, so its header would be visible almost constantly — the
-single-project case that motivated this stays busy. The predicate lives in one
-small function; flipping to whole-project reveal is a one-line override.*
+This changes BOTH kinds: projects drop the `is_project` always-on escape
+hatch; terminals narrow from anywhere-on-window reveal to band-only. The
+existing invariant is preserved: the content interact rect stays below the
+strip, and whenever the pointer is up there the (now shown) header owns the
+band, so no clicks are lost. The terminal scrollbar keeps its own
+anywhere-on-window reveal — reaching for the right edge is not reaching for
+the top.
 
 ### 2. Band stays reserved; bg goes transparent
 
@@ -84,14 +88,16 @@ a bg fill.
 
 ### 6. Out of scope
 
-Terminal headers (already quiet), the OS chrome bar, minimized taskbar,
-drop-hint painting during drags (separate painter, unaffected by reveal).
+Terminal header *styling* (bg fill stays; only their reveal trigger changes),
+the OS chrome bar, minimized taskbar, terminal scrollbar reveal, drop-hint
+painting during drags (separate painter, unaffected by reveal).
 
 ## Testing
 
-- Unit (pure, wm tests): reveal predicate — band hover reveals; content hover
-  does not; drag/rename/menu-open pin; extract predicate so it's testable
-  without egui.
+- Unit (pure, wm tests): the shared reveal predicate — band hover reveals;
+  content hover does not; drag/rename/tear-out/menu-open pin; identical
+  outcomes for project and terminal windows; extract the predicate so it's
+  testable without egui.
 - Evidence (per foreman-validation-and-qa): screenshots — hidden state,
   hover-revealed state, overflow menu open, focus legibility with 3 projects.
 - Existing 373 tests stay green.
