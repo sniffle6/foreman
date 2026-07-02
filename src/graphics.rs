@@ -34,7 +34,6 @@ pub struct TermView {
 }
 
 /// Viewport facts sampled at paint time.
-#[allow(dead_code)] // constructed by the paint path landing in Task 9
 pub struct ViewportView {
     pub alt_screen: bool,
     pub history_size: usize,
@@ -44,7 +43,6 @@ pub struct ViewportView {
 
 /// One image to paint. `line` is a viewport row and may be negative (partially
 /// scrolled off the top). `cols`/`rows` of 0 = derive the span from pixels.
-#[allow(dead_code)] // constructed by visible(); consumed by the paint path landing in Task 9
 pub struct Placed<'a> {
     pub id: u32,
     pub r#gen: u64,
@@ -59,25 +57,19 @@ pub struct Placed<'a> {
 
 struct Image {
     rgba: Vec<u8>,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     w: u32,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     h: u32,
     r#gen: u64,
 }
 
 struct Placement {
     img: u32,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     col: usize,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     line: usize,
     alt: bool,
     /// history_size when placed — primary-screen placements scroll by the delta.
     history: usize,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     cols: u16,
-    #[allow(dead_code)] // read by visible(), dark until Task 9
     rows: u16,
 }
 
@@ -162,8 +154,14 @@ fn parse_header(h: &[u8]) -> Header {
     };
     for kv in h.split(|&b| b == b',') {
         let mut it = kv.splitn(2, |&b| b == b'=');
-        let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
-        let num = |v: &[u8]| std::str::from_utf8(v).ok().and_then(|s| s.parse::<u32>().ok());
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let num = |v: &[u8]| {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+        };
         match k {
             b"a" => {
                 out.action = v.first().copied().unwrap_or(b't');
@@ -328,7 +326,11 @@ impl Graphics {
                 }
                 let (first, data) = self.chunk.take().expect("checked above");
                 let display = first.action == b'T';
-                self.pending.push_back(Cmd::Transmit { header: first, payload: data, display });
+                self.pending.push_back(Cmd::Transmit {
+                    header: first,
+                    payload: data,
+                    display,
+                });
                 return true;
             }
             // A real command interleaved mid-chain violates the kitty
@@ -386,9 +388,15 @@ impl Graphics {
     /// Apply the next pending command using sampled term facts. Called exactly
     /// once per `Cut`, in order (see terminal.rs `advance_scanned`).
     pub fn apply(&mut self, view: TermView, out: &mut Vec<u8>) {
-        let Some(cmd) = self.pending.pop_front() else { return };
+        let Some(cmd) = self.pending.pop_front() else {
+            return;
+        };
         match cmd {
-            Cmd::Transmit { header, payload, display } => match decode_image(&header, &payload) {
+            Cmd::Transmit {
+                header,
+                payload,
+                display,
+            } => match decode_image(&header, &payload) {
                 Ok((w, h, rgba)) => {
                     let id = header.id.unwrap_or_else(|| {
                         self.next_anon = self.next_anon.wrapping_add(1);
@@ -396,7 +404,15 @@ impl Graphics {
                     });
                     self.r#gen += 1;
                     self.store_bytes += rgba.len();
-                    if let Some(old) = self.images.insert(id, Image { rgba, w, h, r#gen: self.r#gen }) {
+                    if let Some(old) = self.images.insert(
+                        id,
+                        Image {
+                            rgba,
+                            w,
+                            h,
+                            r#gen: self.r#gen,
+                        },
+                    ) {
                         self.store_bytes -= old.rgba.len();
                     }
                     self.evict_over_quota();
@@ -464,7 +480,6 @@ impl Graphics {
 
     /// What's visible right now. `line` already accounts for scrollback offset;
     /// the painter clips partially-visible images.
-    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn visible(&self, v: &ViewportView) -> Vec<Placed<'_>> {
         let mut out = Vec::new();
         for p in &self.placements {
@@ -483,7 +498,9 @@ impl Graphics {
             if line >= v.screen_lines as isize || line < -300 {
                 continue; // fully below, or absurdly far above (max rows is 300)
             }
-            let Some(img) = self.images.get(&p.img) else { continue };
+            let Some(img) = self.images.get(&p.img) else {
+                continue;
+            };
             out.push(Placed {
                 id: p.img,
                 r#gen: img.r#gen,
@@ -500,20 +517,20 @@ impl Graphics {
     }
 
     /// Paint guard: `show` skips all image work when this is false.
-    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn active(&self) -> bool {
         !self.placements.is_empty()
     }
 
     /// Texture-cache retention (terminal.rs drops textures for gone images).
-    #[allow(dead_code)] // called by the paint path landing in Task 9
     pub fn has_image(&self, id: u32) -> bool {
         self.images.contains_key(&id)
     }
 
     fn evict_over_quota(&mut self) {
         while self.store_bytes > MAX_STORE && self.images.len() > 1 {
-            let Some((&id, _)) = self.images.iter().min_by_key(|(_, i)| i.r#gen) else { break };
+            let Some((&id, _)) = self.images.iter().min_by_key(|(_, i)| i.r#gen) else {
+                break;
+            };
             if let Some(img) = self.images.remove(&id) {
                 self.store_bytes -= img.rgba.len();
             }
@@ -721,7 +738,10 @@ mod tests {
     #[test]
     fn interleaved_command_mid_chain_drops_the_chain_and_honors_the_command() {
         let mut g = Graphics::default();
-        assert!(g.feed(b"\x1b_Ga=T,t=d,f=100,q=2,i=4,m=1;AAAA\x1b\\").is_empty());
+        assert!(
+            g.feed(b"\x1b_Ga=T,t=d,f=100,q=2,i=4,m=1;AAAA\x1b\\")
+                .is_empty()
+        );
         // An explicit command mid-chain kills the chain and is itself queued.
         let cuts = g.feed(b"\x1b_Ga=d,d=I,i=9,q=2;\x1b\\");
         assert_eq!(cuts.len(), 1);
@@ -742,17 +762,28 @@ mod tests {
 
     /// 2x2 raw RGBA red square, transmitted+displayed with the given id.
     fn red_transmit(id: u32) -> Vec<u8> {
-        let rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4).flatten().collect();
+        let rgba: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4)
+            .flatten()
+            .collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
         format!("\x1b_Ga=T,t=d,f=32,s=2,v=2,c=2,r=1,q=2,i={id};{b64}\x1b\\").into_bytes()
     }
 
     fn view(col: usize, line: usize) -> TermView {
-        TermView { cursor_col: col, cursor_line: line, alt_screen: false, history_size: 0 }
+        TermView {
+            cursor_col: col,
+            cursor_line: line,
+            alt_screen: false,
+            history_size: 0,
+        }
     }
 
-    const VP: ViewportView =
-        ViewportView { alt_screen: false, history_size: 0, display_offset: 0, screen_lines: 40 };
+    const VP: ViewportView = ViewportView {
+        alt_screen: false,
+        history_size: 0,
+        display_offset: 0,
+        screen_lines: 40,
+    };
 
     #[test]
     fn transmit_places_at_the_sampled_cursor() {
@@ -788,12 +819,30 @@ mod tests {
         let mut out = Vec::new();
         g.feed(&red_transmit(1));
         // placed at line 30 when history was 100
-        g.apply(TermView { cursor_col: 0, cursor_line: 30, alt_screen: false, history_size: 100 }, &mut out);
+        g.apply(
+            TermView {
+                cursor_col: 0,
+                cursor_line: 30,
+                alt_screen: false,
+                history_size: 100,
+            },
+            &mut out,
+        );
         // 15 more lines scrolled into history since
-        let v = ViewportView { alt_screen: false, history_size: 115, display_offset: 0, screen_lines: 40 };
+        let v = ViewportView {
+            alt_screen: false,
+            history_size: 115,
+            display_offset: 0,
+            screen_lines: 40,
+        };
         assert_eq!(g.visible(&v)[0].line, 15);
         // scrolling back 5 lines shifts it back down
-        let v = ViewportView { alt_screen: false, history_size: 115, display_offset: 5, screen_lines: 40 };
+        let v = ViewportView {
+            alt_screen: false,
+            history_size: 115,
+            display_offset: 5,
+            screen_lines: 40,
+        };
         assert_eq!(g.visible(&v)[0].line, 20);
     }
 
@@ -802,9 +851,20 @@ mod tests {
         let mut g = Graphics::default();
         let mut out = Vec::new();
         g.feed(&red_transmit(2));
-        g.apply(TermView { cursor_col: 1, cursor_line: 1, alt_screen: true, history_size: 0 }, &mut out);
+        g.apply(
+            TermView {
+                cursor_col: 1,
+                cursor_line: 1,
+                alt_screen: true,
+                history_size: 0,
+            },
+            &mut out,
+        );
         assert!(g.visible(&VP).is_empty()); // primary viewport
-        let alt = ViewportView { alt_screen: true, ..VP };
+        let alt = ViewportView {
+            alt_screen: true,
+            ..VP
+        };
         assert_eq!(g.visible(&alt).len(), 1);
     }
 
@@ -876,9 +936,22 @@ mod tests {
         let mut g = Graphics::default();
         let mut out = Vec::new();
         g.feed(&red_transmit(1));
-        g.apply(TermView { cursor_col: 0, cursor_line: 5, alt_screen: false, history_size: 100 }, &mut out);
+        g.apply(
+            TermView {
+                cursor_col: 0,
+                cursor_line: 5,
+                alt_screen: false,
+                history_size: 100,
+            },
+            &mut out,
+        );
         // Scrollback was cleared: history went backwards.
-        let v = ViewportView { alt_screen: false, history_size: 0, display_offset: 0, screen_lines: 40 };
+        let v = ViewportView {
+            alt_screen: false,
+            history_size: 0,
+            display_offset: 0,
+            screen_lines: 40,
+        };
         assert!(g.visible(&v).is_empty());
     }
 
@@ -899,7 +972,11 @@ mod tests {
             for &b in data {
                 c ^= b as u32;
                 for _ in 0..8 {
-                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
                 }
             }
             !c

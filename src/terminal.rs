@@ -293,6 +293,9 @@ pub struct Session {
     /// Kitty graphics state: overlay images only — the grid stays pure text.
     /// See src/graphics.rs and the spec.
     graphics: crate::graphics::Graphics,
+    /// egui textures for graphics images, keyed by image id → (data generation,
+    /// handle). The egui adapter stays here so `graphics` remains egui-free.
+    textures: std::collections::HashMap<u32, (u64, egui::TextureHandle)>,
     /// Sub-line remainder of wheel scrolling. egui delivers a notch as smoothed
     /// per-frame fractions; carrying the remainder keeps gentle scrolls from
     /// rounding to nothing and fast flicks from over-emitting lines.
@@ -584,6 +587,7 @@ impl Session {
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
+            textures: std::collections::HashMap::new(),
             scroll_accum: 0.0,
             zoom_accum: 0.0,
         })
@@ -1086,6 +1090,69 @@ impl Session {
         let galley = painter.layout_job(job);
         painter.galley(rect.min, galley, FG);
 
+        // Kitty graphics overlay — images are pure overlay; the grid stays
+        // text (spec: docs/superpowers/specs/2026-07-02-terminal-image-support-design.md).
+        if self.graphics.active() {
+            let (alt, hist, off, lines) = {
+                let g = self.term.grid();
+                (
+                    self.term.mode().contains(TermMode::ALT_SCREEN),
+                    g.history_size(),
+                    g.display_offset(),
+                    g.screen_lines(),
+                )
+            };
+            let vv = crate::graphics::ViewportView {
+                alt_screen: alt,
+                history_size: hist,
+                display_offset: off,
+                screen_lines: lines,
+            };
+            for p in self.graphics.visible(&vv) {
+                let tex = match self.textures.get(&p.id) {
+                    Some((g, t)) if *g == p.r#gen => t.clone(), // cheap Arc clone
+                    _ => {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [p.w as usize, p.h as usize],
+                            p.rgba,
+                        );
+                        let t = ui.ctx().load_texture(
+                            format!("kittyimg{}", p.id),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.textures.insert(p.id, (p.r#gen, t.clone()));
+                        t
+                    }
+                };
+                // c/r from the client when given (pets always sends them);
+                // otherwise derive the cell span from pixel size.
+                let cols_f = if p.cols > 0 {
+                    p.cols as f32
+                } else {
+                    (p.w as f32 / cw).ceil().max(1.0)
+                };
+                let rows_f = if p.rows > 0 {
+                    p.rows as f32
+                } else {
+                    (p.h as f32 / rh).ceil().max(1.0)
+                };
+                let min = egui::pos2(
+                    rect.min.x + p.col as f32 * cw,
+                    rect.min.y + p.line as f32 * rh,
+                );
+                let img_rect = egui::Rect::from_min_size(min, egui::vec2(cols_f * cw, rows_f * rh));
+                painter.image(
+                    tex.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            // Drop textures whose image data is gone (deleted/evicted).
+            self.textures.retain(|id, _| self.graphics.has_image(*id));
+        }
+
         for r in &plan.highlights {
             painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
         }
@@ -1100,11 +1167,7 @@ impl Session {
         if let Some(r) = plan.thumb
             && (plan.scrolled_back || resp.hovered())
         {
-            painter.rect_filled(
-                r,
-                egui::CornerRadius::same(2),
-                SCROLL_THUMB,
-            );
+            painter.rect_filled(r, egui::CornerRadius::same(2), SCROLL_THUMB);
         }
     }
 }
