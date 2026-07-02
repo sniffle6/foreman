@@ -30,8 +30,10 @@ overlap with `⋯` (which would open both hover menus at once).
 
 ## Key files
 
-- `src/wm.rs` — the `bare` rule, the header paint branch, `hover_menu`, the
-  `+`/`⋯` menu wiring.
+- `src/wm.rs` — the `bare` rule, `header_layout` (the pure geometry module:
+  chip packing, the control-zone fence, the `+` clamp — contract-tested),
+  the header paint branch that consumes it, `hover_menu`, the `+`/`⋯` menu
+  wiring.
 - `src/terminal.rs` — `BG`, the shared surface color.
 - `docs/superpowers/specs/2026-07-02-quiet-project-chrome-design.md` — the
   approved design and its rejected alternatives (overlay band, two menus,

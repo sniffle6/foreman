@@ -2447,10 +2447,10 @@ impl WindowManager {
                 continue;
             }
 
-            // Right-side control zone. Projects show only ✕ + ⋯ (quiet chrome);
-            // terminals keep four buttons. Sized per kind so the drag strip and
-            // the tab bar reclaim the space the old five-button row reserved.
-            let ctl_w = if is_project { 54.0 } else { 113.0 };
+            // Right-side control zone width (✕+⋯ project / four buttons
+            // terminal); the drag strip and header_layout's fence both
+            // derive from the same policy.
+            let ctl_w = header_ctl_w(is_project);
 
             // --- title drag (interact first, then we know final position) ---
             let drag_rect = egui::Rect::from_min_size(
@@ -2651,17 +2651,52 @@ impl WindowManager {
             }
 
             {
-                // Where the project `+` (create/open menu) anchors: after the
-                // title text or the tab chips. None while renaming.
-                let mut plus_rect: Option<egui::Rect> = None;
-                if is_renaming {
+                // Measure text caller-side (fonts are impure), then let the
+                // pure header_layout place every header rect: chips, the
+                // clamped `+`, and the control row. The layout variant
+                // mirrors the branch below by construction.
+                let tab_font = egui::FontId::proportional(11.5);
+                let title_font = egui::FontId::proportional(12.5);
+                let tab_measures: Vec<TabMeasure>;
+                let spec = if is_renaming {
+                    HeaderSpec::Rename
+                } else if self.windows[i].tabs.len() > 1 {
+                    tab_measures = self.windows[i]
+                        .tabs
+                        .iter()
+                        .map(|t| TabMeasure {
+                            label_w: ui
+                                .painter()
+                                .layout_no_wrap(t.title.clone(), tab_font.clone(), TEXT)
+                                .size()
+                                .x,
+                            has_icon: t.content.icon_kind().is_some(),
+                        })
+                        .collect();
+                    HeaderSpec::Tabs(&tab_measures)
+                } else {
+                    HeaderSpec::Title {
+                        title_w: ui
+                            .painter()
+                            .layout_no_wrap(
+                                self.windows[i].title().to_string(),
+                                title_font.clone(),
+                                TEXT,
+                            )
+                            .size()
+                            .x,
+                        has_icon: self.windows[i].tabs[self.windows[i].active]
+                            .content
+                            .icon_kind()
+                            .is_some(),
+                    }
+                };
+                let hl = header_layout(scr, is_project, spec);
+
+                if let HeaderContentLayout::Rename { field } = &hl.content {
                     // Field box centered in the titlebar; `vertical_align(Center)` lets
                     // egui center the text within it, so no pixel-fudging is needed.
-                    let te_h = TITLE_H - 8.0;
-                    let te_rect = egui::Rect::from_min_size(
-                        egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
-                        egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
-                    );
+                    let te_rect = *field;
                     // Theme the field to the dark/amber titlebar instead of egui's
                     // default light TextEdit: dark inset fill + amber edit-mode border.
                     p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
@@ -2699,50 +2734,19 @@ impl WindowManager {
                         }
                         self.renaming = None;
                     }
-                } else if self.windows[i].tabs.len() > 1 {
+                } else if let HeaderContentLayout::Tabs { chips } = &hl.content {
                     // --- tab bar (multi-tab stacks only) ---
-                    // Drawn inside the titlebar (respecting TITLE_H): one chip per tab,
-                    // active highlighted, each with a small close affordance. Chips are
-                    // registered after the window-drag rect so they win pointer priority;
-                    // dragging a chip off the bar detaches it (untab).
-                    let ntabs = self.windows[i].tabs.len();
-                    let tab_font = egui::FontId::proportional(11.5);
-                    // Classic browser tabs: taller chips whose flat bottoms meet the
-                    // content area, rounded only on top, each with a leading icon.
-                    let chip_h = TITLE_H - 4.0;
-                    let cy = scr.min.y + 4.0;
-                    let mut cx = scr.min.x + 6.0;
-                    let avail_end = scr.max.x - ctl_w;
-                    let icon_disp = 14.0_f32; // icon box edge, in points
-                    let icon_gap = 6.0_f32;
-                    let left_pad = 8.0_f32;
-                    for ti in 0..ntabs {
+                    // One pre-packed chip per visible tab: the geometry (chip
+                    // metrics, the control-zone fence, truncation) lives in
+                    // header_layout. Chips are registered after the window-drag
+                    // rect so they win pointer priority; dragging a chip off
+                    // the bar detaches it (untab).
+                    for ch in chips {
+                        let ti = ch.idx;
+                        let chip = ch.rect;
                         let is_active_tab = self.windows[i].active == ti;
                         let label = self.windows[i].tabs[ti].title.clone();
                         let icon = self.windows[i].tabs[ti].content.icon_kind();
-                        let tw = ui
-                            .painter()
-                            .layout_no_wrap(label.clone(), tab_font.clone(), TEXT)
-                            .size()
-                            .x
-                            .min(120.0);
-                        let close_w = 16.0;
-                        let icon_w = if icon.is_some() {
-                            icon_disp + icon_gap
-                        } else {
-                            0.0
-                        };
-                        let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
-                        if cx + chip_w > avail_end && ti > 0 {
-                            // Out of room: stop drawing further chips (rare; many tabs on
-                            // a narrow window). The active tab is always within the first
-                            // few, and cycling still reaches the rest.
-                            break;
-                        }
-                        let chip = egui::Rect::from_min_size(
-                            egui::pos2(cx, cy),
-                            egui::vec2(chip_w, chip_h),
-                        );
                         let chip_resp = ui.interact(
                             chip,
                             base.with((id, "tab", ti)),
@@ -2793,16 +2797,10 @@ impl WindowManager {
                         }
                         let txt_col = if is_active_tab { TEXT } else { DIM };
                         // Leading icon: agent logo / shell glyph / project folder.
-                        let mut label_x = cx + left_pad;
-                        if let Some(kind) = icon {
-                            let center =
-                                egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0);
-                            let icon_rect = egui::Rect::from_center_size(
-                                center,
-                                egui::vec2(icon_disp, icon_disp),
-                            );
-                            let px =
-                                (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                        if let (Some(kind), Some(icon_rect)) = (icon, ch.icon) {
+                            let px = (icon_rect.width() * ui.ctx().pixels_per_point())
+                                .round()
+                                .max(1.0) as u32;
                             let tex = crate::icons::texture(ui.ctx(), kind, px);
                             let tint = if is_active_tab {
                                 kind.tint()
@@ -2818,10 +2816,9 @@ impl WindowManager {
                                 ),
                                 tint,
                             );
-                            label_x += icon_disp + icon_gap;
                         }
                         p.text(
-                            egui::pos2(label_x, cy + chip_h / 2.0),
+                            ch.label_pos,
                             egui::Align2::LEFT_CENTER,
                             &label,
                             tab_font.clone(),
@@ -2830,10 +2827,7 @@ impl WindowManager {
                         // Close affordance — shown only on the active or hovered tab
                         // (browser-style), and interactable only when shown.
                         let show_x = is_active_tab || chip_resp.hovered();
-                        let xr = egui::Rect::from_min_size(
-                            egui::pos2(cx + chip_w - close_w, cy),
-                            egui::vec2(close_w, chip_h),
-                        );
+                        let xr = ch.close;
                         let xresp = if show_x {
                             let r =
                                 ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
@@ -2901,32 +2895,19 @@ impl WindowManager {
                                 }
                             }
                         }
-                        cx += chip_w + 4.0;
                     }
-                    if is_project {
-                        // Clamp against the reserved control zone: chips pack
-                        // right up to it, and an unclamped + would overlap ⋯
-                        // and open both hover menus at once.
-                        let px = (cx + 8.0).min(scr.max.x - ctl_w - 10.0);
-                        plus_rect = Some(egui::Rect::from_center_size(
-                            egui::pos2(px, scr.min.y + TITLE_H / 2.0),
-                            egui::vec2(16.0, 16.0),
-                        ));
-                    }
-                } else {
+                } else if let HeaderContentLayout::Title { icon, text_pos } = &hl.content {
                     // Leading icon, mirroring the tab chips so a single-window header
                     // reads consistently (agent logo / shell glyph / project folder).
-                    let mut tx = scr.min.x + 11.0;
-                    if let Some(kind) = self.windows[i].tabs[self.windows[i].active]
-                        .content
-                        .icon_kind()
-                    {
-                        let disp = 14.0_f32;
-                        let icon_rect = egui::Rect::from_center_size(
-                            egui::pos2(tx + disp / 2.0, scr.min.y + TITLE_H / 2.0),
-                            egui::vec2(disp, disp),
-                        );
-                        let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
+                    if let (Some(kind), Some(icon_rect)) = (
+                        self.windows[i].tabs[self.windows[i].active]
+                            .content
+                            .icon_kind(),
+                        *icon,
+                    ) {
+                        let px = (icon_rect.width() * ui.ctx().pixels_per_point())
+                            .round()
+                            .max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
                         let tint = if is_focus {
                             kind.tint()
@@ -2939,24 +2920,14 @@ impl WindowManager {
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             tint,
                         );
-                        tx += disp + 7.0;
                     }
-                    let trect = p.text(
-                        egui::pos2(tx, scr.min.y + TITLE_H / 2.0),
+                    p.text(
+                        *text_pos,
                         egui::Align2::LEFT_CENTER,
                         self.windows[i].title(),
-                        egui::FontId::proportional(12.5),
+                        title_font.clone(),
                         if is_focus { TEXT } else { DIM },
                     );
-                    if is_project {
-                        // Same clamp as the tab-chip branch: a long project
-                        // name must not push + into the ⋯/✕ control zone.
-                        let px = (trect.max.x + 14.0).min(scr.max.x - ctl_w - 10.0);
-                        plus_rect = Some(egui::Rect::from_center_size(
-                            egui::pos2(px, scr.min.y + TITLE_H / 2.0),
-                            egui::vec2(16.0, 16.0),
-                        ));
-                    }
                 }
 
                 // --- window controls ---
@@ -2964,28 +2935,14 @@ impl WindowManager {
                 // Min/Max live in the hover-opened ⋯ menu, create/open actions
                 // in the + menu after the name. Terminals keep all four
                 // buttons.
-                let roles: &[(&str, bool)] = if is_project {
-                    &[("close", true), ("ovf", false)]
-                } else {
-                    &[
-                        ("close", true),
-                        ("max", false),
-                        ("min", false),
-                        ("float", false),
-                    ]
-                };
-                let by = scr.min.y + 3.0;
-                let bh = TITLE_H - 6.0;
-                let mut bx = scr.max.x - 4.0 - 22.0;
                 let mut ovf_rect = egui::Rect::NOTHING;
-                for (role, danger) in roles.iter().copied() {
-                    let r = egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh));
-                    if role == "ovf" {
+                for &(role, r) in &hl.controls {
+                    if role == CtlRole::Ovf {
                         ovf_rect = r;
                     }
-                    let resp = ui.interact(r, base.with((id, role)), egui::Sense::click());
+                    let resp = ui.interact(r, base.with((id, role.id_str())), egui::Sense::click());
                     let bg = if resp.hovered() {
-                        if danger {
+                        if role.danger() {
                             egui::Color32::from_rgb(120, 45, 36)
                         } else {
                             egui::Color32::from_rgb(72, 64, 50)
@@ -3002,13 +2959,13 @@ impl WindowManager {
                     let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
                     let p = ui.painter();
                     match role {
-                        "min" => {
+                        CtlRole::Min => {
                             p.line_segment(
                                 [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
                                 stroke,
                             );
                         }
-                        "max" => {
+                        CtlRole::Max => {
                             p.rect_stroke(
                                 egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
                                 egui::CornerRadius::same(1),
@@ -3016,7 +2973,7 @@ impl WindowManager {
                                 egui::StrokeKind::Inside,
                             );
                         }
-                        "float" => {
+                        CtlRole::Float => {
                             if is_tiled {
                                 // In the tree: 2×2 grid. Click pops it out to floating.
                                 p.rect_stroke(
@@ -3058,7 +3015,7 @@ impl WindowManager {
                                 );
                             }
                         }
-                        "ovf" => {
+                        CtlRole::Ovf => {
                             for dx in [-4.0f32, 0.0, 4.0] {
                                 p.circle_filled(
                                     egui::pos2(c.x + dx, c.y),
@@ -3080,20 +3037,19 @@ impl WindowManager {
                     }
                     if resp.clicked() {
                         match role {
-                            "close" => acts.push(Act::Close(id)),
-                            "max" => acts.push(Act::Max(id)),
-                            "float" => acts.push(Act::Float(id)),
-                            "ovf" => {} // hover opens the menu; click is inert
-                            _ => acts.push(Act::Min(id)),
+                            CtlRole::Close => acts.push(Act::Close(id)),
+                            CtlRole::Max => acts.push(Act::Max(id)),
+                            CtlRole::Float => acts.push(Act::Float(id)),
+                            CtlRole::Ovf => {} // hover opens the menu; click is inert
+                            CtlRole::Min => acts.push(Act::Min(id)),
                         }
                     }
-                    bx -= 25.0;
                 }
 
                 // --- project header menus (hover-opened) ---
                 if is_project {
                     // The + after the name: create/open actions.
-                    if let Some(pr) = plus_rect {
+                    if let Some(pr) = hl.plus {
                         let presp =
                             ui.interact(pr, base.with((id, "plus")), egui::Sense::click());
                         let pbg = if presp.hovered() {
@@ -3807,6 +3763,216 @@ fn hover_menu(
     clicked
 }
 
+// --- header layout (pure) --------------------------------------------------
+// All rect math for the TITLE_H band: chip packing, the project `+` clamp,
+// and the control row. Pure over caller-measured label widths (fonts are
+// impure), so the left-content/control-zone fence is unit-tested instead of
+// comment-enforced. Pixel-identical to the pre-seam inline math; legacy
+// quirks (chip 0 may overflow the fence on absurdly narrow windows; the
+// rename field's 40pt floor may underlap controls) are contract-documented,
+// not fixed — changing pixels is out of scope for a seam extraction.
+
+/// Width of the reserved right-hand control zone: ✕+⋯ for projects, four
+/// buttons for terminals. The one home for the 54/113 policy — the title
+/// drag strip and the fence both derive from it.
+const fn header_ctl_w(is_project: bool) -> f32 {
+    if is_project {
+        54.0
+    } else {
+        113.0
+    }
+}
+
+/// Caller-measured tab label (raw galley width — the module applies the
+/// 120pt clamp) plus whether the tab has a leading icon.
+#[derive(Clone, Copy)]
+struct TabMeasure {
+    label_w: f32,
+    has_icon: bool,
+}
+
+/// What occupies the left of the band. Mirrors the paint code's three-way
+/// branch one to one; the layout variant always matches the spec variant.
+enum HeaderSpec<'a> {
+    Rename,
+    Tabs(&'a [TabMeasure]),
+    Title { title_w: f32, has_icon: bool },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CtlRole {
+    Close,
+    Max,
+    Min,
+    Float,
+    Ovf,
+}
+
+impl CtlRole {
+    fn danger(self) -> bool {
+        matches!(self, CtlRole::Close)
+    }
+    /// Stable egui Id salt — matches the pre-seam string literals so widget
+    /// identity survives the refactor.
+    fn id_str(self) -> &'static str {
+        match self {
+            CtlRole::Close => "close",
+            CtlRole::Max => "max",
+            CtlRole::Min => "min",
+            CtlRole::Float => "float",
+            CtlRole::Ovf => "ovf",
+        }
+    }
+}
+
+/// One packed tab chip; all rects in `scr`'s space.
+struct ChipLayout {
+    /// Tab index — packing may stop early, so idx is load-bearing for
+    /// Act::SetTab/CloseTab/Untab addressing.
+    idx: usize,
+    rect: egui::Rect,
+    icon: Option<egui::Rect>,
+    label_pos: egui::Pos2,
+    close: egui::Rect,
+}
+
+enum HeaderContentLayout {
+    Rename { field: egui::Rect },
+    Tabs { chips: Vec<ChipLayout> },
+    Title { icon: Option<egui::Rect>, text_pos: egui::Pos2 },
+}
+
+struct HeaderLayout {
+    /// The fence: left content (chips past the first, the `+`) never
+    /// crosses `avail_end = scr.max.x - header_ctl_w(kind)`. Read by the
+    /// contract tests; the paint code never needs it because every output
+    /// rect is already clamped against it.
+    #[allow(dead_code)]
+    avail_end: f32,
+    content: HeaderContentLayout,
+    /// The project `+`, pre-clamped against the fence. `Some` iff project
+    /// and not renaming.
+    plus: Option<egui::Rect>,
+    /// Right-to-left: [Close, Ovf] (project) / [Close, Max, Min, Float]
+    /// (terminal); 22pt buttons at 25pt pitch, rightmost ends at
+    /// scr.max.x - 4.
+    controls: Vec<(CtlRole, egui::Rect)>,
+}
+
+/// Pure rect math over numbers — no Ui, no Context, no fonts. Total:
+/// degenerate `scr` yields degenerate rects, never a panic.
+fn header_layout(scr: egui::Rect, is_project: bool, spec: HeaderSpec<'_>) -> HeaderLayout {
+    let ctl_w = header_ctl_w(is_project);
+    let avail_end = scr.max.x - ctl_w;
+
+    // (content, unclamped x where the `+` would anchor; None while renaming)
+    let (content, plus_x) = match spec {
+        HeaderSpec::Rename => {
+            let te_h = TITLE_H - 8.0;
+            let field = egui::Rect::from_min_size(
+                egui::pos2(scr.min.x + 8.0, scr.min.y + (TITLE_H - te_h) * 0.5),
+                egui::vec2((scr.width() - ctl_w - 14.0).max(40.0), te_h),
+            );
+            (HeaderContentLayout::Rename { field }, None)
+        }
+        HeaderSpec::Tabs(tabs) => {
+            let chip_h = TITLE_H - 4.0;
+            let cy = scr.min.y + 4.0;
+            let mut cx = scr.min.x + 6.0;
+            let icon_disp = 14.0;
+            let icon_gap = 6.0;
+            let left_pad = 8.0;
+            let close_w = 16.0;
+            let mut chips = Vec::new();
+            for (idx, t) in tabs.iter().enumerate() {
+                let tw = t.label_w.min(120.0);
+                let icon_w = if t.has_icon { icon_disp + icon_gap } else { 0.0 };
+                let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
+                if cx + chip_w > avail_end && idx > 0 {
+                    // Out of room: stop packing (many tabs on a narrow
+                    // window); cycling still reaches the hidden tabs.
+                    break;
+                }
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(chip_w, chip_h));
+                let icon = t.has_icon.then(|| {
+                    egui::Rect::from_center_size(
+                        egui::pos2(cx + left_pad + icon_disp / 2.0, cy + chip_h / 2.0),
+                        egui::vec2(icon_disp, icon_disp),
+                    )
+                });
+                let label_pos = egui::pos2(cx + left_pad + icon_w, cy + chip_h / 2.0);
+                let close = egui::Rect::from_min_size(
+                    egui::pos2(cx + chip_w - close_w, cy),
+                    egui::vec2(close_w, chip_h),
+                );
+                chips.push(ChipLayout {
+                    idx,
+                    rect,
+                    icon,
+                    label_pos,
+                    close,
+                });
+                cx += chip_w + 4.0;
+            }
+            (HeaderContentLayout::Tabs { chips }, Some(cx + 8.0))
+        }
+        HeaderSpec::Title { title_w, has_icon } => {
+            let mut tx = scr.min.x + 11.0;
+            let icon_disp = 14.0_f32;
+            let icon = has_icon.then(|| {
+                egui::Rect::from_center_size(
+                    egui::pos2(tx + icon_disp / 2.0, scr.min.y + TITLE_H / 2.0),
+                    egui::vec2(icon_disp, icon_disp),
+                )
+            });
+            if has_icon {
+                tx += icon_disp + 7.0;
+            }
+            let text_pos = egui::pos2(tx, scr.min.y + TITLE_H / 2.0);
+            (
+                HeaderContentLayout::Title { icon, text_pos },
+                Some(tx + title_w + 14.0),
+            )
+        }
+    };
+
+    let plus = if is_project {
+        plus_x.map(|x| {
+            egui::Rect::from_center_size(
+                egui::pos2(x.min(scr.max.x - ctl_w - 10.0), scr.min.y + TITLE_H / 2.0),
+                egui::vec2(16.0, 16.0),
+            )
+        })
+    } else {
+        None
+    };
+
+    let roles: &[CtlRole] = if is_project {
+        &[CtlRole::Close, CtlRole::Ovf]
+    } else {
+        &[CtlRole::Close, CtlRole::Max, CtlRole::Min, CtlRole::Float]
+    };
+    let by = scr.min.y + 3.0;
+    let bh = TITLE_H - 6.0;
+    let mut bx = scr.max.x - 4.0 - 22.0;
+    let mut controls = Vec::with_capacity(roles.len());
+    for &role in roles {
+        controls.push((
+            role,
+            egui::Rect::from_min_size(egui::pos2(bx, by), egui::vec2(22.0, bh)),
+        ));
+        bx -= 25.0;
+    }
+
+    HeaderLayout {
+        avail_end,
+        content,
+        plus,
+        controls,
+    }
+}
+
 /// A tab's display name for chat purposes: the title minus the one-shot
 /// exit marker `refresh_exit_titles` appends.
 fn display_name(title: &str) -> &str {
@@ -4341,6 +4507,86 @@ mod tests {
         assert_eq!(m.renaming, Some(b));
         m.minimize(b);
         assert!(m.renaming.is_none(), "minimize left a dangling rename");
+    }
+
+    #[test]
+    fn header_fence_holds_under_packing_pressure() {
+        // Over-wide tabs at a spread of window widths, incl. degenerate:
+        // chips past the first and the `+` must never cross the fence.
+        for w in [90.0f32, 141.0, 213.7, 400.0, 1200.0] {
+            let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(w, 300.0));
+            let tabs = vec![
+                TabMeasure {
+                    label_w: 300.0,
+                    has_icon: true
+                };
+                6
+            ];
+            let hl = header_layout(scr, true, HeaderSpec::Tabs(&tabs));
+            let HeaderContentLayout::Tabs { chips } = &hl.content else {
+                panic!("layout variant must mirror spec variant");
+            };
+            assert!(!chips.is_empty(), "active tab must stay reachable (w={w})");
+            for c in &chips[1..] {
+                assert!(
+                    c.rect.max.x <= hl.avail_end,
+                    "chip {} crossed the fence (w={w})",
+                    c.idx
+                );
+            }
+            let plus = hl.plus.expect("projects get a +");
+            assert!(plus.max.x <= hl.avail_end, "+ crossed the fence (w={w})");
+            for (role, r) in &hl.controls {
+                assert!(
+                    !plus.intersects(*r),
+                    "+ overlaps {} (w={w})",
+                    role.id_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_layout_mirrors_spec_kind_and_order() {
+        let scr = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(500.0, 300.0));
+
+        // Terminal: four controls right-to-left at 25pt pitch, no +.
+        let hl = header_layout(
+            scr,
+            false,
+            HeaderSpec::Title {
+                title_w: 80.0,
+                has_icon: true,
+            },
+        );
+        assert!(hl.plus.is_none(), "terminals have no +");
+        let roles: Vec<&str> = hl.controls.iter().map(|(r, _)| r.id_str()).collect();
+        assert_eq!(roles, ["close", "max", "min", "float"]);
+        assert_eq!(hl.controls[0].1.max.x, scr.max.x - 4.0);
+        assert_eq!(hl.controls[1].1.max.x, scr.max.x - 29.0);
+
+        // Rename: field present, + suppressed even on a project, and the
+        // documented 40pt width floor holds on an absurdly narrow window.
+        let hl = header_layout(scr, true, HeaderSpec::Rename);
+        assert!(matches!(hl.content, HeaderContentLayout::Rename { .. }));
+        assert!(hl.plus.is_none(), "no + while renaming");
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(30.0, 100.0));
+        let hl = header_layout(tiny, true, HeaderSpec::Rename);
+        let HeaderContentLayout::Rename { field } = hl.content else {
+            panic!();
+        };
+        assert_eq!(field.width(), 40.0);
+
+        // A 5000pt title still clamps the + inside the fence.
+        let hl = header_layout(
+            scr,
+            true,
+            HeaderSpec::Title {
+                title_w: 5000.0,
+                has_icon: false,
+            },
+        );
+        assert!(hl.plus.unwrap().max.x <= hl.avail_end);
     }
 
     #[test]
