@@ -373,6 +373,13 @@ impl eframe::App for App {
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        // Closing the last project quits the app — an empty desktop is a dead
+        // end, and terminal emulators (tmux, Windows Terminal) exit with their
+        // last session. `deserted` stays false while the dir picker or the
+        // settings modal is up, so a project being created mid-modal survives.
+        if self.started && self.desktop.deserted() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
         // persist it after a debounce so a scroll gesture writes the file once.
         let live = terminal::font_size(&ctx);

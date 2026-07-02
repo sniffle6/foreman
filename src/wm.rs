@@ -1887,6 +1887,15 @@ impl WindowManager {
         }
     }
 
+    /// True when this manager has no windows left and no modal is open (the
+    /// picker could still create a project; an open settings editor must not
+    /// be yanked out from under the user). On the desktop this means "closing
+    /// the last project": `main.rs` quits the app when it turns true, the way
+    /// a terminal emulator exits with its last tab.
+    pub fn deserted(&self) -> bool {
+        self.windows.is_empty() && self.picker.is_none() && self.settings.is_none()
+    }
+
     /// Close one tab: the given tab index of window `id`. Removing the last tab
     /// closes the window. Otherwise the active index is clamped so it still points
     /// at a live tab (prefer staying on the tab to the left of the one removed).
@@ -4179,6 +4188,24 @@ mod tests {
             m.focused = None;
         }
         m
+    }
+
+    #[test]
+    fn closing_the_last_project_deserts_the_desktop() {
+        let mut m = mgr_with_project(true);
+        assert!(!m.deserted());
+        let id = m.windows[0].id;
+        m.close(id);
+        assert!(m.deserted());
+    }
+
+    #[test]
+    fn an_open_picker_keeps_the_empty_desktop_alive() {
+        let mut m = mgr_with_project(true);
+        let id = m.windows[0].id;
+        m.picker = Some(DirPicker::new(m.picker_start()));
+        m.close(id);
+        assert!(!m.deserted(), "picker may still create a project; no quit");
     }
 
     #[test]
