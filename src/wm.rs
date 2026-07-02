@@ -2587,13 +2587,14 @@ impl WindowManager {
             let tab_dragging = (0..self.windows[i].tabs.len())
                 .any(|ti| ui.ctx().is_being_dragged(base.with((id, "tab", ti))));
             // Reveal pins: header gestures that must keep a fading header
-            // alive mid-flight, plus the project overflow menu while open.
-            let menu_open = ui
-                .ctx()
-                .data(|d| d.get_temp::<bool>(base.with((id, "ovfmenu_open"))))
-                .unwrap_or(false);
-            let pinned = is_renaming || dr.dragged() || tab_dragging || menu_open;
-            let reveal_chrome = pinned || ui.rect_contains_pointer(reveal_band(scr, area));
+            // alive mid-flight.
+            let pinned = is_renaming || dr.dragged() || tab_dragging;
+            // Projects keep their quiet chrome always visible — the name and ✕
+            // are the desktop's identity/navigation signals (user iteration
+            // 2026-07-02). Terminals stay band-revealed. The hover-opened
+            // project menus need no reveal pin: projects never fade.
+            let reveal_chrome =
+                is_project || pinned || ui.rect_contains_pointer(reveal_band(scr, area));
             // Chrome alpha: 0→1 fade, same feel as the OS bar minus the slide
             // (the band is reserved space; sliding would be motion for its
             // own sake). Interacts stay inside `if reveal_chrome`, so a
@@ -2668,6 +2669,9 @@ impl WindowManager {
                         fade(if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }),
                     );
                 }
+                // Where the project `+` (create/open menu) anchors: after the
+                // title text or the tab chips. None while renaming.
+                let mut plus_rect: Option<egui::Rect> = None;
                 if is_renaming {
                     // Field box centered in the titlebar; `vertical_align(Center)` lets
                     // egui center the text within it, so no pixel-fudging is needed.
@@ -2917,6 +2921,12 @@ impl WindowManager {
                         }
                         cx += chip_w + 4.0;
                     }
+                    if is_project {
+                        plus_rect = Some(egui::Rect::from_center_size(
+                            egui::pos2(cx + 8.0, scr.min.y + TITLE_H / 2.0),
+                            egui::vec2(16.0, 16.0),
+                        ));
+                    }
                 } else {
                     // Leading icon, mirroring the tab chips so a single-window header
                     // reads consistently (agent logo / shell glyph / project folder).
@@ -2945,19 +2955,26 @@ impl WindowManager {
                         );
                         tx += disp + 7.0;
                     }
-                    p.text(
+                    let trect = p.text(
                         egui::pos2(tx, scr.min.y + TITLE_H / 2.0),
                         egui::Align2::LEFT_CENTER,
                         self.windows[i].title(),
                         egui::FontId::proportional(12.5),
                         fade(if is_focus { TEXT } else { DIM }),
                     );
+                    if is_project {
+                        plus_rect = Some(egui::Rect::from_center_size(
+                            egui::pos2(trect.max.x + 14.0, scr.min.y + TITLE_H / 2.0),
+                            egui::vec2(16.0, 16.0),
+                        ));
+                    }
                 }
 
                 // --- window controls ---
-                // Projects show only close + overflow (quiet chrome); the
-                // remaining actions live in the ⋯ menu. Terminals keep all
-                // four buttons.
+                // Projects show only close + overflow (quiet chrome): Float/
+                // Min/Max live in the hover-opened ⋯ menu, create/open actions
+                // in the + menu after the name. Terminals keep all four
+                // buttons.
                 let roles: &[(&str, bool)] = if is_project {
                     &[("close", true), ("ovf", false)]
                 } else {
@@ -3077,121 +3094,69 @@ impl WindowManager {
                             "close" => acts.push(Act::Close(id)),
                             "max" => acts.push(Act::Max(id)),
                             "float" => acts.push(Act::Float(id)),
-                            "ovf" => {
-                                let mid = base.with((id, "ovfmenu_open"));
-                                ui.ctx().data_mut(|d| {
-                                    let open = d.get_temp::<bool>(mid).unwrap_or(false);
-                                    d.insert_temp(mid, !open);
-                                });
-                            }
+                            "ovf" => {} // hover opens the menu; click is inert
                             _ => acts.push(Act::Min(id)),
                         }
                     }
                     bx -= 25.0;
                 }
 
-                // --- ⋯ overflow menu (projects only) ---
-                // Open flag lives in transient egui memory: per-frame UI
-                // state, not model state — it must never reach Win/serde.
+                // --- project header menus (hover-opened) ---
                 if is_project {
-                    let mid = base.with((id, "ovfmenu_open"));
-                    let open = ui.ctx().data(|d| d.get_temp::<bool>(mid)).unwrap_or(false);
-                    if open {
-                        let float_label = if is_tiled { "Float" } else { "Tile" };
-                        let labels = [
-                            "New PS terminal",
-                            "New CMD terminal",
-                            "New SH terminal",
-                            "New project",
-                            float_label,
-                            "Minimize",
-                            "Maximize",
-                        ];
-                        let font = egui::FontId::proportional(12.0);
-                        let row_h = 22.0;
-                        let pad = 10.0;
-                        let w = labels
-                            .iter()
-                            .map(|l| {
-                                ui.painter()
-                                    .layout_no_wrap((*l).to_owned(), font.clone(), TEXT)
-                                    .size()
-                                    .x
-                            })
-                            .fold(0.0f32, f32::max)
-                            + pad * 2.0;
-                        let panel_h = row_h * labels.len() as f32 + 8.0;
-                        // Open below the ⋯; flip above it when the desktop
-                        // edge would clip the panel.
-                        let below = ovf_rect.bottom() + 2.0;
-                        let oy = if below + panel_h > area.max.y {
-                            (ovf_rect.top() - 2.0 - panel_h).max(area.min.y)
+                    // The + after the name: create/open actions.
+                    if let Some(pr) = plus_rect {
+                        let presp =
+                            ui.interact(pr, base.with((id, "plus")), egui::Sense::click());
+                        let pbg = if presp.hovered() {
+                            egui::Color32::from_rgb(72, 64, 50)
                         } else {
-                            below
+                            egui::Color32::TRANSPARENT
                         };
-                        let origin =
-                            egui::pos2((ovf_rect.right() - w).max(area.min.x), oy);
-                        let panel = egui::Rect::from_min_size(origin, egui::vec2(w, panel_h));
-                        egui::Area::new(base.with((id, "ovfmenu")))
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(origin)
-                            .show(ui.ctx(), |mui| {
-                                let mp = mui.painter();
-                                mp.rect_filled(panel, egui::CornerRadius::same(4), TITLE_BG);
-                                mp.rect_stroke(
-                                    panel,
-                                    egui::CornerRadius::same(4),
-                                    egui::Stroke::new(1.0, BORDER),
-                                    egui::StrokeKind::Inside,
-                                );
-                                for (ri, label) in labels.iter().enumerate() {
-                                    let rr = egui::Rect::from_min_size(
-                                        egui::pos2(
-                                            panel.min.x,
-                                            panel.min.y + 4.0 + row_h * ri as f32,
-                                        ),
-                                        egui::vec2(w, row_h),
-                                    );
-                                    let rresp = mui.interact(
-                                        rr,
-                                        base.with((id, "ovfitem", ri)),
-                                        egui::Sense::click(),
-                                    );
-                                    if rresp.hovered() {
-                                        mui.painter().rect_filled(rr, 0.0, TITLE_BG_FOCUS);
-                                    }
-                                    mui.painter().text(
-                                        egui::pos2(rr.min.x + pad, rr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        *label,
-                                        font.clone(),
-                                        TEXT,
-                                    );
-                                    if rresp.clicked() {
-                                        match ri {
-                                            0 => acts.push(Act::AddTerm(id, Shell::PowerShell)),
-                                            1 => acts.push(Act::AddTerm(id, Shell::Cmd)),
-                                            2 => acts.push(Act::AddTerm(id, Shell::Bash)),
-                                            3 => acts.push(Act::OpenProjectPicker),
-                                            4 => acts.push(Act::Float(id)),
-                                            5 => acts.push(Act::Min(id)),
-                                            _ => acts.push(Act::Max(id)),
-                                        }
-                                        mui.ctx().data_mut(|d| d.insert_temp(mid, false));
-                                    }
-                                }
+                        ui.painter()
+                            .rect_filled(pr, egui::CornerRadius::same(4), fade(pbg));
+                        let c = pr.center();
+                        let s = 4.0;
+                        let stroke =
+                            egui::Stroke::new(1.4, fade(if is_focus { TEXT } else { DIM }));
+                        let p = ui.painter();
+                        p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
+                        p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+                        if let Some(ri) = hover_menu(
+                            ui,
+                            base.with((id, "plusmenu")),
+                            pr,
+                            area,
+                            &[
+                                "New project",
+                                "New PS terminal",
+                                "New CMD terminal",
+                                "New SH terminal",
+                            ],
+                            false,
+                        ) {
+                            acts.push(match ri {
+                                0 => Act::OpenProjectPicker,
+                                1 => Act::AddTerm(id, Shell::PowerShell),
+                                2 => Act::AddTerm(id, Shell::Cmd),
+                                _ => Act::AddTerm(id, Shell::Bash),
                             });
-                        // Click anywhere outside menu + button, or Escape: close.
-                        let clicked_out = ui.input(|i| {
-                            i.pointer.any_click()
-                                && i.pointer
-                                    .latest_pos()
-                                    .is_some_and(|p| !panel.contains(p) && !ovf_rect.contains(p))
-                        });
-                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                        if clicked_out || esc {
-                            ui.ctx().data_mut(|d| d.insert_temp(mid, false));
                         }
+                    }
+                    // The ⋯ on the right: window controls for the project.
+                    let float_label = if is_tiled { "Float" } else { "Tile" };
+                    if let Some(ri) = hover_menu(
+                        ui,
+                        base.with((id, "ovfmenu")),
+                        ovf_rect,
+                        area,
+                        &[float_label, "Minimize", "Maximize"],
+                        true,
+                    ) {
+                        acts.push(match ri {
+                            0 => Act::Float(id),
+                            1 => Act::Min(id),
+                            _ => Act::Max(id),
+                        });
                     }
                 }
             } // end reveal_chrome (hover-revealed header)
@@ -3773,6 +3738,104 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 /// a floating window above them.
 fn reveal_band(scr: egui::Rect, area: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H)).intersect(area)
+}
+
+/// Hover-opened popup menu anchored to a header button. Paints rows in a
+/// Foreground `Area` and returns the clicked row index. Opens when the
+/// pointer rides the anchor (no click), closes on item click, Escape, or the
+/// pointer leaving the anchor+panel region (4 px slop bridges the gap). The
+/// open flag is transient egui memory — per-frame UI state, never model
+/// state. `align_right` right-aligns the panel to the anchor's right edge.
+fn hover_menu(
+    ui: &mut egui::Ui,
+    menu_id: egui::Id,
+    anchor: egui::Rect,
+    area: egui::Rect,
+    labels: &[&str],
+    align_right: bool,
+) -> Option<usize> {
+    let open_id = menu_id.with("open");
+    let was_open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(open_id))
+        .unwrap_or(false);
+    // Layer-aware open test: an occluded header can't pop a menu through a
+    // floating window above it.
+    let open = was_open || ui.rect_contains_pointer(anchor);
+    if !open {
+        return None;
+    }
+    let font = egui::FontId::proportional(12.0);
+    let row_h = 22.0;
+    let pad = 10.0;
+    let w = labels
+        .iter()
+        .map(|l| {
+            ui.painter()
+                .layout_no_wrap((*l).to_owned(), font.clone(), TEXT)
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max)
+        + pad * 2.0;
+    let panel_h = row_h * labels.len() as f32 + 8.0;
+    // Below the anchor; flip above it at the bottom desktop edge.
+    let below = anchor.bottom() + 2.0;
+    let oy = if below + panel_h > area.max.y {
+        (anchor.top() - 2.0 - panel_h).max(area.min.y)
+    } else {
+        below
+    };
+    let ox = if align_right {
+        (anchor.right() - w).max(area.min.x)
+    } else {
+        anchor.left().min(area.max.x - w).max(area.min.x)
+    };
+    let panel = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(w, panel_h));
+    let mut clicked = None;
+    egui::Area::new(menu_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel.min)
+        .show(ui.ctx(), |mui| {
+            let mp = mui.painter();
+            mp.rect_filled(panel, egui::CornerRadius::same(4), TITLE_BG);
+            mp.rect_stroke(
+                panel,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, BORDER),
+                egui::StrokeKind::Inside,
+            );
+            for (ri, label) in labels.iter().enumerate() {
+                let rr = egui::Rect::from_min_size(
+                    egui::pos2(panel.min.x, panel.min.y + 4.0 + row_h * ri as f32),
+                    egui::vec2(w, row_h),
+                );
+                let rresp = mui.interact(rr, menu_id.with(("item", ri)), egui::Sense::click());
+                if rresp.hovered() {
+                    mui.painter().rect_filled(rr, 0.0, TITLE_BG_FOCUS);
+                }
+                mui.painter().text(
+                    egui::pos2(rr.min.x + pad, rr.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    *label,
+                    font.clone(),
+                    TEXT,
+                );
+                if rresp.clicked() {
+                    clicked = Some(ri);
+                }
+            }
+        });
+    // Stay open only while the pointer rides the anchor or panel. Geometric
+    // containment is safe here: the panel is topmost Foreground.
+    let ptr_near = ui
+        .ctx()
+        .pointer_latest_pos()
+        .is_some_and(|p| anchor.union(panel).expand(4.0).contains(p));
+    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let stay = ptr_near && !esc && clicked.is_none();
+    ui.ctx().data_mut(|d| d.insert_temp(open_id, stay));
+    clicked
 }
 
 /// A tab's display name for chat purposes: the title minus the one-shot

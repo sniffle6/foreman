@@ -4,6 +4,13 @@
 rule is SHARED by projects and terminals (terminals switch from
 anywhere-on-window reveal to the same top-band rule).
 
+**Post-feel iteration (user, 2026-07-02, supersedes §1/§3 for projects):**
+project chrome (name, `+`, `⋯`, `✕`) is ALWAYS visible — hiding it left the
+desktop with no identity/navigation signals. Terminals keep the band reveal.
+The single `⋯` menu split in two, both **hover-opened**: `+` after the name
+(New project, New PS/CMD/SH terminal) and `⋯` on the right (Float, Min,
+Max). Ground truth: `docs/window-chrome.md`.
+
 ## Goal
 
 Project headers currently always show: name, tab chips, `PS · CMD · SH` shell
