@@ -59,6 +59,8 @@ struct Header {
     more: bool,
     quiet: u8,
     delete: u8,
+    has_action: bool,
+    has_other: bool,
 }
 
 #[allow(dead_code)]
@@ -100,18 +102,45 @@ fn parse_header(h: &[u8]) -> Header {
         let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
         let num = |v: &[u8]| std::str::from_utf8(v).ok().and_then(|s| s.parse::<u32>().ok());
         match k {
-            b"a" => out.action = v.first().copied().unwrap_or(b't'),
-            b"t" => out.medium = v.first().copied().unwrap_or(b'd'),
-            b"f" => out.format = num(v).unwrap_or(32),
-            b"c" => out.cols = num(v).unwrap_or(0) as u16,
-            b"r" => out.rows = num(v).unwrap_or(0) as u16,
-            b"s" => out.pix_w = num(v).unwrap_or(0),
-            b"v" => out.pix_h = num(v).unwrap_or(0),
-            b"i" => out.id = num(v),
+            b"a" => {
+                out.action = v.first().copied().unwrap_or(b't');
+                out.has_action = true;
+            }
+            b"t" => {
+                out.medium = v.first().copied().unwrap_or(b'd');
+                out.has_other = true;
+            }
+            b"f" => {
+                out.format = num(v).unwrap_or(32);
+                out.has_other = true;
+            }
+            b"c" => {
+                out.cols = num(v).unwrap_or(0) as u16;
+                out.has_other = true;
+            }
+            b"r" => {
+                out.rows = num(v).unwrap_or(0) as u16;
+                out.has_other = true;
+            }
+            b"s" => {
+                out.pix_w = num(v).unwrap_or(0);
+                out.has_other = true;
+            }
+            b"v" => {
+                out.pix_h = num(v).unwrap_or(0);
+                out.has_other = true;
+            }
+            b"i" => {
+                out.id = num(v);
+                out.has_other = true;
+            }
             b"m" => out.more = num(v) == Some(1),
             b"q" => out.quiet = num(v).unwrap_or(0) as u8,
-            b"d" => out.delete = v.first().copied().unwrap_or(b'a'),
-            _ => {}
+            b"d" => {
+                out.delete = v.first().copied().unwrap_or(b'a');
+                out.has_other = true;
+            }
+            _ => out.has_other = true,
         }
     }
     out
@@ -221,26 +250,34 @@ impl Graphics {
         };
         let h = parse_header(header);
 
-        // Continuation of a chunked transmit: only m matters (codex sends bare
-        // `m=<flag>;<chunk>` continuations); finish on m=0.
-        if let Some((_, data)) = self.chunk.as_mut() {
-            if data.len() + payload.len() > MAX_APC {
-                self.chunk = None; // runaway chunk stream — drop it whole
-                return false;
+        let bare_continuation = !h.has_action && !h.has_other;
+
+        if self.chunk.is_some() {
+            if bare_continuation {
+                let (_, data) = self.chunk.as_mut().expect("checked above");
+                if data.len() + payload.len() > MAX_APC {
+                    // Runaway chain — drop it whole; its trailing bare
+                    // continuations are discarded by the orphan arm below.
+                    self.chunk = None;
+                    return false;
+                }
+                data.extend_from_slice(payload);
+                if h.more {
+                    return false;
+                }
+                let (first, data) = self.chunk.take().expect("checked above");
+                let display = first.action == b'T';
+                self.pending.push_back(Cmd::Transmit { header: first, payload: data, display });
+                return true;
             }
-            data.extend_from_slice(payload);
-            if h.more {
-                return false;
-            }
-            let (first, data) = self.chunk.take().expect("checked above");
-            let display = first.action == b'T';
-            self.pending
-                .push_back(Cmd::Transmit {
-                    header: first,
-                    payload: data,
-                    display,
-                });
-            return true;
+            // A real command interleaved mid-chain violates the kitty
+            // protocol; the chain is unrecoverable — drop it, honor the
+            // command via the normal dispatch below.
+            self.chunk = None;
+        } else if bare_continuation {
+            // Orphan continuation (no chain in flight, e.g. after a runaway
+            // drop): not a command — discard silently (tolerance rule).
+            return false;
         }
 
         match h.action {
@@ -401,5 +438,25 @@ mod tests {
         let cuts = g.feed(b"\x1b_Ga=z,q=2;\x1b\\");
         assert_eq!(cuts.len(), 1); // one cut per completed command, even a nop
         assert_eq!(g.pending_len(), 1);
+    }
+
+    #[test]
+    fn interleaved_command_mid_chain_drops_the_chain_and_honors_the_command() {
+        let mut g = Graphics::default();
+        assert!(g.feed(b"\x1b_Ga=T,t=d,f=100,q=2,i=4,m=1;AAAA\x1b\\").is_empty());
+        // An explicit command mid-chain kills the chain and is itself queued.
+        let cuts = g.feed(b"\x1b_Ga=d,d=I,i=9,q=2;\x1b\\");
+        assert_eq!(cuts.len(), 1);
+        assert_eq!(g.pending_len(), 1);
+        // The dead chain's stale trailing continuation is discarded.
+        assert!(g.feed(b"\x1b_Gm=0;AAAA\x1b\\").is_empty());
+        assert_eq!(g.pending_len(), 1);
+    }
+
+    #[test]
+    fn orphan_bare_continuation_is_discarded_not_promoted() {
+        let mut g = Graphics::default();
+        assert!(g.feed(b"\x1b_Gm=0;junkdata\x1b\\").is_empty());
+        assert_eq!(g.pending_len(), 0);
     }
 }
