@@ -11,6 +11,13 @@ The single `⋯` menu split in two, both **hover-opened**: `+` after the name
 (New project, New PS/CMD/SH terminal) and `⋯` on the right (Float, Min,
 Max). Ground truth: `docs/window-chrome.md`.
 
+**Second iteration (user, 2026-07-02, supersedes §1/§4 entirely):** terminal
+(subwindow) headers are ALWAYS shown too, surface-colored (`terminal::BG`),
+on a reserved band — unless the window is the project's lone pane (the
+pre-existing `bare` rule). The hover-reveal + fade machinery (`reveal_band`,
+`chrome_t`, pins) was removed as dead code. Ground truth:
+`docs/window-chrome.md`.
+
 ## Goal
 
 Project headers currently always show: name, tab chips, `PS · CMD · SH` shell

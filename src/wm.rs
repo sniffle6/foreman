@@ -2405,7 +2405,7 @@ impl WindowManager {
                 ui.painter_at(scr.intersect(area)).rect_filled(
                     scr,
                     egui::CornerRadius::ZERO,
-                    WIN_BG,
+                    crate::terminal::BG,
                 );
                 let cresp = ui.interact(
                     scr,
@@ -2569,47 +2569,20 @@ impl WindowManager {
                 }
             }
 
-            let title_rect = egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H));
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(scr.min.x + 1.0, scr.min.y + TITLE_H),
                 egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
             );
 
-            // ALL window chrome (projects and terminals) is hover-revealed by
-            // ONE rule: the pointer must be in the title band, not merely on
-            // the window (spec 2026-07-02). Content owns the full window rect
-            // so grids never resize on hover; the header paints OVER the top
-            // strip while revealed. Header gestures (move drag, tab tear-out,
-            // rename, open overflow menu) pin it so a fast pointer can't
-            // strand it mid-drag. The content INTERACT rect stays below the
-            // strip: whenever the pointer is up there the header is showing
-            // and owns that band, so nothing is lost.
-            let tab_dragging = (0..self.windows[i].tabs.len())
-                .any(|ti| ui.ctx().is_being_dragged(base.with((id, "tab", ti))));
-            // Reveal pins: header gestures that must keep a fading header
-            // alive mid-flight.
-            let pinned = is_renaming || dr.dragged() || tab_dragging;
-            // Projects keep their quiet chrome always visible — the name and ✕
-            // are the desktop's identity/navigation signals (user iteration
-            // 2026-07-02). Terminals stay band-revealed. The hover-opened
-            // project menus need no reveal pin: projects never fade.
-            let reveal_chrome =
-                is_project || pinned || ui.rect_contains_pointer(reveal_band(scr, area));
-            // Chrome alpha: 0→1 fade, same feel as the OS bar minus the slide
-            // (the band is reserved space; sliding would be motion for its
-            // own sake). Interacts stay inside `if reveal_chrome`, so a
-            // fading-out header never swallows a click.
-            let chrome_t = ui
-                .ctx()
-                .animate_bool(base.with((id, "chrome_t")), reveal_chrome);
-            let content_paint = if is_project {
-                content_rect
-            } else {
-                egui::Rect::from_min_max(
-                    egui::pos2(scr.min.x + 1.0, scr.min.y + 1.0),
-                    egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
-                )
-            };
+            // Every non-bare window paints its chrome unconditionally (the
+            // bare sole-pane path above is the only chrome-less window): a
+            // quiet header on a reserved band, surface-colored so it blends
+            // with the content below (user iteration 2026-07-02). The old
+            // hover-reveal + fade machinery is gone with it.
+            // The band is reserved at BOTH levels now that headers are
+            // permanent: content starts below TITLE_H, so the PTY grid gives
+            // up a row instead of hiding one under the header.
+            let content_paint = content_rect;
 
             // --- paint window ---
             // Tiled/zoomed windows square their corners so they tile flush to
@@ -2620,14 +2593,11 @@ impl WindowManager {
                 egui::CornerRadius::same(6)
             };
             let p = ui.painter_at(scr.intersect(area));
-            // Projects paint the terminal surface color, not chrome grey: the
-            // reserved (unfilled) title band must blend into the terminals
-            // below it, or it still reads as a header bar even with no fill.
-            p.rect_filled(
-                scr,
-                cr,
-                if is_project { crate::terminal::BG } else { WIN_BG },
-            );
+            // Every window body paints the terminal surface color: the
+            // reserved (unfilled) title bands at both levels must blend into
+            // the content below them, or they read as header bars even with
+            // no fill.
+            p.rect_filled(scr, cr, crate::terminal::BG);
 
             // --- content ---
             // Painted BEFORE the header so the hover-revealed header overlays
@@ -2657,18 +2627,7 @@ impl WindowManager {
                 acts.push(Act::Focus(id));
             }
 
-            if chrome_t > 0.0 {
-                let fade = |c: egui::Color32| c.gamma_multiply(chrome_t);
-                // Projects have NO title bg — quiet chrome (spec 2026-07-02):
-                // the band reads as window margin until revealed, and revealed
-                // chrome floats directly on WIN_BG. Terminals keep their fill.
-                if !is_project {
-                    p.rect_filled(
-                        title_rect,
-                        cr,
-                        fade(if is_focus { TITLE_BG_FOCUS } else { TITLE_BG }),
-                    );
-                }
+            {
                 // Where the project `+` (create/open menu) anchors: after the
                 // title text or the tab chips. None while renaming.
                 let mut plus_rect: Option<egui::Rect> = None;
@@ -2682,11 +2641,11 @@ impl WindowManager {
                     );
                     // Theme the field to the dark/amber titlebar instead of egui's
                     // default light TextEdit: dark inset fill + amber edit-mode border.
-                    p.rect_filled(te_rect, egui::CornerRadius::same(3), fade(WIN_BG));
+                    p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
                     p.rect_stroke(
                         te_rect,
                         egui::CornerRadius::same(3),
-                        egui::Stroke::new(1.0, fade(BORDER_FOCUS)),
+                        egui::Stroke::new(1.0, BORDER_FOCUS),
                         egui::StrokeKind::Inside,
                     );
                     ui.visuals_mut().selection.bg_fill =
@@ -2787,7 +2746,7 @@ impl WindowManager {
                             sw: 0,
                             se: 0,
                         };
-                        p.rect_filled(chip, radius, fade(bg));
+                        p.rect_filled(chip, radius, bg);
                         // Project tabs get the focus-amber selection border (the same
                         // colour as a focused subwindow's border) on three sides only —
                         // the bottom edge is left open so the tab's colour flows straight
@@ -2798,7 +2757,7 @@ impl WindowManager {
                             p.rect_stroke(
                                 chip,
                                 radius,
-                                egui::Stroke::new(BORDER_W, fade(tab_border)),
+                                egui::Stroke::new(BORDER_W, tab_border),
                                 egui::StrokeKind::Inside,
                             );
                             // Paint over the bottom edge with the tab bg, leaving an open
@@ -2807,7 +2766,7 @@ impl WindowManager {
                                 egui::pos2(chip.min.x, chip.max.y - 1.0),
                                 egui::pos2(chip.max.x, chip.max.y),
                             );
-                            p.rect_filled(open, egui::CornerRadius::ZERO, fade(bg));
+                            p.rect_filled(open, egui::CornerRadius::ZERO, bg);
                         }
                         let txt_col = if is_active_tab { TEXT } else { DIM };
                         // Leading icon: agent logo / shell glyph / project folder.
@@ -2822,11 +2781,11 @@ impl WindowManager {
                             let px =
                                 (icon_disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                             let tex = crate::icons::texture(ui.ctx(), kind, px);
-                            let tint = fade(if is_active_tab {
+                            let tint = if is_active_tab {
                                 kind.tint()
                             } else {
                                 kind.tint().gamma_multiply(0.55)
-                            });
+                            };
                             p.image(
                                 tex.id(),
                                 icon_rect,
@@ -2843,7 +2802,7 @@ impl WindowManager {
                             egui::Align2::LEFT_CENTER,
                             &label,
                             tab_font.clone(),
-                            fade(txt_col),
+                            txt_col,
                         );
                         // Close affordance — shown only on the active or hovered tab
                         // (browser-style), and interactable only when shown.
@@ -2862,7 +2821,7 @@ impl WindowManager {
                             } else {
                                 txt_col
                             };
-                            let xstroke = egui::Stroke::new(1.2, fade(xcol));
+                            let xstroke = egui::Stroke::new(1.2, xcol);
                             p.line_segment(
                                 [
                                     egui::pos2(xc.x - xs, xc.y - xs),
@@ -2881,9 +2840,9 @@ impl WindowManager {
                         } else {
                             None
                         };
-                        if reveal_chrome && xresp.is_some_and(|r| r.clicked()) {
+                        if xresp.is_some_and(|r| r.clicked()) {
                             acts.push(Act::CloseTab(id, ti));
-                        } else if reveal_chrome && chip_resp.clicked() {
+                        } else if chip_resp.clicked() {
                             acts.push(Act::SetTab(id, ti));
                         } else if chip_resp.dragged() {
                             // Live drag-out: the instant the pointer leaves the tab bar,
@@ -2922,8 +2881,12 @@ impl WindowManager {
                         cx += chip_w + 4.0;
                     }
                     if is_project {
+                        // Clamp against the reserved control zone: chips pack
+                        // right up to it, and an unclamped + would overlap ⋯
+                        // and open both hover menus at once.
+                        let px = (cx + 8.0).min(scr.max.x - ctl_w - 10.0);
                         plus_rect = Some(egui::Rect::from_center_size(
-                            egui::pos2(cx + 8.0, scr.min.y + TITLE_H / 2.0),
+                            egui::pos2(px, scr.min.y + TITLE_H / 2.0),
                             egui::vec2(16.0, 16.0),
                         ));
                     }
@@ -2942,11 +2905,11 @@ impl WindowManager {
                         );
                         let px = (disp * ui.ctx().pixels_per_point()).round().max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
-                        let tint = fade(if is_focus {
+                        let tint = if is_focus {
                             kind.tint()
                         } else {
                             kind.tint().gamma_multiply(0.55)
-                        });
+                        };
                         p.image(
                             tex.id(),
                             icon_rect,
@@ -2960,11 +2923,14 @@ impl WindowManager {
                         egui::Align2::LEFT_CENTER,
                         self.windows[i].title(),
                         egui::FontId::proportional(12.5),
-                        fade(if is_focus { TEXT } else { DIM }),
+                        if is_focus { TEXT } else { DIM },
                     );
                     if is_project {
+                        // Same clamp as the tab-chip branch: a long project
+                        // name must not push + into the ⋯/✕ control zone.
+                        let px = (trect.max.x + 14.0).min(scr.max.x - ctl_w - 10.0);
                         plus_rect = Some(egui::Rect::from_center_size(
-                            egui::pos2(trect.max.x + 14.0, scr.min.y + TITLE_H / 2.0),
+                            egui::pos2(px, scr.min.y + TITLE_H / 2.0),
                             egui::vec2(16.0, 16.0),
                         ));
                     }
@@ -3005,12 +2971,12 @@ impl WindowManager {
                         egui::Color32::TRANSPARENT
                     };
                     ui.painter()
-                        .rect_filled(r, egui::CornerRadius::same(4), fade(bg));
+                        .rect_filled(r, egui::CornerRadius::same(4), bg);
                     // Icons are drawn as vector strokes (not font glyphs) so all three
                     // share one optical center, size, and weight regardless of font.
                     let c = r.center();
                     let s = 4.0; // icon half-extent
-                    let stroke = egui::Stroke::new(1.4, fade(if is_focus { TEXT } else { DIM }));
+                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
                     let p = ui.painter();
                     match role {
                         "min" => {
@@ -3074,7 +3040,7 @@ impl WindowManager {
                                 p.circle_filled(
                                     egui::pos2(c.x + dx, c.y),
                                     1.2,
-                                    fade(if is_focus { TEXT } else { DIM }),
+                                    if is_focus { TEXT } else { DIM },
                                 );
                             }
                         }
@@ -3089,7 +3055,7 @@ impl WindowManager {
                             );
                         }
                     }
-                    if reveal_chrome && resp.clicked() {
+                    if resp.clicked() {
                         match role {
                             "close" => acts.push(Act::Close(id)),
                             "max" => acts.push(Act::Max(id)),
@@ -3113,11 +3079,11 @@ impl WindowManager {
                             egui::Color32::TRANSPARENT
                         };
                         ui.painter()
-                            .rect_filled(pr, egui::CornerRadius::same(4), fade(pbg));
+                            .rect_filled(pr, egui::CornerRadius::same(4), pbg);
                         let c = pr.center();
                         let s = 4.0;
                         let stroke =
-                            egui::Stroke::new(1.4, fade(if is_focus { TEXT } else { DIM }));
+                            egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
                         let p = ui.painter();
                         p.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
                         p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
@@ -3159,7 +3125,7 @@ impl WindowManager {
                         });
                     }
                 }
-            } // end reveal_chrome (hover-revealed header)
+            } // end header chrome
 
             // --- border + resize ---
             let border_col = if is_focus {
@@ -3730,15 +3696,6 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
     *rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
 }
 
-/// The hover strip that reveals a window's chrome: the title band, clipped to
-/// the manager's visible area. Shared by projects and terminals — one reveal
-/// rule at both levels (spec 2026-07-02). The caller must test the pointer
-/// with `ui.rect_contains_pointer(reveal_band(..))`, which is layer-aware;
-/// a raw `band.contains(pointer)` would reveal chrome on windows occluded by
-/// a floating window above them.
-fn reveal_band(scr: egui::Rect, area: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(scr.min, egui::vec2(scr.width(), TITLE_H)).intersect(area)
-}
 
 /// Hover-opened popup menu anchored to a header button. Paints rows in a
 /// Foreground `Area` and returns the clicked row index. Opens when the
@@ -6197,19 +6154,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reveal_band_is_the_title_strip_clipped_to_area() {
-        let scr = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 100.0));
-        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(500.0, 500.0));
-        let band = reveal_band(scr, area);
-        assert_eq!(band.min, egui::pos2(10.0, 10.0));
-        assert_eq!(band.width(), 200.0);
-        assert_eq!(band.height(), TITLE_H);
-
-        // A window hanging off the top of the area gets a clipped band.
-        let scr2 = egui::Rect::from_min_size(egui::pos2(10.0, -10.0), egui::vec2(200.0, 100.0));
-        let band2 = reveal_band(scr2, area);
-        assert_eq!(band2.min.y, 0.0);
-        assert_eq!(band2.height(), TITLE_H - 10.0);
-    }
 }
