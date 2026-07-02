@@ -337,13 +337,16 @@ pub(crate) fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Vec<u8> {
             let name = key.name();
             let b = name.as_bytes();
             if b.len() == 1 {
-                // Ctrl+Alt+letter → ESC + control code (meta over the ctrl
-                // code); Codex's paste-image needs Ctrl+Alt+V = 1b 16.
+                // Ctrl+Alt+V only → ESC + 0x16 (Codex's paste-image binding).
+                // Deliberately NOT all letters: AltGr arrives as Ctrl+Alt on
+                // Windows, so an unscoped branch would double-inject a stray
+                // ESC+ctrl-code alongside genuine AltGr text (e.g. AltGr+E=€).
+                // AltGr+V produces no character on major layouts.
                 if ctrl && mods.alt {
-                    let up = b[0].to_ascii_uppercase();
-                    if up.is_ascii_uppercase() {
-                        return vec![0x1b, up - 0x40];
+                    if b[0].to_ascii_uppercase() == b'V' {
+                        return vec![0x1b, 0x16];
                     }
+                    return Vec::new();
                 }
                 // Ctrl+letter → control code (0x01..0x1a).
                 if ctrl && !mods.alt {
@@ -696,7 +699,9 @@ mod tests {
         assert!(!out.paste_clipboard);
     }
     #[test]
-    fn ctrl_alt_c_does_not_copy_or_interrupt() {
+    fn ctrl_alt_other_letters_produce_nothing() {
+        // Ctrl+Alt on any letter other than V produces no bytes. This prevents
+        // the Ctrl+Alt branch from interfering with AltGr text on intl layouts.
         let live = Modifiers {
             alt: true,
             ctrl: true,
@@ -708,8 +713,25 @@ mod tests {
             TermMode::empty(),
             true,
         );
-        assert_eq!(out.pty_bytes, b"\x1b\x03");
+        assert!(out.pty_bytes.is_empty());
         assert!(!out.copy && !out.interrupt);
+    }
+    #[test]
+    fn altgr_letter_with_text_types_only_the_text() {
+        // German AltGr+E: Key::E with ctrl+alt PLUS Text("€") in one frame —
+        // only the € may reach the PTY.
+        let live = Modifiers {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[key_ev(Key::E, mods(true, true, false)), Event::Text("€".into())],
+            live,
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, "€".as_bytes());
     }
     #[test]
     fn empty_paste_event_still_flags_clipboard_read() {
