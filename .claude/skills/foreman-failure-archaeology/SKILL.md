@@ -31,6 +31,7 @@ behind those triage rows. Settled verdicts are enforced by
 | 5 | Flaky chat broadcast test | Pre-Ready swallow; fixed in 3 stages | 2026-06-27 |
 | 6 | Input latency | 16 ms metronome, NOT vsync | 2026-06-18 |
 | 7 | Chat-room A/B experiment | Planned in full, never executed | abandoned |
+| 8 | Eaten chat posts under the passthrough ConPTY host | `ready` redefined: DSR answered AND first child paint | 2026-07-03 |
 
 ---
 
@@ -241,6 +242,53 @@ child's device-status scan. Details: **terminal-emulation-reference**.
 - **Status:** abandoned-without-marker; explicitly a revival candidate — see
   **foreman-research-frontier** (ownership of the open problem) and
   **foreman-research-methodology** (evidence bar for running it).
+
+## 8. Eaten chat posts under the passthrough ConPTY host (settled 2026-07-03)
+
+- **Symptom:** 5 wm chat tests red, consistently (not flaky):
+  `chat_broadcast_hits_members_only_excluding_sender`,
+  `chat_broadcast_reaches_background_member_tab_not_foreground_shell`,
+  `chat_post_replies_ok_then_broadcasts`,
+  `chat_targeted_broadcast_hits_only_the_target`,
+  `human_post_appends_with_reserved_id_and_broadcasts_to_all_members`. A
+  broadcast to a `ready()` member never reached its PTY (`cmd /c pause`
+  members never exited). The live app was equally affected: posts to a
+  freshly-dispatched member silently vanished.
+- **Wrong turns (exonerated by experiment — do not re-test):** conpty pair in
+  deps, orphan swarm, ConPTY slowness, the session-tree-kill branch changes,
+  cmd AutoRun, test parallelism, and the prime-suspect commit `9aeb72b` (the
+  delivery-cursor sweep) — the whole chat model was proven innocent by
+  instrumentation, no bisect needed. A prior session's "410 green at
+  `29fd6bb`" claim could not be reproduced; the mechanism, not the exact
+  first-red date, is the settled fact.
+- **Root cause:** since `405dc55` (vendored OpenConsole passthrough host for
+  kitty graphics), the startup DSR that latches `Session.ready` comes from
+  the HOST, microseconds after spawn — seconds before the child's input path
+  opens. `ready` stopped meaning "injection is safe": the boot window ate the
+  chat paste + deferred `\r`, and `ChatRoom::tick` had already advanced the
+  delivery cursor (it advances even when nothing is addressed), so the post
+  was never re-sent. Battle 5's pre-Ready swallow, resurrected by the host
+  redefining what the signal observes.
+- **Evidence (instrumented single-test runs, 2026-07-03):** tick returned the
+  delivery, the wm matched the terminal, the paste was written with
+  `ready=true` — yet the child's prompt first rendered **2.57s after** the
+  post. rx timeline: host chrome (`ESC[1t`, `ESC[6n ESC[c ESC[?1004h
+  ESC[?9001h`, `ESC[1;1H`) all inside 11ms, ready latched at +373µs; first
+  child ink ("Press any key…") at +3.0s. Single-variable confirmation: delay
+  only the post until both children painted → the identical delivery path
+  went green in 3.1s.
+- **Fix:** `ready` = DSR answered AND first visible glyph in the PTY output.
+  The glyph detector is `InkScan` (src/terminal.rs), a pure cross-chunk
+  scanner that skips escape/control sequences. Grid-sniffing was rejected:
+  `inject_note` paints the dispatch banner into the grid without any child
+  output, so "grid non-empty" false-latches in the real app. Regression
+  contract test: `ready_waits_for_the_childs_first_paint`.
+- **Status:** settled. If chat posts vanish again, first ask what `ready`
+  observes (who answers the DSR, when the child actually paints) before
+  re-litigating the outbox — the delivery model has now been proven correct
+  twice. Known edge: a child that never prints anything never latches ready;
+  posts queue instead of being eaten (READY_GRACE remains the designed
+  remedy — **foreman-agent-state-campaign** Phase 0).
 
 ---
 

@@ -250,6 +250,53 @@ fn term_view<L: EventListener>(term: &Term<L>) -> crate::graphics::TermView {
     }
 }
 
+/// Scanner for the first *visible* glyph in raw PTY output — printable bytes
+/// OUTSIDE any escape/control sequence. A ConPTY host emits control-only
+/// chrome (DSR, DA1, mode sets, cursor homing) long before its child paints,
+/// and input written in that window is eaten; the first real ink is the
+/// observable "the child is up" signal readiness waits for (see
+/// [`Session::ready`]). Chunk-boundary safe: state persists across calls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InkScan {
+    Ground,
+    Esc,
+    Csi,
+    /// OSC/DCS/APC/PM/SOS string body — consumed until BEL or ST.
+    Str,
+    /// ESC inside a string: `ESC \` (ST) terminates it.
+    StrEsc,
+    /// ESC ( ) * + charset designation — the designator byte is consumed.
+    Charset,
+}
+
+impl InkScan {
+    /// Advance over `bytes`; true as soon as a visible glyph is found.
+    /// Spaces don't count — ConPTY paints space runs as erasure chrome.
+    fn saw_ink(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            *self = match (*self, b) {
+                (InkScan::Ground, 0x1b) => InkScan::Esc,
+                (InkScan::Ground, 0x21..=0x7e | 0x80..=0xff) => return true,
+                (InkScan::Ground, _) => InkScan::Ground,
+                (InkScan::Esc, b'[') => InkScan::Csi,
+                (InkScan::Esc, b']' | b'P' | b'_' | b'^' | b'X') => InkScan::Str,
+                (InkScan::Esc, b'(' | b')' | b'*' | b'+') => InkScan::Charset,
+                (InkScan::Esc, _) => InkScan::Ground,
+                (InkScan::Csi, 0x40..=0x7e) => InkScan::Ground,
+                (InkScan::Csi, _) => InkScan::Csi,
+                (InkScan::Str, 0x07) => InkScan::Ground,
+                (InkScan::Str, 0x1b) => InkScan::StrEsc,
+                (InkScan::Str, _) => InkScan::Str,
+                (InkScan::StrEsc, b'\\') => InkScan::Ground,
+                (InkScan::StrEsc, 0x1b) => InkScan::StrEsc,
+                (InkScan::StrEsc, _) => InkScan::Str,
+                (InkScan::Charset, _) => InkScan::Ground,
+            };
+        }
+        false
+    }
+}
+
 pub struct Session {
     term: Term<Listener>,
     parser: Processor,
@@ -291,10 +338,21 @@ pub struct Session {
     // Chat input that arrived before `ready`; held here and flushed by pump()
     // once the startup DSR scan resolves (see inject_input).
     pending_inject: Vec<String>,
-    // Latches true once the startup DSR (`ESC[6n`) has been answered — the
-    // point after which injected input is no longer eaten by the device-status
-    // scan. Catch-up replay and cursor advance gate on this (chat handshake
-    // contract: the cursor advances only on inject into a READY session).
+    // Latches true once the startup DSR (`ESC[6n`) has been answered — half
+    // of the readiness contract (see `ready`).
+    dsr_replied: bool,
+    // Latches true on the first visible glyph in the PTY output (InkScan) —
+    // the other half: proof the child is actually up and painting. A
+    // passthrough ConPTY host answers the DSR itself microseconds after
+    // spawn, seconds before the child's input path opens; injecting on the
+    // DSR alone eats the bytes (the 2026-07-03 chat-delivery regression).
+    painted: bool,
+    // Cross-chunk scanner state feeding `painted`.
+    ink: InkScan,
+    // Injection safety: `dsr_replied && painted` — the point after which
+    // injected input is no longer eaten by the boot window. Catch-up replay
+    // and cursor advance gate on this (chat handshake contract: the cursor
+    // advances only on inject into a READY session).
     ready: bool,
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
@@ -600,6 +658,9 @@ impl Session {
             pending_note: None,
             pending_submit: None,
             pending_inject: Vec::new(),
+            dsr_replied: false,
+            painted: false,
+            ink: InkScan::Ground,
             ready: false,
             output_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
@@ -629,9 +690,12 @@ impl Session {
         self.term_id = id;
     }
 
-    /// Has the startup DSR exchange resolved? Once true, injected chat input
-    /// reaches the child instead of being swallowed by the device-status scan.
-    /// Latched by [`Session::pump`] on the first reply flushed back to the PTY.
+    /// Is injected input safe to send? True once the startup DSR exchange has
+    /// resolved AND the child has painted its first visible output. Either
+    /// alone is insufficient — a passthrough ConPTY host answers the DSR
+    /// microseconds after spawn, seconds before the child's input path opens,
+    /// and bytes injected in that window are eaten. Latched by
+    /// [`Session::pump`].
     pub fn ready(&self) -> bool {
         self.ready
     }
@@ -692,8 +756,9 @@ impl Session {
             return;
         }
         if !self.ready {
-            // Hold the post until the startup DSR scan resolves; a paste sent now
-            // gets swallowed by it. pump() flushes the queue once ready.
+            // Hold the post until the session is ready (DSR answered + first
+            // child paint); a paste sent now gets swallowed by the boot
+            // window. pump() flushes the queue once ready.
             self.pending_inject.push(text.to_string());
             return;
         }
@@ -747,6 +812,9 @@ impl Session {
             if let Some(f) = self.rx_dump.as_mut() {
                 let _ = f.write_all(&bytes);
             }
+            if !self.painted && self.ink.saw_ink(&bytes) {
+                self.painted = true;
+            }
             advance_scanned(
                 &mut self.parser,
                 &mut self.term,
@@ -768,7 +836,14 @@ impl Session {
             let _ = self.writer.write_all(&reply);
             let _ = self.writer.flush();
             // First device-status reply flushed back = the startup DSR scan is
-            // done; input injected from here on reaches the child (see `ready`).
+            // done — half the readiness contract (see `ready`).
+            self.dsr_replied = true;
+        }
+        // Injection is safe once the DSR scan resolved AND the child has
+        // painted: a passthrough ConPTY host answers the DSR itself long
+        // before the child's input path opens, so the reply alone proves
+        // nothing about the child (the 2026-07-03 chat-delivery regression).
+        if self.dsr_replied && self.painted {
             self.ready = true;
         }
         // Now that the scan is done, flush any post that arrived before readiness
@@ -1498,7 +1573,7 @@ mod tests {
         // cmd.exe sends ESC[6n at startup; pump() flushes the reply back to the
         // PTY — that first flush is the readiness latch.
         let mut became_ready = false;
-        for _ in 0..200 {
+        for _ in 0..750 {
             s.pump();
             if s.ready() {
                 became_ready = true;
@@ -1531,7 +1606,7 @@ mod tests {
         );
         // The pump that latches readiness also flushes the held post.
         let mut flushed = false;
-        for _ in 0..200 {
+        for _ in 0..750 {
             s.pump();
             if s.ready() && s.pending_inject.is_empty() {
                 flushed = true;
@@ -1547,13 +1622,73 @@ mod tests {
     }
 
     #[test]
+    fn ready_waits_for_the_childs_first_paint() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        // The DSR reply alone must not latch readiness: a passthrough ConPTY
+        // host answers the startup DSR microseconds after spawn, seconds
+        // before the child's input path is open — bytes injected in that
+        // window are eaten (the 2026-07-03 chat-delivery regression).
+        // Readiness must also require the child's first visible output.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !s.snapshot_text(None).join("").trim().is_empty(),
+            "ready latched before the child painted anything — \
+             input injected now would be eaten by the boot window"
+        );
+    }
+
+    #[test]
+    fn ink_scan_ignores_control_chrome_and_finds_first_glyph() {
+        // The exact boot chrome the passthrough ConPTY host emits before its
+        // child paints (captured 2026-07-03): window ops, DSR, DA1, mode
+        // sets, cursor homing — all ink-free.
+        let mut ink = InkScan::Ground;
+        assert!(!ink.saw_ink(b"\x1b[1t"));
+        assert!(!ink.saw_ink(b"\x1b[6n\x1b[c\x1b[?1004h\x1b[?9001h"));
+        assert!(!ink.saw_ink(b"\x1b[1;1H"));
+        // OSC title, APC graphics, charset designation: sequence bodies
+        // never count as ink.
+        assert!(!ink.saw_ink(b"\x1b]0;some title\x07"));
+        assert!(!ink.saw_ink(b"\x1b_Gf=100,t=d;QUJD\x1b\\"));
+        assert!(!ink.saw_ink(b"\x1b(B"));
+        // Spaces are erasure chrome, not ink; C0 controls aren't ink.
+        assert!(!ink.saw_ink(b"   \r\n\x08\x07"));
+        // The child's first real output IS ink.
+        assert!(ink.saw_ink(b"\x1b[?7l\x1b[?7hPress any key"));
+    }
+
+    #[test]
+    fn ink_scan_survives_chunk_splits_inside_sequences() {
+        let mut ink = InkScan::Ground;
+        // CSI split mid-parameters: `H` is the sequence's final byte, not ink.
+        assert!(!ink.saw_ink(b"\x1b[1;"));
+        assert!(!ink.saw_ink(b"1H"));
+        // OSC split before its terminator: body bytes stay swallowed.
+        assert!(!ink.saw_ink(b"\x1b]0;tit"));
+        assert!(!ink.saw_ink(b"le"));
+        assert!(!ink.saw_ink(b"\x07"));
+        // UTF-8 text after all that is ink.
+        assert!(ink.saw_ink("héllo".as_bytes()));
+    }
+
+    #[test]
     fn inject_input_defers_the_submit_keypress() {
         let ctx = egui::Context::default();
         let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         // Injection now waits for readiness; clear the startup DSR scan first so
         // this test exercises the submit-defer timing, not the readiness gate.
-        for _ in 0..200 {
+        for _ in 0..750 {
             s.pump();
             if s.ready() {
                 break;

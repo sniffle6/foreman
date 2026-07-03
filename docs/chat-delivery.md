@@ -84,11 +84,14 @@ The engine adapter (`src/wm.rs`):
   marks a registered member exited if it is *absent* from `live`. If the engine
   ever passed a partial set, the room would wrongly exit members. (`chat_tick`
   passes every terminal, ready or not.)
-- **Delivery only into a `ready()` session.** A just-spawned shell answers its
-  startup DSR (`ESC[6n`) before it reads input; bytes injected earlier get eaten
-  by the device-status scan. A not-ready member keeps its cursor and catches up
-  the first frame it is ready. (This is the original silent-drop fix, now inside
-  the room's outbox.)
+- **Delivery only into a `ready()` session.** Ready = the startup DSR
+  (`ESC[6n`) has been answered AND the child has painted its first visible
+  output; bytes injected before both get eaten by the boot window. The DSR
+  alone stopped being proof when the passthrough ConPTY host arrived — the
+  host answers the DSR itself microseconds after spawn, seconds before the
+  child's input path opens (the 2026-07-03 eaten-post regression). A not-ready
+  member keeps its cursor and catches up the first frame it is ready. (This is
+  the original silent-drop fix, now inside the room's outbox.)
 - **A member never gets its own post** (`from == id` is skipped in the outbox).
 - **`post` is strict, `post_human` is lenient.** Two methods, two policies, one
   owner. Don't fold them — the CLI agent needs the error; the pane input can't
@@ -107,7 +110,8 @@ The engine adapter (`src/wm.rs`):
   membership in `status_dispatch`, the `Content::Chat` viewer pull,
   `drain_chat_clicks` (resolve click → window by id).
 - `src/terminal.rs` — `Session::term_id()` / `set_term_id()` (the stable Member
-  id) and `ready()` (the DSR latch the outbox gates on).
+  id) and `ready()` (the DSR-answered + first-paint latch the outbox gates on;
+  `InkScan` is the paint detector).
 - `src/main.rs` — calls `chat_tick()` once per frame after `show()`.
 - Design: `CONTEXT.md` (Member / Member id / Outbox), and
   `docs/contracts/chat-handshake-contract.md` (the pinned delivery contract).
