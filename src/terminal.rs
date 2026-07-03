@@ -1663,6 +1663,42 @@ mod tests {
         assert_eq!(s.exited(), Some(0)); // plain exited() still reports
     }
 
+    /// Diagnostic canary, machine-dependent: does THIS Windows' ConPTY pass a
+    /// kitty graphics APC (`ESC _ G … ESC \`) through to the hosting terminal?
+    /// The in-process pipeline is covered by pure tests; this exercises the OS
+    /// layer in between. Run manually: cargo test --release conpty_passes -- --ignored
+    #[test]
+    #[ignore = "diagnostic: result depends on the OS conhost version"]
+    fn conpty_passes_kitty_apc_through() {
+        let ctx = egui::Context::default();
+        let cmd = "Write-Host MARKER; Write-Host ([char]27 + '_Ga=T,t=d,f=32,s=1,v=1,q=2,i=9;' \
+                   + [Convert]::ToBase64String([byte[]](255,0,0,255)) + [char]27 + '\\')";
+        let argv = vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            cmd.to_string(),
+        ];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while s.exited().is_none() {
+            s.pump();
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        s.pump(); // drain anything buffered after exit
+        let screen: String = (0..24).map(|r| grid_row(&s, r, 80)).collect();
+        assert!(
+            screen.contains("MARKER"),
+            "child produced no output at all — the ConPTY host failed to run, \
+             so this proves nothing about APC passthrough"
+        );
+        assert!(
+            s.graphics.has_image(9),
+            "ConPTY stripped the kitty APC before it reached the terminal"
+        );
+    }
+
     fn sel_range((l0, c0): (i32, usize), (l1, c1): (i32, usize)) -> SelectionRange {
         SelectionRange {
             start: Point::new(Line(l0), Column(c0)),
