@@ -260,6 +260,10 @@ pub struct Session {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Kill-on-close job the child lives in: dropping the Session kills the
+    /// whole process tree (see src/job.rs). None = assignment failed; the
+    /// session still works, its tree just isn't reaped (old behavior).
+    job: Option<crate::job::Job>,
     exit: Option<u32>,
     exit_noted: bool,
     pub shell: Shell,
@@ -584,6 +588,7 @@ impl Session {
             writer,
             master: pair.master,
             child,
+            job: root_pid.and_then(crate::job::Job::assign),
             exit: None,
             exit_noted: false,
             shell,
@@ -1728,6 +1733,28 @@ mod tests {
         assert_eq!(noted, Some(0));
         assert_eq!(s.exit_to_note(), None); // second note must not fire
         assert_eq!(s.exited(), Some(0)); // plain exited() still reports
+    }
+
+    /// Closing a pane / dropping a Session must take the child process with
+    /// it — an interactive shell never exits on its own when the PTY closes,
+    /// and used to pile up as orphans (2,000+ found from test runs alone).
+    #[test]
+    fn dropping_a_session_kills_its_child() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string()]; // interactive — never exits by itself
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let pid = s.root_pid.expect("no root pid");
+        let watch = crate::job::DeathWatch::open(pid).expect("cannot watch child");
+        for _ in 0..10 {
+            s.pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(s.exited().is_none(), "shell died prematurely");
+        drop(s);
+        assert!(
+            watch.dead_within_ms(5000),
+            "child cmd.exe survived Session drop"
+        );
     }
 
     /// Diagnostic canary, machine-dependent: does THIS Windows' ConPTY pass a

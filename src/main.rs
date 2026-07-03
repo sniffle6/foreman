@@ -10,6 +10,7 @@ mod graphics;
 mod icons;
 mod input;
 mod inspect;
+mod job;
 mod keymap;
 mod layout;
 mod proc;
