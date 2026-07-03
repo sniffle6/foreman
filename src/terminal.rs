@@ -1699,6 +1699,47 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "perf: cargo test --release scanner_overhead -- --ignored --nocapture"]
+    fn scanner_overhead_on_plain_and_ansi_floods() {
+        let plain = {
+            let line = "x".repeat(120) + "\r\n";
+            line.repeat(200_000).into_bytes() // ~24 MB
+        };
+        let ansi = {
+            let mut v = Vec::new();
+            for r in 0..200_000 {
+                v.extend_from_slice(
+                    format!(
+                        "\x1b[{};1H\x1b[38;5;{}mrow of colorful tui text",
+                        (r % 40) + 1,
+                        r % 256
+                    )
+                    .as_bytes(),
+                );
+            }
+            v
+        };
+        for (name, corpus) in [("plain", &plain), ("ansi", &ansi)] {
+            let mut term = term_with(b"", 120, 40);
+            let mut parser: Processor = Processor::new();
+            let t0 = std::time::Instant::now();
+            parser.advance(&mut term, corpus);
+            let vte = t0.elapsed();
+            let mut g = crate::graphics::Graphics::default();
+            let t1 = std::time::Instant::now();
+            let cuts = g.feed(corpus);
+            let scan = t1.elapsed();
+            assert!(cuts.is_empty());
+            println!(
+                "{name}: vte {vte:?} ({:.0} MB/s) | scanner {scan:?} ({:.0} MB/s) | overhead {:.2}%",
+                corpus.len() as f64 / vte.as_secs_f64() / 1e6,
+                corpus.len() as f64 / scan.as_secs_f64() / 1e6,
+                100.0 * scan.as_secs_f64() / vte.as_secs_f64(),
+            );
+        }
+    }
+
     fn sel_range((l0, c0): (i32, usize), (l1, c1): (i32, usize)) -> SelectionRange {
         SelectionRange {
             start: Point::new(Line(l0), Column(c0)),
