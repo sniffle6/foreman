@@ -1699,6 +1699,56 @@ mod tests {
         );
     }
 
+    /// Diagnostic canary #2, machine-dependent: does ConPTY preserve a cursor
+    /// move that immediately precedes a kitty APC — (a) as a bare CUP, and
+    /// (b) wrapped in codex's DECSC/CUP/APC/DECRC sandwich (net-zero cursor
+    /// delta, which a diffing renderer may optimize away)? Prints the anchor
+    /// each style produced; the CUP target is row 2, col 9 (0-based).
+    /// Run manually: cargo test --release conpty_preserves -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the OS conhost version"]
+    fn conpty_preserves_cursor_moves_for_apc() {
+        for (style, seq) in [
+            ("bare CUP", "[char]27 + '[3;10H' + $img"),
+            ("DECSC sandwich", "[char]27 + '7' + [char]27 + '[3;10H' + $img + [char]27 + '8'"),
+        ] {
+            let ctx = egui::Context::default();
+            let cmd = format!(
+                "$img = [char]27 + '_Ga=T,t=d,f=32,s=1,v=1,q=2,i=9;' \
+                 + [Convert]::ToBase64String([byte[]](255,0,0,255)) + [char]27 + '\\'; \
+                 Write-Host MARKER; [Console]::Write({seq}); Start-Sleep -Milliseconds 300"
+            );
+            let argv = vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                cmd,
+            ];
+            let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while s.exited().is_none() {
+                s.pump();
+                assert!(std::time::Instant::now() < deadline, "child never exited");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            s.pump();
+            let screen: String = (0..24).map(|r| grid_row(&s, r, 80)).collect();
+            assert!(screen.contains("MARKER"), "{style}: child produced no output");
+            let vp = crate::graphics::ViewportView {
+                alt_screen: false,
+                history_size: s.term.grid().history_size(),
+                display_offset: 0,
+                screen_lines: s.term.grid().screen_lines(),
+            };
+            let vis = s.graphics.visible(&vp);
+            assert_eq!(vis.len(), 1, "{style}: image never arrived");
+            println!(
+                "{style}: anchored at (line {}, col {}) — CUP target was (2, 9)",
+                vis[0].line, vis[0].col
+            );
+        }
+    }
+
     #[test]
     #[ignore = "perf: cargo test --release scanner_overhead -- --ignored --nocapture"]
     fn scanner_overhead_on_plain_and_ansi_floods() {
