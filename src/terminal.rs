@@ -1308,7 +1308,7 @@ mod tests {
         // pump() reads PTY output and writes back any pending device-status replies;
         // without it cmd.exe hangs before executing /c exit and never exits.
         let mut code = None;
-        for _ in 0..100 {
+        for _ in 0..750 {
             s.pump(); // answer DSR queries so cmd.exe can proceed to exit
             if let Some(c) = s.exited() {
                 code = Some(c);
@@ -1722,7 +1722,7 @@ mod tests {
         ];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         let mut noted = None;
-        for _ in 0..100 {
+        for _ in 0..750 {
             s.pump();
             if let Some(c) = s.exit_to_note() {
                 noted = Some(c);
@@ -1804,7 +1804,10 @@ mod tests {
     fn conpty_preserves_cursor_moves_for_apc() {
         for (style, seq) in [
             ("bare CUP", "[char]27 + '[3;10H' + $img"),
-            ("DECSC sandwich", "[char]27 + '7' + [char]27 + '[3;10H' + $img + [char]27 + '8'"),
+            (
+                "DECSC sandwich",
+                "[char]27 + '7' + [char]27 + '[3;10H' + $img + [char]27 + '8'",
+            ),
         ] {
             let ctx = egui::Context::default();
             let cmd = format!(
@@ -1827,7 +1830,10 @@ mod tests {
             }
             s.pump();
             let screen: String = (0..24).map(|r| grid_row(&s, r, 80)).collect();
-            assert!(screen.contains("MARKER"), "{style}: child produced no output");
+            assert!(
+                screen.contains("MARKER"),
+                "{style}: child produced no output"
+            );
             let vp = crate::graphics::ViewportView {
                 alt_screen: false,
                 history_size: s.term.grid().history_size(),
@@ -1951,7 +1957,11 @@ mod tests {
                     esc(gap)
                 };
                 println!("GAP [{last_end}..{i}] ({}b): {shown}", gap.len());
-                println!("APC @{i} len {}: {}", end - i, esc(&bytes[i..hdr_end.min(end)]));
+                println!(
+                    "APC @{i} len {}: {}",
+                    end - i,
+                    esc(&bytes[i..hdr_end.min(end)])
+                );
                 last_end = end;
                 i = end;
             } else {

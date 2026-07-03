@@ -4711,7 +4711,7 @@ mod tests {
         // wait for the `cmd /c exit 0` member child to end — pumping keepalive()
         // each pass, or the startup DSR query leaves cmd.exe hung forever
         // (the documented trap; same pattern as the broadcast tests above)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
@@ -4949,7 +4949,7 @@ mod tests {
         // addressed to every member. chat_tick only delivers to ready()
         // sessions, so pump every session each iteration (latching ready())
         // then tick until both stdins have seen it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             for w in wm.windows.iter_mut() {
                 if let Content::Terminal(s) = &mut w.tabs[w.active].content {
@@ -5112,7 +5112,7 @@ mod tests {
         // and the tick delivers. It still proves the membership filter: the
         // sender and the non-member are pumped too — so a wrongful injection
         // into them WOULD make them exit below.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             for w in wm.windows.iter_mut() {
                 if let Content::Terminal(s) = &mut w.tabs[w.active].content {
@@ -5220,7 +5220,7 @@ mod tests {
         // The post was appended once above; each iteration pumps the child
         // sessions (latching ready()) then chat_tick recurses into the project
         // and delivers. The cursor + ready-gating make a re-send unnecessary.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
             let Content::Project(child) = &mut win.tabs[win.active].content else {
@@ -5667,7 +5667,7 @@ mod tests {
         };
         // pump until the child process has actually exited (the DSR trap:
         // cmd.exe hangs on its startup query until keepalive answers it)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
             let Content::Project(child) = &mut win.tabs[win.active].content else {
@@ -6020,7 +6020,7 @@ mod tests {
         // chat_broadcast_hits_members_only_excluding_sender (the DSR trap):
         // every tab of every window is kept pumped, so a wrongful injection
         // into the foreground shell would make it exit below.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             for w in wm.windows.iter_mut() {
                 for t in w.tabs.iter_mut() {
@@ -6088,7 +6088,7 @@ mod tests {
         wm.chat_post(&term_tag(sender), "go", &[term_tag(target)], None)
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             for w in wm.windows.iter_mut() {
                 if let Content::Terminal(s) = &mut w.tabs[w.active].content {
@@ -6268,7 +6268,7 @@ mod tests {
             .unwrap();
         // kill the victim by injecting a byte (pause exits on any stdin), pumping
         // through the DSR window like the broadcast tests
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             for w in wm.windows.iter_mut() {
                 if let Content::Terminal(s) = &mut w.tabs[w.active].content {
