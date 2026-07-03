@@ -44,6 +44,10 @@ if the install fails, foreman still runs, images just don't arrive.
   the 2025-02+ build does. If you update `assets/conpty/`, rerun the canary.
 - The canary test fails in `target/release/deps` unless the pair is copied
   there too (the app's auto-install only covers the exe's own directory).
+- The image-only-clipboard Ctrl+V → `0x16` fallback is best-effort: it relies
+  on egui delivering the Key::V event alongside an empty Paste event, which
+  may vary by egui version/platform. The primary paste paths (Alt+V, handled
+  entirely by the agent, and Ctrl+Alt+V → `ESC 0x16`) don't depend on it.
 
 ## Performance
 

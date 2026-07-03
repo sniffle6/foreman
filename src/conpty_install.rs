@@ -31,8 +31,12 @@ fn install_into(dir: &std::path::Path) {
         if current_len == Some(bytes.len() as u64) {
             continue;
         }
-        // A running session may hold the old file open; best-effort only.
-        if let Err(e) = std::fs::write(&dest, bytes) {
+        // Atomic tmp+rename like skills_install: a hard kill mid-write must
+        // never leave a torn DLL for portable-pty to load. A running session
+        // may hold the old file open; best-effort only.
+        let tmp = dest.with_extension("tmp");
+        let write = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &dest));
+        if let Err(e) = write {
             eprintln!("conpty install: {} -> {}: {e}", name, dest.display());
         }
     }
