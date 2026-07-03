@@ -1,6 +1,7 @@
 mod caret;
 mod chat;
 mod config;
+mod conpty_install;
 mod control;
 mod dirpicker;
 mod frame;
@@ -452,6 +453,7 @@ fn main() -> eframe::Result {
     }
     install_panic_logger();
     skills_install::install();
+    conpty_install::ensure_conpty();
     let (tx, rx) = std::sync::mpsc::channel();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
