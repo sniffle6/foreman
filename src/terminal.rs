@@ -226,6 +226,15 @@ fn advance_scanned<L: EventListener>(
     for cut in cuts {
         parser.advance(term, &bytes[at..cut.offset]);
         at = cut.offset;
+        // A synchronized update (?2026h) buffers everything inside the parser,
+        // so the Term would still show the PREVIOUS frame's cursor — codex
+        // parks it at the composer caret, then emits the pet CUP inside the
+        // sync block. Force-flush the buffered prefix so the sample reflects
+        // the stream exactly up to this cut. The block's remainder still
+        // applies within this pump pass, so no torn frame reaches the painter.
+        if parser.sync_bytes_count() > 0 {
+            parser.stop_sync(term);
+        }
         graphics.apply(term_view(term), replies);
     }
     parser.advance(term, &bytes[at..]);
@@ -304,6 +313,9 @@ pub struct Session {
     /// `scroll_accum`, but accumulated against the zoom notch size so a gentle
     /// Ctrl+wheel still eventually steps the font and a fast flick doesn't lurch.
     zoom_accum: f32,
+    /// Diagnostic tap (FOREMAN_RX_DUMP=<file>): every raw PTY chunk pump()
+    /// receives is appended verbatim. None (zero-cost) when the var is unset.
+    rx_dump: Option<std::fs::File>,
 }
 
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
@@ -590,6 +602,13 @@ impl Session {
             textures: std::collections::HashMap::new(),
             scroll_accum: 0.0,
             zoom_accum: 0.0,
+            rx_dump: std::env::var_os("FOREMAN_RX_DUMP").and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            }),
         })
     }
 
@@ -720,6 +739,9 @@ impl Session {
     fn pump(&mut self) {
         let mut greplies = Vec::new();
         while let Ok(bytes) = self.rx.try_recv() {
+            if let Some(f) = self.rx_dump.as_mut() {
+                let _ = f.write_all(&bytes);
+            }
             advance_scanned(
                 &mut self.parser,
                 &mut self.term,
@@ -1640,6 +1662,51 @@ mod tests {
         assert!(row(4).contains("tail")); // vte ignored the APC
     }
 
+    /// The codex pet frame rides INSIDE a synchronized update (?2026h..?2026l):
+    /// BSU, delete, save, CUP(pet spot), chunked transmit, restore, ESU — with
+    /// the cursor last parked at the composer caret by the PREVIOUS block. The
+    /// vte parser buffers all sync-block bytes, so a naive cursor sample at the
+    /// cut reads the stale caret; the anchor must be the in-block pet CUP.
+    /// Distilled from a real codex 0.142.5 rx capture (codex_pet_rx_capture).
+    #[test]
+    fn sync_update_frame_anchors_at_the_pet_cup_not_the_stale_caret() {
+        use base64::Engine as _;
+        let mut term = term_with(b"", 80, 24);
+        let mut parser: Processor = Processor::new();
+        let mut g = crate::graphics::Graphics::default();
+        let mut replies = Vec::new();
+
+        let rgba = [255u8, 0, 0, 255];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(rgba);
+        let bytes = format!(
+            "\x1b[14;3H\x1b[?2026l\
+             \x1b[?2026h\
+             \x1b_Ga=d,d=I,i=9,q=2\x1b\\\
+             \x1b7\x1b[11;72H\
+             \x1b_Ga=T,t=d,f=32,s=1,v=1,q=2,i=9,m=1;{b64}\x1b\\\
+             \x1b_Gm=0;\x1b\\\
+             \x1b8\x1b[?2026l"
+        );
+        advance_scanned(
+            &mut parser,
+            &mut term,
+            &mut g,
+            bytes.as_bytes(),
+            &mut replies,
+        );
+
+        let vp = crate::graphics::ViewportView {
+            alt_screen: false,
+            history_size: 0,
+            display_offset: 0,
+            screen_lines: 24,
+        };
+        let vis = g.visible(&vp);
+        assert_eq!(vis.len(), 1);
+        // CUP 11;72 is 0-based (10, 71); the stale caret would be (13, 2).
+        assert_eq!((vis[0].line, vis[0].col), (10, 71));
+    }
+
     #[test]
     fn exit_is_noted_exactly_once() {
         let ctx = egui::Context::default();
@@ -1747,6 +1814,129 @@ mod tests {
                 vis[0].line, vis[0].col
             );
         }
+    }
+
+    /// Diagnostic capture: run the real codex TUI headlessly (pets enabled via
+    /// ~/.codex/config.toml) and dump the raw post-ConPTY byte stream so pet
+    /// frames can be inspected offline: where do conhost's cursor moves sit
+    /// relative to the kitty chunk chain? No prompt is submitted — ambient pet
+    /// frames render on idle, so this consumes zero codex usage.
+    /// Run: cargo test --release codex_pet_rx_capture -- --ignored --nocapture
+    /// (needs conpty.dll + OpenConsole.exe beside the test exe in deps/).
+    #[test]
+    #[ignore = "diagnostic: drives a real codex TUI"]
+    fn codex_pet_rx_capture() {
+        let dump = std::env::temp_dir().join("foreman-codex-rx.bin");
+        let _ = std::fs::remove_file(&dump);
+        // Safety: set before the Session exists, removed right after spawn;
+        // this #[ignore]d diagnostic runs alone.
+        unsafe { std::env::set_var("FOREMAN_RX_DUMP", &dump) };
+        let ctx = egui::Context::default();
+        let env = [("KITTY_WINDOW_ID".to_string(), "1".to_string())];
+        let argv = vec!["codex".to_string()];
+        let mut s = Session::spawn_argv(
+            &argv,
+            Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
+            &env,
+            ctx,
+        )
+        .expect("spawn failed");
+        unsafe { std::env::remove_var("FOREMAN_RX_DUMP") };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while std::time::Instant::now() < deadline && s.exited().is_none() {
+            s.pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let vp = crate::graphics::ViewportView {
+            alt_screen: s.term.mode().contains(TermMode::ALT_SCREEN),
+            history_size: s.term.grid().history_size(),
+            display_offset: 0,
+            screen_lines: s.term.grid().screen_lines(),
+        };
+        println!(
+            "cursor: line {} col {}  history {}  alt {}",
+            s.term.grid().cursor.point.line.0,
+            s.term.grid().cursor.point.column.0,
+            vp.history_size,
+            vp.alt_screen,
+        );
+        for p in s.graphics.visible(&vp) {
+            println!(
+                "placed id={} at (line {}, col {}) px {}x{} cells {:?}x{:?}",
+                p.id, p.line, p.col, p.w, p.h, p.cols, p.rows
+            );
+        }
+        for r in 0..s.rows as i32 {
+            println!("|{}|", grid_row(&s, r, s.cols));
+        }
+        let _ = s.child.kill();
+        let bytes = std::fs::read(&dump).expect("no dump written");
+        println!("captured {} bytes -> {}", bytes.len(), dump.display());
+        assert!(!bytes.is_empty(), "no rx captured");
+    }
+
+    /// Companion analyzer for `codex_pet_rx_capture`: walks the captured dump
+    /// and prints every kitty APC header plus the raw (escaped) bytes between
+    /// consecutive APCs, so the cursor moves around the chunk chain are
+    /// visible. Pure file analysis — no PTY, no GUI.
+    /// Run: cargo test --release codex_pet_rx_analyze -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: analyzes a prior capture"]
+    fn codex_pet_rx_analyze() {
+        let dump = std::env::temp_dir().join("foreman-codex-rx.bin");
+        let bytes = std::fs::read(&dump).expect("run codex_pet_rx_capture first");
+        let esc = |b: &[u8]| -> String {
+            b.iter()
+                .map(|&c| match c {
+                    0x1b => "\\e".to_string(),
+                    0x20..=0x7e => (c as char).to_string(),
+                    _ => format!("\\x{c:02x}"),
+                })
+                .collect()
+        };
+        let mut i = 0;
+        let mut last_end = 0usize;
+        while i + 2 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'_' && bytes[i + 2] == b'G' {
+                let hdr_end = bytes[i..]
+                    .iter()
+                    .position(|&c| c == b';')
+                    .map(|o| i + o)
+                    .unwrap_or_else(|| (i + 80).min(bytes.len()));
+                let mut end = bytes.len();
+                let mut j = i + 3;
+                while j + 1 < bytes.len() {
+                    if bytes[j] == 0x1b && bytes[j + 1] == b'\\' {
+                        end = j + 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                let gap = &bytes[last_end..i];
+                let shown = if gap.len() > 600 {
+                    format!(
+                        "{} ...[{} bytes]... {}",
+                        esc(&gap[..300]),
+                        gap.len() - 600,
+                        esc(&gap[gap.len() - 300..])
+                    )
+                } else {
+                    esc(gap)
+                };
+                println!("GAP [{last_end}..{i}] ({}b): {shown}", gap.len());
+                println!("APC @{i} len {}: {}", end - i, esc(&bytes[i..hdr_end.min(end)]));
+                last_end = end;
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        let tail = &bytes[last_end..(last_end + 600).min(bytes.len())];
+        println!(
+            "== trailing {} bytes after last APC ==\n{}",
+            bytes.len() - last_end,
+            esc(tail)
+        );
     }
 
     #[test]

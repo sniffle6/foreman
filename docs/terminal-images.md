@@ -44,6 +44,15 @@ if the install fails, foreman still runs, images just don't arrive.
   the 2025-02+ build does. If you update `assets/conpty/`, rerun the canary.
 - The canary test fails in `target/release/deps` unless the pair is copied
   there too (the app's auto-install only covers the exe's own directory).
+- **Synchronized updates stale the anchor.** Ratatui apps (codex) emit whole
+  frames inside `?2026h..?2026l`; vte buffers the block, so a cursor sample at
+  a graphics cut would read the PREVIOUS frame's cursor (codex parks it at the
+  composer caret — the pet rendered there until this was fixed).
+  `advance_scanned` force-flushes the parser (`stop_sync`) at each cut so the
+  Term reflects the stream up to the command. Regression test:
+  `sync_update_frame_anchors_at_the_pet_cup_not_the_stale_caret`; diagnostics:
+  `codex_pet_rx_capture` (headless codex, dumps raw rx, zero usage) +
+  `codex_pet_rx_analyze`, and `FOREMAN_RX_DUMP=<file>` on any session.
 - The image-only-clipboard Ctrl+V → `0x16` fallback is best-effort: it relies
   on egui delivering the Key::V event alongside an empty Paste event, which
   may vary by egui version/platform. The primary paste paths (Alt+V, handled
