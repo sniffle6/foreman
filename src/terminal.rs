@@ -357,6 +357,12 @@ pub struct Session {
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
     output_gen: u64,
+    // Grid-content version for the render galley cache. Distinct from
+    // output_gen (which means "child produced PTY bytes" and drives settle
+    // quiescence): content_gen bumps on EVERY grid-content mutation, including
+    // the inject_note banner that never rides pump(). Single source of truth
+    // for "the galley is stale" — bump it wherever self.term's grid changes.
+    content_gen: u64,
     // The Caret gate: decides which cell the painted caret rests at, de-jittering
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
@@ -667,6 +673,7 @@ impl Session {
             ink: InkScan::Ground,
             ready: false,
             output_gen: 0,
+            content_gen: 0,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
             textures: std::collections::HashMap::new(),
@@ -827,6 +834,7 @@ impl Session {
                 &mut greplies,
             );
             self.output_gen = self.output_gen.wrapping_add(1);
+            self.content_gen = self.content_gen.wrapping_add(1);
         }
         // Graphics replies (a=q probes etc.) go straight back to the app — NOT
         // via `resp`: that buffer's flush is what latches `ready` (the DSR
@@ -914,6 +922,7 @@ impl Session {
             };
             let bytes = format!("\x1b[2m{fitted}\x1b[0m\r\n").into_bytes();
             self.parser.advance(&mut self.term, &bytes);
+            self.content_gen = self.content_gen.wrapping_add(1);
         }
     }
 
@@ -1289,6 +1298,23 @@ mod tests {
 
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
+    }
+
+    #[test]
+    fn content_gen_bumps_on_injected_note() {
+        // The dispatch banner is written straight to the emulator (NOT the PTY),
+        // so it never rides pump(). The galley cache must still invalidate — this
+        // is the one grid mutation output_gen deliberately does not cover.
+        let ctx = egui::Context::default();
+        let mut s = Session::spawn(Shell::PowerShell, None, &[], ctx).expect("spawn");
+        let before = s.content_gen;
+        s.inject_note("dispatched: test");
+        s.resize(40, 10); // first resize flushes the pending note into the grid
+        assert!(
+            s.content_gen > before,
+            "note injection must bump content_gen (before={before}, after={})",
+            s.content_gen
+        );
     }
 
     #[test]
