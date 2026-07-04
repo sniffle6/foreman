@@ -297,6 +297,18 @@ impl InkScan {
     }
 }
 
+/// Cache key for a pane's rendered galley. All five inputs fully determine the
+/// laid-out text: content version, scroll position, grid dims, and font size.
+/// Selection/caret are NOT here — they paint as separate overlays.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GalleyKey {
+    content_gen: u64,
+    off: usize,
+    cols: usize,
+    rows: usize,
+    font_bits: u32,
+}
+
 pub struct Session {
     term: Term<Listener>,
     parser: Processor,
@@ -363,6 +375,10 @@ pub struct Session {
     // the inject_note banner that never rides pump(). Single source of truth
     // for "the galley is stale" — bump it wherever self.term's grid changes.
     content_gen: u64,
+    // Memoized text galley + the key it was built for. On a key hit show()
+    // re-clones the Arc (cheap) instead of re-walking the grid and rebuilding
+    // the LayoutJob. Invalidated implicitly by any key change.
+    galley_cache: Option<(GalleyKey, std::sync::Arc<egui::Galley>)>,
     // The Caret gate: decides which cell the painted caret rests at, de-jittering
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
@@ -674,6 +690,7 @@ impl Session {
             ready: false,
             output_gen: 0,
             content_gen: 0,
+            galley_cache: None,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
             textures: std::collections::HashMap::new(),
@@ -1172,36 +1189,52 @@ impl Session {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
 
-        // Text: one TextFormat append per style run, a newline after each row.
-        let rows = crate::frame::text_rows(self.term.grid(), &metrics);
-        let mut job = LayoutJob::default();
-        job.wrap.max_width = f32::INFINITY;
-        for runs in &rows {
-            for r in runs {
-                let st = r.style;
-                let line = |on: bool| {
-                    if on {
-                        egui::Stroke::new(1.0, st.fg)
-                    } else {
-                        egui::Stroke::NONE
+        // Text galley — rebuilt only when the content/scroll/dims/font key
+        // changes; otherwise a cheap Arc clone. Selection + caret are overlays
+        // (below), so they never invalidate this.
+        let key = GalleyKey {
+            content_gen: self.content_gen,
+            off: self.term.grid().display_offset(),
+            cols: self.cols,
+            rows: self.rows,
+            font_bits: font_px.to_bits(),
+        };
+        let galley = match &self.galley_cache {
+            Some((k, g)) if *k == key => g.clone(),
+            _ => {
+                let rows = crate::frame::text_rows(self.term.grid(), &metrics);
+                let mut job = LayoutJob::default();
+                job.wrap.max_width = f32::INFINITY;
+                for runs in &rows {
+                    for r in runs {
+                        let st = r.style;
+                        let line = |on: bool| {
+                            if on {
+                                egui::Stroke::new(1.0, st.fg)
+                            } else {
+                                egui::Stroke::NONE
+                            }
+                        };
+                        job.append(
+                            &r.text,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::monospace(font_px),
+                                color: st.fg,
+                                background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
+                                underline: line(st.underline),
+                                strikethrough: line(st.strikethrough),
+                                ..Default::default()
+                            },
+                        );
                     }
-                };
-                job.append(
-                    &r.text,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: egui::FontId::monospace(font_px),
-                        color: st.fg,
-                        background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
-                        underline: line(st.underline),
-                        strikethrough: line(st.strikethrough),
-                        ..Default::default()
-                    },
-                );
+                    job.append("\n", 0.0, egui::TextFormat::default());
+                }
+                let g = painter.layout_job(job);
+                self.galley_cache = Some((key, g.clone()));
+                g
             }
-            job.append("\n", 0.0, egui::TextFormat::default());
-        }
-        let galley = painter.layout_job(job);
+        };
         painter.galley(rect.min, galley, FG);
 
         // Kitty graphics overlay — images are pure overlay; the grid stays
