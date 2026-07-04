@@ -1158,17 +1158,16 @@ impl Session {
                 )
             });
 
-        // The frame's paint geometry + content (pure). show() only replays it here,
-        // deciding visibility (focus/hover) and the paint style (colors, radii).
-        let plan = crate::frame::plan(self.term.grid(), &metrics, sel, cursor_draw);
+        let overlays = crate::frame::overlays(self.term.grid(), &metrics, sel, cursor_draw);
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
 
         // Text: one TextFormat append per style run, a newline after each row.
+        let rows = crate::frame::text_rows(self.term.grid(), &metrics);
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
-        for runs in &plan.rows {
+        for runs in &rows {
             for r in runs {
                 let st = r.style;
                 let line = |on: bool| {
@@ -1263,19 +1262,19 @@ impl Session {
             }
         }
 
-        for r in &plan.highlights {
+        for r in &overlays.highlights {
             painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
         }
 
         // caret — the gate chose the cell; focus (`active`) gates whether we paint.
-        if active && let Some(r) = plan.caret {
+        if active && let Some(r) = overlays.caret {
             painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
         // history and the user is scrolled back or hovering the pane.
-        if let Some(r) = plan.thumb
-            && (plan.scrolled_back || resp.hovered())
+        if let Some(r) = overlays.thumb
+            && (overlays.scrolled_back || resp.hovered())
         {
             painter.rect_filled(r, egui::CornerRadius::same(2), SCROLL_THUMB);
         }

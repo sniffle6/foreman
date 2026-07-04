@@ -39,37 +39,16 @@ pub struct StyleRun {
     pub style: GlyphStyle,
 }
 
-/// Everything one frame paints for a pane, minus the visibility decisions
-/// (`active`/hover) and the paint style (colors, corner radii) that stay in
-/// `show()`.
-pub struct FramePlan {
-    /// Outer index = grid row; each row is its cells batched into style runs.
-    pub rows: Vec<Vec<StyleRun>>,
-    /// One rect per selected row-span (`metrics.span_rect`).
-    pub highlights: Vec<egui::Rect>,
-    /// The caret rect — `Some` iff the gate said `At`, the line is on-screen
-    /// (`line >= 0`), and the viewport is at the live bottom (`display_offset == 0`).
-    pub caret: Option<egui::Rect>,
-    /// The scrollback thumb rect — `Some` iff there is any history.
-    pub thumb: Option<egui::Rect>,
-    /// Whether the viewport is scrolled back into history (`display_offset > 0`).
-    pub scrolled_back: bool,
-}
-
-pub fn plan(
-    grid: &Grid<Cell>,
-    metrics: &CellMetrics,
-    selection: Option<SelRange>,
-    cursor: CursorDraw,
-) -> FramePlan {
+/// The per-cell text walk: batch consecutive cells sharing a GlyphStyle into
+/// one StyleRun per run, one Vec<StyleRun> per row. The expensive, content-only
+/// half of a frame — depends solely on grid content + geometry, so show()
+/// caches the galley built from it and only re-walks when content/scroll/dims/
+/// font change. Clamps to the grid's REAL size first (a stale index panics, and
+/// a panic across the winit callback aborts the process).
+pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>> {
     let off = grid.display_offset() as i32;
-    // Clamp to the grid's REAL size first (see the module docs): a stale index
-    // panics and a panic across the winit callback aborts the process. Both the
-    // text walk and the highlight builder walk these clamped dims.
     let ncols = metrics.cols().min(grid.columns());
     let nrows = metrics.rows().min(grid.screen_lines());
-
-    // Text: batch consecutive cells sharing a GlyphStyle into one StyleRun.
     let mut rows: Vec<Vec<StyleRun>> = Vec::with_capacity(nrows);
     for row in 0..nrows {
         let mut runs: Vec<StyleRun> = Vec::new();
@@ -102,9 +81,30 @@ pub fn plan(
         }
         rows.push(runs);
     }
+    rows
+}
 
-    // Highlights: one span per selected row, clamped to the grid (rows to nrows,
-    // columns to ncols) so a selection cached before a shrink can't ghost.
+/// The cheap, per-frame half: selection highlights (O(selected rows)), the
+/// gated caret rect (O(1)), and the scrollback thumb (O(1)). None touch the
+/// galley, so show() recomputes these every frame even on a cache hit — the
+/// caret settles over time (Caret gate) and selection changes on drag.
+pub struct Overlays {
+    pub highlights: Vec<egui::Rect>,
+    pub caret: Option<egui::Rect>,
+    pub thumb: Option<egui::Rect>,
+    pub scrolled_back: bool,
+}
+
+pub fn overlays(
+    grid: &Grid<Cell>,
+    metrics: &CellMetrics,
+    selection: Option<SelRange>,
+    cursor: CursorDraw,
+) -> Overlays {
+    let off = grid.display_offset() as i32;
+    let ncols = metrics.cols().min(grid.columns());
+    let nrows = metrics.rows().min(grid.screen_lines());
+
     let mut highlights = Vec::new();
     if let Some(sel) = &selection {
         for row in sel.start.0..=sel.end.0 {
@@ -125,7 +125,6 @@ pub fn plan(
         }
     }
 
-    // Caret: only on the live viewport (off == 0), only when on-screen (line >= 0).
     let caret = match cursor {
         CursorDraw::At { line, col, shape } if line >= 0 && off == 0 => Some(
             crate::geom::caret_rect(metrics.cell_rect(line as usize, col), shape),
@@ -133,7 +132,6 @@ pub fn plan(
         _ => None,
     };
 
-    // Thumb: exists whenever there is history; the cached row count matches today.
     let hist = grid.history_size();
     let thumb = if hist > 0 {
         Some(crate::geom::thumb_rect(
@@ -146,8 +144,7 @@ pub fn plan(
         None
     };
 
-    FramePlan {
-        rows,
+    Overlays {
         highlights,
         caret,
         thumb,
@@ -214,9 +211,9 @@ mod tests {
             10,
             10,
         );
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        assert_eq!(p.rows.len(), 2, "must walk only the grid's 2 rows");
-        for runs in &p.rows {
+        let rows = text_rows(term.grid(), &m);
+        assert_eq!(rows.len(), 2, "must walk only the grid's 2 rows");
+        for runs in &rows {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
             assert!(
                 text.chars().count() <= 4,
@@ -231,9 +228,9 @@ mod tests {
         // paints exactly what the pane shows, no more.
         let term = term_with(b"", 10, 10);
         let m = metrics(4, 2);
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        assert_eq!(p.rows.len(), 2);
-        for runs in &p.rows {
+        let rows = text_rows(term.grid(), &m);
+        assert_eq!(rows.len(), 2);
+        for runs in &rows {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
             assert!(text.chars().count() <= 4);
         }
@@ -249,12 +246,12 @@ mod tests {
             start: (0, 0),
             end: (8, 3),
         };
-        let p = plan(term.grid(), &m, Some(sel), CursorDraw::Hidden);
+        let o = overlays(term.grid(), &m, Some(sel), CursorDraw::Hidden);
         // Rows 0 and 1 only — nothing at or beyond nrows (2).
-        assert_eq!(p.highlights.len(), 2);
+        assert_eq!(o.highlights.len(), 2);
         let beyond = m.cell_rect(2, 0).min.y;
         assert!(
-            p.highlights.iter().all(|r| r.min.y < beyond),
+            o.highlights.iter().all(|r| r.min.y < beyond),
             "a highlight span landed at or beyond the grid's last row"
         );
     }
@@ -265,9 +262,9 @@ mod tests {
         // "ab" is plain, "cd" is underlined (ESC[4m): one run per style, in order.
         let term = term_with(b"ab\x1b[4mcd", 4, 1);
         let m = metrics(4, 1);
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        assert_eq!(p.rows.len(), 1);
-        let runs = &p.rows[0];
+        let rows = text_rows(term.grid(), &m);
+        assert_eq!(rows.len(), 1);
+        let runs = &rows[0];
         assert_eq!(runs.len(), 2, "a plain run then an underlined run");
         assert_eq!(runs[0].text, "ab");
         assert!(!runs[0].style.underline);
@@ -280,8 +277,8 @@ mod tests {
         // A fresh row is blank cells; the walk emits spaces, never a raw '\0'.
         let term = term_with(b"", 4, 1);
         let m = metrics(4, 1);
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        let text: String = p.rows[0].iter().map(|r| r.text.as_str()).collect();
+        let rows = text_rows(term.grid(), &m);
+        let text: String = rows[0].iter().map(|r| r.text.as_str()).collect();
         assert_eq!(text, "    ");
         assert!(!text.contains('\0'));
     }
@@ -299,9 +296,9 @@ mod tests {
             col: 0,
             shape: CursorShape::Block,
         };
-        let p = plan(term.grid(), &m, None, cursor);
-        assert!(p.caret.is_none(), "no caret while scrolled back");
-        assert!(p.scrolled_back);
+        let o = overlays(term.grid(), &m, None, cursor);
+        assert!(o.caret.is_none(), "no caret while scrolled back");
+        assert!(o.scrolled_back);
     }
 
     #[test]
@@ -315,10 +312,10 @@ mod tests {
             col: 2,
             shape: CursorShape::Block,
         };
-        let p = plan(term.grid(), &m, None, cursor);
+        let o = overlays(term.grid(), &m, None, cursor);
         let expect = crate::geom::caret_rect(m.cell_rect(1, 2), CursorShape::Block);
-        assert_eq!(p.caret, Some(expect));
-        assert!(!p.scrolled_back);
+        assert_eq!(o.caret, Some(expect));
+        assert!(!o.scrolled_back);
     }
 
     // ---- thumb ---------------------------------------------------------------
@@ -326,9 +323,9 @@ mod tests {
     fn thumb_none_without_history() {
         let term = term_with(b"hi", 4, 2);
         let m = metrics(4, 2);
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        assert!(p.thumb.is_none());
-        assert!(!p.scrolled_back);
+        let o = overlays(term.grid(), &m, None, CursorDraw::Hidden);
+        assert!(o.thumb.is_none());
+        assert!(!o.scrolled_back);
     }
 
     #[test]
@@ -337,9 +334,9 @@ mod tests {
         // (off == 0): the thumb exists, yet scrolled_back is false.
         let term = term_with(b"1\r\n2\r\n3\r\n4\r\n5\r\n6", 4, 2);
         let m = metrics(4, 2);
-        let p = plan(term.grid(), &m, None, CursorDraw::Hidden);
-        assert!(p.thumb.is_some());
-        assert!(!p.scrolled_back, "at the live bottom, not scrolled back");
+        let o = overlays(term.grid(), &m, None, CursorDraw::Hidden);
+        assert!(o.thumb.is_some());
+        assert!(!o.scrolled_back, "at the live bottom, not scrolled back");
     }
 
     // ---- multi-row selection -------------------------------------------------
@@ -353,13 +350,13 @@ mod tests {
             start: (0, 2),
             end: (2, 3),
         };
-        let p = plan(term.grid(), &m, Some(sel), CursorDraw::Hidden);
-        assert_eq!(p.highlights.len(), 3);
+        let o = overlays(term.grid(), &m, Some(sel), CursorDraw::Hidden);
+        assert_eq!(o.highlights.len(), 3);
         // first row: c0 = start col (2), c1 = last column (ncols-1 = 5)
-        assert_eq!(p.highlights[0], m.span_rect(0, 2, 5));
+        assert_eq!(o.highlights[0], m.span_rect(0, 2, 5));
         // middle row: full width 0..=5
-        assert_eq!(p.highlights[1], m.span_rect(1, 0, 5));
+        assert_eq!(o.highlights[1], m.span_rect(1, 0, 5));
         // last row: 0..=end col (3)
-        assert_eq!(p.highlights[2], m.span_rect(2, 0, 3));
+        assert_eq!(o.highlights[2], m.span_rect(2, 0, 3));
     }
 }
