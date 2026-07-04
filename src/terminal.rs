@@ -612,7 +612,11 @@ impl Session {
 
         let (tx, rx) = channel::<Vec<u8>>();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            // 64 KiB: read() returns whatever is already available (never waits
+            // to fill), so this only cuts chunk count under flood — fewer
+            // to_vec()/channel/repaint/parse-setup ops per MiB. No latency or
+            // ordering change for small output.
+            let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
