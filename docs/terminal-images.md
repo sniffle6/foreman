@@ -28,6 +28,16 @@ wezterm 2025-02) and drops `conpty.dll` + `OpenConsole.exe` beside foreman.exe
 at startup — portable-pty prefers a sideloaded pair over kernel32. Best-effort:
 if the install fails, foreman still runs, images just don't arrive.
 
+**Pin the pair to a good version.** The sideloaded host owns *every* PTY spawn,
+so a bad build slows the whole app. The WezTerm-vendored **1.22.2502** pair we
+shipped first added a fixed **~3.0s stall on every terminal spawn** (prompt in
+~3.3s vs ~0.25s on in-box conhost) — a host bug, not ours. Bumped to the
+official Microsoft redistributable **1.24.2605.12001**
+(`Microsoft.Windows.Console.ConPTY` on NuGet, x64, MIT, Microsoft-signed):
+spawn→prompt back to ~0.25s and the canary still passes. See
+`assets/conpty/README.md` for the exact source. Whenever you touch
+`assets/conpty/`, re-check BOTH: the canary (passthrough) *and* spawn time.
+
 ## Gotchas
 
 - The cursor does NOT advance after an image (v1): ratatui apps don't care;
@@ -42,6 +52,10 @@ if the install fails, foreman still runs, images just don't arrive.
   unscoped version double-injects on AltGr text.
 - WezTerm's *stable* (2024-02) conpty pair does NOT pass APC through — only
   the 2025-02+ build does. If you update `assets/conpty/`, rerun the canary.
+- ...but don't ship *just any* passthrough build: the 1.22.2502 pair passes the
+  canary yet stalls every spawn ~3s. Vendor from the Microsoft
+  `Microsoft.Windows.Console.ConPTY` NuGet redistributable (currently
+  1.24.2605.12001) and verify spawn time as well as the canary.
 - The canary test fails in `target/release/deps` unless the pair is copied
   there too (the app's auto-install only covers the exe's own directory).
 - **Synchronized updates stale the anchor.** Ratatui apps (codex) emit whole
