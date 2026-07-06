@@ -726,7 +726,10 @@ mod tests {
             ..Default::default()
         };
         let out = process_input(
-            &[key_ev(Key::E, mods(true, true, false)), Event::Text("€".into())],
+            &[
+                key_ev(Key::E, mods(true, true, false)),
+                Event::Text("€".into()),
+            ],
             live,
             TermMode::empty(),
             false,

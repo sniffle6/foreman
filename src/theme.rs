@@ -71,7 +71,7 @@ pub const SNAP_STROKE: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 // Sender colors are assigned by terminal-id hash — stable for a given id,
 // distinct enough across a small fleet.
 pub const CHAT_COLORS: [egui::Color32; 6] = [
-    egui::Color32::from_rgb(231, 169, 63),  // amber (also the human "you")
+    egui::Color32::from_rgb(231, 169, 63), // amber (also the human "you")
     egui::Color32::from_rgb(127, 179, 127), // green
     egui::Color32::from_rgb(111, 167, 199), // blue
     egui::Color32::from_rgb(199, 127, 174), // pink

@@ -2399,11 +2399,8 @@ impl WindowManager {
                 && self.windows[i].tabs.len() == 1
                 && !is_project;
             if bare {
-                ui.painter_at(scr.intersect(area)).rect_filled(
-                    scr,
-                    egui::CornerRadius::ZERO,
-                    BG,
-                );
+                ui.painter_at(scr.intersect(area))
+                    .rect_filled(scr, egui::CornerRadius::ZERO, BG);
                 let cresp = ui.interact(
                     scr,
                     base.with((id, "content")),
