@@ -46,6 +46,9 @@ struct App {
     /// Last time anything happened (input, PTY output, control msg). Drives the
     /// adaptive repaint cadence: fast while recently active, slow when idle.
     last_activity: Option<std::time::Instant>,
+    /// Set once the quit confirm was accepted, so the next viewport Close isn't
+    /// intercepted again.
+    force_quit: bool,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -62,6 +65,7 @@ impl App {
             settings: config::Settings::load(),
             font_dirty_at: None,
             last_activity: None,
+            force_quit: false,
         }
     }
 }
@@ -371,6 +375,21 @@ impl eframe::App for App {
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
         self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        // Quit guard: the window's title-bar X and Alt+F4 send
+        // ViewportCommand::Close straight to the viewport, bypassing every WM
+        // close funnel. Intercept while any subprocess is running and confirm
+        // first; the modal renders next frame via the desktop's show_modals.
+        if self.started
+            && !self.force_quit
+            && ctx.input(|i| i.viewport().close_requested())
+            && self.desktop.begin_quit_confirm()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.desktop.take_quit_confirmed() {
+            self.force_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Closing the last project quits the app — an empty desktop is a dead
         // end, and terminal emulators (tmux, Windows Terminal) exit with their
         // last session. `deserted` stays false while the dir picker or the

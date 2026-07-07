@@ -2093,6 +2093,38 @@ impl WindowManager {
         out
     }
 
+    /// Open the quit confirm if any subprocess is running anywhere; return true
+    /// when it did (caller should cancel the OS close). False → nothing running,
+    /// let the app quit.
+    pub fn begin_quit_confirm(&mut self) -> bool {
+        if self.pending_close.is_some() {
+            return true; // already confirming (a quit or a close)
+        }
+        let groups = self.project_groups();
+        if groups.is_empty() {
+            return false;
+        }
+        let total: usize = groups.iter().map(|g| g.procs.len()).sum();
+        let k = groups.len();
+        let view = crate::confirm::ConfirmClose::new(
+            "quit foreman?",
+            format!(
+                "{total} process{} still running across {k} project{}:",
+                if total == 1 { " is" } else { "es are" },
+                if k == 1 { "" } else { "s" },
+            ),
+            "quit anyway",
+            groups,
+        );
+        self.pending_close = Some(PendingClose { target: CloseTarget::Quit, view });
+        true
+    }
+
+    /// True once, when the quit confirm was accepted. Resets on read.
+    pub fn take_quit_confirmed(&mut self) -> bool {
+        std::mem::take(&mut self.quit_confirmed)
+    }
+
     /// Merge `src` window's tabs onto `dst` window's stack, then remove `src`.
     /// The merged tabs are appended; the first moved tab becomes active so the
     /// dropped window is what the user sees. No-op if either id is missing or
@@ -6726,5 +6758,20 @@ mod tests {
         let proj = build_confirm(true, vec![g("a", 2), g("b", 1)]);
         assert_eq!(proj.title(), "close this project?");
         assert!(proj.lead().contains("across 2 terminals"), "got: {}", proj.lead());
+    }
+
+    #[test]
+    fn begin_quit_confirm_is_false_when_nothing_runs() {
+        let mut m = WindowManager::new().as_desktop();
+        assert!(!m.begin_quit_confirm(), "empty desktop should let the app quit");
+        assert!(m.pending_close.is_none());
+    }
+
+    #[test]
+    fn take_quit_confirmed_reports_once_then_resets() {
+        let mut m = WindowManager::new().as_desktop();
+        m.quit_confirmed = true;
+        assert!(m.take_quit_confirmed());
+        assert!(!m.take_quit_confirmed(), "flag must reset after being taken");
     }
 }
