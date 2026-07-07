@@ -567,6 +567,24 @@ enum ChatOutcome {
     History(Vec<String>),
 }
 
+/// What a pending close would destroy once confirmed. Held in `pending_close`
+/// while the modal is up; consumed by `resolve_pending`.
+enum CloseTarget {
+    /// The active tab of window `id` (titlebar `x`, leader close).
+    ActiveTab(WinId),
+    /// A specific tab index of window `id` (tab-bar `x`).
+    Tab(WinId, usize),
+    /// The whole app: set by the app-quit guard (Task 5).
+    Quit,
+}
+
+/// An in-flight close awaiting confirmation: the doomed target plus the modal
+/// view rendering the running-process list.
+struct PendingClose {
+    target: CloseTarget,
+    view: crate::confirm::ConfirmClose,
+}
+
 pub struct WindowManager {
     pub windows: Vec<Win>,
     z: u64,
@@ -626,6 +644,13 @@ pub struct WindowManager {
     /// Pending `foreman send` settle entries, serviced each frame by
     /// `advance_settles` so the GUI never blocks waiting for a terminal to quiet.
     pending_settles: Vec<PendingSettle>,
+    /// When `Some`, this manager's close-confirm modal is open: a close (or the
+    /// app quit) is waiting on the user. Holds the target and the modal view.
+    /// Only one may be pending at a time, which also holds the app alive.
+    pending_close: Option<PendingClose>,
+    /// Set true (on the desktop) once a quit confirm is accepted, so the app-quit
+    /// guard in main.rs can drive the actual OS close. Inert until Task 5 wires it.
+    quit_confirmed: bool,
 }
 
 impl WindowManager {
@@ -653,6 +678,8 @@ impl WindowManager {
             zoomed: None,
             drag_from_tree: None,
             pending_settles: Vec::new(),
+            pending_close: None,
+            quit_confirmed: false,
         }
     }
 
@@ -1762,7 +1789,7 @@ impl WindowManager {
             }
             Command::CloseProject => {
                 if let Some(id) = self.focused {
-                    self.close_active_tab(id);
+                    self.request_close_active_tab(id);
                 }
             }
             Command::LastProject => self.toggle_last(),
@@ -1787,7 +1814,7 @@ impl WindowManager {
                         }
                         Command::CloseTerm => {
                             if let Some(id) = child.focused {
-                                child.close_active_tab(id);
+                                child.request_close_active_tab(id);
                             }
                         }
                         Command::Rename => child.begin_rename(),
@@ -1884,11 +1911,15 @@ impl WindowManager {
 
     /// True when this manager has no windows left and no modal is open (the
     /// picker could still create a project; an open settings editor must not
-    /// be yanked out from under the user). On the desktop this means "closing
-    /// the last project": `main.rs` quits the app when it turns true, the way
-    /// a terminal emulator exits with its last tab.
+    /// be yanked out from under the user; a pending close-confirm must hold the
+    /// app alive until answered). On the desktop this means "closing the last
+    /// project": `main.rs` quits the app when it turns true, the way a terminal
+    /// emulator exits with its last tab.
     pub fn deserted(&self) -> bool {
-        self.windows.is_empty() && self.picker.is_none() && self.settings.is_none()
+        self.windows.is_empty()
+            && self.picker.is_none()
+            && self.settings.is_none()
+            && self.pending_close.is_none()
     }
 
     /// Close one tab: the given tab index of window `id`. Removing the last tab
@@ -1920,6 +1951,68 @@ impl WindowManager {
         let active = self.windows.iter().find(|w| w.id == id).map(|w| w.active);
         if let Some(a) = active {
             self.close_tab(id, a);
+        }
+    }
+
+    /// Close the active tab of `id`, or open the confirm modal if it has running
+    /// subprocesses. No-op guard-wise if a confirm is already open.
+    fn request_close_active_tab(&mut self, id: WinId) {
+        if self.pending_close.is_some() {
+            return;
+        }
+        let Some(w) = self.windows.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let tab = &w.tabs[w.active];
+        let is_project = matches!(tab.content, Content::Project(_));
+        let groups = groups_in_tab(tab);
+        if groups.is_empty() {
+            self.close_active_tab(id);
+            return;
+        }
+        self.pending_close = Some(PendingClose {
+            target: CloseTarget::ActiveTab(id),
+            view: build_confirm(is_project, groups),
+        });
+    }
+
+    /// Same, for a specific tab index (tab-bar X).
+    fn request_close_tab(&mut self, id: WinId, idx: usize) {
+        if self.pending_close.is_some() {
+            return;
+        }
+        let Some(w) = self.windows.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let Some(tab) = w.tabs.get(idx) else {
+            return;
+        };
+        let is_project = matches!(tab.content, Content::Project(_));
+        let groups = groups_in_tab(tab);
+        if groups.is_empty() {
+            self.close_tab(id, idx);
+            return;
+        }
+        self.pending_close = Some(PendingClose {
+            target: CloseTarget::Tab(id, idx),
+            view: build_confirm(is_project, groups),
+        });
+    }
+
+    /// Apply a modal outcome to the pending close. Pure decision, split from the
+    /// egui render so it is unit-tested without a UI context.
+    fn resolve_pending(&mut self, outcome: crate::confirm::ConfirmOutcome) {
+        let Some(pending) = self.pending_close.take() else {
+            return;
+        };
+        match outcome {
+            crate::confirm::ConfirmOutcome::Pending => self.pending_close = Some(pending),
+            crate::confirm::ConfirmOutcome::Cancelled => {}
+            crate::confirm::ConfirmOutcome::Confirmed => match pending.target {
+                CloseTarget::ActiveTab(id) => self.close_active_tab(id),
+                CloseTarget::Tab(id, idx) => self.close_tab(id, idx),
+                CloseTarget::Quit => self.quit_confirmed = true,
+            },
         }
     }
 
@@ -3463,7 +3556,7 @@ impl WindowManager {
                 }
                 // The titlebar close control closes the *active tab* — which closes
                 // the whole window only when it was the last tab.
-                Act::Close(id) => self.close_active_tab(id),
+                Act::Close(id) => self.request_close_active_tab(id),
                 Act::SetTab(id, idx) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         if idx < w.tabs.len() {
@@ -3472,7 +3565,7 @@ impl WindowManager {
                     }
                     self.focus(id);
                 }
-                Act::CloseTab(id, idx) => self.close_tab(id, idx),
+                Act::CloseTab(id, idx) => self.request_close_tab(id, idx),
                 Act::Merge { src, dst } => self.merge_windows(src, dst),
                 Act::Untab { id, idx, pos, grab } => {
                     if let Some(new_id) = self.untab(id, idx, pos) {
@@ -3528,6 +3621,16 @@ impl WindowManager {
                 }
                 SettingsOutcome::Pending => self.settings = Some(settings),
             }
+            self.swallow_input(ui);
+        }
+
+        // --- close-confirm modal (runs at every level: a terminal close renders
+        // over its project's rect, a project/quit close over the desktop). The
+        // decision lives in `resolve_pending`; this only renders + routes it.
+        if let Some(mut pending) = self.pending_close.take() {
+            let outcome = pending.view.show(ui, area);
+            self.pending_close = Some(pending);
+            self.resolve_pending(outcome);
             self.swallow_input(ui);
         }
 
@@ -4082,6 +4185,37 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
         }
         Content::Project(wm) => wm.terminal_groups(),
         Content::Chat(_) => Vec::new(),
+    }
+}
+
+/// Compose the confirm copy for a pane/project close from the gathered groups.
+fn build_confirm(
+    is_project: bool,
+    groups: Vec<crate::confirm::ProcGroup>,
+) -> crate::confirm::ConfirmClose {
+    let total: usize = groups.iter().map(|g| g.procs.len()).sum();
+    if is_project {
+        let k = groups.len();
+        crate::confirm::ConfirmClose::new(
+            "close this project?",
+            format!(
+                "{total} process{} still running across {k} terminal{}:",
+                if total == 1 { " is" } else { "es are" },
+                if k == 1 { "" } else { "s" },
+            ),
+            "close anyway",
+            groups,
+        )
+    } else {
+        crate::confirm::ConfirmClose::new(
+            "close this terminal?",
+            format!(
+                "{total} process{} still running here:",
+                if total == 1 { " is" } else { "es are" },
+            ),
+            "close anyway",
+            groups,
+        )
     }
 }
 
@@ -6538,5 +6672,59 @@ mod tests {
             (p[0].1.width() - (1000.0 - 16.0)).abs() < 0.5,
             "b expanded to full inner width"
         );
+    }
+
+    #[test]
+    fn resolve_confirmed_closes_the_target_window() {
+        let mut m = WindowManager::new();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let child = WindowManager::new();
+        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        m.pending_close = Some(PendingClose {
+            target: CloseTarget::ActiveTab(7),
+            view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
+        });
+        m.resolve_pending(crate::confirm::ConfirmOutcome::Confirmed);
+        assert!(m.windows.iter().all(|w| w.id != 7), "window not closed on confirm");
+        assert!(m.pending_close.is_none());
+    }
+
+    #[test]
+    fn resolve_cancelled_keeps_the_window() {
+        let mut m = WindowManager::new();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let child = WindowManager::new();
+        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        m.pending_close = Some(PendingClose {
+            target: CloseTarget::ActiveTab(7),
+            view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
+        });
+        m.resolve_pending(crate::confirm::ConfirmOutcome::Cancelled);
+        assert!(m.windows.iter().any(|w| w.id == 7), "window closed on cancel");
+        assert!(m.pending_close.is_none());
+    }
+
+    #[test]
+    fn deserted_is_false_while_a_close_is_pending() {
+        let mut m = WindowManager::new().as_desktop();
+        m.pending_close = Some(PendingClose {
+            target: CloseTarget::Quit,
+            view: crate::confirm::ConfirmClose::new("quit foreman?", "l", "quit anyway", vec![]),
+        });
+        assert!(!m.deserted(), "a pending confirm must hold the app alive");
+    }
+
+    #[test]
+    fn build_confirm_wording_terminal_vs_project() {
+        let g = |label: &str, n: usize| crate::confirm::ProcGroup {
+            label: label.into(),
+            scope: None,
+            procs: (0..n).map(|i| crate::proc::ProcInfo { pid: i as u32, name: "x.exe".into() }).collect(),
+        };
+        let term = build_confirm(false, vec![g("claude", 1)]);
+        assert_eq!(term.title(), "close this terminal?");
+        let proj = build_confirm(true, vec![g("a", 2), g("b", 1)]);
+        assert_eq!(proj.title(), "close this project?");
+        assert!(proj.lead().contains("across 2 terminals"), "got: {}", proj.lead());
     }
 }

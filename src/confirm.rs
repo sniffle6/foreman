@@ -47,6 +47,16 @@ impl ConfirmClose {
         self.groups.iter().map(|g| g.procs.len()).sum()
     }
 
+    /// The modal heading (read-only; used by the wm close-gate tests).
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The lead line under the heading (read-only; used by the wm close-gate tests).
+    pub fn lead(&self) -> &str {
+        &self.lead
+    }
+
     /// True once there is more than one group — render terminal-name headers and
     /// indent the processes under them. A single group renders flat.
     fn grouped(&self) -> bool {
