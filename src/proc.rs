@@ -91,7 +91,10 @@ fn collect_descendants(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
         .filter(|r| r.pid != root)
         .filter(|r| descends_from(table, r.pid, root))
         .filter(|r| !HOST_PLUMBING.contains(&r.name.to_ascii_lowercase().as_str()))
-        .map(|r| ProcInfo { pid: r.pid, name: r.name.clone() })
+        .map(|r| ProcInfo {
+            pid: r.pid,
+            name: r.name.clone(),
+        })
         .collect()
 }
 
@@ -298,13 +301,20 @@ mod tests {
         ];
         let procs = collect_descendants(&t, 100);
         let names: Vec<&str> = procs.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["node.exe"], "host plumbing leaked into the list");
+        assert_eq!(
+            names,
+            vec!["node.exe"],
+            "host plumbing leaked into the list"
+        );
     }
 
     #[test]
     fn descendants_never_include_the_shell_itself() {
         let t = vec![row(100, 1, "powershell.exe", &["powershell"])];
-        assert!(collect_descendants(&t, 100).is_empty(), "idle shell should have no descendants");
+        assert!(
+            collect_descendants(&t, 100).is_empty(),
+            "idle shell should have no descendants"
+        );
     }
 
     #[test]
@@ -314,6 +324,9 @@ mod tests {
             row(200, 100, "claude.exe", &["claude"]),
             row(500, 1, "powershell.exe", &["powershell"]),
         ];
-        assert!(collect_descendants(&t, 500).is_empty(), "another shell's child leaked in");
+        assert!(
+            collect_descendants(&t, 500).is_empty(),
+            "another shell's child leaked in"
+        );
     }
 }
