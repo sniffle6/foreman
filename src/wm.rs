@@ -1980,10 +1980,22 @@ impl WindowManager {
         })
     }
 
+    /// True while an overlay that owns the keyboard is up: an existing
+    /// close-confirm (app-wide via `app_modal`), the dir picker, the settings
+    /// editor, or an in-progress rename. A new close-confirm must not open on top
+    /// of one — otherwise two overlays render at once and fight over one keypress.
+    fn overlay_blocks_close(&self) -> bool {
+        self.app_modal
+            || self.pending_close.is_some()
+            || self.picker.is_some()
+            || self.settings.is_some()
+            || self.renaming.is_some()
+    }
+
     /// Close the active tab of `id`, or open the confirm modal if it has running
-    /// subprocesses. No-op if any confirm is already open anywhere in the app.
+    /// subprocesses. No-op if any overlay is already up.
     fn request_close_active_tab(&mut self, id: WinId) {
-        if self.app_modal || self.pending_close.is_some() {
+        if self.overlay_blocks_close() {
             return;
         }
         let Some(w) = self.windows.iter().find(|w| w.id == id) else {
@@ -2004,7 +2016,7 @@ impl WindowManager {
 
     /// Same, for a specific tab index (tab-bar X).
     fn request_close_tab(&mut self, id: WinId, idx: usize) {
-        if self.app_modal || self.pending_close.is_some() {
+        if self.overlay_blocks_close() {
             return;
         }
         let Some(w) = self.windows.iter().find(|w| w.id == id) else {
@@ -2049,8 +2061,12 @@ impl WindowManager {
         for w in &self.windows {
             for t in &w.tabs {
                 if let Content::Terminal(s) = &t.content {
-                    if let Some(pid) = s.root_pid() {
-                        out.push((t.title.clone(), pid));
+                    // Skip a shell we've already seen exit: its root_pid can be
+                    // recycled by the OS, which would list unrelated processes.
+                    if !s.has_exited() {
+                        if let Some(pid) = s.root_pid() {
+                            out.push((t.title.clone(), pid));
+                        }
                     }
                 }
             }
@@ -2074,43 +2090,26 @@ impl WindowManager {
             .collect()
     }
 
-    /// Flat aggregate of every running subprocess anywhere in this manager
-    /// (recurses into nested projects). The cheap "is anything running?" check.
-    fn all_procs(&self) -> Vec<crate::proc::ProcInfo> {
-        let mut out = Vec::new();
-        for w in &self.windows {
-            for t in &w.tabs {
-                match &t.content {
-                    Content::Terminal(s) => {
-                        if let Some(pid) = s.root_pid() {
-                            out.extend(crate::proc::top_children(pid));
-                        }
-                    }
-                    Content::Project(wm) => out.extend(wm.all_procs()),
-                    Content::Chat(_) => {}
-                }
-            }
-        }
-        out
-    }
-
     /// One group per project tab in THIS (desktop) manager that has running
-    /// processes: label = project title, scope = "N terminals", procs = aggregate.
-    /// Used by the quit guard.
+    /// processes: label = project title, scope = "N terminals", procs = the
+    /// project's per-terminal rows flattened. Used by the quit guard. Like
+    /// `groups_in_tab`'s project path, this reads the project's *direct* terminals
+    /// (nested projects can't occur today — projects are only created at the
+    /// desktop).
     fn project_groups(&self) -> Vec<crate::confirm::ProcGroup> {
         let mut out = Vec::new();
         for w in &self.windows {
             for t in &w.tabs {
                 if let Content::Project(wm) = &t.content {
-                    let procs = wm.all_procs();
-                    if procs.is_empty() {
+                    // One scan drives BOTH the rows and the "N terminals" count, so
+                    // the count can never disagree with the list shown.
+                    let inner = wm.terminal_groups();
+                    if inner.is_empty() {
                         continue;
                     }
-                    let n = wm
-                        .terminal_shells()
-                        .iter()
-                        .filter(|(_, pid)| !crate::proc::top_children(*pid).is_empty())
-                        .count();
+                    let n = inner.len();
+                    let procs: Vec<crate::proc::ProcInfo> =
+                        inner.into_iter().flat_map(|g| g.procs).collect();
                     out.push(crate::confirm::ProcGroup {
                         label: t.title.clone(),
                         scope: Some(format!("{n} terminal{}", if n == 1 { "" } else { "s" })),
@@ -2126,8 +2125,8 @@ impl WindowManager {
     /// when it did (caller should cancel the OS close). False → nothing running,
     /// let the app quit.
     pub fn begin_quit_confirm(&mut self) -> bool {
-        if self.app_modal || self.pending_close.is_some() {
-            return true; // already confirming somewhere (a quit or a close)
+        if self.overlay_blocks_close() {
+            return true; // an overlay is already up (a confirm, picker, or settings)
         }
         let groups = self.project_groups();
         if groups.is_empty() {
@@ -3618,6 +3617,16 @@ impl WindowManager {
         base: egui::Id,
         ctx: &egui::Context,
     ) {
+        // A modal overlay (a close-confirm anywhere via `app_modal`, the dir
+        // picker, or the settings editor) is modal for the MOUSE too, not just the
+        // keyboard: drop every background window act while one is up. Otherwise the
+        // user could retarget the doomed tab (switch/merge → confirm kills the
+        // wrong one), hide the dialog (minimize → app-wide keyboard freeze with no
+        // visible modal), or stack a second overlay on top. These fields still hold
+        // the pre-open state the frame a modal OPENS, so that opening act applies.
+        if self.app_modal || self.picker.is_some() || self.settings.is_some() {
+            return;
+        }
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
@@ -4252,10 +4261,15 @@ fn dispatch_banner(argv: &[String]) -> String {
 fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
     match &tab.content {
         Content::Terminal(s) => {
-            let procs = s
-                .root_pid()
-                .map(crate::proc::top_children)
-                .unwrap_or_default();
+            // A dead shell's root_pid may be recycled — don't scan it (see
+            // terminal_shells). An exited terminal has nothing left to warn about.
+            let procs = if s.has_exited() {
+                Vec::new()
+            } else {
+                s.root_pid()
+                    .map(crate::proc::top_children)
+                    .unwrap_or_default()
+            };
             if procs.is_empty() {
                 Vec::new()
             } else {
@@ -4816,7 +4830,8 @@ mod tests {
         m.push_win(1, "idle".into(), r, Content::Terminal(s));
         // An idle cmd.exe has no non-plumbing descendants → no group to warn about.
         assert!(m.terminal_groups().is_empty());
-        assert!(m.all_procs().is_empty());
+        // groups_in_tab agrees: the idle terminal contributes nothing.
+        assert!(groups_in_tab(&m.windows[0].tabs[0]).is_empty());
     }
 
     #[test]
@@ -6925,6 +6940,78 @@ mod tests {
         assert!(
             m.windows.iter().any(|w| w.id == 7),
             "the window must not close either while a dialog is up"
+        );
+    }
+
+    #[test]
+    fn a_modal_freezes_background_mouse_acts() {
+        // While a confirm is up, clicking a sibling tab / dragging a merge / hitting
+        // minimize must NOT take effect — otherwise Confirm could close the wrong
+        // tab, or a minimize could hide the modal while the whole app stays frozen.
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(
+            1,
+            "a".into(),
+            r,
+            Content::Project(Box::new(WindowManager::new())),
+        );
+        m.push_win(
+            2,
+            "b".into(),
+            r,
+            Content::Project(Box::new(WindowManager::new())),
+        );
+        m.focus(1);
+        m.app_modal = true;
+        m.apply_acts(
+            vec![Act::Focus(2), Act::Min(1)],
+            egui::vec2(0.0, 0.0),
+            egui::Id::new("t"),
+            &ctx,
+        );
+        assert_eq!(
+            m.focused,
+            Some(1),
+            "focus change must be dropped under a modal"
+        );
+        assert!(
+            !m.windows.iter().find(|w| w.id == 1).unwrap().minimized,
+            "minimize must be dropped under a modal (no soft-lock)"
+        );
+        // Once the modal clears, the same act applies again.
+        m.app_modal = false;
+        m.apply_acts(
+            vec![Act::Focus(2)],
+            egui::vec2(0.0, 0.0),
+            egui::Id::new("t"),
+            &ctx,
+        );
+        assert_eq!(m.focused, Some(2));
+    }
+
+    #[test]
+    fn a_close_confirm_wont_open_over_another_overlay() {
+        // A rename (like the picker/settings) owns the keyboard — a close-confirm
+        // must not stack on top, or the two overlays fight over one Enter/Esc.
+        let mut m = WindowManager::new();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(
+            7,
+            "proj".into(),
+            r,
+            Content::Project(Box::new(WindowManager::new())),
+        );
+        m.renaming = Some(7);
+        m.request_close_active_tab(7);
+        assert!(
+            m.pending_close.is_none(),
+            "must not stack a confirm over a rename"
+        );
+        assert!(
+            m.windows.iter().any(|w| w.id == 7),
+            "and must not close the window"
         );
     }
 }

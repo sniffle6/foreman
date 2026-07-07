@@ -743,6 +743,14 @@ impl Session {
         self.exit
     }
 
+    /// Cheap `&self` read of the exit latch (set by `exited`/`exit_to_note`,
+    /// which the window manager polls every frame). True once the shell has been
+    /// observed to exit — used to skip the close-confirm process scan for a dead
+    /// terminal whose `root_pid` the OS may since have recycled.
+    pub fn has_exited(&self) -> bool {
+        self.exit.is_some()
+    }
+
     /// Like `exited`, but reports the exit exactly once — for one-shot
     /// reactions like stamping the window title.
     pub fn exit_to_note(&mut self) -> Option<u32> {
