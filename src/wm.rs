@@ -1923,6 +1923,83 @@ impl WindowManager {
         }
     }
 
+    /// (title, root_pid) for every terminal tab in THIS manager whose shell
+    /// reported a pid. Pure tree read — the testable surface for grouping.
+    fn terminal_shells(&self) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for w in &self.windows {
+            for t in &w.tabs {
+                if let Content::Terminal(s) = &t.content {
+                    if let Some(pid) = s.root_pid() {
+                        out.push((t.title.clone(), pid));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One group per terminal tab in THIS manager that has running processes
+    /// (label = the tab title, empties skipped). Used for project-close.
+    fn terminal_groups(&self) -> Vec<crate::confirm::ProcGroup> {
+        self.terminal_shells()
+            .into_iter()
+            .filter_map(|(label, pid)| {
+                let procs = crate::proc::descendants(pid);
+                (!procs.is_empty())
+                    .then(|| crate::confirm::ProcGroup { label, scope: None, procs })
+            })
+            .collect()
+    }
+
+    /// Flat aggregate of every running subprocess anywhere in this manager
+    /// (recurses into nested projects). The cheap "is anything running?" check.
+    fn all_procs(&self) -> Vec<crate::proc::ProcInfo> {
+        let mut out = Vec::new();
+        for w in &self.windows {
+            for t in &w.tabs {
+                match &t.content {
+                    Content::Terminal(s) => {
+                        if let Some(pid) = s.root_pid() {
+                            out.extend(crate::proc::descendants(pid));
+                        }
+                    }
+                    Content::Project(wm) => out.extend(wm.all_procs()),
+                    Content::Chat(_) => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// One group per project tab in THIS (desktop) manager that has running
+    /// processes: label = project title, scope = "N terminals", procs = aggregate.
+    /// Used by the quit guard.
+    fn project_groups(&self) -> Vec<crate::confirm::ProcGroup> {
+        let mut out = Vec::new();
+        for w in &self.windows {
+            for t in &w.tabs {
+                if let Content::Project(wm) = &t.content {
+                    let procs = wm.all_procs();
+                    if procs.is_empty() {
+                        continue;
+                    }
+                    let n = wm
+                        .terminal_shells()
+                        .iter()
+                        .filter(|(_, pid)| !crate::proc::descendants(*pid).is_empty())
+                        .count();
+                    out.push(crate::confirm::ProcGroup {
+                        label: t.title.clone(),
+                        scope: Some(format!("{n} terminal{}", if n == 1 { "" } else { "s" })),
+                        procs,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Merge `src` window's tabs onto `dst` window's stack, then remove `src`.
     /// The merged tabs are appended; the first moved tab becomes active so the
     /// dropped window is what the user sees. No-op if either id is missing or
@@ -3986,6 +4063,28 @@ fn dispatch_banner(argv: &[String]) -> String {
     }
 }
 
+
+/// Processes that closing this one tab would kill: a terminal → at most its own
+/// group; a project → one group per terminal inside it; chat → none.
+fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
+    match &tab.content {
+        Content::Terminal(s) => {
+            let procs = s.root_pid().map(crate::proc::descendants).unwrap_or_default();
+            if procs.is_empty() {
+                Vec::new()
+            } else {
+                vec![crate::confirm::ProcGroup {
+                    label: tab.title.clone(),
+                    scope: None,
+                    procs,
+                }]
+            }
+        }
+        Content::Project(wm) => wm.terminal_groups(),
+        Content::Chat(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4445,6 +4544,37 @@ mod tests {
             m.focused = None;
         }
         m
+    }
+
+    #[test]
+    fn terminal_shells_lists_one_pair_per_terminal_tab() {
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        let env: Vec<(String, String)> = vec![];
+        let s1 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
+        let s2 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(1, "one".into(), r, Content::Terminal(s1));
+        m.push_win(2, "two".into(), r, Content::Terminal(s2));
+
+        let shells = m.terminal_shells();
+        assert_eq!(shells.len(), 2);
+        let titles: Vec<&str> = shells.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(titles.contains(&"one") && titles.contains(&"two"));
+        assert!(shells.iter().all(|(_, pid)| *pid != 0));
+    }
+
+    #[test]
+    fn idle_terminals_produce_no_groups() {
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        let env: Vec<(String, String)> = vec![];
+        let s = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(1, "idle".into(), r, Content::Terminal(s));
+        // An idle cmd.exe has no non-plumbing descendants → no group to warn about.
+        assert!(m.terminal_groups().is_empty());
+        assert!(m.all_procs().is_empty());
     }
 
     #[test]

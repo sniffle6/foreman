@@ -712,6 +712,12 @@ impl Session {
         self.term_id
     }
 
+    /// The shell's own process id, if the spawn reported one. Root of the
+    /// descendant scan the close-confirm walks.
+    pub fn root_pid(&self) -> Option<u32> {
+        self.root_pid
+    }
+
     /// Stamp the stable Member id. The window manager calls this once, right
     /// after spawn, with the same id it baked into FOREMAN_TERMINAL_ID.
     pub fn set_term_id(&mut self, id: u64) {
