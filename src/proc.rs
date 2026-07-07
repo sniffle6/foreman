@@ -73,41 +73,62 @@ fn detect_agent(table: &[ProcRow], root_pid: u32) -> Option<IconKind> {
     })
 }
 
-/// One live descendant process, for the close-confirm list. Plain data so the
-/// selection logic is unit-tested with synthetic tables.
+/// One top-level process the shell launched, for the close-confirm list. Plain
+/// data so the selection logic is unit-tested with synthetic tables.
 pub struct ProcInfo {
     pub pid: u32,
     pub name: String,
+    /// How many further processes sit under this one (its own subtree, minus
+    /// console-host plumbing). Rendered as "(+n)"; closing kills them too.
+    pub background: usize,
 }
 
 /// Console-host plumbing ConPTY spawns around a shell — never real user work.
 const HOST_PLUMBING: &[&str] = &["openconsole.exe", "conhost.exe"];
 
-/// Pure: descendants of `root` worth warning about before a kill — every process
-/// under `root` except `root` itself and console-host plumbing. The test surface.
-fn collect_descendants(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
+fn is_plumbing(name: &str) -> bool {
+    HOST_PLUMBING.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Count every process under `root` (any depth), minus `root` and console-host
+/// plumbing. The rollup shown as "(+n)" next to a top-level process.
+fn count_descendants(table: &[ProcRow], root: u32) -> usize {
     table
         .iter()
         .filter(|r| r.pid != root)
+        .filter(|r| !is_plumbing(&r.name))
         .filter(|r| descends_from(table, r.pid, root))
-        .filter(|r| !HOST_PLUMBING.contains(&r.name.to_ascii_lowercase().as_str()))
+        .count()
+}
+
+/// Pure: the shell's direct children worth warning about — what the user
+/// actually launched (an agent, a build, a REPL, a server) — each carrying a
+/// count of its own subtree. Console-host plumbing is skipped. The test surface.
+/// An agent that spawns a fleet of MCP servers shows as one row with a big
+/// rollup, not one row per helper.
+fn collect_top_level(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
+    table
+        .iter()
+        .filter(|r| r.parent == root)
+        .filter(|r| !is_plumbing(&r.name))
         .map(|r| ProcInfo {
             pid: r.pid,
             name: r.name.clone(),
+            background: count_descendants(table, r.pid),
         })
         .collect()
 }
 
-/// Live descendants of `root_pid`. Throttled through the same scanner as
-/// `agent_for`; returns an empty list for an idle shell.
-pub fn descendants(root_pid: u32) -> Vec<ProcInfo> {
+/// The shell's live top-level children (with subtree rollups). Throttled through
+/// the same scanner as `agent_for`; empty for an idle shell.
+pub fn top_children(root_pid: u32) -> Vec<ProcInfo> {
     SCANNER.with(|s| {
         let mut s = s.borrow_mut();
         let stale = s.last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
         if stale {
             s.refresh();
         }
-        collect_descendants(&s.table, root_pid)
+        collect_top_level(&s.table, root_pid)
     })
 }
 
@@ -269,63 +290,71 @@ mod tests {
     }
 
     #[test]
-    fn descendants_lists_direct_child() {
+    fn top_level_lists_the_direct_child() {
         let t = vec![
             row(100, 1, "powershell.exe", &["powershell"]),
             row(200, 100, "claude.exe", &["claude"]),
         ];
-        let d = collect_descendants(&t, 100);
+        let d = collect_top_level(&t, 100);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].pid, 200);
         assert_eq!(d[0].name, "claude.exe");
+        assert_eq!(d[0].background, 0, "a leaf child has no subtree");
     }
 
     #[test]
-    fn descendants_lists_grandchild() {
+    fn top_level_rolls_grandchildren_into_the_child() {
+        // shell -> claude -> {rg, node}: one top-level row (claude), rollup +2.
         let t = vec![
             row(100, 1, "powershell.exe", &["powershell"]),
             row(200, 100, "claude.exe", &["claude"]),
             row(300, 200, "rg.exe", &["rg", "foo"]),
+            row(400, 200, "node.exe", &["node"]),
         ];
-        let pids: Vec<u32> = collect_descendants(&t, 100).iter().map(|p| p.pid).collect();
-        assert!(pids.contains(&300), "grandchild not listed");
+        let d = collect_top_level(&t, 100);
+        assert_eq!(d.len(), 1, "only the direct child is a top-level row");
+        assert_eq!(d[0].name, "claude.exe");
+        assert_eq!(d[0].background, 2, "both grandchildren rolled up");
     }
 
     #[test]
-    fn descendants_exclude_console_host_plumbing() {
+    fn top_level_excludes_console_host_plumbing() {
+        // plumbing is skipped as a row and left out of the rollup count.
         let t = vec![
             row(100, 1, "powershell.exe", &["powershell"]),
             row(200, 100, "OpenConsole.exe", &["OpenConsole"]),
             row(210, 100, "conhost.exe", &["conhost"]),
             row(300, 100, "node.exe", &["node"]),
+            row(310, 300, "conhost.exe", &["conhost"]),
         ];
-        let procs = collect_descendants(&t, 100);
-        let names: Vec<&str> = procs.iter().map(|p| p.name.as_str()).collect();
+        let d = collect_top_level(&t, 100);
+        let names: Vec<&str> = d.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["node.exe"],
             "host plumbing leaked into the list"
         );
+        assert_eq!(d[0].background, 0, "plumbing under node was not counted");
     }
 
     #[test]
-    fn descendants_never_include_the_shell_itself() {
+    fn top_level_is_empty_for_an_idle_shell() {
         let t = vec![row(100, 1, "powershell.exe", &["powershell"])];
         assert!(
-            collect_descendants(&t, 100).is_empty(),
-            "idle shell should have no descendants"
+            collect_top_level(&t, 100).is_empty(),
+            "an idle shell has no children to warn about"
         );
     }
 
     #[test]
-    fn descendants_do_not_leak_across_shells() {
+    fn top_level_does_not_leak_across_shells() {
         let t = vec![
             row(100, 1, "powershell.exe", &["powershell"]),
             row(200, 100, "claude.exe", &["claude"]),
             row(500, 1, "powershell.exe", &["powershell"]),
         ];
         assert!(
-            collect_descendants(&t, 500).is_empty(),
+            collect_top_level(&t, 500).is_empty(),
             "another shell's child leaked in"
         );
     }

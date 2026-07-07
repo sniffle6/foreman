@@ -101,7 +101,8 @@ impl ConfirmClose {
                     .show(ui, |ui| {
                         for g in &self.groups {
                             if grouped {
-                                let mut header = egui::RichText::new(&g.label).color(DIM).monospace();
+                                let mut header =
+                                    egui::RichText::new(&g.label).color(DIM).monospace();
                                 if let Some(scope) = &g.scope {
                                     header = egui::RichText::new(format!("{}   {scope}", g.label))
                                         .color(DIM)
@@ -123,6 +124,19 @@ impl ConfirmClose {
                                                     .color(DIM)
                                                     .monospace(),
                                             );
+                                            // Rollup of the child's own subtree,
+                                            // shown left of the pid: "(+16)".
+                                            if p.background > 0 {
+                                                ui.add_space(10.0);
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "+{}",
+                                                        p.background
+                                                    ))
+                                                    .color(DIM)
+                                                    .monospace(),
+                                                );
+                                            }
                                         },
                                     );
                                 });
@@ -136,7 +150,11 @@ impl ConfirmClose {
                         outcome = ConfirmOutcome::Cancelled;
                     }
                     if ui
-                        .button(egui::RichText::new(&self.confirm_label).color(CARET).strong())
+                        .button(
+                            egui::RichText::new(&self.confirm_label)
+                                .color(CARET)
+                                .strong(),
+                        )
                         .clicked()
                     {
                         outcome = ConfirmOutcome::Confirmed;
@@ -156,14 +174,25 @@ mod tests {
         ProcGroup {
             label: label.into(),
             scope: None,
-            procs: pids.iter().map(|&pid| ProcInfo { pid, name: format!("p{pid}.exe") }).collect(),
+            procs: pids
+                .iter()
+                .map(|&pid| ProcInfo {
+                    pid,
+                    name: format!("p{pid}.exe"),
+                    background: 0,
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn total_sums_all_groups() {
-        let c = ConfirmClose::new("t", "l", "close anyway",
-            vec![grp("a", &[1, 2]), grp("b", &[3])]);
+        let c = ConfirmClose::new(
+            "t",
+            "l",
+            "close anyway",
+            vec![grp("a", &[1, 2]), grp("b", &[3])],
+        );
         assert_eq!(c.total(), 3);
     }
 
@@ -175,8 +204,12 @@ mod tests {
 
     #[test]
     fn multiple_groups_render_grouped() {
-        let c = ConfirmClose::new("t", "l", "close anyway",
-            vec![grp("a", &[1]), grp("b", &[2])]);
+        let c = ConfirmClose::new(
+            "t",
+            "l",
+            "close anyway",
+            vec![grp("a", &[1]), grp("b", &[2])],
+        );
         assert!(c.grouped());
     }
 }

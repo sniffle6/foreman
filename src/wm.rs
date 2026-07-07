@@ -2038,9 +2038,12 @@ impl WindowManager {
         self.terminal_shells()
             .into_iter()
             .filter_map(|(label, pid)| {
-                let procs = crate::proc::descendants(pid);
-                (!procs.is_empty())
-                    .then(|| crate::confirm::ProcGroup { label, scope: None, procs })
+                let procs = crate::proc::top_children(pid);
+                (!procs.is_empty()).then(|| crate::confirm::ProcGroup {
+                    label,
+                    scope: None,
+                    procs,
+                })
             })
             .collect()
     }
@@ -2054,7 +2057,7 @@ impl WindowManager {
                 match &t.content {
                     Content::Terminal(s) => {
                         if let Some(pid) = s.root_pid() {
-                            out.extend(crate::proc::descendants(pid));
+                            out.extend(crate::proc::top_children(pid));
                         }
                     }
                     Content::Project(wm) => out.extend(wm.all_procs()),
@@ -2080,7 +2083,7 @@ impl WindowManager {
                     let n = wm
                         .terminal_shells()
                         .iter()
-                        .filter(|(_, pid)| !crate::proc::descendants(*pid).is_empty())
+                        .filter(|(_, pid)| !crate::proc::top_children(*pid).is_empty())
                         .count();
                     out.push(crate::confirm::ProcGroup {
                         label: t.title.clone(),
@@ -2104,19 +2107,21 @@ impl WindowManager {
         if groups.is_empty() {
             return false;
         }
-        let total: usize = groups.iter().map(|g| g.procs.len()).sum();
         let k = groups.len();
         let view = crate::confirm::ConfirmClose::new(
             "quit foreman?",
-            format!(
-                "{total} process{} still running across {k} project{}:",
-                if total == 1 { " is" } else { "es are" },
-                if k == 1 { "" } else { "s" },
+            running_lead(
+                top_count(&groups),
+                background_count(&groups),
+                Some((k, "project")),
             ),
             "quit anyway",
             groups,
         );
-        self.pending_close = Some(PendingClose { target: CloseTarget::Quit, view });
+        self.pending_close = Some(PendingClose {
+            target: CloseTarget::Quit,
+            view,
+        });
         true
     }
 
@@ -4198,13 +4203,15 @@ fn dispatch_banner(argv: &[String]) -> String {
     }
 }
 
-
 /// Processes that closing this one tab would kill: a terminal → at most its own
 /// group; a project → one group per terminal inside it; chat → none.
 fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
     match &tab.content {
         Content::Terminal(s) => {
-            let procs = s.root_pid().map(crate::proc::descendants).unwrap_or_default();
+            let procs = s
+                .root_pid()
+                .map(crate::proc::top_children)
+                .unwrap_or_default();
             if procs.is_empty() {
                 Vec::new()
             } else {
@@ -4220,31 +4227,56 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
     }
 }
 
+/// Top-level processes across all groups (the rows the modal shows).
+fn top_count(groups: &[crate::confirm::ProcGroup]) -> usize {
+    groups.iter().map(|g| g.procs.len()).sum()
+}
+
+/// Descendants rolled up under those top-level processes (the "(+n)" totals).
+fn background_count(groups: &[crate::confirm::ProcGroup]) -> usize {
+    groups
+        .iter()
+        .flat_map(|g| &g.procs)
+        .map(|p| p.background)
+        .sum()
+}
+
+/// The lead line, e.g. "1 process (+16 background) still running:" or
+/// "3 processes still running across 2 terminals:". The background clause is
+/// dropped when nothing is rolled up; the "across" clause when it's a single
+/// unit (a lone terminal/project reads fine without it).
+fn running_lead(top: usize, bg: usize, across: Option<(usize, &str)>) -> String {
+    let procs = if top == 1 { "process" } else { "processes" };
+    let bg_clause = if bg > 0 {
+        format!(" (+{bg} background)")
+    } else {
+        String::new()
+    };
+    let across_clause = match across {
+        Some((k, unit)) if k > 1 => format!(" across {k} {unit}s"),
+        _ => String::new(),
+    };
+    format!("{top} {procs}{bg_clause} still running{across_clause}:")
+}
+
 /// Compose the confirm copy for a pane/project close from the gathered groups.
 fn build_confirm(
     is_project: bool,
     groups: Vec<crate::confirm::ProcGroup>,
 ) -> crate::confirm::ConfirmClose {
-    let total: usize = groups.iter().map(|g| g.procs.len()).sum();
+    let top = top_count(&groups);
+    let bg = background_count(&groups);
     if is_project {
-        let k = groups.len();
         crate::confirm::ConfirmClose::new(
             "close this project?",
-            format!(
-                "{total} process{} still running across {k} terminal{}:",
-                if total == 1 { " is" } else { "es are" },
-                if k == 1 { "" } else { "s" },
-            ),
+            running_lead(top, bg, Some((groups.len(), "terminal"))),
             "close anyway",
             groups,
         )
     } else {
         crate::confirm::ConfirmClose::new(
             "close this terminal?",
-            format!(
-                "{total} process{} still running here:",
-                if total == 1 { " is" } else { "es are" },
-            ),
+            running_lead(top, bg, None),
             "close anyway",
             groups,
         )
@@ -6717,7 +6749,10 @@ mod tests {
             view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
         });
         m.resolve_pending(crate::confirm::ConfirmOutcome::Confirmed);
-        assert!(m.windows.iter().all(|w| w.id != 7), "window not closed on confirm");
+        assert!(
+            m.windows.iter().all(|w| w.id != 7),
+            "window not closed on confirm"
+        );
         assert!(m.pending_close.is_none());
     }
 
@@ -6732,7 +6767,10 @@ mod tests {
             view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
         });
         m.resolve_pending(crate::confirm::ConfirmOutcome::Cancelled);
-        assert!(m.windows.iter().any(|w| w.id == 7), "window closed on cancel");
+        assert!(
+            m.windows.iter().any(|w| w.id == 7),
+            "window closed on cancel"
+        );
         assert!(m.pending_close.is_none());
     }
 
@@ -6748,22 +6786,48 @@ mod tests {
 
     #[test]
     fn build_confirm_wording_terminal_vs_project() {
-        let g = |label: &str, n: usize| crate::confirm::ProcGroup {
+        let proc = |pid: u32, bg: usize| crate::proc::ProcInfo {
+            pid,
+            name: "x.exe".into(),
+            background: bg,
+        };
+        let g = |label: &str, procs: Vec<crate::proc::ProcInfo>| crate::confirm::ProcGroup {
             label: label.into(),
             scope: None,
-            procs: (0..n).map(|i| crate::proc::ProcInfo { pid: i as u32, name: "x.exe".into() }).collect(),
+            procs,
         };
-        let term = build_confirm(false, vec![g("claude", 1)]);
+        // Terminal: one top-level process with a rolled-up subtree.
+        let term = build_confirm(false, vec![g("claude", vec![proc(1, 16)])]);
         assert_eq!(term.title(), "close this terminal?");
-        let proj = build_confirm(true, vec![g("a", 2), g("b", 1)]);
+        assert!(
+            term.lead()
+                .contains("1 process (+16 background) still running"),
+            "got: {}",
+            term.lead()
+        );
+        // Project: two terminals → the "across" clause appears.
+        let proj = build_confirm(
+            true,
+            vec![
+                g("a", vec![proc(2, 0), proc(3, 0)]),
+                g("b", vec![proc(4, 0)]),
+            ],
+        );
         assert_eq!(proj.title(), "close this project?");
-        assert!(proj.lead().contains("across 2 terminals"), "got: {}", proj.lead());
+        assert!(
+            proj.lead().contains("across 2 terminals"),
+            "got: {}",
+            proj.lead()
+        );
     }
 
     #[test]
     fn begin_quit_confirm_is_false_when_nothing_runs() {
         let mut m = WindowManager::new().as_desktop();
-        assert!(!m.begin_quit_confirm(), "empty desktop should let the app quit");
+        assert!(
+            !m.begin_quit_confirm(),
+            "empty desktop should let the app quit"
+        );
         assert!(m.pending_close.is_none());
     }
 
@@ -6772,6 +6836,9 @@ mod tests {
         let mut m = WindowManager::new().as_desktop();
         m.quit_confirmed = true;
         assert!(m.take_quit_confirmed());
-        assert!(!m.take_quit_confirmed(), "flag must reset after being taken");
+        assert!(
+            !m.take_quit_confirmed(),
+            "flag must reset after being taken"
+        );
     }
 }
