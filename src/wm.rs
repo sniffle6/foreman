@@ -113,6 +113,7 @@ impl Content {
         base: egui::Id,
         win_id: WinId,
         resp: &egui::Response,
+        app_modal: bool,
     ) -> bool {
         match self {
             Content::Terminal(s) => {
@@ -122,7 +123,10 @@ impl Content {
             // Recurse: the project's content rect becomes the child manager's area.
             // The child only reads the keyboard if this project is itself active,
             // so `active` ANDs down the tree to exactly one leaf terminal.
-            Content::Project(wm) => wm.show(ui, rect, active, base.with(("proj", win_id))),
+            // `app_modal` threads the app-wide "a confirm is open" state down.
+            Content::Project(wm) => {
+                wm.show(ui, rect, active, base.with(("proj", win_id)), app_modal)
+            }
             Content::Chat(view) => {
                 // Reserve the input strip up front and shrink the working
                 // rect so the board/log lay out above it. The painter keeps
@@ -646,11 +650,18 @@ pub struct WindowManager {
     pending_settles: Vec<PendingSettle>,
     /// When `Some`, this manager's close-confirm modal is open: a close (or the
     /// app quit) is waiting on the user. Holds the target and the modal view.
-    /// Only one may be pending at a time, which also holds the app alive.
+    /// At most one is pending *per manager*; the app-wide "only one anywhere"
+    /// rule is enforced through `app_modal`, which also holds the app alive.
     pending_close: Option<PendingClose>,
     /// Set true (on the desktop) once a quit confirm is accepted, so the app-quit
-    /// guard in main.rs can drive the actual OS close. Inert until Task 5 wires it.
+    /// guard in main.rs can drive the actual OS close.
     quit_confirmed: bool,
+    /// True this frame when a confirm modal is open ANYWHERE in the app (this
+    /// manager or any nested project). A confirm is globally modal: while it is
+    /// set every terminal's keyboard is frozen (via `is_focus`) and no second
+    /// confirm may open (checked in the close funnels). Recomputed each frame at
+    /// the top of `show` from the threaded `app_modal` arg + `any_pending_close`.
+    app_modal: bool,
 }
 
 impl WindowManager {
@@ -680,6 +691,7 @@ impl WindowManager {
             pending_settles: Vec::new(),
             pending_close: None,
             quit_confirmed: false,
+            app_modal: false,
         }
     }
 
@@ -1954,10 +1966,24 @@ impl WindowManager {
         }
     }
 
-    /// Close the active tab of `id`, or open the confirm modal if it has running
-    /// subprocesses. No-op guard-wise if a confirm is already open.
-    fn request_close_active_tab(&mut self, id: WinId) {
+    /// True if a confirm modal is open in this manager or any nested project.
+    /// The desktop calls this over the whole tree; the answer becomes `app_modal`
+    /// and is threaded back down so every level knows a dialog is up somewhere.
+    fn any_pending_close(&self) -> bool {
         if self.pending_close.is_some() {
+            return true;
+        }
+        self.windows.iter().any(|w| {
+            w.tabs
+                .iter()
+                .any(|t| matches!(&t.content, Content::Project(wm) if wm.any_pending_close()))
+        })
+    }
+
+    /// Close the active tab of `id`, or open the confirm modal if it has running
+    /// subprocesses. No-op if any confirm is already open anywhere in the app.
+    fn request_close_active_tab(&mut self, id: WinId) {
+        if self.app_modal || self.pending_close.is_some() {
             return;
         }
         let Some(w) = self.windows.iter().find(|w| w.id == id) else {
@@ -1978,7 +2004,7 @@ impl WindowManager {
 
     /// Same, for a specific tab index (tab-bar X).
     fn request_close_tab(&mut self, id: WinId, idx: usize) {
-        if self.pending_close.is_some() {
+        if self.app_modal || self.pending_close.is_some() {
             return;
         }
         let Some(w) = self.windows.iter().find(|w| w.id == id) else {
@@ -2100,8 +2126,8 @@ impl WindowManager {
     /// when it did (caller should cancel the OS close). False → nothing running,
     /// let the app quit.
     pub fn begin_quit_confirm(&mut self) -> bool {
-        if self.pending_close.is_some() {
-            return true; // already confirming (a quit or a close)
+        if self.app_modal || self.pending_close.is_some() {
+            return true; // already confirming somewhere (a quit or a close)
         }
         let groups = self.project_groups();
         if groups.is_empty() {
@@ -2522,16 +2548,27 @@ impl WindowManager {
         area: egui::Rect,
         active: bool,
         base: egui::Id,
+        // True when a confirm modal is already open in an ancestor manager. The
+        // desktop is passed `false` and folds in its own whole-tree scan; the
+        // result flows back down so every level sees the app-wide state.
+        app_modal: bool,
     ) -> bool {
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
         self.last_area = area.size();
 
+        // A confirm dialog anywhere in the app is globally modal: freeze this
+        // manager's keyboard (leader + terminals, via `is_focus`) so only the
+        // dialog reads Enter/Esc, and block a second dialog from opening. The
+        // desktop's scan reaches every nested project; the flag threads down.
+        self.app_modal = app_modal || self.any_pending_close();
+        let live = active && !self.app_modal;
+
         if self.desktop {
             self.refresh_exit_titles();
         }
 
-        self.pump_commands(ui, active);
+        self.pump_commands(ui, live);
 
         ui.painter_at(area)
             .rect_filled(area, egui::CornerRadius::ZERO, DESK_BG);
@@ -2567,7 +2604,7 @@ impl WindowManager {
             // While renaming, no window is active so the typed title doesn't also
             // leak into the focused terminal (which reads raw input events).
             let is_focus = focused == Some(id)
-                && active
+                && live
                 && self.picker.is_none()
                 && self.renaming.is_none()
                 && self.settings.is_none();
@@ -2616,9 +2653,15 @@ impl WindowManager {
                 if cresp.clicked() {
                     acts.push(Act::Focus(id));
                 }
-                let child_interacted = self.windows[i]
-                    .active_content()
-                    .show(ui, scr, is_focus, base, id, &cresp);
+                let child_interacted = self.windows[i].active_content().show(
+                    ui,
+                    scr,
+                    is_focus,
+                    base,
+                    id,
+                    &cresp,
+                    self.app_modal,
+                );
                 if child_interacted {
                     acts.push(Act::Focus(id));
                 }
@@ -2820,6 +2863,7 @@ impl WindowManager {
                 base,
                 id,
                 &cresp,
+                self.app_modal,
             );
             if child_interacted {
                 // A sub-window inside this project was clicked: raise this project
@@ -6839,6 +6883,48 @@ mod tests {
         assert!(
             !m.take_quit_confirmed(),
             "flag must reset after being taken"
+        );
+    }
+
+    #[test]
+    fn any_pending_close_sees_a_nested_modal() {
+        let mut m = WindowManager::new().as_desktop();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        assert!(!m.any_pending_close(), "empty desktop has no modal");
+        let mut child = WindowManager::new();
+        child.pending_close = Some(PendingClose {
+            target: CloseTarget::ActiveTab(1),
+            view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
+        });
+        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        assert!(
+            m.any_pending_close(),
+            "a confirm inside a nested project must be visible app-wide"
+        );
+    }
+
+    #[test]
+    fn a_second_confirm_cannot_open_while_one_is_up() {
+        // `app_modal` is the app-wide "a dialog is open somewhere" flag the
+        // desktop threads down each frame. With it set, a close funnel elsewhere
+        // must refuse — no second modal, and the target is left untouched.
+        let mut m = WindowManager::new();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(
+            7,
+            "proj".into(),
+            r,
+            Content::Project(Box::new(WindowManager::new())),
+        );
+        m.app_modal = true;
+        m.request_close_active_tab(7);
+        assert!(
+            m.pending_close.is_none(),
+            "guard must refuse to open a second confirm"
+        );
+        assert!(
+            m.windows.iter().any(|w| w.id == 7),
+            "the window must not close either while a dialog is up"
         );
     }
 }

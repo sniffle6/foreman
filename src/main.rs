@@ -374,7 +374,8 @@ impl eframe::App for App {
         }
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
-        self.desktop.show(ui, area, true, egui::Id::new("desktop"));
+        self.desktop
+            .show(ui, area, true, egui::Id::new("desktop"), false);
         // Quit guard: the window's title-bar X and Alt+F4 send
         // ViewportCommand::Close straight to the viewport, bypassing every WM
         // close funnel. Intercept while any subprocess is running and confirm

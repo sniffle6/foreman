@@ -49,6 +49,9 @@ speed-bump in front of that.
 4. **Rendering:** the modal is drawn in `show_modals`, which already runs at both
    window-manager levels — so a terminal-close modal renders over its project's
    rect and a project/quit modal over the desktop, with no cross-level plumbing.
+   Both the dim and the panel center on the owning manager's `area` (the panel
+   uses `pivot(CENTER_CENTER).fixed_pos(area.center())`, not a viewport anchor),
+   so a terminal-close over an off-center project pops over *that* project.
 5. **The decision is split from the render:** `resolve_pending(outcome)` is a
    pure method (confirm → close, cancel → drop, pending → keep) so the state
    machine is unit-tested without an egui context. `show()` just draws and
@@ -63,11 +66,24 @@ speed-bump in front of that.
 - **The list is a snapshot** taken when the modal opens, not live. If a listed
   process exits while you're staring at the dialog, no big deal — confirming
   just closes, cancelling just keeps the pane.
+- **Detection can lag up to ~1.5s.** `top_children` reads the shared, throttled
+  `proc::SCANNER` (refreshes at most every 1500 ms). A child spawned in the last
+  fraction of a second before you hit close may not be in the table yet, so a
+  genuinely-busy pane could close with no warning. Narrow window, and the
+  kill-on-close Job still cleans it up — but it's the one hole left in the gate.
+  A forced refresh at request time would close it (follow-up).
 - **`OpenConsole.exe` / `conhost.exe` are always excluded.** Whether they show up
   as children of the shell depends on the ConPTY host; the denylist means an
   idle shell never false-triggers the modal either way.
-- **Only one modal at a time.** `request_close_*` no-ops if a confirm is already
-  open (same discipline as the picker/settings modals).
+- **A confirm is globally modal.** While one is open *anywhere* in the app, every
+  terminal's keyboard is frozen and no second confirm can open — even in a
+  different project. This is enforced by `app_modal`, an app-wide flag the
+  desktop recomputes each frame (`any_pending_close` walks the whole tree) and
+  threads down through `show`. It gates both the keyboard (`is_focus` /
+  `pump_commands` see the frozen flag) and the close funnels (`request_close_*` /
+  `begin_quit_confirm` refuse when it's set). Without this the modal's `Enter`
+  would *also* reach the terminal underneath (submitting into the doomed
+  process), and two dialogs could open at once and share one keypress.
 - **A pending confirm holds the app alive** — `deserted()` returns false while
   one is open, so closing the last project can't yank the modal out from under
   you before you answer.
@@ -88,7 +104,8 @@ speed-bump in front of that.
   grouped/flat `Name │ Pid` list).
 - `src/wm.rs` — the gate (`request_close_*`), grouping (`terminal_shells`,
   `terminal_groups`, `project_groups`, `all_procs`, `groups_in_tab`), the pure
-  `resolve_pending`, `pending_close` state, and `begin_quit_confirm` /
+  `resolve_pending`, `pending_close` state, the app-wide `app_modal` freeze
+  (`any_pending_close` + the `show` threading), and `begin_quit_confirm` /
   `take_quit_confirmed`.
 - `src/terminal.rs` — `Session::root_pid()` accessor.
 - `src/main.rs` — the app-quit guard (`close_requested` interception, `force_quit`).

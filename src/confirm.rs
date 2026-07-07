@@ -84,11 +84,15 @@ impl ConfirmClose {
             .rect_filled(area, 0.0, egui::Color32::from_black_alpha(150));
 
         let grouped = self.grouped();
+        // Center the panel on the OWNING manager's `area` (which the dim above
+        // covers), not the whole viewport: a terminal-close over an off-center
+        // project must pop over that project's rect, not the app center.
         egui::Window::new(&self.title)
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(area.center())
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(360.0);
                 ui.label(egui::RichText::new(&self.title).strong().color(TEXT));
