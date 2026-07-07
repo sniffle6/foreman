@@ -1,0 +1,479 @@
+<title>foreman — close-confirm mockup</title>
+<style>
+  :root {
+    /* --- charcoal-steel + safety-orange, from mocks/toolbar-concepts.html --- */
+    --bg:        #141619;
+    --desk-bg:   #15171a; /* steel-0 */
+    --win-bg:    #1d2024; /* steel-1, pane / modal */
+    --title-bg:  #262a30; /* steel-2 */
+    --edge:      #0d0e10;
+    --text:      #c9ced6; /* ink */
+    --dim:       #7c838d; /* ink-dim */
+    --faint:     #565d66;
+    --border:    #2b2f35;
+    --hairline:  rgba(255,255,255,0.06);
+    --focus:     #b6bdc6;
+    --accent:    #ff7a18; /* safety orange */
+    --accent-dim:#b9560f;
+    --dim-overlay: rgba(0,0,0,0.588); /* from_black_alpha(150) */
+    --t-green:#8fb87f;
+    --t-blue: #6fa7c7;
+    --t-pink: #b98cc0;
+    --tool-bg:   #101215;
+    --tool-panel:#16191d;
+    --tool-line: #23272d;
+
+    --sans: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "Cascadia Mono", "Consolas", monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--tool-bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "topbar topbar"
+      "stage  notes";
+    min-height: 100vh;
+  }
+
+  /* ---------------- top bar (tool chrome) ---------------- */
+  .topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+    padding: 13px 22px;
+    background: var(--tool-panel);
+    border-bottom: 1px solid var(--tool-line);
+  }
+  .brand {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+  }
+  .brand b { color: var(--accent); font-weight: 600; }
+  .brand span {
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: .16em;
+    font-size: 10px;
+    margin-left: 8px;
+  }
+
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dim);
+    background: transparent;
+    border: 0;
+    border-bottom: 1.5px solid transparent;
+    border-radius: 0;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: color .12s, border-color .12s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.is-active { color: var(--text); border-bottom-color: var(--accent); }
+  .tab:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .toggle {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { accent-color: var(--accent); width: 14px; height: 14px; }
+  .toggle:hover { color: var(--text); }
+
+  /* ---------------- stage: dimmed foreman desktop ---------------- */
+  .stage {
+    grid-area: stage;
+    position: relative;
+    overflow: hidden;
+    min-height: 520px;
+    background: var(--desk-bg);
+  }
+  .desktop {
+    position: absolute;
+    inset: 0;
+    padding: 14px;
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 10px;
+  }
+  .pane {
+    background: var(--win-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .pane.tall { grid-row: span 2; }
+  .pane.focus { border-color: var(--focus); }
+  .pane-head {
+    height: 22px;
+    background: var(--title-bg);
+    display: flex;
+    align-items: center;
+    padding: 0 9px;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--dim);
+  }
+  .pane.focus .pane-head { color: var(--text); }
+  .pane-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); flex: none; }
+  .pane.focus .pane-dot { background: var(--accent); }
+  .pane-body {
+    flex: 1;
+    padding: 8px 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: #a6adb6;
+    white-space: pre;
+    overflow: hidden;
+  }
+  .g { color: var(--t-green); }
+  .a { color: var(--accent); }
+  .b { color: var(--t-blue); }
+  .p { color: var(--t-pink); }
+  .d { color: var(--dim); }
+  .caret {
+    display: inline-block;
+    width: 7px; height: 13px;
+    background: var(--accent);
+    opacity: .85;
+    vertical-align: -2px;
+  }
+
+  .dim { position: absolute; inset: 0; background: var(--dim-overlay); }
+
+  /* ---------------- the modal (hero) — flat, single surface ---------------- */
+  .modal-wrap {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .modal {
+    width: 384px;
+    max-width: 100%;
+    background: var(--win-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 16px 44px rgba(0,0,0,0.5);
+    overflow: hidden;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .modal { animation: pop .13s ease-out; }
+    @keyframes pop {
+      from { opacity: 0; transform: translateY(5px); }
+      to   { opacity: 1; transform: none; }
+    }
+  }
+
+  .modal-title {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text);
+    padding: 13px 17px 12px;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .modal-body { padding: 14px 17px 16px; }
+  .lead {
+    margin: 0 0 13px;
+    font-size: 13px;
+    color: var(--dim);
+  }
+
+  .proclist { max-height: 220px; overflow-y: auto; }
+  .proclist::-webkit-scrollbar { width: 8px; }
+  .proclist::-webkit-scrollbar-thumb { background: #2f343b; border-radius: 5px; }
+
+  .grp-head {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--faint);
+    padding: 9px 2px 3px;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .grp-head:first-child { padding-top: 0; }
+  .grp-head .scope { margin-left: auto; opacity: .85; }
+
+  .proc {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 3px 2px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .proc-name { color: var(--text); }
+  .proc-pid {
+    margin-left: auto;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* grouped: indent terminal-name headers, nest their processes a step deeper */
+  .proclist.grouped .grp-head { padding-left: 12px; }
+  .proclist.grouped .proc { padding-left: 26px; }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 4px;
+    padding: 11px 13px;
+    border-top: 1px solid var(--hairline);
+  }
+  .btn {
+    font-family: var(--sans);
+    font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--dim);
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .btn:hover { color: var(--text); }
+  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .btn-primary {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .btn-primary:hover { color: #ff9040; background: rgba(255,122,24,0.10); }
+
+  /* ---------------- notes rail ---------------- */
+  .notes {
+    grid-area: notes;
+    background: var(--tool-panel);
+    border-left: 1px solid var(--tool-line);
+    padding: 20px 20px 40px;
+    overflow-y: auto;
+  }
+  .notes h2 {
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .18em;
+    color: var(--dim);
+    margin: 0 0 11px;
+    font-weight: 600;
+  }
+  .notes h2:not(:first-child) { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--tool-line); }
+  .notes p { margin: 0 0 10px; font-size: 12.5px; color: #aab1ba; }
+  .notes p .em { color: var(--text); }
+  .notes p code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--accent);
+    background: rgba(255,122,24,0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .swatches { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 4px; }
+  .sw { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
+  .sw i { width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(255,255,255,0.12); }
+  .q {
+    font-size: 12.5px; color: #aab1ba;
+    padding: 8px 11px; margin: 0 0 7px;
+    background: var(--bg);
+    border-left: 2px solid var(--border);
+    border-radius: 0 3px 3px 0;
+  }
+  .q b { color: var(--text); font-weight: 600; }
+</style>
+
+<div class="layout">
+  <header class="topbar">
+    <div class="brand"><b>foreman</b> · close-confirm <span>design preview</span></div>
+    <nav class="tabs" role="tablist" aria-label="modal variant">
+      <button class="tab is-active" data-variant="terminal" role="tab" aria-selected="true">terminal</button>
+      <button class="tab" data-variant="project" role="tab" aria-selected="false">project</button>
+      <button class="tab" data-variant="quit" role="tab" aria-selected="false">quit</button>
+    </nav>
+    <label class="toggle"><input type="checkbox" id="grp" checked> group by terminal</label>
+  </header>
+
+  <main class="stage">
+    <div class="desktop" aria-hidden="true">
+      <div class="pane tall focus">
+        <div class="pane-head"><span class="pane-dot"></span>claude · foreman</div>
+        <div class="pane-body"><span class="a">✳</span> <span class="d">Wrangling the layout tree…</span>
+  <span class="g">●</span> read <span class="b">src/wm.rs</span>
+  <span class="g">●</span> edit <span class="b">src/layout.rs</span>
+<span class="d">running cargo test…</span><span class="caret"></span></div>
+      </div>
+      <div class="pane">
+        <div class="pane-head"><span class="pane-dot"></span>build</div>
+        <div class="pane-body"><span class="d">$</span> cargo test
+<span class="g">   Compiling</span> foreman
+<span class="a">    Running</span> unittests</div>
+      </div>
+      <div class="pane">
+        <div class="pane-head"><span class="pane-dot"></span>dev server</div>
+        <div class="pane-body"><span class="p">➜</span> ready in 412 ms
+<span class="d">watching for changes</span><span class="caret"></span></div>
+      </div>
+    </div>
+    <div class="dim"></div>
+
+    <div class="modal-wrap">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="m-title">
+        <div class="modal-title" id="m-title"><span id="m-title-text">close this terminal?</span></div>
+        <div class="modal-body">
+          <p class="lead" id="m-lead"></p>
+          <div class="proclist" id="m-list"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn">cancel</button>
+          <button class="btn btn-primary" id="m-confirm">close anyway</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="notes">
+    <h2>What this is</h2>
+    <p>Three states of one confirm modal, shown at foreman's real dim level (<span class="em">rgba(0,0,0,.588)</span>) over a mock desktop. Minimal pass: flat single surface, no glyph, no pips, one accent.</p>
+    <p style="color:var(--dim);font-size:11.5px">Skinned to the steel + safety-orange direction from <code>mocks/toolbar-concepts.html</code>. <code>theme.rs</code> still holds the warm palette — the real modal inherits whatever tokens exist when built.</p>
+
+    <h2>Palette</h2>
+    <div class="swatches">
+      <span class="sw"><i style="background:#15171a"></i>steel-0</span>
+      <span class="sw"><i style="background:#1d2024"></i>steel-1</span>
+      <span class="sw"><i style="background:#262a30"></i>steel-2</span>
+      <span class="sw"><i style="background:#ff7a18"></i>orange</span>
+      <span class="sw"><i style="background:#7c838d"></i>ink-dim</span>
+    </div>
+    <p>Safety orange is the single accent — it carries the confirm action (the "proceed with caution" button) and nothing else in the modal.</p>
+
+    <h2>Interaction</h2>
+    <p>Fires <span class="em">only</span> when the shell has a real child (agent, build, REPL, server). Idle prompt closes with no modal. <code>OpenConsole.exe</code> plumbing is filtered out. <code>Esc</code> cancels; <code>Enter</code> confirms.</p>
+
+    <h2>Open decisions</h2>
+    <div class="q"><b>Default button.</b> <span class="em">close anyway</span> is default (Enter confirms), like Windows Terminal. Safer alt: default to <span class="em">cancel</span>.</div>
+    <div class="q"><b>Group by terminal.</b> Toggle above. Grouped needs each process tagged with its terminal — a small extension to the flat list the spec has today.</div>
+  </aside>
+</div>
+
+<script>
+  const singular = n => n === 1 ? "process" : "processes";
+
+  const DATA = {
+    terminal: {
+      title: "close this terminal?",
+      confirm: "close anyway",
+      groups: [ { label: "claude", procs: [["claude.exe", 24817]] } ],
+      lead: () => `1 process is still running here:`
+    },
+    project: {
+      title: "close this project?",
+      confirm: "close anyway",
+      groups: [
+        { label: "claude",     procs: [["claude.exe", 24817], ["node.exe", 24902]] },
+        { label: "build",      procs: [["cargo.exe", 18340], ["rustc.exe", 18512]] },
+        { label: "dev server", procs: [["node.exe", 9120]] }
+      ],
+      lead: total => `${total} ${singular(total)} still running across 3 terminals:`
+    },
+    quit: {
+      title: "quit foreman?",
+      confirm: "quit anyway",
+      groups: [
+        { label: "foreman", scope: "3 terminals", procs: [["claude.exe", 24817], ["cargo.exe", 18340], ["node.exe", 9120]] },
+        { label: "scratchpad", scope: "1 terminal", procs: [["python.exe", 7744], ["codex.exe", 30188]] }
+      ],
+      lead: total => `${total} ${singular(total)} still running across 2 projects:`
+    }
+  };
+
+  const el = id => document.getElementById(id);
+
+  function render(variant, grouped) {
+    const d = DATA[variant];
+    const total = d.groups.reduce((s, g) => s + g.procs.length, 0);
+
+    el("m-title-text").textContent = d.title;
+    el("m-lead").textContent = d.lead(total);
+    el("m-confirm").textContent = d.confirm;
+
+    const list = el("m-list");
+    list.innerHTML = "";
+
+    const procRow = ([name, pid]) => {
+      const row = document.createElement("div");
+      row.className = "proc";
+      row.innerHTML = `<span class="proc-name">${name}</span><span class="proc-pid">${pid}</span>`;
+      return row;
+    };
+
+    const showGroups = grouped && d.groups.length > 1;
+    list.classList.toggle("grouped", showGroups);
+    if (showGroups) {
+      d.groups.forEach(g => {
+        const h = document.createElement("div");
+        h.className = "grp-head";
+        h.innerHTML = g.label + (g.scope ? `<span class="scope">${g.scope}</span>` : "");
+        list.appendChild(h);
+        g.procs.forEach(p => list.appendChild(procRow(p)));
+      });
+    } else {
+      d.groups.flatMap(g => g.procs).forEach(p => list.appendChild(procRow(p)));
+    }
+  }
+
+  let current = "terminal";
+  const grpBox = el("grp");
+
+  document.querySelectorAll(".tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t => {
+        t.classList.remove("is-active");
+        t.setAttribute("aria-selected", "false");
+      });
+      tab.classList.add("is-active");
+      tab.setAttribute("aria-selected", "true");
+      current = tab.dataset.variant;
+      const m = document.querySelector(".modal");
+      m.style.animation = "none"; void m.offsetWidth; m.style.animation = "";
+      render(current, grpBox.checked);
+    });
+  });
+
+  grpBox.addEventListener("change", () => render(current, grpBox.checked));
+
+  render(current, grpBox.checked);
+</script>
