@@ -1,6 +1,7 @@
 mod caret;
 mod chat;
 mod config;
+mod confirm;
 mod conpty_install;
 mod control;
 mod dirpicker;
