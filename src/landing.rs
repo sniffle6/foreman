@@ -39,15 +39,29 @@ struct LandingLayout {
     tagline: egui::Rect,
     field: egui::Rect,
     icons: Vec<egui::Rect>,
+    recents_header: egui::Rect,
+    recents: Vec<egui::Rect>,
 }
 
-/// Place the stack (wordmark → tagline → field → icon row) centered in `area`.
-/// Pure arithmetic — no fonts, no fs.
-fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout {
+/// Recents band metrics (below the icon row, which paints labels ~24px under
+/// the icons — BAND_GAP clears them).
+const BAND_GAP: f32 = 44.0;
+const HEADER_H: f32 = 18.0;
+const ROW_H: f32 = 24.0;
+const ROW_GAP: f32 = 4.0;
+
+/// Place the stack (wordmark → tagline → field → icon row → recents) centered
+/// in `area`. Pure arithmetic — no fonts, no fs.
+fn layout(area: egui::Rect, n_icons: usize, n_recents: usize) -> LandingLayout {
     let cx = area.center().x;
     let field_w = area.width().min(520.0).max(0.0);
     let (word_h, tag_h, field_h, icon, gap) = (120.0_f32, 24.0, 26.0, 72.0_f32, 18.0);
-    let total = word_h + 16.0 + tag_h + 28.0 + field_h + 36.0 + icon;
+    let recents_h = if n_recents > 0 {
+        BAND_GAP + HEADER_H + 6.0 + ROW_H * n_recents as f32 + ROW_GAP * (n_recents as f32 - 1.0)
+    } else {
+        0.0
+    };
+    let total = word_h + 16.0 + tag_h + 28.0 + field_h + 36.0 + icon + recents_h;
     let mut y = area.center().y - total / 2.0;
 
     let centered = |w: f32, y: f32, h: f32| {
@@ -71,12 +85,65 @@ fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout {
             r
         })
         .collect();
+    y += icon;
+
+    let (recents_header, recents) = if n_recents > 0 {
+        y += BAND_GAP;
+        let header = centered(field_w, y, HEADER_H);
+        y += HEADER_H + 6.0;
+        let mut rows = Vec::with_capacity(n_recents);
+        for _ in 0..n_recents {
+            rows.push(centered(field_w, y, ROW_H));
+            y += ROW_H + ROW_GAP;
+        }
+        (header, rows)
+    } else {
+        (egui::Rect::NOTHING, Vec::new())
+    };
 
     LandingLayout {
         wordmark,
         tagline,
         field,
         icons,
+        recents_header,
+        recents,
+    }
+}
+
+/// Which part of the landing owns navigation keys. `Field` is the picker's
+/// text field (default); `Recents` is the list under the icon row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Zone {
+    Field,
+    Recents,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NavKey {
+    Tab,
+    Up,
+    Down,
+    Enter,
+    Esc,
+    Text,
+}
+
+/// Pure keyboard model for field↔recents focus (spec: Tab enters, ↑/↓ step,
+/// ↑ past the top / Esc / Tab / typing return to the field, Enter opens).
+/// Returns (zone, selection, row index to open).
+fn step(zone: Zone, sel: usize, len: usize, key: NavKey) -> (Zone, usize, Option<usize>) {
+    if len == 0 {
+        return (Zone::Field, 0, None);
+    }
+    match (zone, key) {
+        (Zone::Field, NavKey::Tab) => (Zone::Recents, 0, None),
+        (Zone::Field, _) => (Zone::Field, sel, None),
+        (Zone::Recents, NavKey::Up) if sel > 0 => (Zone::Recents, sel - 1, None),
+        (Zone::Recents, NavKey::Up) => (Zone::Field, 0, None),
+        (Zone::Recents, NavKey::Down) => (Zone::Recents, (sel + 1).min(len - 1), None),
+        (Zone::Recents, NavKey::Enter) => (Zone::Field, 0, Some(sel)),
+        (Zone::Recents, NavKey::Tab | NavKey::Esc | NavKey::Text) => (Zone::Field, 0, None),
     }
 }
 
@@ -223,6 +290,17 @@ impl SessionKind {
         }
     }
 
+    /// Map a persisted recents kind string back to a kind. Unknown strings (a
+    /// future agent written by a newer build) degrade to Terminal — per the
+    /// recents spec, one bad entry must never cost the list.
+    pub fn from_kind_str(s: &str) -> SessionKind {
+        match s {
+            "claude" => SessionKind::Claude,
+            "codex" => SessionKind::Codex,
+            _ => SessionKind::Terminal,
+        }
+    }
+
     /// PATH stem to probe and launch, or None for a plain shell.
     fn stem(self) -> Option<&'static str> {
         match self {
@@ -290,7 +368,7 @@ impl Landing {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> Option<LandingAction> {
-        let l = layout(area, ICON_ORDER.len());
+        let l = layout(area, ICON_ORDER.len(), 0);
         let mut action: Option<LandingAction> = None;
 
         // Wordmark (mono block art, forge-gradient with an animated specular
@@ -360,7 +438,7 @@ mod tests {
     #[test]
     fn every_element_is_inside_the_area_and_disjoint() {
         let a = area();
-        let l = layout(a, 3);
+        let l = layout(a, 3, 0);
         for r in [l.wordmark, l.tagline, l.field] {
             assert!(a.contains_rect(r), "{r:?} escapes {a:?}");
         }
@@ -372,7 +450,7 @@ mod tests {
     #[test]
     fn stack_is_horizontally_centered() {
         let a = area();
-        let l = layout(a, 3);
+        let l = layout(a, 3, 0);
         let c = a.center().x;
         for r in [l.wordmark, l.tagline, l.field] {
             assert!((r.center().x - c).abs() < 1.0, "{r:?} not centered");
@@ -381,7 +459,7 @@ mod tests {
 
     #[test]
     fn icons_are_equal_width_and_evenly_spaced() {
-        let l = layout(area(), 3);
+        let l = layout(area(), 3, 0);
         assert_eq!(l.icons.len(), 3);
         let w = l.icons[0].width();
         assert!(l.icons.iter().all(|r| (r.width() - w).abs() < 0.5));
@@ -393,7 +471,7 @@ mod tests {
     #[test]
     fn tiny_area_degrades_without_negative_sizes() {
         let a = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 180.0));
-        let l = layout(a, 3);
+        let l = layout(a, 3, 0);
         for r in [l.wordmark, l.tagline, l.field] {
             assert!(r.width() >= 0.0 && r.height() >= 0.0);
             assert!(a.contains_rect(r.intersect(a)));
@@ -420,5 +498,96 @@ mod tests {
     #[test]
     fn on_path_is_false_without_a_path_var() {
         assert!(!on_path("claude", None, &|_| true));
+    }
+
+    #[test]
+    fn recents_band_sits_below_icons_inside_area() {
+        let a = area();
+        let l = layout(a, 3, 4);
+        assert_eq!(l.recents.len(), 4);
+        let icons_bottom = l.icons.iter().map(|r| r.bottom()).fold(f32::MIN, f32::max);
+        assert!(
+            l.recents_header.top() > icons_bottom,
+            "band below the icon row"
+        );
+        assert!(a.contains_rect(l.recents_header));
+        for r in &l.recents {
+            assert!(a.contains_rect(*r));
+        }
+        for w in l.recents.windows(2) {
+            assert!(w[1].top() >= w[0].bottom(), "rows don't overlap");
+            assert_eq!(w[0].height(), w[1].height(), "rows equal height");
+        }
+    }
+
+    #[test]
+    fn zero_recents_hides_the_band() {
+        let l = layout(area(), 3, 0);
+        assert!(l.recents.is_empty());
+    }
+
+    #[test]
+    fn tab_toggles_zones_and_arrows_step_clamp_and_exit_at_top() {
+        assert_eq!(
+            step(Zone::Field, 0, 3, NavKey::Tab),
+            (Zone::Recents, 0, None)
+        );
+        assert_eq!(
+            step(Zone::Recents, 2, 3, NavKey::Tab),
+            (Zone::Field, 0, None)
+        );
+        assert_eq!(
+            step(Zone::Recents, 0, 3, NavKey::Down),
+            (Zone::Recents, 1, None)
+        );
+        assert_eq!(
+            step(Zone::Recents, 2, 3, NavKey::Down),
+            (Zone::Recents, 2, None),
+            "clamps"
+        );
+        assert_eq!(
+            step(Zone::Recents, 1, 3, NavKey::Up),
+            (Zone::Recents, 0, None)
+        );
+        assert_eq!(
+            step(Zone::Recents, 0, 3, NavKey::Up),
+            (Zone::Field, 0, None),
+            "top exits"
+        );
+    }
+
+    #[test]
+    fn enter_opens_and_esc_text_empty_return_to_field() {
+        assert_eq!(
+            step(Zone::Recents, 2, 3, NavKey::Enter),
+            (Zone::Field, 0, Some(2))
+        );
+        assert_eq!(
+            step(Zone::Recents, 1, 3, NavKey::Esc),
+            (Zone::Field, 0, None)
+        );
+        assert_eq!(
+            step(Zone::Recents, 1, 3, NavKey::Text),
+            (Zone::Field, 0, None)
+        );
+        assert_eq!(
+            step(Zone::Field, 0, 0, NavKey::Tab),
+            (Zone::Field, 0, None),
+            "empty list inert"
+        );
+    }
+
+    #[test]
+    fn kind_strings_map_back_with_unknown_falling_to_terminal() {
+        assert_eq!(SessionKind::from_kind_str("claude"), SessionKind::Claude);
+        assert_eq!(SessionKind::from_kind_str("codex"), SessionKind::Codex);
+        assert_eq!(
+            SessionKind::from_kind_str("terminal"),
+            SessionKind::Terminal
+        );
+        assert_eq!(
+            SessionKind::from_kind_str("future-agent"),
+            SessionKind::Terminal
+        );
     }
 }
