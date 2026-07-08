@@ -662,6 +662,11 @@ pub struct WindowManager {
     /// confirm may open (checked in the close funnels). Recomputed each frame at
     /// the top of `show` from the threaded `app_modal` arg + `any_pending_close`.
     app_modal: bool,
+    /// Project opens since the last drain: (cwd, injected command if any).
+    /// Pushed by add_project / add_project_with_command; the app drains it each
+    /// frame to record recents. The engine never learns what a "recent" is —
+    /// it only reports (spec: open-drain seam).
+    opened: Vec<(PathBuf, Option<String>)>,
 }
 
 impl WindowManager {
@@ -692,6 +697,7 @@ impl WindowManager {
             pending_close: None,
             quit_confirmed: false,
             app_modal: false,
+            opened: Vec::new(),
         }
     }
 
@@ -775,6 +781,7 @@ impl WindowManager {
     /// Add a new project window. It starts as a sandbox containing one terminal.
     /// TODO(status line): show repo / branch on the project titlebar.
     pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) -> WinId {
+        self.opened.push((cwd.clone(), None));
         let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
         let title = cwd
             .file_name()
@@ -791,6 +798,12 @@ impl WindowManager {
         id
     }
 
+    /// Drain project opens recorded since the last call (most callers: the app,
+    /// once per frame, to feed the recents list).
+    pub fn take_opened(&mut self) -> Vec<(PathBuf, Option<String>)> {
+        std::mem::take(&mut self.opened)
+    }
+
     /// Add a project with the default shell, then type `command` into its fresh
     /// terminal (queued until the shell is ready). Used to launch an agent
     /// inside a normal shell, so quitting the agent drops back to a prompt
@@ -801,6 +814,7 @@ impl WindowManager {
         command: &str,
         ctx: &egui::Context,
     ) -> WinId {
+        self.opened.push((cwd.clone(), Some(command.to_string())));
         let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
         let title = cwd
             .file_name()
@@ -4393,6 +4407,29 @@ mod tests {
         });
         wm.focused = Some(id);
         id
+    }
+
+    #[test]
+    fn project_opens_land_in_the_drain_and_drain_empties() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new().as_desktop();
+        wm.add_project(
+            Shell::PowerShell,
+            std::path::PathBuf::from("C:\\proj"),
+            &ctx,
+        );
+        wm.add_project_with_command(std::path::PathBuf::from("C:\\agent"), "claude", &ctx);
+        assert_eq!(
+            wm.take_opened(),
+            vec![
+                (std::path::PathBuf::from("C:\\proj"), None),
+                (
+                    std::path::PathBuf::from("C:\\agent"),
+                    Some("claude".to_string())
+                ),
+            ]
+        );
+        assert!(wm.take_opened().is_empty(), "take drains");
     }
 
     // --- agent-dispatch drain semantics (handle_ctrl) ---
