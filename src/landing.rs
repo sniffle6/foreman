@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::icons::{self, IconKind};
-use crate::theme::{BORDER_FOCUS, DIM, TEXT};
+use crate::theme::{DIM, TEXT};
 
 /// Provisional, landing-local taxonomy (phase-2 replaces it with the dispatch model).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,6 +88,131 @@ fn icon_of(k: SessionKind) -> IconKind {
     }
 }
 
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+/// Per-glyph wordmark color: a monotonic ember→amber→gold ramp across x, lit
+/// from the top (vertical bevel), with a moving specular streak blended toward
+/// warm white where `shine` is high. All stops sit in the warm terminal palette
+/// (signature amber `231,169,63`) so it reads as lit metal, not a cool gradient.
+fn wordmark_color(fx: f32, fy: f32, shine: f32) -> egui::Color32 {
+    const EMBER: [f32; 3] = [196.0, 82.0, 44.0]; // left
+    const AMBER: [f32; 3] = [232.0, 150.0, 56.0]; // mid
+    const GOLD: [f32; 3] = [242.0, 198.0, 98.0]; // right
+    let base = if fx < 0.5 {
+        lerp3(EMBER, AMBER, fx / 0.5)
+    } else {
+        lerp3(AMBER, GOLD, (fx - 0.5) / 0.5)
+    };
+    let shade = 1.08 - 0.24 * fy; // top-lit bevel: brighter up top, darker below
+    let lit = [base[0] * shade, base[1] * shade, base[2] * shade];
+    const HILITE: [f32; 3] = [255.0, 249.0, 233.0];
+    let c = lerp3(lit, HILITE, shine.clamp(0.0, 1.0));
+    egui::Color32::from_rgb(
+        c[0].clamp(0.0, 255.0).round() as u8,
+        c[1].clamp(0.0, 255.0).round() as u8,
+        c[2].clamp(0.0, 255.0).round() as u8,
+    )
+}
+
+/// Center of the moving specular streak (in x-fraction) for animation time
+/// `time` seconds. A quick sweep across the wordmark, then a long rest with the
+/// streak parked off-screen — returns `f32::INFINITY` during the rest.
+fn shine_center(time: f32) -> f32 {
+    const PERIOD: f32 = 5.0; // one sweep every 5s
+    const SWEEP: f32 = 0.42; // fraction of the period the streak is travelling
+    let phase = (time % PERIOD) / PERIOD;
+    if phase >= SWEEP {
+        return f32::INFINITY; // parked off-screen: resting gradient
+    }
+    let u = phase / SWEEP; // 0..1 across the sweep
+    let eased = u * u * (3.0 - 2.0 * u); // smoothstep
+    -0.25 + 1.5 * eased // travel from just-left to just-right of the glyphs
+}
+
+/// Paint the block-art wordmark: forge gradient per glyph, an animated specular
+/// sweep, and a soft warm bloom behind. Centered in `rect`, top-aligned.
+fn paint_wordmark(ui: &egui::Ui, rect: egui::Rect, art: &str, font: egui::FontId, time: f32) {
+    let lines: Vec<&str> = art.lines().collect();
+    let rows = lines.len().max(1);
+    let cols = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let p = shine_center(time);
+    const WIDTH: f32 = 0.11; // streak half-width in x-fraction
+    const INTENSITY: f32 = 0.9;
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut buf = [0u8; 4];
+    for (row, line) in lines.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            let fx = if cols > 1 {
+                col as f32 / (cols - 1) as f32
+            } else {
+                0.0
+            };
+            let fy = if rows > 1 {
+                row as f32 / (rows - 1) as f32
+            } else {
+                0.0
+            };
+            // Gaussian streak, skewed slightly by row so the shine falls on a
+            // diagonal (light glinting across the face of the letters).
+            let d = (fx + 0.10 * fy - p) / WIDTH;
+            let shine = if p.is_finite() {
+                INTENSITY * (-(d * d)).exp()
+            } else {
+                0.0
+            };
+            job.append(
+                ch.encode_utf8(&mut buf),
+                0.0,
+                egui::text::TextFormat {
+                    font_id: font.clone(),
+                    color: wordmark_color(fx, fy, shine),
+                    ..Default::default()
+                },
+            );
+        }
+        if row + 1 < rows {
+            job.append(
+                "\n",
+                0.0,
+                egui::text::TextFormat {
+                    font_id: font.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    let galley = ui.painter().layout_job(job);
+    let pos = egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top());
+
+    // Warm bloom: a few low-alpha amber copies offset around the glyphs, so the
+    // wordmark glows off the dark surface. Then the crisp gradient on top.
+    let glow = egui::Color32::from_rgba_unmultiplied(233, 138, 48, 34);
+    for off in [
+        egui::vec2(-1.6, 0.0),
+        egui::vec2(1.6, 0.0),
+        egui::vec2(0.0, -1.6),
+        egui::vec2(0.0, 1.6),
+    ] {
+        ui.painter()
+            .galley_with_override_text_color(pos + off, galley.clone(), glow);
+    }
+    ui.painter().galley(pos, galley, TEXT);
+}
+
 impl SessionKind {
     /// Human label for buttons and notifications.
     pub fn label(self) -> &'static str {
@@ -168,15 +293,20 @@ impl Landing {
         let l = layout(area, ICON_ORDER.len());
         let mut action: Option<LandingAction> = None;
 
-        // Wordmark (mono block art) + tagline, centered.
+        // Wordmark (mono block art, forge-gradient with an animated specular
+        // sweep) + tagline, centered. The sweep needs a steady repaint while the
+        // landing is up; it stops as soon as a project opens (show stops being
+        // called), so the idle cost is scoped to the empty desktop.
         let word_font = egui::FontId::monospace(14.0);
-        ui.painter().text(
-            l.wordmark.center_top(),
-            egui::Align2::CENTER_TOP,
+        let time = ui.input(|i| i.time) as f32;
+        paint_wordmark(
+            ui,
+            l.wordmark,
             FOREMAN_ART.trim_matches('\n'),
             word_font,
-            BORDER_FOCUS,
+            time,
         );
+        ui.ctx().request_repaint();
         ui.painter().text(
             l.tagline.center(),
             egui::Align2::CENTER_CENTER,
