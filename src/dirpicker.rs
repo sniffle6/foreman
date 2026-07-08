@@ -199,17 +199,29 @@ impl DirPicker {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    /// Tab / click: drill into the highlighted dir, or climb on the Parent row.
+    /// Mouse click on a row: drill into the highlighted dir, or climb on `../`.
     pub fn complete(&mut self) {
         match self.rows().into_iter().nth(self.selected) {
-            Some(Row::Parent) => {
-                let (base, _) = self.base_and_partial();
-                if let Some(parent) = base.parent() {
-                    self.set_path(with_sep(parent));
-                }
-            }
+            Some(Row::Parent) => self.go_parent(),
             Some(Row::Dir(p)) => self.set_path(with_sep(&p)),
             None => {}
+        }
+    }
+
+    /// ← : climb to the parent of the current folder, regardless of the
+    /// highlight (file-browser model — Left always goes up).
+    pub fn go_parent(&mut self) {
+        let (base, _) = self.base_and_partial();
+        if let Some(parent) = base.parent() {
+            self.set_path(with_sep(parent));
+        }
+    }
+
+    /// → : descend into the highlighted directory. No-op on the `../` row (use
+    /// ← to go up) — Right always goes into a child.
+    pub fn go_child(&mut self) {
+        if let Some(dir) = self.highlighted() {
+            self.set_path(with_sep(&dir));
         }
     }
 
@@ -263,18 +275,16 @@ impl DirPicker {
         // only while open, so a collapsed field (post-Esc) leaves keys alone and
         // no sibling widget is starved of them.
         if self.open {
-            // Right-arrow drills into the highlighted dir / accepts the ghost,
-            // but only when the caret is at the end of the text, so mid-edit
-            // Right still moves the cursor. The caret read is one frame lagged.
-            let at_end = egui::TextEdit::load_state(ui.ctx(), id)
-                .and_then(|s| s.cursor.char_range())
-                .map_or(true, |r| r.primary.index >= self.path.chars().count());
-            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)); // eat Tab: no focus escape
-            let (up, down, right, enter, esc) = ui.input_mut(|i| {
+            // File-browser model: ←/→ drive the tree (not the text caret), so
+            // they are always consumed. ← up a dir, → into the highlighted dir,
+            // ↑/↓ move the highlight. Edit the path with Backspace/Home/End/click.
+            let (up, down, left, right, enter, esc) = ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab); // eat Tab: no focus escape
                 (
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    at_end && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
                 )
@@ -287,8 +297,12 @@ impl DirPicker {
                 self.move_down();
                 self.scroll_to_sel = true;
             }
+            if left {
+                self.go_parent(); // ← up a directory, always
+                self.scroll_to_sel = true;
+            }
             if right {
-                self.complete();
+                self.go_child(); // → into the highlighted directory
                 self.scroll_to_sel = true;
             }
             if enter {
@@ -340,7 +354,10 @@ impl DirPicker {
                 .margin(egui::Margin::symmetric(6, 0))
                 .desired_width(field_rect.width()),
         );
-        if self.open && self.focus_next {
+        // Keep the field focused the whole time the picker is open, so typing
+        // and the ←/→/↑/↓ handlers never desync from a click that stole focus
+        // (e.g. a mouse click on a dropdown row).
+        if self.open && (self.focus_next || !te.has_focus()) {
             te.request_focus();
             self.focus_next = false;
         }
@@ -520,6 +537,24 @@ mod tests {
         p.select(0); // Parent row
         p.complete();
         assert_eq!(p.current_dir(), Some(d.path().to_path_buf()));
+    }
+
+    #[test]
+    fn left_climbs_and_right_descends_regardless_of_highlight() {
+        let d = tree();
+        // ← climbs to the parent even though a child (not `../`) is highlighted.
+        let mut p = at(&d.path().join("beta"));
+        assert_eq!(p.highlighted_name(), Some("inner".to_string()));
+        p.go_parent();
+        assert_eq!(p.current_dir(), Some(d.path().to_path_buf()));
+        // → descends into the highlighted child.
+        p.set_path(format!(
+            "{}{}be",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        p.go_child();
+        assert_eq!(p.current_dir(), Some(d.path().join("beta")));
     }
 
     #[test]
