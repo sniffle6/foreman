@@ -267,8 +267,8 @@ impl DirPicker {
         self.highlighted()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
     }
-    #[cfg(test)]
-    fn is_open(&self) -> bool {
+    /// Whether the completion popup is showing (and therefore owns Tab/arrows).
+    pub fn is_open(&self) -> bool {
         self.open
     }
     #[cfg(test)]

@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::icons::{self, IconKind};
-use crate::theme::{DIM, TEXT};
+use crate::recents::RecentEntry;
+use crate::theme::{DIM, SEL_BG, TEXT};
 
 /// Provisional, landing-local taxonomy (phase-2 replaces it with the dispatch model).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -351,12 +352,16 @@ fn on_path(
 /// desktop's leader picker).
 pub struct Landing {
     picker: DirPicker,
+    zone: Zone,
+    sel: usize,
 }
 
 impl Landing {
     pub fn new(start: PathBuf) -> Self {
         Self {
             picker: DirPicker::new(start),
+            zone: Zone::Field,
+            sel: 0,
         }
     }
 
@@ -365,11 +370,59 @@ impl Landing {
     /// flag is already spent after the first show).
     pub fn reopen(&mut self) {
         self.picker.reopen();
+        self.zone = Zone::Field;
+        self.sel = 0;
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> Option<LandingAction> {
-        let l = layout(area, ICON_ORDER.len(), 0);
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        recents: &[RecentEntry],
+    ) -> Option<LandingAction> {
+        // Display-only filter: an entry whose dir is missing (unplugged drive) is
+        // hidden, not deleted — it comes back when the drive does (spec).
+        let visible: Vec<&RecentEntry> = recents.iter().filter(|e| e.path.is_dir()).collect();
+        let l = layout(area, ICON_ORDER.len(), visible.len());
+
         let mut action: Option<LandingAction> = None;
+        if !self.picker.is_open() && !visible.is_empty() {
+            let nav = ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    Some(NavKey::Tab)
+                } else if self.zone == Zone::Recents {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                        Some(NavKey::Up)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                        Some(NavKey::Down)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                        Some(NavKey::Enter)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                        Some(NavKey::Esc)
+                    } else if i.events.iter().any(|e| matches!(e, egui::Event::Text(_))) {
+                        Some(NavKey::Text) // typing always means "edit the path"
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            if let Some(key) = nav {
+                let (zone, sel, open) = step(self.zone, self.sel, visible.len(), key);
+                self.zone = zone;
+                self.sel = sel;
+                if let Some(idx) = open {
+                    let e = visible[idx];
+                    action = Some(LandingAction {
+                        path: e.path.clone(),
+                        kind: SessionKind::from_kind_str(&e.kind),
+                    });
+                }
+            }
+        } else {
+            self.zone = Zone::Field; // popup open or list empty: field owns keys
+        }
 
         // Wordmark (mono block art, forge-gradient with an animated specular
         // sweep) + tagline, centered. The sweep needs a steady repaint while the
@@ -419,6 +472,79 @@ impl Landing {
             if resp.clicked() {
                 if let Some(path) = self.picker.current_dir() {
                     action = Some(LandingAction { path, kind });
+                }
+            }
+        }
+
+        if !visible.is_empty() {
+            ui.painter().text(
+                l.recents_header.left_center(),
+                egui::Align2::LEFT_CENTER,
+                "Recent",
+                egui::FontId::proportional(12.0),
+                DIM,
+            );
+            let row_font = egui::FontId::proportional(13.0);
+            for (idx, (r, e)) in l.recents.iter().zip(visible.iter()).enumerate() {
+                let resp = ui.interact(*r, ui.id().with(("recent", idx)), egui::Sense::click());
+                let selected = self.zone == Zone::Recents && idx == self.sel;
+                if selected || resp.hovered() {
+                    ui.painter()
+                        .rect_filled(*r, egui::CornerRadius::same(3), SEL_BG);
+                }
+                if selected {
+                    ui.painter().text(
+                        egui::pos2(r.min.x + 6.0, r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        ">",
+                        egui::FontId::monospace(13.0),
+                        TEXT,
+                    );
+                }
+                let kind = SessionKind::from_kind_str(&e.kind);
+                let tex = icons::texture(ui.ctx(), icon_of(kind), 16);
+                let icon_rect = egui::Rect::from_center_size(
+                    egui::pos2(r.min.x + 28.0, r.center().y),
+                    egui::vec2(16.0, 16.0),
+                );
+                ui.painter().image(
+                    tex.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| e.path.display().to_string());
+                let name_x = r.min.x + 44.0;
+                let name_w = ui
+                    .painter()
+                    .layout_no_wrap(name.clone(), row_font.clone(), TEXT)
+                    .rect
+                    .width();
+                ui.painter().text(
+                    egui::pos2(name_x, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    row_font.clone(),
+                    TEXT,
+                );
+                if let Some(parent) = e.path.parent() {
+                    ui.painter().text(
+                        egui::pos2(name_x + name_w + 10.0, r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        parent.display().to_string(),
+                        row_font.clone(),
+                        DIM,
+                    );
+                }
+                if resp.clicked() {
+                    action = Some(LandingAction {
+                        path: e.path.clone(),
+                        kind,
+                    });
                 }
             }
         }

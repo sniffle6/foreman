@@ -65,6 +65,8 @@ struct App {
     landing_shown: bool,
     /// App-global transient notifications (toasts), drawn on top of everything.
     notify: notify::Notifications,
+    /// Recent-project MRU (recents.json), fed by the desktop's open drain.
+    recents: recents::Recents,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -88,6 +90,7 @@ impl App {
             landing_enabled: std::env::var_os("FOREMAN_LANDING").is_some(),
             landing_shown: false,
             notify: notify::Notifications::new(),
+            recents: recents::Recents::load(),
         }
     }
 }
@@ -380,6 +383,9 @@ impl eframe::App for App {
                 let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
                 self.desktop.tile_new(nid, None);
             }
+            // The startup auto-project is implicit (launch cwd), not a choice —
+            // discard its drain entry so it never pollutes recents (spec).
+            let _ = self.desktop.take_opened();
             self.started = true;
         }
 
@@ -405,7 +411,7 @@ impl eframe::App for App {
                 self.landing.reopen(); // re-focus the field each time we land here
                 self.landing_shown = true;
             }
-            if let Some(act) = self.landing.show(ui, area) {
+            if let Some(act) = self.landing.show(ui, area, self.recents.entries()) {
                 match act.kind.launch_command() {
                     // Terminal: a plain shell, as before.
                     None => {
@@ -499,6 +505,13 @@ impl eframe::App for App {
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250));
         let cadence = if hot { 4 } else { 100 };
         ctx.request_repaint_after(std::time::Duration::from_millis(cadence));
+
+        // Record deliberate project opens (landing, leader picker) into recents.
+        // CLI `foreman open` never creates projects, so it never appears here.
+        for (path, cmd) in self.desktop.take_opened() {
+            self.recents
+                .record(path, recents::kind_of_command(cmd.as_deref()));
+        }
     }
 }
 
