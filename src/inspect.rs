@@ -53,15 +53,16 @@ pub struct CellData {
     pub wide: bool,
 }
 
-/// The rendered viewport as plain text — one string per row, trailing spaces
-/// trimmed, wide-char spacer cells skipped. `region` clamps to the grid.
-pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -> Vec<String> {
-    let grid = term.grid();
-    let off = grid.display_offset() as i32;
-    let cols = grid.columns();
-    let screen_rows = grid.screen_lines();
-    // Clamp the region to the real grid so an out-of-range index can't panic.
-    let (r0, r1, c0, c1) = match region {
+/// Clamp an optional [`Region`] against the grid dimensions, returning the
+/// half-open `(r0, r1, c0, c1)` row/column bounds to iterate. `None` = the full
+/// viewport. Shared by [`snapshot_text`] and [`snapshot_cells`] so an
+/// out-of-range index can't panic and the two clamps can never drift apart.
+fn clamp_region(
+    region: Option<Region>,
+    screen_rows: usize,
+    cols: usize,
+) -> (usize, usize, usize, usize) {
+    match region {
         Some(r) => (
             r.row.min(screen_rows),
             (r.row + r.rows).min(screen_rows),
@@ -69,7 +70,17 @@ pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -
             (r.col + r.cols).min(cols),
         ),
         None => (0, screen_rows, 0, cols),
-    };
+    }
+}
+
+/// The rendered viewport as plain text — one string per row, trailing spaces
+/// trimmed, wide-char spacer cells skipped. `region` clamps to the grid.
+pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -> Vec<String> {
+    let grid = term.grid();
+    let off = grid.display_offset() as i32;
+    let cols = grid.columns();
+    let screen_rows = grid.screen_lines();
+    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
     let mut out = Vec::with_capacity(r1.saturating_sub(r0));
     for row in r0..r1 {
         let line = Line(row as i32 - off);
@@ -128,15 +139,7 @@ pub fn snapshot_cells<L: EventListener>(
     let off = grid.display_offset() as i32;
     let cols = grid.columns();
     let screen_rows = grid.screen_lines();
-    let (r0, r1, c0, c1) = match region {
-        Some(r) => (
-            r.row.min(screen_rows),
-            (r.row + r.rows).min(screen_rows),
-            r.col.min(cols),
-            (r.col + r.cols).min(cols),
-        ),
-        None => (0, screen_rows, 0, cols),
-    };
+    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
     let mut out = Vec::with_capacity(r1.saturating_sub(r0));
     for row in r0..r1 {
         let line = Line(row as i32 - off);
