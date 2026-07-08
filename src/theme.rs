@@ -48,8 +48,10 @@ pub const PROJ_BORDER_FOCUS: egui::Color32 = egui::Color32::from_rgb(150, 150, 1
 pub const SELECTION: egui::Color32 = unmultiplied(231, 231, 231, 70);
 /// `selection.bg_fill` for TextEdits (rename fields).
 pub const SELECTION_TEXT_BG: egui::Color32 = unmultiplied(231, 231, 231, 90);
-/// Selected-row wash in the settings editor.
-pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(231, 231, 231, 30);
+/// Selected-row wash (settings editor, landing recents). Straight alpha via
+/// `unmultiplied` — `from_rgba_premultiplied` with rgb > alpha is an invalid
+/// premultiplied color and blends as a near-white additive band.
+pub const SEL_BG: egui::Color32 = unmultiplied(231, 231, 231, 30);
 pub const CARET: egui::Color32 = unmultiplied(231, 169, 63, 130);
 /// Scrollback indicator thumb at a pane's right edge.
 pub const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
