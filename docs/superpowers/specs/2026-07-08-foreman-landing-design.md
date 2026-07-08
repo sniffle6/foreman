@@ -23,6 +23,13 @@ via the **redesigned directory picker rendered inline** (its own spec,
 untouched while we iterate the look. Spawning a *specific* agent from an icon is
 a named phase-2 gap, not part of this spec.
 
+**Build order (hard prerequisite):** the landing's hero is the *redesigned*
+`DirPicker::show(ui)` (placement-agnostic). Today's `show` paints a full-screen
+dim scrim + centered `egui::Window` (`dirpicker.rs:140-233`), so rendering it
+"inline" would dim the whole landing and pop a modal — the landing is
+unbuildable and un-screenshottable until the picker redesign lands. Build the
+picker first (or co-develop); it gates this work.
+
 ## Design
 
 When the desktop has no windows, render a centered landing instead of quitting;
@@ -57,7 +64,16 @@ New module **`src/landing.rs`** — the empty-desktop landing screen. It owns
 /// (kind = Terminal) or an icon click (that kind), only when `path` exists.
 pub struct LandingAction { pub path: PathBuf, pub kind: SessionKind }
 
+/// Provisional, landing-local taxonomy (a third one alongside `Shell` and
+/// `IconKind`). Kept because three visually distinct buttons must be
+/// distinguishable in the returned value — NOT gratuitous. Expect phase-2 to
+/// replace it with the dispatch/control model's notion of "how to run X" rather
+/// than grow this enum.
 pub enum SessionKind { Claude, Codex, Terminal }
+
+/// Fixed icon order so `layout`'s positional `Vec<Rect>` and the hit-test agree
+/// (test 5's `kind[i]` depends on this).
+const ICON_ORDER: [SessionKind; 3] = [SessionKind::Claude, SessionKind::Codex, SessionKind::Terminal];
 
 /// Holds the inline path field's state across frames.
 pub struct Landing { picker: crate::dirpicker::DirPicker }
@@ -103,9 +119,11 @@ fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout;
 `show` calls `layout`, paints the wordmark (monospace galley) and tagline,
 renders `self.picker.show(ui)` inside `field`, and draws the icon row as
 textured labelled buttons. The picker's `Outcome::Accepted(path)` becomes
-`LandingAction { path, kind: Terminal }`; an icon click opens the picker's
-current path (same existence check) with that kind. The layout arithmetic is
-pure and unit-testable.
+`LandingAction { path, kind: Terminal }`; an icon click reads
+`self.picker.current_dir()` (the picker's blocker-fix accessor) and, when it is
+`Some(dir)`, returns `LandingAction { path: dir, kind }` — the icon opens the
+field's current path without an Enter. The layout arithmetic is pure and
+unit-testable.
 
 The wordmark is an embedded constant — real terminal art, not painter strokes:
 
@@ -123,8 +141,13 @@ gradient-hero cliché.
 Gated behind `FOREMAN_LANDING=1` (read once at startup) so the default build is
 byte-for-byte the current behavior:
 
-- **Startup** (`src/main.rs:343`): when the flag is set, *skip* the auto-project
-  so first run is deserted and lands. Flag off → auto-project as today.
+- **Startup** (`src/main.rs:343`): the `if !self.started` block does three
+  things — the egui zoom opt-out (`349-352`), the auto-project (`354-356`), and
+  the `self.started = true` latch (`357`). Gate **only** the two auto-project
+  lines behind the flag; the zoom opt-out and the `started` latch stay
+  unconditional (skip the latch and the block re-runs every frame; skip the
+  zoom opt-out and terminal Ctrl+Scroll/Ctrl+0 zoom breaks). Flag on → first run
+  is deserted and lands.
 - **Render** (top of the desktop draw): `if flag && desktop.deserted() {
   self.landing.show(ui, area) } else { desktop.show(...) }`. `deserted()` stays
   true on the landing because the landing's picker is `App`-owned — the
@@ -136,6 +159,15 @@ byte-for-byte the current behavior:
   `desktop.add_project(shell, path, ctx)` + `tile_new` (the same pair startup
   uses, `src/main.rs:355`). For the mock every `kind` maps to a plain shell;
   phase-2 maps `Claude`/`Codex` to spawning that agent.
+- **Immediate-mode notes.** While the landing is up, `desktop.show()` does not
+  run, so the desktop's event pump and leader keys are dormant — leader
+  `NewProject` is unavailable on the landing (fine: the inline field *is* the
+  entry; the window X / Alt+F4 is the only quit path now that deserted-quit is
+  skipped). With no PTYs driving repaint on an empty desktop, the ghost/caret
+  will freeze between events — the landing must call `ctx.request_repaint()` (or
+  `_after`) while visible for any animation (see `egui-immediate-mode-reference`).
+  `Outcome::Cancelled` (Esc) from the inline picker is a no-op on the landing —
+  there is nothing to dismiss.
 
 ### What does not change
 
@@ -176,9 +208,17 @@ byte-for-byte the current behavior:
   inline in the field rect (not a button that opens a separate modal), so the
   landing hosts its own `DirPicker`. This removes any blank-behind-modal seam.
 - **Icon-row semantics for the mock:** Enter opens the field path as a plain
-  terminal; an icon opens that same path with its `kind`. **Named gap (phase
-  2):** map `Claude`/`Codex` to actually spawning that agent in the new project;
-  the mock spawns a plain shell for every kind.
+  terminal; an icon opens that same path with its `kind`. **Loud caveat:** in
+  this look-only mock the returned `kind` is cosmetic — every icon (including
+  [Claude]/[Codex]) actually spawns a plain PowerShell shell, so a tester
+  clicking [Claude] gets a shell with no agent and no error. Also the
+  [Terminal] icon uses `IconKind::PowerShell`, which is PS-blue-tinted
+  (`icons.rs`), so it reads blue, not neutral. **Named gap (phase 2):** map
+  `Claude`/`Codex` to actually spawning that agent in the new project.
+- **`SessionKind` is provisional / landing-local** — accepted as the return
+  value (three distinct buttons need to be told apart), but expected to be
+  superseded by the phase-2 dispatch model rather than grown; icon order is
+  pinned to the `ICON_ORDER` const so positional rects and the hit-test agree.
 
 ## Testing
 
