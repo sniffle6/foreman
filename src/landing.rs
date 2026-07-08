@@ -3,6 +3,10 @@
 use eframe::egui;
 use std::path::PathBuf;
 
+use crate::dirpicker::{DirPicker, Outcome};
+use crate::icons::{self, IconKind};
+use crate::theme::{BORDER_FOCUS, DIM, TEXT};
+
 /// Provisional, landing-local taxonomy (phase-2 replaces it with the dispatch model).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
@@ -75,6 +79,91 @@ fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout {
         tagline,
         field,
         icons,
+    }
+}
+
+fn icon_of(k: SessionKind) -> IconKind {
+    match k {
+        SessionKind::Claude => IconKind::Claude,
+        SessionKind::Codex => IconKind::Codex,
+        SessionKind::Terminal => IconKind::PowerShell, // shared shell-prompt glyph
+    }
+}
+
+fn label_of(k: SessionKind) -> &'static str {
+    match k {
+        SessionKind::Claude => "Claude",
+        SessionKind::Codex => "Codex",
+        SessionKind::Terminal => "Terminal",
+    }
+}
+
+/// The empty-desktop landing. Owns its own path-field picker (separate from the
+/// desktop's leader picker).
+pub struct Landing {
+    picker: DirPicker,
+}
+
+impl Landing {
+    pub fn new(start: PathBuf) -> Self {
+        Self {
+            picker: DirPicker::new(start),
+        }
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> Option<LandingAction> {
+        let l = layout(area, ICON_ORDER.len());
+        let mut action: Option<LandingAction> = None;
+
+        // Wordmark (mono block art) + tagline, centered.
+        let word_font = egui::FontId::monospace(14.0);
+        ui.painter().text(
+            l.wordmark.center_top(),
+            egui::Align2::CENTER_TOP,
+            FOREMAN_ART.trim_matches('\n'),
+            word_font,
+            BORDER_FOCUS,
+        );
+        ui.painter().text(
+            l.tagline.center(),
+            egui::Align2::CENTER_CENTER,
+            "tmux for AI agents",
+            egui::FontId::proportional(14.0),
+            DIM,
+        );
+
+        // Inline picker in the field rect.
+        let picker_out = {
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(l.field));
+            self.picker.show(&mut child)
+        };
+        if let Outcome::Accepted(path) = picker_out {
+            action = Some(LandingAction {
+                path,
+                kind: SessionKind::Terminal,
+            });
+        }
+
+        // Icon row — each opens the picker's current path with that kind.
+        for (r, &kind) in l.icons.iter().zip(ICON_ORDER.iter()) {
+            let tex = icons::texture(ui.ctx(), icon_of(kind), 48);
+            let resp = ui.put(*r, egui::Button::image(&tex));
+            ui.painter().text(
+                r.center_bottom() + egui::vec2(0.0, 12.0),
+                egui::Align2::CENTER_TOP,
+                label_of(kind),
+                egui::FontId::proportional(12.0),
+                TEXT,
+            );
+            if resp.clicked() {
+                if let Some(path) = self.picker.current_dir() {
+                    action = Some(LandingAction { path, kind });
+                }
+            }
+        }
+
+        ui.ctx().request_repaint(); // no PTYs drive repaint on an empty desktop
+        action
     }
 }
 
