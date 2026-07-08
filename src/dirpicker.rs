@@ -1,6 +1,75 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
+fn is_sep(c: char) -> bool {
+    c == '/' || c == '\\'
+}
+
+/// Lexically split a path buffer into (base, partial). `partial` is the segment
+/// after the last separator (empty if the buffer ends in one). `base` drops the
+/// trailing separator, except a lone leading-sep root ("/") or a bare drive
+/// ("C:") keep a separator so the base still names a directory. Pure — no fs.
+fn split(buf: &str) -> (String, String) {
+    match buf.rfind(is_sep) {
+        None => (String::new(), buf.to_string()),
+        Some(i) => {
+            let head = &buf[..i];
+            let sep = &buf[i..=i];
+            let base = if head.is_empty() {
+                buf[..=i].to_string() // "/x" → "/"
+            } else if head.ends_with(':') {
+                format!("{head}{sep}") // r"C:\Us" → r"C:\"
+            } else {
+                head.to_string()
+            };
+            (base, buf[i + 1..].to_string())
+        }
+    }
+}
+
+/// Resolve a lexical `base` to a directory to list: empty → `root`; relative →
+/// joined onto `root`; absolute → itself.
+fn base_dir(base: &str, root: &Path) -> PathBuf {
+    if base.is_empty() {
+        root.to_path_buf()
+    } else {
+        let p = Path::new(base);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    }
+}
+
+/// Child dirs of `base` whose names case-insensitively prefix `partial`. A pure
+/// prefix filter over the injected `lister`'s output (the lister owns sort +
+/// dotfile policy — see `list_dirs`).
+fn completions(base: &Path, partial: &str, lister: &dyn Fn(&Path) -> Vec<PathBuf>) -> Vec<PathBuf> {
+    let needle = partial.to_lowercase();
+    lister(base)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_lowercase().starts_with(&needle))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Remainder of the highlighted dir's REAL name after `partial` chars, plus a
+/// separator — the gray inline ghost. None when partial is empty or nothing is
+/// highlighted. Case-preserving (prefix match is case-insensitive).
+fn ghost(partial: &str, highlighted: Option<&Path>) -> Option<String> {
+    if partial.is_empty() {
+        return None;
+    }
+    let name = highlighted?.file_name()?.to_str()?;
+    let rest: String = name.chars().skip(partial.chars().count()).collect();
+    Some(format!("{rest}{}", std::path::MAIN_SEPARATOR))
+}
+
 /// One row in the picker list.
 #[derive(Debug, PartialEq)]
 pub enum Item {
@@ -370,5 +439,57 @@ mod tests {
         p.drill_in(); // must NOT panic on empty list
         p.move_down(); // must NOT panic / overflow on empty list
         assert_eq!(p.cwd(), d.path()); // drill_in on empty list was a no-op
+    }
+
+    #[test]
+    fn split_lexical_posix_and_windows() {
+        assert_eq!(split("/a/b/c"), ("/a/b".into(), "c".into()));
+        assert_eq!(split("/a/b/"), ("/a/b".into(), "".into()));
+        assert_eq!(split("/x"), ("/".into(), "x".into())); // leading-sep root keeps its sep
+        assert_eq!(split(""), ("".into(), "".into()));
+        assert_eq!(split("foreman"), ("".into(), "foreman".into())); // no sep: all partial
+        assert_eq!(split(r"C:\Us"), (r"C:\".into(), "Us".into())); // drive root keeps its sep
+        assert_eq!(split(r"C:\"), (r"C:\".into(), "".into()));
+        assert_eq!(split(r"C:\Users\"), (r"C:\Users".into(), "".into()));
+        // Pinned rules for the ambiguous cases (documented degradation):
+        assert_eq!(split("C:"), ("".into(), "C:".into())); // bare drive → treated as a partial
+        assert_eq!(split(r"\\srv\share"), (r"\\srv".into(), "share".into())); // UNC: base is bare \\srv
+    }
+
+    #[test]
+    fn base_dir_resolves_relative_against_root() {
+        let root = Path::new("/root");
+        assert_eq!(base_dir("", root), PathBuf::from("/root")); // empty → root
+        assert_eq!(base_dir("sub", root), PathBuf::from("/root/sub")); // relative → joined
+    }
+
+    #[test]
+    fn completions_is_case_insensitive_prefix_over_the_lister() {
+        let lister = |_: &Path| {
+            ["foreman", "formats", "platform"]
+                .iter()
+                .map(|n| PathBuf::from("/x").join(n))
+                .collect()
+        };
+        let got: Vec<String> = completions(Path::new("/x"), "FoR", &lister)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["foreman", "formats"]); // prefix only, case-insensitive; no "platform"
+    }
+
+    #[test]
+    fn ghost_is_the_real_names_remainder_case_preserving() {
+        let hl = PathBuf::from("/x/foreman");
+        assert_eq!(
+            ghost("for", Some(&hl)),
+            Some(format!("eman{}", std::path::MAIN_SEPARATOR))
+        );
+        assert_eq!(
+            ghost("FOR", Some(&hl)),
+            Some(format!("eman{}", std::path::MAIN_SEPARATOR))
+        ); // real casing
+        assert_eq!(ghost("", Some(&hl)), None); // no partial → no ghost
+        assert_eq!(ghost("for", None), None); // nothing highlighted
     }
 }
