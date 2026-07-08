@@ -14,7 +14,7 @@ I" means walking the tree one directory at a time.
 
 We want an address-bar model: an **editable path field is the source of truth**,
 with completion shown two ways at once — **inline ghost text** in the field
-(the remainder of the top match, accepted with Tab or →, exactly like PSReadLine
+(the remainder of the top match, accepted with **Tab**, like PSReadLine
 predictive text) and a **clickable dropdown** that slides out beneath the field
 (`../` at the top plus matching child directories). Editing the field text —
 e.g. shrinking `/code/foreman/` to `/code/`, or typing `for` — re-derives the
@@ -39,9 +39,9 @@ supplies both the ghost text and the drop-down selection.
 - Type → edits the buffer, re-derives base/partial, resets the highlight to the
   first completion. Ghost = highlighted match's remainder.
 - ↑/↓ → move the highlight; the ghost follows the highlighted row.
-- **Tab or → (at end of text)** → accept: rewrite the buffer to the highlighted
-  directory + separator (drill in), then re-derive. `→` mid-text is a normal
-  cursor move; only `→` at the caret's end accepts the ghost (see the risk note).
+- **Tab** → accept: rewrite the buffer to the highlighted directory + separator
+  (drill in), then re-derive. (Right-arrow stays a normal cursor move — see the
+  decision history for why `→`-to-accept was dropped.)
 - Click a row → same as accept for that row.
 - **Enter** → open the buffer path as the project, iff it is an existing
   **directory** (`is_dir`, not `exists`: a file path is rejected). On a
@@ -141,20 +141,15 @@ segments and drive matching.
   an Enter that does NOT open (path is not a dir) we `request_focus()` again and
   paint a weak invalid cue from the theme border ladder; only a valid dir ends
   the picker.
-- **Key capture is the known risk, and it splits into two tiers.** The *safe,
-  standard* part (do this first): intercept Tab, ↑/↓, Enter, Esc via
-  `input_mut().consume_key(...)` before showing the field — the codebase already
-  runs focused `TextEdit`s this way (chat input, rename). The *riskiest 10%* is
-  **`→`-at-end-of-text**: distinguishing "accept ghost" from "move cursor right"
-  needs a caret-at-end test, i.e. a frame-lagged `cursor_range`/`TextEditState`
-  read plus a conditional consume of Right. Implement it with the prior frame's
-  caret-at-end + ghost-present to decide whether to consume `→` this frame.
-  **Fallback:** if it proves flaky, ship **Tab-only accept** in v1 and add `→`
-  as a fast-follow — Tab alone satisfies "fill it in." Follow the
-  `egui-immediate-mode-reference` skill throughout. (The current picker
-  deliberately avoids a focusable field to keep these keys free,
-  `dirpicker.rs:137-139`; the rewrite takes the conflict on with the pattern
-  above.)
+- **Key capture** stays in the safe, standard tier: intercept Tab, ↑/↓, Enter,
+  Esc via `input_mut().consume_key(...)` before showing the field — the codebase
+  already runs focused `TextEdit`s this way (chat input, rename). Accept is
+  **Tab only**; right-arrow is left to the `TextEdit` as an ordinary cursor
+  move, which removes the one genuinely fiddly interception (caret-at-end
+  gating) entirely. Follow the `egui-immediate-mode-reference` skill. (The
+  current picker avoids a focusable field to keep these keys free,
+  `dirpicker.rs:137-139`; the rewrite takes the conflict on, but only for the
+  no-conflict keys.)
 - The dropdown "slide-out" is a plain popup for v1; a real slide animation is
   optional polish. `show_modal` keeps a **subtle scrim** (lighter than today's
   150-alpha dim) as the modality signal; `show` (inline) draws no scrim.
@@ -180,7 +175,7 @@ segments and drive matching.
 - **Ghost text in the field + clickable dropdown, both synced to the highlight**
   — **accepted** (user: "auto complete should be on the text field too; Tab or
   → to fill it in"). One highlight drives both surfaces.
-- **Tab/→ completes, Enter opens** — **accepted** over Enter-drills-then-opens
+- **Tab completes, Enter opens** — **accepted** over Enter-drills-then-opens
   and Enter-opens-highlighted; only this lets you open the folder you are
   *inside* (`/code/foreman/`) without it being a row.
 - **Prefix matching** — **accepted** over substring (current) and fuzzy;
@@ -188,11 +183,11 @@ segments and drive matching.
 - **Inline on the landing + light floating popup from the leader** — **accepted**
   over always-a-bar and keep-the-centered-modal. Drove the placement-agnostic
   `show` / `show_modal` split.
-- **`→` accepts the ghost only at end-of-text; Tab always accepts** — **kept in
-  v1** at the user's explicit request ("Tab or right arrow"). A reviewer flagged
-  the end-of-text gate as the one genuinely risky bit of key interception and
-  suggested Tab-only v1; kept because the user asked for `→`, but documented with
-  a Tab-only fallback and `→` as a fast-follow if it proves flaky.
+- **Tab accepts the ghost; `→` does not** — **settled Tab-only.** The user first
+  asked for "Tab or right arrow," a reviewer flagged `→`-at-end-of-text as the
+  one genuinely risky bit of key interception (needs a frame-lagged caret-at-end
+  read), and on that tradeoff the user chose Tab-only. `→` stays a plain cursor
+  move; right-arrow accept is not planned.
 - **Enter opens only an existing directory** (`is_dir`) — never a file or a
   missing path; a no-op Enter re-focuses the field with an invalid cue rather
   than dying. The current picker deliberately avoided a focusable field for this
@@ -222,7 +217,7 @@ off the old `cwd`/`query`/`items` API and are replaced.
 3. `ghost`: highlighted `foreman`, partial `for` → `eman` + sep; **casing** —
    partial `FOR`, dir `foreman` → `eman` (dir's real name); partial empty → None;
    `../` highlighted → None.
-4. `complete` (Tab/→/click): highlighted `foreman` → buffer becomes `…/foreman`
+4. `complete` (Tab/click): highlighted `foreman` → buffer becomes `…/foreman`
    + sep, partial resets, rows = foreman's children, `selected` re-seeds to the
    first completion.
 5. `../` drill rewrites the buffer to base's parent + sep.
@@ -238,7 +233,7 @@ off the old `cwd`/`query`/`items` API and are replaced.
    path → `None`.
 
 Evidence loop: build, invoke the picker (leader `NewProject` and the landing
-hero), type a partial and confirm the gray ghost, Tab/→ fills it, ↑/↓ moves the
+hero), type a partial and confirm the gray ghost, Tab fills it, ↑/↓ moves the
 ghost, a click drills, Enter opens an existing dir (and a bad Enter keeps focus
 with an invalid cue), Esc cancels — screenshot.
 
