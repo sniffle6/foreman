@@ -17,6 +17,7 @@ mod landing;
 mod layout;
 mod notify;
 mod proc;
+mod recents;
 mod settings;
 mod skills_install;
 mod terminal;
