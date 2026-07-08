@@ -57,6 +57,10 @@ struct App {
     /// and closing the last one quits (today's behavior); when set, an empty
     /// desktop shows the landing instead.
     landing_enabled: bool,
+    /// Whether the landing rendered last frame. Its false→true edge re-opens and
+    /// re-focuses the landing's picker (whose one-shot focus flag is otherwise
+    /// spent after the first appearance).
+    landing_shown: bool,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -78,6 +82,7 @@ impl App {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             ),
             landing_enabled: std::env::var_os("FOREMAN_LANDING").is_some(),
+            landing_shown: false,
         }
     }
 }
@@ -391,6 +396,10 @@ impl eframe::App for App {
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
         if self.landing_enabled && self.desktop.deserted() {
+            if !self.landing_shown {
+                self.landing.reopen(); // re-focus the field each time we land here
+                self.landing_shown = true;
+            }
             if let Some(act) = self.landing.show(ui, area) {
                 let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
                 self.desktop.tile_new(nid, None);
@@ -399,6 +408,7 @@ impl eframe::App for App {
                 let _ = act.kind;
             }
         } else {
+            self.landing_shown = false;
             self.desktop
                 .show(ui, area, true, egui::Id::new("desktop"), false);
         }

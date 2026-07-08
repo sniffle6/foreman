@@ -109,6 +109,13 @@ impl Landing {
         }
     }
 
+    /// Re-open + re-focus the picker when the landing reappears (the same
+    /// `Landing` lives for the app's lifetime, so its picker's one-shot focus
+    /// flag is already spent after the first show).
+    pub fn reopen(&mut self) {
+        self.picker.reopen();
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, area: egui::Rect) -> Option<LandingAction> {
         let l = layout(area, ICON_ORDER.len());
         let mut action: Option<LandingAction> = None;
@@ -160,7 +167,6 @@ impl Landing {
             }
         }
 
-        ui.ctx().request_repaint(); // no PTYs drive repaint on an empty desktop
         action
     }
 }

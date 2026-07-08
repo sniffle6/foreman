@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-use crate::theme::{BORDER, DANGER, DESK_BG, DIM, TEXT};
+use crate::theme::{BORDER, BORDER_FOCUS, DANGER, DESK_BG, DIM, TEXT};
 
 fn is_sep(c: char) -> bool {
     c == '/' || c == '\\'
@@ -93,6 +93,12 @@ pub struct DirPicker {
     root: PathBuf,
     focus_next: bool,
     invalid: bool,
+    /// Whether the dropdown is showing and the field wants focus. Esc collapses
+    /// it (hiding the dropdown, revealing anything behind); a click reopens it.
+    open: bool,
+    /// Set on keyboard navigation so the dropdown scrolls the highlight into
+    /// view next frame; cleared after rendering.
+    scroll_to_sel: bool,
 }
 
 impl DirPicker {
@@ -107,9 +113,19 @@ impl DirPicker {
             root: start,
             focus_next: true,
             invalid: false,
+            open: true,
+            scroll_to_sel: false,
         };
         p.reseed();
         p
+    }
+
+    /// Reopen the dropdown and re-request field focus — used when the landing
+    /// reappears (the same `Landing`/`DirPicker` lives for the app's lifetime,
+    /// so `focus_next` would otherwise be spent after the first show).
+    pub fn reopen(&mut self) {
+        self.open = true;
+        self.focus_next = true;
     }
 
     // --- pure-ish derivations (real fs via list_dirs) ---
@@ -241,48 +257,76 @@ impl DirPicker {
     pub fn show(&mut self, ui: &mut egui::Ui) -> Outcome {
         let id = egui::Id::new("dirpicker-field");
 
-        // Intercept navigation keys BEFORE the TextEdit sees them.
-        let (tab, up, down, enter, esc) = ui.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            )
-        });
-        if up {
-            self.move_up();
-        }
-        if down {
-            self.move_down();
-        }
-        if tab {
-            self.complete();
-        }
-        if esc {
-            return Outcome::Cancelled;
-        }
-        if enter {
-            match self.accept() {
-                Some(p) => return Outcome::Accepted(p),
-                None => self.invalid = true, // Task A3 paints the cue; keep focus below
+        let mut outcome = Outcome::Pending;
+
+        // Navigation keys are intercepted BEFORE the TextEdit sees them — but
+        // only while open, so a collapsed field (post-Esc) leaves keys alone and
+        // no sibling widget is starved of them.
+        if self.open {
+            // Right-arrow drills into the highlighted dir / accepts the ghost,
+            // but only when the caret is at the end of the text, so mid-edit
+            // Right still moves the cursor. The caret read is one frame lagged.
+            let at_end = egui::TextEdit::load_state(ui.ctx(), id)
+                .and_then(|s| s.cursor.char_range())
+                .map_or(true, |r| r.primary.index >= self.path.chars().count());
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)); // eat Tab: no focus escape
+            let (up, down, right, enter, esc) = ui.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    at_end && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                )
+            });
+            if up {
+                self.move_up();
+                self.scroll_to_sel = true;
+            }
+            if down {
+                self.move_down();
+                self.scroll_to_sel = true;
+            }
+            if right {
+                self.complete();
+                self.scroll_to_sel = true;
+            }
+            if enter {
+                match self.accept() {
+                    Some(p) => return Outcome::Accepted(p),
+                    None => self.invalid = true, // A3 paints the cue; Enter is consumed so focus is kept
+                }
+            }
+            if esc {
+                // Collapse, not cancel: the leader modal turns this Cancelled
+                // into dropping the picker; the landing ignores it, leaving the
+                // dropdown hidden and the field defocused so its icons show.
+                self.open = false;
+                ui.memory_mut(|m| m.surrender_focus(id));
+                outcome = Outcome::Cancelled;
             }
         }
 
-        // Field.
+        // Field (always drawn — a collapsed field is still visible and clickable).
         let font = egui::FontId::monospace(13.0);
         let field_h = 26.0;
         let field_rect = {
             let r = ui.max_rect();
             egui::Rect::from_min_size(r.min, egui::vec2(r.width().min(520.0), field_h))
         };
+        let border = if self.invalid {
+            DANGER
+        } else if self.open {
+            BORDER_FOCUS
+        } else {
+            BORDER
+        };
         ui.painter()
             .rect_filled(field_rect, egui::CornerRadius::same(3), DESK_BG);
         ui.painter().rect_stroke(
             field_rect,
             egui::CornerRadius::same(3),
-            egui::Stroke::new(1.0, if self.invalid { DANGER } else { BORDER }),
+            egui::Stroke::new(1.0, border),
             egui::StrokeKind::Inside,
         );
         let te = ui.put(
@@ -296,68 +340,76 @@ impl DirPicker {
                 .margin(egui::Margin::symmetric(6, 0))
                 .desired_width(field_rect.width()),
         );
-        if self.focus_next {
+        if self.open && self.focus_next {
             te.request_focus();
             self.focus_next = false;
         }
+        if te.gained_focus() {
+            self.open = true; // clicking a collapsed field reopens it
+        }
         if te.changed() {
+            self.open = true;
             self.reseed(); // typing re-derives
         }
-        if enter && self.invalid {
-            te.request_focus(); // never a dead field
-        }
 
-        // Inline ghost: the highlighted match's remainder, painted in DIM right
-        // after the typed text (mono font → measured width lines it up exactly).
-        if let Some(g) = self.ghost_text() {
-            let text_w = ui
-                .painter()
-                .layout_no_wrap(self.path.clone(), font.clone(), TEXT)
-                .rect
-                .width();
-            let x = field_rect.min.x + 6.0 + text_w; // 6.0 == field margin
-            ui.painter().text(
-                egui::pos2(x, field_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                g,
-                font.clone(),
-                DIM,
-            );
-        }
+        if self.open {
+            // Inline ghost: the highlighted match's remainder, painted in DIM
+            // right after the typed text (mono font → measured width aligns it).
+            if let Some(g) = self.ghost_text() {
+                let text_w = ui
+                    .painter()
+                    .layout_no_wrap(self.path.clone(), font.clone(), TEXT)
+                    .rect
+                    .width();
+                let x = field_rect.min.x + 6.0 + text_w; // 6.0 == field margin
+                ui.painter().text(
+                    egui::pos2(x, field_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    g,
+                    font.clone(),
+                    DIM,
+                );
+            }
 
-        // Dropdown, in a popup Area anchored under the field.
-        let mut clicked: Option<usize> = None;
-        egui::Area::new(id.with("drop"))
-            .fixed_pos(field_rect.left_bottom() + egui::vec2(0.0, 2.0))
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                ui.set_max_width(field_rect.width());
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            for (idx, row) in self.rows().into_iter().enumerate() {
-                                let label = match &row {
-                                    Row::Parent => "../".to_string(),
-                                    Row::Dir(p) => p
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                };
-                                if ui.selectable_label(idx == self.selected, label).clicked() {
-                                    clicked = Some(idx);
+            // Dropdown, in a popup Area anchored under the field.
+            let mut clicked: Option<usize> = None;
+            egui::Area::new(id.with("drop"))
+                .fixed_pos(field_rect.left_bottom() + egui::vec2(0.0, 2.0))
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_width(field_rect.width());
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(280.0)
+                            .show(ui, |ui| {
+                                for (idx, row) in self.rows().into_iter().enumerate() {
+                                    let label = match &row {
+                                        Row::Parent => "../".to_string(),
+                                        Row::Dir(p) => p
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    };
+                                    let resp = ui.selectable_label(idx == self.selected, label);
+                                    if resp.clicked() {
+                                        clicked = Some(idx);
+                                    }
+                                    if idx == self.selected && self.scroll_to_sel {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
                                 }
-                            }
-                        });
+                            });
+                    });
                 });
-            });
-        if let Some(idx) = clicked {
-            self.selected = idx;
-            self.complete();
+            if let Some(idx) = clicked {
+                self.selected = idx;
+                self.complete();
+            }
         }
 
-        Outcome::Pending
+        self.scroll_to_sel = false;
+        outcome
     }
 
     /// Leader-invoked modal: `show` inside a top-center floating Area with a
@@ -368,10 +420,7 @@ impl DirPicker {
             .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(90)); // lighter than 150
         let mut outcome = Outcome::Pending;
         egui::Area::new(egui::Id::new("dirpicker-modal"))
-            .anchor(
-                egui::Align2::CENTER_TOP,
-                egui::vec2(0.0, screen.height() * 0.18),
-            )
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 16.0))
             .show(ui.ctx(), |ui| {
                 ui.set_max_width(520.0);
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
