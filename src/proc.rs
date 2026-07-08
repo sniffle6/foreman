@@ -132,6 +132,17 @@ pub fn top_children(root_pid: u32) -> Vec<ProcInfo> {
     })
 }
 
+/// Force an immediate table refresh, ignoring the throttle, and reset it so the
+/// following `top_children` calls this frame reuse the fresh scan. Called once at
+/// the instant a close/quit is requested: without it, a child spawned inside the
+/// last throttle window (<`REFRESH_EVERY`) is invisible and the pane closes with
+/// no warning — the exact silent-kill the confirm exists to prevent. One
+/// synchronous scan on the caller's thread, on the closing click (not the modal);
+/// the icon detector already runs the same scan every `REFRESH_EVERY` anyway.
+pub fn refresh_now() {
+    SCANNER.with(|s| s.borrow_mut().refresh());
+}
+
 struct Scanner {
     sys: sysinfo::System,
     table: Vec<ProcRow>,
@@ -356,6 +367,20 @@ mod tests {
         assert!(
             collect_top_level(&t, 500).is_empty(),
             "another shell's child leaked in"
+        );
+    }
+
+    #[test]
+    fn refresh_now_scans_the_live_table() {
+        // Forces a real scan (ignoring the throttle) and reads back the table via
+        // the current process's PID — proving the close-time refresh actually
+        // repopulates, so a just-spawned child would be visible.
+        refresh_now();
+        let me = std::process::id();
+        let seen = SCANNER.with(|s| s.borrow().table.iter().any(|r| r.pid == me));
+        assert!(
+            seen,
+            "a forced refresh should include the running test process"
         );
     }
 }

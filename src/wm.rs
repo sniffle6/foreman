@@ -2003,6 +2003,9 @@ impl WindowManager {
         };
         let tab = &w.tabs[w.active];
         let is_project = matches!(tab.content, Content::Project(_));
+        // Fresh scan at the instant of the request so a child spawned inside the
+        // throttle window is seen before we decide whether to warn (or close now).
+        crate::proc::refresh_now();
         let groups = groups_in_tab(tab);
         if groups.is_empty() {
             self.close_active_tab(id);
@@ -2026,6 +2029,7 @@ impl WindowManager {
             return;
         };
         let is_project = matches!(tab.content, Content::Project(_));
+        crate::proc::refresh_now();
         let groups = groups_in_tab(tab);
         if groups.is_empty() {
             self.close_tab(id, idx);
@@ -2128,6 +2132,7 @@ impl WindowManager {
         if self.overlay_blocks_close() {
             return true; // an overlay is already up (a confirm, picker, or settings)
         }
+        crate::proc::refresh_now();
         let groups = self.project_groups();
         if groups.is_empty() {
             return false;

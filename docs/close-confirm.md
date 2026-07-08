@@ -66,12 +66,15 @@ speed-bump in front of that.
 - **The list is a snapshot** taken when the modal opens, not live. If a listed
   process exits while you're staring at the dialog, no big deal — confirming
   just closes, cancelling just keeps the pane.
-- **Detection can lag up to ~1.5s.** `top_children` reads the shared, throttled
-  `proc::SCANNER` (refreshes at most every 1500 ms). A child spawned in the last
-  fraction of a second before you hit close may not be in the table yet, so a
-  genuinely-busy pane could close with no warning. Narrow window, and the
-  kill-on-close Job still cleans it up — but it's the one hole left in the gate.
-  A forced refresh at request time would close it (follow-up).
+- **The scan is forced fresh at close time.** `top_children` normally reads the
+  shared `proc::SCANNER` throttled to ~1500 ms, so a child spawned inside that
+  window could otherwise be missed and the pane close with no warning. Each close
+  funnel calls `proc::refresh_now()` first, forcing an immediate scan (and
+  resetting the throttle so the rest of the request reuses it). Cost is one
+  synchronous `sysinfo` scan on the *closing click*, not on the modal — the modal
+  never lags — and the icon detector already runs the same scan every 1500 ms.
+  (A child spawned in the same instant as the click is still a theoretical miss,
+  but the kill-on-close Job cleans it up regardless.)
 - **Exited terminals are skipped.** A shell that has died lingers as a tab (its
   title stamped `· exited`) until you close it. Its `root_pid` is stale and the
   OS may recycle it, so the scan gates on `Session::has_exited()` — a dead
