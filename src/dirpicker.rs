@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-use crate::theme::{BORDER, DANGER, DESK_BG, TEXT};
+use crate::theme::{BORDER, DANGER, DESK_BG, DIM, TEXT};
 
 fn is_sep(c: char) -> bool {
     c == '/' || c == '\\'
@@ -132,13 +132,18 @@ impl DirPicker {
     }
 
     /// The highlighted dir, if `selected` points at a `Dir` row. Consumed by the
-    /// inline ghost text (Task A3) and by the test accessors below.
-    #[allow(dead_code)] // non-test use arrives with the ghost render in Task A3
+    /// inline ghost text (`ghost_text`) and by the test accessors below.
     fn highlighted(&self) -> Option<PathBuf> {
         match self.rows().into_iter().nth(self.selected) {
             Some(Row::Dir(p)) => Some(p),
             _ => None,
         }
+    }
+
+    /// The ghost suffix for the current field: the highlighted match's remainder.
+    fn ghost_text(&self) -> Option<String> {
+        let (_, partial) = self.base_and_partial();
+        ghost(&partial, self.highlighted().as_deref())
     }
 
     /// Resolve the whole buffer to a path (relative → against root).
@@ -300,6 +305,24 @@ impl DirPicker {
         }
         if enter && self.invalid {
             te.request_focus(); // never a dead field
+        }
+
+        // Inline ghost: the highlighted match's remainder, painted in DIM right
+        // after the typed text (mono font → measured width lines it up exactly).
+        if let Some(g) = self.ghost_text() {
+            let text_w = ui
+                .painter()
+                .layout_no_wrap(self.path.clone(), font.clone(), TEXT)
+                .rect
+                .width();
+            let x = field_rect.min.x + 6.0 + text_w; // 6.0 == field margin
+            ui.painter().text(
+                egui::pos2(x, field_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                g,
+                font.clone(),
+                DIM,
+            );
         }
 
         // Dropdown, in a popup Area anchored under the field.
