@@ -3659,7 +3659,7 @@ impl WindowManager {
     /// picker, the keybindings editor, and the leader cue / help cheat-sheet.
     fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
-            match picker.show(ui) {
+            match picker.show_modal(ui) {
                 Outcome::Pending => self.picker = Some(picker),
                 Outcome::Cancelled => {}
                 Outcome::Accepted(path) => {

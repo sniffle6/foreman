@@ -1,6 +1,8 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
+use crate::theme::{BORDER, DANGER, DESK_BG, TEXT};
+
 fn is_sep(c: char) -> bool {
     c == '/' || c == '\\'
 }
@@ -70,234 +72,289 @@ fn ghost(partial: &str, highlighted: Option<&Path>) -> Option<String> {
     Some(format!("{rest}{}", std::path::MAIN_SEPARATOR))
 }
 
-/// One row in the picker list.
-#[derive(Debug, PartialEq)]
-pub enum Item {
-    /// ".." — navigate to the parent of the current location.
+/// A row in the completion dropdown.
+enum Row {
     Parent,
-    /// A child directory of the current location.
     Dir(PathBuf),
 }
 
-/// Result of rendering the modal for one frame.
+/// Result of rendering the picker for one frame.
 pub enum Outcome {
     Pending,
     Cancelled,
     Accepted(PathBuf),
 }
 
-/// Keyboard-driven directory navigator. Enter accepts the current location.
+/// Address-bar directory picker: the editable `path` buffer is the source of
+/// truth; completion shows as a ghost + a dropdown driven by `selected`.
 pub struct DirPicker {
-    cwd: PathBuf,
-    query: String,
-    dirs: Vec<PathBuf>, // child directories of `cwd`; sorted; dotfiles excluded
-    selected: usize,    // index into `items()`
+    path: String,
+    selected: usize,
+    root: PathBuf,
+    focus_next: bool,
+    invalid: bool,
 }
 
 impl DirPicker {
     pub fn new(start: PathBuf) -> Self {
+        let mut path = start.display().to_string();
+        if !path.ends_with(is_sep) {
+            path.push(std::path::MAIN_SEPARATOR);
+        }
         let mut p = Self {
-            cwd: start,
-            query: String::new(),
-            dirs: vec![],
+            path,
             selected: 0,
+            root: start,
+            focus_next: true,
+            invalid: false,
         };
-        p.reload();
+        p.reseed();
         p
     }
 
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
+    // --- pure-ish derivations (real fs via list_dirs) ---
+
+    fn base_and_partial(&self) -> (PathBuf, String) {
+        let (base, partial) = split(&self.path);
+        (base_dir(&base, &self.root), partial)
     }
 
-    pub fn query(&self) -> &str {
-        &self.query
-    }
-
-    pub fn selected(&self) -> usize {
-        self.selected
-    }
-
-    /// Reload `dirs` from disk and reset query/selection. Called on every move
-    /// between directories.
-    fn reload(&mut self) {
-        self.query.clear();
-        self.selected = 0;
-        self.dirs = list_dirs(&self.cwd);
-    }
-
-    /// Visible rows after applying the query filter. A `Parent` row leads the
-    /// list only when the query is empty and `cwd` has a parent.
-    pub fn items(&self) -> Vec<Item> {
+    fn rows(&self) -> Vec<Row> {
+        let (base, partial) = self.base_and_partial();
         let mut out = Vec::new();
-        if self.query.is_empty() && self.cwd.parent().is_some() {
-            out.push(Item::Parent);
+        if base.parent().is_some() {
+            out.push(Row::Parent);
         }
-        let q = self.query.to_lowercase();
-        for d in &self.dirs {
-            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if q.is_empty() || name.to_lowercase().contains(&q) {
-                out.push(Item::Dir(d.clone()));
-            }
+        for d in completions(&base, &partial, &list_dirs) {
+            out.push(Row::Dir(d));
         }
         out
     }
 
+    /// The highlighted dir, if `selected` points at a `Dir` row. Consumed by the
+    /// inline ghost text (Task A3) and by the test accessors below.
+    #[allow(dead_code)] // non-test use arrives with the ghost render in Task A3
+    fn highlighted(&self) -> Option<PathBuf> {
+        match self.rows().into_iter().nth(self.selected) {
+            Some(Row::Dir(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Resolve the whole buffer to a path (relative → against root).
+    fn resolve(&self) -> PathBuf {
+        let p = Path::new(&self.path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        }
+    }
+
+    // --- state transitions ---
+
+    fn reseed(&mut self) {
+        let rows = self.rows();
+        self.selected = rows
+            .iter()
+            .position(|r| matches!(r, Row::Dir(_)))
+            .unwrap_or(0);
+        self.invalid = false;
+    }
+
+    pub fn set_path(&mut self, new: String) {
+        self.path = new;
+        self.reseed();
+    }
+
     pub fn move_down(&mut self) {
-        let n = self.items().len();
+        let n = self.rows().len();
         if n > 0 && self.selected + 1 < n {
             self.selected += 1;
         }
     }
 
     pub fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-        }
+        self.selected = self.selected.saturating_sub(1);
     }
 
-    pub fn push_char(&mut self, c: char) {
-        self.query.push(c);
-        self.clamp();
-    }
-
-    pub fn pop_char(&mut self) {
-        self.query.pop();
-        self.clamp();
-    }
-
-    fn clamp(&mut self) {
-        let n = self.items().len();
-        if n == 0 {
-            self.selected = 0;
-        } else if self.selected >= n {
-            self.selected = n - 1;
-        }
-    }
-
-    /// Right / Tab: enter the highlighted directory (or climb if it is `Parent`).
-    pub fn drill_in(&mut self) {
-        match self.items().into_iter().nth(self.selected) {
-            Some(Item::Parent) => self.go_parent(),
-            Some(Item::Dir(p)) => {
-                self.cwd = p;
-                self.reload();
+    /// Tab / click: drill into the highlighted dir, or climb on the Parent row.
+    pub fn complete(&mut self) {
+        match self.rows().into_iter().nth(self.selected) {
+            Some(Row::Parent) => {
+                let (base, _) = self.base_and_partial();
+                if let Some(parent) = base.parent() {
+                    self.set_path(with_sep(parent));
+                }
             }
+            Some(Row::Dir(p)) => self.set_path(with_sep(&p)),
             None => {}
         }
     }
 
-    /// Left: go to the parent of the current location.
-    pub fn go_parent(&mut self) {
-        if let Some(parent) = self.cwd.parent() {
-            self.cwd = parent.to_path_buf();
-            self.reload();
-        }
+    /// Enter: the buffer resolved to an existing directory, else None.
+    pub fn current_dir(&self) -> Option<PathBuf> {
+        let p = self.resolve();
+        p.is_dir().then_some(p)
     }
 
-    /// Enter: accept the current location as the chosen directory.
-    pub fn accept(&self) -> PathBuf {
-        self.cwd.clone()
+    fn accept(&self) -> Option<PathBuf> {
+        self.current_dir()
+    }
+
+    // --- test-facing accessors ---
+    #[cfg(test)]
+    fn selected(&self) -> usize {
+        self.selected
+    }
+    #[cfg(test)]
+    fn rows_len(&self) -> usize {
+        self.rows().len()
+    }
+    #[cfg(test)]
+    fn select(&mut self, i: usize) {
+        self.selected = i;
+    }
+    #[cfg(test)]
+    fn highlighted_name(&self) -> Option<String> {
+        self.highlighted()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
     }
 }
 
+/// A path's display string with a guaranteed trailing separator.
+fn with_sep(p: &Path) -> String {
+    let mut s = p.display().to_string();
+    if !s.ends_with(is_sep) {
+        s.push(std::path::MAIN_SEPARATOR);
+    }
+    s
+}
+
 impl DirPicker {
-    /// Render the modal for one frame and report the outcome. Keyboard:
-    /// Up/Down move, Right/Tab drill in, Left up, Enter accept, Esc cancel,
-    /// typing filters. Characters are captured manually (no focusable text
-    /// field) so the arrow/Tab/Enter keys are free for navigation.
+    /// Inline render: field + dropdown into the current `ui`. Placement-agnostic.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Outcome {
-        let mut outcome = Outcome::Pending;
+        let id = egui::Id::new("dirpicker-field");
 
-        ui.input(|i| {
-            for ev in &i.events {
-                if let egui::Event::Text(t) = ev {
-                    for c in t.chars() {
-                        self.push_char(c);
-                    }
-                }
-            }
-            if i.key_pressed(egui::Key::Backspace) {
-                self.pop_char();
-            }
-            if i.key_pressed(egui::Key::ArrowDown) {
-                self.move_down();
-            }
-            if i.key_pressed(egui::Key::ArrowUp) {
-                self.move_up();
-            }
-            if i.key_pressed(egui::Key::Tab) || i.key_pressed(egui::Key::ArrowRight) {
-                self.drill_in();
-            }
-            if i.key_pressed(egui::Key::ArrowLeft) {
-                self.go_parent();
-            }
-            if i.key_pressed(egui::Key::Enter) {
-                outcome = Outcome::Accepted(self.accept());
-            }
-            if i.key_pressed(egui::Key::Escape) {
-                outcome = Outcome::Cancelled;
-            }
+        // Intercept navigation keys BEFORE the TextEdit sees them.
+        let (tab, up, down, enter, esc) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
         });
+        if up {
+            self.move_up();
+        }
+        if down {
+            self.move_down();
+        }
+        if tab {
+            self.complete();
+        }
+        if esc {
+            return Outcome::Cancelled;
+        }
+        if enter {
+            match self.accept() {
+                Some(p) => return Outcome::Accepted(p),
+                None => self.invalid = true, // Task A3 paints the cue; keep focus below
+            }
+        }
 
-        // Dim the desktop behind the modal.
-        let screen = ui.ctx().content_rect();
+        // Field.
+        let font = egui::FontId::monospace(13.0);
+        let field_h = 26.0;
+        let field_rect = {
+            let r = ui.max_rect();
+            egui::Rect::from_min_size(r.min, egui::vec2(r.width().min(520.0), field_h))
+        };
         ui.painter()
-            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+            .rect_filled(field_rect, egui::CornerRadius::same(3), DESK_BG);
+        ui.painter().rect_stroke(
+            field_rect,
+            egui::CornerRadius::same(3),
+            egui::Stroke::new(1.0, if self.invalid { DANGER } else { BORDER }),
+            egui::StrokeKind::Inside,
+        );
+        let te = ui.put(
+            field_rect,
+            egui::TextEdit::singleline(&mut self.path)
+                .id(id)
+                .font(font.clone())
+                .text_color(TEXT)
+                .frame(egui::Frame::NONE)
+                .vertical_align(egui::Align::Center)
+                .margin(egui::Margin::symmetric(6, 0))
+                .desired_width(field_rect.width()),
+        );
+        if self.focus_next {
+            te.request_focus();
+            self.focus_next = false;
+        }
+        if te.changed() {
+            self.reseed(); // typing re-derives
+        }
+        if enter && self.invalid {
+            te.request_focus(); // never a dead field
+        }
 
-        egui::Window::new("set project directory")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        // Dropdown, in a popup Area anchored under the field.
+        let mut clicked: Option<usize> = None;
+        egui::Area::new(id.with("drop"))
+            .fixed_pos(field_rect.left_bottom() + egui::vec2(0.0, 2.0))
+            .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                ui.set_min_width(440.0);
-                ui.label(egui::RichText::new(self.cwd.display().to_string()).strong());
-                let hint = if self.query.is_empty() {
-                    "type to filter · → enter · ← up · Enter open here · Esc cancel".to_string()
-                } else {
-                    format!("filter: {}", self.query)
-                };
-                ui.label(egui::RichText::new(hint).weak());
-                ui.separator();
-
-                egui::ScrollArea::vertical()
-                    .max_height(280.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (idx, item) in self.items().into_iter().enumerate() {
-                            let (label, is_parent) = match &item {
-                                Item::Parent => (".. (parent)".to_string(), true),
-                                Item::Dir(p) => (
-                                    p.file_name()
+                ui.set_max_width(field_rect.width());
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (idx, row) in self.rows().into_iter().enumerate() {
+                                let label = match &row {
+                                    Row::Parent => "../".to_string(),
+                                    Row::Dir(p) => p
+                                        .file_name()
                                         .unwrap_or_default()
                                         .to_string_lossy()
                                         .into_owned(),
-                                    false,
-                                ),
-                            };
-                            let resp = ui.selectable_label(idx == self.selected, label);
-                            if resp.clicked() {
-                                self.selected = idx;
-                                if is_parent {
-                                    self.go_parent();
-                                } else {
-                                    self.drill_in();
+                                };
+                                if ui.selectable_label(idx == self.selected, label).clicked() {
+                                    clicked = Some(idx);
                                 }
                             }
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("open here").clicked() {
-                        outcome = Outcome::Accepted(self.accept());
-                    }
-                    if ui.button("cancel").clicked() {
-                        outcome = Outcome::Cancelled;
-                    }
+                        });
                 });
             });
+        if let Some(idx) = clicked {
+            self.selected = idx;
+            self.complete();
+        }
 
+        Outcome::Pending
+    }
+
+    /// Leader-invoked modal: `show` inside a top-center floating Area with a
+    /// subtle scrim (the modality signal), replacing the old centered Window.
+    pub fn show_modal(&mut self, ui: &mut egui::Ui) -> Outcome {
+        let screen = ui.ctx().content_rect();
+        ui.painter()
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(90)); // lighter than 150
+        let mut outcome = Outcome::Pending;
+        egui::Area::new(egui::Id::new("dirpicker-modal"))
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                egui::vec2(0.0, screen.height() * 0.18),
+            )
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(520.0);
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    outcome = self.show(ui);
+                });
+            });
         outcome
     }
 }
@@ -343,102 +400,98 @@ mod tests {
         d
     }
 
-    fn dir_names(p: &DirPicker) -> Vec<String> {
-        p.items()
-            .iter()
-            .filter_map(|i| match i {
-                Item::Dir(pb) => Some(pb.file_name().unwrap().to_string_lossy().into_owned()),
-                Item::Parent => None,
-            })
-            .collect()
+    // Build a picker whose buffer points at `dir` (trailing sep), tests via real fs.
+    fn at(dir: &Path) -> DirPicker {
+        DirPicker::new(dir.to_path_buf())
     }
 
     #[test]
-    fn lists_dirs_only_sorted_no_dotfiles() {
+    fn new_seeds_highlight_to_first_completion_not_parent() {
         let d = tree();
-        let p = DirPicker::new(d.path().to_path_buf());
-        assert_eq!(dir_names(&p), vec!["alpha", "beta", "gamma"]);
+        let p = at(d.path());
+        // rows = [Parent, alpha, beta, gamma]; selected seeds to the first Dir (alpha).
+        assert_eq!(p.selected(), 1);
+        assert_eq!(p.highlighted_name(), Some("alpha".to_string()));
     }
 
     #[test]
-    fn parent_row_present_when_query_empty() {
+    fn typing_a_partial_prefix_filters_and_reseeds() {
         let d = tree();
-        let p = DirPicker::new(d.path().to_path_buf());
-        assert_eq!(p.items().first(), Some(&Item::Parent));
+        let mut p = at(d.path());
+        p.set_path(format!(
+            "{}{}be",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        // rows = [Parent, beta]; highlight reseeds to beta.
+        assert_eq!(p.highlighted_name(), Some("beta".to_string()));
     }
 
     #[test]
-    fn query_filters_dirs_and_hides_parent() {
+    fn tab_completes_into_the_highlighted_dir() {
         let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        p.push_char('b');
-        let items = p.items();
-        assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], Item::Dir(_)));
+        let mut p = at(d.path());
+        p.set_path(format!(
+            "{}{}be",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        p.complete(); // Tab
+        assert_eq!(p.current_dir(), Some(d.path().join("beta")));
+        assert_eq!(p.highlighted_name(), Some("inner".to_string())); // now inside beta
     }
 
     #[test]
-    fn drill_in_enters_highlighted_dir() {
+    fn parent_row_climbs() {
         let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        // items: [Parent, alpha, beta, gamma]; move to beta (index 2).
+        let mut p = at(&d.path().join("beta"));
+        p.select(0); // Parent row
+        p.complete();
+        assert_eq!(p.current_dir(), Some(d.path().to_path_buf()));
+    }
+
+    #[test]
+    fn accept_only_for_an_existing_directory() {
+        let d = tree();
+        let mut p = at(d.path());
+        assert!(matches!(p.accept(), Some(_))); // a real dir
+        p.set_path(format!(
+            "{}{}zzz",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(p.accept(), None); // missing path
+        p.set_path(d.path().join("file.txt").display().to_string());
+        assert_eq!(p.accept(), None); // a file, not a dir
+    }
+
+    #[test]
+    fn empty_completions_are_panic_free() {
+        let d = tree();
+        let mut p = at(d.path());
+        p.set_path(format!(
+            "{}{}zzz",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        )); // matches nothing
         p.move_down();
-        p.move_down();
-        p.drill_in();
-        assert_eq!(p.cwd(), d.path().join("beta"));
-        assert_eq!(dir_names(&p), vec!["inner"]);
+        p.move_up();
+        p.complete(); // must not panic
+        let _ = p.accept();
+        assert!(p.selected() < p.rows_len().max(1));
     }
 
     #[test]
-    fn accept_returns_current_location() {
+    fn current_dir_none_for_partial_some_for_dir() {
         let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        p.move_down();
-        p.move_down();
-        p.drill_in(); // into beta
-        assert_eq!(p.accept(), d.path().join("beta"));
-    }
-
-    #[test]
-    fn go_parent_climbs_up() {
-        let d = tree();
-        let mut p = DirPicker::new(d.path().join("beta"));
-        p.go_parent();
-        assert_eq!(p.cwd(), d.path());
-    }
-
-    #[test]
-    fn move_down_clamps_to_last_item() {
-        let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        for _ in 0..50 {
-            p.move_down();
-        }
-        assert!(p.selected() < p.items().len());
-    }
-
-    #[test]
-    fn backspace_restores_parent_row() {
-        let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        p.push_char('b');
-        assert_eq!(p.items().first(), Some(&Item::Dir(d.path().join("beta"))));
-        p.pop_char();
-        assert_eq!(p.items().first(), Some(&Item::Parent));
-    }
-
-    #[test]
-    fn empty_filter_clamps_and_drill_is_safe() {
-        let d = tree();
-        let mut p = DirPicker::new(d.path().to_path_buf());
-        p.move_down();
-        p.move_down(); // highlight some non-zero row
-        p.push_char('z'); // matches nothing
-        assert_eq!(p.items().len(), 0);
-        assert_eq!(p.selected(), 0); // clamp pinned to zero
-        p.drill_in(); // must NOT panic on empty list
-        p.move_down(); // must NOT panic / overflow on empty list
-        assert_eq!(p.cwd(), d.path()); // drill_in on empty list was a no-op
+        let mut p = at(d.path());
+        assert_eq!(p.current_dir(), Some(d.path().to_path_buf()));
+        p.set_path(format!(
+            "{}{}al",
+            d.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(p.current_dir(), None); // "…/al" is a partial, not a dir
     }
 
     #[test]
