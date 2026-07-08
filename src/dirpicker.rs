@@ -311,6 +311,9 @@ impl DirPicker {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
                 )
             });
+            // ↑ on the top row closes the dropdown, same as Esc.
+            let esc = esc || (up && self.selected == 0);
+            let up = up && self.selected > 0;
             if up || down || left || right {
                 self.caret_to_end = true;
             }
