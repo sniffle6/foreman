@@ -482,3 +482,117 @@ fn is_modifier_key(_key: egui::Key) -> bool {
     // that changes; currently nothing is a lone modifier key.
     false
 }
+
+#[cfg(test)]
+mod tests {
+    //! `SettingsView::apply` is the pure rebind core (no egui). These tests drive
+    //! it directly with real `Keymap`/`Chord`/`Command` values and assert on the
+    //! observable state: the keymap table, the returned "changed" bool, and the
+    //! resulting `Mode`. Conflict *resolution* (Enter → replace) lives in `show`/
+    //! `render_rows`, not `apply`, so it is intentionally not exercised here.
+    use super::*;
+    use eframe::egui::Key as K;
+
+    fn plain(k: K) -> Chord {
+        Chord::new(k, false, false, false)
+    }
+
+    #[test]
+    fn clean_rebind_returns_changed_and_updates_keymap() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        // `Y` is unbound by default, so this rebind has no conflict.
+        let chord = plain(K::Y);
+        let changed = view.apply(&mut km, Row::Command(Command::CloseTerm), chord);
+        assert!(changed, "a clean rebind reports the keymap changed");
+        assert_eq!(km.resolve(chord), Some(Command::CloseTerm));
+        // The command's old default chord (`x`) is released by `rebind`.
+        assert_eq!(km.resolve(plain(K::X)), None);
+        assert!(matches!(view.mode, Mode::Idle));
+    }
+
+    #[test]
+    fn rebinding_command_to_current_chord_is_idempotent_success() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        // `x` already *is* CloseTerm — the `_` arm rebinds it to itself.
+        let changed = view.apply(&mut km, Row::Command(Command::CloseTerm), plain(K::X));
+        assert!(changed);
+        assert_eq!(km.resolve(plain(K::X)), Some(Command::CloseTerm));
+        assert!(matches!(view.mode, Mode::Idle));
+    }
+
+    #[test]
+    fn rebinding_command_to_leader_chord_is_rejected() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        let leader = km.leader; // Ctrl+B by default
+        let changed = view.apply(&mut km, Row::Command(Command::CloseTerm), leader);
+        assert!(!changed, "the leader chord cannot double as a command");
+        // Nothing moved: CloseTerm still on `x`, leader untouched.
+        assert_eq!(km.resolve(plain(K::X)), Some(Command::CloseTerm));
+        assert_eq!(km.leader, leader);
+        assert!(matches!(view.mode, Mode::Idle));
+        assert!(
+            view.message.as_deref().unwrap_or("").contains("leader"),
+            "the footer explains the leader collision"
+        );
+    }
+
+    #[test]
+    fn leader_row_rejects_a_chord_already_bound_to_a_command() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        let original_leader = km.leader;
+        // `c` is NewTerm — the leader may not also be a command chord.
+        let changed = view.apply(&mut km, Row::Leader, plain(K::C));
+        assert!(!changed);
+        assert_eq!(km.leader, original_leader, "leader unchanged on rejection");
+        // The command that owned the chord is untouched.
+        assert_eq!(km.resolve(plain(K::C)), Some(Command::NewTerm));
+        assert!(matches!(view.mode, Mode::Idle));
+    }
+
+    #[test]
+    fn leader_row_accepts_an_unbound_chord() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        // `Y` is unbound, so it is a valid leader.
+        let chord = plain(K::Y);
+        let changed = view.apply(&mut km, Row::Leader, chord);
+        assert!(changed);
+        assert_eq!(km.leader, chord);
+        assert!(matches!(view.mode, Mode::Idle));
+    }
+
+    #[test]
+    fn conflicting_command_chord_enters_conflict_without_rebinding() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        // `c` is NewTerm; binding CloseTerm to it is a conflict.
+        let chord = plain(K::C);
+        let changed = view.apply(&mut km, Row::Command(Command::CloseTerm), chord);
+        assert!(
+            !changed,
+            "a conflict defers the rebind, so nothing changed yet"
+        );
+        // Nothing was rebound: `c` still NewTerm, CloseTerm still on `x`.
+        assert_eq!(km.resolve(chord), Some(Command::NewTerm));
+        assert_eq!(km.resolve(plain(K::X)), Some(Command::CloseTerm));
+        // The mode captures the pending conflict for the UI to resolve.
+        match &view.mode {
+            Mode::Conflict {
+                row,
+                chord: c,
+                existing,
+            } => {
+                // `Row` doesn't derive Debug, so compare with `==` rather than
+                // `assert_eq!` (which would require a Debug impl just for tests).
+                assert!(*row == Row::Command(Command::CloseTerm));
+                assert_eq!(*c, chord);
+                assert_eq!(*existing, Command::NewTerm);
+            }
+            _ => panic!("expected Mode::Conflict, got a different mode"),
+        }
+    }
+}
