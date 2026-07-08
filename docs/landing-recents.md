@@ -15,10 +15,14 @@ back into one is a single click — or Tab, arrows, Enter.
 ## How to use it
 
 - **Mouse:** click a row. Hover highlights it.
-- **Keyboard:** with the path field's completion popup closed, press `Tab` —
-  a `>` marker appears on the first row. `↑`/`↓` move it, `Enter` opens,
-  `Tab`/`Esc`/`↑` past the top (or just typing) put you back in the path
-  field.
+- **Keyboard:** the landing is three zones — path field, agent buttons,
+  recents. `Tab` cycles them forward, `Shift+Tab` backward (recents skipped
+  while empty). `↑`/`↓` walk the same order as one column: `↓` in the field
+  opens the directory popup, `↓` past the popup's last row lands on the
+  buttons, `↓` again enters recents. In the buttons zone `←`/`→` pick
+  Claude/Codex/Terminal and `Enter` launches the field's path with that
+  kind; in recents `↑`/`↓` move the `>` marker and `Enter` reopens the
+  entry. `Esc` (or just typing) returns to the field from anywhere.
 
 ## Where it lives on disk
 

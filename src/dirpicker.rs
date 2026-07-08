@@ -83,6 +83,9 @@ pub enum Outcome {
     Pending,
     Cancelled,
     Accepted(PathBuf),
+    /// ↓ past the last dropdown row: the popup closed and keyboard focus
+    /// should continue to whatever sits below the field (landing: buttons).
+    PassedEnd,
 }
 
 /// Address-bar directory picker: the editable `path` buffer is the source of
@@ -140,6 +143,13 @@ impl DirPicker {
         self.armed = true;
         self.focus_next = true;
         self.invalid = false;
+    }
+
+    /// Open the completion popup programmatically (landing: ↓ in the field).
+    pub fn open_dropdown(&mut self) {
+        self.open = true;
+        self.armed = false;
+        self.focus_next = true;
     }
 
     // --- pure-ish derivations (real fs via list_dirs) ---
@@ -254,7 +264,6 @@ impl DirPicker {
     fn selected(&self) -> usize {
         self.selected
     }
-    #[cfg(test)]
     fn rows_len(&self) -> usize {
         self.rows().len()
     }
@@ -321,7 +330,9 @@ impl DirPicker {
                 self.move_up();
                 self.scroll_to_sel = true;
             }
-            if down {
+            // ↓ past the last row exits the popup downward (see Outcome::PassedEnd).
+            let past_end = down && self.selected + 1 >= self.rows_len();
+            if down && !past_end {
                 self.move_down();
                 self.scroll_to_sel = true;
             }
@@ -346,6 +357,11 @@ impl DirPicker {
                 self.open = false;
                 ui.memory_mut(|m| m.surrender_focus(id));
                 outcome = Outcome::Cancelled;
+            }
+            if past_end {
+                self.open = false;
+                ui.memory_mut(|m| m.surrender_focus(id));
+                outcome = Outcome::PassedEnd;
             }
         }
 

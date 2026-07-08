@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::icons::{self, IconKind};
 use crate::recents::RecentEntry;
-use crate::theme::{DIM, SEL_BG, TEXT};
+use crate::theme::{BORDER_FOCUS, DIM, SEL_BG, TEXT, WIN_BG};
 
 /// Provisional, landing-local taxonomy (phase-2 replaces it with the dispatch model).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,39 +112,117 @@ fn layout(area: egui::Rect, n_icons: usize, n_recents: usize) -> LandingLayout {
     }
 }
 
-/// Which part of the landing owns navigation keys. `Field` is the picker's
-/// text field (default); `Recents` is the list under the icon row.
+/// Which landing area owns navigation keys. One vertical axis, top to bottom:
+/// the picker's text field (default), the agent buttons, the recents list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Zone {
     Field,
+    Buttons,
     Recents,
+}
+
+/// Keyboard cursor across the three zones: the zone plus a remembered
+/// selection inside each (button index, recent-row index).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Nav {
+    zone: Zone,
+    btn: usize,
+    rec: usize,
+}
+
+impl Nav {
+    const HOME: Nav = Nav {
+        zone: Zone::Field,
+        btn: 0,
+        rec: 0,
+    };
+}
+
+/// What a key step asks the landing to do beyond moving the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepAct {
+    None,
+    /// ↓ in the field: open the directory popup.
+    OpenPopup,
+    /// Enter on an agent button: launch that kind at the field's path.
+    LaunchButton(usize),
+    /// Enter on a recents row: reopen that entry.
+    OpenRecent(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
 enum NavKey {
     Tab,
+    ShiftTab,
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Esc,
     Text,
 }
 
-/// Pure keyboard model for field↔recents focus (spec: Tab enters, ↑/↓ step,
-/// ↑ past the top / Esc / Tab / typing return to the field, Enter opens).
-/// Returns (zone, selection, row index to open).
-fn step(zone: Zone, sel: usize, len: usize, key: NavKey) -> (Zone, usize, Option<usize>) {
-    if len == 0 {
-        return (Zone::Field, 0, None);
-    }
+/// Pure keyboard model. Tab / Shift+Tab cycle the zones forward / backward
+/// (recents skipped while empty); ↑/↓ walk the same order as one clamped
+/// vertical axis, with ↓ in the field opening the directory popup instead.
+/// Esc or typing returns to the field. Enter acts on the current zone.
+fn step(nav: Nav, n_btns: usize, n_recs: usize, key: NavKey) -> (Nav, StepAct) {
+    use NavKey::*;
+    use StepAct::None as Move;
+    let Nav { zone, btn, rec } = nav;
+    let to = |zone| (Nav { zone, btn, rec }, Move);
     match (zone, key) {
-        (Zone::Field, NavKey::Tab) => (Zone::Recents, 0, None),
-        (Zone::Field, _) => (Zone::Field, sel, None),
-        (Zone::Recents, NavKey::Up) if sel > 0 => (Zone::Recents, sel - 1, None),
-        (Zone::Recents, NavKey::Up) => (Zone::Field, 0, None),
-        (Zone::Recents, NavKey::Down) => (Zone::Recents, (sel + 1).min(len - 1), None),
-        (Zone::Recents, NavKey::Enter) => (Zone::Field, 0, Some(sel)),
-        (Zone::Recents, NavKey::Tab | NavKey::Esc | NavKey::Text) => (Zone::Field, 0, None),
+        (Zone::Field, Tab) => to(Zone::Buttons),
+        (Zone::Field, ShiftTab) if n_recs > 0 => to(Zone::Recents),
+        (Zone::Field, ShiftTab) => to(Zone::Buttons),
+        (Zone::Field, Down) => (nav, StepAct::OpenPopup),
+        (Zone::Field, _) => (nav, Move),
+
+        (Zone::Buttons, Tab) if n_recs > 0 => to(Zone::Recents),
+        (Zone::Buttons, Tab) => to(Zone::Field),
+        (Zone::Buttons, ShiftTab | Up | Esc | Text) => to(Zone::Field),
+        (Zone::Buttons, Left) => (
+            Nav {
+                zone,
+                btn: btn.saturating_sub(1),
+                rec,
+            },
+            Move,
+        ),
+        (Zone::Buttons, Right) => (
+            Nav {
+                zone,
+                btn: (btn + 1).min(n_btns.saturating_sub(1)),
+                rec,
+            },
+            Move,
+        ),
+        (Zone::Buttons, Down) if n_recs > 0 => to(Zone::Recents),
+        (Zone::Buttons, Down) => (nav, Move),
+        (Zone::Buttons, Enter) => (nav, StepAct::LaunchButton(btn)),
+
+        (Zone::Recents, Up) if rec > 0 => (
+            Nav {
+                zone,
+                btn,
+                rec: rec - 1,
+            },
+            Move,
+        ),
+        (Zone::Recents, Up) => to(Zone::Buttons),
+        (Zone::Recents, Down) => (
+            Nav {
+                zone,
+                btn,
+                rec: (rec + 1).min(n_recs.saturating_sub(1)),
+            },
+            Move,
+        ),
+        (Zone::Recents, Tab | Esc | Text) => to(Zone::Field),
+        (Zone::Recents, ShiftTab) => to(Zone::Buttons),
+        (Zone::Recents, Enter) => (Nav { zone: Zone::Field, btn, rec }, StepAct::OpenRecent(rec)),
+        (Zone::Recents, Left | Right) => (nav, Move),
     }
 }
 
@@ -352,8 +430,7 @@ fn on_path(
 /// desktop's leader picker).
 pub struct Landing {
     picker: DirPicker,
-    zone: Zone,
-    sel: usize,
+    nav: Nav,
     /// Missing-dir-filtered recents snapshot; rebuilt when `refilter` is set.
     visible: Vec<RecentEntry>,
     refilter: bool,
@@ -363,8 +440,7 @@ impl Landing {
     pub fn new(start: PathBuf) -> Self {
         Self {
             picker: DirPicker::new(start),
-            zone: Zone::Field,
-            sel: 0,
+            nav: Nav::HOME,
             visible: Vec::new(),
             refilter: true,
         }
@@ -375,8 +451,7 @@ impl Landing {
     /// flag is already spent after the first show).
     pub fn reopen(&mut self) {
         self.picker.reopen();
-        self.zone = Zone::Field;
-        self.sel = 0;
+        self.nav = Nav::HOME;
         self.refilter = true; // recents may have changed while a project was open
     }
 
@@ -398,42 +473,78 @@ impl Landing {
         let l = layout(area, ICON_ORDER.len(), visible.len());
 
         let mut action: Option<LandingAction> = None;
-        if !self.picker.is_open() && !visible.is_empty() {
-            let nav = ui.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                    Some(NavKey::Tab)
-                } else if self.zone == Zone::Recents {
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                        Some(NavKey::Up)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                        Some(NavKey::Down)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
-                        Some(NavKey::Enter)
-                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                        Some(NavKey::Esc)
-                    } else if i.events.iter().any(|e| matches!(e, egui::Event::Text(_))) {
-                        Some(NavKey::Text) // typing always means "edit the path"
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+        if visible.is_empty() && self.nav.zone == Zone::Recents {
+            self.nav = Nav::HOME; // the list emptied under the cursor
+        }
+        if !self.picker.is_open() {
+            let key = ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+                    return Some(NavKey::ShiftTab);
                 }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    return Some(NavKey::Tab);
+                }
+                match self.nav.zone {
+                    // The field owns editing keys; only ↓ (open the popup) is
+                    // claimed while the popup is closed.
+                    Zone::Field => {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            return Some(NavKey::Down);
+                        }
+                    }
+                    Zone::Buttons | Zone::Recents => {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                            return Some(NavKey::Up);
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                            return Some(NavKey::Down);
+                        }
+                        if self.nav.zone == Zone::Buttons {
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                                return Some(NavKey::Left);
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                                return Some(NavKey::Right);
+                            }
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                            return Some(NavKey::Enter);
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                            return Some(NavKey::Esc);
+                        }
+                        if i.events.iter().any(|e| matches!(e, egui::Event::Text(_))) {
+                            return Some(NavKey::Text); // typing always means "edit the path"
+                        }
+                    }
+                }
+                None
             });
-            if let Some(key) = nav {
-                let (zone, sel, open) = step(self.zone, self.sel, visible.len(), key);
-                self.zone = zone;
-                self.sel = sel;
-                if let Some(idx) = open {
-                    let e = &visible[idx];
-                    action = Some(LandingAction {
-                        path: e.path.clone(),
-                        kind: SessionKind::from_kind_str(&e.kind),
-                    });
+            if let Some(key) = key {
+                let (nav, act) = step(self.nav, ICON_ORDER.len(), visible.len(), key);
+                self.nav = nav;
+                match act {
+                    StepAct::None => {}
+                    StepAct::OpenPopup => self.picker.open_dropdown(),
+                    StepAct::LaunchButton(i) => {
+                        if let Some(path) = self.picker.current_dir() {
+                            action = Some(LandingAction {
+                                path,
+                                kind: ICON_ORDER[i],
+                            });
+                        }
+                    }
+                    StepAct::OpenRecent(i) => {
+                        let e = &visible[i];
+                        action = Some(LandingAction {
+                            path: e.path.clone(),
+                            kind: SessionKind::from_kind_str(&e.kind),
+                        });
+                    }
                 }
             }
         } else {
-            self.zone = Zone::Field; // popup open or list empty: field owns keys
+            self.nav = Nav::HOME; // popup open: the field owns every key
         }
 
         // Wordmark (mono block art, forge-gradient with an animated specular
@@ -463,17 +574,46 @@ impl Landing {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(l.field));
             self.picker.show(&mut child)
         };
-        if let Outcome::Accepted(path) = picker_out {
-            action = Some(LandingAction {
-                path,
-                kind: SessionKind::Terminal,
-            });
+        match picker_out {
+            Outcome::Accepted(path) => {
+                action = Some(LandingAction {
+                    path,
+                    kind: SessionKind::Terminal,
+                });
+            }
+            // ↓ past the popup's last row exits downward, onto the buttons.
+            Outcome::PassedEnd => self.nav.zone = Zone::Buttons,
+            _ => {}
         }
 
         // Icon row — each opens the picker's current path with that kind.
-        for (r, &kind) in l.icons.iter().zip(ICON_ORDER.iter()) {
+        // Landing-drawn hit areas, NOT egui Buttons: focusable widgets would
+        // catch egui's Tab focus-traversal and fight the zone model (the
+        // double-selection bug); here the `Nav` cursor is the only selection.
+        for (idx, (r, &kind)) in l.icons.iter().zip(ICON_ORDER.iter()).enumerate() {
+            let resp = ui.interact(*r, ui.id().with(("icon", idx)), egui::Sense::click());
+            let selected = self.nav.zone == Zone::Buttons && idx == self.nav.btn;
+            ui.painter()
+                .rect_filled(*r, egui::CornerRadius::same(4), WIN_BG);
+            if selected || resp.hovered() {
+                ui.painter()
+                    .rect_filled(*r, egui::CornerRadius::same(4), SEL_BG);
+            }
+            if selected {
+                ui.painter().rect_stroke(
+                    *r,
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(1.0, BORDER_FOCUS),
+                    egui::StrokeKind::Inside,
+                );
+            }
             let tex = icons::texture(ui.ctx(), icon_of(kind), 48);
-            let resp = ui.put(*r, egui::Button::image(&tex));
+            ui.painter().image(
+                tex.id(),
+                egui::Rect::from_center_size(r.center(), egui::vec2(48.0, 48.0)),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
             ui.painter().text(
                 r.center_bottom() + egui::vec2(0.0, 12.0),
                 egui::Align2::CENTER_TOP,
@@ -499,7 +639,7 @@ impl Landing {
             let row_font = egui::FontId::proportional(13.0);
             for (idx, (r, e)) in l.recents.iter().zip(visible.iter()).enumerate() {
                 let resp = ui.interact(*r, ui.id().with(("recent", idx)), egui::Sense::click());
-                let selected = self.zone == Zone::Recents && idx == self.sel;
+                let selected = self.nav.zone == Zone::Recents && idx == self.nav.rec;
                 if selected || resp.hovered() {
                     ui.painter()
                         .rect_filled(*r, egui::CornerRadius::same(3), SEL_BG);
@@ -664,55 +804,74 @@ mod tests {
         assert!(l.recents.is_empty());
     }
 
-    #[test]
-    fn tab_toggles_zones_and_arrows_step_clamp_and_exit_at_top() {
-        assert_eq!(
-            step(Zone::Field, 0, 3, NavKey::Tab),
-            (Zone::Recents, 0, None)
-        );
-        assert_eq!(
-            step(Zone::Recents, 2, 3, NavKey::Tab),
-            (Zone::Field, 0, None)
-        );
-        assert_eq!(
-            step(Zone::Recents, 0, 3, NavKey::Down),
-            (Zone::Recents, 1, None)
-        );
-        assert_eq!(
-            step(Zone::Recents, 2, 3, NavKey::Down),
-            (Zone::Recents, 2, None),
-            "clamps"
-        );
-        assert_eq!(
-            step(Zone::Recents, 1, 3, NavKey::Up),
-            (Zone::Recents, 0, None)
-        );
-        assert_eq!(
-            step(Zone::Recents, 0, 3, NavKey::Up),
-            (Zone::Field, 0, None),
-            "top exits"
-        );
+    fn nav(zone: Zone, btn: usize, rec: usize) -> Nav {
+        Nav { zone, btn, rec }
     }
 
     #[test]
-    fn enter_opens_and_esc_text_empty_return_to_field() {
-        assert_eq!(
-            step(Zone::Recents, 2, 3, NavKey::Enter),
-            (Zone::Field, 0, Some(2))
-        );
-        assert_eq!(
-            step(Zone::Recents, 1, 3, NavKey::Esc),
-            (Zone::Field, 0, None)
-        );
-        assert_eq!(
-            step(Zone::Recents, 1, 3, NavKey::Text),
-            (Zone::Field, 0, None)
-        );
-        assert_eq!(
-            step(Zone::Field, 0, 0, NavKey::Tab),
-            (Zone::Field, 0, None),
-            "empty list inert"
-        );
+    fn tab_cycles_zones_forward_and_shift_tab_backward() {
+        let (n, _) = step(Nav::HOME, 3, 2, NavKey::Tab);
+        assert_eq!(n.zone, Zone::Buttons);
+        let (n, _) = step(n, 3, 2, NavKey::Tab);
+        assert_eq!(n.zone, Zone::Recents);
+        let (n, _) = step(n, 3, 2, NavKey::Tab);
+        assert_eq!(n.zone, Zone::Field);
+        let (n, _) = step(n, 3, 2, NavKey::ShiftTab);
+        assert_eq!(n.zone, Zone::Recents);
+        let (n, _) = step(n, 3, 2, NavKey::ShiftTab);
+        assert_eq!(n.zone, Zone::Buttons);
+        let (n, _) = step(n, 3, 2, NavKey::ShiftTab);
+        assert_eq!(n.zone, Zone::Field);
+    }
+
+    #[test]
+    fn empty_recents_is_skipped_in_both_directions_and_below_buttons() {
+        let (n, _) = step(nav(Zone::Buttons, 0, 0), 3, 0, NavKey::Tab);
+        assert_eq!(n.zone, Zone::Field);
+        let (n, _) = step(Nav::HOME, 3, 0, NavKey::ShiftTab);
+        assert_eq!(n.zone, Zone::Buttons);
+        let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 0, NavKey::Down);
+        assert_eq!((n.zone, n.btn), (Zone::Buttons, 1), "clamp: nothing below");
+    }
+
+    #[test]
+    fn vertical_axis_walks_field_buttons_recents_with_clamps() {
+        let (n, act) = step(Nav::HOME, 3, 2, NavKey::Down);
+        assert_eq!((n.zone, act), (Zone::Field, StepAct::OpenPopup));
+        let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Up);
+        assert_eq!(n.zone, Zone::Field);
+        let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Down);
+        assert_eq!(n.zone, Zone::Recents);
+        let (n, _) = step(nav(Zone::Recents, 0, 0), 3, 2, NavKey::Up);
+        assert_eq!(n.zone, Zone::Buttons);
+        let (n, _) = step(nav(Zone::Recents, 0, 0), 3, 2, NavKey::Down);
+        assert_eq!((n.zone, n.rec), (Zone::Recents, 1));
+        let (n, _) = step(nav(Zone::Recents, 0, 1), 3, 2, NavKey::Down);
+        assert_eq!(n.rec, 1, "clamp at the last recent");
+        let (n, _) = step(Nav::HOME, 3, 2, NavKey::Up);
+        assert_eq!(n.zone, Zone::Field, "clamp at the top");
+    }
+
+    #[test]
+    fn buttons_left_right_clamp_and_enter_launches() {
+        let (n, _) = step(nav(Zone::Buttons, 0, 0), 3, 2, NavKey::Left);
+        assert_eq!(n.btn, 0, "clamp left");
+        let (n, _) = step(nav(Zone::Buttons, 0, 0), 3, 2, NavKey::Right);
+        assert_eq!(n.btn, 1);
+        let (n, _) = step(nav(Zone::Buttons, 2, 0), 3, 2, NavKey::Right);
+        assert_eq!(n.btn, 2, "clamp right");
+        let (_, act) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Enter);
+        assert_eq!(act, StepAct::LaunchButton(1));
+    }
+
+    #[test]
+    fn enter_opens_recent_and_esc_text_return_to_field() {
+        let (n, act) = step(nav(Zone::Recents, 0, 1), 3, 2, NavKey::Enter);
+        assert_eq!((n.zone, act), (Zone::Field, StepAct::OpenRecent(1)));
+        let (n, _) = step(nav(Zone::Recents, 0, 1), 3, 2, NavKey::Esc);
+        assert_eq!(n.zone, Zone::Field);
+        let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Text);
+        assert_eq!(n.zone, Zone::Field);
     }
 
     #[test]
