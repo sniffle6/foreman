@@ -89,7 +89,7 @@ fn ghost_is_the_real_names_remainder_case_preserving() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run (PowerShell): `cargo test --lib dirpicker 2>&1 | Select-Object -Last 20`
+Run (PowerShell): `cargo test --bin foreman dirpicker 2>&1 | Select-Object -Last 20`
 Expected: FAIL — `cannot find function split/base_dir/completions/ghost`.
 
 - [ ] **Step 3: Implement the pure functions** — add near the top of `src/dirpicker.rs` (after the imports, above `DirPicker`):
@@ -159,7 +159,7 @@ fn ghost(partial: &str, highlighted: Option<&Path>) -> Option<String> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib dirpicker 2>&1 | Select-Object -Last 20`
+Run: `cargo test --bin foreman dirpicker 2>&1 | Select-Object -Last 20`
 Expected: PASS (the four new tests plus the existing 10 old-`DirPicker` tests — all green; the file still compiles because the old struct is untouched).
 
 - [ ] **Step 5: Commit**
@@ -369,7 +369,7 @@ fn with_sep(p: &Path) -> String {
 
 - [ ] **Step 3: Run the state-machine tests**
 
-Run: `cargo test --lib dirpicker 2>&1 | Select-Object -Last 30`
+Run: `cargo test --bin foreman dirpicker 2>&1 | Select-Object -Last 30`
 Expected: PASS for the seven new state tests + the four Task-A1 tests. (Compilation will still fail until Step 4 provides `show`/`show_modal` — that's expected; if you want a green checkpoint, run after Step 5.)
 
 - [ ] **Step 4: Add the basic render (`show` + `show_modal`)** — append an `impl DirPicker` with the render. Modeled on the chat-input field (`wm.rs:426-445`):
@@ -487,7 +487,7 @@ match picker.show_modal(ui) {
 ```powershell
 Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
-cargo test --lib dirpicker 2>&1 | Select-Object -Last 30   # all state + pure tests green
+cargo test --bin foreman dirpicker 2>&1 | Select-Object -Last 30   # all state + pure tests green
 ```
 Expected: build OK; tests PASS. Then `cargo run`, press the leader (`Ctrl+B`) + the `NewProject` chord, and confirm a top-anchored path field with a dropdown appears; typing filters, ↑/↓ moves the highlight, Tab drills, a click drills, Enter opens an existing dir, Esc cancels. Screenshot and `Read` the PNG to verify (GUI can't be checked from the terminal).
 
@@ -627,8 +627,8 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib landing 2>&1 | Select-Object -Last 20`
-Expected: FAIL — `cannot find function layout` / unresolved `landing` (module not declared yet — Step 3 adds the code; the `mod landing;` line comes in Task B3, but `cargo test --lib landing` will report the missing symbols once the file is referenced. If the module isn't compiled yet, temporarily add `mod landing;` to `src/main.rs` now and keep it.)
+Run: `cargo test --bin foreman landing 2>&1 | Select-Object -Last 20`
+Expected: FAIL — `cannot find function layout` / unresolved `landing` (module not declared yet — Step 3 adds the code; the `mod landing;` line comes in Task B3, but `cargo test --bin foreman landing` will report the missing symbols once the file is referenced. If the module isn't compiled yet, temporarily add `mod landing;` to `src/main.rs` now and keep it.)
 
 - [ ] **Step 3: Implement the constants + layout** — at the top of `src/landing.rs` (above the tests):
 
@@ -690,7 +690,7 @@ fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib landing 2>&1 | Select-Object -Last 20`
+Run: `cargo test --bin foreman landing 2>&1 | Select-Object -Last 20`
 Expected: PASS (four layout tests).
 
 - [ ] **Step 5: Commit**
