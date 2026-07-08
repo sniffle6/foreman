@@ -96,9 +96,18 @@ pub struct DirPicker {
     /// Whether the dropdown is showing and the field wants focus. Esc collapses
     /// it (hiding the dropdown, revealing anything behind); a click reopens it.
     open: bool,
+    /// Landing mode: the field is focused but the dropdown stays closed until the
+    /// user's first interaction (typing, a click, or a key press). Merely gaining
+    /// focus does not open it — we requested that focus ourselves. Set by
+    /// `reopen`, cleared the moment we open.
+    armed: bool,
     /// Set on keyboard navigation so the dropdown scrolls the highlight into
     /// view next frame; cleared after rendering.
     scroll_to_sel: bool,
+    /// Set when tree navigation (arrows or a row click) rewrites the buffer, so
+    /// the field's caret is pinned back to the end before it draws — the path
+    /// stays fully visible and the ghost completion always appends at the tail.
+    caret_to_end: bool,
 }
 
 impl DirPicker {
@@ -114,18 +123,23 @@ impl DirPicker {
             focus_next: true,
             invalid: false,
             open: true,
+            armed: false,
             scroll_to_sel: false,
+            caret_to_end: false,
         };
         p.reseed();
         p
     }
 
-    /// Reopen the dropdown and re-request field focus — used when the landing
-    /// reappears (the same `Landing`/`DirPicker` lives for the app's lifetime,
-    /// so `focus_next` would otherwise be spent after the first show).
+    /// Re-arm for the landing: focus the field but keep the dropdown closed until
+    /// the user's first interaction. Used when the landing (re)appears — the same
+    /// `Landing`/`DirPicker` lives for the app's lifetime, so `focus_next` would
+    /// otherwise be spent after the first show.
     pub fn reopen(&mut self) {
-        self.open = true;
+        self.open = false;
+        self.armed = true;
         self.focus_next = true;
+        self.invalid = false;
     }
 
     // --- pure-ish derivations (real fs via list_dirs) ---
@@ -253,6 +267,14 @@ impl DirPicker {
         self.highlighted()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
     }
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    #[cfg(test)]
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
 }
 
 /// A path's display string with a guaranteed trailing separator.
@@ -289,6 +311,9 @@ impl DirPicker {
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
                 )
             });
+            if up || down || left || right {
+                self.caret_to_end = true;
+            }
             if up {
                 self.move_up();
                 self.scroll_to_sel = true;
@@ -321,6 +346,17 @@ impl DirPicker {
             }
         }
 
+        // Pin the caret to the end of the (possibly rewritten) buffer before the
+        // field draws, so navigating the tree never strands it mid-path.
+        if std::mem::take(&mut self.caret_to_end) {
+            let end = egui::text::CCursor::new(self.path.chars().count());
+            let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            egui::TextEdit::store_state(ui.ctx(), id, state);
+        }
+
         // Field (always drawn — a collapsed field is still visible and clickable).
         let font = egui::FontId::monospace(13.0);
         let field_h = 26.0;
@@ -330,7 +366,7 @@ impl DirPicker {
         };
         let border = if self.invalid {
             DANGER
-        } else if self.open {
+        } else if self.open || self.armed {
             BORDER_FOCUS
         } else {
             BORDER
@@ -354,19 +390,37 @@ impl DirPicker {
                 .margin(egui::Margin::symmetric(6, 0))
                 .desired_width(field_rect.width()),
         );
-        // Keep the field focused the whole time the picker is open, so typing
-        // and the ←/→/↑/↓ handlers never desync from a click that stole focus
-        // (e.g. a mouse click on a dropdown row).
-        if self.open && (self.focus_next || !te.has_focus()) {
+        // Keep the field focused the whole time the picker is open or armed, so
+        // typing and the ←/→/↑/↓ handlers never desync from a click that stole
+        // focus (e.g. a mouse click on a dropdown row).
+        if (self.open || self.armed) && (self.focus_next || !te.has_focus()) {
             te.request_focus();
             self.focus_next = false;
         }
-        if te.gained_focus() {
-            self.open = true; // clicking a collapsed field reopens it
-        }
         if te.changed() {
-            self.open = true;
-            self.reseed(); // typing re-derives
+            self.open = true; // typing re-derives, and opens if armed
+            self.armed = false;
+            self.reseed();
+        } else if self.armed {
+            // Armed (landing): open on the first real interaction — a click or a
+            // key press while focused — but NOT on the focus we requested above.
+            let key_pressed = te.has_focus()
+                && ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key { pressed: true, .. }
+                                | egui::Event::Text(_)
+                                | egui::Event::Paste(_)
+                        )
+                    })
+                });
+            if te.clicked() || key_pressed {
+                self.open = true;
+                self.armed = false;
+            }
+        } else if te.gained_focus() {
+            self.open = true; // clicking a collapsed field reopens it
         }
 
         if self.open {
@@ -422,6 +476,7 @@ impl DirPicker {
             if let Some(idx) = clicked {
                 self.selected = idx;
                 self.complete();
+                self.caret_to_end = true; // buffer rewritten — re-pin next frame
             }
         }
 
@@ -492,6 +547,18 @@ mod tests {
     // Build a picker whose buffer points at `dir` (trailing sep), tests via real fs.
     fn at(dir: &Path) -> DirPicker {
         DirPicker::new(dir.to_path_buf())
+    }
+
+    #[test]
+    fn reopen_arms_focused_with_dropdown_closed() {
+        let d = tree();
+        let mut p = at(d.path());
+        // A freshly-built picker (the leader modal path) opens its dropdown.
+        assert!(p.is_open() && !p.is_armed());
+        // The landing re-arms it: focused, but the dropdown stays closed until
+        // the user's first interaction.
+        p.reopen();
+        assert!(!p.is_open() && p.is_armed());
     }
 
     #[test]
