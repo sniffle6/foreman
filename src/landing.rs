@@ -88,12 +88,59 @@ fn icon_of(k: SessionKind) -> IconKind {
     }
 }
 
-fn label_of(k: SessionKind) -> &'static str {
-    match k {
-        SessionKind::Claude => "Claude",
-        SessionKind::Codex => "Codex",
-        SessionKind::Terminal => "Terminal",
+impl SessionKind {
+    /// Human label for buttons and notifications.
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionKind::Claude => "Claude",
+            SessionKind::Codex => "Codex",
+            SessionKind::Terminal => "Terminal",
+        }
     }
+
+    /// PATH stem to probe and launch, or None for a plain shell.
+    fn stem(self) -> Option<&'static str> {
+        match self {
+            SessionKind::Claude => Some("claude"),
+            SessionKind::Codex => Some("codex"),
+            SessionKind::Terminal => None,
+        }
+    }
+
+    /// argv for a dedicated agent pane, or None for a plain shell. Launched via
+    /// `cmd /c` so npm's `.cmd`/`.bat` shims resolve — `CreateProcess` won't find
+    /// a bare `claude` otherwise. The pane IS the agent and closes when it exits.
+    pub fn launch_argv(self) -> Option<Vec<String>> {
+        self.stem()
+            .map(|s| vec!["cmd".to_string(), "/c".to_string(), s.to_string()])
+    }
+
+    /// Is this agent resolvable on PATH? A plain shell is always "installed".
+    pub fn installed(self) -> bool {
+        match self.stem() {
+            None => true,
+            Some(s) => on_path(s, std::env::var_os("PATH").as_deref(), &|p| p.exists()),
+        }
+    }
+}
+
+/// Pure: is `stem` (with any cmd-runnable extension) present in a PATH dir?
+/// Inject the PATH value and an existence probe — mirrors `preferred_powershell`
+/// in terminal.rs, so tests never touch the real filesystem.
+fn on_path(
+    stem: &str,
+    path: Option<&std::ffi::OsStr>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    // cmd resolves these via PATHEXT; "" catches an exact-named executable.
+    const EXTS: [&str; 4] = ["", ".exe", ".cmd", ".bat"];
+    std::env::split_paths(path).any(|dir| {
+        EXTS.iter()
+            .any(|ext| exists(&dir.join(format!("{stem}{ext}"))))
+    })
 }
 
 /// The empty-desktop landing. Owns its own path-field picker (separate from the
@@ -156,7 +203,7 @@ impl Landing {
             ui.painter().text(
                 r.center_bottom() + egui::vec2(0.0, 12.0),
                 egui::Align2::CENTER_TOP,
-                label_of(kind),
+                kind.label(),
                 egui::FontId::proportional(12.0),
                 TEXT,
             );
@@ -220,5 +267,33 @@ mod tests {
             assert!(r.width() >= 0.0 && r.height() >= 0.0);
             assert!(a.contains_rect(r.intersect(a)));
         }
+    }
+
+    #[test]
+    fn launch_argv_wraps_agents_and_skips_shells() {
+        assert_eq!(
+            SessionKind::Claude.launch_argv(),
+            Some(vec!["cmd".into(), "/c".into(), "claude".into()])
+        );
+        assert_eq!(
+            SessionKind::Codex.launch_argv(),
+            Some(vec!["cmd".into(), "/c".into(), "codex".into()])
+        );
+        assert_eq!(SessionKind::Terminal.launch_argv(), None);
+    }
+
+    #[test]
+    fn on_path_resolves_a_shim_by_extension() {
+        let path = std::env::join_paths(["/a", "/b"]).unwrap();
+        // Only `claude.cmd` exists; probe matches on the .cmd extension.
+        let has_claude_cmd =
+            |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()) == Some("claude.cmd");
+        assert!(on_path("claude", Some(path.as_os_str()), &has_claude_cmd));
+        assert!(!on_path("codex", Some(path.as_os_str()), &has_claude_cmd));
+    }
+
+    #[test]
+    fn on_path_is_false_without_a_path_var() {
+        assert!(!on_path("claude", None, &|_| true));
     }
 }

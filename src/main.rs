@@ -15,6 +15,7 @@ mod job;
 mod keymap;
 mod landing;
 mod layout;
+mod notify;
 mod proc;
 mod settings;
 mod skills_install;
@@ -61,6 +62,8 @@ struct App {
     /// re-focuses the landing's picker (whose one-shot focus flag is otherwise
     /// spent after the first appearance).
     landing_shown: bool,
+    /// App-global transient notifications (toasts), drawn on top of everything.
+    notify: notify::Notifications,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -83,6 +86,7 @@ impl App {
             ),
             landing_enabled: std::env::var_os("FOREMAN_LANDING").is_some(),
             landing_shown: false,
+            notify: notify::Notifications::new(),
         }
     }
 }
@@ -401,11 +405,30 @@ impl eframe::App for App {
                 self.landing_shown = true;
             }
             if let Some(act) = self.landing.show(ui, area) {
-                let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
-                self.desktop.tile_new(nid, None);
-                // NOTE (phase-2 gap): act.kind is cosmetic in the mock — every
-                // kind spawns a plain PowerShell shell; Claude/Codex spawn later.
-                let _ = act.kind;
+                match act.kind.launch_argv() {
+                    // Terminal: a plain shell, as before.
+                    None => {
+                        let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
+                        self.desktop.tile_new(nid, None);
+                    }
+                    // Claude/Codex, installed: a dedicated agent pane.
+                    Some(argv) if act.kind.installed() => {
+                        match self.desktop.add_project_running(&argv, act.path, &ctx) {
+                            Ok(nid) => self.desktop.tile_new(nid, None),
+                            Err(e) => self.notify.push(
+                                notify::Level::Error,
+                                format!("Couldn't launch {}: {e}", act.kind.label()),
+                                std::time::Instant::now(),
+                            ),
+                        }
+                    }
+                    // Claude/Codex, missing: an error toast; stay on the landing.
+                    Some(_) => self.notify.push(
+                        notify::Level::Error,
+                        format!("{} isn't installed", act.kind.label()),
+                        std::time::Instant::now(),
+                    ),
+                }
             }
         } else {
             self.landing_shown = false;
@@ -459,6 +482,9 @@ impl eframe::App for App {
         self.desktop.advance_settles(std::time::Instant::now());
 
         self.show_os_chrome(&ctx);
+
+        // Transient toasts, on top of everything (chrome included).
+        self.notify.show(&ctx, std::time::Instant::now());
 
         // Adaptive repaint cadence. The real fast paths are all event-driven and
         // immediate (~0.2ms): reader threads request_repaint() on every PTY chunk,

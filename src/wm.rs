@@ -791,6 +791,52 @@ impl WindowManager {
         id
     }
 
+    /// Like `add_terminal`, but runs an explicit `argv` (e.g. an agent CLI) as
+    /// the terminal's process instead of a shell. Errs if the program can't be
+    /// spawned (e.g. it isn't installed), creating no window.
+    pub fn add_terminal_argv(
+        &mut self,
+        argv: &[String],
+        ctx: &egui::Context,
+    ) -> std::io::Result<WinId> {
+        let env = self.term_env(self.next);
+        let mut s = Session::spawn_argv(argv, self.cwd.as_deref(), &env, ctx.clone())?;
+        let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
+        s.set_term_id(id);
+        let name = argv.last().map(String::as_str).unwrap_or("agent");
+        self.push_win(
+            id,
+            format!("{}  ·  #{}", name, id),
+            rect,
+            Content::Terminal(s),
+        );
+        Ok(id)
+    }
+
+    /// Add a project whose sole terminal runs `argv` — a dedicated agent pane.
+    /// Errs (creating no project) if the program can't be spawned, so a missing
+    /// agent leaves the desktop untouched for the caller to report.
+    pub fn add_project_running(
+        &mut self,
+        argv: &[String],
+        cwd: PathBuf,
+        ctx: &egui::Context,
+    ) -> std::io::Result<WinId> {
+        let (id, rect) = self.next_slot(egui::vec2(720.0, 480.0));
+        let title = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("project {}", id));
+        let mut child = WindowManager::new();
+        child.tag = Some(format!("p{}", id));
+        child.cwd = Some(cwd);
+        let tid = child.add_terminal_argv(argv, ctx)?; // bails here if unspawnable
+        child.tile_new(tid, None);
+        self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        Ok(id)
+    }
+
     /// Env injected into every PTY this manager spawns (spec: agent-dispatch).
     fn term_env(&self, term_id: WinId) -> Vec<(String, String)> {
         let mut v = vec![
