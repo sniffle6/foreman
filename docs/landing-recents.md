@@ -32,7 +32,9 @@ the list; a missing or corrupt file just means an empty list.
   A kind this build doesn't recognize (written by a newer foreman) opens as a
   plain terminal instead of breaking the file.
 - **Missing directories are hidden, not deleted.** Unplug a drive and its
-  projects vanish from the list; plug it back in and they return.
+  projects vanish from the list; plug it back in and they return. The check
+  runs when the landing (re)appears, not every frame — a dead network path
+  can't stall the GUI, but a drive plugged in mid-landing shows up next visit.
 - **What is NOT recorded:** the flag-off startup auto-project (implicit, not
   a choice) and `foreman open` from the CLI (it spawns terminals inside an
   existing project — it never creates one).

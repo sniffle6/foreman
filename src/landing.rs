@@ -354,6 +354,9 @@ pub struct Landing {
     picker: DirPicker,
     zone: Zone,
     sel: usize,
+    /// Missing-dir-filtered recents snapshot; rebuilt when `refilter` is set.
+    visible: Vec<RecentEntry>,
+    refilter: bool,
 }
 
 impl Landing {
@@ -362,6 +365,8 @@ impl Landing {
             picker: DirPicker::new(start),
             zone: Zone::Field,
             sel: 0,
+            visible: Vec::new(),
+            refilter: true,
         }
     }
 
@@ -372,6 +377,7 @@ impl Landing {
         self.picker.reopen();
         self.zone = Zone::Field;
         self.sel = 0;
+        self.refilter = true; // recents may have changed while a project was open
     }
 
     pub fn show(
@@ -381,8 +387,14 @@ impl Landing {
         recents: &[RecentEntry],
     ) -> Option<LandingAction> {
         // Display-only filter: an entry whose dir is missing (unplugged drive) is
-        // hidden, not deleted — it comes back when the drive does (spec).
-        let visible: Vec<&RecentEntry> = recents.iter().filter(|e| e.path.is_dir()).collect();
+        // hidden, not deleted — it comes back when the drive does (spec). Cached
+        // and refreshed on landing (re)appearance, NOT per frame: the landing
+        // repaints continuously for the wordmark sweep, and is_dir() on a dead
+        // network path can block the GUI thread for seconds.
+        if std::mem::take(&mut self.refilter) {
+            self.visible = recents.iter().filter(|e| e.path.is_dir()).cloned().collect();
+        }
+        let visible = &self.visible;
         let l = layout(area, ICON_ORDER.len(), visible.len());
 
         let mut action: Option<LandingAction> = None;
@@ -413,7 +425,7 @@ impl Landing {
                 self.zone = zone;
                 self.sel = sel;
                 if let Some(idx) = open {
-                    let e = visible[idx];
+                    let e = &visible[idx];
                     action = Some(LandingAction {
                         path: e.path.clone(),
                         kind: SessionKind::from_kind_str(&e.kind),
