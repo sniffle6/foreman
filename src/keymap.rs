@@ -361,20 +361,12 @@ impl Keymap {
         self.leader = chord;
     }
 
-    /// Persist the current keymap to `%APPDATA%\foreman\keybindings.json`,
-    /// creating the `foreman` directory if needed. Errors are returned (never
-    /// panicked) so the caller can surface them in-UI; they are also logged.
+    /// Persist the current keymap to `%APPDATA%\foreman\keybindings.json` via
+    /// the atomic `config::save_json` (write a sibling `.tmp`, then rename),
+    /// so a crash mid-write can't truncate the file. Errors are returned
+    /// (never panicked) so the caller can surface them in-UI; they are also
+    /// logged.
     pub fn save(&self) -> Result<(), String> {
-        let appdata = std::env::var("APPDATA")
-            .map_err(|_| "APPDATA is not set; cannot locate the config directory".to_string())?;
-        let dir = std::path::Path::new(&appdata).join("foreman");
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            let msg = format!("could not create {}: {}", dir.display(), e);
-            eprintln!("foreman: {msg}");
-            return Err(msg);
-        }
-        let path = dir.join("keybindings.json");
-
         let mut bindings: Vec<BindingRepr> = self
             .table
             .iter()
@@ -387,15 +379,9 @@ impl Keymap {
             leader: Some(self.leader),
             bindings,
         };
-        let json = serde_json::to_string_pretty(&file)
-            .map_err(|e| format!("could not serialize keybindings: {e}"))?;
-
-        if let Err(e) = std::fs::write(&path, json) {
-            let msg = format!("could not write {}: {}", path.display(), e);
+        crate::config::save_json("keybindings.json", &file).inspect_err(|msg| {
             eprintln!("foreman: {msg}");
-            return Err(msg);
-        }
-        Ok(())
+        })
     }
 
     /// Load from `%APPDATA%\foreman\keybindings.json`, merged over the defaults.
