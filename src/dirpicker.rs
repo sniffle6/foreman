@@ -422,8 +422,13 @@ impl DirPicker {
                 self.open = true;
                 self.armed = false;
             }
-        } else if te.gained_focus() {
-            self.open = true; // clicking a collapsed field reopens it
+        } else if te.gained_focus() && ui.input(|i| i.pointer.any_down()) {
+            // Clicking a collapsed field reopens it. Pointer-gained focus only:
+            // egui's Tab focus-traversal also lands focus here (it runs at the
+            // raw-input layer, before consume_key can eat the Tab), and that
+            // must not pop the dropdown open — the landing's recents zone owns
+            // that Tab press.
+            self.open = true;
         }
 
         if self.open {
