@@ -137,6 +137,25 @@ pub enum Shell {
     PowerShell,
     Bash,
 }
+/// Pure: pick the PowerShell binary given a PATH value and an existence probe.
+/// PowerShell 7 (`pwsh.exe`) ships PSReadLine 2.1+ with inline predictions;
+/// Windows PowerShell 5.1 (`powershell.exe`) does not, so prefer pwsh when
+/// installed. Returns the bare exe name — CreateProcess resolves it through
+/// the same PATH this scanned.
+fn preferred_powershell(
+    path: Option<&std::ffi::OsStr>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> &'static str {
+    let Some(path) = path else {
+        return "powershell.exe";
+    };
+    if std::env::split_paths(path).any(|dir| exists(&dir.join("pwsh.exe"))) {
+        "pwsh.exe"
+    } else {
+        "powershell.exe"
+    }
+}
+
 impl Shell {
     fn program(self) -> &'static str {
         match self {
@@ -1345,6 +1364,40 @@ mod tests {
 
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
+    }
+
+    #[test]
+    fn preferred_powershell_finds_pwsh_in_first_path_dir() {
+        let path = std::env::join_paths(["C:\\one", "C:\\two"]).unwrap();
+        let got = preferred_powershell(Some(path.as_os_str()), &|p| {
+            p == Path::new("C:\\one\\pwsh.exe")
+        });
+        assert_eq!(got, "pwsh.exe");
+    }
+
+    #[test]
+    fn preferred_powershell_finds_pwsh_in_later_path_dir() {
+        // pwsh only in the SECOND dir: the whole PATH is scanned.
+        let path = std::env::join_paths(["C:\\one", "C:\\two"]).unwrap();
+        let got = preferred_powershell(Some(path.as_os_str()), &|p| {
+            p == Path::new("C:\\two\\pwsh.exe")
+        });
+        assert_eq!(got, "pwsh.exe");
+    }
+
+    #[test]
+    fn preferred_powershell_falls_back_when_pwsh_absent() {
+        let path = std::env::join_paths(["C:\\one", "C:\\two"]).unwrap();
+        assert_eq!(
+            preferred_powershell(Some(path.as_os_str()), &|_| false),
+            "powershell.exe"
+        );
+    }
+
+    #[test]
+    fn preferred_powershell_falls_back_without_path_var() {
+        // No PATH at all: never probe, just fall back.
+        assert_eq!(preferred_powershell(None, &|_| true), "powershell.exe");
     }
 
     #[test]
