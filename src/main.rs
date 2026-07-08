@@ -405,22 +405,16 @@ impl eframe::App for App {
                 self.landing_shown = true;
             }
             if let Some(act) = self.landing.show(ui, area) {
-                match act.kind.launch_argv() {
+                match act.kind.launch_command() {
                     // Terminal: a plain shell, as before.
                     None => {
                         let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
                         self.desktop.tile_new(nid, None);
                     }
-                    // Claude/Codex, installed: a dedicated agent pane.
-                    Some(argv) if act.kind.installed() => {
-                        match self.desktop.add_project_running(&argv, act.path, &ctx) {
-                            Ok(nid) => self.desktop.tile_new(nid, None),
-                            Err(e) => self.notify.push(
-                                notify::Level::Error,
-                                format!("Couldn't launch {}: {e}", act.kind.label()),
-                                std::time::Instant::now(),
-                            ),
-                        }
+                    // Claude/Codex, installed: a normal shell that runs the agent.
+                    Some(cmd) if act.kind.installed() => {
+                        let nid = self.desktop.add_project_with_command(act.path, cmd, &ctx);
+                        self.desktop.tile_new(nid, None);
                     }
                     // Claude/Codex, missing: an error toast; stay on the landing.
                     Some(_) => self.notify.push(

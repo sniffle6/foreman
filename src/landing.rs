@@ -107,12 +107,12 @@ impl SessionKind {
         }
     }
 
-    /// argv for a dedicated agent pane, or None for a plain shell. Launched via
-    /// `cmd /c` so npm's `.cmd`/`.bat` shims resolve — `CreateProcess` won't find
-    /// a bare `claude` otherwise. The pane IS the agent and closes when it exits.
-    pub fn launch_argv(self) -> Option<Vec<String>> {
+    /// The command to type into the project's shell to start this session, or
+    /// None for a plain shell (Terminal). Running the agent inside a normal
+    /// shell means quitting it drops back to a prompt instead of closing the
+    /// pane. Same string as the PATH stem today.
+    pub fn launch_command(self) -> Option<&'static str> {
         self.stem()
-            .map(|s| vec!["cmd".to_string(), "/c".to_string(), s.to_string()])
     }
 
     /// Is this agent resolvable on PATH? A plain shell is always "installed".
@@ -135,8 +135,9 @@ fn on_path(
     let Some(path) = path else {
         return false;
     };
-    // cmd resolves these via PATHEXT; "" catches an exact-named executable.
-    const EXTS: [&str; 4] = ["", ".exe", ".cmd", ".bat"];
+    // Extensions the shell can launch (npm ships .cmd/.ps1 shims); "" catches
+    // an exact-named executable.
+    const EXTS: [&str; 5] = ["", ".exe", ".cmd", ".bat", ".ps1"];
     std::env::split_paths(path).any(|dir| {
         EXTS.iter()
             .any(|ext| exists(&dir.join(format!("{stem}{ext}"))))
@@ -270,16 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn launch_argv_wraps_agents_and_skips_shells() {
-        assert_eq!(
-            SessionKind::Claude.launch_argv(),
-            Some(vec!["cmd".into(), "/c".into(), "claude".into()])
-        );
-        assert_eq!(
-            SessionKind::Codex.launch_argv(),
-            Some(vec!["cmd".into(), "/c".into(), "codex".into()])
-        );
-        assert_eq!(SessionKind::Terminal.launch_argv(), None);
+    fn launch_command_names_agents_and_skips_shells() {
+        assert_eq!(SessionKind::Claude.launch_command(), Some("claude"));
+        assert_eq!(SessionKind::Codex.launch_command(), Some("codex"));
+        assert_eq!(SessionKind::Terminal.launch_command(), None);
     }
 
     #[test]
