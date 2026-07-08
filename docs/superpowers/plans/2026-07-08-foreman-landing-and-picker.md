@@ -665,7 +665,7 @@ fn layout(area: egui::Rect, n_icons: usize) -> LandingLayout {
     let field_w = area.width().min(520.0).max(0.0);
     let (word_h, tag_h, field_h, icon, gap) = (120.0_f32, 24.0, 26.0, 72.0_f32, 18.0);
     let total = word_h + 16.0 + tag_h + 28.0 + field_h + 36.0 + icon;
-    let mut y = (area.center().y - total / 2.0).max(area.top());
+    let mut y = area.center().y - total / 2.0; // truly centered (no top-clamp; see B1 exec note)
 
     let centered = |w: f32, y: f32, h: f32| {
         egui::Rect::from_min_size(egui::pos2(cx - w / 2.0, y), egui::vec2(w, h))
