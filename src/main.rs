@@ -50,6 +50,13 @@ struct App {
     /// Set once the quit confirm was accepted, so the next viewport Close isn't
     /// intercepted again.
     force_quit: bool,
+    /// The empty-state landing screen (wordmark + inline picker + session
+    /// icons), shown when the desktop is deserted and `landing_enabled`.
+    landing: landing::Landing,
+    /// Gated behind `FOREMAN_LANDING`: when unset, startup auto-opens a project
+    /// and closing the last one quits (today's behavior); when set, an empty
+    /// desktop shows the landing instead.
+    landing_enabled: bool,
 }
 
 /// Wait this long after the last zoom change before writing `settings.json`.
@@ -67,6 +74,10 @@ impl App {
             font_dirty_at: None,
             last_activity: None,
             force_quit: false,
+            landing: landing::Landing::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ),
+            landing_enabled: std::env::var_os("FOREMAN_LANDING").is_some(),
         }
     }
 }
@@ -352,9 +363,13 @@ impl eframe::App for App {
                 o.input_options.zoom_modifier = egui::Modifiers::NONE;
             });
             // Desktop hosts project windows; each project is its own sandbox.
-            let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
-            self.desktop.tile_new(nid, None);
+            // With the landing enabled, an empty desktop is the landing screen,
+            // so skip the startup auto-project and let the user pick a directory.
+            if !self.landing_enabled {
+                let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
+                self.desktop.tile_new(nid, None);
+            }
             self.started = true;
         }
 
@@ -375,8 +390,18 @@ impl eframe::App for App {
         }
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
-        self.desktop
-            .show(ui, area, true, egui::Id::new("desktop"), false);
+        if self.landing_enabled && self.desktop.deserted() {
+            if let Some(act) = self.landing.show(ui, area) {
+                let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
+                self.desktop.tile_new(nid, None);
+                // NOTE (phase-2 gap): act.kind is cosmetic in the mock — every
+                // kind spawns a plain PowerShell shell; Claude/Codex spawn later.
+                let _ = act.kind;
+            }
+        } else {
+            self.desktop
+                .show(ui, area, true, egui::Id::new("desktop"), false);
+        }
         // Quit guard: the window's title-bar X and Alt+F4 send
         // ViewportCommand::Close straight to the viewport, bypassing every WM
         // close funnel. Intercept while any subprocess is running and confirm
@@ -396,7 +421,7 @@ impl eframe::App for App {
         // end, and terminal emulators (tmux, Windows Terminal) exit with their
         // last session. `deserted` stays false while the dir picker or the
         // settings modal is up, so a project being created mid-modal survives.
-        if self.started && self.desktop.deserted() {
+        if self.started && !self.landing_enabled && self.desktop.deserted() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // removed in Task B3 once App wires the landing
-
 use eframe::egui;
 use std::path::PathBuf;
 
