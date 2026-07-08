@@ -473,9 +473,15 @@ impl DirPicker {
                 .order(egui::Order::Foreground)
                 .show(ui.ctx(), |ui| {
                     ui.set_max_width(field_rect.width());
+                    // Fill the space actually available under the field (capped),
+                    // instead of a fixed height: a constant either wastes tall
+                    // windows or overflows short ones — and an overflowing Area
+                    // gets relocated/squeezed by egui's screen constrain.
+                    let below =
+                        (ui.ctx().content_rect().bottom() - field_rect.bottom() - 24.0).max(72.0);
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         egui::ScrollArea::vertical()
-                            .max_height(280.0)
+                            .max_height(below.min(420.0))
                             .show(ui, |ui| {
                                 for (idx, row) in self.rows().into_iter().enumerate() {
                                     let label = match &row {
