@@ -160,7 +160,13 @@ impl Shell {
     fn program(self) -> &'static str {
         match self {
             Shell::Cmd => "cmd.exe",
-            Shell::PowerShell => "powershell.exe",
+            Shell::PowerShell => {
+                // Probe PATH once per run; installing pwsh mid-run needs a restart.
+                static PWSH: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+                *PWSH.get_or_init(|| {
+                    preferred_powershell(std::env::var_os("PATH").as_deref(), &|p| p.is_file())
+                })
+            }
             Shell::Bash => "wsl.exe",
         }
     }
