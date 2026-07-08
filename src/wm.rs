@@ -1017,14 +1017,7 @@ impl WindowManager {
             return Err("empty command".into());
         }
         let pid = self.resolve_project(req.project.as_deref())?;
-        let win = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == pid)
-            .expect("resolved");
-        let Content::Project(child) = &mut win.tabs[win.active].content else {
-            return Err("not a project".into()); // unreachable after resolve
-        };
+        let child = self.project_child_mut(pid)?;
         child
             .add_terminal_cmd(
                 &req.command,
@@ -1041,14 +1034,7 @@ impl WindowManager {
     /// the post-reply broadcast.
     fn chat_dispatch(&mut self, req: &crate::control::ChatRequest) -> Result<ChatOutcome, String> {
         let pid = self.resolve_project(req.project.as_deref())?;
-        let win = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == pid)
-            .expect("resolved");
-        let Content::Project(child) = &mut win.tabs[win.active].content else {
-            return Err("not a project".into()); // unreachable after resolve
-        };
+        let child = self.project_child_mut(pid)?;
         match (&req.text, req.history) {
             (None, Some(n)) => Ok(ChatOutcome::History(child.chat_history(n))),
             (Some(text), None) => {
@@ -1150,10 +1136,7 @@ impl WindowManager {
             return Err("no terminals to close".into());
         }
         let pid = self.resolve_project(req.project.as_deref())?;
-        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
-        let Content::Project(child) = &win.tabs[win.active].content else {
-            return Err("not a project".into()); // unreachable after resolve
-        };
+        let child = self.project_child(pid)?;
         let mut tids = Vec::new();
         for spec in &req.terminals {
             let tid = term_id(spec)?;
@@ -1185,10 +1168,7 @@ impl WindowManager {
     ) -> Result<(WinId, WinId), String> {
         let pid = self.resolve_project(project)?;
         let tid = term_id(terminal)?;
-        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
-        let Content::Project(child) = &win.tabs[win.active].content else {
-            return Err("not a project".into()); // unreachable after resolve
-        };
+        let child = self.project_child(pid)?;
         let tw = child
             .windows
             .iter()
@@ -1204,11 +1184,35 @@ impl WindowManager {
         Ok((pid, tid))
     }
 
+    /// The desktop→project hop shared by the control executors: the child
+    /// `WindowManager` inside project `pid`'s ACTIVE tab. Callers pass a
+    /// freshly `resolve_project`-ed pid, so a missing window is a logic
+    /// error (`expect`) and a non-project active tab is unreachable.
+    fn project_child(&self, pid: WinId) -> Result<&WindowManager, String> {
+        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
+        match &win.tabs[win.active].content {
+            Content::Project(child) => Ok(child),
+            _ => Err("not a project".into()), // unreachable after resolve
+        }
+    }
+
+    /// Mutable sibling of [`Self::project_child`].
+    fn project_child_mut(&mut self, pid: WinId) -> Result<&mut WindowManager, String> {
+        let win = self
+            .windows
+            .iter_mut()
+            .find(|w| w.id == pid)
+            .expect("resolved");
+        match &mut win.tabs[win.active].content {
+            Content::Project(child) => Ok(child),
+            _ => Err("not a project".into()), // unreachable after resolve
+        }
+    }
+
     /// Get a mutable reference to the `Session` for the given (pid, tid).
-    /// Prefers the active tab if it's a `Content::Terminal`; otherwise the
-    /// first terminal tab. Uses immutable checks first to find the tab
-    /// index, then takes a single mutable borrow — satisfying the borrow
-    /// checker without unsafe.
+    /// Tab choice is `terminal_tab_idx` (active-tab-preferred). Uses
+    /// immutable checks first to find the tab index, then takes a single
+    /// mutable borrow — satisfying the borrow checker without unsafe.
     fn session_mut(
         &mut self,
         pid: WinId,
@@ -1216,34 +1220,16 @@ impl WindowManager {
     ) -> Result<&mut crate::terminal::Session, String> {
         // Immutable pass: find which tab index holds a terminal.
         let tab_idx = {
-            let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
-            let Content::Project(child) = &win.tabs[win.active].content else {
-                return Err("not a project".into());
-            };
+            let child = self.project_child(pid)?;
             let tw = child
                 .windows
                 .iter()
                 .find(|w| w.id == tid)
                 .ok_or_else(|| format!("no such terminal: t{tid}"))?;
-            let active = tw.active;
-            if matches!(tw.tabs[active].content, Content::Terminal(_)) {
-                active
-            } else {
-                tw.tabs
-                    .iter()
-                    .position(|t| matches!(t.content, Content::Terminal(_)))
-                    .ok_or_else(|| format!("no terminal tab in t{tid}"))?
-            }
+            terminal_tab_idx(tw).ok_or_else(|| format!("no terminal tab in t{tid}"))?
         };
         // Mutable pass: take the borrow with the known index.
-        let win = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == pid)
-            .expect("resolved");
-        let Content::Project(child) = &mut win.tabs[win.active].content else {
-            return Err("not a project".into());
-        };
+        let child = self.project_child_mut(pid)?;
         let tw = child
             .windows
             .iter_mut()
@@ -1255,24 +1241,19 @@ impl WindowManager {
         Ok(s)
     }
 
-    /// Read-only `output_gen` of the terminal at (pid, tid). Mirrors the
-    /// active-tab-preferred lookup of `session_mut` but takes `&self`, so the
-    /// settle machinery can poll freshness while iterating the pending list.
-    /// `None` if the project/terminal/terminal-tab no longer exists.
+    /// Read-only `output_gen` of the terminal at (pid, tid). Tab choice is
+    /// `terminal_tab_idx`, same as `session_mut` — but this walk takes
+    /// `&self` and degrades to `None` instead of erroring: the settle
+    /// machinery polls freshness while iterating the pending list, and the
+    /// project/terminal may have closed since the request was parked (so no
+    /// `project_child`, which expects a live pid).
     fn session_gen(&self, pid: WinId, tid: WinId) -> Option<u64> {
         let win = self.windows.iter().find(|w| w.id == pid)?;
         let Content::Project(child) = &win.tabs[win.active].content else {
             return None;
         };
         let tw = child.windows.iter().find(|w| w.id == tid)?;
-        let active = tw.active;
-        let idx = if matches!(tw.tabs[active].content, Content::Terminal(_)) {
-            active
-        } else {
-            tw.tabs
-                .iter()
-                .position(|t| matches!(t.content, Content::Terminal(_)))?
-        };
+        let idx = terminal_tab_idx(tw)?;
         let Content::Terminal(s) = &tw.tabs[idx].content else {
             return None;
         };
@@ -1332,24 +1313,13 @@ impl WindowManager {
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
         // Read mode with an immutable borrow BEFORE taking the mutable session borrow.
         let mode = {
-            let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
-            let Content::Project(child) = &win.tabs[win.active].content else {
-                return Err("not a project".into());
-            };
+            let child = self.project_child(pid)?;
             let tw = child
                 .windows
                 .iter()
                 .find(|w| w.id == tid)
                 .expect("resolved");
-            let active = tw.active;
-            let idx = if matches!(tw.tabs[active].content, Content::Terminal(_)) {
-                active
-            } else {
-                tw.tabs
-                    .iter()
-                    .position(|t| matches!(t.content, Content::Terminal(_)))
-                    .ok_or_else(|| format!("no terminal tab in t{tid}"))?
-            };
+            let idx = terminal_tab_idx(tw).ok_or_else(|| format!("no terminal tab in t{tid}"))?;
             let Content::Terminal(s) = &tw.tabs[idx].content else {
                 return Err("not a terminal tab".into());
             };
@@ -4245,6 +4215,21 @@ fn term_tag(id: WinId) -> String {
     format!("t{id}")
 }
 
+/// Active-tab-preferred terminal-tab pick: the active tab if it holds a
+/// `Content::Terminal`, else the first terminal tab (`None` if the window
+/// has no terminal tabs at all). This is the ONE place the policy lives —
+/// every control executor that reads or feeds "the terminal in window `tN`"
+/// must agree on which tab that means.
+fn terminal_tab_idx(tw: &Win) -> Option<usize> {
+    if matches!(tw.tabs[tw.active].content, Content::Terminal(_)) {
+        Some(tw.active)
+    } else {
+        tw.tabs
+            .iter()
+            .position(|t| matches!(t.content, Content::Terminal(_)))
+    }
+}
+
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
@@ -4515,6 +4500,89 @@ mod tests {
         wm.merge_windows(a, a);
         assert_eq!(wm.windows.len(), 1);
         assert_eq!(wm.windows[0].tabs.len(), 1);
+    }
+
+    // --- merge_target_at (titlebar hit-testing) -----------------------------
+    // NOTE: `merge_target_at` returns the window *index* (`Some(usize)`) into
+    // `self.windows`, not the `WinId`. `push` gives every window the same local
+    // rect (20,20)+(400,300); an `area` anchored at the origin makes local ==
+    // screen coords, so the titlebar band is y ∈ [20, 20+TITLE_H). `9999` is a
+    // `WinId` no window owns, used when the drag source is irrelevant.
+
+    // A screen area at the origin: window-local rects coincide with screen rects.
+    fn origin_area() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 2000.0))
+    }
+    // A point inside the shared titlebar band of a `push`ed window.
+    fn titlebar_point() -> egui::Pos2 {
+        egui::pos2(100.0, 20.0 + TITLE_H / 2.0)
+    }
+
+    #[test]
+    fn merge_target_hits_the_titlebar_band() {
+        let mut wm = WindowManager::new();
+        let _a = push(&mut wm, "A"); // index 0
+        assert_eq!(
+            wm.merge_target_at(9999, titlebar_point(), origin_area(), &[0]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn merge_target_misses_the_body_below_the_titlebar() {
+        let mut wm = WindowManager::new();
+        let _a = push(&mut wm, "A"); // index 0
+        // Inside the window body (rect y ∈ [20,320]) but below the titlebar band.
+        let body = egui::pos2(100.0, 20.0 + TITLE_H + 50.0);
+        assert_eq!(
+            wm.merge_target_at(9999, body, origin_area(), &[0]),
+            None,
+            "only the titlebar band is a merge target, not the body"
+        );
+    }
+
+    #[test]
+    fn merge_target_prefers_topmost_in_z_order() {
+        let mut wm = WindowManager::new();
+        let _a = push(&mut wm, "A"); // index 0
+        let _b = push(&mut wm, "B"); // index 1, overlapping A
+        // `order` is back-to-front, so its last entry is the top-most window.
+        assert_eq!(
+            wm.merge_target_at(9999, titlebar_point(), origin_area(), &[0, 1]),
+            Some(1),
+            "top-most (last in back-to-front order) wins"
+        );
+        // Reverse the stacking: index 0 is now on top.
+        assert_eq!(
+            wm.merge_target_at(9999, titlebar_point(), origin_area(), &[1, 0]),
+            Some(0),
+            "the z-order slice, not the windows vec order, decides the winner"
+        );
+    }
+
+    #[test]
+    fn merge_target_skips_the_dragged_source() {
+        let mut wm = WindowManager::new();
+        let _a = push(&mut wm, "A"); // index 0
+        let b = push(&mut wm, "B"); // index 1, top-most, overlapping A
+        // `b` is on top but is the drag source, so the target is A beneath it.
+        assert_eq!(
+            wm.merge_target_at(b, titlebar_point(), origin_area(), &[0, 1]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn merge_target_skips_minimized_windows() {
+        let mut wm = WindowManager::new();
+        let _a = push(&mut wm, "A"); // index 0
+        let _b = push(&mut wm, "B"); // index 1, top-most, overlapping A
+        wm.windows[1].minimized = true;
+        // The top-most window is minimized, so the pointer falls through to A.
+        assert_eq!(
+            wm.merge_target_at(9999, titlebar_point(), origin_area(), &[0, 1]),
+            Some(0)
+        );
     }
 
     #[test]
