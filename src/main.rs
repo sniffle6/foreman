@@ -13,6 +13,7 @@ mod input;
 mod inspect;
 mod job;
 mod keymap;
+mod landing;
 mod layout;
 mod proc;
 mod settings;
