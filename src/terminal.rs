@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode, viewport_to_point};
@@ -272,6 +272,52 @@ fn term_view<L: EventListener>(term: &Term<L>) -> crate::graphics::TermView {
         cursor_line: g.cursor.point.line.0.max(0) as usize,
         alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
         history_size: g.history_size(),
+    }
+}
+
+/// Resize the grid to `size`, keeping content anchored on a height grow.
+///
+/// ConPTY emits no repaint when a pane grows taller: it anchors existing
+/// content (blank rows appear below) and keeps addressing the cursor by the
+/// same absolute rows. `alacritty_terminal` instead pulls lines back from
+/// scrollback, shifting content down — so the child's next absolute repaint
+/// (e.g. PSReadLine echoing a keystroke via CUP) lands mid-scrollback, rows
+/// above the prompt. Cancel the pull so both layouts agree. Shrinks and pure
+/// width changes are untouched: shrink was probed clean, and width is the
+/// separate wrapped-reflow divergence. See docs/conpty-resize-reflow.md.
+fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) {
+    let old_rows = term.screen_lines();
+    if size.rows <= old_rows {
+        term.resize(size);
+        return;
+    }
+    // Apply the column step on its own first — a deliberate reordering
+    // (native alacritty reflows lines before columns) so the cursor delta
+    // below measures only the height step's history pull, unpolluted by
+    // rewrap moving the cursor.
+    if size.cols != term.columns() {
+        term.resize(Size {
+            cols: size.cols,
+            rows: old_rows,
+        });
+    }
+    let before = term.grid().cursor.point.line.0;
+    term.resize(size);
+    let pulled = (term.grid().cursor.point.line.0 - before).max(0) as usize;
+    if pulled > 0 {
+        let region = Line(0)..Line(size.rows as i32);
+        // Term::resize rotated any live selection to track the pull; rotate
+        // it back alongside the content (mirrors Term::scroll_up_relative).
+        let rotated = term
+            .selection
+            .take()
+            .and_then(|s| s.rotate(term, &region, pulled as i32));
+        term.selection = rotated;
+        let grid = term.grid_mut();
+        grid.scroll_up(&region, pulled);
+        // grow_lines moved both cursors down by exactly `pulled`; undo it.
+        grid.cursor.point.line -= pulled;
+        grid.saved_cursor.point.line -= pulled;
     }
 }
 
@@ -943,7 +989,7 @@ impl Session {
         if cols != self.cols || rows != self.rows {
             self.cols = cols;
             self.rows = rows;
-            self.term.resize(Size { cols, rows });
+            resize_anchored(&mut self.term, Size { cols, rows });
             // Reflow under a preserved scroll offset points the viewport at stale
             // content; snap back to the live prompt like a normal terminal.
             self.term.scroll_display(Scroll::Bottom);
@@ -2119,15 +2165,16 @@ mod tests {
         }
     }
 
-    /// Diagnostic, machine-dependent: after a pane resize, does plain typed
-    /// input echo at the prompt or stranded mid-screen? Prints grid + cursor +
-    /// raw ConPTY bytes for each phase so the divergence is attributable
-    /// (foreman/alacritty grid state vs what ConPTY actually emitted).
-    /// Run manually:
-    /// cargo test --release resize_typing_probe -- --ignored --nocapture
-    #[test]
-    #[ignore = "diagnostic: result depends on the OS ConPTY version"]
-    fn resize_typing_probe() {
+    fn resize_probe_scenario(label: &str, from: (usize, usize), to: (usize, usize)) {
+        resize_probe_scenario_with(label, from, to, "1..40 | % { \"line $_\" }\r");
+    }
+
+    fn resize_probe_scenario_with(
+        label: &str,
+        from: (usize, usize),
+        to: (usize, usize),
+        fill: &str,
+    ) {
         fn pump_for(s: &mut Session, ms: u64) {
             let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
             while std::time::Instant::now() < end {
@@ -2157,13 +2204,13 @@ mod tests {
             }
         }
 
-        let dump = std::env::temp_dir().join("foreman_resize_probe.bin");
+        let dump = std::env::temp_dir().join(format!("foreman_resize_probe_{label}.bin"));
         let _ = std::fs::remove_file(&dump);
         let ctx = egui::Context::default();
         let argv = vec!["powershell.exe".to_string(), "-NoProfile".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         s.rx_dump = std::fs::File::create(&dump).ok();
-        s.resize(100, 30);
+        s.resize(from.0, from.1);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !s.ready() {
@@ -2173,7 +2220,7 @@ mod tests {
         }
         pump_for(&mut s, 1000); // let PSReadLine finish its startup render
 
-        s.send(b"1..40 | % { \"line $_\" }\r");
+        s.send(fill.as_bytes());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !s.snapshot_text(None).iter().any(|r| r.contains("line 40")) {
             assert!(std::time::Instant::now() < deadline, "output never arrived");
@@ -2182,27 +2229,178 @@ mod tests {
         pump_for(&mut s, 500);
         let len =
             |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as usize;
-        dump_state(&mut s, "before resize (100x30)");
+        dump_state(&mut s, &format!("[{label}] before resize {from:?}"));
         let mark0 = len(&dump);
 
-        s.resize(80, 45); // narrower + taller, like a floating-window drag
+        s.resize(to.0, to.1);
         pump_for(&mut s, 1500);
-        dump_state(&mut s, "after resize to 80x45");
+        dump_state(&mut s, &format!("[{label}] after resize to {to:?}"));
         let mark1 = len(&dump);
 
         s.send(b"sdfs");
         pump_for(&mut s, 1500);
-        dump_state(&mut s, "after typing sdfs");
+        dump_state(&mut s, &format!("[{label}] after typing sdfs"));
 
         let bytes = std::fs::read(&dump).unwrap_or_default();
         println!(
-            "=== raw ConPTY bytes: resize repaint ===\n{}",
+            "=== [{label}] raw ConPTY bytes: resize repaint ===\n{}",
             esc(&bytes[mark0.min(bytes.len())..mark1.min(bytes.len())])
         );
         println!(
-            "=== raw ConPTY bytes: typed echo ===\n{}",
+            "=== [{label}] raw ConPTY bytes: typed echo ===\n{}",
             esc(&bytes[mark1.min(bytes.len())..])
         );
+    }
+
+    /// Diagnostic, machine-dependent: after a pane resize, does plain typed
+    /// input echo at the prompt or stranded mid-screen? Prints grid + cursor +
+    /// raw ConPTY bytes for each phase so the divergence is attributable
+    /// (foreman/alacritty grid state vs what ConPTY actually emitted).
+    /// Run manually:
+    /// cargo test --release resize_typing_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the OS ConPTY version"]
+    fn resize_typing_probe() {
+        resize_probe_scenario("grow", (100, 30), (80, 45));
+        resize_probe_scenario("shrink", (100, 45), (100, 30));
+        // Wide rows that wrap when the pane narrows — the reflow divergence.
+        resize_probe_scenario_with(
+            "wrap-narrow",
+            (100, 30),
+            (80, 30),
+            "1..40 | % { \"line $_ \" + (\"x\" * 90) }\r",
+        );
+        // ...and widening back out after the wrap.
+        resize_probe_scenario_with(
+            "wrap-widen",
+            (80, 30),
+            (100, 30),
+            "1..40 | % { \"line $_ \" + (\"x\" * 70) }\r",
+        );
+    }
+
+    /// ConPTY anchors its layout on a height grow (zero bytes emitted, blank
+    /// rows appear below) and keeps addressing the cursor by the same absolute
+    /// rows. So growing must NOT pull scrollback back in — content and cursor
+    /// stay put, or every subsequent absolute repaint from the child lands
+    /// mid-scrollback. See docs/conpty-resize-reflow.md, second manifestation.
+    #[test]
+    fn height_grow_anchors_content_instead_of_pulling_scrollback() {
+        let mut feed = String::new();
+        for i in 1..=40 {
+            feed.push_str(&format!("line {i}\r\n"));
+        }
+        feed.push_str("PS>");
+        let mut term = term_with(feed.as_bytes(), 80, 30);
+        assert_eq!(
+            term.grid().cursor.point.line.0,
+            29,
+            "setup: prompt on the last row"
+        );
+
+        resize_anchored(&mut term, Size { cols: 80, rows: 45 });
+
+        let rows = crate::inspect::snapshot_text(&term, None);
+        assert_eq!(
+            term.grid().cursor.point.line.0,
+            29,
+            "cursor must stay on ConPTY's row"
+        );
+        assert_eq!(rows[29], "PS>", "prompt row must stay anchored");
+        assert!(
+            rows[30..].iter().all(|r| r.is_empty()),
+            "the new rows appear blank below, as in ConPTY's layout"
+        );
+        // The lines alacritty pulled in must go back to scrollback, not vanish.
+        term.scroll_display(Scroll::Top);
+        let scrolled = crate::inspect::snapshot_text(&term, None);
+        assert!(
+            scrolled.iter().any(|r| r == "line 1"),
+            "history intact after re-anchoring"
+        );
+    }
+
+    /// A live selection must keep pointing at the same content when a height
+    /// grow is re-anchored: `Term::resize` rotates the selection to track the
+    /// history pull, so cancelling the pull must rotate it back.
+    #[test]
+    fn height_grow_keeps_selection_on_its_content() {
+        let mut feed = String::new();
+        for i in 1..=40 {
+            feed.push_str(&format!("line {i}\r\n"));
+        }
+        feed.push_str("PS>");
+        let mut term = term_with(feed.as_bytes(), 80, 30);
+        // History holds lines 1-11, so viewport row 5 shows "line 17".
+        select(
+            &mut term,
+            SelectionType::Simple,
+            (5, 0, Side::Left),
+            Some((5, 6, Side::Right)),
+        );
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("line 17"),
+            "setup: selection covers line 17"
+        );
+
+        resize_anchored(&mut term, Size { cols: 80, rows: 45 });
+
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("line 17"),
+            "selection must stick to its content across a re-anchored grow"
+        );
+    }
+
+    /// Regression, machine-dependent: grow a pane taller while scrollback
+    /// exists, then type. The echo and the caret must land on the prompt row,
+    /// not rows above it inside old output (the height-grow divergence in
+    /// docs/conpty-resize-reflow.md). Run manually:
+    /// cargo test --release typed_echo_lands -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the OS ConPTY version"]
+    fn typed_echo_lands_on_the_prompt_after_a_height_grow() {
+        let ctx = egui::Context::default();
+        let argv = vec!["powershell.exe".to_string(), "-NoProfile".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.resize(100, 30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.ready() {
+            s.pump();
+            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        s.send(b"1..40 | % { \"line $_\" }\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.snapshot_text(None).iter().any(|r| r.contains("line 40")) {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Settle, then grow taller only — isolates the height policy from the
+        // separately documented (and unfixable-cheap) width reflow divergence.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.pump();
+        s.resize(100, 45);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        s.pump();
+        s.send(b"sdfs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.snapshot_text(None).iter().any(|r| r.contains("sdfs")) {
+            assert!(std::time::Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let rows = s.snapshot_text(None);
+        let echo = rows.iter().position(|r| r.contains("sdfs")).unwrap();
+        let prompt = rows.iter().rposition(|r| r.contains('>')).unwrap();
+        assert_eq!(
+            echo,
+            prompt,
+            "typed echo stranded {} rows above the prompt:\n{rows:#?}",
+            prompt.saturating_sub(echo)
+        );
+        let cur = s.cursor_info();
+        assert_eq!(cur.row as usize, prompt, "caret stranded off the prompt row");
     }
 
     /// Diagnostic capture: run the real codex TUI headlessly (pets enabled via

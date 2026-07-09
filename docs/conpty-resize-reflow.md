@@ -4,8 +4,9 @@
 **Upstream:** [microsoft/terminal #18725](https://github.com/microsoft/terminal/issues/18725) (open, unshipped).
 
 Two distinct manifestations of the same root divergence are documented here:
-width-shrink + history recall (below), and **height-grow + plain typing**
-(§ "Second manifestation"). Both heal with `Ctrl+L`.
+width-shrink + history recall (below, **not fixed**, heals with `Ctrl+L`), and
+height-grow + plain typing (§ "Second manifestation", **fixed in foreman** by
+`resize_anchored` in `src/terminal.rs`).
 
 ## Symptom
 
@@ -77,12 +78,28 @@ Observed: resize-repaint phase = empty byte stream; typed-echo phase =
 `ESC[30;20H … sdfs` while our prompt sits at row 45 — offset 15 = exactly the
 height delta (all 15 new rows were filled from history).
 
-**Fixability note:** unlike the wrapped-line reflow divergence above, this one
-does not require conhost's reflow math — it is a pure policy difference ("pull
-from history on grow" vs "anchor and extend below"). A foreman-side
-compensation (cancel alacritty's history pull after a grow so the prompt row
-matches ConPTY's) is plausible but untried; it must not disturb the
-no-scrollback case, width changes, or shrink.
+**Fixed (2026-07-08):** unlike the wrapped-line reflow divergence above, this
+one does not require conhost's reflow math — it is a pure policy difference
+("pull from history on grow" vs "anchor and extend below"). `resize_anchored`
+(`src/terminal.rs`, called from `Session::resize`) cancels alacritty's history
+pull after a height grow: it measures the pull as the cursor-line delta across
+the height step (the column step runs separately first so rewrap can't pollute
+the measurement), scrolls the pulled lines back into history via
+`Grid::scroll_up` on the full screen, rotates any live selection back alongside
+the content (`Term::resize` had rotated it to track the pull), and restores the
+cursor + saved cursor. Height **shrink** was probed clean (both sides push into
+history the same way) and is untouched, as are width-only changes.
+Regression tests: `height_grow_anchors_content_instead_of_pulling_scrollback`,
+`height_grow_keeps_selection_on_its_content` (pure) and
+`typed_echo_lands_on_the_prompt_after_a_height_grow` (live ConPTY,
+ignored/diagnostic).
+
+**TODO (tracked follow-up, not fixed):** the compensation only reaches the
+*active* grid — alacritty exposes no public accessor for the inactive one. A
+height grow while an alt-screen app runs (vim/less/htop, agent TUIs) leaves the
+*primary* grid pulled and uncompensated; quitting the app then reproduces the
+mis-anchored prompt. A full fix needs the inactive grid compensated too
+(e.g. swap, compensate, swap back — invasive) or an upstream accessor.
 
 ## What was tried and rejected ("let ConPTY own the redraw")
 
