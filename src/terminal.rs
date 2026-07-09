@@ -285,11 +285,11 @@ fn term_view<L: EventListener>(term: &Term<L>) -> crate::graphics::TermView {
 /// above the prompt. Cancel the pull so both layouts agree. Shrinks and pure
 /// width changes are untouched: shrink was probed clean, and width is the
 /// separate wrapped-reflow divergence. See docs/conpty-resize-reflow.md.
-fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) {
+fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) -> usize {
     let old_rows = term.screen_lines();
     if size.rows <= old_rows {
         term.resize(size);
-        return;
+        return 0;
     }
     // Apply the column step on its own first — a deliberate reordering
     // (native alacritty reflows lines before columns) so the cursor delta
@@ -319,6 +319,7 @@ fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) {
         grid.cursor.point.line -= pulled;
         grid.saved_cursor.point.line -= pulled;
     }
+    pulled
 }
 
 /// Scanner for the first *visible* glyph in raw PTY output — printable bytes
@@ -987,18 +988,36 @@ impl Session {
             return;
         }
         if cols != self.cols || rows != self.rows {
+            let (oldc, oldr) = (self.cols, self.rows);
             self.cols = cols;
             self.rows = rows;
-            resize_anchored(&mut self.term, Size { cols, rows });
+            let pulled = resize_anchored(&mut self.term, Size { cols, rows });
             // Reflow under a preserved scroll offset points the viewport at stale
             // content; snap back to the live prompt like a normal terminal.
             self.term.scroll_display(Scroll::Bottom);
-            let _ = self.master.resize(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            let pty_ok = self
+                .master
+                .resize(PtySize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .is_ok();
+            // Diagnostic marker in the FOREMAN_RX_DUMP stream: interleaves the
+            // resize (and what the anchor compensation did) with the raw ConPTY
+            // bytes, so a live repro attributes divergence without guesswork.
+            if let Some(f) = self.rx_dump.as_mut() {
+                use std::io::Write;
+                let cur = self.term.grid().cursor.point;
+                let _ = writeln!(
+                    f,
+                    "\n<<RESIZE {oldc}x{oldr}->{cols}x{rows} pulled={pulled} cursor={},{} pty={}>>",
+                    cur.line.0,
+                    cur.column.0,
+                    if pty_ok { "ok" } else { "ERR" }
+                );
+            }
         }
         // First resize() = first time the grid has its real render-time width
         // (show() calls this every frame). Flush the deferred note now, fitted
@@ -2207,7 +2226,8 @@ mod tests {
         let dump = std::env::temp_dir().join(format!("foreman_resize_probe_{label}.bin"));
         let _ = std::fs::remove_file(&dump);
         let ctx = egui::Context::default();
-        let argv = vec!["powershell.exe".to_string(), "-NoProfile".to_string()];
+        let shell = std::env::var("FOREMAN_PROBE_SHELL").unwrap_or("powershell.exe".into());
+        let argv = vec![shell, "-NoProfile".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
         s.rx_dump = std::fs::File::create(&dump).ok();
         s.resize(from.0, from.1);
@@ -2252,6 +2272,61 @@ mod tests {
         );
     }
 
+    /// Simulate a mouse drag: step the width down 100→60 and back up at frame
+    /// cadence (one Session::resize per ~16ms with pumping between), over
+    /// wide `ls`-like rows that wrap when narrow. Then type and report where
+    /// the echo lands relative to the prompt.
+    fn drag_probe_scenario(label: &str, rows: usize) {
+        fn pump_for(s: &mut Session, ms: u64) {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                s.pump();
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+        }
+        let ctx = egui::Context::default();
+        let shell = std::env::var("FOREMAN_PROBE_SHELL").unwrap_or("powershell.exe".into());
+        let argv = vec![shell, "-NoProfile".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.resize(100, rows);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.ready() {
+            s.pump();
+            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 1000);
+        s.send(b"1..40 | % { \"line $_ \" + (\"x\" * 80) }\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.snapshot_text(None).iter().any(|r| r.contains("line 40")) {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 500);
+
+        for w in (60..=100).rev().chain(60..=100).step_by(1) {
+            s.resize(w, rows);
+            pump_for(&mut s, 16);
+        }
+        pump_for(&mut s, 1500);
+
+        s.send(b"sdfs");
+        pump_for(&mut s, 1500);
+        let rows_txt = s.snapshot_text(None);
+        let cur = s.cursor_info();
+        let echo = rows_txt.iter().position(|r| r.contains("sdfs"));
+        let prompt = rows_txt.iter().rposition(|r| r.contains('>'));
+        println!(
+            "=== [{label}] after drag+typing: cursor row={} col={} echo_row={echo:?} prompt_row={prompt:?} ===",
+            cur.row, cur.col
+        );
+        for (i, row) in rows_txt.iter().enumerate() {
+            if !row.is_empty() {
+                println!("{i:3} |{row}");
+            }
+        }
+    }
+
     /// Diagnostic, machine-dependent: after a pane resize, does plain typed
     /// input echo at the prompt or stranded mid-screen? Prints grid + cursor +
     /// raw ConPTY bytes for each phase so the divergence is attributable
@@ -2277,6 +2352,10 @@ mod tests {
             (100, 30),
             "1..40 | % { \"line $_ \" + (\"x\" * 70) }\r",
         );
+        // A real mouse drag: many small width steps at frame cadence, down
+        // then back up, with ConPTY repaints landing asynchronously between
+        // steps — the reported "width smaller then bigger" gesture.
+        drag_probe_scenario("drag-narrow-widen", 30);
     }
 
     /// ConPTY anchors its layout on a height grow (zero bytes emitted, blank

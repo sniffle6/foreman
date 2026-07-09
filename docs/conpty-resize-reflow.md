@@ -47,8 +47,10 @@ reflow algorithm, which we cannot cheaply match without forking
   `ESC[23;22H` (row 23). foreman renders both faithfully — the bytes disagree.
 - foreman sends ConPTY nothing but the Up key around the recall; no DSR query is
   involved. The child reports the correct (narrow) width. Plain typing after a
-  **width-only shrink** is correct — only history-recall misfires there. (Typing
-  after a **height grow** is NOT safe — see the second manifestation below.)
+  single **width-only shrink** is correct — only history-recall misfires there.
+  (Typing after a **height grow** is NOT safe — see the second manifestation
+  below. Typing after a **width drag through wrap overflow** is NOT safe either
+  — see the third manifestation.)
 - The offset equals the prompt's wrapped-row count, consistent across all widths
   and heights where the prompt wraps.
 - **Windows Terminal renders the identical PowerShell scenario cleanly.**
@@ -100,6 +102,31 @@ height grow while an alt-screen app runs (vim/less/htop, agent TUIs) leaves the
 *primary* grid pulled and uncompensated; quitting the app then reproduces the
 mis-anchored prompt. A full fix needs the inactive grid compensated too
 (e.g. swap, compensate, swap back — invasive) or an upstream accessor.
+
+## Third manifestation: width drag through wrap overflow (typed echo lands mid-screen)
+
+**Symptom (2026-07-08, reproduced):** drag a pane's width smaller then bigger
+while on-screen rows are wide enough to wrap when narrow and the wrapped total
+exceeds the pane height. Afterwards, typed input and the caret land rows above
+the prompt (a torn wrap fragment is usually visible nearby). `Ctrl+L` heals.
+
+**Root cause:** the scrollback asymmetry again, through the width axis. ConPTY's
+buffer is viewport-sized — when narrowing wraps content past the pane height,
+the overflow scrolls out ConPTY's top and is **gone**; alacritty parks the same
+rows in scrollback. On widening, alacritty's rewrap re-joins wrapped lines
+across the history boundary and the content comes back; ConPTY unwraps only
+what it kept, so its cursor settles rows higher than ours. The next child
+repaint addresses ConPTY's layout. Unlike the height-grow case, the re-join is
+intrinsic to reflow — there is no separable "pull" to cancel — so this is NOT
+cheaply fixable; it needs the conhost-parity reflow (or the newer-ConPTY
+partial mitigation) described below.
+
+**Evidence:** `drag_probe_scenario` (inside `resize_typing_probe`,
+`src/terminal.rs`) steps the width 100→60→100 at frame cadence over wrapping
+rows, then types: echo at row 15, prompt at row 29. Height never changes, so
+`resize_anchored` is not involved. `Session::resize` also writes
+`<<RESIZE …>>` markers (old→new size, measured pull, cursor, PTY result) into
+the `FOREMAN_RX_DUMP` stream for attributing live repros.
 
 ## What was tried and rejected ("let ConPTY own the redraw")
 
