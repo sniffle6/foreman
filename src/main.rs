@@ -545,7 +545,7 @@ fn main() -> eframe::Result {
     }
     install_panic_logger();
     skills_install::install();
-    conpty_install::ensure_conpty();
+    conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
