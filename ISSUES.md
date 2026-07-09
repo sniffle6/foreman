@@ -46,16 +46,21 @@ or a TDR triggered by other GPU load while foreman idled). egui-wgpu/eframe
 0.34 does not handle device loss; it panics instead of recovering, and per
 playbook §11 the panic aborts the whole process — every session dies.
 
-**Candidate fixes (unvalidated):**
-1. Upgrade egui/eframe/egui-wgpu — check whether newer versions recover from
-   device loss instead of panicking (known upstream pain point; check egui
-   changelog/issues for device-lost handling before assuming).
-2. Try a different wgpu backend (`WGPU_BACKEND=gl`, or DX12 vs Vulkan) —
-   device-loss behavior varies by backend/driver; also identify which
-   adapter/backend foreman currently gets.
+**Candidate fixes:**
+1. ~~Upgrade egui/eframe/egui-wgpu~~ — **ruled out 2026-07-09**: egui-wgpu
+   0.35.0 (latest, 2026-06-25) still has the identical `panic!` for both the
+   index and vertex staging buffers (`renderer.rs`, `write_buffer_with` →
+   `None`), and its changelog contains no device-loss/recovery work. Upgrading
+   does not address this crash.
+2. Try a different backend (unvalidated) — `WGPU_BACKEND` env or eframe's
+   `glow` renderer (avoids egui-wgpu entirely). Caveat: GL contexts also die on
+   driver reset, so this may relocate the failure, not remove it. Warp (also a
+   GPU-rendered terminal) has this exact class open on Windows/DX12:
+   warpdotdev/warp#12132 (DXGI_ERROR_DEVICE_REMOVED → fatal panic, no
+   recovery) — device loss is simply unhandled across this stack today.
 3. Longer term: session persistence / daemon-client split (already an open
-   research item) would make any GUI-process crash survivable by keeping PTYs
-   in a separate process.
+   research item) — the only option that makes the crash *survivable* rather
+   than hopefully-avoided; PTYs live in a separate process from the GUI.
 
 **Repro.** Not deterministic. Leave foreman running, put the machine through
 sleep/resume or heavy GPU load in another app, return and interact. Confirm a
