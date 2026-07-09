@@ -144,6 +144,8 @@ enum StepAct {
     None,
     /// ↓ in the field: open the directory popup.
     OpenPopup,
+    /// Enter in the field: open the current path as a plain terminal.
+    AcceptField,
     /// Enter on an agent button: launch that kind at the field's path.
     LaunchButton(usize),
     /// Enter on a recents row: reopen that entry.
@@ -177,6 +179,7 @@ fn step(nav: Nav, n_btns: usize, n_recs: usize, key: NavKey) -> (Nav, StepAct) {
         (Zone::Field, ShiftTab) if n_recs > 0 => to(Zone::Recents),
         (Zone::Field, ShiftTab) => to(Zone::Buttons),
         (Zone::Field, Down) => (nav, StepAct::OpenPopup),
+        (Zone::Field, Enter) => (nav, StepAct::AcceptField),
         (Zone::Field, _) => (nav, Move),
 
         (Zone::Buttons, Tab) if n_recs > 0 => to(Zone::Recents),
@@ -491,6 +494,9 @@ impl Landing {
                         if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
                             return Some(NavKey::Down);
                         }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                            return Some(NavKey::Enter);
+                        }
                     }
                     Zone::Buttons | Zone::Recents => {
                         if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
@@ -526,6 +532,14 @@ impl Landing {
                 match act {
                     StepAct::None => {}
                     StepAct::OpenPopup => self.picker.open_dropdown(),
+                    StepAct::AcceptField => {
+                        if let Some(path) = self.picker.accept_or_flag() {
+                            action = Some(LandingAction {
+                                path,
+                                kind: SessionKind::Terminal,
+                            });
+                        }
+                    }
                     StepAct::LaunchButton(i) => {
                         if let Some(path) = self.picker.current_dir() {
                             action = Some(LandingAction {
@@ -844,6 +858,8 @@ mod tests {
     fn vertical_axis_walks_field_buttons_recents_with_clamps() {
         let (n, act) = step(Nav::HOME, 3, 2, NavKey::Down);
         assert_eq!((n.zone, act), (Zone::Field, StepAct::OpenPopup));
+        let (n, act) = step(Nav::HOME, 3, 2, NavKey::Enter);
+        assert_eq!((n.zone, act), (Zone::Field, StepAct::AcceptField));
         let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Up);
         assert_eq!(n.zone, Zone::Field);
         let (n, _) = step(nav(Zone::Buttons, 1, 0), 3, 2, NavKey::Down);

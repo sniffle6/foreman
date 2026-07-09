@@ -158,6 +158,17 @@ impl DirPicker {
         self.focus_next = true;
     }
 
+    /// Accept the field's current path from outside the popup (landing: Enter
+    /// in the field zone). Paints the invalid cue on failure, exactly like
+    /// Enter with the popup open.
+    pub fn accept_or_flag(&mut self) -> Option<PathBuf> {
+        let dir = self.accept();
+        if dir.is_none() {
+            self.invalid = true;
+        }
+        dir
+    }
+
     // --- pure-ish derivations (real fs via list_dirs) ---
 
     fn base_and_partial(&self) -> (PathBuf, String) {
