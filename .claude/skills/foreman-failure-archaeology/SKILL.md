@@ -24,7 +24,7 @@ behind those triage rows. Settled verdicts are enforced by
 
 | # | Battle | Verdict | Settled |
 |---|--------|---------|---------|
-| 1 | ConPTY resize/recall corruption | Upstream bug; wontfix; `Ctrl+L` heals | 2026-06-29 |
+| 1 | ConPTY resize/recall corruption | Cursor mitigation shipped 2026-07-09; full reflow still wontfix; `Ctrl+L` heals residuals | 2026-06-29 / 2026-07-09 |
 | 2 | 9-zone snap system | Deleted; Layout tree replaced it | 2026-06-11 |
 | 3 | `--await-ack` | Removed same day as built ("lying API surface") | 2026-06-11 |
 | 4 | Selection rewrite | Doc described code that didn't exist for 3 weeks — until `b581240` built it | resolved 2026-07-02 |
@@ -35,7 +35,7 @@ behind those triage rows. Settled verdicts are enforced by
 
 ---
 
-## 1. ConPTY resize/recall corruption — wontfix (settled 2026-06-29)
+## 1. ConPTY resize/recall corruption — full reflow wontfix; cursor mitigated
 
 ConPTY is Windows' pseudo-console layer: it hosts the child shell and
 translates its screen into VT escape bytes that foreman's emulator
@@ -54,10 +54,10 @@ translates its screen into VT escape bytes that foreman's emulator
   disagree with each other*. Windows Terminal renders the identical scenario
   cleanly only because it bundles a newer ConPTY **and** replicates conhost's
   reflow math byte-for-byte.
-- **Root cause:** ConPTY's internal reflow diverges from the hosting
-  terminal's, and it reports a cursor inconsistent with its own VT repaint —
-  upstream [microsoft/terminal #18725](https://github.com/microsoft/terminal/issues/18725),
-  open and unshipped.
+- **Root cause:** ConPTY's internal reflow diverges from the hosting terminal's.
+  The old build returned a cursor inconsistent with the host grid through
+  `GetConsoleScreenBufferInfo(Ex)` — upstream
+  [microsoft/terminal #18725](https://github.com/microsoft/terminal/issues/18725).
 - **Four failed experiments** ("let ConPTY own the redraw"), built on a
   vendored `portable-pty` with `PSEUDOCONSOLE_RESIZE_QUIRK` dropped, an
   experimental grid-reset on resize, and a sideloaded NuGet ConPTY
@@ -65,16 +65,21 @@ translates its screen into VT escape bytes that foreman's emulator
 
   | # | Combination | Result |
   |---|-------------|--------|
-  | 1 | newer ConPTY + quirk on | no resize repaint; alacritty reflow diverges → gap |
-  | 2 | newer ConPTY + quirk off | still no resize repaint → same gap |
+  | 1 | ConPTY 1.24 stable + quirk on | no resize repaint; alacritty reflow diverges → gap |
+  | 2 | ConPTY 1.24 stable + quirk off | still no resize repaint → same gap |
   | 3 | in-box ConPTY + quirk off + reflow | clean repaint, recall still misplaced → mashup |
   | 4 | in-box ConPTY + quirk off + grid-reset | recall still misplaced → mashup |
 
   No frontend redraw-ownership strategy can fix a cursor report that is
   inconsistent with ConPTY's own repaint.
-- **Status:** settled wontfix. Workaround `Ctrl+L`. The only real fix is
-  conhost-parity reflow (what Windows Terminal does) — rejected on
-  cost/benefit. Reopening this is a research-frontier question, not a bugfix:
+- **2026-07-09 addendum:** #18725 is closed by #19535. Foreman now bundles
+  official ConPTY 1.25.260512002-preview, which lazily requests the host cursor
+  before a later screen-buffer query. Byte traces prove Foreman's existing
+  `Event::PtyWrite` path returns the matching CPR. This improves cursor placement
+  but cannot reconstruct dropped rows or erase stale PSReadLine text.
+- **Status:** the full conhost-parity reflow remains settled wontfix on
+  cost/benefit. `Ctrl+L` remains the residual repair. Reopening full buffer
+  parity is a research-frontier question, not a routine bugfix:
   **foreman-research-frontier**.
 - **Evidence trail:** `docs/conpty-resize-reflow.md` (full record), commit
   `5332757` (2026-06-29). The remote branch `origin/fix/terminal-reflow-on-resize`

@@ -236,20 +236,19 @@ error tile, and `foreman_panic.log` captured the cause.
 
 ## 6. FENCED: ConPTY reflow ownership — do not reopen
 
-The resize+recall cursor corruption is ConPTY's bug (microsoft/terminal
-#18725), fully investigated and closed: byte-level tracing proved foreman
-renders ConPTY's own inconsistent output faithfully, and all four
-redraw-ownership combinations (quirk on/off × in-box/newer ConPTY) failed. The
-only real fix is what Windows Terminal does — **replicate conhost's
-`ResizeWithReflow` math byte-for-byte** around `alacritty_terminal` and bundle
-a newer ConPTY — rejected on cost/benefit. Full evidence:
+The resize+recall divergence is ConPTY's bug (microsoft/terminal #18725).
+Foreman adopted #19535's cursor-only mitigation on 2026-07-09. What remains
+fenced is **full buffer parity**: byte-level tracing proved all four
+redraw-ownership combinations failed, and matching Windows Terminal requires
+replicating conhost's `ResizeWithReflow` math byte-for-byte around
+`alacritty_terminal`. That remains rejected on cost/benefit. Full evidence:
 docs/conpty-resize-reflow.md; the investigation chronicle belongs to
 **foreman-failure-archaeology**.
 
-**Reopening requires BOTH:** the user's explicit sign-off (via
-**foreman-change-control**) AND accepting that exact obligation — the
-byte-for-byte reflow replication, not another frontend redraw scheme. Anything
-less re-runs a completed failure.
+**Reopening full parity requires BOTH:** the user's explicit sign-off (via
+**foreman-change-control**) AND accepting that exact byte-for-byte reflow
+obligation, not another frontend redraw scheme. Cursor-sync package maintenance
+does not reopen this fence.
 
 ---
 
