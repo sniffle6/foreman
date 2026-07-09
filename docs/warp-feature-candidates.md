@@ -586,6 +586,42 @@ font discovery only if foreman ever leaves Windows.
 
 ---
 
+## Recommendation: the single most important thing (2026-07-09)
+
+**Agent-state detection — the needs-input / working / done signal per pane.**
+Not the badges or the fleet view; the *detector* underneath them.
+
+1. **It's the product thesis.** The binding constraint on how many agents one
+   human can run is attention, not panes or speed. Today you visually poll
+   every pane to find the one blocked on you. Warp's Oz dashboard is market
+   confirmation that "which agent needs me" *is* the product. HANDOFF.md
+   already calls state detection the differentiator; the campaign runbook
+   (`.claude/skills/foreman-agent-state-campaign/SKILL.md`) exists with
+   nothing built.
+2. **It's upstream of nearly everything else in this doc.** The fleet
+   dashboard (#7) and per-pane badges are renderings of it. Chat
+   quiescence-gating (safe injection timing — known chat gap) needs it.
+   "Agent finished" notifications need it. The OSC 133 spike (#1) is best
+   understood as one candidate *signal* for it. Build the detector once as a
+   pure module (`agentstate.rs`, fixture-tested, as the campaign prescribes)
+   and four features fall out.
+3. **It's the hardest, which is why it's a moat.** Passive signals cleanly
+   give *working* (output flowing), but done vs idle vs waiting-on-you is
+   ambiguous from PTY bytes — Claude Code idles at a TUI input box where no
+   prompt mark ever fires. Nobody solves this well from the outside. If the
+   passive route fails, foreman's control plane + skill-install mechanism are
+   unusually well positioned to ship the escalation: a `foreman state` verb
+   agents self-report through (the real Oz-parity mechanism, since Warp has
+   first-party state).
+
+**Tradeoff:** M-effort with genuine research risk, vs the S-effort sure things
+(composer, font fallback, `--tail`). Plan: knock out the S items for momentum,
+then commit to campaign Phase 0-1 (signal audit) as the main line. If the
+audit shows passive signals can't separate needs-input from resting, don't
+grind on heuristics — go straight to the self-reporting verb. A detector
+that's right 99% of the time beats a clever one that flaps; a flappy
+"needs you" badge trains the user to ignore it.
+
 ## Suggested sequencing (if/when adopted)
 
 1. **Now / cheap:** font fallback (S), snapshot `--tail N` (S),
