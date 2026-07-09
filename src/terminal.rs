@@ -469,8 +469,8 @@ pub struct Session {
     /// `scroll_accum`, but accumulated against the zoom notch size so a gentle
     /// Ctrl+wheel still eventually steps the font and a fast flick doesn't lurch.
     zoom_accum: f32,
-    /// Diagnostic tap (FOREMAN_RX_DUMP=<file>): every raw PTY chunk pump()
-    /// receives is appended verbatim. None (zero-cost) when the var is unset.
+    /// Diagnostic trace (FOREMAN_RX_DUMP=<file>): raw PTY chunks plus resize and
+    /// host-reply markers. None (zero-cost) when the variable is unset.
     rx_dump: Option<std::fs::File>,
 }
 
@@ -938,22 +938,15 @@ impl Session {
             );
             self.output_gen = self.output_gen.wrapping_add(1);
             self.content_gen = self.content_gen.wrapping_add(1);
+            // A DSR can block the child inside GetConsoleScreenBufferInfo. Do
+            // not leave its CPR behind later queued output; flush after the
+            // exact chunk that completed the query.
+            self.flush_graphics_replies(&mut greplies);
+            self.flush_pty_replies();
         }
-        // Graphics replies (a=q probes etc.) go straight back to the app — NOT
-        // via `resp`: that buffer's flush is what latches `ready` (the DSR
-        // contract), and a graphics reply must never fake readiness.
-        if !greplies.is_empty() {
-            let _ = self.writer.write_all(&greplies);
-            let _ = self.writer.flush();
-        }
-        let reply = std::mem::take(&mut *self.resp.lock().unwrap());
-        if !reply.is_empty() {
-            let _ = self.writer.write_all(&reply);
-            let _ = self.writer.flush();
-            // First device-status reply flushed back = the startup DSR scan is
-            // done — half the readiness contract (see `ready`).
-            self.dsr_replied = true;
-        }
+        // Defensive drains for replies already queued when pump() was entered.
+        self.flush_graphics_replies(&mut greplies);
+        self.flush_pty_replies();
         // Injection is safe once the DSR scan resolved AND the child has
         // painted: a passthrough ConPTY host answers the DSR itself long
         // before the child's input path opens, so the reply alone proves
@@ -977,12 +970,57 @@ impl Session {
         }
     }
 
+    fn flush_graphics_replies(&mut self, replies: &mut Vec<u8>) {
+        // Graphics replies (a=q probes etc.) go straight back to the app — NOT
+        // via `resp`: that buffer's flush is what latches `ready` (the DSR
+        // contract), and a graphics reply must never fake readiness.
+        if !replies.is_empty() {
+            let replies = std::mem::take(replies);
+            let _ = self.writer.write_all(&replies);
+            let _ = self.writer.flush();
+        }
+    }
+
+    fn flush_pty_replies(&mut self) {
+        let reply = std::mem::take(&mut *self.resp.lock().unwrap());
+        if !reply.is_empty() {
+            let sent = self
+                .writer
+                .write_all(&reply)
+                .and_then(|()| self.writer.flush())
+                .is_ok();
+            if let Some(f) = self.rx_dump.as_mut() {
+                let _ = write!(f, "\n<<PTY_REPLY{}", if sent { "" } else { "_ERR" });
+                for byte in &reply {
+                    let _ = write!(f, " {byte:02x}");
+                }
+                let _ = writeln!(f, ">>");
+            }
+            // First device-status reply flushed back = the startup DSR scan is
+            // done — half the readiness contract (see `ready`).
+            if sent {
+                self.dsr_replied = true;
+            } else {
+                // Deliberate no-retry: the reply bytes are dropped. Writer
+                // failures track pipe/child death, where the blocked query no
+                // longer matters; re-queueing would risk duplicate CPRs. Log
+                // so a wedged live session is at least observable.
+                eprintln!(
+                    "terminal: failed to write a {}-byte PTY reply; the child's \
+                     pending console query may stay blocked",
+                    reply.len()
+                );
+            }
+        }
+    }
+
     fn resize(&mut self, cols: usize, rows: usize) {
-        // Known limitation: narrowing past a wrapped prompt then recalling history
-        // (Up) corrupts the line until Ctrl+L. This is ConPTY's reflow diverging
-        // from our grid (microsoft/terminal #18725), NOT a double reflow here —
-        // ConPTY reports a cursor inconsistent with its own repaint. Letting
-        // ConPTY own the redraw does not help; only conhost-parity reflow would.
+        // Known limitation: ConPTY's reflow still diverges from our grid. The
+        // bundled #19535 lineage lazily asks us for the post-resize cursor before
+        // a later screen-buffer query, but it cannot restore rows ConPTY dropped
+        // or clear stale PSReadLine text. This is NOT a double reflow here, and
+        // letting ConPTY own redraw was already disproven. Ctrl+L remains the
+        // residual repair; full parity still requires conhost's reflow algorithm.
         // See docs/conpty-resize-reflow.md before touching this.
         if cols < 2 || rows < 1 {
             return;
@@ -1433,6 +1471,40 @@ mod tests {
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::index::Line;
 
+    type RecordedWrites = Arc<Mutex<Vec<(Vec<u8>, Option<String>)>>>;
+
+    struct TitleRecordingWriter {
+        title: Arc<Mutex<Option<String>>>,
+        writes: RecordedWrites,
+    }
+
+    impl Write for TitleRecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let title = self.title.lock().unwrap().clone();
+            self.writes.lock().unwrap().push((bytes.to_vec(), title));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "intentional test failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
     }
@@ -1788,6 +1860,98 @@ mod tests {
     }
 
     #[test]
+    fn pump_flushes_cpr_before_later_rx_chunks_without_advancing_ready() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.rx = rx;
+        let writes: RecordedWrites = Arc::new(Mutex::new(Vec::new()));
+        s.writer = Box::new(TitleRecordingWriter {
+            title: Arc::clone(&s.osc_title),
+            writes: Arc::clone(&writes),
+        });
+        *s.osc_title.lock().unwrap() = None;
+        s.resp.lock().unwrap().clear();
+        s.dsr_replied = false;
+        s.painted = false;
+        s.ink = InkScan::Ground;
+        s.ready = false;
+        s.pending_inject = vec!["held".to_string()];
+        s.pending_submit = None;
+
+        tx.send(b"\x1b[5;7H\x1b[6".to_vec()).unwrap();
+        tx.send(b"n".to_vec()).unwrap();
+        tx.send(b"\x1b]0;LATE\x07".to_vec()).unwrap();
+        s.pump();
+
+        let recorded = writes.lock().unwrap().clone();
+        assert_eq!(recorded[0].0, b"\x1b[5;7R");
+        assert_eq!(
+            recorded[0].1, None,
+            "later RX was parsed before the blocking CPR was written"
+        );
+        assert!(s.dsr_replied);
+        assert!(!s.painted);
+        assert!(!s.ready());
+        assert_eq!(s.pending_inject, ["held"]);
+        assert_eq!(*s.osc_title.lock().unwrap(), Some("LATE".to_string()));
+
+        tx.send(b"X".to_vec()).unwrap();
+        s.pump();
+
+        let recorded = writes.lock().unwrap().clone();
+        assert!(s.ready());
+        assert!(s.pending_inject.is_empty());
+        assert_eq!(recorded[1].0, paste_wrap("held"));
+        assert_eq!(recorded[1].1.as_deref(), Some("LATE"));
+    }
+
+    #[test]
+    fn failed_cpr_write_does_not_latch_readiness() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.rx = rx;
+        s.writer = Box::new(FailingWriter);
+        s.resp.lock().unwrap().clear();
+        s.dsr_replied = false;
+        s.painted = false;
+        s.ink = InkScan::Ground;
+        s.ready = false;
+        s.pending_inject = vec!["held".to_string()];
+
+        tx.send(b"X\x1b[6n".to_vec()).unwrap();
+        s.pump();
+
+        assert!(s.painted);
+        assert!(!s.dsr_replied);
+        assert!(!s.ready());
+        assert_eq!(s.pending_inject, ["held"]);
+    }
+
+    #[test]
     fn inject_before_ready_is_queued_then_flushed() {
         let ctx = egui::Context::default();
         let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
@@ -2100,8 +2264,13 @@ mod tests {
     #[ignore = "diagnostic: result depends on the OS conhost version"]
     fn conpty_passes_kitty_apc_through() {
         let ctx = egui::Context::default();
-        let cmd = "Write-Host MARKER; Write-Host ([char]27 + '_Ga=T,t=d,f=32,s=1,v=1,q=2,i=9;' \
-                   + [Convert]::ToBase64String([byte[]](255,0,0,255)) + [char]27 + '\\')";
+        let cmd = "Start-Sleep -Milliseconds 250; Write-Host MARKER; \
+                   Write-Host ([char]27 + '_Ga=T,t=d,f=32,s=1,v=1,q=2,i=9;' \
+                   + [Convert]::ToBase64String([byte[]](255,0,0,255)) + [char]27 + '\\'); \
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); \
+                   $p = $Host.UI.RawUI.CursorPosition; \
+                   $sw.Stop(); \
+                   Write-Host ('AFTER_GCSBI {0},{1} ELAPSED_MS={2}' -f $p.X,$p.Y,$sw.ElapsedMilliseconds)";
         let argv = vec![
             "powershell.exe".to_string(),
             "-NoProfile".to_string(),
@@ -2109,6 +2278,9 @@ mod tests {
             cmd.to_string(),
         ];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let dump = std::env::temp_dir().join("foreman-conpty-apc-cpr.bin");
+        let _ = std::fs::remove_file(&dump);
+        s.rx_dump = std::fs::File::create(&dump).ok();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while s.exited().is_none() {
             s.pump();
@@ -2126,6 +2298,44 @@ mod tests {
             s.graphics.has_image(9),
             "ConPTY stripped the kitty APC before it reached the terminal"
         );
+        assert!(
+            screen.contains("AFTER_GCSBI"),
+            "screen-buffer query never resumed after the kitty APC"
+        );
+        let trace = std::fs::read(&dump).unwrap_or_default();
+        let trace_text = String::from_utf8_lossy(&trace);
+        let latency_ms: u64 = trace_text
+            .split("ELAPSED_MS=")
+            .nth(1)
+            .and_then(|tail| {
+                tail.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .expect("child did not report the post-APC query duration");
+        assert!(
+            latency_ms < 400,
+            "post-APC screen-buffer query took {latency_ms}ms; likely hit ConPTY's 500ms CPR timeout"
+        );
+        let apc = trace
+            .windows(3)
+            .position(|window| window == b"\x1b_G")
+            .expect("kitty APC missing from raw PTY trace");
+        assert!(
+            trace[apc..].windows(4).any(|window| window == b"\x1b[6n"),
+            "ConPTY did not request a cursor report after the unknown kitty APC"
+        );
+        assert!(
+            trace.windows(11).any(|window| window == b"<<PTY_REPLY"),
+            "Foreman did not send the requested CPR"
+        );
+        assert!(
+            !trace.windows(15).any(|window| window == b"<<PTY_REPLY_ERR"),
+            "Foreman generated but failed to write the CPR"
+        );
+        println!("post-APC GCSBI completed in {latency_ms}ms");
     }
 
     /// Diagnostic canary #2, machine-dependent: does ConPTY preserve a cursor
@@ -2235,7 +2445,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !s.ready() {
             s.pump();
-            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never became ready"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         pump_for(&mut s, 1000); // let PSReadLine finish its startup render
@@ -2247,8 +2460,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         pump_for(&mut s, 500);
-        let len =
-            |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as usize;
+        let len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as usize;
         dump_state(&mut s, &format!("[{label}] before resize {from:?}"));
         let mark0 = len(&dump);
 
@@ -2292,7 +2504,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !s.ready() {
             s.pump();
-            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never became ready"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         pump_for(&mut s, 1000);
@@ -2327,12 +2542,122 @@ mod tests {
         }
     }
 
+    /// Reproduce the original width-shrink + Up-history failure. The pending
+    /// input is deliberately wrapped before the resize; Up then makes
+    /// PSReadLine query the console cursor and repaint the previous command.
+    fn recall_probe_scenario(label: &str) {
+        fn pump_for(s: &mut Session, ms: u64) {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                s.pump();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        fn esc(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(|&b| match b {
+                    0x1b => "<ESC>".to_string(),
+                    b'\r' => "\\r".to_string(),
+                    b'\n' => "\\n\n".to_string(),
+                    0x20..=0x7e => (b as char).to_string(),
+                    _ => format!("\\x{b:02x}"),
+                })
+                .collect()
+        }
+
+        let dump = std::env::temp_dir().join(format!("foreman_resize_probe_{label}.bin"));
+        let _ = std::fs::remove_file(&dump);
+        let ctx = egui::Context::default();
+        let argv = vec!["powershell.exe".to_string(), "-NoProfile".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.rx_dump = std::fs::File::create(&dump).ok();
+        s.resize(100, 30);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 500);
+        s.send(b"1..12 | % { \"line $_\" }\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.snapshot_text(None).iter().any(|r| r.contains("line 12")) {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 500);
+
+        let pending = format!("PENDING_{}", "z".repeat(80));
+        s.send(pending.as_bytes());
+        pump_for(&mut s, 500);
+        let mark = std::fs::metadata(&dump).map(|m| m.len()).unwrap_or(0) as usize;
+
+        s.resize(60, 30);
+        pump_for(&mut s, 500);
+        s.send(b"\x1b[A");
+        pump_for(&mut s, 1500);
+
+        let rows = s.snapshot_text(None);
+        let cur = s.cursor_info();
+        println!(
+            "=== [{label}] after shrink+Up: cursor row={} col={} recalled_rows={:?} pending_rows={:?} ===",
+            cur.row,
+            cur.col,
+            rows.iter()
+                .enumerate()
+                .filter_map(|(i, row)| row.contains("1..12").then_some(i))
+                .collect::<Vec<_>>(),
+            rows.iter()
+                .enumerate()
+                .filter_map(|(i, row)| row.contains("PENDING_").then_some(i))
+                .collect::<Vec<_>>(),
+        );
+        for (i, row) in rows.iter().enumerate() {
+            if !row.is_empty() {
+                println!("{i:3} |{row}");
+            }
+        }
+        let bytes = std::fs::read(&dump).unwrap_or_default();
+        let phase = &bytes[mark.min(bytes.len())..];
+        println!(
+            "=== [{label}] raw ConPTY bytes + host replies: resize through Up ===\n{}",
+            esc(phase)
+        );
+        println!(
+            "=== [{label}] post-resize DSR count={} host CPR markers={} ===",
+            phase.windows(4).filter(|w| *w == b"\x1b[6n").count(),
+            phase.windows(11).filter(|w| *w == b"<<PTY_REPLY").count(),
+        );
+    }
+
+    /// Diagnostic: does the bundled ConPTY request and consume a host cursor
+    /// report before PSReadLine recalls history after a width shrink?
+    /// Run: cargo test --release resize_recall_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the bundled ConPTY version"]
+    fn resize_recall_probe() {
+        recall_probe_scenario("recall-after-shrink");
+    }
+
+    /// Diagnostic: after width overflow and recovery, does plain input land on
+    /// the visible prompt? Run with the candidate pair beside the test exe.
+    /// Run: cargo test --release resize_drag_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the bundled ConPTY version"]
+    fn resize_drag_probe() {
+        drag_probe_scenario("drag-narrow-widen", 30);
+    }
+
     /// Diagnostic, machine-dependent: after a pane resize, does plain typed
     /// input echo at the prompt or stranded mid-screen? Prints grid + cursor +
     /// raw ConPTY bytes for each phase so the divergence is attributable
     /// (foreman/alacritty grid state vs what ConPTY actually emitted).
-    /// Run manually:
-    /// cargo test --release resize_typing_probe -- --ignored --nocapture
+    /// Run: cargo test --release resize_typing_probe -- --ignored --nocapture
     #[test]
     #[ignore = "diagnostic: result depends on the OS ConPTY version"]
     fn resize_typing_probe() {
@@ -2352,10 +2677,6 @@ mod tests {
             (100, 30),
             "1..40 | % { \"line $_ \" + (\"x\" * 70) }\r",
         );
-        // A real mouse drag: many small width steps at frame cadence, down
-        // then back up, with ConPTY repaints landing asynchronously between
-        // steps — the reported "width smaller then bigger" gesture.
-        drag_probe_scenario("drag-narrow-widen", 30);
     }
 
     /// ConPTY anchors its layout on a height grow (zero bytes emitted, blank
@@ -2447,7 +2768,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !s.ready() {
             s.pump();
-            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never became ready"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         s.send(b"1..40 | % { \"line $_\" }\r");
@@ -2479,7 +2803,10 @@ mod tests {
             prompt.saturating_sub(echo)
         );
         let cur = s.cursor_info();
-        assert_eq!(cur.row as usize, prompt, "caret stranded off the prompt row");
+        assert_eq!(
+            cur.row as usize, prompt,
+            "caret stranded off the prompt row"
+        );
     }
 
     /// Diagnostic capture: run the real codex TUI headlessly (pets enabled via

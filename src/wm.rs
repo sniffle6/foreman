@@ -2595,6 +2595,13 @@ impl WindowManager {
 
         let focused = self.focused;
         let asz = area.size();
+        // Minimized windows never enter draw_order(), but their PTYs still
+        // need to answer DSR/CPR and drain output. Pump every tab headlessly;
+        // Content::keepalive recurses through minimized project windows.
+        for w in self.windows.iter_mut().filter(|w| w.minimized) {
+            w.keepalive_inactive();
+            w.active_content().keepalive();
+        }
         let mut order = self.draw_order();
 
         let placements: std::collections::HashMap<WinId, egui::Rect> = self
@@ -4654,6 +4661,47 @@ mod tests {
             wm.merge_target_at(9999, titlebar_point(), origin_area(), &[0, 1]),
             Some(0)
         );
+    }
+
+    #[test]
+    fn minimized_window_keeps_its_active_terminal_alive() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .expect("spawn failed");
+        wm.windows
+            .iter_mut()
+            .find(|w| w.id == id)
+            .unwrap()
+            .minimized = true;
+        assert!(wm.draw_order().is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            ));
+            let _ = ctx.run_ui(input, |ui| {
+                let area = ui.max_rect();
+                wm.show(ui, area, true, egui::Id::new("minimized-keepalive"), false);
+            });
+
+            let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &w.tabs[w.active].content else {
+                panic!("test window stopped being a terminal");
+            };
+            if session.ready() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "minimized terminal never answered its startup DSR"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
