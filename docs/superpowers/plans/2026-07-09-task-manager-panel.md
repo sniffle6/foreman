@@ -1,6 +1,6 @@
 # Task-Manager Panel Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan with the **hybrid-plan-execution** protocol — see the "Execution Protocol" section below, which is self-contained in case this session lacks the skill. Mechanics: superpowers:subagent-driven-development for dispatch + two-stage review, superpowers:executing-plans for inline tasks, superpowers:verification-before-completion before claiming done. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A desktop-level side-panel window listing every project and its terminal/chat tabs with open/minimized state, click-to-focus, and hover minimize/close — fully replacing the minimize chip taskbars.
 
@@ -22,7 +22,67 @@
 
 ---
 
-### Task 1: `TargetPath` + `PanelModel` types and the read seam `panel_model()`
+## Execution Protocol (hybrid-plan-execution)
+
+This plan is executed with the **hybrid-plan-execution** discipline. If the
+executing session does not have that skill, this section is a self-contained
+copy of its rules — follow it as written.
+
+**One classifier — risk — drives three decisions per task: where it executes,
+whether it gets reviewed, and which model runs it. Risk is blast radius times
+verifiability, not lines changed.** Effort and diff size appear nowhere in the
+classifier.
+
+Two different gates, never interchangeable:
+- **Verification** = machine evidence the change works (tests, screenshots,
+  build). Never skipped, any tier.
+- **Review** = fresh judgment that it's the *right* change. Scales with tier.
+  The author re-reading their own diff is not review.
+
+Tiers:
+- **M — Mechanical** (ALL must hold): plan supplies exact content (execution is
+  transcription, zero new decisions); an automated check in the same batch
+  exercises THIS change; git-reversible. Executes inline or batched (≤4,
+  adjacent, same tier); no review (the check is the review); cheap model
+  allowed.
+- **S — Standard**: judgment at execution time; blast radius contained to the
+  repo; automated verification written into the task. Fresh subagent; one
+  review pass (spec compliance); inherit the session model. Groupable with
+  other S only.
+- **C — Critical** (ANY suffices): destructive/irreversible ops · contract
+  surfaces · code deletion (a foreman-change-control gate) · behavioral change
+  whose only verification is manual. Dedicated subagent; **two-stage review**
+  (spec compliance, then code quality); session model or stronger — never
+  downgrade. Never grouped. Destructive/interactive ops stay in the main
+  session, run last, gated on all prior verification.
+
+**Forbidden combination:** cheap model + no review + no automated check
+exercising the change. Per-task commits survive grouping. The **full test
+suite** runs before claiming done, regardless of which targeted checks ran
+along the way. Do not reclassify your own task downward at execution time.
+
+### Tier assignments for this plan
+
+| Task | Tier | Where | Review | Notes |
+|---|---|---|---|---|
+| 1 panel_model read seam | S | subagent (may group with 2) | spec compliance | signature adaptation = judgment, tests included |
+| 2 surface_target + Acts | S | subagent (may group with 1) | spec compliance | tightly coupled to Task 1's types |
+| 3 crew-click retrofit | S | fresh subagent | spec compliance | modifies existing behavior; regression net = existing chat tests |
+| 4 panel window + flags | S | fresh subagent | spec compliance | touches `deserted()` (app-quit) — tests cover it; if tests can't be made to cover it, escalate to C |
+| 5 row UI + drains | S | fresh subagent | spec compliance | data flow unit-tested; pixels verified by screenshot in the same task |
+| 6 collapse/keymap/persistence | S | fresh subagent | spec compliance | config compat test required |
+| 7 delete chip taskbars | **C** | dedicated subagent | **two-stage** | code deletion gate + minimize-reachability blast radius; manual check is part of verification |
+| 8 acid pass + docs | main session | run **last**, inline | n/a | interactive GUI verification, gated on Tasks 1-7 all green and committed |
+
+Rationalizations to refuse (verbatim from the skill): "it's one line" (size
+isn't in the classifier) · "a review adds nothing the test doesn't" (on C they
+catch different failure classes) · "risk is covered by the other task's gate"
+(borrowed verification — M2 fails) · "skip the full sweep to save time"
+(targeted during, full sweep at the end, always).
+
+---
+
+### Task 1: `TargetPath` + `PanelModel` types and the read seam `panel_model()` — **Tier S**
 
 **Files:**
 - Create: `src/panel.rs` (plain-data model types only — no egui, no wm imports beyond `WinId`)
@@ -222,7 +282,7 @@ git commit -m "feat(panel): TargetPath + PanelModel read seam (panel_model)"
 
 ---
 
-### Task 2: Write seam — `surface_target()` + path-carrying `Act` variants
+### Task 2: Write seam — `surface_target()` + path-carrying `Act` variants — **Tier S**
 
 **Files:**
 - Modify: `src/wm.rs` — `Act` enum (line ~525), the `Act` apply loop (search `Act::Min(id) => self.minimize(id)` ~wm.rs:3677), new method `surface_target` near `drain_chat_clicks` (~1484); tests in the wm test module.
@@ -373,7 +433,7 @@ git commit -m "feat(panel): surface_target write seam + FocusPath/MinPath/CloseP
 
 ---
 
-### Task 3: Retrofit the chat crew click onto the write seam
+### Task 3: Retrofit the chat crew click onto the write seam — **Tier S**
 
 **Files:**
 - Modify: `src/wm.rs` — `drain_chat_clicks` (wm.rs:1484-1519).
@@ -428,7 +488,7 @@ git commit -m "refactor(chat): crew click + open_chat_window route through surfa
 
 ---
 
-### Task 4: `Content::TaskManager` + panel window creation, flags, and `deserted()` exclusion
+### Task 4: `Content::TaskManager` + panel window creation, flags, and `deserted()` exclusion — **Tier S** (escalate to C if `deserted()` can't be test-covered)
 
 **Files:**
 - Modify: `src/panel.rs` — add `PanelView`.
@@ -592,7 +652,7 @@ git commit -m "feat(panel): Content::TaskManager window - creation, flags, deser
 
 ---
 
-### Task 5: Panel UI — rows, click-to-focus, hover minimize/close
+### Task 5: Panel UI — rows, click-to-focus, hover minimize/close — **Tier S**
 
 **Files:**
 - Modify: `src/wm.rs` — `Content::show` TaskManager arm; snapshot stash + `drain_panel_acts()` in the desktop `show()`; theme tokens if needed in `src/theme.rs`.
@@ -704,7 +764,7 @@ git commit -m "feat(panel): row rendering, click-to-focus, hover min/close"
 
 ---
 
-### Task 6: Collapse rail, keymap command, persistence
+### Task 6: Collapse rail, keymap command, persistence — **Tier S**
 
 **Files:**
 - Modify: `src/wm.rs` (header collapse button on the panel window; rail rendering; ratio application), `src/keymap.rs` (`Command::ToggleTaskManager`), `src/config.rs` (Settings fields), `src/main.rs` (seed + persist), `src/layout.rs` (already has `set_root_ratio` from Task 4).
@@ -773,7 +833,7 @@ git commit -m "feat(panel): rail collapse, ToggleTaskManager chord, persisted st
 
 ---
 
-### Task 7: Delete the chip taskbars
+### Task 7: Delete the chip taskbars — **Tier C** (code deletion + minimize-reachability blast radius; two-stage review)
 
 **Files:**
 - Modify: `src/wm.rs` — remove `paint_taskbar` (wm.rs:3576-3614) and its call (wm.rs:3498). `Act::Restore` stays (still used by tests/paths — verify remaining users with grep; if only the taskbar used it, keep the variant anyway this task and note it, since `Restore` semantics are exercised in tests like wm.rs:5286).
@@ -790,7 +850,7 @@ git commit -m "feat(panel): remove minimize chip taskbars - panel is the restore
 
 ---
 
-### Task 8: Verification pass + docs
+### Task 8: Verification pass + docs — **main session, run last** (interactive GUI verification, gated on Tasks 1-7)
 
 - [ ] **Step 1: Full suite** — `cargo test 2>&1 | Select-Object -Last 10` (all green).
 - [ ] **Step 2: Visual acid pass (release build)** — 2+ projects, 4+ terminals incl. a chat viewer and a tab-stack: screenshot (a) expanded panel with focused/minimized/background rows distinguishable, (b) collapsed rail with tooltips, (c) hover buttons, (d) close-with-confirm from a row, (e) panel torn out to floating and re-tiled, (f) leader-WASD navigation into/out of the panel, (g) app quits on last project close with panel open.
