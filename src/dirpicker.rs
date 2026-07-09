@@ -152,6 +152,12 @@ impl DirPicker {
         self.focus_next = true;
     }
 
+    /// Ask the field to (re)take keyboard focus on its next render (landing:
+    /// the zone cursor arrived on the field, so typing must work immediately).
+    pub fn focus_field(&mut self) {
+        self.focus_next = true;
+    }
+
     // --- pure-ish derivations (real fs via list_dirs) ---
 
     fn base_and_partial(&self) -> (PathBuf, String) {
@@ -412,7 +418,7 @@ impl DirPicker {
         // Keep the field focused the whole time the picker is open or armed, so
         // typing and the ←/→/↑/↓ handlers never desync from a click that stole
         // focus (e.g. a mouse click on a dropdown row).
-        if (self.open || self.armed) && (self.focus_next || !te.has_focus()) {
+        if self.focus_next || ((self.open || self.armed) && !te.has_focus()) {
             te.request_focus();
             self.focus_next = false;
         }

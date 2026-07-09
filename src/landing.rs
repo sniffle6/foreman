@@ -546,6 +546,12 @@ impl Landing {
         } else {
             self.nav = Nav::HOME; // popup open: the field owns every key
         }
+        if self.nav.zone == Zone::Field {
+            // The zone cursor is on the field: it must always be typable —
+            // Tab/Shift+Tab/↑ back into it, or Esc collapsing the popup
+            // (which surrenders egui focus), must not strand a dead field.
+            self.picker.focus_field();
+        }
 
         // Wordmark (mono block art, forge-gradient with an animated specular
         // sweep) + tagline, centered. The sweep needs a steady repaint while the
