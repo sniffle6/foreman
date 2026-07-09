@@ -2119,6 +2119,92 @@ mod tests {
         }
     }
 
+    /// Diagnostic, machine-dependent: after a pane resize, does plain typed
+    /// input echo at the prompt or stranded mid-screen? Prints grid + cursor +
+    /// raw ConPTY bytes for each phase so the divergence is attributable
+    /// (foreman/alacritty grid state vs what ConPTY actually emitted).
+    /// Run manually:
+    /// cargo test --release resize_typing_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: result depends on the OS ConPTY version"]
+    fn resize_typing_probe() {
+        fn pump_for(s: &mut Session, ms: u64) {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                s.pump();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        fn esc(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(|&b| match b {
+                    0x1b => "␛".to_string(),
+                    b'\r' => "\\r".to_string(),
+                    b'\n' => "\\n\n".to_string(),
+                    0x20..=0x7e => (b as char).to_string(),
+                    _ => format!("\\x{b:02x}"),
+                })
+                .collect()
+        }
+        fn dump_state(s: &mut Session, label: &str) {
+            let cur = s.cursor_info();
+            println!("=== {label}: cursor row={} col={} ===", cur.row, cur.col);
+            for (i, row) in s.snapshot_text(None).iter().enumerate() {
+                if !row.is_empty() {
+                    println!("{i:3} |{row}");
+                }
+            }
+        }
+
+        let dump = std::env::temp_dir().join("foreman_resize_probe.bin");
+        let _ = std::fs::remove_file(&dump);
+        let ctx = egui::Context::default();
+        let argv = vec!["powershell.exe".to_string(), "-NoProfile".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        s.rx_dump = std::fs::File::create(&dump).ok();
+        s.resize(100, 30);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.ready() {
+            s.pump();
+            assert!(std::time::Instant::now() < deadline, "shell never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 1000); // let PSReadLine finish its startup render
+
+        s.send(b"1..40 | % { \"line $_\" }\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.snapshot_text(None).iter().any(|r| r.contains("line 40")) {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_for(&mut s, 500);
+        let len =
+            |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) as usize;
+        dump_state(&mut s, "before resize (100x30)");
+        let mark0 = len(&dump);
+
+        s.resize(80, 45); // narrower + taller, like a floating-window drag
+        pump_for(&mut s, 1500);
+        dump_state(&mut s, "after resize to 80x45");
+        let mark1 = len(&dump);
+
+        s.send(b"sdfs");
+        pump_for(&mut s, 1500);
+        dump_state(&mut s, "after typing sdfs");
+
+        let bytes = std::fs::read(&dump).unwrap_or_default();
+        println!(
+            "=== raw ConPTY bytes: resize repaint ===\n{}",
+            esc(&bytes[mark0.min(bytes.len())..mark1.min(bytes.len())])
+        );
+        println!(
+            "=== raw ConPTY bytes: typed echo ===\n{}",
+            esc(&bytes[mark1.min(bytes.len())..])
+        );
+    }
+
     /// Diagnostic capture: run the real codex TUI headlessly (pets enabled via
     /// ~/.codex/config.toml) and dump the raw post-ConPTY byte stream so pet
     /// frames can be inspected offline: where do conhost's cursor moves sit

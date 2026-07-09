@@ -3,6 +3,10 @@
 **Status:** Known upstream bug, not fixed in foreman. Workaround: `Ctrl+L`.
 **Upstream:** [microsoft/terminal #18725](https://github.com/microsoft/terminal/issues/18725) (open, unshipped).
 
+Two distinct manifestations of the same root divergence are documented here:
+width-shrink + history recall (below), and **height-grow + plain typing**
+(§ "Second manifestation"). Both heal with `Ctrl+L`.
+
 ## Symptom
 
 Resize a terminal pane **narrower** while a **wrapped** prompt/input line is on
@@ -42,11 +46,43 @@ reflow algorithm, which we cannot cheaply match without forking
   `ESC[23;22H` (row 23). foreman renders both faithfully — the bytes disagree.
 - foreman sends ConPTY nothing but the Up key around the recall; no DSR query is
   involved. The child reports the correct (narrow) width. Plain typing after a
-  resize is correct — only history-recall misfires.
+  **width-only shrink** is correct — only history-recall misfires there. (Typing
+  after a **height grow** is NOT safe — see the second manifestation below.)
 - The offset equals the prompt's wrapped-row count, consistent across all widths
   and heights where the prompt wraps.
 - **Windows Terminal renders the identical PowerShell scenario cleanly.**
 - win32-input-mode (`ESC[?9001h`) is unrelated (input fidelity only).
+
+## Second manifestation: height-grow + scrollback (typed echo lands mid-screen)
+
+**Symptom (2026-07-08):** make a pane **taller** while there is scrollback, then
+type. The typed characters and the caret appear rows *above* the prompt, in the
+middle of old output. No recall needed — plain typing misfires. `Ctrl+L` heals.
+
+**Root cause (byte-level, reproduced):** on a height grow ConPTY emits **zero
+bytes** — no repaint. Its internal layout keeps content anchored where it was
+(prompt row unchanged, blank rows appear below). `alacritty_terminal` instead
+**pulls lines back from scrollback** to fill the new rows, moving the prompt to
+the bottom. The layouts silently diverge by exactly the number of pulled lines.
+The next PSReadLine render addresses the cursor **absolutely** in ConPTY's
+layout (e.g. `ESC[30;20H`), which in our grid is mid-scrollback — the echo and
+caret land there.
+
+**Evidence:** the ignored diagnostic test `resize_typing_probe` in
+`src/terminal.rs` reproduces this headless (spawn PowerShell → 40 lines of
+output → resize 100x30 → 80x45 → type `sdfs`) and dumps grid, cursor, and the
+raw ConPTY byte stream per phase. Run:
+`cargo test --release resize_typing_probe -- --ignored --nocapture`.
+Observed: resize-repaint phase = empty byte stream; typed-echo phase =
+`ESC[30;20H … sdfs` while our prompt sits at row 45 — offset 15 = exactly the
+height delta (all 15 new rows were filled from history).
+
+**Fixability note:** unlike the wrapped-line reflow divergence above, this one
+does not require conhost's reflow math — it is a pure policy difference ("pull
+from history on grow" vs "anchor and extend below"). A foreman-side
+compensation (cancel alacritty's history pull after a grow so the prompt row
+matches ConPTY's) is plausible but untried; it must not disturb the
+no-scrollback case, width changes, or shrink.
 
 ## What was tried and rejected ("let ConPTY own the redraw")
 
