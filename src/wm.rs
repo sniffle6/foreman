@@ -88,6 +88,9 @@ pub enum Content {
     /// view state; shares the log via Rc — a viewer, not a member: never
     /// injected into (spec §4).
     Chat(crate::chat::ChatView),
+    /// Desktop-level task-manager panel (project/tab list). At most one per
+    /// desktop; non-closable / non-minimizable / non-tabbable.
+    TaskManager(crate::panel::PanelView),
 }
 impl Content {
     /// Returns whether a window in this content was interacted with this frame.
@@ -122,6 +125,10 @@ impl Content {
                 view.show(ui, rect, active, resp, base.with((win_id, "chat-input")));
                 false
             }
+            Content::TaskManager(view) => {
+                view.show(ui, rect, base.with((win_id, "panel")));
+                false
+            }
         }
     }
 
@@ -134,6 +141,7 @@ impl Content {
             Content::Terminal(s) => s.keepalive(),
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
+            Content::TaskManager(_) => {}
         }
     }
 
@@ -144,6 +152,7 @@ impl Content {
             Content::Terminal(s) => Some(s.icon_kind()),
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
+            Content::TaskManager(_) => None,
         }
     }
 }
@@ -167,6 +176,9 @@ pub struct Win {
     pub rect: egui::Rect, // local coords (origin = manager area.min)
     pub z: u64,
     pub minimized: bool,
+    /// True while minimized if the window was tiled when minimized — restore
+    /// re-enters the tree instead of leaving the window floating.
+    pub min_from_tree: bool,
     pub prev: Option<egui::Rect>, // floating rect to restore when un-tiled/un-zoomed
 }
 
@@ -182,6 +194,13 @@ impl Win {
     /// Is the active tab a project? (Drives titlebar styling + the +project key.)
     fn is_project(&self) -> bool {
         matches!(self.tabs[self.active].content, Content::Project(_))
+    }
+    /// Task-manager panel window (any tab). Non-closable / non-minimizable /
+    /// non-tabbable; excluded from `deserted` and `panel_model`.
+    pub fn is_panel(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| matches!(t.content, Content::TaskManager(_)))
     }
     /// Pump every tab that is *not* the active one so backgrounded PTYs stay alive.
     fn keepalive_inactive(&mut self) {
@@ -206,7 +225,6 @@ enum Act {
     Max(WinId),
     /// Toggle window between tiled and floating (the header toggle button).
     Float(WinId),
-    Restore(WinId),
     /// Dispatch a terminal of `Shell` into project window `WinId`. Deferred like
     /// the rest: the header key is drawn mid-loop, but reaching into the project's
     /// nested manager has to wait until after the render borrow is released.
@@ -235,6 +253,12 @@ enum Act {
         pos: egui::Pos2,
         grab: bool,
     },
+    /// Focus / restore a panel row target (project, child window, and/or tab).
+    FocusPath(crate::panel::TargetPath),
+    /// Minimize a panel row target.
+    MinPath(crate::panel::TargetPath),
+    /// Close a panel row target (routes through the close-confirm path).
+    ClosePath(crate::panel::TargetPath),
 }
 
 /// What a validated chat request resolved to. Posting is split from injection
@@ -405,6 +429,7 @@ impl WindowManager {
             rect,
             z: self.z,
             minimized: false,
+            min_from_tree: false,
             prev: None,
         });
         self.focused = Some(id);
@@ -451,7 +476,18 @@ impl WindowManager {
                 };
                 self.tree.insert_split(a, id, side);
             }
-            None => self.tree.insert_root(id, Dir::Right),
+            None => {
+                // Keep the task-manager panel as the rightmost root leaf when
+                // present: insert the new window on its left rather than to the
+                // right of an empty/sole-panel tree.
+                if let Some(pid) = self.panel_id().filter(|p| self.tree.contains(*p)) {
+                    if !self.tree.insert_split(pid, id, Dir::Left) {
+                        self.tree.insert_root(id, Dir::Left);
+                    }
+                } else {
+                    self.tree.insert_root(id, Dir::Right);
+                }
+            }
         }
     }
 
@@ -1135,24 +1171,17 @@ impl WindowManager {
     /// Open (or focus) this project's chat viewer — singleton per project
     /// (spec §4). Closing it later doesn't touch the log; the room is the log.
     fn open_chat_window(&mut self) {
-        if let Some(w) = self
-            .windows
-            .iter_mut()
-            .find(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Chat(_))))
-        {
-            // Surface it like the taskbar's Restore does: unminimize and make
-            // the chat tab active before focusing — focus() alone leaves a
-            // minimized window invisible and a background tab hidden.
-            if let Some(i) = w
-                .tabs
+        if let Some((win, tab)) = self.windows.iter().find_map(|w| {
+            w.tabs
                 .iter()
                 .position(|t| matches!(t.content, Content::Chat(_)))
-            {
-                w.active = i;
-            }
-            w.minimized = false;
-            let id = w.id;
-            self.focus(id);
+                .map(|i| (w.id, i))
+        }) {
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                window: None,
+                tab: Some(tab),
+            });
             return;
         }
         let (id, rect) = self.next_slot(egui::vec2(420.0, 320.0));
@@ -1197,13 +1226,315 @@ impl WindowManager {
             }
         }
         if let Some((win, tab)) = hit {
-            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
-                w.active = tab;
-                w.minimized = false;
-                self.focus(win);
-            }
+            // Local-level surface: this manager owns both viewer and terminal.
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                window: None,
+                tab: Some(tab),
+            });
         }
         // else: no live terminal for that id (human seat, or closed) — no-op.
+    }
+
+    /// Make the addressed target visible and focused (write seam): restore the
+    /// window (re-tiling it when it was minimized out of the tree), restore a
+    /// nested child if addressed, switch its active tab, and run the focus
+    /// cascade. Stale ids no-op silently.
+    ///
+    /// Dual shape: with `window: None`, `project` is a window in *this* manager
+    /// (crew board / project row). With `window: Some`, `project` is a desktop
+    /// window whose nested project contains that child.
+    pub fn surface_target(&mut self, path: crate::panel::TargetPath) {
+        let Some(pidx) = self.windows.iter().position(|w| w.id == path.project) else {
+            return;
+        };
+        self.unminimize(path.project);
+
+        match path.window {
+            None => {
+                if let Some(t) = path.tab {
+                    if t < self.windows[pidx].tabs.len() {
+                        self.windows[pidx].active = t;
+                    }
+                }
+            }
+            Some(wid) => {
+                // Find the project tab that owns this child window.
+                let mut found_pi = None;
+                for (i, t) in self.windows[pidx].tabs.iter().enumerate() {
+                    if let Content::Project(inner) = &t.content {
+                        if inner.windows.iter().any(|cw| cw.id == wid) {
+                            found_pi = Some(i);
+                            break;
+                        }
+                    }
+                }
+                let Some(pi) = found_pi else { return };
+                self.windows[pidx].active = pi;
+                if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
+                    inner.unminimize(wid);
+                    if let Some(cw) = inner.windows.iter_mut().find(|w| w.id == wid) {
+                        if let Some(t) = path.tab {
+                            if t < cw.tabs.len() {
+                                cw.active = t;
+                            }
+                        }
+                    }
+                    inner.focus(wid);
+                }
+            }
+        }
+        self.focus(path.project);
+    }
+
+    /// Pure snapshot of the whole tree for the task-manager panel (read seam).
+    /// One `ProjectEntry` per `Content::Project` tab; the panel window itself is
+    /// skipped. Cheap; rebuilt each frame by the desktop `show`.
+    pub fn panel_model(&self) -> crate::panel::PanelModel {
+        use crate::panel::*;
+        let mut projects = Vec::new();
+        for w in &self.windows {
+            if w.is_panel() {
+                continue;
+            }
+            for (pi, pt) in w.tabs.iter().enumerate() {
+                let Content::Project(inner) = &pt.content else {
+                    continue;
+                };
+                let ppath = TargetPath {
+                    project: w.id,
+                    window: None,
+                    tab: Some(pi),
+                };
+                let pfocused = self.focused == Some(w.id) && w.active == pi;
+                let mut tabs = Vec::new();
+                for cw in &inner.windows {
+                    for (ti, t) in cw.tabs.iter().enumerate() {
+                        let kind = match &t.content {
+                            Content::Terminal(s) => RowKind::Terminal(s.icon_kind()),
+                            Content::Chat(_) => RowKind::Chat,
+                            // Nested project content is not a product path today; tests
+                            // use empty Project stubs as PTY-free tab stand-ins.
+                            Content::Project(_) => {
+                                RowKind::Terminal(crate::icons::IconKind::Folder)
+                            }
+                            Content::TaskManager(_) => continue,
+                        };
+                        tabs.push(TabEntry {
+                            path: TargetPath {
+                                project: w.id,
+                                window: Some(cw.id),
+                                tab: Some(ti),
+                            },
+                            title: t.title.clone(),
+                            kind,
+                            minimized: cw.minimized,
+                            active_tab: cw.active == ti,
+                            focused: pfocused && inner.focused == Some(cw.id) && cw.active == ti,
+                            exited: match &t.content {
+                                Content::Terminal(s) => s.has_exited(),
+                                _ => false,
+                            },
+                        });
+                    }
+                }
+                projects.push(ProjectEntry {
+                    path: ppath,
+                    title: pt.title.clone(),
+                    minimized: w.minimized,
+                    focused: pfocused,
+                    tabs,
+                });
+            }
+        }
+        PanelModel { projects }
+    }
+
+    /// Desktop-only, idempotent: create the task-manager panel as a right-edge
+    /// root split if none exists.
+    pub fn ensure_panel(&mut self, collapsed: bool, expanded_width: f32) {
+        if self.windows.iter().any(|w| w.is_panel()) {
+            return;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.z += 1;
+        let prev_focus = self.focused;
+        self.windows.push(Win {
+            id,
+            tabs: vec![Tab {
+                title: "Sessions".into(),
+                content: Content::TaskManager(crate::panel::PanelView::new(
+                    collapsed,
+                    expanded_width,
+                )),
+            }],
+            active: 0,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(crate::panel::PANEL_W, 400.0),
+            ),
+            z: self.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        // Don't steal focus from an existing project.
+        self.focused = prev_focus;
+        self.tree.insert_root(id, Dir::Right);
+        if let Some(area_w) = Some(self.last_area.x).filter(|&w| w > 1.0) {
+            self.apply_panel_ratio(area_w);
+        }
+    }
+
+    fn panel_id(&self) -> Option<WinId> {
+        self.windows.iter().find(|w| w.is_panel()).map(|w| w.id)
+    }
+
+    /// Live collapse/width prefs for settings persistence.
+    pub fn panel_prefs(&self) -> Option<(bool, f32)> {
+        for w in &self.windows {
+            for t in &w.tabs {
+                if let Content::TaskManager(v) = &t.content {
+                    return Some((v.collapsed, v.expanded_width));
+                }
+            }
+        }
+        None
+    }
+
+    fn toggle_panel(&mut self) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::TaskManager(v) = &mut t.content {
+                    v.collapsed = !v.collapsed;
+                }
+            }
+        }
+        let area_w = self.last_area.x;
+        if area_w > 1.0 {
+            self.apply_panel_ratio(area_w);
+        }
+    }
+
+    /// Size the panel leaf: rail width when collapsed, else expanded_width.
+    /// Pins the nearest H divider so it works wherever the panel sits in the
+    /// tree, not just as the rightmost root leaf.
+    fn apply_panel_ratio(&mut self, area_w: f32) {
+        let Some(pid) = self.panel_id() else {
+            return;
+        };
+        let (collapsed, expanded_width) =
+            self.panel_prefs().unwrap_or((false, crate::panel::PANEL_W));
+        let target_w = if collapsed {
+            crate::panel::RAIL_W
+        } else {
+            expanded_width
+        }
+        .clamp(
+            crate::panel::RAIL_W,
+            (area_w * 0.5).max(crate::panel::RAIL_W),
+        );
+
+        if self.tree.contains(pid) {
+            let local = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(area_w, self.last_area.y.max(1.0)),
+            );
+            self.tree.set_leaf_width(pid, target_w, local, SNAP_GAP);
+        } else if let Some(w) = self.windows.iter_mut().find(|w| w.id == pid) {
+            // Floating panel: resize width only.
+            let h = w.rect.height();
+            w.rect.set_width(target_w);
+            w.rect.set_height(h);
+        }
+    }
+
+    /// Drain panel-row interactions recorded during the draw into deferred Acts.
+    fn drain_panel_acts(&mut self, acts: &mut Vec<Act>) {
+        let mut click = None;
+        let mut hover = None;
+        let mut toggle = false;
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::TaskManager(v) = &mut t.content {
+                    if let Some(p) = v.click.take() {
+                        click = Some(p);
+                    }
+                    if let Some(h) = v.hover_act.take() {
+                        hover = Some(h);
+                    }
+                    if v.toggle_collapse {
+                        v.toggle_collapse = false;
+                        toggle = true;
+                    }
+                }
+            }
+        }
+        if let Some(p) = click {
+            acts.push(Act::FocusPath(p));
+        }
+        if let Some((p, b)) = hover {
+            acts.push(match b {
+                crate::panel::PanelBtn::Min => Act::MinPath(p),
+                crate::panel::PanelBtn::Close => Act::ClosePath(p),
+            });
+        }
+        if toggle {
+            self.toggle_panel();
+        }
+    }
+
+    fn apply_min_path(&mut self, p: crate::panel::TargetPath) {
+        match p.window {
+            None => self.minimize(p.project),
+            Some(wid) => {
+                let Some(pidx) = self.windows.iter().position(|w| w.id == p.project) else {
+                    return;
+                };
+                // Activate the project tab that owns this child, then minimize.
+                let pi = self.windows[pidx].tabs.iter().position(|t| {
+                    matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
+                });
+                if let Some(pi) = pi {
+                    self.windows[pidx].active = pi;
+                    if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
+                        inner.minimize(wid);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_close_path(&mut self, p: crate::panel::TargetPath) {
+        match p.window {
+            None => match p.tab {
+                Some(t) => self.request_close_tab(p.project, t),
+                None => self.request_close_active_tab(p.project),
+            },
+            Some(wid) => {
+                let Some(pidx) = self.windows.iter().position(|w| w.id == p.project) else {
+                    return;
+                };
+                let pi = self.windows[pidx].tabs.iter().position(|t| {
+                    matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
+                });
+                let Some(pi) = pi else { return };
+                self.windows[pidx].active = pi;
+                // Route through the nested manager's confirm path.
+                if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
+                    match p.tab {
+                        Some(t) => inner.request_close_tab(wid, t),
+                        None => {
+                            if let Some(cw) = inner.windows.iter().find(|w| w.id == wid) {
+                                let t = cw.active;
+                                inner.request_close_tab(wid, t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Apply input-line submissions recorded during the draw. Human posts
@@ -1290,7 +1621,7 @@ impl WindowManager {
                         ready: s.ready(),
                         exited: s.exited().is_some(),
                     }),
-                    Content::Chat(_) => {} // viewer, never a member
+                    Content::Chat(_) | Content::TaskManager(_) => {} // not members
                 }
             }
         }
@@ -1500,6 +1831,7 @@ impl WindowManager {
             }
             Command::Help => self.show_help = true,
             Command::OpenSettings => self.open_settings(),
+            Command::ToggleTaskManager => self.toggle_panel(),
 
             // ---- terminal (inner) level: act on the focused project's child ----
             other => {
@@ -1579,6 +1911,9 @@ impl WindowManager {
 
     /// Remove an entire window (all of its tabs) and fix up focus.
     fn close(&mut self, id: WinId) {
+        if self.windows.iter().any(|w| w.id == id && w.is_panel()) {
+            return;
+        }
         self.detach(id);
         self.windows.retain(|w| w.id != id);
         if self.focused == Some(id) {
@@ -1595,13 +1930,19 @@ impl WindowManager {
         }
     }
 
-    /// Minimize a window to the taskbar. Like `close`, this ends an in-flight
-    /// rename of the window — its header (and the rename editor in it) stops
-    /// rendering, and a dangling `renaming` blocks focus for EVERY window.
+    /// Minimize a window (listed in the task-manager panel). Like `close`, this
+    /// ends an in-flight rename of the window — its header (and the rename
+    /// editor in it) stops rendering, and a dangling `renaming` blocks focus
+    /// for EVERY window.
     fn minimize(&mut self, id: WinId) {
+        if self.windows.iter().any(|w| w.id == id && w.is_panel()) {
+            return;
+        }
+        let was_tiled = self.tree.contains(id);
         self.detach(id);
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.minimized = true;
+            w.min_from_tree = was_tiled;
         }
         if self.focused == Some(id) {
             self.focused = None;
@@ -1611,14 +1952,53 @@ impl WindowManager {
         }
     }
 
-    /// True when this manager has no windows left and no modal is open (the
+    /// Clear `minimized` and, when the window was tiled at minimize time,
+    /// re-enter the tree at the leaf under its old center (longer-axis split).
+    /// Best effort — the tree may have changed shape since; falls back to the
+    /// panel-aware root insert `tile_new` uses. No-op on unknown ids.
+    fn unminimize(&mut self, id: WinId) {
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
+            return;
+        };
+        let retile = w.minimized && std::mem::take(&mut w.min_from_tree);
+        w.minimized = false;
+        if !retile || self.tree.contains(id) {
+            return;
+        }
+        let center = w.rect.center();
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+        let panel = self.panel_id().filter(|p| self.tree.contains(*p));
+        match self.tree.hit_leaf(center, local, SNAP_GAP) {
+            Some((leaf, r)) if Some(leaf) != panel => {
+                let side = if r.width() >= r.height() {
+                    Dir::Right
+                } else {
+                    Dir::Down
+                };
+                self.tree.insert_split(leaf, id, side);
+            }
+            _ => match panel {
+                // Old center hit the panel leaf (or nothing): keep the panel
+                // the rightmost root leaf, same as tile_new.
+                Some(pid) => {
+                    if !self.tree.insert_split(pid, id, Dir::Left) {
+                        self.tree.insert_root(id, Dir::Left);
+                    }
+                }
+                None => self.tree.insert_root(id, Dir::Right),
+            },
+        }
+    }
+
+    /// True when this manager has no real windows left and no modal is open (the
     /// picker could still create a project; an open settings editor must not
     /// be yanked out from under the user; a pending close-confirm must hold the
-    /// app alive until answered). On the desktop this means "closing the last
-    /// project": `main.rs` quits the app when it turns true, the way a terminal
-    /// emulator exits with its last tab.
+    /// app alive until answered). The task-manager panel alone does not count.
+    /// On the desktop this means "closing the last project": `main.rs` quits
+    /// the app when it turns true, the way a terminal emulator exits with its
+    /// last tab.
     pub fn deserted(&self) -> bool {
-        self.windows.is_empty()
+        self.windows.iter().all(|w| w.is_panel())
             && self.picker.is_none()
             && self.settings.is_none()
             && self.pending_close.is_none()
@@ -1920,6 +2300,7 @@ impl WindowManager {
             rect: egui::Rect::from_min_size(origin, size),
             z: self.z,
             minimized: false,
+            min_from_tree: false,
             prev: None,
         });
         self.focus(new_id);
@@ -2198,7 +2579,7 @@ impl WindowManager {
         // `order` is back-to-front; iterate in reverse for top-most-first.
         for &j in order.iter().rev() {
             let w = &self.windows[j];
-            if w.id == src || w.minimized {
+            if w.id == src || w.minimized || w.is_panel() {
                 continue;
             }
             let scr = w.rect.translate(area.min.to_vec2());
@@ -2227,7 +2608,7 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),
-                    Content::Chat(_) => {} // no process, no exit marker
+                    Content::Chat(_) | Content::TaskManager(_) => {} // no process
                 }
             }
         }
@@ -2249,6 +2630,7 @@ impl WindowManager {
     ) -> bool {
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
+        let prev_area_w = self.last_area.x;
         self.last_area = area.size();
 
         // A confirm dialog anywhere in the app is globally modal: freeze this
@@ -2260,6 +2642,26 @@ impl WindowManager {
 
         if self.desktop {
             self.refresh_exit_titles();
+            // First real area (or large area change): size the panel leaf.
+            // While collapsed, re-pin every frame so divider drags (from the
+            // panel's edge or a neighbour's) spring back to the rail width.
+            let panel_collapsed = self.panel_prefs().is_some_and(|(c, _)| c);
+            if area.width() > 1.0
+                && (panel_collapsed
+                    || prev_area_w < 1.0
+                    || (area.width() - prev_area_w).abs() > 80.0)
+            {
+                self.apply_panel_ratio(area.width());
+            }
+            // Stash the read-model snapshot into the panel before painting.
+            let model = self.panel_model();
+            for w in &mut self.windows {
+                for t in &mut w.tabs {
+                    if let Content::TaskManager(v) = &mut t.content {
+                        v.model = model.clone();
+                    }
+                }
+            }
         }
 
         self.pump_commands(ui, live);
@@ -2339,10 +2741,12 @@ impl WindowManager {
             // it can't be dragged or torn out (there is nothing to tear it from).
             // This is what lets a project's tab/header flow straight into a single
             // terminal with no redundant inner frame between them.
+            let is_panel = self.windows[i].is_panel();
             let bare = is_tiled
                 && self.windows.len() == 1
                 && self.windows[i].tabs.len() == 1
-                && !is_project;
+                && !is_project
+                && !is_panel;
             if bare {
                 ui.painter_at(scr.intersect(area))
                     .rect_filled(scr, egui::CornerRadius::ZERO, BG);
@@ -2843,129 +3247,173 @@ impl WindowManager {
                             tint,
                         );
                     }
-                    p.text(
-                        *text_pos,
-                        egui::Align2::LEFT_CENTER,
-                        self.windows[i].title(),
-                        title_font.clone(),
-                        if is_focus { TEXT } else { DIM },
+                    // Collapsed panel rail: 36px can't fit a label — a clipped
+                    // "Sessions" reads as garbage, so the header shows only
+                    // the expand toggle.
+                    let collapsed_panel = matches!(
+                        &self.windows[i].tabs[self.windows[i].active].content,
+                        Content::TaskManager(v) if v.collapsed
                     );
+                    if !collapsed_panel {
+                        p.text(
+                            *text_pos,
+                            egui::Align2::LEFT_CENTER,
+                            self.windows[i].title(),
+                            title_font.clone(),
+                            if is_focus { TEXT } else { DIM },
+                        );
+                    }
                 }
 
                 // --- window controls ---
-                // Projects show only close + overflow (quiet chrome): Float/
-                // Min/Max live in the hover-opened ⋯ menu, create/open actions
-                // in the + menu after the name. Terminals keep all four
-                // buttons.
+                // Panel: collapse only (non-closable / non-minimizable).
+                // Projects: close + overflow (quiet chrome). Terminals: four buttons.
                 let mut ovf_rect = egui::Rect::NOTHING;
-                for &(role, r) in &hl.controls {
-                    if role == CtlRole::Ovf {
-                        ovf_rect = r;
+                if is_panel {
+                    let br = egui::Rect::from_center_size(
+                        egui::pos2(scr.max.x - 14.0, scr.min.y + TITLE_H * 0.5),
+                        egui::vec2(22.0, 22.0),
+                    );
+                    let resp =
+                        ui.interact(br, base.with((id, "panel-collapse")), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            br,
+                            egui::CornerRadius::same(4),
+                            egui::Color32::from_rgb(72, 64, 50),
+                        );
                     }
-                    let resp = ui.interact(r, base.with((id, role.id_str())), egui::Sense::click());
-                    let bg = if resp.hovered() {
-                        if role.danger() {
-                            egui::Color32::from_rgb(120, 45, 36)
+                    let collapsed = matches!(
+                        &self.windows[i].tabs[self.windows[i].active].content,
+                        Content::TaskManager(v) if v.collapsed
+                    );
+                    ui.painter().text(
+                        br.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if collapsed { "«" } else { "»" },
+                        egui::FontId::proportional(13.0),
+                        if is_focus { TEXT } else { DIM },
+                    );
+                    if resp.clicked() {
+                        let active = self.windows[i].active;
+                        if let Content::TaskManager(v) = &mut self.windows[i].tabs[active].content {
+                            v.toggle_collapse = true;
+                        }
+                    }
+                } else {
+                    for &(role, r) in &hl.controls {
+                        if role == CtlRole::Ovf {
+                            ovf_rect = r;
+                        }
+                        let resp =
+                            ui.interact(r, base.with((id, role.id_str())), egui::Sense::click());
+                        let bg = if resp.hovered() {
+                            if role.danger() {
+                                egui::Color32::from_rgb(120, 45, 36)
+                            } else {
+                                egui::Color32::from_rgb(72, 64, 50)
+                            }
                         } else {
-                            egui::Color32::from_rgb(72, 64, 50)
-                        }
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
-                    ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
-                    // Icons are drawn as vector strokes (not font glyphs) so all three
-                    // share one optical center, size, and weight regardless of font.
-                    let c = r.center();
-                    let s = 4.0; // icon half-extent
-                    let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
-                    let p = ui.painter();
-                    match role {
-                        CtlRole::Min => {
-                            p.line_segment(
-                                [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
-                                stroke,
-                            );
-                        }
-                        CtlRole::Max => {
-                            p.rect_stroke(
-                                egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
-                                egui::CornerRadius::same(1),
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        CtlRole::Float => {
-                            if is_tiled {
-                                // In the tree: 2×2 grid. Click pops it out to floating.
+                            egui::Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(r, egui::CornerRadius::same(4), bg);
+                        // Icons are drawn as vector strokes (not font glyphs) so all three
+                        // share one optical center, size, and weight regardless of font.
+                        let c = r.center();
+                        let s = 4.0; // icon half-extent
+                        let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                        let p = ui.painter();
+                        match role {
+                            CtlRole::Min => {
+                                p.line_segment(
+                                    [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                    stroke,
+                                );
+                            }
+                            CtlRole::Max => {
                                 p.rect_stroke(
                                     egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0)),
                                     egui::CornerRadius::same(1),
                                     stroke,
                                     egui::StrokeKind::Inside,
                                 );
+                            }
+                            CtlRole::Float => {
+                                if is_tiled {
+                                    // In the tree: 2×2 grid. Click pops it out to floating.
+                                    p.rect_stroke(
+                                        egui::Rect::from_center_size(
+                                            c,
+                                            egui::vec2(s * 2.0, s * 2.0),
+                                        ),
+                                        egui::CornerRadius::same(1),
+                                        stroke,
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    p.line_segment(
+                                        [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                                        stroke,
+                                    );
+                                    p.line_segment(
+                                        [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                        stroke,
+                                    );
+                                } else {
+                                    // Floating: two offset squares. Click tiles it
+                                    // (enters at the leaf under the window's center).
+                                    let q = s * 0.8;
+                                    let o = 1.5;
+                                    p.rect_stroke(
+                                        egui::Rect::from_center_size(
+                                            egui::pos2(c.x + o, c.y - o),
+                                            egui::vec2(q * 2.0, q * 2.0),
+                                        ),
+                                        egui::CornerRadius::same(1),
+                                        stroke,
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    p.rect_stroke(
+                                        egui::Rect::from_center_size(
+                                            egui::pos2(c.x - o, c.y + o),
+                                            egui::vec2(q * 2.0, q * 2.0),
+                                        ),
+                                        egui::CornerRadius::same(1),
+                                        stroke,
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                            }
+                            CtlRole::Ovf => {
+                                for dx in [-4.0f32, 0.0, 4.0] {
+                                    p.circle_filled(
+                                        egui::pos2(c.x + dx, c.y),
+                                        1.2,
+                                        if is_focus { TEXT } else { DIM },
+                                    );
+                                }
+                            }
+                            _ => {
                                 p.line_segment(
-                                    [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
+                                    [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
                                     stroke,
                                 );
                                 p.line_segment(
-                                    [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
+                                    [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
                                     stroke,
-                                );
-                            } else {
-                                // Floating: two offset squares. Click tiles it
-                                // (enters at the leaf under the window's center).
-                                let q = s * 0.8;
-                                let o = 1.5;
-                                p.rect_stroke(
-                                    egui::Rect::from_center_size(
-                                        egui::pos2(c.x + o, c.y - o),
-                                        egui::vec2(q * 2.0, q * 2.0),
-                                    ),
-                                    egui::CornerRadius::same(1),
-                                    stroke,
-                                    egui::StrokeKind::Inside,
-                                );
-                                p.rect_stroke(
-                                    egui::Rect::from_center_size(
-                                        egui::pos2(c.x - o, c.y + o),
-                                        egui::vec2(q * 2.0, q * 2.0),
-                                    ),
-                                    egui::CornerRadius::same(1),
-                                    stroke,
-                                    egui::StrokeKind::Inside,
                                 );
                             }
                         }
-                        CtlRole::Ovf => {
-                            for dx in [-4.0f32, 0.0, 4.0] {
-                                p.circle_filled(
-                                    egui::pos2(c.x + dx, c.y),
-                                    1.2,
-                                    if is_focus { TEXT } else { DIM },
-                                );
+                        if resp.clicked() {
+                            match role {
+                                CtlRole::Close => acts.push(Act::Close(id)),
+                                CtlRole::Max => acts.push(Act::Max(id)),
+                                CtlRole::Float => acts.push(Act::Float(id)),
+                                CtlRole::Ovf => {} // hover opens the menu; click is inert
+                                CtlRole::Min => acts.push(Act::Min(id)),
                             }
                         }
-                        _ => {
-                            p.line_segment(
-                                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
-                                stroke,
-                            );
-                            p.line_segment(
-                                [egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)],
-                                stroke,
-                            );
-                        }
                     }
-                    if resp.clicked() {
-                        match role {
-                            CtlRole::Close => acts.push(Act::Close(id)),
-                            CtlRole::Max => acts.push(Act::Max(id)),
-                            CtlRole::Float => acts.push(Act::Float(id)),
-                            CtlRole::Ovf => {} // hover opens the menu; click is inert
-                            CtlRole::Min => acts.push(Act::Min(id)),
-                        }
-                    }
-                }
+                } // !is_panel
 
                 // --- project header menus (hover-opened) ---
                 if is_project {
@@ -3049,6 +3497,12 @@ impl WindowManager {
             // divider so the tiles resize together, while outer edges are inert
             // (tear-out lives on the header drag). Zoomed windows don't resize.
             let bnd = RESIZE_BAND;
+            // A collapsed panel is pinned to the rail width: no resize
+            // affordance (any drag would spring back on the next frame).
+            let pinned = self.windows[i]
+                .tabs
+                .iter()
+                .any(|t| matches!(&t.content, Content::TaskManager(v) if v.collapsed));
             let (x0, y0, x1, y1) = (scr.min.x, scr.min.y, scr.max.x, scr.max.y);
             type Ci = egui::CursorIcon;
             // (key, rect, left, right, top, bottom, cursor)
@@ -3143,7 +3597,7 @@ impl WindowManager {
                 if resp.hovered() || resp.dragged() {
                     // Only advertise a resize that can actually happen: tiled
                     // windows resize on interior dividers only; zoomed never.
-                    let usable = if self.zoomed == Some(id) {
+                    let usable = if pinned || self.zoomed == Some(id) {
                         false
                     } else if self.tree.contains(id) {
                         (hl && self.tree.has_divider(id, Dir::Left))
@@ -3164,8 +3618,8 @@ impl WindowManager {
                     continue;
                 }
                 let d = resp.drag_delta();
-                if self.zoomed == Some(id) {
-                    continue; // zoomed windows render full-area; resizing is meaningless
+                if pinned || self.zoomed == Some(id) {
+                    continue; // zoomed renders full-area; a pinned panel springs back
                 }
                 if self.tree.contains(id) {
                     // Tiled: each edge maps to the divider it shares with a neighbour
@@ -3190,23 +3644,59 @@ impl WindowManager {
         }
 
         self.paint_drag_overlays(ui, area, snap_overlay, merge_hint);
-        self.paint_taskbar(ui, area, base, &mut acts);
+        // Chip taskbar removed — minimized windows restore via the panel.
 
+        let ctx = ui.ctx().clone();
+        // Panel drains join the same act list before apply (focus/min/close paths).
+        if self.desktop {
+            self.drain_panel_acts(&mut acts);
+        }
         // Any Act means a window in this manager was interacted with this frame.
         // Captured before the apply loop consumes `acts`, returned at the end so
         // the parent can bubble focus upward through arbitrary nesting depth.
         let interacted = !acts.is_empty();
-
-        let ctx = ui.ctx().clone();
         self.apply_acts(acts, asz, base, &ctx);
         // After the acts, not before: the same click that recorded a crew-row
         // hit also pushed Act::Focus(chat window) via cresp — draining last is
         // the fixed order that lets the member, not the viewer, end up focused.
         self.drain_chat_clicks();
         self.drain_chat_posts();
+        // Remember expanded panel width from the live tiled rect (divider drag).
+        if self.desktop {
+            self.sync_panel_width_from_layout();
+        }
         self.show_modals(ui, area, &ctx);
 
         interacted
+    }
+
+    /// After layout, store the panel's tiled width into `expanded_width` when
+    /// expanded so divider drags persist.
+    fn sync_panel_width_from_layout(&mut self) {
+        let Some(pid) = self.panel_id() else {
+            return;
+        };
+        if !self.tree.contains(pid) {
+            return;
+        }
+        let w = self
+            .windows
+            .iter()
+            .find(|w| w.id == pid)
+            .map(|w| w.rect.width())
+            .unwrap_or(0.0);
+        if w < 1.0 {
+            return;
+        }
+        for win in &mut self.windows {
+            for t in &mut win.tabs {
+                if let Content::TaskManager(v) = &mut t.content {
+                    if !v.collapsed && (w - v.expanded_width).abs() > 0.5 {
+                        v.expanded_width = w.clamp(crate::panel::RAIL_W + 40.0, 600.0);
+                    }
+                }
+            }
+        }
     }
 
     /// Leader / command mode: only the root desktop runs it, and only while it is
@@ -3268,47 +3758,6 @@ impl WindowManager {
         }
     }
 
-    /// Bottom-left taskbar of minimized windows; clicking a chip restores it.
-    fn paint_taskbar(
-        &self,
-        ui: &mut egui::Ui,
-        area: egui::Rect,
-        base: egui::Id,
-        acts: &mut Vec<Act>,
-    ) {
-        let mins: Vec<(WinId, String)> = self
-            .windows
-            .iter()
-            .filter(|w| w.minimized)
-            .map(|w| (w.id, w.title().to_string()))
-            .collect();
-        if mins.is_empty() {
-            return;
-        }
-        let mut tx = area.min.x + 8.0;
-        let ty = area.max.y - 30.0;
-        for (id, title) in mins {
-            let r = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(160.0, 24.0));
-            let resp = ui.interact(r, base.with((id, "task")), egui::Sense::click());
-            ui.painter().rect_filled(
-                r,
-                egui::CornerRadius::same(5),
-                egui::Color32::from_rgb(42, 38, 29),
-            );
-            ui.painter().text(
-                egui::pos2(tx + 9.0, ty + 12.0),
-                egui::Align2::LEFT_CENTER,
-                &title,
-                egui::FontId::proportional(11.5),
-                DIM,
-            );
-            if resp.clicked() {
-                acts.push(Act::Restore(id));
-            }
-            tx += 168.0;
-        }
-    }
-
     /// Deferred window mutations collected during render, applied after the render
     /// borrow on `self.windows` is released so we never remove/retab a window
     /// mid-loop and invalidate the draw order.
@@ -3358,7 +3807,15 @@ impl WindowManager {
                     self.focus(id);
                 }
                 Act::CloseTab(id, idx) => self.request_close_tab(id, idx),
-                Act::Merge { src, dst } => self.merge_windows(src, dst),
+                Act::Merge { src, dst } => {
+                    let panelish =
+                        |id: WinId| self.windows.iter().any(|w| w.id == id && w.is_panel());
+                    if panelish(src) || panelish(dst) {
+                        // Panel is non-tabbable.
+                    } else {
+                        self.merge_windows(src, dst);
+                    }
+                }
                 Act::Untab { id, idx, pos, grab } => {
                     if let Some(new_id) = self.untab(id, idx, pos) {
                         if grab {
@@ -3370,14 +3827,11 @@ impl WindowManager {
                     }
                 }
                 Act::Min(id) => self.minimize(id),
-                Act::Restore(id) => {
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        w.minimized = false;
-                    }
-                    self.focus(id);
-                }
                 Act::Max(id) => self.toggle_zoom(id),
                 Act::Float(id) => self.toggle_float_for(id),
+                Act::FocusPath(p) => self.surface_target(p),
+                Act::MinPath(p) => self.apply_min_path(p),
+                Act::ClosePath(p) => self.apply_close_path(p),
             }
         }
     }
@@ -4000,7 +4454,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
             }
         }
         Content::Project(wm) => wm.terminal_groups(),
-        Content::Chat(_) => Vec::new(),
+        Content::Chat(_) | Content::TaskManager(_) => Vec::new(),
     }
 }
 
@@ -4086,6 +4540,7 @@ mod tests {
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
             z: wm.z,
             minimized: false,
+            min_from_tree: false,
             prev: None,
         });
         wm.focused = Some(id);
@@ -4376,6 +4831,49 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn unminimize_retiles_a_window_minimized_from_the_tree() {
+        let mut wm = WindowManager::new();
+        wm.last_area = egui::vec2(1000.0, 600.0);
+        let a = push(&mut wm, "a");
+        let b = push(&mut wm, "b");
+        wm.tree.insert_root(a, Dir::Right);
+        wm.tree.insert_root(b, Dir::Right);
+        // give the windows their live tiled rects, as layout would each frame
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
+        for (w, r) in wm.tree.layout(local, 8.0) {
+            wm.windows.iter_mut().find(|win| win.id == w).unwrap().rect = r;
+        }
+        wm.minimize(b);
+        assert!(!wm.tree.contains(b));
+        assert!(wm.windows.iter().find(|w| w.id == b).unwrap().minimized);
+
+        wm.surface_target(crate::panel::TargetPath {
+            project: b,
+            window: None,
+            tab: None,
+        });
+        let wb = wm.windows.iter().find(|w| w.id == b).unwrap();
+        assert!(!wb.minimized);
+        assert!(wm.tree.contains(b), "restore should re-enter the tree");
+    }
+
+    #[test]
+    fn unminimize_leaves_a_floating_minimized_window_floating() {
+        let mut wm = WindowManager::new();
+        wm.last_area = egui::vec2(1000.0, 600.0);
+        let a = push(&mut wm, "a"); // floating, never tiled
+        wm.minimize(a);
+        wm.surface_target(crate::panel::TargetPath {
+            project: a,
+            window: None,
+            tab: None,
+        });
+        let wa = wm.windows.iter().find(|w| w.id == a).unwrap();
+        assert!(!wa.minimized);
+        assert!(!wm.tree.contains(a), "floating windows restore floating");
     }
 
     #[test]
@@ -6809,6 +7307,157 @@ mod tests {
         );
     }
 
+    // --- task-manager panel seams ---
+
+    #[test]
+    fn panel_model_groups_tabs_under_projects_with_state_flags() {
+        let mut desk = WindowManager::new();
+        let proj = push(&mut desk, "projA");
+        let mut inner = WindowManager::new();
+        let a = push(&mut inner, "termA");
+        inner.windows[0].tabs.push(Tab {
+            title: "termA2".into(),
+            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+                std::cell::RefCell::new(crate::chat::ChatRoom::new()),
+            ))),
+        });
+        let b = push(&mut inner, "termB");
+        inner
+            .windows
+            .iter_mut()
+            .find(|w| w.id == b)
+            .unwrap()
+            .minimized = true;
+        inner.focus(a);
+        desk.windows[0].tabs[0].content = Content::Project(Box::new(inner));
+        desk.focus(proj);
+
+        let m = desk.panel_model();
+        assert_eq!(m.projects.len(), 1);
+        let p = &m.projects[0];
+        assert_eq!(p.title, "projA");
+        assert!(p.focused && !p.minimized);
+        assert_eq!(
+            p.path,
+            crate::panel::TargetPath {
+                project: proj,
+                window: None,
+                tab: Some(0),
+            }
+        );
+        assert_eq!(p.tabs.len(), 3);
+        assert!(p.tabs[0].active_tab && !p.tabs[0].minimized);
+        assert!(matches!(p.tabs[1].kind, crate::panel::RowKind::Chat));
+        assert!(!p.tabs[1].active_tab);
+        let bt = p.tabs.iter().find(|t| t.path.window == Some(b)).unwrap();
+        assert!(bt.minimized);
+    }
+
+    #[test]
+    fn panel_model_skips_the_panel_window_itself() {
+        let mut desk = WindowManager::new();
+        desk.ensure_panel(false, crate::panel::PANEL_W);
+        assert!(
+            desk.panel_model().projects.is_empty(),
+            "panel alone is not a project row"
+        );
+        let _ = push(&mut desk, "projA");
+        let m = desk.panel_model();
+        assert_eq!(m.projects.len(), 1);
+        assert_eq!(m.projects[0].title, "projA");
+        assert!(
+            !m.projects.iter().any(|p| p.title == "Sessions"),
+            "panel window must not appear as a project"
+        );
+    }
+
+    #[test]
+    fn surface_target_restores_and_focuses_across_levels() {
+        let mut desk = WindowManager::new();
+        let other = push(&mut desk, "other");
+        let proj = push(&mut desk, "proj");
+        let mut inner = WindowManager::new();
+        let cw = push(&mut inner, "t1");
+        inner.windows[0].tabs.push(Tab {
+            title: "t2".into(),
+            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+                std::cell::RefCell::new(crate::chat::ChatRoom::new()),
+            ))),
+        });
+        inner.windows[0].minimized = true;
+        desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
+            Content::Project(Box::new(inner));
+        desk.windows
+            .iter_mut()
+            .find(|w| w.id == proj)
+            .unwrap()
+            .minimized = true;
+        desk.focus(other);
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: proj,
+            window: Some(cw),
+            tab: Some(1),
+        });
+
+        let pw = desk.windows.iter().find(|w| w.id == proj).unwrap();
+        assert!(!pw.minimized, "project must be restored");
+        assert_eq!(desk.focused, Some(proj), "project must take desktop focus");
+        let Content::Project(inner) = &pw.tabs[0].content else {
+            panic!()
+        };
+        let c = inner.windows.iter().find(|w| w.id == cw).unwrap();
+        assert!(!c.minimized, "child window must be restored");
+        assert_eq!(c.active, 1, "background tab must become active");
+        assert_eq!(inner.focused, Some(cw), "child must take inner focus");
+    }
+
+    #[test]
+    fn surface_target_is_a_noop_on_stale_paths() {
+        let mut desk = WindowManager::new();
+        let a = push(&mut desk, "a");
+        desk.focus(a);
+        desk.surface_target(crate::panel::TargetPath {
+            project: 999,
+            window: None,
+            tab: None,
+        });
+        assert_eq!(desk.focused, Some(a), "stale path must change nothing");
+    }
+
+    #[test]
+    fn ensure_panel_is_idempotent_and_tiled_right() {
+        let mut desk = WindowManager::new();
+        desk.ensure_panel(false, crate::panel::PANEL_W);
+        desk.ensure_panel(false, crate::panel::PANEL_W);
+        let panels: Vec<_> = desk.windows.iter().filter(|w| w.is_panel()).collect();
+        assert_eq!(panels.len(), 1);
+        assert!(desk.tree.contains(panels[0].id), "panel starts tiled");
+    }
+
+    #[test]
+    fn deserted_ignores_the_panel() {
+        let mut desk = WindowManager::new();
+        desk.ensure_panel(false, crate::panel::PANEL_W);
+        assert!(desk.deserted(), "a lone panel must not hold the app alive");
+        let p = push(&mut desk, "proj");
+        assert!(!desk.deserted());
+        desk.close(p);
+        assert!(desk.deserted());
+    }
+
+    #[test]
+    fn panel_refuses_close_and_minimize() {
+        let mut desk = WindowManager::new();
+        desk.ensure_panel(false, crate::panel::PANEL_W);
+        let id = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
+        desk.close(id);
+        desk.minimize(id);
+        let w = desk.windows.iter().find(|w| w.id == id).unwrap();
+        assert!(!w.minimized);
+        assert_eq!(desk.windows.iter().filter(|w| w.is_panel()).count(), 1);
+    }
+
     #[test]
     fn a_modal_freezes_background_mouse_acts() {
         // While a confirm is up, clicking a sibling tab / dragging a merge / hitting
@@ -6832,7 +7481,20 @@ mod tests {
         m.focus(1);
         m.app_modal = true;
         m.apply_acts(
-            vec![Act::Focus(2), Act::Min(1)],
+            vec![
+                Act::Focus(2),
+                Act::Min(1),
+                Act::FocusPath(crate::panel::TargetPath {
+                    project: 2,
+                    window: None,
+                    tab: None,
+                }),
+                Act::MinPath(crate::panel::TargetPath {
+                    project: 1,
+                    window: None,
+                    tab: None,
+                }),
+            ],
             egui::vec2(0.0, 0.0),
             egui::Id::new("t"),
             &ctx,

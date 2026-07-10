@@ -1,6 +1,6 @@
 # Task-manager panel — design
 
-Status: approved 2026-07-09.
+Status: implemented 2026-07-09 (see `src/panel.rs`, plan tasks 1–7).
 A desktop-level side panel listing every project and its terminal/chat tabs,
 grouped by owning project, with open/minimized state and click-to-focus. It
 fully replaces the minimize chip taskbars and is the future home of

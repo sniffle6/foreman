@@ -17,6 +17,7 @@ mod keymap;
 mod landing;
 mod layout;
 mod notify;
+mod panel;
 mod proc;
 mod ready;
 mod recents;
@@ -394,6 +395,9 @@ impl eframe::App for App {
                 o.input_options.zoom_modifier = egui::Modifiers::NONE;
             });
             // Desktop hosts project windows; each project is its own sandbox.
+            // Task-manager panel is always present (right-edge leaf).
+            self.desktop
+                .ensure_panel(self.settings.panel_collapsed, self.settings.panel_width);
             // With the landing enabled, an empty desktop is the landing screen,
             // so skip the startup auto-project and let the user pick a directory.
             if !self.landing_enabled {
@@ -477,10 +481,24 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
-        // persist it after a debounce so a scroll gesture writes the file once.
+        // panel collapse/width, persist after a debounce so a scroll/drag
+        // gesture writes the file once.
         let live = terminal::font_size(&ctx);
+        let mut settings_dirty = false;
         if live != self.settings.font_size {
             self.settings.font_size = live;
+            settings_dirty = true;
+        }
+        if let Some((collapsed, width)) = self.desktop.panel_prefs() {
+            if collapsed != self.settings.panel_collapsed
+                || (width - self.settings.panel_width).abs() > 0.5
+            {
+                self.settings.panel_collapsed = collapsed;
+                self.settings.panel_width = width;
+                settings_dirty = true;
+            }
+        }
+        if settings_dirty {
             self.font_dirty_at = Some(std::time::Instant::now());
         }
         if let Some(t) = self.font_dirty_at {

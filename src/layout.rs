@@ -34,6 +34,66 @@ pub enum Node {
     },
 }
 
+fn holds(n: &Node, id: WinId) -> bool {
+    match n {
+        Node::Leaf(w) => *w == id,
+        Node::Split { children, .. } => children.iter().any(|c| holds(c, id)),
+    }
+}
+
+/// Deepest split on `axis` along the path to `id` where `edge` is interior:
+/// (address-of-split, child-index, avail-extent-px). Shared by `resize_edge`
+/// and `set_leaf_width`.
+fn find_interior_split(
+    n: &Node,
+    r: egui::Rect,
+    id: WinId,
+    edge: Dir,
+    axis: SplitDir,
+    gap: f32,
+    addr: Vec<usize>,
+) -> Option<(Vec<usize>, usize, f32)> {
+    let Node::Split {
+        dir,
+        ratios,
+        children,
+    } = n
+    else {
+        return None;
+    };
+    let idx = children.iter().position(|c| holds(c, id))?;
+    // child rect, same math as layout()
+    let gaps = gap * (children.len() - 1) as f32;
+    let avail = match dir {
+        SplitDir::H => (r.width() - gaps).max(1.0),
+        SplitDir::V => (r.height() - gaps).max(1.0),
+    };
+    let lead: f32 = ratios[..idx].iter().sum::<f32>() * avail + gap * idx as f32;
+    let extent = ratios[idx] * avail;
+    let child_rect = match dir {
+        SplitDir::H => egui::Rect::from_min_size(
+            egui::pos2(r.min.x + lead, r.min.y),
+            egui::vec2(extent, r.height()),
+        ),
+        SplitDir::V => egui::Rect::from_min_size(
+            egui::pos2(r.min.x, r.min.y + lead),
+            egui::vec2(r.width(), extent),
+        ),
+    };
+    let mut child_addr = addr.clone();
+    child_addr.push(idx);
+    let deeper = find_interior_split(&children[idx], child_rect, id, edge, axis, gap, child_addr);
+    if deeper.is_some() {
+        return deeper;
+    }
+    let interior = *dir == axis
+        && match edge {
+            Dir::Left | Dir::Up => idx > 0,
+            Dir::Right | Dir::Down => idx < children.len() - 1,
+        };
+    interior.then_some((addr, idx, avail))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LayoutTree {
     pub root: Option<Node>,
@@ -430,71 +490,14 @@ impl LayoutTree {
         gap: f32,
     ) -> bool {
         let axis = SplitDir::of(edge);
-        // Pass 1 (read-only): find (address-of-split, child-index, avail-extent)
-        // of the deepest matching split along the path to `id`.
-        fn find(
-            n: &Node,
-            r: egui::Rect,
-            id: WinId,
-            edge: Dir,
-            axis: SplitDir,
-            gap: f32,
-            addr: Vec<usize>,
-        ) -> Option<(Vec<usize>, usize, f32)> {
-            let Node::Split {
-                dir,
-                ratios,
-                children,
-            } = n
-            else {
-                return None;
-            };
-            fn holds(n: &Node, id: WinId) -> bool {
-                match n {
-                    Node::Leaf(w) => *w == id,
-                    Node::Split { children, .. } => children.iter().any(|c| holds(c, id)),
-                }
-            }
-            let idx = children.iter().position(|c| holds(c, id))?;
-            // child rect, same math as layout()
-            let gaps = gap * (children.len() - 1) as f32;
-            let avail = match dir {
-                SplitDir::H => (r.width() - gaps).max(1.0),
-                SplitDir::V => (r.height() - gaps).max(1.0),
-            };
-            let lead: f32 = ratios[..idx].iter().sum::<f32>() * avail + gap * idx as f32;
-            let extent = ratios[idx] * avail;
-            let child_rect = match dir {
-                SplitDir::H => egui::Rect::from_min_size(
-                    egui::pos2(r.min.x + lead, r.min.y),
-                    egui::vec2(extent, r.height()),
-                ),
-                SplitDir::V => egui::Rect::from_min_size(
-                    egui::pos2(r.min.x, r.min.y + lead),
-                    egui::vec2(r.width(), extent),
-                ),
-            };
-            let mut child_addr = addr.clone();
-            child_addr.push(idx);
-            let deeper = find(&children[idx], child_rect, id, edge, axis, gap, child_addr);
-            if deeper.is_some() {
-                return deeper;
-            }
-            let interior = *dir == axis
-                && match edge {
-                    Dir::Left | Dir::Up => idx > 0,
-                    Dir::Right | Dir::Down => idx < children.len() - 1,
-                };
-            interior.then_some((addr, idx, avail))
-        }
         let found = match &self.root {
-            Some(r) => find(r, area.shrink(gap), id, edge, axis, gap, Vec::new()),
+            Some(r) => find_interior_split(r, area.shrink(gap), id, edge, axis, gap, Vec::new()),
             None => None,
         };
         let Some((addr, idx, avail)) = found else {
             return false;
         };
-        // Pass 2: descend by address and adjust the two ratios.
+        // Descend by address and adjust the two ratios.
         let mut node = self.root.as_mut().unwrap();
         for i in addr {
             let Node::Split { children, .. } = node else {
@@ -515,6 +518,64 @@ impl LayoutTree {
         ratios[a] += df;
         ratios[b] -= df;
         true
+    }
+
+    /// Pin leaf `id`'s width to `target_px` by moving the divider it shares
+    /// with its nearest H-axis sibling. Unlike `resize_edge`, the pinned leaf
+    /// may drop below MIN_RATIO (the collapsed task-manager rail is far
+    /// narrower than any tile); the sibling still clamps at MIN_RATIO. False
+    /// when the leaf has no interior H divider (sole leaf / empty tree).
+    pub fn set_leaf_width(
+        &mut self,
+        id: WinId,
+        target_px: f32,
+        area: egui::Rect,
+        gap: f32,
+    ) -> bool {
+        for edge in [Dir::Right, Dir::Left] {
+            let found = match &self.root {
+                Some(r) => {
+                    find_interior_split(r, area.shrink(gap), id, edge, SplitDir::H, gap, Vec::new())
+                }
+                None => None,
+            };
+            let Some((addr, idx, avail)) = found else {
+                continue;
+            };
+            let mut node = self.root.as_mut().unwrap();
+            for i in addr {
+                let Node::Split { children, .. } = node else {
+                    unreachable!()
+                };
+                node = &mut children[i];
+            }
+            let Node::Split { ratios, .. } = node else {
+                unreachable!()
+            };
+            let floor = (2.0 / avail).min(MIN_RATIO);
+            let want = target_px / avail - ratios[idx];
+            let (a, b, lo, hi, desired) = match edge {
+                Dir::Right | Dir::Down => (
+                    idx,
+                    idx + 1,
+                    floor - ratios[idx],
+                    ratios[idx + 1] - MIN_RATIO,
+                    want,
+                ),
+                Dir::Left | Dir::Up => (
+                    idx - 1,
+                    idx,
+                    MIN_RATIO - ratios[idx - 1],
+                    ratios[idx] - floor,
+                    -want,
+                ),
+            };
+            let df = desired.clamp(lo.min(hi), hi.max(lo));
+            ratios[a] += df;
+            ratios[b] -= df;
+            return true;
+        }
+        false
     }
 }
 
@@ -799,5 +860,43 @@ mod tests {
         assert!(t.has_divider(3, Dir::Up));
         assert!(t.has_divider(3, Dir::Left)); // column's left edge is the root divider
         assert!(!t.has_divider(3, Dir::Right)); // outer
+    }
+
+    #[test]
+    fn set_leaf_width_pins_a_leaf_below_min_ratio() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Right); // [1 | 2]
+        assert!(t.set_leaf_width(2, 36.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
+        assert!((r2.width() - 36.0).abs() < 0.5, "got {}", r2.width());
+    }
+
+    #[test]
+    fn set_leaf_width_reaches_a_leaf_nested_in_a_v_column() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Right);
+        t.insert_split(2, 3, Dir::Down); // right column stacks 2 over 3
+        assert!(t.set_leaf_width(2, 200.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
+        let r3 = p.iter().find(|(w, _)| *w == 3).unwrap().1;
+        assert!((r2.width() - 200.0).abs() < 0.5, "got {}", r2.width());
+        assert!((r3.width() - 200.0).abs() < 0.5); // same column follows
+    }
+
+    #[test]
+    fn set_leaf_width_is_false_for_a_sole_leaf_and_clamps_the_sibling() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        assert!(!t.set_leaf_width(1, 36.0, area(), 8.0));
+        // [1 | 2]: growing 2 to nearly everything leaves 1 at MIN_RATIO
+        t.insert_split(1, 2, Dir::Right);
+        assert!(t.set_leaf_width(2, 950.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r1 = p.iter().find(|(w, _)| *w == 1).unwrap().1;
+        assert!((r1.width() - 97.6).abs() < 0.5, "got {}", r1.width());
     }
 }

@@ -99,7 +99,7 @@ catch different failure classes) · "risk is covered by the other task's gate"
   - `panel::RowKind::{Terminal(crate::icons::IconKind), Chat}`
   - `WindowManager::panel_model(&self) -> panel::PanelModel`
 
-- [ ] **Step 1: Write `src/panel.rs` with the model types**
+- [x] **Step 1: Write `src/panel.rs` with the model types**
 
 ```rust
 //! Task-manager panel: plain-data model types (the read seam's vocabulary).

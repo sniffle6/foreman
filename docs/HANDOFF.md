@@ -44,7 +44,7 @@ as distinct.
   through `portable-pty` (ConPTY); `alacritty_terminal` emulation with **ANSI
   colors, cursor, inverse/dim**; resizes the shell to the window.
 - **Window manager** (shared engine, used at desktop + project levels):
-  - drag by titlebar, click-to-focus + raise (z-order), minimize→taskbar→restore,
+  - drag by titlebar, click-to-focus + raise (z-order), minimize→task-manager panel→restore,
     maximize/restore, resize (corner), close. Confined to the area.
   - **Two window states — tiled + floating** (replaced the old 9-zone snap):
     each manager owns a `LayoutTree` (`src/layout.rs`) of recursive H/V splits

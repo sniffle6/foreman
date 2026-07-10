@@ -79,6 +79,9 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   Headers at both levels are always-on quiet chrome — surface-colored
   (`terminal::BG`) on a reserved band, no fill — except a lone tiled pane
   (bare); projects add hover-opened `+`/`⋯` menus (`docs/window-chrome.md`).
+  Minimize restores via the task-manager panel (chip taskbars removed).
+- `src/panel.rs` — task-manager panel model + shallow view (`Content::TaskManager`);
+  desktop right-edge list of projects/tabs. See `docs/task-manager-panel.md`.
 - `src/layout.rs` — the tiling tree (pure, unit-tested): insert/remove/layout/
   drop targets/divider resize.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
@@ -116,6 +119,20 @@ Subsystem docs: `docs/tiling-tree.md` (two-state windows + layout tree),
 `docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
 `docs/epics/window-tabbing-split-epic.md` (tab-stacks; zone parts superseded).
 (`docs/foreman.md` is older narrative notes — prefer HANDOFF.md on any conflict.)
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `sniffle6/foreman` via `gh`; external PRs are **not** a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
 
 ## Working agreement
 

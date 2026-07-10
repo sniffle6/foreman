@@ -49,6 +49,8 @@ pub enum Command {
     // global
     Help,
     OpenSettings,
+    /// Collapse / expand the desktop task-manager panel (not focus).
+    ToggleTaskManager,
 }
 
 impl Command {
@@ -99,6 +101,7 @@ impl Command {
             // Actions
             Help,
             OpenSettings,
+            ToggleTaskManager,
         ]
     };
 
@@ -110,7 +113,7 @@ impl Command {
             | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
             | LastTerm | TabCycle | TabPrev | OpenChat | TermFloat => Group::Terminals,
-            Help | OpenSettings => Group::Actions,
+            Help | OpenSettings | ToggleTaskManager => Group::Actions,
         }
     }
 
@@ -164,6 +167,7 @@ impl Command {
             OpenChat => "Open project chat",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
+            ToggleTaskManager => "Toggle task panel",
         }
     }
 }
@@ -529,6 +533,9 @@ impl Default for Keymap {
         // `Ctrl+,` after the leader — the conventional "preferences" chord, and
         // unused here (plain `,` is Rename). Documented in the `?` overlay.
         t.insert(ctrl(K::Comma), OpenSettings);
+
+        // --- task-manager panel collapse/expand ---
+        t.insert(plain(K::M), ToggleTaskManager);
 
         Keymap {
             leader: Chord::new(K::B, true, false, false), // Ctrl+b

@@ -93,12 +93,18 @@ pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
 pub struct Settings {
     /// Global terminal text size, shared by every pane.
     pub font_size: f32,
+    /// Task-manager panel collapsed to the icon rail.
+    pub panel_collapsed: bool,
+    /// Task-manager panel width when expanded (px).
+    pub panel_width: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             font_size: DEFAULT_FONT_SIZE,
+            panel_collapsed: false,
+            panel_width: crate::panel::PANEL_W,
         }
     }
 }
@@ -125,6 +131,8 @@ mod tests {
         // the full default — the forward/back-compat property the layer promises.
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.font_size, DEFAULT_FONT_SIZE);
+        assert!(!s.panel_collapsed);
+        assert_eq!(s.panel_width, crate::panel::PANEL_W);
     }
 
     #[test]

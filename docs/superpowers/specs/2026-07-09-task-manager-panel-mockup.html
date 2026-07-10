@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>foreman — task-manager panel mockup</title>
+<style>
+  :root {
+    /* From src/theme.rs (warm charcoal, not the steel close-confirm mock) */
+    --bg:        #14120f;
+    --desk-bg:   #191713;
+    --win-bg:    #211e18;
+    --title:     #2b271f;
+    --text:      #deded4;
+    --dim:       #968f7d;
+    --border:    #3c3c3c;
+    --border-f:  #e7e7e7;
+    --proj-f:    #969696;
+    --sel:       rgba(231, 231, 231, 0.12);
+    --amber:     #e7a93f;
+    --danger:    #d66654;
+    --chat-g:    #7fb37f;
+    --chat-b:    #6fa7c7;
+    --sans:      "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+    --mono:      ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0c0b09;
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  header.doc {
+    padding: 20px 28px 8px;
+    max-width: 1180px;
+    margin: 0 auto;
+  }
+  header.doc h1 {
+    margin: 0 0 6px;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+  header.doc p {
+    margin: 0 0 10px;
+    color: var(--dim);
+    max-width: 70ch;
+  }
+  .toggles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 14px 0 6px;
+  }
+  .toggles button {
+    background: var(--title);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font: inherit;
+  }
+  .toggles button.active {
+    border-color: var(--proj-f);
+    color: #fff;
+  }
+  .toggles button:hover { border-color: var(--dim); }
+
+  .stage-wrap {
+    padding: 8px 28px 40px;
+    max-width: 1180px;
+    margin: 0 auto;
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: 1fr var(--panel-w, 260px);
+    height: 520px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--desk-bg);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+  }
+  .stage.rail { --panel-w: 36px; }
+
+  /* ---- desktop content (projects) ---- */
+  .desktop {
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    min-width: 0;
+  }
+  .proj {
+    background: var(--win-bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .proj.focus { border-color: var(--proj-f); }
+  .proj-head {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    color: var(--dim);
+    font-size: 12px;
+    border-bottom: 1px solid transparent;
+  }
+  .proj.focus .proj-head { color: var(--text); }
+  .proj-body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3px;
+    padding: 3px;
+    min-height: 0;
+  }
+  .term {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 8px 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--dim);
+    overflow: hidden;
+  }
+  .term.focus {
+    border-color: var(--border-f);
+    color: var(--text);
+  }
+  .term .prompt { color: var(--amber); }
+  .term.gone { opacity: 0.35; }
+  .term.chat {
+    grid-column: 1 / -1;
+    max-height: 72px;
+  }
+
+  /* ---- panel ---- */
+  .panel {
+    background: var(--win-bg);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    position: relative;
+  }
+  .panel.focus-ring { box-shadow: inset 0 0 0 1px var(--proj-f); }
+  .panel-head {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px 0 10px;
+    color: var(--dim);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+  .stage.rail .panel-head {
+    justify-content: center;
+    padding: 0;
+    font-size: 14px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .collapse {
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border-radius: 4px;
+    color: var(--dim);
+    cursor: pointer;
+    user-select: none;
+  }
+  .collapse:hover { background: var(--sel); color: var(--text); }
+
+  .panel-body {
+    flex: 1;
+    overflow: auto;
+    padding: 6px 0 10px;
+  }
+  .stage.rail .panel-body {
+    padding: 4px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* expanded rows */
+  .group { margin-bottom: 6px; }
+  .row {
+    height: 22px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px 0 10px;
+    margin: 0 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text);
+    position: relative;
+  }
+  .row.tab { padding-left: 26px; color: var(--text); }
+  .row.dim, .row.bg { color: var(--dim); }
+  .row.exited { color: var(--dim); text-decoration: line-through; text-decoration-color: rgba(150,143,125,0.55); }
+  .row.focused {
+    background: var(--sel);
+    color: var(--text);
+  }
+  .row.focused::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 2px;
+    border-radius: 1px;
+    background: var(--border-f);
+  }
+  .row:hover { background: var(--sel); }
+  .ico {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    font-size: 11px;
+    opacity: 0.9;
+  }
+  .ico.folder { color: var(--amber); }
+  .ico.claude { color: #d4a574; }
+  .ico.codex { color: #8eb4d4; }
+  .ico.shell { color: var(--dim); }
+  .ico.chat { color: var(--chat-g); }
+  .label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12.5px;
+  }
+  .row.tab .label { font-size: 12px; }
+  .marker {
+    font-size: 10px;
+    color: var(--dim);
+    flex-shrink: 0;
+  }
+  .btns {
+    display: none;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .row:hover .btns { display: flex; }
+  .row:hover .marker { display: none; }
+  .btn {
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    display: grid;
+    place-items: center;
+    font-size: 11px;
+    color: var(--dim);
+    line-height: 1;
+  }
+  .btn:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+  .btn.close:hover { background: var(--danger); color: #fff; }
+
+  /* rail icons */
+  .rail-ico {
+    width: 28px;
+    height: 28px;
+    border-radius: 5px;
+    display: grid;
+    place-items: center;
+    color: var(--amber);
+    font-size: 13px;
+    cursor: pointer;
+    position: relative;
+  }
+  .rail-ico:hover, .rail-ico.on {
+    background: var(--sel);
+  }
+  .rail-ico.on::after {
+    content: "";
+    position: absolute;
+    left: 2px;
+    top: 6px;
+    bottom: 6px;
+    width: 2px;
+    border-radius: 1px;
+    background: var(--border-f);
+  }
+  .dot {
+    position: absolute;
+    right: 3px;
+    bottom: 3px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--dim);
+    opacity: 0.5;
+  }
+  .dot.future {
+    /* placeholder for agent-state — out of scope v1, shown faint dashed */
+    border: 1px dashed var(--amber);
+    background: transparent;
+    opacity: 0.4;
+  }
+
+  .legend {
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px 18px;
+    color: var(--dim);
+    font-size: 12px;
+  }
+  .legend strong { color: var(--text); font-weight: 600; }
+  .legend code {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--title);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--text);
+  }
+  .callouts {
+    margin-top: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--win-bg);
+    font-size: 12.5px;
+    color: var(--dim);
+  }
+  .callouts h3 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text);
+  }
+  .callouts ul { margin: 0; padding-left: 18px; }
+  .callouts li { margin: 4px 0; }
+  .ghost-taskbar {
+    position: absolute;
+    left: 12px;
+    bottom: 10px;
+    display: none;
+    gap: 8px;
+    opacity: 0.35;
+    pointer-events: none;
+  }
+  .stage.show-old .ghost-taskbar { display: flex; }
+  .chip {
+    background: #2a261d;
+    color: var(--dim);
+    padding: 4px 12px;
+    border-radius: 5px;
+    font-size: 11px;
+    text-decoration: line-through;
+  }
+</style>
+</head>
+<body>
+  <header class="doc">
+    <h1>Task-manager panel — visual mockup</h1>
+    <p>
+      Spec: <code>2026-07-09-task-manager-panel-design.md</code>.
+      Right-edge desktop leaf (~260px), rail collapse (~36px), full replacement of minimize chips.
+      Colors match <code>src/theme.rs</code>. Hover a row to see min/close.
+    </p>
+    <div class="toggles">
+      <button type="button" id="btn-expanded" class="active">Expanded (260px)</button>
+      <button type="button" id="btn-rail">Collapsed rail (36px)</button>
+      <button type="button" id="btn-hover">Force hover on “t4 · auth”</button>
+      <button type="button" id="btn-old">Show deleted chip taskbar (ghost)</button>
+    </div>
+  </header>
+
+  <div class="stage-wrap">
+    <div class="stage" id="stage">
+      <div class="desktop">
+        <div class="proj focus">
+          <div class="proj-head">📁  foreman &nbsp;·&nbsp; + &nbsp; ⋯</div>
+          <div class="proj-body">
+            <div class="term focus">
+              <div class="prompt">PS H:\claude code\foreman&gt;</div>
+              <div>cargo test --lib wm</div>
+              <div style="color:var(--chat-g)">ok. 142 passed</div>
+            </div>
+            <div class="term">
+              <div class="prompt">›</div>
+              <div>claude — reviewing control.rs</div>
+              <div style="opacity:.7">…thinking</div>
+            </div>
+          </div>
+        </div>
+        <div class="proj">
+          <div class="proj-head">📁  other-repo &nbsp;(minimized in panel)</div>
+          <div class="proj-body">
+            <div class="term gone">minimized — only reachable via panel</div>
+            <div class="term chat">
+              chat room · crew board lives here
+            </div>
+          </div>
+        </div>
+        <div class="ghost-taskbar" title="deleted in Task 7">
+          <div class="chip">other-repo</div>
+          <div class="chip">t7 · dead</div>
+        </div>
+      </div>
+
+      <aside class="panel" id="panel" aria-label="Task manager">
+        <div class="panel-head">
+          <span class="title-text">Sessions</span>
+          <span class="collapse" id="collapse" title="Collapse to rail">«</span>
+        </div>
+        <div class="panel-body" id="panel-body">
+          <!-- expanded body injected / also static for no-js -->
+          <div class="expanded" id="expanded">
+            <div class="group">
+              <div class="row focused" data-kind="project">
+                <span class="ico folder">📁</span>
+                <span class="label">foreman</span>
+                <span class="btns">
+                  <span class="btn" title="Minimize">–</span>
+                  <span class="btn close" title="Close">×</span>
+                </span>
+              </div>
+              <div class="row tab focused">
+                <span class="ico shell">▣</span>
+                <span class="label">t1 · shell</span>
+                <span class="btns">
+                  <span class="btn">–</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab">
+                <span class="ico claude">◆</span>
+                <span class="label">t3 · claude</span>
+                <span class="btns">
+                  <span class="btn">–</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab bg" id="hover-demo">
+                <span class="ico codex">◈</span>
+                <span class="label">t4 · auth (background tab)</span>
+                <span class="marker">tab</span>
+                <span class="btns">
+                  <span class="btn">–</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab dim">
+                <span class="ico shell">▣</span>
+                <span class="label">t2 · build</span>
+                <span class="marker">min</span>
+                <span class="btns">
+                  <span class="btn" title="Restore">▢</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="row dim" data-kind="project">
+                <span class="ico folder">📁</span>
+                <span class="label">other-repo</span>
+                <span class="marker">min</span>
+                <span class="btns">
+                  <span class="btn" title="Restore">▢</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab dim">
+                <span class="ico shell">▣</span>
+                <span class="label">t5 · main</span>
+                <span class="marker">min</span>
+                <span class="btns">
+                  <span class="btn">▢</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab">
+                <span class="ico chat">💬</span>
+                <span class="label">chat</span>
+                <span class="btns">
+                  <span class="btn">–</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+              <div class="row tab exited">
+                <span class="ico shell">▣</span>
+                <span class="label">t7 · dead</span>
+                <span class="marker">exit</span>
+                <span class="btns">
+                  <span class="btn">–</span>
+                  <span class="btn close">×</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="rail" id="rail" hidden>
+            <div class="rail-ico on" title="foreman">📁</div>
+            <div class="rail-ico" title="other-repo">📁<span class="dot" title="minimized"></span></div>
+            <!-- faint future status slot — not v1 -->
+            <div class="rail-ico" title="(future agent-state dots live here)" style="opacity:0.35">·<span class="dot future"></span></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="legend">
+      <div><strong>Focused</strong> — left hairline + row wash (<code>SEL_BG</code>)</div>
+      <div><strong>Minimized</strong> — <code>DIM</code> text + <code>min</code> marker; restore glyph on hover</div>
+      <div><strong>Background tab</strong> — dimmer than active; click surfaces + activates</div>
+      <div><strong>Exited</strong> — struck + dim (terminal child exited)</div>
+      <div><strong>Hover actions</strong> — –/▢ minimize-restore, × close (confirm path)</div>
+      <div><strong>Rail</strong> — one icon per project; tooltip = title; no tab rows</div>
+    </div>
+
+    <div class="callouts">
+      <h3>Design intent (implementation notes)</h3>
+      <ul>
+        <li>Quiet chrome: no title fill — body is <code>WIN_BG</code> / terminal <code>BG</code>; focus from border + text, matching <code>docs/window-chrome.md</code>.</li>
+        <li>Panel header has collapse only — no min/max/close (window is non-closable / non-minimizable).</li>
+        <li>Row density ~22px, crew-board-ish; project rows full width, tabs indented ~16px.</li>
+        <li>Icons reuse existing tab-strip <code>IconKind</code> (folder / Claude / Codex / shell / chat).</li>
+        <li>No agent-state badges in v1 — rail leaves a reserved slot for future dots.</li>
+        <li>Bottom-left chips are gone (Task 7); ghost toggle only shows what is deleted.</li>
+      </ul>
+    </div>
+  </div>
+
+  <script>
+    const stage = document.getElementById('stage');
+    const expanded = document.getElementById('expanded');
+    const rail = document.getElementById('rail');
+    const collapse = document.getElementById('collapse');
+    const titleText = document.querySelector('.title-text');
+    const btnExp = document.getElementById('btn-expanded');
+    const btnRail = document.getElementById('btn-rail');
+    const btnHover = document.getElementById('btn-hover');
+    const btnOld = document.getElementById('btn-old');
+
+    function setRail(on) {
+      stage.classList.toggle('rail', on);
+      expanded.hidden = on;
+      rail.hidden = !on;
+      collapse.textContent = on ? '»' : '«';
+      collapse.title = on ? 'Expand panel' : 'Collapse to rail';
+      titleText.hidden = on;
+      btnExp.classList.toggle('active', !on);
+      btnRail.classList.toggle('active', on);
+    }
+    btnExp.onclick = () => setRail(false);
+    btnRail.onclick = () => setRail(true);
+    collapse.onclick = () => setRail(!stage.classList.contains('rail'));
+    btnHover.onclick = () => {
+      setRail(false);
+      const row = document.getElementById('hover-demo');
+      row.classList.add('focused');
+      row.style.background = 'rgba(231,231,231,0.12)';
+      row.querySelector('.btns').style.display = 'flex';
+      row.querySelector('.marker').style.display = 'none';
+      btnHover.classList.add('active');
+    };
+    btnOld.onclick = () => {
+      stage.classList.toggle('show-old');
+      btnOld.classList.toggle('active', stage.classList.contains('show-old'));
+    };
+  </script>
+</body>
+</html>
