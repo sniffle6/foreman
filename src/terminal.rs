@@ -127,7 +127,8 @@ fn query_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
 /// Resolved per-cell display style: foreground/background after the inverse swap
 /// and dim, plus the line decorations. Pure, so the inverse/dim/flag logic is
 /// unit-tested apart from the egui painter; `show` turns this into a `TextFormat`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `Hash`/`Eq` so mono-paint can dedupe galleys by `(char, GlyphStyle)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GlyphStyle {
     pub(crate) fg: egui::Color32,
     pub(crate) bg: Option<egui::Color32>,
@@ -345,16 +346,108 @@ fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) -> usize {
     pulled
 }
 
-/// Cache key for a pane's rendered galley. All five inputs fully determine the
-/// laid-out text: content version, scroll position, grid dims, and font size.
-/// Selection/caret are NOT here — they paint as separate overlays.
+/// Cache key for a pane's grid-locked mono paint. All five inputs fully determine
+/// the laid-out glyphs: content version, scroll position, grid dims, and font
+/// size. Selection/caret are NOT here — they paint as separate overlays.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct GalleyKey {
+struct MonoPaintKey {
     content_gen: u64,
     off: usize,
     cols: usize,
     rows: usize,
     font_bits: u32,
+}
+
+/// One grid-locked glyph ready to blit: pixel position + shared galley.
+struct MonoGlyph {
+    pos: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+/// Memoized per-placement galleys for a pane. On key hit, show() re-blits only
+/// (0 layout_*). Rebuild skips blank cells and dedupes by (char, style).
+struct MonoPaintCache {
+    key: MonoPaintKey,
+    items: std::sync::Arc<Vec<MonoGlyph>>,
+}
+
+impl MonoPaintCache {
+    fn empty() -> Self {
+        Self {
+            // Impossible key so the first get_or_rebuild always rebuilds.
+            key: MonoPaintKey {
+                content_gen: u64::MAX,
+                off: usize::MAX,
+                cols: 0,
+                rows: 0,
+                font_bits: 0,
+            },
+            items: std::sync::Arc::new(Vec::new()),
+        }
+    }
+
+    /// On key match: return cached items, zero layouts.
+    /// On miss: rebuild via [`mono_paint_items`], store, return.
+    fn get_or_rebuild(
+        &mut self,
+        key: MonoPaintKey,
+        plan: &crate::frame::PaintPlan,
+        metrics: &crate::geom::CellMetrics,
+        layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
+    ) -> std::sync::Arc<Vec<MonoGlyph>> {
+        if self.key == key {
+            return self.items.clone();
+        }
+        let items = std::sync::Arc::new(mono_paint_items(plan, metrics, layout));
+        self.key = key;
+        self.items = items.clone();
+        items
+    }
+}
+
+/// Rebuild positioned mono galleys from a paint plan.
+///
+/// Calls the injected `layout` once per **distinct** `(char, GlyphStyle)` —
+/// callers should invoke [`note_layout_call`] inside that closure when doing a
+/// real `layout_no_wrap` / `layout_job`. Skips space/`'\0'` (blank cells); screen
+/// backgrounds still come from the pane fill. Position is
+/// `metrics.cell_rect(row, col).min` (grid-locked; overhang allowed).
+fn mono_paint_items(
+    plan: &crate::frame::PaintPlan,
+    metrics: &crate::geom::CellMetrics,
+    layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
+) -> Vec<MonoGlyph> {
+    use std::collections::HashMap;
+    let mut dedupe: HashMap<(char, GlyphStyle), std::sync::Arc<egui::Galley>> = HashMap::new();
+    let mut items = Vec::new();
+    for g in &plan.glyphs {
+        if g.ch == ' ' || g.ch == '\0' {
+            continue;
+        }
+        let galley = match dedupe.get(&(g.ch, g.style)) {
+            Some(arc) => arc.clone(),
+            None => {
+                let arc = layout(g.ch, g.style);
+                dedupe.insert((g.ch, g.style), arc.clone());
+                arc
+            }
+        };
+        items.push(MonoGlyph {
+            pos: metrics.cell_rect(g.row, g.col).min,
+            galley,
+        });
+    }
+    items
+}
+
+/// Test/production seam alias: same as [`mono_paint_items`].
+#[cfg(test)]
+fn mono_paint_items_for_test(
+    plan: &crate::frame::PaintPlan,
+    metrics: &crate::geom::CellMetrics,
+    layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
+) -> Vec<MonoGlyph> {
+    mono_paint_items(plan, metrics, layout)
 }
 
 pub struct Session {
@@ -404,10 +497,9 @@ pub struct Session {
     // the inject_note banner that never rides pump(). Single source of truth
     // for "the galley is stale" — bump it wherever self.term's grid changes.
     content_gen: u64,
-    // Memoized text galley + the key it was built for. On a key hit show()
-    // re-clones the Arc (cheap) instead of re-walking the grid and rebuilding
-    // the LayoutJob. Invalidated implicitly by any key change.
-    galley_cache: Option<(GalleyKey, std::sync::Arc<egui::Galley>)>,
+    // Memoized grid-locked mono paint + the key it was built for. On a key hit
+    // show() re-blits Arc clones (0 layout_*). Invalidated by any key change.
+    mono_paint: Option<MonoPaintCache>,
     // The Caret gate: decides which cell the painted caret rests at, de-jittering
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
@@ -694,7 +786,7 @@ impl Session {
             ready_gate: crate::ready::ReadyGate::new(),
             output_gen: 0,
             content_gen: 0,
-            galley_cache: None,
+            mono_paint: None,
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
             textures: std::collections::HashMap::new(),
@@ -1283,53 +1375,58 @@ impl Session {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
 
-        // Text galley — rebuilt only when the content/scroll/dims/font key
-        // changes; otherwise a cheap Arc clone. Selection + caret are overlays
-        // (below), so they never invalidate this.
-        let key = GalleyKey {
+        // Grid-locked mono paint — Strategy P: one galley per non-blank placement,
+        // positions from cell_rect (not free-flow advances). Rebuilt only when the
+        // content/scroll/dims/font key changes; cache hit re-blits only (0 layout_*).
+        // Blank cells skipped; galleys deduped by (char, style). Overhang allowed.
+        // Selection + caret are overlays (below), so they never invalidate this.
+        let key = MonoPaintKey {
             content_gen: self.content_gen,
             off: self.term.grid().display_offset(),
             cols: self.cols,
             rows: self.rows,
             font_bits: font_px.to_bits(),
         };
-        let galley = match &self.galley_cache {
-            Some((k, g)) if *k == key => g.clone(),
+        let items = match &self.mono_paint {
+            Some(c) if c.key == key => c.items.clone(),
             _ => {
-                let rows = crate::frame::text_rows(self.term.grid(), &metrics);
-                let mut job = LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                for runs in &rows {
-                    for r in runs {
-                        let st = r.style;
-                        let line = |on: bool| {
-                            if on {
-                                egui::Stroke::new(1.0, st.fg)
-                            } else {
-                                egui::Stroke::NONE
-                            }
-                        };
-                        job.append(
-                            &r.text,
-                            0.0,
-                            egui::TextFormat {
-                                font_id: egui::FontId::monospace(font_px),
-                                color: st.fg,
-                                background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
-                                underline: line(st.underline),
-                                strikethrough: line(st.strikethrough),
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    job.append("\n", 0.0, egui::TextFormat::default());
-                }
-                let g = painter.layout_job(job);
-                self.galley_cache = Some((key, g.clone()));
-                g
+                let plan = crate::frame::plan_paint(self.term.grid(), &metrics);
+                let mut layout = |ch: char, st: GlyphStyle| {
+                    note_layout_call();
+                    let line = |on: bool| {
+                        if on {
+                            egui::Stroke::new(1.0, st.fg)
+                        } else {
+                            egui::Stroke::NONE
+                        }
+                    };
+                    let mut job = LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
+                    job.append(
+                        &ch.to_string(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_px),
+                            color: st.fg,
+                            background: st.bg.unwrap_or(egui::Color32::TRANSPARENT),
+                            underline: line(st.underline),
+                            strikethrough: line(st.strikethrough),
+                            ..Default::default()
+                        },
+                    );
+                    painter.layout_job(job)
+                };
+                let items = std::sync::Arc::new(mono_paint_items(&plan, &metrics, &mut layout));
+                self.mono_paint = Some(MonoPaintCache {
+                    key,
+                    items: items.clone(),
+                });
+                items
             }
         };
-        painter.galley(rect.min, galley, FG);
+        for g in items.iter() {
+            painter.galley(g.pos, g.galley.clone(), FG);
+        }
 
         // Kitty graphics overlay — images are pure overlay; the grid stays
         // text (spec: docs/superpowers/specs/2026-07-02-terminal-image-support-design.md).
@@ -1470,6 +1567,140 @@ mod tests {
         assert_eq!(layout_call_count(), 2);
         reset_layout_call_count();
         assert_eq!(layout_call_count(), 0);
+    }
+
+    fn default_style() -> GlyphStyle {
+        GlyphStyle {
+            fg: FG,
+            bg: None,
+            underline: false,
+            strikethrough: false,
+        }
+    }
+
+    /// Build a real Arc<Galley> via a headless Context (no window).
+    /// Fonts are unavailable until the first `Context::run`, so we tick once.
+    fn dummy_galley_for_tests(ch: char) -> std::sync::Arc<egui::Galley> {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                ch.to_string(),
+                egui::FontId::monospace(14.0),
+                egui::Color32::WHITE,
+            )
+        })
+    }
+
+    #[test]
+    fn mono_paint_skips_blanks_and_dedupes_layouts() {
+        reset_layout_call_count();
+        let style = default_style();
+        let plan = crate::frame::PaintPlan {
+            glyphs: vec![
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 0,
+                    ch: 'a',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 1,
+                    ch: 'a',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 2,
+                    ch: ' ',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 3,
+                    ch: 'b',
+                    style,
+                    width_cells: 1,
+                },
+            ],
+            emoji_sites: Vec::new(),
+        };
+        let m = crate::geom::CellMetrics::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(32.0, 16.0)),
+            8.0,
+            16.0,
+            4,
+            1,
+        );
+        let mut layout = |ch: char, _style: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let items = mono_paint_items_for_test(&plan, &m, &mut layout);
+        assert_eq!(items.len(), 3, "blank skipped");
+        assert_eq!(
+            layout_call_count(),
+            2,
+            "two 'a's share one layout; + 'b'"
+        );
+        // Grid-locked positions (not free-flow advances).
+        assert_eq!(items[0].pos, m.cell_rect(0, 0).min);
+        assert_eq!(items[1].pos, m.cell_rect(0, 1).min);
+        assert_eq!(items[2].pos, m.cell_rect(0, 3).min);
+    }
+
+    #[test]
+    fn mono_paint_cache_hit_does_zero_layouts() {
+        reset_layout_call_count();
+        let style = default_style();
+        let plan = crate::frame::PaintPlan {
+            glyphs: vec![
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 0,
+                    ch: 'x',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 1,
+                    ch: 'y',
+                    style,
+                    width_cells: 1,
+                },
+            ],
+            emoji_sites: Vec::new(),
+        };
+        let m = crate::geom::CellMetrics::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(16.0, 16.0)),
+            8.0,
+            16.0,
+            2,
+            1,
+        );
+        let key = MonoPaintKey {
+            content_gen: 1,
+            off: 0,
+            cols: 2,
+            rows: 1,
+            font_bits: 14.0f32.to_bits(),
+        };
+        let mut cache = MonoPaintCache::empty();
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests('x')
+        };
+        let _ = cache.get_or_rebuild(key, &plan, &m, &mut layout);
+        let first = layout_call_count();
+        assert!(first > 0);
+        reset_layout_call_count();
+        let _ = cache.get_or_rebuild(key, &plan, &m, &mut layout);
+        assert_eq!(layout_call_count(), 0, "cache hit must not layout");
     }
 
     #[test]
