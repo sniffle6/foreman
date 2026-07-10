@@ -107,9 +107,16 @@ pub fn is_default_emoji_presentation(ch: char) -> bool {
     )
 }
 
+/// Spacer halves of width-2 glyphs — never paint as their own cell (shows as
+/// tofu □). Includes wrap placeholders at line end (`LEADING_WIDE_CHAR_SPACER`).
+fn is_wide_spacer(flags: Flags) -> bool {
+    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
 /// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per
-/// logical cell at its grid column. Skips `WIDE_CHAR_SPACER`; wide chars get
-/// `width_cells = 2`. Clamps to real grid bounds (same process-abort guard).
+/// logical cell at its grid column. Skips wide spacers (incl. leading/wrap);
+/// wide chars get `width_cells = 2` when the trailing cell fits on this row.
+/// Clamps to real grid bounds (same process-abort guard).
 ///
 /// Also records [`EmojiSite`]s for wide default-emoji-presentation scalars
 /// (stamp paint is a later phase — mono placement still always emitted).
@@ -122,10 +129,12 @@ pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
     for row in 0..nrows {
         for col in 0..ncols {
             let cell = &grid[Line(row as i32 - off)][Column(col)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            if is_wide_spacer(cell.flags) {
                 continue;
             }
-            let width_cells = if cell.flags.contains(Flags::WIDE_CHAR) {
+            // Wide char at last column wraps to next line (LEADING spacer there);
+            // do not claim width 2 past the row edge.
+            let width_cells = if cell.flags.contains(Flags::WIDE_CHAR) && col + 1 < ncols {
                 2
             } else {
                 1
@@ -266,7 +275,7 @@ pub fn overlays(
                 let cell = &grid[Line(line - off)][Column(col)];
                 if cell.flags.contains(Flags::WIDE_CHAR) && col + 1 < ncols {
                     metrics.span_rect(row, col, col + 1)
-                } else if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                } else if is_wide_spacer(cell.flags) && col > 0 {
                     metrics.span_rect(row, col - 1, col)
                 } else {
                     metrics.cell_rect(row, col)
@@ -566,11 +575,11 @@ mod tests {
         let m = metrics(8, 1);
         let plan = plan_paint(term.grid(), &m);
 
-        // Invariant: no GlyphPlacement may sit on a WIDE_CHAR_SPACER cell.
+        // Invariant: no GlyphPlacement may sit on any wide spacer cell.
         for g in &plan.glyphs {
             let cell = &term.grid()[Line(0)][Column(g.col)];
             assert!(
-                !cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+                !is_wide_spacer(cell.flags),
                 "spacer cell must not appear as a GlyphPlacement: {g:?}"
             );
         }
@@ -579,6 +588,30 @@ mod tests {
         assert_eq!(wides.len(), 2, "expected two wide CJK glyphs; got {:?}", plan.glyphs);
         assert_eq!((wides[0].col, wides[0].ch), (0, '你'));
         assert_eq!((wides[1].col, wides[1].ch), (2, '好'));
+    }
+
+    #[test]
+    fn plan_paint_skips_leading_wide_char_spacer() {
+        // LEADING_WIDE_CHAR_SPACER is the wrap placeholder (often last col of a
+        // line, or col 0 after wrap). Painting it shows a white tofu □.
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let mut term = term_with(b"x", 4, 2);
+        {
+            let grid = term.grid_mut();
+            let cell = &mut grid[Line(1)][Column(0)];
+            cell.c = '□'; // what epaint would draw if we failed to skip
+            cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+        }
+        let m = metrics(4, 2);
+        let plan = plan_paint(term.grid(), &m);
+        assert!(
+            plan.glyphs
+                .iter()
+                .all(|g| !(g.row == 1 && g.col == 0)),
+            "LEADING_WIDE_CHAR_SPACER must not be painted: {:?}",
+            plan.glyphs
+        );
     }
 
     #[test]

@@ -999,7 +999,10 @@ impl Session {
             let f = g[p.line][alacritty_terminal::index::Column(c)].flags;
             line.push(if f.contains(Flags::WIDE_CHAR) {
                 CellWide::WideBase
-            } else if f.contains(Flags::WIDE_CHAR_SPACER) {
+            } else if f.intersects(
+                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+            ) {
+                // LEADING = wrap placeholder at end of line (or col-0 after wrap).
                 CellWide::WideSpacer
             } else {
                 CellWide::Narrow
