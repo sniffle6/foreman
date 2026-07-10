@@ -368,10 +368,13 @@ struct MonoGlyph {
 }
 
 /// Non-default SGR cell background (including blank/space cells). Stored as
-/// grid identity + color; painted via `rect_filled(cell_rect)` with live metrics.
+/// grid identity + color + cell span; painted via `rect_filled(span_rect)` with
+/// live metrics so width-2 CJK/mono-emoji covers both cells (spacers emit no bg).
 struct MonoBg {
     row: usize,
     col: usize,
+    /// Grid cells this bg covers (1 for ASCII, 2 for wide glyphs).
+    width_cells: u8,
     color: egui::Color32,
 }
 
@@ -455,7 +458,7 @@ fn retain_emoji_textures_at_px<T>(
 /// real `layout_no_wrap` / `layout_job`. Skips space/`'\0'` for galleys (blank
 /// cells); non-default `style.bg` is collected for every cell including spaces
 /// so inverse/colored empties still paint. Positions are grid identity only —
-/// blit uses live `metrics.cell_rect(row, col)` every frame.
+/// blit uses live metrics every frame (`cell_rect` for glyphs, `span_rect` for bgs).
 fn mono_paint_items(
     plan: &crate::frame::PaintPlan,
     layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
@@ -469,6 +472,7 @@ fn mono_paint_items(
             bgs.push(MonoBg {
                 row: g.row,
                 col: g.col,
+                width_cells: g.width_cells.max(1),
                 color,
             });
         }
@@ -1492,8 +1496,9 @@ impl Session {
             })
         };
         for bg in bgs.iter() {
+            let end_col = bg.col + (bg.width_cells as usize).saturating_sub(1);
             painter.rect_filled(
-                metrics.cell_rect(bg.row, bg.col),
+                metrics.span_rect(bg.row, bg.col, end_col),
                 egui::CornerRadius::ZERO,
                 bg.color,
             );
@@ -1778,7 +1783,47 @@ mod tests {
         // Colored blank still yields a bg rect with no layout call.
         assert_eq!(bgs.len(), 1);
         assert_eq!((bgs[0].row, bgs[0].col), (0, 2));
+        assert_eq!(bgs[0].width_cells, 1);
         assert_eq!(bgs[0].color, egui::Color32::from_rgb(0, 0, 80));
+    }
+
+    #[test]
+    fn mono_paint_wide_glyph_bg_spans_full_width() {
+        // plan_paint skips WIDE_CHAR_SPACER, so width-2 SGR bg must ride the
+        // primary placement's width_cells and paint via span_rect (2 cells).
+        let style = GlyphStyle {
+            bg: Some(egui::Color32::from_rgb(40, 0, 0)),
+            ..default_style()
+        };
+        let plan = crate::frame::PaintPlan {
+            glyphs: vec![crate::frame::GlyphPlacement {
+                row: 0,
+                col: 0,
+                ch: '中',
+                style,
+                width_cells: 2,
+            }],
+            emoji_sites: Vec::new(),
+        };
+        let m = crate::geom::CellMetrics::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(16.0, 16.0)),
+            8.0,
+            16.0,
+            2,
+            1,
+        );
+        let mut layout = |ch: char, _style: GlyphStyle| dummy_galley_for_tests(ch);
+        let (_items, bgs) = mono_paint_items_for_test(&plan, &mut layout);
+        assert_eq!(bgs.len(), 1);
+        assert_eq!((bgs[0].row, bgs[0].col), (0, 0));
+        assert_eq!(bgs[0].width_cells, 2);
+        assert_eq!(bgs[0].color, egui::Color32::from_rgb(40, 0, 0));
+        let end_col = bgs[0].col + (bgs[0].width_cells as usize).saturating_sub(1);
+        let span = m.span_rect(bgs[0].row, bgs[0].col, end_col);
+        assert_eq!(span, m.span_rect(0, 0, 1));
+        assert_eq!(span.width(), m.cell_rect(0, 0).width() * 2.0);
+        // Half-width cell_rect must NOT equal the painted span.
+        assert_ne!(span, m.cell_rect(0, 0));
     }
 
     #[test]
