@@ -322,53 +322,6 @@ fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) -> usize {
     pulled
 }
 
-/// Scanner for the first *visible* glyph in raw PTY output — printable bytes
-/// OUTSIDE any escape/control sequence. A ConPTY host emits control-only
-/// chrome (DSR, DA1, mode sets, cursor homing) long before its child paints,
-/// and input written in that window is eaten; the first real ink is the
-/// observable "the child is up" signal readiness waits for (see
-/// [`Session::ready`]). Chunk-boundary safe: state persists across calls.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum InkScan {
-    Ground,
-    Esc,
-    Csi,
-    /// OSC/DCS/APC/PM/SOS string body — consumed until BEL or ST.
-    Str,
-    /// ESC inside a string: `ESC \` (ST) terminates it.
-    StrEsc,
-    /// ESC ( ) * + charset designation — the designator byte is consumed.
-    Charset,
-}
-
-impl InkScan {
-    /// Advance over `bytes`; true as soon as a visible glyph is found.
-    /// Spaces don't count — ConPTY paints space runs as erasure chrome.
-    fn saw_ink(&mut self, bytes: &[u8]) -> bool {
-        for &b in bytes {
-            *self = match (*self, b) {
-                (InkScan::Ground, 0x1b) => InkScan::Esc,
-                (InkScan::Ground, 0x21..=0x7e | 0x80..=0xff) => return true,
-                (InkScan::Ground, _) => InkScan::Ground,
-                (InkScan::Esc, b'[') => InkScan::Csi,
-                (InkScan::Esc, b']' | b'P' | b'_' | b'^' | b'X') => InkScan::Str,
-                (InkScan::Esc, b'(' | b')' | b'*' | b'+') => InkScan::Charset,
-                (InkScan::Esc, _) => InkScan::Ground,
-                (InkScan::Csi, 0x40..=0x7e) => InkScan::Ground,
-                (InkScan::Csi, _) => InkScan::Csi,
-                (InkScan::Str, 0x07) => InkScan::Ground,
-                (InkScan::Str, 0x1b) => InkScan::StrEsc,
-                (InkScan::Str, _) => InkScan::Str,
-                (InkScan::StrEsc, b'\\') => InkScan::Ground,
-                (InkScan::StrEsc, 0x1b) => InkScan::StrEsc,
-                (InkScan::StrEsc, _) => InkScan::Str,
-                (InkScan::Charset, _) => InkScan::Ground,
-            };
-        }
-        false
-    }
-}
-
 /// Cache key for a pane's rendered galley. All five inputs fully determine the
 /// laid-out text: content version, scroll position, grid dims, and font size.
 /// Selection/caret are NOT here — they paint as separate overlays.
@@ -416,28 +369,9 @@ pub struct Session {
     // Dispatch banner queued by inject_note(); flushed (fitted to the real
     // width) by the first resize(). See inject_note for why it is deferred.
     pending_note: Option<String>,
-    // When to send the deferred chat-submit `\r`; fired by pump(). See
-    // inject_input for why the submit cannot ride with the paste.
-    pending_submit: Option<std::time::Instant>,
-    // Chat input that arrived before `ready`; held here and flushed by pump()
-    // once the startup DSR scan resolves (see inject_input).
-    pending_inject: Vec<String>,
-    // Latches true once the startup DSR (`ESC[6n`) has been answered — half
-    // of the readiness contract (see `ready`).
-    dsr_replied: bool,
-    // Latches true on the first visible glyph in the PTY output (InkScan) —
-    // the other half: proof the child is actually up and painting. A
-    // passthrough ConPTY host answers the DSR itself microseconds after
-    // spawn, seconds before the child's input path opens; injecting on the
-    // DSR alone eats the bytes (the 2026-07-03 chat-delivery regression).
-    painted: bool,
-    // Cross-chunk scanner state feeding `painted`.
-    ink: InkScan,
-    // Injection safety: `dsr_replied && painted` — the point after which
-    // injected input is no longer eaten by the boot window. Catch-up replay
-    // and cursor advance gate on this (chat handshake contract: the cursor
-    // advances only on inject into a READY session).
-    ready: bool,
+    // Ready latch + chat inject queue + deferred submit (pure gate; Session
+    // applies Action::Write). See crate::ready and CONTEXT.md "Ready gate".
+    ready_gate: crate::ready::ReadyGate,
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
     output_gen: u64,
@@ -473,15 +407,6 @@ pub struct Session {
     /// host-reply markers. None (zero-cost) when the variable is unset.
     rx_dump: Option<std::fs::File>,
 }
-
-/// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
-/// input arriving within the same few-ms burst as a paste INTO the paste, so
-/// a `\r` written back-to-back with `ESC[201~` becomes a literal newline in
-/// the input box instead of an Enter keypress (the same reason tmux users
-/// must `send-keys "msg"; sleep; send-keys Enter`). One frame later is not
-/// enough under load; ~150ms is comfortably past the burst window while
-/// still feeling instant.
-const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Smoothed-scroll points that equal one Ctrl+Scroll zoom notch. egui reports a
 /// wheel notch as ~50 points of `smooth_scroll_delta`, so dividing by this gives
@@ -520,19 +445,8 @@ pub fn set_font_size(ctx: &egui::Context, px: f32) {
     ctx.data_mut(|d| d.insert_temp(font_size_id(), FontSizeState(px)));
 }
 
-/// Bracketed-paste wrapper (`ESC[200~ … ESC[201~`): multi-line text lands in
-/// the target's input box as one paste block instead of submitting per line
-/// (spec: agent-group-chat §3).
-pub fn paste_wrap(text: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(text.len() + 12);
-    v.extend_from_slice(b"\x1b[200~");
-    // Strip ESC so a quoted `ESC[201~` can't terminate the block early and
-    // turn the rest of the message into live keystrokes (alacritty does the
-    // same to paste payloads).
-    v.extend(text.bytes().filter(|&b| b != 0x1b));
-    v.extend_from_slice(b"\x1b[201~");
-    v
-}
+/// Re-export: chat inject always brackets (see [`crate::ready::paste_wrap`]).
+pub use crate::ready::paste_wrap;
 
 fn sel_viewport_range(
     range: SelectionRange,
@@ -754,12 +668,7 @@ impl Session {
             cols,
             rows,
             pending_note: None,
-            pending_submit: None,
-            pending_inject: Vec::new(),
-            dsr_replied: false,
-            painted: false,
-            ink: InkScan::Ground,
-            ready: false,
+            ready_gate: crate::ready::ReadyGate::new(),
             output_gen: 0,
             content_gen: 0,
             galley_cache: None,
@@ -800,10 +709,10 @@ impl Session {
     /// resolved AND the child has painted its first visible output. Either
     /// alone is insufficient — a passthrough ConPTY host answers the DSR
     /// microseconds after spawn, seconds before the child's input path opens,
-    /// and bytes injected in that window are eaten. Latched by
-    /// [`Session::pump`].
+    /// and bytes injected in that window are eaten. Owned by the Ready gate;
+    /// latched during [`Session::pump`].
     pub fn ready(&self) -> bool {
-        self.ready
+        self.ready_gate.ready()
     }
 
     /// Exit code of the child process, once it has ended. Cached — `try_wait`
@@ -856,28 +765,20 @@ impl Session {
     /// input block), so the wrap stays unconditional in v1; gating on
     /// TermMode::BRACKETED_PASTE remains a possible hardening if non-claude
     /// members ever matter.
-    /// The submit is DEFERRED by [`SUBMIT_DELAY`], not written with the
-    /// paste: a back-to-back `\r` gets folded into the paste by Claude
-    /// Code's burst detection and lands as a literal newline (live failure
-    /// 2026-06-10 — message sat unsubmitted in the input box). pump() fires
-    /// it once the deadline passes; the frame loop pumps every session every
-    /// ~16ms, so no extra repaint plumbing is needed. Accepted quirks: two
-    /// posts inside the window merge into one submitted turn for the
-    /// receiver, and bytes buffered through a member's entire boot can still
-    /// coalesce (residual; revisit with age-gating if it bites).
+    /// The submit is DEFERRED by [`crate::ready::SUBMIT_DELAY`], not written
+    /// with the paste: a back-to-back `\r` gets folded into the paste by
+    /// Claude Code's burst detection and lands as a literal newline (live
+    /// failure 2026-06-10 — message sat unsubmitted in the input box).
+    /// pump() fires it once the deadline passes; the frame loop pumps every
+    /// session every ~16ms, so no extra repaint plumbing is needed. Accepted
+    /// quirks: two posts inside the window merge into one submitted turn for
+    /// the receiver, and bytes buffered through a member's entire boot can
+    /// still coalesce (residual; revisit with age-gating if it bites).
     pub fn inject_input(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
+        let now = std::time::Instant::now();
+        if let Some(crate::ready::Action::Write(bytes)) = self.ready_gate.try_inject(text, now) {
+            self.send(&bytes);
         }
-        if !self.ready {
-            // Hold the post until the session is ready (DSR answered + first
-            // child paint); a paste sent now gets swallowed by the boot
-            // window. pump() flushes the queue once ready.
-            self.pending_inject.push(text.to_string());
-            return;
-        }
-        self.send(&paste_wrap(text));
-        self.pending_submit = Some(std::time::Instant::now() + SUBMIT_DELAY);
     }
 
     /// Raw PTY write — bypasses bracketed-paste and the submit delay. Used by
@@ -900,12 +801,19 @@ impl Session {
 
     /// Pump pending PTY output into the grid, then return the rendered viewport
     /// as plain text rows (trailing spaces trimmed). Used by `foreman snapshot`.
+    ///
+    /// Each call pumps. For a consistent multi-field read (text + attrs and/or
+    /// cursor) use [`Self::snapshot_all`] — chaining this with
+    /// [`Self::snapshot_cells`] / [`Self::cursor_info`] can stitch fields from
+    /// different PTY generations under active output.
     pub fn snapshot_text(&mut self, region: Option<crate::inspect::Region>) -> Vec<String> {
         self.pump();
         crate::inspect::snapshot_text(&self.term, region)
     }
 
     /// Pump pending PTY output, then return per-cell attribute data (`--attrs`).
+    ///
+    /// Each call pumps. For a consistent multi-field read use [`snapshot_all`].
     pub fn snapshot_cells(
         &mut self,
         region: Option<crate::inspect::Region>,
@@ -915,20 +823,46 @@ impl Session {
     }
 
     /// Pump pending PTY output, then return the cursor position + shape (`--cursor`).
+    ///
+    /// Each call pumps. For a consistent multi-field read use [`snapshot_all`].
     pub fn cursor_info(&mut self) -> crate::inspect::CursorInfo {
         self.pump();
         crate::inspect::cursor_info(&self.term)
     }
 
+    /// One pump, then the requested Inspection fields from that grid state.
+    /// Prefer this over chaining [`snapshot_text`] / [`snapshot_cells`] /
+    /// [`cursor_info`] when more than one field is needed — each of those
+    /// pumps independently, so concurrent PTY output can tear the reply.
+    pub fn snapshot_all(
+        &mut self,
+        attrs: bool,
+        cursor: bool,
+    ) -> (
+        Vec<String>,
+        Option<Vec<Vec<crate::inspect::CellData>>>,
+        Option<crate::inspect::CursorInfo>,
+    ) {
+        self.pump();
+        let text = crate::inspect::snapshot_text(&self.term, None);
+        let cells = attrs.then(|| crate::inspect::snapshot_cells(&self.term, None));
+        let cursor = cursor.then(|| crate::inspect::cursor_info(&self.term));
+        (text, cells, cursor)
+    }
+
     fn pump(&mut self) {
+        self.pump_at(std::time::Instant::now());
+    }
+
+    /// Drain PTY output and advance the Ready gate at `now` (injected so tests
+    /// can drive submit delay without real sleep).
+    fn pump_at(&mut self, now: std::time::Instant) {
         let mut greplies = Vec::new();
         while let Ok(bytes) = self.rx.try_recv() {
             if let Some(f) = self.rx_dump.as_mut() {
                 let _ = f.write_all(&bytes);
             }
-            if !self.painted && self.ink.saw_ink(&bytes) {
-                self.painted = true;
-            }
+            self.ready_gate.on_rx_chunk(&bytes);
             advance_scanned(
                 &mut self.parser,
                 &mut self.term,
@@ -947,33 +881,18 @@ impl Session {
         // Defensive drains for replies already queued when pump() was entered.
         self.flush_graphics_replies(&mut greplies);
         self.flush_pty_replies();
-        // Injection is safe once the DSR scan resolved AND the child has
-        // painted: a passthrough ConPTY host answers the DSR itself long
-        // before the child's input path opens, so the reply alone proves
-        // nothing about the child (the 2026-07-03 chat-delivery regression).
-        if self.dsr_replied && self.painted {
-            self.ready = true;
-        }
-        // Now that the scan is done, flush any post that arrived before readiness
-        // (inject_input held it). Ready is true here, so each reaches the child.
-        if self.ready && !self.pending_inject.is_empty() {
-            for text in std::mem::take(&mut self.pending_inject) {
-                self.inject_input(&text);
+        // Ready gate: flush queued injects + deferred submit (pure; we write).
+        for action in self.ready_gate.poll(now) {
+            match action {
+                crate::ready::Action::Write(bytes) => self.send(&bytes),
             }
-        }
-        // Deferred chat submit (see inject_input).
-        if let Some(due) = self.pending_submit
-            && std::time::Instant::now() >= due
-        {
-            self.pending_submit = None;
-            self.send(b"\r");
         }
     }
 
     fn flush_graphics_replies(&mut self, replies: &mut Vec<u8>) {
         // Graphics replies (a=q probes etc.) go straight back to the app — NOT
-        // via `resp`: that buffer's flush is what latches `ready` (the DSR
-        // contract), and a graphics reply must never fake readiness.
+        // via `resp` and NOT through the Ready gate: that buffer's flush is
+        // what latches DSR readiness, and a graphics reply must never fake it.
         if !replies.is_empty() {
             let replies = std::mem::take(replies);
             let _ = self.writer.write_all(&replies);
@@ -997,10 +916,10 @@ impl Session {
                 let _ = writeln!(f, ">>");
             }
             // First device-status reply flushed back = the startup DSR scan is
-            // done — half the readiness contract (see `ready`).
-            if sent {
-                self.dsr_replied = true;
-            } else {
+            // done — half the readiness contract. Session decides "this was a
+            // resp flush" and tells the gate; graphics never takes this path.
+            self.ready_gate.on_dsr_reply_flushed(sent);
+            if !sent {
                 // Deliberate no-retry: the reply bytes are dropped. Writer
                 // failures track pipe/child death, where the blocked query no
                 // longer matters; re-queueing would risk duplicate CPRs. Log
@@ -1823,23 +1742,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn paste_wrap_brackets_text_without_submitting() {
-        let b = paste_wrap("line1\nline2");
-        assert_eq!(b, b"\x1b[200~line1\nline2\x1b[201~".to_vec());
-        assert!(!b.ends_with(b"\r"), "submit must be a separate write");
-    }
-
-    #[test]
-    fn paste_wrap_neutralizes_embedded_paste_end() {
-        let b = paste_wrap("a\x1b[201~rm -rf\r");
-        // only the two framing markers may contain ESC
-        let interior = &b[6..b.len() - 6];
-        assert!(
-            !interior.contains(&0x1b),
-            "payload ESC must be stripped: {b:?}"
-        );
-    }
+    // paste_wrap / InkScan pure tests live in ready.rs (with ReadyGate).
 
     #[test]
     fn paste_text_honors_bracketed_paste_and_strips_esc() {
@@ -1932,12 +1835,9 @@ mod tests {
         });
         *s.osc_title.lock().unwrap() = None;
         s.resp.lock().unwrap().clear();
-        s.dsr_replied = false;
-        s.painted = false;
-        s.ink = InkScan::Ground;
-        s.ready = false;
-        s.pending_inject = vec!["held".to_string()];
-        s.pending_submit = None;
+        s.ready_gate.clear_latch();
+        s.ready_gate.pending_inject = vec!["held".to_string()];
+        s.ready_gate.pending_submit = None;
 
         tx.send(b"\x1b[5;7H\x1b[6".to_vec()).unwrap();
         tx.send(b"n".to_vec()).unwrap();
@@ -1950,10 +1850,10 @@ mod tests {
             recorded[0].1, None,
             "later RX was parsed before the blocking CPR was written"
         );
-        assert!(s.dsr_replied);
-        assert!(!s.painted);
+        assert!(s.ready_gate.dsr_replied);
+        assert!(!s.ready_gate.painted);
         assert!(!s.ready());
-        assert_eq!(s.pending_inject, ["held"]);
+        assert_eq!(s.ready_gate.pending_inject, ["held"]);
         assert_eq!(*s.osc_title.lock().unwrap(), Some("LATE".to_string()));
 
         tx.send(b"X".to_vec()).unwrap();
@@ -1961,7 +1861,7 @@ mod tests {
 
         let recorded = writes.lock().unwrap().clone();
         assert!(s.ready());
-        assert!(s.pending_inject.is_empty());
+        assert!(s.ready_gate.pending_inject.is_empty());
         assert_eq!(recorded[1].0, paste_wrap("held"));
         assert_eq!(recorded[1].1.as_deref(), Some("LATE"));
     }
@@ -1985,19 +1885,16 @@ mod tests {
         s.rx = rx;
         s.writer = Box::new(FailingWriter);
         s.resp.lock().unwrap().clear();
-        s.dsr_replied = false;
-        s.painted = false;
-        s.ink = InkScan::Ground;
-        s.ready = false;
-        s.pending_inject = vec!["held".to_string()];
+        s.ready_gate.clear_latch();
+        s.ready_gate.pending_inject = vec!["held".to_string()];
 
         tx.send(b"X\x1b[6n".to_vec()).unwrap();
         s.pump();
 
-        assert!(s.painted);
-        assert!(!s.dsr_replied);
+        assert!(s.ready_gate.painted);
+        assert!(!s.ready_gate.dsr_replied);
         assert!(!s.ready());
-        assert_eq!(s.pending_inject, ["held"]);
+        assert_eq!(s.ready_gate.pending_inject, ["held"]);
     }
 
     #[test]
@@ -2010,18 +1907,18 @@ mod tests {
         // gets eaten by the DSR scan), so no submit is armed yet.
         s.inject_input("hello room");
         assert!(
-            s.pending_submit.is_none(),
+            s.ready_gate.pending_submit.is_none(),
             "injection before ready must not arm the submit"
         );
         assert!(
-            !s.pending_inject.is_empty(),
+            !s.ready_gate.pending_inject.is_empty(),
             "injection before ready must be queued"
         );
         // The pump that latches readiness also flushes the held post.
         let mut flushed = false;
         for _ in 0..750 {
             s.pump();
-            if s.ready() && s.pending_inject.is_empty() {
+            if s.ready() && s.ready_gate.pending_inject.is_empty() {
                 flushed = true;
                 break;
             }
@@ -2029,7 +1926,7 @@ mod tests {
         }
         assert!(flushed, "queued post never flushed after becoming ready");
         assert!(
-            s.pending_submit.is_some(),
+            s.ready_gate.pending_submit.is_some(),
             "flushing the queue arms the deferred submit"
         );
     }
@@ -2060,47 +1957,29 @@ mod tests {
         );
     }
 
+    /// Session wiring: graphics replies must not go through the DSR latch path.
+    /// The gate only advances on `on_dsr_reply_flushed`; paint alone (or any
+    /// write that isn't a resp flush) leaves Ready false.
     #[test]
-    fn ink_scan_ignores_control_chrome_and_finds_first_glyph() {
-        // The exact boot chrome the passthrough ConPTY host emits before its
-        // child paints (captured 2026-07-03): window ops, DSR, DA1, mode
-        // sets, cursor homing — all ink-free.
-        let mut ink = InkScan::Ground;
-        assert!(!ink.saw_ink(b"\x1b[1t"));
-        assert!(!ink.saw_ink(b"\x1b[6n\x1b[c\x1b[?1004h\x1b[?9001h"));
-        assert!(!ink.saw_ink(b"\x1b[1;1H"));
-        // OSC title, APC graphics, charset designation: sequence bodies
-        // never count as ink.
-        assert!(!ink.saw_ink(b"\x1b]0;some title\x07"));
-        assert!(!ink.saw_ink(b"\x1b_Gf=100,t=d;QUJD\x1b\\"));
-        assert!(!ink.saw_ink(b"\x1b(B"));
-        // Spaces are erasure chrome, not ink; C0 controls aren't ink.
-        assert!(!ink.saw_ink(b"   \r\n\x08\x07"));
-        // The child's first real output IS ink.
-        assert!(ink.saw_ink(b"\x1b[?7l\x1b[?7hPress any key"));
+    fn graphics_reply_path_does_not_latch_ready() {
+        let mut g = crate::ready::ReadyGate::new();
+        g.on_rx_chunk(b"X"); // paint half
+        // Simulate: Session flushed a graphics reply without calling
+        // on_dsr_reply_flushed — Ready must stay false.
+        assert!(!g.ready());
+        assert!(!g.dsr_replied);
+        // Only an explicit DSR flush outcome latches the other half.
+        g.on_dsr_reply_flushed(true);
+        assert!(g.ready());
     }
 
-    #[test]
-    fn ink_scan_survives_chunk_splits_inside_sequences() {
-        let mut ink = InkScan::Ground;
-        // CSI split mid-parameters: `H` is the sequence's final byte, not ink.
-        assert!(!ink.saw_ink(b"\x1b[1;"));
-        assert!(!ink.saw_ink(b"1H"));
-        // OSC split before its terminator: body bytes stay swallowed.
-        assert!(!ink.saw_ink(b"\x1b]0;tit"));
-        assert!(!ink.saw_ink(b"le"));
-        assert!(!ink.saw_ink(b"\x07"));
-        // UTF-8 text after all that is ink.
-        assert!(ink.saw_ink("héllo".as_bytes()));
-    }
-
+    /// Submit deferral with injected clock (no real sleep). Pure timing lives
+    /// in ready.rs; this pins Session::inject_input + pump_at applying writes.
     #[test]
     fn inject_input_defers_the_submit_keypress() {
         let ctx = egui::Context::default();
         let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
         let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
-        // Injection now waits for readiness; clear the startup DSR scan first so
-        // this test exercises the submit-defer timing, not the readiness gate.
         for _ in 0..750 {
             s.pump();
             if s.ready() {
@@ -2109,26 +1988,44 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(s.ready(), "session never became ready");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.rx = rx;
+        let writes: RecordedWrites = Arc::new(Mutex::new(Vec::new()));
+        s.writer = Box::new(TitleRecordingWriter {
+            title: Arc::clone(&s.osc_title),
+            writes: Arc::clone(&writes),
+        });
+        let _ = tx; // no further rx; only write side matters
+
+        let t0 = std::time::Instant::now();
+        // Drive inject with a known clock via the gate + pump_at (inject_input
+        // uses Instant::now(); pin deadline by overwriting after inject).
         s.inject_input("hello");
         assert!(
-            s.pending_submit.is_some(),
+            s.ready_gate.pending_submit.is_some(),
             "submit must be deferred, not written with the paste"
         );
-        s.pump();
-        assert!(
-            s.pending_submit.is_some(),
-            "a pump before the deadline must not fire the submit"
-        );
-        // a second post inside the window refreshes the deadline (posts merge
-        // into one submitted turn — accepted quirk)
+        let due = s.ready_gate.pending_submit.unwrap();
+        // Before deadline: pump must not fire \r.
+        s.pump_at(due - std::time::Duration::from_millis(1));
+        assert!(s.ready_gate.pending_submit.is_some());
+        // Second post refreshes the deadline (accepted merge quirk).
         s.inject_input("world");
-        assert!(s.pending_submit.is_some());
-        std::thread::sleep(SUBMIT_DELAY + std::time::Duration::from_millis(30));
-        s.pump();
+        let due2 = s.ready_gate.pending_submit.expect("still armed");
+        s.pump_at(due2 - std::time::Duration::from_millis(1));
+        assert!(s.ready_gate.pending_submit.is_some());
+        s.pump_at(due2 + std::time::Duration::from_millis(1));
         assert!(
-            s.pending_submit.is_none(),
+            s.ready_gate.pending_submit.is_none(),
             "a pump past the deadline fires the submit exactly once"
         );
+        let recorded = writes.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|(b, _)| b == b"\r"),
+            "deferred submit must write CR; got {recorded:?}"
+        );
+        let _ = t0;
     }
 
     #[test]

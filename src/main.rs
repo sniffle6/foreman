@@ -1,5 +1,6 @@
 mod caret;
 mod chat;
+mod chat_view;
 mod config;
 mod confirm;
 mod conpty_install;
@@ -17,6 +18,7 @@ mod landing;
 mod layout;
 mod notify;
 mod proc;
+mod ready;
 mod recents;
 mod settings;
 mod skills_install;
