@@ -1248,15 +1248,16 @@ impl Session {
             let g = self.term.grid();
             let p = g.cursor.point;
             let col = p.column.0;
-            let on_wide_base = g[p.line][p.column]
-                .flags
-                .contains(Flags::WIDE_CHAR);
+            let flags = g[p.line][p.column].flags;
+            let on_wide_base = flags.contains(Flags::WIDE_CHAR);
+            let on_wide_spacer = flags.contains(Flags::WIDE_CHAR_SPACER);
             let left_is_spacer = col > 0
                 && g[p.line][alacritty_terminal::index::Column(col - 1)]
                     .flags
                     .contains(Flags::WIDE_CHAR_SPACER);
             crate::input::WideCursorHint {
                 on_wide_base,
+                on_wide_spacer,
                 left_is_spacer,
             }
         };

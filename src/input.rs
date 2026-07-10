@@ -36,9 +36,12 @@ pub struct InputOutcome {
 /// Default is a no-op so pure input tests stay free of grid fixtures.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WideCursorHint {
-    /// Cursor sits on a `WIDE_CHAR` base cell — unmodified Right should skip the spacer.
+    /// Cursor sits on a `WIDE_CHAR` base cell — Right should skip the spacer.
     pub on_wide_base: bool,
-    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — unmodified Left
+    /// Cursor sits on a `WIDE_CHAR_SPACER` — Left should leave the whole glyph
+    /// (one physical keypress, not base-then-before).
+    pub on_wide_spacer: bool,
+    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — Left
     /// should jump back to before the wide glyph (skip the spacer column).
     pub left_is_spacer: bool,
 }
@@ -160,16 +163,16 @@ pub fn process_input_wide(
                 // Everything else → the pure encoder.
                 let seq = encode_key(k, m, mode);
                 out.pty_bytes.extend_from_slice(&seq);
-                // Unmodified Left/Right only: double the CSI so one keypress
-                // crosses a width-2 cell (emoji/CJK). Modified chords (Ctrl+→
-                // word-nav) stay single. Empty seq = unmapped key, no double.
-                if !seq.is_empty()
-                    && !ctrl
-                    && !m.shift
-                    && !m.alt
-                    && ((k == Key::ArrowRight && wide.on_wide_base)
-                        || (k == Key::ArrowLeft && wide.left_is_spacer))
-                {
+                // Left/Right across width-2 cells (emoji/CJK): double the CSI so
+                // one keypress skips the spacer. Covers plain move *and*
+                // Shift+←/→ selection extend. Ctrl/Alt chords stay single
+                // (word-nav / other bindings). Empty seq = unmapped, no double.
+                let skip_wide = match k {
+                    Key::ArrowRight => wide.on_wide_base,
+                    Key::ArrowLeft => wide.left_is_spacer || wide.on_wide_spacer,
+                    _ => false,
+                };
+                if !seq.is_empty() && !ctrl && !m.alt && skip_wide {
                     out.pty_bytes.extend_from_slice(&seq);
                 }
             }
@@ -808,6 +811,7 @@ mod tests {
     fn right_on_wide_base_emits_two_csi() {
         let wide = WideCursorHint {
             on_wide_base: true,
+            on_wide_spacer: false,
             left_is_spacer: false,
         };
         let out = process_input_wide(
@@ -823,6 +827,7 @@ mod tests {
     fn left_when_left_is_spacer_emits_two_csi() {
         let wide = WideCursorHint {
             on_wide_base: false,
+            on_wide_spacer: false,
             left_is_spacer: true,
         };
         let out = process_input_wide(
@@ -849,6 +854,7 @@ mod tests {
         // Word-nav must not double.
         let wide = WideCursorHint {
             on_wide_base: true,
+            on_wide_spacer: false,
             left_is_spacer: false,
         };
         let out = process_input_wide(
@@ -859,6 +865,58 @@ mod tests {
             wide,
         );
         assert_eq!(out.pty_bytes, b"\x1b[1;5C");
+    }
+    #[test]
+    fn shift_left_when_left_is_spacer_emits_two_csi() {
+        // Shift+← selection extend must skip the spacer the same as plain ←.
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            on_wide_spacer: false,
+            left_is_spacer: true,
+        };
+        let shift = mods(false, false, true);
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowLeft, shift)],
+            shift,
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[1;2D\x1b[1;2D");
+    }
+    #[test]
+    fn shift_right_on_wide_base_emits_two_csi() {
+        let wide = WideCursorHint {
+            on_wide_base: true,
+            on_wide_spacer: false,
+            left_is_spacer: false,
+        };
+        let shift = mods(false, false, true);
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowRight, shift)],
+            shift,
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[1;2C\x1b[1;2C");
+    }
+    #[test]
+    fn left_on_wide_spacer_emits_two_csi() {
+        // Parked mid-glyph: one ← should leave the whole wide char.
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            on_wide_spacer: true,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowLeft, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[D\x1b[D");
     }
 
     // ---- zoom ----------------------------------------------------------------
