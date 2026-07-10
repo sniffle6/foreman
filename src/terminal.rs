@@ -493,6 +493,11 @@ fn mono_paint_items(
         if g.ch == ' ' || g.ch == '\0' {
             continue;
         }
+        // Color stamps own default-emoji-presentation scalars. Laying them out
+        // as mono produces tofu □ (esp. width-1 orphans after wrap/BS).
+        if crate::frame::is_default_emoji_presentation(g.ch) {
+            continue;
+        }
         let galley = match dedupe.get(&(g.ch, g.style)) {
             Some(arc) => arc.clone(),
             None => {
@@ -1596,6 +1601,7 @@ impl Session {
             if stamped.contains(&(g.row, g.col)) {
                 continue; // color stamp covers this cell; mono would fringe
             }
+            // EP emoji never enter `items` (mono_paint_items skips them).
             painter.galley(
                 metrics.cell_rect(g.row, g.col).min,
                 g.galley.clone(),

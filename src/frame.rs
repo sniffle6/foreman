@@ -132,10 +132,17 @@ pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
             if is_wide_spacer(cell.flags) {
                 continue;
             }
-            // Wide char at last column wraps to next line (LEADING spacer there);
-            // do not claim width 2 past the row edge.
+            // Width-2 only when a real trailing spacer sits on this row. Edge
+            // wrap (no room), or BS-broken pairs (flag still WIDE_CHAR but next
+            // cell is not a spacer), stay width-1 so we don't stamp over a
+            // neighbor or force mono tofu for a missing half.
             let width_cells = if cell.flags.contains(Flags::WIDE_CHAR) && col + 1 < ncols {
-                2
+                let next = &grid[Line(row as i32 - off)][Column(col + 1)];
+                if next.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    2
+                } else {
+                    1
+                }
             } else {
                 1
             };
@@ -147,14 +154,16 @@ pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
                 style: glyph_style(cell.flags, cell.fg, cell.bg),
                 width_cells,
             });
-            // Stamp candidates: default emoji presentation + wide cell only.
-            // Narrow (width 1) stays mono-only even if the range matches.
-            if is_default_emoji_presentation(ch) && width_cells == 2 {
+            // Stamp candidates: default emoji presentation (any width).
+            // Orphan/wrap-edge EP cells are often width_cells==1 after BS or at
+            // the row edge; mono tofu □ is worse than a 1-cell color stamp.
+            // Skip pure blanks.
+            if is_default_emoji_presentation(ch) && ch != ' ' {
                 emoji_sites.push(EmojiSite {
                     row,
                     col,
                     ch,
-                    width_cells,
+                    width_cells: width_cells.max(1),
                 });
             }
         }
@@ -588,6 +597,30 @@ mod tests {
         assert_eq!(wides.len(), 2, "expected two wide CJK glyphs; got {:?}", plan.glyphs);
         assert_eq!((wides[0].col, wides[0].ch), (0, '你'));
         assert_eq!((wides[1].col, wides[1].ch), (2, '好'));
+    }
+
+    #[test]
+    fn plan_paint_emits_emoji_site_for_width_one_orphan() {
+        // After wrap/BS an EP scalar can sit as width_cells==1 (no spacer).
+        // Still stamp, never mono-tofu.
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let mut term = term_with(b" ", 4, 1);
+        {
+            let grid = term.grid_mut();
+            let cell = &mut grid[Line(0)][Column(1)];
+            cell.c = '🥒';
+            // No WIDE_CHAR flag → width_cells 1 (orphan / broken pair).
+        }
+        let m = metrics(4, 1);
+        let plan = plan_paint(term.grid(), &m);
+        let site = plan
+            .emoji_sites
+            .iter()
+            .find(|s| s.ch == '🥒')
+            .expect("width-1 EP must still be an emoji site");
+        assert_eq!(site.width_cells, 1);
+        assert_eq!(site.col, 1);
     }
 
     #[test]
