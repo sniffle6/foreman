@@ -115,6 +115,12 @@ Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Mi
 cargo build 2>&1 | Select-Object -Last 20
 ```
 
+**⚠ Unless `$env:FOREMAN` is `1`** — then you are running inside the foreman app
+itself and `Stop-Process foreman` kills your own host, every terminal in it, and
+you (incident: 2026-07-09, an agent reviewing this repo from a foreman terminal
+took the whole app down). Ask the user to close foreman, or build to a separate
+target dir that doesn't lock the running exe: `cargo build --target-dir target/agent`.
+
 **Run + screenshot the window** (you can't see the GUI otherwise — capture it and
 `Read` the PNG):
 ```powershell

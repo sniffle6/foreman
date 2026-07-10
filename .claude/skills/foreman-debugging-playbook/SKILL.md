@@ -89,12 +89,18 @@ Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Mi
 cargo build 2>&1 | Select-Object -Last 20
 ```
 
+**⚠ Unless `$env:FOREMAN` is `1`** — then you are running inside the foreman
+app and that kill takes down your own host, every terminal in it, and you
+(incident: 2026-07-09). Ask the user to close foreman, or build without
+touching the running exe: `cargo build --target-dir target/agent`.
+
 **Fence.** A repo hook automates this — but only partially:
 `.claude/settings.json` registers a `PreToolUse` hook with **matcher "Bash"**
 running `.claude/hooks/kill-foreman.ps1`, which kills foreman before any
-`cargo build|run|test` command. It fires **only for the Bash tool** — a cargo
-command issued through the PowerShell tool gets no kill, so run the
-`Stop-Process` line yourself there. Build-loop details live in
+`cargo build|run|test` command — except when `FOREMAN=1` (session inside
+foreman), where it no-ops for the reason above. It fires **only for the Bash
+tool** — a cargo command issued through the PowerShell tool gets no kill, so
+run the `Stop-Process` line yourself there. Build-loop details live in
 **foreman-build-and-env**.
 
 ## §3 `cannot find -lgcc_eh`

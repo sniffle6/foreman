@@ -11,6 +11,10 @@ runs it, and grabs a PNG of its window so you can `Read` the result.
 
 ## Steps
 
+0. **Bail out if `$env:FOREMAN` is `1`** — you are running inside the foreman
+   app; the kill below would take down your own host and this session
+   (incident: 2026-07-09). Tell the user and stop.
+
 1. **Kill + build** (the PreToolUse hook also kills foreman, but be explicit):
    ```powershell
    Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500

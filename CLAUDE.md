@@ -21,6 +21,12 @@ cargo run --release  # the "is it fast" build
 cargo test           # unit tests (layout tree, wm, chat — no GUI needed)
 ```
 
+**⚠ If `$env:FOREMAN` is `1`, you are running INSIDE the foreman app.** Do NOT
+`Stop-Process foreman` — you will kill your own host, every other terminal in
+it, and yourself mid-command (this has happened). Instead ask the user to close
+foreman, or build without touching the running exe:
+`cargo build --target-dir target/agent`.
+
 The GUI can't be seen from the terminal — to verify visually, run the exe and
 screenshot the window, then `Read` the PNG. Full screenshot script is in
 `docs/HANDOFF.md` § 3.

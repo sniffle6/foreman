@@ -260,7 +260,7 @@ Dev-workflow configuration for sessions working ON this repo — not app config.
 
 | Event | Matcher | Script | Does |
 |---|---|---|---|
-| `PreToolUse` | `Bash` | `.claude/hooks/kill-foreman.ps1` | If the command matches regex `cargo\s+(build\|run\|test)`: `Stop-Process -Name foreman`, sleep 500 ms. Always exits 0 (never blocks) |
+| `PreToolUse` | `Bash` | `.claude/hooks/kill-foreman.ps1` | No-op when `FOREMAN=1` (session runs inside foreman — killing it would kill the host; incident 2026-07-09). Otherwise, if the command matches regex `cargo\s+(build\|run\|test)`: `Stop-Process -Name foreman`, sleep 500 ms. Always exits 0 (never blocks) |
 | `PostToolUse` | `Edit\|Write` | `.claude/hooks/cargo-fmt.ps1` | If the edited path ends `.rs`: run `cargo fmt` (prepends `C:\w64devkit\bin` and `%USERPROFILE%\.cargo\bin` to PATH). Always exits 0 |
 
 Gaps (verified against the matchers/scripts, as of 2026-07-01):
