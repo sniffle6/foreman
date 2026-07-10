@@ -553,6 +553,90 @@ fn install_panic_logger() {
     }));
 }
 
+/// Decode an embedded app-icon PNG to unpremultiplied RGBA. Separate from the
+/// terminal graphics decoder: no MAX_PIXELS gate, soft-fail at launch only.
+fn decode_app_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    let mut dec = png::Decoder::new(data);
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().map_err(|_| "bad png")?;
+    let (w, h) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if w == 0 || h == 0 {
+        return Err("empty png");
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|_| "bad png")?;
+    buf.truncate(info.buffer_size());
+    match info.color_type {
+        png::ColorType::Rgba => Ok((w, h, buf)),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
+            for p in buf.chunks_exact(3) {
+                rgba.extend_from_slice(p);
+                rgba.push(255);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(buf.len() * 2);
+            for p in buf.chunks_exact(2) {
+                rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::Grayscale => {
+            let mut rgba = Vec::with_capacity(buf.len() * 4);
+            for &v in &buf {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+            Ok((w, h, rgba))
+        }
+        _ => Err("bad png"),
+    }
+}
+
+/// Center `rgba` (w×h) on a transparent square whose side is a multiple of 4
+/// (egui IconData guidance). Does not stretch.
+fn pad_to_square_rgba(w: u32, h: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) {
+    let side = w.max(h).div_ceil(4) * 4;
+    let mut out = vec![0u8; (side as usize) * (side as usize) * 4];
+    let ox = ((side - w) / 2) as usize;
+    let oy = ((side - h) / 2) as usize;
+    let src_stride = (w as usize) * 4;
+    let dst_stride = (side as usize) * 4;
+    for row in 0..(h as usize) {
+        let src = row * src_stride;
+        let dst = (oy + row) * dst_stride + ox * 4;
+        out[dst..dst + src_stride].copy_from_slice(&rgba[src..src + src_stride]);
+    }
+    (side, side, out)
+}
+
+/// Taskbar / Alt-Tab icon from the embedded PNG. Soft-fails (None) so a bad
+/// asset never blocks launch.
+fn load_app_icon() -> Option<egui::IconData> {
+    const BYTES: &[u8] = include_bytes!("../assets/icons/app-icon.png");
+    let (w, h, rgba) = match decode_app_png(BYTES) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("foreman: app icon decode failed: {e}");
+            return None;
+        }
+    };
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        eprintln!("foreman: app icon size mismatch");
+        return None;
+    }
+    let (sw, sh, square) = pad_to_square_rgba(w, h, &rgba);
+    Some(egui::IconData {
+        rgba: square,
+        width: sw,
+        height: sh,
+    })
+}
+
 fn main() -> eframe::Result {
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
@@ -563,10 +647,15 @@ fn main() -> eframe::Result {
     skills_install::install();
     conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_decorations(false);
+    match load_app_icon() {
+        Some(icon) => viewport = viewport.with_icon(icon),
+        None => eprintln!("foreman: using default window icon"),
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_decorations(false),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -581,4 +670,43 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(rx)))
         }),
     )
+}
+
+#[cfg(test)]
+mod app_icon_tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_square_centers_and_rounds_side_to_multiple_of_4() {
+        // 3×5 red pixel field → side max(3,5)=5 → round up to 8.
+        let mut src = vec![0u8; 3 * 5 * 4];
+        for px in src.chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let (sw, sh, out) = pad_to_square_rgba(3, 5, &src);
+        assert_eq!((sw, sh), (8, 8));
+        assert_eq!(out.len(), 8 * 8 * 4);
+        // Center offset: ((8-3)/2, (8-5)/2) = (2, 1).
+        let at = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        assert_eq!(at(2, 1), [255, 0, 0, 255]); // top-left of blit
+        assert_eq!(at(4, 5), [255, 0, 0, 255]); // bottom-right of blit
+        assert_eq!(at(0, 0), [0, 0, 0, 0]); // padding
+        assert_eq!(at(7, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn embedded_app_icon_loads_as_square_icon_data() {
+        let icon = load_app_icon().expect("app-icon.png should decode");
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.width % 4, 0);
+        assert_eq!(
+            icon.rgba.len(),
+            (icon.width as usize) * (icon.height as usize) * 4
+        );
+        // Asset is non-trivial art; must not be an empty transparent square.
+        assert!(icon.rgba.iter().any(|&b| b != 0));
+    }
 }

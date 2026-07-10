@@ -37,6 +37,16 @@ Foreman is its own window manager; the OS title bar was 30px of dead space above
 a UI that already has titlebars, tabs, and snapping. Hover-reveal keeps the
 min/max/close affordances without paying for them permanently.
 
+## App icon
+
+Taskbar and Alt-Tab use `assets/icons/app-icon.png`, embedded at build time and
+set on the viewport at launch (`ViewportBuilder::with_icon`). The PNG is
+center-padded to a square (side multiple of 4) so non-square art still works.
+This is **not** the in-app tab icons (`src/icons.rs` / agent SVGs). Decorations
+are off, so there is no OS title-bar icon — only taskbar / Alt-Tab while the
+process is running. Embedding a PE `.ico` for Explorer/shortcuts is a separate
+follow-up.
+
 ## Gotchas
 
 - Open is instant on the thin top border; close is delayed (coyote). Mid-close
@@ -79,4 +89,6 @@ min/max/close affordances without paying for them permanently.
 
 - `src/main.rs` — everything: `with_decorations(false)` in `main()`, the
   `CHROME_*` constants, `App::show_os_chrome` (reveal state machine + bar),
-  `App::os_resize_rim` (edge resize), `chrome_glyph` (painted caption icons).
+  `App::os_resize_rim` (edge resize), `chrome_glyph` (painted caption icons),
+  `load_app_icon` / `pad_to_square_rgba` (taskbar icon).
+- `assets/icons/app-icon.png` — OS app icon source.
