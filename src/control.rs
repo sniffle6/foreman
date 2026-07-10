@@ -543,7 +543,9 @@ pub fn parse_close_args(
 /// [--keys "K K …"]... [--settle-ms N]`. `--keys` splits its value on
 /// whitespace; repeatable `--keys` appends. When `--terminal` is absent,
 /// fills from `self_terminal` (FOREMAN_TERMINAL_ID) and requires
-/// `self_project` (FOREMAN_PROJECT_ID) — same self-target rule as `close`.
+/// `self_project` (FOREMAN_PROJECT_ID) — same self-target rule as `close`;
+/// an explicit `--project` then errors (terminal ids are only unique within
+/// a project, so it would be a cross-project guess).
 /// Requires at least one of `--text` or `--keys`.
 /// NOTE: `settle_ms` is parsed but not yet honored (settle is the next phase).
 pub fn parse_send_args(
@@ -553,6 +555,7 @@ pub fn parse_send_args(
     self_project: Option<String>,
 ) -> Result<SendRequest, String> {
     let mut project = default_project;
+    let mut explicit_project = false;
     let mut terminal: Option<String> = None;
     let mut text: Option<String> = None;
     let mut keys: Vec<String> = Vec::new();
@@ -562,6 +565,7 @@ pub fn parse_send_args(
         match args[i].as_str() {
             "--project" => {
                 project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                explicit_project = true;
                 i += 2;
             }
             "--terminal" => {
@@ -590,16 +594,19 @@ pub fn parse_send_args(
         }
     }
     if terminal.is_none() {
-        // self-target: both env vars required
+        // self-target: the caller's own identity, never a cross-project guess
+        if explicit_project {
+            return Err(
+                "--project needs an explicit --terminal; bare send targets your own pane".into(),
+            );
+        }
         let me =
             self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
         let proj = self_project.ok_or(
             "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
         )?;
         terminal = Some(me);
-        if project.is_none() {
-            project = Some(proj);
-        }
+        project = Some(proj);
     }
     if text.is_none() && keys.is_empty() {
         return Err("nothing to send: give --text and/or --keys".into());
@@ -616,7 +623,9 @@ pub fn parse_send_args(
 
 /// Parse `foreman snapshot` args: `[--project P] [--terminal T] [--attrs]
 /// [--cursor]`. When `--terminal` is absent, fills from `self_terminal`
-/// (FOREMAN_TERMINAL_ID) and requires `self_project` (FOREMAN_PROJECT_ID).
+/// (FOREMAN_TERMINAL_ID) and requires FOREMAN_PROJECT_ID (`default_project`);
+/// an explicit `--project` then errors (terminal ids are only unique within
+/// a project, so it would be a cross-project guess).
 /// `--attrs`/`--cursor` are valueless boolean opt-ins.
 pub fn parse_snapshot_args(
     args: &[String],
@@ -624,6 +633,7 @@ pub fn parse_snapshot_args(
     self_terminal: Option<String>,
 ) -> Result<SnapshotRequest, String> {
     let mut project = default_project;
+    let mut explicit_project = false;
     let mut terminal: Option<String> = None;
     let mut attrs = false;
     let mut cursor = false;
@@ -632,6 +642,7 @@ pub fn parse_snapshot_args(
         match args[i].as_str() {
             "--project" => {
                 project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                explicit_project = true;
                 i += 2;
             }
             "--terminal" => {
@@ -650,10 +661,16 @@ pub fn parse_snapshot_args(
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
+    // An explicit --project with no --terminal is never a self-target: terminal
+    // ids are only unique within a project, so filling the terminal from the
+    // caller's env would silently cross into another project's pane.
+    if terminal.is_none() && explicit_project {
+        return Err(
+            "--project needs an explicit --terminal; bare snapshot reads your own pane".into(),
+        );
+    }
     // Self-target only when we actually have a FOREMAN_TERMINAL_ID; otherwise fall
-    // through to the clear "--terminal is required" error — so `snapshot --project
-    // p1` with no `--terminal` doesn't misleadingly complain about not being inside
-    // a foreman terminal.
+    // through to the clear "--terminal is required" error.
     if terminal.is_none() && self_terminal.is_some() {
         let proj = project.ok_or(
             "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
@@ -1751,6 +1768,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_send_args_rejects_explicit_project_without_terminal() {
+        let e = parse_send_args(
+            &s(&["--project", "p2", "--text", "x"]),
+            Some("p1".into()),
+            Some("t4".into()),
+            Some("p1".into()),
+        )
+        .unwrap_err();
+        assert!(e.contains("--project needs an explicit --terminal"), "{e}");
+    }
+
+    #[test]
+    fn parse_send_args_self_target_uses_own_project() {
+        // bare self-target resolves from FOREMAN_PROJECT_ID, never a guess
+        let req = parse_send_args(
+            &s(&["--text", "x"]),
+            Some("stale".into()),
+            Some("t4".into()),
+            Some("p9".into()),
+        )
+        .unwrap();
+        assert_eq!(req.terminal.as_deref(), Some("t4"));
+        assert_eq!(req.project.as_deref(), Some("p9"));
+    }
+
+    #[test]
     fn parse_send_args_self_target_requires_both_env_vars() {
         // missing self_terminal
         let e = parse_send_args(
@@ -1865,6 +1908,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_snapshot_args_rejects_explicit_project_without_terminal() {
+        let e = parse_snapshot_args(
+            &s(&["--project", "p2"]),
+            Some("p1".into()),
+            Some("t4".into()),
+        )
+        .unwrap_err();
+        assert!(e.contains("--project needs an explicit --terminal"), "{e}");
+    }
+
+    #[test]
     fn parse_snapshot_args_self_target_requires_project() {
         let e = parse_snapshot_args(&s(&[]), None, Some("t4".into())).unwrap_err();
         assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
@@ -1872,9 +1926,10 @@ mod tests {
 
     #[test]
     fn parse_snapshot_args_requires_terminal() {
-        // no terminal flag and no self-target env
-        let e = parse_snapshot_args(&s(&["--project", "p1"]), None, None).unwrap_err();
-        assert!(e.contains("terminal"), "{e}");
+        // no flags and no self-target env — pins the fallthrough error, not the
+        // explicit-project rejection (that path has its own test above)
+        let e = parse_snapshot_args(&s(&[]), None, None).unwrap_err();
+        assert!(e.contains("--terminal is required"), "{e}");
     }
 
     #[test]

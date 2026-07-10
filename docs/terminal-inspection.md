@@ -60,6 +60,10 @@ from inside any foreman terminal:
 foreman send --text "pwd\r" && foreman snapshot
 ```
 
+An explicit `--project` without `--terminal` is an error (same rule as bare
+`close`): terminal ids are only unique within a project, so filling the
+terminal from your env would silently target another project's pane.
+
 ## Key files
 
 - `src/inspect.rs` — pure grid-walk: `snapshot_text`, `parse_keys`, `cursor_info`, `grid_contains`

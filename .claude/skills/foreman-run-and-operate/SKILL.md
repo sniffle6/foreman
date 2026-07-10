@@ -75,8 +75,8 @@ General rules:
 | chat (read) | `foreman chat [--project P] --history [N]` | N optional (default 20, `DEFAULT_HISTORY`). Mutually exclusive with a message AND with `--to`; `--re` is post-only. Needs no terminal id; never joins the room. |
 | status | `foreman status [--project P]` | **Deliberately no env default**: bare `status` lists ALL projects (`src/control.rs:103-105`); it is an overview verb. `--project pN` filters; unknown pN is an error. Any stray positional is an error. |
 | close | `foreman close [tN ...] [--project P]` | Ids must match `t<digits>`. With ids: closes those in P (default `FOREMAN_PROJECT_ID`, else focused). Validation is **all-or-nothing**: any unknown/non-terminal id fails the whole request, nothing closes. With **no** ids = self-close: requires BOTH `FOREMAN_TERMINAL_ID` and `FOREMAN_PROJECT_ID`, and **refuses** an explicit `--project` (`src/control.rs:513-529`). |
-| send | `foreman send [--project P] [--terminal T] [--text TXT] [--keys "K K..."]... [--settle-ms N]` | At least one of `--text`/`--keys`. `--text` is raw UTF-8 written verbatim (last one wins if repeated); `--keys` splits its value on whitespace and is repeatable (appends). Write order: text first, then keys. No `--terminal` = self-target: requires BOTH env vars. Key names validated against the Session's live terminal mode BEFORE any byte is written — errors have no side effects (`src/wm.rs:1346-1354`). |
-| snapshot | `foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor]` | `--attrs`/`--cursor` are valueless opt-ins. No `--terminal`: self-targets only when `FOREMAN_TERMINAL_ID` is set (then a project — env or flag — is required); otherwise errors `--terminal is required`. |
+| send | `foreman send [--project P] [--terminal T] [--text TXT] [--keys "K K..."]... [--settle-ms N]` | At least one of `--text`/`--keys`. `--text` is raw UTF-8 written verbatim (last one wins if repeated); `--keys` splits its value on whitespace and is repeatable (appends). Write order: text first, then keys. No `--terminal` = self-target: requires BOTH env vars and **refuses** an explicit `--project` (a `tN` is only unique within its project — pass `--terminal` to cross projects). Key names validated against the Session's live terminal mode BEFORE any byte is written — errors have no side effects (`src/wm.rs:1346-1354`). |
+| snapshot | `foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor]` | `--attrs`/`--cursor` are valueless opt-ins. No `--terminal`: **refuses** an explicit `--project` (same rule as send); self-targets only when `FOREMAN_TERMINAL_ID` is set (then `FOREMAN_PROJECT_ID` is required); otherwise errors `--terminal is required`. |
 
 ### send key-name grammar (`src/inspect.rs:207-283`, encoding in `src/input.rs:257-342`)
 
@@ -226,9 +226,9 @@ binary — PATH won't have `target\debug`), `FOREMAN_PROJECT_ID` (`pN`), and
 | status | **ignored — deliberate** | ignored |
 | close tN... | default for `--project` | unused |
 | close (bare = self) | **required**; `--project` refused | **required** |
-| send without `--terminal` | **required** | **required** |
+| send without `--terminal` | **required**; `--project` refused | **required** |
 | send/snapshot with `--terminal` | default for `--project` | unused |
-| snapshot without `--terminal` | required (env or `--project`) | used as the target when set; otherwise `--terminal is required` |
+| snapshot without `--terminal` | **required**; `--project` refused | used as the target when set; otherwise `--terminal is required` |
 
 The recurring error strings are exact: `not inside a foreman terminal
 (FOREMAN_TERMINAL_ID unset)` and `cannot resolve your own pane without
