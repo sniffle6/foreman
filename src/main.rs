@@ -657,6 +657,67 @@ fn load_app_icon() -> Option<egui::IconData> {
     })
 }
 
+// ---- Font fallbacks (CJK / emoji) ------------------------------------------
+// egui defaults cover Latin well and almost no CJK. Grid/selection already
+// handle wide chars; this only supplies glyphs so those cells don't draw as
+// empty boxes (tofu). Fallbacks append after primaries — never replace them.
+// See docs/font-fallback.md.
+
+/// Append named font blobs as lowest-priority fallbacks for Monospace and
+/// Proportional. Empty blobs are skipped. Existing primary fonts stay first.
+/// Pure: no filesystem, no Context — unit-tested with fake bytes.
+fn append_font_fallbacks(
+    fonts: &mut egui::FontDefinitions,
+    named_fonts: impl IntoIterator<Item = (String, Vec<u8>)>,
+) {
+    for (name, bytes) in named_fonts {
+        if bytes.is_empty() {
+            continue;
+        }
+        fonts.font_data.insert(
+            name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [
+            egui::FontFamily::Monospace,
+            egui::FontFamily::Proportional,
+        ] {
+            if let Some(list) = fonts.families.get_mut(&family) {
+                if !list.iter().any(|n| n == &name) {
+                    list.push(name.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Known Windows system fonts used as glyph fallbacks (CJK + emoji shapes).
+/// Order: CJK first, emoji second (both lowest priority after defaults).
+fn windows_fallback_font_paths() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("yahei", r"C:\Windows\Fonts\msyh.ttc"),
+        ("seguiemj", r"C:\Windows\Fonts\seguiemj.ttf"),
+    ]
+}
+
+/// Build default FontDefinitions plus any fallbacks `read` can supply.
+/// Inject `read` so tests never touch the real disk.
+fn load_font_definitions(
+    read: &dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>>,
+) -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut loaded = Vec::new();
+    for &(name, path) in windows_fallback_font_paths() {
+        match read(std::path::Path::new(path)) {
+            Ok(bytes) if !bytes.is_empty() => loaded.push((name.to_string(), bytes)),
+            Ok(_) => {}  // empty file — skip
+            Err(_) => {} // missing / unreadable — skip
+        }
+    }
+    append_font_fallbacks(&mut fonts, loaded);
+    fonts
+}
+
 fn main() -> eframe::Result {
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
@@ -682,6 +743,11 @@ fn main() -> eframe::Result {
         "Foreman",
         opts,
         Box::new(move |cc| {
+            // CJK/emoji glyph coverage (tofu fix). Best-effort; missing system
+            // fonts leave defaults alone. Once per process — not per frame.
+            cc.egui_ctx
+                .set_fonts(load_font_definitions(&|p| std::fs::read(p)));
+
             // Spawn the control server here (not before run_native) so it can hold
             // the egui Context and wake the render loop the instant a dispatch
             // arrives, rather than waiting on the idle repaint tick.
@@ -728,5 +794,152 @@ mod app_icon_tests {
         );
         // Asset is non-trivial art; must not be an empty transparent square.
         assert!(icon.rgba.iter().any(|&b| b != 0));
+    }
+}
+
+#[cfg(test)]
+mod font_fallback_tests {
+    use super::*;
+
+    fn mono_names(fonts: &egui::FontDefinitions) -> Vec<String> {
+        fonts
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn prop_names(fonts: &egui::FontDefinitions) -> Vec<String> {
+        fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn append_fallbacks_pushes_name_to_mono_and_proportional() {
+        let mut fonts = egui::FontDefinitions::default();
+        let before_mono = mono_names(&fonts);
+        let before_prop = prop_names(&fonts);
+
+        append_font_fallbacks(&mut fonts, [("yahei".into(), vec![0u8, 1, 2, 3])]);
+
+        let after_mono = mono_names(&fonts);
+        let after_prop = prop_names(&fonts);
+        assert_eq!(&after_mono[..before_mono.len()], &before_mono[..]);
+        assert_eq!(after_mono.last().map(String::as_str), Some("yahei"));
+        assert_eq!(&after_prop[..before_prop.len()], &before_prop[..]);
+        assert_eq!(after_prop.last().map(String::as_str), Some("yahei"));
+        assert!(fonts.font_data.contains_key("yahei"));
+    }
+
+    #[test]
+    fn append_fallbacks_preserves_primary_first() {
+        // First entry stays primary — tofu fix must not replace Hack/etc.
+        let mut fonts = egui::FontDefinitions::default();
+        let primary = mono_names(&fonts)
+            .first()
+            .cloned()
+            .expect("default mono family non-empty");
+
+        append_font_fallbacks(&mut fonts, [("seguiemj".into(), vec![9u8, 9, 9])]);
+
+        assert_eq!(
+            mono_names(&fonts).first().map(String::as_str),
+            Some(primary.as_str())
+        );
+        assert_eq!(
+            mono_names(&fonts).last().map(String::as_str),
+            Some("seguiemj")
+        );
+    }
+
+    #[test]
+    fn append_fallbacks_skips_empty_blob() {
+        let mut fonts = egui::FontDefinitions::default();
+        let before = mono_names(&fonts);
+
+        append_font_fallbacks(&mut fonts, [("empty".into(), Vec::new())]);
+
+        assert_eq!(mono_names(&fonts), before);
+        assert!(!fonts.font_data.contains_key("empty"));
+    }
+
+    #[test]
+    fn append_fallbacks_two_fonts_order_stable() {
+        let mut fonts = egui::FontDefinitions::default();
+        append_font_fallbacks(
+            &mut fonts,
+            [("yahei".into(), vec![1u8]), ("seguiemj".into(), vec![2u8])],
+        );
+        let mono = mono_names(&fonts);
+        let n = mono.len();
+        assert!(n >= 2);
+        assert_eq!(mono[n - 2], "yahei");
+        assert_eq!(mono[n - 1], "seguiemj");
+    }
+
+    #[test]
+    fn append_fallbacks_does_not_duplicate_name_in_family() {
+        let mut fonts = egui::FontDefinitions::default();
+        append_font_fallbacks(&mut fonts, [("yahei".into(), vec![1u8])]);
+        append_font_fallbacks(&mut fonts, [("yahei".into(), vec![2u8])]);
+        let count = mono_names(&fonts)
+            .iter()
+            .filter(|n| n.as_str() == "yahei")
+            .count();
+        assert_eq!(count, 1);
+        assert!(fonts.font_data.contains_key("yahei"));
+    }
+
+    #[test]
+    fn windows_fallback_paths_name_yahei_and_seguiemj() {
+        let paths = windows_fallback_font_paths();
+        let names: Vec<&str> = paths.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"yahei"));
+        assert!(names.contains(&"seguiemj"));
+        for (_, p) in paths {
+            assert!(p.starts_with(r"C:\Windows\Fonts\"), "{p}");
+        }
+    }
+
+    #[test]
+    fn load_font_definitions_skips_missing_files() {
+        let fonts = load_font_definitions(&|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "nope"))
+        });
+        assert!(!fonts.font_data.contains_key("yahei"));
+        assert!(!fonts.font_data.contains_key("seguiemj"));
+        assert!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Monospace)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn load_font_definitions_installs_readable_fonts() {
+        let fonts = load_font_definitions(&|path| {
+            let s = path.to_string_lossy();
+            if s.contains("msyh") {
+                Ok(vec![0xAA])
+            } else if s.contains("seguiemj") {
+                Ok(vec![0xBB])
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "x"))
+            }
+        });
+        assert!(fonts.font_data.contains_key("yahei"));
+        assert!(fonts.font_data.contains_key("seguiemj"));
+        let mono = fonts
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .cloned()
+            .unwrap();
+        assert_eq!(mono.last().map(String::as_str), Some("seguiemj"));
+        assert!(mono.iter().any(|n| n == "yahei"));
     }
 }
