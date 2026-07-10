@@ -451,6 +451,20 @@ fn retain_emoji_textures_at_px<T>(
     map.retain(|(_, entry_px), _| *entry_px == px);
 }
 
+/// Center `tex_w × tex_h` inside `span` preserving aspect ratio (letterbox).
+fn emoji_stamp_fit_rect(span: egui::Rect, tex_w: f32, tex_h: f32) -> egui::Rect {
+    let tw = tex_w.max(1.0);
+    let th = tex_h.max(1.0);
+    let scale = (span.width() / tw).min(span.height() / th);
+    let w = tw * scale;
+    let h = th * scale;
+    let min = egui::pos2(
+        span.min.x + (span.width() - w) * 0.5,
+        span.min.y + (span.height() - h) * 0.5,
+    );
+    egui::Rect::from_min_size(min, egui::vec2(w, h))
+}
+
 /// Rebuild content-only mono galleys + SGR bg cells from a paint plan.
 ///
 /// Calls the injected `layout` once per **distinct** `(char, GlyphStyle)` —
@@ -1227,8 +1241,34 @@ impl Session {
             .as_ref()
             .and_then(|s| s.to_range(&self.term))
             .is_some();
-        let outcome =
-            ui.input(|i| crate::input::process_input(&i.events, i.modifiers, mode, has_selection));
+        // Wide-char arrow skip: one Left/Right keypress should cross emoji/CJK
+        // (base+spacer), not park the caret mid-glyph.
+        let wide = {
+            use alacritty_terminal::term::cell::Flags;
+            let g = self.term.grid();
+            let p = g.cursor.point;
+            let col = p.column.0;
+            let on_wide_base = g[p.line][p.column]
+                .flags
+                .contains(Flags::WIDE_CHAR);
+            let left_is_spacer = col > 0
+                && g[p.line][alacritty_terminal::index::Column(col - 1)]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER);
+            crate::input::WideCursorHint {
+                on_wide_base,
+                left_is_spacer,
+            }
+        };
+        let outcome = ui.input(|i| {
+            crate::input::process_input_wide(
+                &i.events,
+                i.modifiers,
+                mode,
+                has_selection,
+                wide,
+            )
+        });
 
         if let Some(s) = outcome.scroll {
             self.term.scroll_display(s);
@@ -1503,23 +1543,15 @@ impl Session {
                 bg.color,
             );
         }
-        for g in items.iter() {
-            painter.galley(
-                metrics.cell_rect(g.row, g.col).min,
-                g.galley.clone(),
-                FG,
-            );
-        }
 
-        // Color emoji stamps — separate texture cache (char, px). Fail-open:
-        // atlas None leaves mono alone. Success: bg rect over mono, then image
-        // (RGBA stamps have transparent bg; plain cover would double-draw).
-        // Never rebuilds mono cache on atlas hit/miss.
+        // Color emoji stamps — resolve textures first so successful stamps can
+        // suppress mono blit (mono outlines overhang the cell and fringe the
+        // stamp). Fail-open: atlas None keeps mono. Separate texture cache;
+        // never rebuilds mono on atlas hit/miss.
         let emoji_px = font_px.round().max(1.0) as u32;
         retain_emoji_textures_at_px(&mut self.emoji_textures, emoji_px);
+        let mut stamp_ready: Vec<(&crate::frame::EmojiSite, egui::TextureHandle)> = Vec::new();
         if !emoji_sites.is_empty() {
-            let off = self.term.grid().display_offset() as i32;
-            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             for site in emoji_sites.iter() {
                 let tex = match self.emoji_textures.get(&(site.ch, emoji_px)) {
                     Some(t) => Some(t.clone()),
@@ -1529,10 +1561,12 @@ impl Session {
                                 [g.w as usize, g.h as usize],
                                 &g.rgba,
                             );
+                            // Nearest: color emoji are small bitmaps; linear
+                            // stretch fringes alpha edges against the cell bg.
                             let t = ui.ctx().load_texture(
                                 format!("emoji_{}_{}", site.ch as u32, emoji_px),
                                 img,
-                                egui::TextureOptions::LINEAR,
+                                egui::TextureOptions::NEAREST,
                             );
                             self.emoji_textures.insert((site.ch, emoji_px), t.clone());
                             Some(t)
@@ -1540,15 +1574,41 @@ impl Session {
                         None => None,
                     },
                 };
-                let Some(tex) = tex else { continue };
-                // Cover mono glyph with cell bg, then stamp (transparent RGBA).
+                if let Some(tex) = tex {
+                    stamp_ready.push((site, tex));
+                }
+            }
+        }
+        let stamped: std::collections::HashSet<(usize, usize)> =
+            stamp_ready.iter().map(|(s, _)| (s.row, s.col)).collect();
+
+        for g in items.iter() {
+            if stamped.contains(&(g.row, g.col)) {
+                continue; // color stamp covers this cell; mono would fringe
+            }
+            painter.galley(
+                metrics.cell_rect(g.row, g.col).min,
+                g.galley.clone(),
+                FG,
+            );
+        }
+
+        if !stamp_ready.is_empty() {
+            let off = self.term.grid().display_offset() as i32;
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            for (site, tex) in &stamp_ready {
                 let cell = &self.term.grid()[Line(site.row as i32 - off)][Column(site.col)];
                 let style = glyph_style(cell.flags, cell.fg, cell.bg);
                 let bg = style.bg.unwrap_or(BG);
                 let end_col = site.col + (site.width_cells as usize).saturating_sub(1);
                 let span = metrics.span_rect(site.row, site.col, end_col);
+                // Cell bg underlay (clears mono hole + transparent stamp corners).
                 painter.rect_filled(span, egui::CornerRadius::ZERO, bg);
-                painter.image(tex.id(), span, uv, egui::Color32::WHITE);
+                // Aspect-fit inside the span — stretch-to-fill squashes DWrite
+                // padding into soft fringes.
+                let size = tex.size_vec2();
+                let fit = emoji_stamp_fit_rect(span, size.x, size.y);
+                painter.image(tex.id(), fit, uv, egui::Color32::WHITE);
             }
         }
 
@@ -1714,6 +1774,17 @@ mod tests {
                 egui::Color32::WHITE,
             )
         })
+    }
+
+    #[test]
+    fn emoji_stamp_fit_preserves_aspect_and_centers() {
+        let span = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(16.0, 16.0));
+        // Tall texture: limited by height → width < span.
+        let fit = emoji_stamp_fit_rect(span, 8.0, 16.0);
+        assert!((fit.height() - 16.0).abs() < 0.01);
+        assert!((fit.width() - 8.0).abs() < 0.01);
+        assert!((fit.center().x - span.center().x).abs() < 0.01);
+        assert!((fit.center().y - span.center().y).abs() < 0.01);
     }
 
     #[test]

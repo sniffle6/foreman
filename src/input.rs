@@ -32,15 +32,47 @@ pub struct InputOutcome {
     pub zoom_reset: bool,
 }
 
+/// Live-cursor grid facts for wide-char arrow skipping (width-2 CJK/emoji).
+/// Default is a no-op so pure input tests stay free of grid fixtures.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WideCursorHint {
+    /// Cursor sits on a `WIDE_CHAR` base cell — unmodified Right should skip the spacer.
+    pub on_wide_base: bool,
+    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — unmodified Left
+    /// should jump back to before the wide glyph (skip the spacer column).
+    pub left_is_spacer: bool,
+}
+
 /// Decide what this frame's egui events mean for the terminal. Pure: real
 /// egui/alacritty types in, an `InputOutcome` out, no I/O. `mods` is the live
 /// frame modifier state (distinct from any per-event `Key` modifiers), used to
 /// tell a genuine Alt+letter Text event apart from AltGr.
+///
+/// Wide-char arrow skipping defaults off; Session calls [`process_input_wide`]
+/// with a live [`WideCursorHint`] so one Left/Right keypress crosses a width-2
+/// emoji/CJK cell instead of landing on the spacer.
 pub fn process_input(
     events: &[Event],
     mods: Modifiers,
     mode: TermMode,
     has_selection: bool,
+) -> InputOutcome {
+    process_input_wide(
+        events,
+        mods,
+        mode,
+        has_selection,
+        WideCursorHint::default(),
+    )
+}
+
+/// Like [`process_input`], plus wide-char Left/Right doubling from `wide`.
+pub fn process_input_wide(
+    events: &[Event],
+    mods: Modifiers,
+    mode: TermMode,
+    has_selection: bool,
+    wide: WideCursorHint,
 ) -> InputOutcome {
     let mut out = InputOutcome::default();
     let mut saw_paste = false;
@@ -126,7 +158,20 @@ pub fn process_input(
                     }
                 }
                 // Everything else → the pure encoder.
-                out.pty_bytes.extend_from_slice(&encode_key(k, m, mode));
+                let seq = encode_key(k, m, mode);
+                out.pty_bytes.extend_from_slice(&seq);
+                // Unmodified Left/Right only: double the CSI so one keypress
+                // crosses a width-2 cell (emoji/CJK). Modified chords (Ctrl+→
+                // word-nav) stay single. Empty seq = unmapped key, no double.
+                if !seq.is_empty()
+                    && !ctrl
+                    && !m.shift
+                    && !m.alt
+                    && ((k == Key::ArrowRight && wide.on_wide_base)
+                        || (k == Key::ArrowLeft && wide.left_is_spacer))
+                {
+                    out.pty_bytes.extend_from_slice(&seq);
+                }
             }
             _ => {}
         }
@@ -756,6 +801,64 @@ mod tests {
         );
         assert!(out.paste_clipboard);
         assert!(out.pty_bytes.is_empty());
+    }
+
+    // ---- wide-char arrow skip ------------------------------------------------
+    #[test]
+    fn right_on_wide_base_emits_two_csi() {
+        let wide = WideCursorHint {
+            on_wide_base: true,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowRight, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[C\x1b[C");
+    }
+    #[test]
+    fn left_when_left_is_spacer_emits_two_csi() {
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            left_is_spacer: true,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowLeft, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[D\x1b[D");
+    }
+    #[test]
+    fn right_without_wide_hint_is_single() {
+        let out = process_input(
+            &[key_ev(Key::ArrowRight, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[C");
+    }
+    #[test]
+    fn ctrl_right_on_wide_base_stays_single() {
+        // Word-nav must not double.
+        let wide = WideCursorHint {
+            on_wide_base: true,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::ArrowRight, mods(true, false, false))],
+            mods(true, false, false),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[1;5C");
     }
 
     // ---- zoom ----------------------------------------------------------------

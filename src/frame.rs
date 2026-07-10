@@ -256,10 +256,26 @@ pub fn overlays(
         }
     }
 
+    // Wide glyphs occupy two cells; paint a 2-cell caret on the base, and when
+    // the model is parked on the spacer cover the full base+spacer span so the
+    // block doesn't look half-stuck mid-emoji.
     let caret = match cursor {
-        CursorDraw::At { line, col, shape } if line >= 0 && off == 0 => Some(
-            crate::geom::caret_rect(metrics.cell_rect(line as usize, col), shape),
-        ),
+        CursorDraw::At { line, col, shape } if line >= 0 && off == 0 => {
+            let row = line as usize;
+            let cell_rect = if row < nrows && col < ncols {
+                let cell = &grid[Line(line - off)][Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR) && col + 1 < ncols {
+                    metrics.span_rect(row, col, col + 1)
+                } else if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+                    metrics.span_rect(row, col - 1, col)
+                } else {
+                    metrics.cell_rect(row, col)
+                }
+            } else {
+                metrics.cell_rect(row, col)
+            };
+            Some(crate::geom::caret_rect(cell_rect, shape))
+        }
         _ => None,
     };
 
@@ -447,6 +463,37 @@ mod tests {
         let expect = crate::geom::caret_rect(m.cell_rect(1, 2), CursorShape::Block);
         assert_eq!(o.caret, Some(expect));
         assert!(!o.scrolled_back);
+    }
+
+    #[test]
+    fn caret_on_wide_char_spans_two_cells() {
+        // 你好: wide base at col 0, spacer at col 1. Block caret on the base
+        // covers both cells so it matches the glyph span.
+        let term = term_with("你".as_bytes(), 4, 1);
+        let m = metrics(4, 1);
+        let cursor = CursorDraw::At {
+            line: 0,
+            col: 0,
+            shape: CursorShape::Block,
+        };
+        let o = overlays(term.grid(), &m, None, cursor);
+        let expect = crate::geom::caret_rect(m.span_rect(0, 0, 1), CursorShape::Block);
+        assert_eq!(o.caret, Some(expect));
+    }
+
+    #[test]
+    fn caret_on_wide_spacer_covers_base_and_spacer() {
+        let term = term_with("你".as_bytes(), 4, 1);
+        let m = metrics(4, 1);
+        // Model parked on the spacer column of the wide glyph.
+        let cursor = CursorDraw::At {
+            line: 0,
+            col: 1,
+            shape: CursorShape::Block,
+        };
+        let o = overlays(term.grid(), &m, None, cursor);
+        let expect = crate::geom::caret_rect(m.span_rect(0, 0, 1), CursorShape::Block);
+        assert_eq!(o.caret, Some(expect));
     }
 
     // ---- thumb ---------------------------------------------------------------
