@@ -32,18 +32,103 @@ pub struct InputOutcome {
     pub zoom_reset: bool,
 }
 
-/// Live-cursor grid facts for wide-char key skipping (width-2 CJK/emoji).
-/// Default is a no-op so pure input tests stay free of grid fixtures.
-#[derive(Clone, Copy, Debug, Default)]
+/// Width class of one grid cell for key encoding (not paint).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CellWide {
+    #[default]
+    Narrow,
+    /// Base cell of a width-2 glyph (`WIDE_CHAR`).
+    WideBase,
+    /// Trailing half of a width-2 glyph (`WIDE_CHAR_SPACER`).
+    WideSpacer,
+}
+
+/// Live-cursor neighborhood for wide-char key encoding.
+/// Built from a row of [`CellWide`] via [`wide_hint_at`] — callers should not
+/// invent fields by hand outside tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WideCursorHint {
-    /// Cursor sits on a `WIDE_CHAR` base cell — Right / Delete should skip the spacer.
+    /// Cursor sits on a wide base — Right / Delete should skip the spacer.
     pub on_wide_base: bool,
-    /// Cursor sits on a `WIDE_CHAR_SPACER` — Left / Backspace should treat the
-    /// whole wide glyph as one unit (not base-then-before).
+    /// Cursor sits on a spacer — Left / Backspace / Right / Delete treat the
+    /// whole glyph as one unit.
     pub on_wide_spacer: bool,
-    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — Left /
-    /// Backspace should remove/skip the full wide glyph (not leave a half-cell).
+    /// Cell immediately left of the cursor is a spacer — Left / Backspace
+    /// remove/skip the full wide glyph (not a half-cell orphan).
     pub left_is_spacer: bool,
+}
+
+/// Derive the encode-time hint for cursor column `col` on `line`.
+pub fn wide_hint_at(line: &[CellWide], col: usize) -> WideCursorHint {
+    let at = line.get(col).copied().unwrap_or(CellWide::Narrow);
+    let left = col
+        .checked_sub(1)
+        .and_then(|c| line.get(c).copied());
+    WideCursorHint {
+        on_wide_base: at == CellWide::WideBase,
+        on_wide_spacer: at == CellWide::WideSpacer,
+        left_is_spacer: left == Some(CellWide::WideSpacer),
+    }
+}
+
+/// Encode one physical keypress with wide-cell policy (deep module).
+///
+/// All keyboard and `send --keys` paths should go through this so ←/→/BS/Del
+/// (and Shift variants) skip width-2 glyphs in one place. Ctrl/Alt chords stay
+/// single (word-nav / other bindings). Empty when `encode_key` does not map.
+pub fn encode_key_wide(
+    key: Key,
+    mods: Modifiers,
+    mode: TermMode,
+    wide: WideCursorHint,
+) -> Vec<u8> {
+    let seq = encode_key(key, mods, mode);
+    if seq.is_empty() {
+        return seq;
+    }
+    let ctrl = mods.ctrl || mods.command;
+    if ctrl || mods.alt {
+        return seq;
+    }
+    let double = match key {
+        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
+        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
+        _ => false,
+    };
+    if !double {
+        return seq;
+    }
+    let mut out = Vec::with_capacity(seq.len() * 2);
+    out.extend_from_slice(&seq);
+    out.extend_from_slice(&seq);
+    out
+}
+
+/// Simulate cursor column after one physical keypress (horizontal only).
+/// Used so multi-key batches re-derive [`WideCursorHint`] without re-reading
+/// the live grid (PTY has not advanced yet).
+pub fn col_after_wide_key(
+    col: usize,
+    key: Key,
+    mods: Modifiers,
+    wide: WideCursorHint,
+) -> usize {
+    let ctrl = mods.ctrl || mods.command;
+    if ctrl || mods.alt {
+        return col;
+    }
+    let double = match key {
+        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
+        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
+        _ => false,
+    };
+    let step = if double { 2usize } else { 1 };
+    match key {
+        Key::ArrowRight => col.saturating_add(step),
+        Key::ArrowLeft | Key::Backspace => col.saturating_sub(step),
+        // Delete typically does not move the cursor in VT hosts.
+        _ => col,
+    }
 }
 
 /// Decide what this frame's egui events mean for the terminal. Pure: real
@@ -51,33 +136,36 @@ pub struct WideCursorHint {
 /// frame modifier state (distinct from any per-event `Key` modifiers), used to
 /// tell a genuine Alt+letter Text event apart from AltGr.
 ///
-/// Wide-char key skipping defaults off; Session calls [`process_input_wide`]
-/// with a live [`WideCursorHint`] so one Left/Right/Backspace/Delete crosses
-/// or removes a width-2 emoji/CJK glyph instead of half a cell.
+/// Wide-char skipping is off unless the shell calls [`process_input_wide`] with
+/// a live row of [`CellWide`] (Session samples the cursor line once per frame
+/// and advances the simulated column after each key).
 pub fn process_input(
     events: &[Event],
     mods: Modifiers,
     mode: TermMode,
     has_selection: bool,
 ) -> InputOutcome {
-    process_input_wide(
-        events,
-        mods,
-        mode,
-        has_selection,
-        WideCursorHint::default(),
-    )
+    process_input_wide(events, mods, mode, has_selection, None)
 }
 
-/// Like [`process_input`], plus wide-char Left/Right/Backspace/Delete doubling
-/// from `wide`.
+/// Like [`process_input`], plus wide-char encoding from an optional cursor row.
+///
+/// `wide_cursor` is `(line_flags, cursor_col)`. When `None`, every key uses a
+/// default (no-wide) hint — tests and non-Session callers. When `Some`, each
+/// key is encoded via [`encode_key_wide`] and the column is advanced with
+/// [`col_after_wide_key`] so multi-key / key-repeat batches do not reuse a
+/// stale base/spacer fact.
 pub fn process_input_wide(
     events: &[Event],
     mods: Modifiers,
     mode: TermMode,
     has_selection: bool,
-    wide: WideCursorHint,
+    wide_cursor: Option<(&[CellWide], usize)>,
 ) -> InputOutcome {
+    let (wide_line, mut wide_col) = match wide_cursor {
+        Some((line, col)) => (Some(line), col),
+        None => (None, 0),
+    };
     let mut out = InputOutcome::default();
     let mut saw_paste = false;
     let mut want_clip_paste = false; // Ctrl+V family
@@ -161,27 +249,14 @@ pub fn process_input_wide(
                         _ => {}
                     }
                 }
-                // Everything else → the pure encoder.
-                let seq = encode_key(k, m, mode);
+                // Deep encode: wide-cell policy lives only in encode_key_wide.
+                let hint = wide_line
+                    .map(|line| wide_hint_at(line, wide_col))
+                    .unwrap_or_default();
+                let seq = encode_key_wide(k, m, mode, hint);
                 out.pty_bytes.extend_from_slice(&seq);
-                // Width-2 cells (emoji/CJK): double the key so one physical
-                // press crosses/removes the whole glyph (base+spacer), not a
-                // half-cell white square. Covers move, Shift+←/→ select,
-                // Backspace, and Delete. Ctrl/Alt chords stay single (word-nav
-                // / other bindings). Empty seq = unmapped, no double.
-                let skip_wide = match k {
-                    // Right / Delete: on base → skip spacer; on spacer → leave glyph.
-                    Key::ArrowRight | Key::Delete => {
-                        wide.on_wide_base || wide.on_wide_spacer
-                    }
-                    // Left / Backspace: after glyph or mid-glyph → full unit.
-                    Key::ArrowLeft | Key::Backspace => {
-                        wide.left_is_spacer || wide.on_wide_spacer
-                    }
-                    _ => false,
-                };
-                if !seq.is_empty() && !ctrl && !m.alt && skip_wide {
-                    out.pty_bytes.extend_from_slice(&seq);
+                if wide_line.is_some() {
+                    wide_col = col_after_wide_key(wide_col, k, m, hint);
                 }
             }
             _ => {}
@@ -814,194 +889,185 @@ mod tests {
         assert!(out.pty_bytes.is_empty());
     }
 
-    // ---- wide-char arrow skip ------------------------------------------------
-    #[test]
-    fn right_on_wide_base_emits_two_csi() {
-        let wide = WideCursorHint {
+    // ---- wide-char encode (deep seam) ----------------------------------------
+    fn hint_base() -> WideCursorHint {
+        WideCursorHint {
             on_wide_base: true,
             on_wide_spacer: false,
             left_is_spacer: false,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::ArrowRight, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        assert_eq!(out.pty_bytes, b"\x1b[C\x1b[C");
+        }
     }
-    #[test]
-    fn left_when_left_is_spacer_emits_two_csi() {
-        let wide = WideCursorHint {
+    fn hint_spacer() -> WideCursorHint {
+        WideCursorHint {
             on_wide_base: false,
-            on_wide_spacer: false,
-            left_is_spacer: true,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::ArrowLeft, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        assert_eq!(out.pty_bytes, b"\x1b[D\x1b[D");
-    }
-    #[test]
-    fn right_without_wide_hint_is_single() {
-        let out = process_input(
-            &[key_ev(Key::ArrowRight, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-        );
-        assert_eq!(out.pty_bytes, b"\x1b[C");
-    }
-    #[test]
-    fn ctrl_right_on_wide_base_stays_single() {
-        // Word-nav must not double.
-        let wide = WideCursorHint {
-            on_wide_base: true,
-            on_wide_spacer: false,
+            on_wide_spacer: true,
             left_is_spacer: false,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::ArrowRight, mods(true, false, false))],
-            mods(true, false, false),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        assert_eq!(out.pty_bytes, b"\x1b[1;5C");
+        }
     }
-    #[test]
-    fn shift_left_when_left_is_spacer_emits_two_csi() {
-        // Shift+← selection extend must skip the spacer the same as plain ←.
-        let wide = WideCursorHint {
+    fn hint_after_wide() -> WideCursorHint {
+        WideCursorHint {
             on_wide_base: false,
             on_wide_spacer: false,
             left_is_spacer: true,
-        };
+        }
+    }
+
+    #[test]
+    fn encode_key_wide_right_on_base_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::ArrowRight, none(), TermMode::empty(), hint_base()),
+            b"\x1b[C\x1b[C"
+        );
+    }
+    #[test]
+    fn encode_key_wide_left_after_wide_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), hint_after_wide()),
+            b"\x1b[D\x1b[D"
+        );
+    }
+    #[test]
+    fn encode_key_wide_default_hint_is_single() {
+        assert_eq!(
+            encode_key_wide(
+                Key::ArrowRight,
+                none(),
+                TermMode::empty(),
+                WideCursorHint::default()
+            ),
+            b"\x1b[C"
+        );
+    }
+    #[test]
+    fn encode_key_wide_ctrl_right_stays_single() {
+        assert_eq!(
+            encode_key_wide(
+                Key::ArrowRight,
+                mods(true, false, false),
+                TermMode::empty(),
+                hint_base()
+            ),
+            b"\x1b[1;5C"
+        );
+    }
+    #[test]
+    fn encode_key_wide_shift_left_after_wide_doubles() {
         let shift = mods(false, false, true);
-        let out = process_input_wide(
-            &[key_ev(Key::ArrowLeft, shift)],
-            shift,
-            TermMode::empty(),
-            false,
-            wide,
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, shift, TermMode::empty(), hint_after_wide()),
+            b"\x1b[1;2D\x1b[1;2D"
         );
-        assert_eq!(out.pty_bytes, b"\x1b[1;2D\x1b[1;2D");
     }
     #[test]
-    fn shift_right_on_wide_base_emits_two_csi() {
-        let wide = WideCursorHint {
-            on_wide_base: true,
-            on_wide_spacer: false,
-            left_is_spacer: false,
-        };
+    fn encode_key_wide_shift_right_on_base_doubles() {
         let shift = mods(false, false, true);
-        let out = process_input_wide(
-            &[key_ev(Key::ArrowRight, shift)],
-            shift,
-            TermMode::empty(),
-            false,
-            wide,
+        assert_eq!(
+            encode_key_wide(Key::ArrowRight, shift, TermMode::empty(), hint_base()),
+            b"\x1b[1;2C\x1b[1;2C"
         );
-        assert_eq!(out.pty_bytes, b"\x1b[1;2C\x1b[1;2C");
     }
     #[test]
-    fn left_on_wide_spacer_emits_two_csi() {
-        // Parked mid-glyph: one ← should leave the whole wide char.
-        let wide = WideCursorHint {
-            on_wide_base: false,
-            on_wide_spacer: true,
-            left_is_spacer: false,
-        };
+    fn encode_key_wide_left_on_spacer_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), hint_spacer()),
+            b"\x1b[D\x1b[D"
+        );
+    }
+    #[test]
+    fn encode_key_wide_backspace_after_wide_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::Backspace, none(), TermMode::empty(), hint_after_wide()),
+            [0x7f, 0x7f]
+        );
+    }
+    #[test]
+    fn encode_key_wide_backspace_on_spacer_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::Backspace, none(), TermMode::empty(), hint_spacer()),
+            [0x7f, 0x7f]
+        );
+    }
+    #[test]
+    fn encode_key_wide_backspace_default_is_single() {
+        assert_eq!(
+            encode_key_wide(
+                Key::Backspace,
+                none(),
+                TermMode::empty(),
+                WideCursorHint::default()
+            ),
+            [0x7f]
+        );
+    }
+    #[test]
+    fn encode_key_wide_delete_on_base_and_spacer_doubles() {
+        assert_eq!(
+            encode_key_wide(Key::Delete, none(), TermMode::empty(), hint_base()),
+            b"\x1b[3~\x1b[3~"
+        );
+        assert_eq!(
+            encode_key_wide(Key::Delete, none(), TermMode::empty(), hint_spacer()),
+            b"\x1b[3~\x1b[3~"
+        );
+    }
+    #[test]
+    fn wide_hint_at_reads_base_spacer_after() {
+        // cols: 0 narrow, 1 base, 2 spacer, 3 narrow
+        let line = [
+            CellWide::Narrow,
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+        ];
+        assert_eq!(wide_hint_at(&line, 1), hint_base());
+        assert_eq!(wide_hint_at(&line, 2), hint_spacer()); // left is base, not spacer
+        assert_eq!(wide_hint_at(&line, 3), hint_after_wide());
+    }
+    #[test]
+    fn multi_right_across_two_wide_glyphs_doubles_each() {
+        // Two width-2 glyphs at cols 0-1 and 2-3; start at col 0.
+        let line = [
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+        ];
         let out = process_input_wide(
-            &[key_ev(Key::ArrowLeft, none())],
+            &[
+                key_ev(Key::ArrowRight, none()),
+                key_ev(Key::ArrowRight, none()),
+            ],
             Modifiers::default(),
             TermMode::empty(),
             false,
-            wide,
+            Some((&line, 0)),
         );
-        assert_eq!(out.pty_bytes, b"\x1b[D\x1b[D");
+        // Each Right doubles → 4 CSI C total, landing after second glyph.
+        assert_eq!(out.pty_bytes, b"\x1b[C\x1b[C\x1b[C\x1b[C");
     }
     #[test]
-    fn backspace_when_left_is_spacer_emits_two_del() {
-        // After a width-2 emoji: one Backspace must remove base+spacer, not
-        // leave a white half-cell (spacer orphan).
-        let wide = WideCursorHint {
-            on_wide_base: false,
-            on_wide_spacer: false,
-            left_is_spacer: true,
-        };
+    fn multi_right_stale_hint_would_overshoot_without_col_advance() {
+        // Regression: fixed hint on_wide_base for two Rights must not emit
+        // four CSI when the second press is after the glyph (narrow).
+        let line = [
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+            CellWide::Narrow,
+        ];
         let out = process_input_wide(
-            &[key_ev(Key::Backspace, none())],
+            &[
+                key_ev(Key::ArrowRight, none()),
+                key_ev(Key::ArrowRight, none()),
+            ],
             Modifiers::default(),
             TermMode::empty(),
             false,
-            wide,
+            Some((&line, 0)),
         );
-        assert_eq!(out.pty_bytes, [0x7f, 0x7f]);
-    }
-    #[test]
-    fn backspace_on_wide_spacer_emits_two_del() {
-        let wide = WideCursorHint {
-            on_wide_base: false,
-            on_wide_spacer: true,
-            left_is_spacer: false,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::Backspace, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        assert_eq!(out.pty_bytes, [0x7f, 0x7f]);
-    }
-    #[test]
-    fn backspace_without_wide_hint_is_single() {
-        let out = process_input(
-            &[key_ev(Key::Backspace, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-        );
-        assert_eq!(out.pty_bytes, [0x7f]);
-    }
-    #[test]
-    fn delete_on_wide_base_emits_two() {
-        let wide = WideCursorHint {
-            on_wide_base: true,
-            on_wide_spacer: false,
-            left_is_spacer: false,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::Delete, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        // encode_key Delete → CSI 3~
-        assert_eq!(out.pty_bytes, b"\x1b[3~\x1b[3~");
-    }
-    #[test]
-    fn delete_on_wide_spacer_emits_two() {
-        let wide = WideCursorHint {
-            on_wide_base: false,
-            on_wide_spacer: true,
-            left_is_spacer: false,
-        };
-        let out = process_input_wide(
-            &[key_ev(Key::Delete, none())],
-            Modifiers::default(),
-            TermMode::empty(),
-            false,
-            wide,
-        );
-        assert_eq!(out.pty_bytes, b"\x1b[3~\x1b[3~");
+        // First doubles (leave wide), second single (on narrow) → 3 CSI C.
+        assert_eq!(out.pty_bytes, b"\x1b[C\x1b[C\x1b[C");
     }
 
     // ---- zoom ----------------------------------------------------------------

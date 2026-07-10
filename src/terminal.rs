@@ -986,6 +986,28 @@ impl Session {
         *self.term.mode()
     }
 
+    /// Cursor line as [`CellWide`] classes + column — input seam for wide-char
+    /// key encoding (`encode_key_wide` / `send --keys`).
+    pub fn wide_line_at_cursor(&self) -> (Vec<crate::input::CellWide>, usize) {
+        use alacritty_terminal::term::cell::Flags;
+        use crate::input::CellWide;
+        let g = self.term.grid();
+        let p = g.cursor.point;
+        let cols = g.columns();
+        let mut line = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let f = g[p.line][alacritty_terminal::index::Column(c)].flags;
+            line.push(if f.contains(Flags::WIDE_CHAR) {
+                CellWide::WideBase
+            } else if f.contains(Flags::WIDE_CHAR_SPACER) {
+                CellWide::WideSpacer
+            } else {
+                CellWide::Narrow
+            });
+        }
+        (line, p.column.0)
+    }
+
     /// Counter bumped every time new PTY bytes arrive in `pump()`. The settle
     /// machinery polls this to detect whether a terminal is still producing output.
     pub fn output_gen(&self) -> u64 {
@@ -1241,33 +1263,17 @@ impl Session {
             .as_ref()
             .and_then(|s| s.to_range(&self.term))
             .is_some();
-        // Wide-char key skip: one Left/Right/Backspace/Delete should cross or
-        // remove a full emoji/CJK glyph (base+spacer), not leave a half-cell.
-        let wide = {
-            use alacritty_terminal::term::cell::Flags;
-            let g = self.term.grid();
-            let p = g.cursor.point;
-            let col = p.column.0;
-            let flags = g[p.line][p.column].flags;
-            let on_wide_base = flags.contains(Flags::WIDE_CHAR);
-            let on_wide_spacer = flags.contains(Flags::WIDE_CHAR_SPACER);
-            let left_is_spacer = col > 0
-                && g[p.line][alacritty_terminal::index::Column(col - 1)]
-                    .flags
-                    .contains(Flags::WIDE_CHAR_SPACER);
-            crate::input::WideCursorHint {
-                on_wide_base,
-                on_wide_spacer,
-                left_is_spacer,
-            }
-        };
+        // Wide-char key encode: sample the cursor line once; process_input_wide
+        // advances the simulated column after each key so multi-key batches
+        // re-derive the hint (encode_key_wide is the only policy).
+        let (wide_line, wide_col) = self.wide_line_at_cursor();
         let outcome = ui.input(|i| {
             crate::input::process_input_wide(
                 &i.events,
                 i.modifiers,
                 mode,
                 has_selection,
-                wide,
+                Some((wide_line.as_slice(), wide_col)),
             )
         });
 

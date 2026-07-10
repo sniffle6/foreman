@@ -261,26 +261,43 @@ fn parse_one_key(token: &str) -> Result<(egui::Key, egui::Modifiers), String> {
     Ok((key, mods))
 }
 
-/// Encode a sequence of named key presses into PTY bytes, via the
-/// `input::encode_key` seam (so `send --keys` and the live keyboard never
-/// diverge). Names: `F1`..`F12`, `Up/Down/Left/Right`, `Home/End/PageUp/PageDown/
+/// Encode a sequence of named key presses into PTY bytes via
+/// [`crate::input::encode_key_wide`] (same deep seam as the live keyboard).
+/// Without a grid row, wide-char doubling is off — prefer
+/// [`parse_keys_wide`] when the target Session cursor line is known.
+///
+/// Names: `F1`..`F12`, `Up/Down/Left/Right`, `Home/End/PageUp/PageDown/
 /// Insert/Delete`, `Enter/Tab/Esc/Backspace/Space`, single letters; with
 /// `Ctrl+`/`Alt+`/`Shift+` prefixes. A bare printable letter (no Ctrl/Alt) has no
 /// key-sequence — use `--text` for literal characters; it's an error here.
 pub fn parse_keys(names: &[String], mode: TermMode) -> Result<Vec<u8>, String> {
+    parse_keys_wide(names, mode, &[], 0)
+}
+
+/// Like [`parse_keys`], with a cursor-line of [`crate::input::CellWide`] so
+/// Left/Right/Backspace/Delete skip width-2 glyphs the same as the live
+/// keyboard. `col` is the starting cursor column; advanced after each key.
+pub fn parse_keys_wide(
+    names: &[String],
+    mode: TermMode,
+    line: &[crate::input::CellWide],
+    mut col: usize,
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for token in names {
         if token.is_empty() {
             continue;
         }
         let (key, mods) = parse_one_key(token)?;
-        let bytes = crate::input::encode_key(key, mods, mode);
+        let hint = crate::input::wide_hint_at(line, col);
+        let bytes = crate::input::encode_key_wide(key, mods, mode, hint);
         if bytes.is_empty() {
             return Err(format!(
                 "key '{token}' has no input sequence — use --text for literal characters"
             ));
         }
         out.extend_from_slice(&bytes);
+        col = crate::input::col_after_wide_key(col, key, mods, hint);
     }
     Ok(out)
 }
@@ -458,6 +475,18 @@ mod tests {
             parse_keys(&[s("Up")], TermMode::APP_CURSOR).unwrap(),
             b"\x1bOA"
         );
+    }
+
+    #[test]
+    fn parse_keys_wide_doubles_right_on_wide_base() {
+        use crate::input::CellWide;
+        let line = [
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+        ];
+        let out = parse_keys_wide(&[s("Right")], TermMode::empty(), &line, 0).unwrap();
+        assert_eq!(out, b"\x1b[C\x1b[C");
     }
 
     #[test]
