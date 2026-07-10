@@ -12,6 +12,13 @@ use eframe::egui;
 pub const PANEL_W: f32 = 260.0;
 /// Collapsed rail width (px).
 pub const RAIL_W: f32 = 36.0;
+/// Per-project column width in horizontal (columns) mode (px).
+const GROUP_W: f32 = 200.0;
+/// Horizontal body shorter than this (project row + one tab row) falls back
+/// to the single-line chip strip.
+const STRIP_H: f32 = 48.0;
+/// Chip label truncation budget in strip mode (px).
+const CHIP_LABEL_W: f32 = 90.0;
 
 /// Address of a row in the panel / `surface_target` write seam.
 ///
@@ -106,8 +113,24 @@ impl PanelView {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
 
+        // Flow follows the rect the leaf was given this frame: wider than tall
+        // means the panel is bottom/top-docked and content runs left-to-right.
+        // No stored state — move the leaf back to a tall slot and it flips back.
+        let horizontal = rect.width() > rect.height();
         if self.collapsed {
-            self.paint_rail(ui, rect, base);
+            if horizontal {
+                self.paint_rail_h(ui, rect, base);
+            } else {
+                self.paint_rail(ui, rect, base);
+            }
+            return;
+        }
+        if horizontal {
+            if rect.height() < STRIP_H {
+                self.paint_strip(ui, rect, base);
+            } else {
+                self.paint_columns(ui, rect, base);
+            }
             return;
         }
 
@@ -239,6 +262,354 @@ impl PanelView {
                 self.click = Some(path);
             }
             y += 32.0;
+        }
+    }
+
+    /// Horizontal columns mode: one fixed-width group per project (project row
+    /// on top, its tab rows below), groups flowing left-to-right with a
+    /// hairline between them. Rows reuse `paint_row` — only the cursor advance
+    /// changes (y within a group, x between groups) and the truncation budget
+    /// comes from the group width. Scroll is horizontal only; rows past the
+    /// group height are clipped.
+    fn paint_columns(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let row_h = 22.0;
+        let gap = 9.0; // pad + hairline + pad between groups
+        let n = self.model.projects.len();
+        let content_w = n as f32 * GROUP_W + n.saturating_sub(1) as f32 * gap + 8.0;
+        let max_scroll = (content_w - rect.width()).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+
+        let mut specs: Vec<(egui::Rect, egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
+        let mut dividers: Vec<f32> = Vec::new();
+        let mut x = rect.min.x + 4.0 - self.scroll;
+        for (pi, proj) in self.model.projects.iter().enumerate() {
+            let group = egui::Rect::from_min_size(
+                egui::pos2(x, rect.min.y),
+                egui::vec2(GROUP_W, rect.height()),
+            );
+            if pi + 1 < n {
+                dividers.push(group.max.x + gap * 0.5);
+            }
+            x += GROUP_W + gap;
+            if group.max.x < rect.min.x || group.min.x > rect.max.x {
+                continue; // scrolled out of view: no paint, no interact
+            }
+            let clip = group.intersect(rect);
+            let mut y = rect.min.y + 4.0;
+            let row =
+                egui::Rect::from_min_size(egui::pos2(group.min.x, y), egui::vec2(GROUP_W, row_h));
+            specs.push((
+                row,
+                clip,
+                base.with(("prow", pi, proj.path.project)),
+                RowPaintOwned {
+                    path: proj.path,
+                    title: proj.title.clone(),
+                    kind: None,
+                    focused: proj.focused,
+                    minimized: proj.minimized,
+                    background_tab: false,
+                    exited: false,
+                    project_row: true,
+                },
+            ));
+            y += row_h;
+            for (ti, t) in proj.tabs.iter().enumerate() {
+                if y >= rect.max.y {
+                    break; // below the panel: clipped, never interactive
+                }
+                let row = egui::Rect::from_min_size(
+                    egui::pos2(group.min.x + 12.0, y),
+                    egui::vec2(GROUP_W - 12.0, row_h),
+                );
+                specs.push((
+                    row,
+                    clip,
+                    base.with(("trow", pi, ti, t.path.window, t.path.tab)),
+                    RowPaintOwned {
+                        path: t.path,
+                        title: t.title.clone(),
+                        kind: Some(t.kind),
+                        focused: t.focused,
+                        minimized: t.minimized,
+                        background_tab: !t.active_tab,
+                        exited: t.exited,
+                        project_row: false,
+                    },
+                ));
+                y += row_h;
+            }
+        }
+        for (row, clip, id, rp) in specs {
+            self.paint_row(ui, row, id, clip, rp);
+        }
+        let p = ui.painter_at(rect);
+        for dx in dividers {
+            p.line_segment(
+                [
+                    egui::pos2(dx, rect.min.y + 4.0),
+                    egui::pos2(dx, rect.max.y - 4.0),
+                ],
+                egui::Stroke::new(1.0, BORDER.gamma_multiply(0.6)),
+            );
+        }
+        self.hscroll(ui, rect, base, max_scroll);
+    }
+
+    /// Strip mode: the body is too short for stacked rows, so projects and
+    /// their tabs flow as one line of chips with a hairline divider between
+    /// projects. Click = surface; no hover min/close here — management means
+    /// expanding the panel first.
+    fn paint_strip(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        struct Chip {
+            id: egui::Id,
+            path: TargetPath,
+            galley: std::sync::Arc<egui::Galley>,
+            kind: Option<RowKind>, // None = project chip
+            focused: bool,
+            dim: bool,
+            div_before: bool,
+            w: f32,
+        }
+        let p = ui.painter_at(rect);
+        let chip_h = 24.0;
+        let pad = 10.0;
+        let icon_w = 14.0;
+        let text_gap = 6.0;
+        let chip_gap = 4.0;
+
+        // Pass 1: measure. Galleys use the placeholder color so hover can
+        // recolor them at paint time.
+        let layout = |title: &str| {
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                title.to_string(),
+                egui::FontId::proportional(12.0),
+                egui::Color32::PLACEHOLDER,
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(CHIP_LABEL_W);
+            p.layout_job(job)
+        };
+        let mut chips: Vec<Chip> = Vec::new();
+        for (pi, proj) in self.model.projects.iter().enumerate() {
+            let galley = layout(&proj.title);
+            chips.push(Chip {
+                id: base.with(("pchip", pi, proj.path.project)),
+                path: proj.path,
+                w: pad + icon_w + text_gap + galley.size().x + pad,
+                galley,
+                kind: None,
+                focused: proj.focused,
+                dim: proj.minimized,
+                div_before: pi > 0,
+            });
+            for (ti, t) in proj.tabs.iter().enumerate() {
+                let galley = layout(&t.title);
+                chips.push(Chip {
+                    id: base.with(("tchip", pi, ti, t.path.window, t.path.tab)),
+                    path: t.path,
+                    w: pad + icon_w + text_gap + galley.size().x + pad,
+                    galley,
+                    kind: Some(t.kind),
+                    focused: t.focused,
+                    dim: t.minimized || !t.active_tab || t.exited,
+                    div_before: false,
+                });
+            }
+        }
+        let content_w: f32 = 16.0
+            + chips
+                .iter()
+                .map(|c| c.w + chip_gap + if c.div_before { 9.0 } else { 0.0 })
+                .sum::<f32>();
+        let max_scroll = (content_w - rect.width()).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+
+        // Pass 2: place, interact, paint.
+        let cy = rect.center().y;
+        let mut x = rect.min.x + 8.0 - self.scroll;
+        for chip in chips {
+            if chip.div_before {
+                x += 4.0;
+                p.line_segment(
+                    [egui::pos2(x, cy - 8.0), egui::pos2(x, cy + 8.0)],
+                    egui::Stroke::new(1.0, BORDER.gamma_multiply(0.8)),
+                );
+                x += 5.0;
+            }
+            let chip_rect = egui::Rect::from_min_size(
+                egui::pos2(x, cy - chip_h / 2.0),
+                egui::vec2(chip.w, chip_h),
+            );
+            x += chip.w + chip_gap;
+            if chip_rect.max.x < rect.min.x || chip_rect.min.x > rect.max.x {
+                continue; // scrolled out of view: no paint, no interact
+            }
+            let resp = ui.interact(chip_rect, chip.id, egui::Sense::click());
+            let over = resp.hovered() || resp.contains_pointer();
+            if chip.focused || over {
+                p.rect_filled(chip_rect, egui::CornerRadius::same(5), SEL_BG);
+            }
+            if chip.focused {
+                p.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(chip_rect.min.x, chip_rect.min.y + 4.0),
+                        egui::vec2(2.0, chip_h - 8.0),
+                    ),
+                    0.0,
+                    BORDER_FOCUS,
+                );
+            }
+            let col = if over || chip.focused {
+                TEXT
+            } else if chip.dim {
+                DIM
+            } else if chip.kind.is_none() {
+                TEXT // project chips read brighter, like project rows
+            } else {
+                DIM
+            };
+            let icon_c = egui::pos2(chip_rect.min.x + pad + icon_w / 2.0, cy);
+            match chip.kind {
+                None => {
+                    let tint = if chip.dim {
+                        DIM
+                    } else {
+                        crate::icons::IconKind::Folder.tint()
+                    };
+                    paint_icon(ui, &p, icon_c, 12.0, crate::icons::IconKind::Folder, tint);
+                }
+                Some(RowKind::Terminal(k)) => {
+                    let tint = if chip.dim { DIM } else { k.tint() };
+                    paint_icon(ui, &p, icon_c, 12.0, k, tint);
+                }
+                Some(RowKind::Chat) => {
+                    p.text(
+                        icon_c,
+                        egui::Align2::CENTER_CENTER,
+                        "§",
+                        egui::FontId::proportional(12.0),
+                        col,
+                    );
+                }
+            }
+            let tp = egui::pos2(
+                chip_rect.min.x + pad + icon_w + text_gap,
+                cy - chip.galley.size().y / 2.0,
+            );
+            p.galley(tp, chip.galley, col);
+            if resp.clicked() {
+                self.click = Some(chip.path);
+            }
+        }
+        self.hscroll(ui, rect, base, max_scroll);
+    }
+
+    /// Collapsed horizontal rail: a 36px-tall strip with project icons flowing
+    /// left-to-right and the expand toggle riding the right end *inside* the
+    /// strip — the wm suppresses the header band entirely for a collapsed
+    /// horizontal panel, so this toggle is the only mouse path back out.
+    fn paint_rail_h(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        // The expand glyph points along the grow axis: a bottom-docked panel
+        // expands upward (⌃), a top-docked one downward (⌄). Same side test as
+        // the expanded header's collapse glyph in wm.rs, mirrored.
+        let up = rect.center().y >= ui.max_rect().center().y;
+        let p = ui.painter_at(rect);
+        // Icons clip against the reserved expand-toggle zone at the right end.
+        let icons_max_x = rect.max.x - 28.0;
+        let ip = ui.painter_at(egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(icons_max_x, rect.max.y),
+        ));
+        let rails: Vec<_> = self
+            .model
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(pi, proj)| {
+                (
+                    pi,
+                    proj.path,
+                    proj.title.clone(),
+                    proj.focused,
+                    proj.minimized,
+                )
+            })
+            .collect();
+        let content_w = rails.len() as f32 * 32.0 + 12.0;
+        let max_scroll = (content_w - (icons_max_x - rect.min.x)).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let mut x = rect.min.x + 6.0 - self.scroll;
+        for (pi, path, title, focused, minimized) in rails {
+            let cell = egui::Rect::from_center_size(
+                egui::pos2(x + 14.0, rect.center().y),
+                egui::vec2(28.0, 28.0),
+            );
+            x += 32.0;
+            if cell.max.x < rect.min.x || cell.min.x > icons_max_x {
+                continue; // out of view / under the expand toggle
+            }
+            let resp = ui
+                .interact(
+                    cell,
+                    base.with(("rail", pi, path.project)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(&title);
+            if focused || resp.hovered() {
+                ip.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
+            }
+            if focused {
+                // Horizontal rail: the focus stripe is an underline.
+                ip.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(cell.min.x + 4.0, cell.max.y - 4.0),
+                        egui::vec2(cell.width() - 8.0, 2.0),
+                    ),
+                    0.0,
+                    BORDER_FOCUS,
+                );
+            }
+            let tint = if minimized {
+                DIM
+            } else {
+                crate::icons::IconKind::Folder.tint()
+            };
+            paint_icon(
+                ui,
+                &ip,
+                cell.center(),
+                14.0,
+                crate::icons::IconKind::Folder,
+                tint,
+            );
+            if resp.clicked() {
+                self.click = Some(path);
+            }
+        }
+        let br = egui::Rect::from_center_size(
+            egui::pos2(rect.max.x - 14.0, rect.center().y),
+            egui::vec2(22.0, 22.0),
+        );
+        let resp = ui.interact(br, base.with("rail-expand"), egui::Sense::click());
+        if resp.hovered() {
+            p.rect_filled(br, egui::CornerRadius::same(4), SEL_BG);
+        }
+        paint_chevron(&p, br.center(), up, if resp.hovered() { TEXT } else { DIM });
+        if resp.clicked() {
+            self.toggle_collapse = true;
+        }
+        self.hscroll(ui, rect, base, max_scroll);
+    }
+
+    /// Wheel → x-offset for the horizontal modes. Mouse wheels have no x axis,
+    /// so the vertical delta drives the horizontal scroll; `.x` is added for
+    /// trackpads that do emit it.
+    fn hscroll(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id, max_scroll: f32) {
+        let resp = ui.interact(rect, base.with("panel-scroll"), egui::Sense::hover());
+        let d = ui.input(|i| i.smooth_scroll_delta);
+        let scroll = d.x + d.y;
+        if resp.hovered() && scroll != 0.0 {
+            self.scroll = (self.scroll - scroll).clamp(0.0, max_scroll);
         }
     }
 
@@ -412,6 +783,23 @@ struct RowPaintOwned {
     background_tab: bool,
     exited: bool,
     project_row: bool,
+}
+
+/// An up/down chevron as two line segments. The default egui fonts have no
+/// glyph for U+2303/U+2304 (they render as tofu), so the expand/collapse
+/// arrows are drawn as vector strokes — same policy as the wm control icons.
+pub(crate) fn paint_chevron(p: &egui::Painter, c: egui::Pos2, up: bool, color: egui::Color32) {
+    let (hw, hh) = (4.0, 2.2);
+    let dy = if up { hh } else { -hh };
+    let stroke = egui::Stroke::new(1.4, color);
+    p.line_segment(
+        [egui::pos2(c.x - hw, c.y + dy), egui::pos2(c.x, c.y - dy)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(c.x, c.y - dy), egui::pos2(c.x + hw, c.y + dy)],
+        stroke,
+    );
 }
 
 fn row_visible(row: egui::Rect, clip: egui::Rect) -> bool {

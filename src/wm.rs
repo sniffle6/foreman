@@ -3331,25 +3331,21 @@ impl WindowManager {
                     // Vertical (right-docked) panel: chevrons point at the
                     // right edge as before. Expanded horizontal: collapse
                     // points at the docked edge — `scr` vs the desktop area
-                    // says whether that's the top or the bottom.
-                    let glyph = if collapsed {
-                        "«"
-                    } else if scr.width() > scr.height() {
-                        if scr.center().y < area.center().y {
-                            "⌃"
-                        } else {
-                            "⌄"
-                        }
+                    // says whether that's the top or the bottom. Up/down are
+                    // vector strokes: the default fonts have no U+2303/U+2304.
+                    let col = if is_focus { TEXT } else { DIM };
+                    if !collapsed && scr.width() > scr.height() {
+                        let up = scr.center().y < area.center().y;
+                        crate::panel::paint_chevron(ui.painter(), br.center(), up, col);
                     } else {
-                        "»"
-                    };
-                    ui.painter().text(
-                        br.center(),
-                        egui::Align2::CENTER_CENTER,
-                        glyph,
-                        egui::FontId::proportional(13.0),
-                        if is_focus { TEXT } else { DIM },
-                    );
+                        ui.painter().text(
+                            br.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if collapsed { "«" } else { "»" },
+                            egui::FontId::proportional(13.0),
+                            col,
+                        );
+                    }
                     if resp.clicked() {
                         let active = self.windows[i].active;
                         if let Content::TaskManager(v) = &mut self.windows[i].tabs[active].content {
