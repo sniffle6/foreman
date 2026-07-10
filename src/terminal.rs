@@ -1090,6 +1090,16 @@ impl Session {
         let _ = self.writer.flush();
     }
 
+    /// Clipboard paste through the same mode-gated helper the keyboard paths
+    /// use (`Event::Paste` / Ctrl+Shift+V): honors bracketed-paste mode and
+    /// strips payload ESC. Right-click paste must not bypass this — raw
+    /// clipboard bytes submit multi-line pastes line by line and let a
+    /// malicious clipboard inject escape sequences.
+    fn paste_text(&mut self, txt: &str) {
+        let seq = crate::input::paste_seq(*self.term.mode(), txt);
+        self.send(&seq);
+    }
+
     /// Pointer → buffer-coord selection point + cell side: the viewport cell
     /// under the pixel, shifted into buffer space by the scrollback offset.
     fn sel_point(&self, metrics: &crate::geom::CellMetrics, p: egui::Pos2) -> (Point, Side) {
@@ -1226,7 +1236,7 @@ impl Session {
             }
             if resp.secondary_clicked() {
                 if let Some(txt) = read_clipboard() {
-                    self.send(txt.as_bytes());
+                    self.paste_text(&txt);
                 }
             }
             self.read_input(ui);
@@ -1829,6 +1839,45 @@ mod tests {
             !interior.contains(&0x1b),
             "payload ESC must be stripped: {b:?}"
         );
+    }
+
+    #[test]
+    fn paste_text_honors_bracketed_paste_and_strips_esc() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut s = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.rx = rx;
+        let writes: RecordedWrites = Arc::new(Mutex::new(Vec::new()));
+        s.writer = Box::new(TitleRecordingWriter {
+            title: Arc::clone(&s.osc_title),
+            writes: Arc::clone(&writes),
+        });
+
+        // App enables bracketed paste → wrapped, payload ESC stripped.
+        tx.send(b"\x1b[?2004h".to_vec()).unwrap();
+        s.pump();
+        s.paste_text("a\x1b[201~b\nc");
+        assert_eq!(
+            writes.lock().unwrap().last().unwrap().0,
+            b"\x1b[200~a[201~b\nc\x1b[201~"
+        );
+
+        // App disables it → plain bytes, ESC still stripped.
+        tx.send(b"\x1b[?2004l".to_vec()).unwrap();
+        s.pump();
+        s.paste_text("a\x1b[201~b\nc");
+        assert_eq!(writes.lock().unwrap().last().unwrap().0, b"a[201~b\nc");
     }
 
     #[test]
