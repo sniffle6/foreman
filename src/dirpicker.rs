@@ -312,9 +312,21 @@ fn with_sep(p: &Path) -> String {
     s
 }
 
+/// Dropdown vertical rule: grow with the number of rows, never past this cap.
+/// Independent of field Y / free space under the field (that made landing vs
+/// the `+` modal disagree). Horizontal stays the field width.
+const DROPDOWN_MAX_H: f32 = 280.0;
+
 impl DirPicker {
     /// Inline render: field + dropdown into the current `ui`. Placement-agnostic.
+    /// Landing uses this so ↓ past the last row can exit downward onto icons.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Outcome {
+        self.show_inner(ui, true)
+    }
+
+    /// `exit_down`: landing wants ↓ past the last row to close the popup
+    /// (`PassedEnd`); the `+` project modal clamps on the last row instead.
+    fn show_inner(&mut self, ui: &mut egui::Ui, exit_down: bool) -> Outcome {
         let id = egui::Id::new("dirpicker-field");
 
         let mut outcome = Outcome::Pending;
@@ -347,8 +359,8 @@ impl DirPicker {
                 self.move_up();
                 self.scroll_to_sel = true;
             }
-            // ↓ past the last row exits the popup downward (see Outcome::PassedEnd).
-            let past_end = down && self.selected + 1 >= self.rows_len();
+            // ↓ past the last row: landing exits downward; modal clamps (move_down).
+            let past_end = exit_down && down && self.selected + 1 >= self.rows_len();
             if down && !past_end {
                 self.move_down();
                 self.scroll_to_sel = true;
@@ -483,43 +495,69 @@ impl DirPicker {
                 );
             }
 
-            // Dropdown, in a popup Area anchored under the field.
+            // Dropdown under the field.
+            // Vertical rule (explicit, not "space under field"):
+            //   height = min((dirs + 1 for ../) * row_h, DROPDOWN_MAX_H), scroll.
+            // Horizontal: field width.
+            // constrain(false): mid-screen landing must not relocate the Area.
+            let rows = self.rows();
+            let row_h = ui.spacing().interact_size.y;
+            // rows already includes Parent when the base has one; still count
+            // height as directories + 1 so the '../' row always has a slot (and so a
+            // slightly short row_h never clips the last line).
+            let n_dirs = rows
+                .iter()
+                .filter(|r| matches!(r, Row::Dir(_)))
+                .count();
+            let n_rows = n_dirs + 1; // +1 for ../
+            let drop_h = if rows.is_empty() {
+                0.0
+            } else {
+                ((n_rows as f32) * row_h).min(DROPDOWN_MAX_H)
+            };
             let mut clicked: Option<usize> = None;
-            egui::Area::new(id.with("drop"))
-                .fixed_pos(field_rect.left_bottom() + egui::vec2(0.0, 2.0))
-                .order(egui::Order::Foreground)
-                .show(ui.ctx(), |ui| {
-                    ui.set_max_width(field_rect.width());
-                    // Fill the space actually available under the field (capped),
-                    // instead of a fixed height: a constant either wastes tall
-                    // windows or overflows short ones — and an overflowing Area
-                    // gets relocated/squeezed by egui's screen constrain.
-                    let below =
-                        (ui.ctx().content_rect().bottom() - field_rect.bottom() - 24.0).max(72.0);
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(below.min(420.0))
-                            .show(ui, |ui| {
-                                for (idx, row) in self.rows().into_iter().enumerate() {
-                                    let label = match &row {
-                                        Row::Parent => "../".to_string(),
-                                        Row::Dir(p) => p
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned(),
-                                    };
-                                    let resp = ui.selectable_label(idx == self.selected, label);
-                                    if resp.clicked() {
-                                        clicked = Some(idx);
+            if drop_h > 0.0 {
+                egui::Area::new(id.with("drop"))
+                    .fixed_pos(field_rect.left_bottom() + egui::vec2(0.0, 2.0))
+                    .order(egui::Order::Foreground)
+                    .constrain(false)
+                    .movable(false)
+                    .default_size(egui::vec2(field_rect.width(), drop_h))
+                    .show(ui.ctx(), |ui| {
+                        ui.set_max_width(field_rect.width());
+                        ui.set_min_width(field_rect.width());
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            // Exact height from row count (capped). Do not rely on
+                            // ScrollArea auto-shrink alone — Area default/memory
+                            // sizing was leaving the list stuck at max height.
+                            egui::ScrollArea::vertical()
+                                .max_height(drop_h)
+                                .min_scrolled_height(drop_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(field_rect.width() - 12.0);
+                                    for (idx, row) in rows.into_iter().enumerate() {
+                                        let label = match &row {
+                                            Row::Parent => "../".to_string(),
+                                            Row::Dir(p) => p
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        };
+                                        let resp =
+                                            ui.selectable_label(idx == self.selected, label);
+                                        if resp.clicked() {
+                                            clicked = Some(idx);
+                                        }
+                                        if idx == self.selected && self.scroll_to_sel {
+                                            resp.scroll_to_me(Some(egui::Align::Center));
+                                        }
                                     }
-                                    if idx == self.selected && self.scroll_to_sel {
-                                        resp.scroll_to_me(Some(egui::Align::Center));
-                                    }
-                                }
-                            });
+                                });
+                        });
                     });
-                });
+            }
             if let Some(idx) = clicked {
                 self.selected = idx;
                 self.complete();
@@ -531,8 +569,8 @@ impl DirPicker {
         outcome
     }
 
-    /// Leader-invoked modal: `show` inside a top-center floating Area with a
-    /// subtle scrim (the modality signal), replacing the old centered Window.
+    /// Leader / "+" project modal: top-center floating Area with a scrim.
+    /// ↓ clamps on the last row (does not collapse the dropdown).
     pub fn show_modal(&mut self, ui: &mut egui::Ui) -> Outcome {
         let screen = ui.ctx().content_rect();
         ui.painter()
@@ -543,7 +581,7 @@ impl DirPicker {
             .show(ui.ctx(), |ui| {
                 ui.set_max_width(520.0);
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    outcome = self.show(ui);
+                    outcome = self.show_inner(ui, false);
                 });
             });
         outcome

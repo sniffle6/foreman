@@ -3713,8 +3713,8 @@ impl WindowManager {
     fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
             match picker.show_modal(ui) {
-                // PassedEnd: nothing sits below the leader modal's field —
-                // treat ↓-past-the-end like Pending and keep the picker up.
+                // show_modal clamps ↓ on the last row (never emits PassedEnd);
+                // keep the Pending arm defensive in case that changes.
                 Outcome::Pending | Outcome::PassedEnd => self.picker = Some(picker),
                 Outcome::Cancelled => {}
                 Outcome::Accepted(path) => {
