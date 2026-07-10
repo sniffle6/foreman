@@ -375,13 +375,16 @@ struct MonoBg {
     color: egui::Color32,
 }
 
-/// Memoized per-placement galleys + bg rects for a pane. On key hit, show()
-/// re-blits only (0 layout_*). Rebuild skips blank galleys and dedupes by
-/// (char, style). Absolute pixel positions are never cached.
+/// Memoized per-placement galleys + bg rects + emoji stamp sites for a pane.
+/// On key hit, show() re-blits only (0 layout_*). Rebuild skips blank galleys
+/// and dedupes by (char, style). Absolute pixel positions are never cached.
+/// `emoji_sites` ride the same mono key so cache hits still have stamp targets
+/// without re-running `plan_paint` or busting mono memo when the atlas fills.
 struct MonoPaintCache {
     key: MonoPaintKey,
     items: std::sync::Arc<Vec<MonoGlyph>>,
     bgs: std::sync::Arc<Vec<MonoBg>>,
+    emoji_sites: std::sync::Arc<Vec<crate::frame::EmojiSite>>,
 }
 
 impl MonoPaintCache {
@@ -397,28 +400,52 @@ impl MonoPaintCache {
             },
             items: std::sync::Arc::new(Vec::new()),
             bgs: std::sync::Arc::new(Vec::new()),
+            emoji_sites: std::sync::Arc::new(Vec::new()),
         }
     }
 
-    /// On key match: return cached items/bgs (rebuild not called — 0 layouts).
+    /// On key match: return cached items/bgs/sites (rebuild not called — 0 layouts).
     /// On miss: call `rebuild`, store, return. Production and tests share this path.
     fn get_or_rebuild(
         &mut self,
         key: MonoPaintKey,
-        rebuild: impl FnOnce() -> (Vec<MonoGlyph>, Vec<MonoBg>),
+        rebuild: impl FnOnce() -> (
+            Vec<MonoGlyph>,
+            Vec<MonoBg>,
+            Vec<crate::frame::EmojiSite>,
+        ),
     ) -> (
         std::sync::Arc<Vec<MonoGlyph>>,
         std::sync::Arc<Vec<MonoBg>>,
+        std::sync::Arc<Vec<crate::frame::EmojiSite>>,
     ) {
         if self.key == key {
-            return (self.items.clone(), self.bgs.clone());
+            return (
+                self.items.clone(),
+                self.bgs.clone(),
+                self.emoji_sites.clone(),
+            );
         }
-        let (items, bgs) = rebuild();
+        let (items, bgs, emoji_sites) = rebuild();
         self.key = key;
         self.items = std::sync::Arc::new(items);
         self.bgs = std::sync::Arc::new(bgs);
-        (self.items.clone(), self.bgs.clone())
+        self.emoji_sites = std::sync::Arc::new(emoji_sites);
+        (
+            self.items.clone(),
+            self.bgs.clone(),
+            self.emoji_sites.clone(),
+        )
     }
+}
+
+/// Drop emoji textures whose px size no longer matches the live font-derived
+/// size (zoom churn). Pure so unit tests can cover the eviction policy.
+fn retain_emoji_textures_at_px<T>(
+    map: &mut std::collections::HashMap<(char, u32), T>,
+    px: u32,
+) {
+    map.retain(|(_, entry_px), _| *entry_px == px);
 }
 
 /// Rebuild content-only mono galleys + SGR bg cells from a paint plan.
@@ -524,6 +551,13 @@ pub struct Session {
     // Memoized grid-locked mono paint + the key it was built for. On a key hit
     // show() re-blits Arc clones (0 layout_*). Invalidated by any key change.
     mono_paint: Option<MonoPaintCache>,
+    /// Color-emoji rasterizer (DirectWrite on Windows, null elsewhere). Fail-open:
+    /// `None` from `color_glyph` leaves the mono glyph alone.
+    emoji_raster: Box<dyn crate::emoji_raster::EmojiRaster>,
+    /// Separate emoji stamp texture cache. Key is `(char, font-derived px)` so
+    /// zoom changes miss rather than stretching stale bitmaps. Evicted by px on
+    /// paint — never invalidates the mono paint memo.
+    emoji_textures: std::collections::HashMap<(char, u32), egui::TextureHandle>,
     // The Caret gate: decides which cell the painted caret rests at, de-jittering
     // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
     // state; fed every frame in show(). See `crate::caret`.
@@ -811,6 +845,8 @@ impl Session {
             output_gen: 0,
             content_gen: 0,
             mono_paint: None,
+            emoji_raster: crate::emoji_raster::system_emoji_raster(),
+            emoji_textures: std::collections::HashMap::new(),
             caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
             textures: std::collections::HashMap::new(),
@@ -1414,42 +1450,47 @@ impl Session {
         };
         // Plan only on miss so cache hits stay free of plan_paint + layout_*.
         // Built before borrowing mono_paint mutably (self.term vs cache).
+        // emoji_sites are stored with the mono key so hits still stamp without
+        // replan; atlas fill never changes this key (separate texture cache).
         let plan = match &self.mono_paint {
             Some(c) if c.key == key => None,
             _ => Some(crate::frame::plan_paint(self.term.grid(), &metrics)),
         };
-        let cache = self.mono_paint.get_or_insert_with(MonoPaintCache::empty);
-        let (items, bgs) = cache.get_or_rebuild(key, || {
-            let plan = plan.expect("rebuild closure only runs on cache miss");
-            let mut layout = |ch: char, st: GlyphStyle| {
-                note_layout_call();
-                let line = |on: bool| {
-                    if on {
-                        egui::Stroke::new(1.0, st.fg)
-                    } else {
-                        egui::Stroke::NONE
-                    }
+        let (items, bgs, emoji_sites) = {
+            let cache = self.mono_paint.get_or_insert_with(MonoPaintCache::empty);
+            cache.get_or_rebuild(key, || {
+                let plan = plan.expect("rebuild closure only runs on cache miss");
+                let mut layout = |ch: char, st: GlyphStyle| {
+                    note_layout_call();
+                    let line = |on: bool| {
+                        if on {
+                            egui::Stroke::new(1.0, st.fg)
+                        } else {
+                            egui::Stroke::NONE
+                        }
+                    };
+                    let mut job = LayoutJob::default();
+                    job.wrap.max_width = f32::INFINITY;
+                    // Cell SGR bg paints via the MonoBg rect pass (incl. blank cells);
+                    // keep TextFormat background transparent so we don't double-fill.
+                    job.append(
+                        &ch.to_string(),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::monospace(font_px),
+                            color: st.fg,
+                            background: egui::Color32::TRANSPARENT,
+                            underline: line(st.underline),
+                            strikethrough: line(st.strikethrough),
+                            ..Default::default()
+                        },
+                    );
+                    painter.layout_job(job)
                 };
-                let mut job = LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                // Cell SGR bg paints via the MonoBg rect pass (incl. blank cells);
-                // keep TextFormat background transparent so we don't double-fill.
-                job.append(
-                    &ch.to_string(),
-                    0.0,
-                    egui::TextFormat {
-                        font_id: egui::FontId::monospace(font_px),
-                        color: st.fg,
-                        background: egui::Color32::TRANSPARENT,
-                        underline: line(st.underline),
-                        strikethrough: line(st.strikethrough),
-                        ..Default::default()
-                    },
-                );
-                painter.layout_job(job)
-            };
-            mono_paint_items(&plan, &mut layout)
-        });
+                let (items, bgs) = mono_paint_items(&plan, &mut layout);
+                (items, bgs, plan.emoji_sites)
+            })
+        };
         for bg in bgs.iter() {
             painter.rect_filled(
                 metrics.cell_rect(bg.row, bg.col),
@@ -1463,6 +1504,47 @@ impl Session {
                 g.galley.clone(),
                 FG,
             );
+        }
+
+        // Color emoji stamps — separate texture cache (char, px). Fail-open:
+        // atlas None leaves mono alone. Success: bg rect over mono, then image
+        // (RGBA stamps have transparent bg; plain cover would double-draw).
+        // Never rebuilds mono cache on atlas hit/miss.
+        let emoji_px = font_px.round().max(1.0) as u32;
+        retain_emoji_textures_at_px(&mut self.emoji_textures, emoji_px);
+        if !emoji_sites.is_empty() {
+            let off = self.term.grid().display_offset() as i32;
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            for site in emoji_sites.iter() {
+                let tex = match self.emoji_textures.get(&(site.ch, emoji_px)) {
+                    Some(t) => Some(t.clone()),
+                    None => match self.emoji_raster.color_glyph(site.ch, emoji_px) {
+                        Some(g) => {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [g.w as usize, g.h as usize],
+                                &g.rgba,
+                            );
+                            let t = ui.ctx().load_texture(
+                                format!("emoji_{}_{}", site.ch as u32, emoji_px),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.emoji_textures.insert((site.ch, emoji_px), t.clone());
+                            Some(t)
+                        }
+                        None => None,
+                    },
+                };
+                let Some(tex) = tex else { continue };
+                // Cover mono glyph with cell bg, then stamp (transparent RGBA).
+                let cell = &self.term.grid()[Line(site.row as i32 - off)][Column(site.col)];
+                let style = glyph_style(cell.flags, cell.fg, cell.bg);
+                let bg = style.bg.unwrap_or(BG);
+                let end_col = site.col + (site.width_cells as usize).saturating_sub(1);
+                let span = metrics.span_rect(site.row, site.col, end_col);
+                painter.rect_filled(span, egui::CornerRadius::ZERO, bg);
+                painter.image(tex.id(), span, uv, egui::Color32::WHITE);
+            }
         }
 
         // Kitty graphics overlay — images are pure overlay; the grid stays
@@ -1734,11 +1816,17 @@ mod tests {
             note_layout_call();
             dummy_galley_for_tests('x')
         };
-        let _ = cache.get_or_rebuild(key, || mono_paint_items(&plan, &mut layout));
+        let _ = cache.get_or_rebuild(key, || {
+            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+            (items, bgs, plan.emoji_sites.clone())
+        });
         let first = layout_call_count();
         assert!(first > 0);
         reset_layout_call_count();
-        let _ = cache.get_or_rebuild(key, || mono_paint_items(&plan, &mut layout));
+        let _ = cache.get_or_rebuild(key, || {
+            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+            (items, bgs, plan.emoji_sites.clone())
+        });
         assert_eq!(layout_call_count(), 0, "cache hit must not layout");
     }
 
@@ -1782,13 +1870,16 @@ mod tests {
             note_layout_call();
             dummy_galley_for_tests('z')
         };
-        let (items_a, _) = cache.get_or_rebuild(key, || mono_paint_items(&plan, &mut layout));
+        let (items_a, _, _) = cache.get_or_rebuild(key, || {
+            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+            (items, bgs, plan.emoji_sites.clone())
+        });
         assert!(layout_call_count() > 0);
         let pos_a = m_a.cell_rect(items_a[0].row, items_a[0].col).min;
         assert_eq!(pos_a, m_a.cell_rect(0, 0).min);
 
         reset_layout_call_count();
-        let (items_b, _) = cache.get_or_rebuild(key, || {
+        let (items_b, _, _) = cache.get_or_rebuild(key, || {
             panic!("cache hit must not rebuild");
         });
         assert_eq!(layout_call_count(), 0, "origin change must not layout");
@@ -1797,6 +1888,57 @@ mod tests {
         assert_ne!(pos_a, pos_b, "blit pos must track new pane origin");
         // Cached content is grid identity, not absolute pixels.
         assert_eq!((items_b[0].row, items_b[0].col), (0, 0));
+    }
+
+    #[test]
+    fn emoji_texture_retain_evicts_stale_px() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(('🥒', 14u32), 1u8);
+        map.insert(('🚀', 14u32), 2u8);
+        map.insert(('🥒', 20u32), 3u8);
+        retain_emoji_textures_at_px(&mut map, 14);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&('🥒', 14)));
+        assert!(map.contains_key(&('🚀', 14)));
+        assert!(!map.contains_key(&('🥒', 20)));
+    }
+
+    #[test]
+    fn mono_paint_cache_hit_keeps_emoji_sites_without_rebuild() {
+        let sites = vec![crate::frame::EmojiSite {
+            row: 0,
+            col: 0,
+            ch: '🥒',
+            width_cells: 2,
+        }];
+        let plan = crate::frame::PaintPlan {
+            glyphs: vec![crate::frame::GlyphPlacement {
+                row: 0,
+                col: 0,
+                ch: '🥒',
+                style: default_style(),
+                width_cells: 2,
+            }],
+            emoji_sites: sites.clone(),
+        };
+        let key = MonoPaintKey {
+            content_gen: 1,
+            off: 0,
+            cols: 2,
+            rows: 1,
+            font_bits: 14.0f32.to_bits(),
+        };
+        let mut cache = MonoPaintCache::empty();
+        let mut layout = |_ch: char, _s: GlyphStyle| dummy_galley_for_tests('x');
+        let (_, _, got) = cache.get_or_rebuild(key, || {
+            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+            (items, bgs, plan.emoji_sites.clone())
+        });
+        assert_eq!(*got, sites);
+        let (_, _, hit) = cache.get_or_rebuild(key, || {
+            panic!("cache hit must not rebuild (sites still available)");
+        });
+        assert_eq!(*hit, sites);
     }
 
     #[test]
