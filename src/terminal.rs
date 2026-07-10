@@ -32,6 +32,29 @@ pub fn take_pty_output() -> bool {
     PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-thread count of text layout calls during terminal paint. Thread-local so
+/// parallel `cargo test` workers cannot clobber each other (unlike a process-wide
+/// atomic). Cheap enough to leave on in normal builds so Session paint can call
+/// [`note_layout_call`] without cfg gymnastics. Task 3 wires the note sites.
+thread_local! {
+    static LAYOUT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has noted a layout call since the last reset.
+pub(crate) fn layout_call_count() -> u64 {
+    LAYOUT_CALLS.with(|c| c.get())
+}
+
+/// Zero the per-thread layout-call counter (test seam / frame gate).
+pub(crate) fn reset_layout_call_count() {
+    LAYOUT_CALLS.with(|c| c.set(0));
+}
+
+/// Record one Galley/layout creation on the Session paint path.
+pub(crate) fn note_layout_call() {
+    LAYOUT_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 fn indexed_rgb(i: u8) -> egui::Color32 {
     if (i as usize) < 16 {
         return PALETTE[i as usize];
@@ -1436,6 +1459,17 @@ mod tests {
 
     fn named(n: NamedColor) -> AnsiColor {
         AnsiColor::Named(n)
+    }
+
+    #[test]
+    fn layout_counter_increments_when_noted() {
+        reset_layout_call_count();
+        assert_eq!(layout_call_count(), 0);
+        note_layout_call();
+        note_layout_call();
+        assert_eq!(layout_call_count(), 2);
+        reset_layout_call_count();
+        assert_eq!(layout_call_count(), 0);
     }
 
     #[test]
