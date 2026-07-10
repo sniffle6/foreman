@@ -43,7 +43,7 @@ fn holds(n: &Node, id: WinId) -> bool {
 
 /// Deepest split on `axis` along the path to `id` where `edge` is interior:
 /// (address-of-split, child-index, avail-extent-px). Shared by `resize_edge`
-/// and `set_leaf_width`.
+/// and `set_leaf_extent`.
 fn find_interior_split(
     n: &Node,
     r: egui::Rect,
@@ -520,11 +520,7 @@ impl LayoutTree {
         true
     }
 
-    /// Pin leaf `id`'s width to `target_px` by moving the divider it shares
-    /// with its nearest H-axis sibling. Unlike `resize_edge`, the pinned leaf
-    /// may drop below MIN_RATIO (the collapsed task-manager rail is far
-    /// narrower than any tile); the sibling still clamps at MIN_RATIO. False
-    /// when the leaf has no interior H divider (sole leaf / empty tree).
+    /// Pin leaf `id`'s width to `target_px`: `set_leaf_extent` on the H axis.
     pub fn set_leaf_width(
         &mut self,
         id: WinId,
@@ -532,10 +528,32 @@ impl LayoutTree {
         area: egui::Rect,
         gap: f32,
     ) -> bool {
-        for edge in [Dir::Right, Dir::Left] {
+        self.set_leaf_extent(id, SplitDir::H, target_px, area, gap)
+    }
+
+    /// Pin leaf `id`'s extent along `axis` (H = width, V = height) to
+    /// `target_px` by moving the divider it shares with its nearest sibling on
+    /// that axis. Unlike `resize_edge`, the pinned leaf may drop below
+    /// MIN_RATIO (the collapsed task-manager rail is far narrower than any
+    /// tile); the sibling still clamps at MIN_RATIO. False when the leaf has
+    /// no interior divider on `axis` (sole leaf / empty tree / axis unused
+    /// anywhere above the leaf).
+    pub fn set_leaf_extent(
+        &mut self,
+        id: WinId,
+        axis: SplitDir,
+        target_px: f32,
+        area: egui::Rect,
+        gap: f32,
+    ) -> bool {
+        let edges = match axis {
+            SplitDir::H => [Dir::Right, Dir::Left],
+            SplitDir::V => [Dir::Down, Dir::Up],
+        };
+        for edge in edges {
             let found = match &self.root {
                 Some(r) => {
-                    find_interior_split(r, area.shrink(gap), id, edge, SplitDir::H, gap, Vec::new())
+                    find_interior_split(r, area.shrink(gap), id, edge, axis, gap, Vec::new())
                 }
                 None => None,
             };
@@ -898,5 +916,56 @@ mod tests {
         let p = t.layout(area(), 8.0);
         let r1 = p.iter().find(|(w, _)| *w == 1).unwrap().1;
         assert!((r1.width() - 97.6).abs() < 0.5, "got {}", r1.width());
+    }
+
+    // ── set_leaf_extent, V axis (mirrors the set_leaf_width trio) ───────────
+
+    #[test]
+    fn set_leaf_extent_v_pins_a_leaf_below_min_ratio() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Down); // 1 stacked over 2
+        assert!(t.set_leaf_extent(2, SplitDir::V, 36.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
+        assert!((r2.height() - 36.0).abs() < 0.5, "got {}", r2.height());
+    }
+
+    #[test]
+    fn set_leaf_extent_v_reaches_a_leaf_nested_in_an_h_row() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Down);
+        t.insert_split(2, 3, Dir::Right); // bottom row sits 2 beside 3
+        assert!(t.set_leaf_extent(2, SplitDir::V, 200.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r2 = p.iter().find(|(w, _)| *w == 2).unwrap().1;
+        let r3 = p.iter().find(|(w, _)| *w == 3).unwrap().1;
+        assert!((r2.height() - 200.0).abs() < 0.5, "got {}", r2.height());
+        assert!((r3.height() - 200.0).abs() < 0.5); // same row follows
+    }
+
+    #[test]
+    fn set_leaf_extent_v_is_false_for_a_sole_leaf_and_clamps_the_sibling() {
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        assert!(!t.set_leaf_extent(1, SplitDir::V, 36.0, area(), 8.0));
+        // [1 / 2]: growing 2 to nearly everything leaves 1 at MIN_RATIO
+        t.insert_split(1, 2, Dir::Down);
+        assert!(t.set_leaf_extent(2, SplitDir::V, 750.0, area(), 8.0));
+        let p = t.layout(area(), 8.0);
+        let r1 = p.iter().find(|(w, _)| *w == 1).unwrap().1;
+        assert!((r1.height() - 77.6).abs() < 0.5, "got {}", r1.height());
+    }
+
+    #[test]
+    fn set_leaf_extent_v_is_false_when_only_h_dividers_exist() {
+        // The axis probe is what lets the wm try H then fall back to V:
+        // an H-only tree must refuse a V pin (and vice versa).
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Right); // [1 | 2] — no V split anywhere
+        assert!(!t.set_leaf_extent(2, SplitDir::V, 36.0, area(), 8.0));
+        assert!(t.set_leaf_extent(2, SplitDir::H, 36.0, area(), 8.0));
     }
 }
