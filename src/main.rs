@@ -6,6 +6,7 @@ mod confirm;
 mod conpty_install;
 mod control;
 mod dirpicker;
+mod emoji_raster;
 mod frame;
 mod geom;
 mod graphics;
