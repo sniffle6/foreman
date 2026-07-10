@@ -135,6 +135,17 @@ impl PanelView {
         }
 
         let row_h = 22.0;
+        // Entry clamp: `scroll` may carry a large x-offset back from a wide
+        // horizontal dock; without it every row paints above the rect (panel
+        // looks empty) until the first wheel tick re-clamps.
+        let content_h: f32 = 4.0
+            + self
+                .model
+                .projects
+                .iter()
+                .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
+                .sum::<f32>();
+        self.scroll = self.scroll.clamp(0.0, (content_h - rect.height()).max(0.0));
         let mut y = rect.min.y + 4.0 - self.scroll;
         let start_y = y;
 
