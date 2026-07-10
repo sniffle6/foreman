@@ -214,15 +214,38 @@ with the hosting grid, no frontend redraw-ownership strategy fixed the old
 build. The current DSR/CPR path addresses that coordinate only; it still does not
 make the two buffers reflow identically.
 
+## Residual matrix (Phase 0, re-run 2026-07-09 on HEAD)
+
+Probes: `cargo test --release <name> -- --ignored --nocapture` with the
+sideloaded pair beside the test exe.
+
+| ID | Gesture | Result on 1.25 + CPR + `resize_anchored` | Class |
+|----|---------|------------------------------------------|-------|
+| R1/R2 | Width shrink + wrapped pending + Up history (`resize_recall_probe`) | **CPR fires** (`ESC[6n` → matching `PTY_REPLY`); recall lands on host cursor row; **stale pending wrap text remains** on the previous row | A — known residual (content/redraw, not cursor) |
+| R3 | Height grow + type (`typed_echo_lands_on_the_prompt_after_a_height_grow`) | **Pass** — echo on prompt | Pass |
+| R3b | Height shrink (e.g. drag bottom edge up) then grow again | Content stays at the **old absolute rows**; blank band below (prompt mid/top of taller pane). Typing still lands on the prompt | A — **expected look**, not a typing desync. ConPTY anchors on grow; `resize_anchored` matches. No small clean fix for “always glue prompt to bottom” without undoing that agreement |
+| R4 | Width 100→60→100 wrap drag + type (`resize_drag_probe`) | **Pass this run** — `echo_row == prompt_row`; content-loss mechanism still possible under other timings | A — cursor mitigated; content risk remains |
+| R5 | Height grow while alt-screen, quit to primary | **Open** — `resize_anchored` only sees the active grid. `Term::swap_alt` **cannot** be used to touch the inactive primary: entering alt from primary **resets** alt contents. Needs an `alacritty_terminal` inactive-grid accessor or a reflow fork | A — blocked without crate API |
+| R6 | Continuous divider drag while typing | Not automated; same dual-buffer class as R1–R4 | A |
+| R7 | Minimized during resize / CPR | Minimized panes `keepalive` every frame; unit test `minimized_window_keeps_its_active_terminal_alive` | Pass (path) |
+| APC | Kitty graphics + post-APC CPR (`conpty_passes_kitty_apc_through`) | **Pass** | Pass |
+
+Class A = expected residual / known look. Full “always pretty after every drag”
+needs conhost-parity reflow (large) or living with `Ctrl+L` for content ghosts.
+Do not claim “clean resize” for R1/R2 content residual without `\x0c` / redraw.
+
 ## Current fix boundary
 
 - **Full fix (large):** replicate conhost's `ResizeWithReflow` (wrapped-line +
   viewport-top math) in/around `alacritty_terminal`, plus bundle a newer ConPTY.
-  This is what Windows Terminal does. It remains rejected on cost/benefit:
-  fragile, large, and ongoing maintenance.
+  This is what Windows Terminal does. **Parked** (cost/benefit): product is ~95%
+  good with cursor mitigation; do not start without an explicit spike go/no-go.
 - **Adopted partial mitigation:** bundle matched ConPTY/OpenConsole
   1.25.260512002-preview. It lazily synchronizes the cursor on the next
   screen-buffer query and substantially reduces cursor-placement failures. It
-  does not clear stale PSReadLine text or reconstruct overflow rows.
-- **Operational fallback:** `Ctrl+L` asks the child for a full redraw and remains
-  the only cheap repair for residual content artifacts.
+  does not clear stale PSReadLine text, reconstruct overflow rows, or bottom-pin
+  the prompt after shrink→grow (R3b).
+- **Operational fallback:** `Ctrl+L` in the shell (form feed) asks the child for
+  a full redraw and remains the cheap repair for residual content artifacts.
+  Do **not** auto-fire this after resize (agent-hostile; incomplete for pure
+  recall timing).
