@@ -18,12 +18,74 @@
 
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use eframe::egui;
 
 use crate::caret::CursorDraw;
 use crate::geom::CellMetrics;
 use crate::terminal::{GlyphStyle, glyph_style};
+
+/// One logical glyph locked to a grid cell column (not pixel-x from galley).
+/// Spacer cells (`WIDE_CHAR_SPACER`) never produce a placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphPlacement {
+    pub row: usize,
+    pub col: usize,
+    pub ch: char,
+    pub style: GlyphStyle,
+    pub width_cells: u8, // 1 or 2
+}
+
+/// Site reserved for color-emoji paint (empty until detector task).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmojiSite {
+    pub row: usize,
+    pub col: usize,
+    pub ch: char,
+    pub width_cells: u8,
+}
+
+/// Pure frame paint plan: grid-locked glyphs + future emoji sites.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintPlan {
+    pub glyphs: Vec<GlyphPlacement>,
+    pub emoji_sites: Vec<EmojiSite>, // empty until Task 4
+}
+
+/// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per
+/// logical cell at its grid column. Skips `WIDE_CHAR_SPACER`; wide chars get
+/// `width_cells = 2`. Clamps to real grid bounds (same process-abort guard).
+pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
+    let off = grid.display_offset() as i32;
+    let ncols = metrics.cols().min(grid.columns());
+    let nrows = metrics.rows().min(grid.screen_lines());
+    let mut glyphs = Vec::with_capacity(nrows * ncols);
+    for row in 0..nrows {
+        for col in 0..ncols {
+            let cell = &grid[Line(row as i32 - off)][Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let width_cells = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            glyphs.push(GlyphPlacement {
+                row,
+                col,
+                ch,
+                style: glyph_style(cell.flags, cell.fg, cell.bg),
+                width_cells,
+            });
+        }
+    }
+    PaintPlan {
+        glyphs,
+        emoji_sites: Vec::new(),
+    }
+}
 
 /// An ordered, inclusive selection span in **viewport** `(row, col)` coords — the
 /// same space `CellMetrics::cell_at` returns. `start <= end`.
@@ -358,5 +420,62 @@ mod tests {
         assert_eq!(o.highlights[1], m.span_rect(1, 0, 5));
         // last row: 0..=end col (3)
         assert_eq!(o.highlights[2], m.span_rect(2, 0, 3));
+    }
+
+    // ---- plan_paint: grid-locked glyph placements ----------------------------
+    #[test]
+    fn plan_paint_places_ascii_on_columns() {
+        let term = term_with(b"ab", 4, 1);
+        let m = metrics(4, 1);
+        let plan = plan_paint(term.grid(), &m);
+        let visible: Vec<_> = plan
+            .glyphs
+            .iter()
+            .filter(|g| g.ch != ' ')
+            .collect();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].col, 0);
+        assert_eq!(visible[0].ch, 'a');
+        assert_eq!(visible[0].width_cells, 1);
+        assert_eq!(visible[1].col, 1);
+        assert_eq!(visible[1].ch, 'b');
+    }
+
+    #[test]
+    fn plan_paint_wide_char_one_glyph_skips_spacer() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        // 你好: two width-2 CJK glyphs at cols 0 and 2; spacer cells emit nothing.
+        let term = term_with("你好".as_bytes(), 8, 1);
+        let m = metrics(8, 1);
+        let plan = plan_paint(term.grid(), &m);
+
+        // Invariant: no GlyphPlacement may sit on a WIDE_CHAR_SPACER cell.
+        for g in &plan.glyphs {
+            let cell = &term.grid()[Line(0)][Column(g.col)];
+            assert!(
+                !cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+                "spacer cell must not appear as a GlyphPlacement: {g:?}"
+            );
+        }
+
+        let wides: Vec<_> = plan.glyphs.iter().filter(|g| g.width_cells == 2).collect();
+        assert_eq!(wides.len(), 2, "expected two wide CJK glyphs; got {:?}", plan.glyphs);
+        assert_eq!((wides[0].col, wides[0].ch), (0, '你'));
+        assert_eq!((wides[1].col, wides[1].ch), (2, '好'));
+    }
+
+    #[test]
+    fn plan_paint_clamps_like_text_rows() {
+        let term = term_with(b"ab\r\ncd", 4, 2);
+        let m = CellMetrics::new(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 160.0)),
+            8.0,
+            16.0,
+            10,
+            10,
+        );
+        let plan = plan_paint(term.grid(), &m);
+        assert!(plan.glyphs.iter().all(|g| g.row < 2 && g.col < 4));
     }
 }
