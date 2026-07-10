@@ -1413,9 +1413,11 @@ impl WindowManager {
         }
     }
 
-    /// Size the panel leaf: rail width when collapsed, else expanded_width.
-    /// Pins the nearest H divider so it works wherever the panel sits in the
-    /// tree, not just as the rightmost root leaf.
+    /// Size the panel leaf: rail extent when collapsed, else expanded_width
+    /// ("expanded extent along the dock axis"). The constrained axis is
+    /// whichever one `set_leaf_extent` can actually pin: try H first (right/
+    /// left dock — today's behavior), fall back to V (bottom/top dock). A
+    /// panel with dividers on both axes stays width-pinned.
     fn apply_panel_ratio(&mut self, area_w: f32) {
         let Some(pid) = self.panel_id() else {
             return;
@@ -1437,7 +1439,14 @@ impl WindowManager {
                 egui::Pos2::ZERO,
                 egui::vec2(area_w, self.last_area.y.max(1.0)),
             );
-            self.tree.set_leaf_width(pid, target_w, local, SNAP_GAP);
+            use crate::layout::SplitDir;
+            if !self
+                .tree
+                .set_leaf_extent(pid, SplitDir::H, target_w, local, SNAP_GAP)
+            {
+                self.tree
+                    .set_leaf_extent(pid, SplitDir::V, target_w, local, SNAP_GAP);
+            }
         } else if let Some(w) = self.windows.iter_mut().find(|w| w.id == pid) {
             // Floating panel: resize width only.
             let h = w.rect.height();
@@ -1536,9 +1545,7 @@ impl WindowManager {
     /// remains as a fallback for stale paths (tab reordered since the model
     /// snapshot).
     fn owning_project_tab(&self, pidx: usize, wid: WinId, ptab: Option<usize>) -> Option<usize> {
-        let owns = |t: &Tab| {
-            matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
-        };
+        let owns = |t: &Tab| matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid));
         if let Some(pi) = ptab {
             if self.windows[pidx].tabs.get(pi).is_some_and(|t| owns(t)) {
                 return Some(pi);
@@ -2788,10 +2795,25 @@ impl WindowManager {
             // derive from the same policy.
             let ctl_w = header_ctl_w(is_project);
 
+            // Collapsed horizontal (bottom/top-docked) panel: the whole window
+            // is a 36px strip. The header band is suppressed — the rail owns
+            // the full rect and the expand toggle lives inside it — so the
+            // drag strip collapses to nothing too. Orientation is derived
+            // per-frame from the rect: wider than tall = horizontal.
+            let panel_h_collapsed = is_panel
+                && scr.width() > scr.height()
+                && matches!(
+                    &self.windows[i].tabs[self.windows[i].active].content,
+                    Content::TaskManager(v) if v.collapsed
+                );
+
             // --- title drag (interact first, then we know final position) ---
             let drag_rect = egui::Rect::from_min_size(
                 scr.min,
-                egui::vec2((scr.width() - ctl_w).max(0.0), TITLE_H),
+                egui::vec2(
+                    (scr.width() - ctl_w).max(0.0),
+                    if panel_h_collapsed { 0.0 } else { TITLE_H },
+                ),
             );
             let dr = ui.interact(
                 drag_rect,
@@ -2928,10 +2950,16 @@ impl WindowManager {
                 }
             }
 
-            let content_rect = egui::Rect::from_min_max(
-                egui::pos2(scr.min.x + 1.0, scr.min.y + TITLE_H),
-                egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
-            );
+            // A collapsed horizontal panel hands its full rect to the rail
+            // (no reserved header band); everything else starts below TITLE_H.
+            let content_rect = if panel_h_collapsed {
+                scr
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(scr.min.x + 1.0, scr.min.y + TITLE_H),
+                    egui::pos2(scr.max.x - 1.0, scr.max.y - 1.0),
+                )
+            };
 
             // Every non-bare window paints its chrome unconditionally (the
             // bare sole-pane path above is the only chrome-less window): a
@@ -3279,7 +3307,10 @@ impl WindowManager {
                 // Panel: collapse only (non-closable / non-minimizable).
                 // Projects: close + overflow (quiet chrome). Terminals: four buttons.
                 let mut ovf_rect = egui::Rect::NOTHING;
-                if is_panel {
+                if panel_h_collapsed {
+                    // No header band at all: the rail (PanelView) owns the
+                    // whole strip; its expand toggle lives inside the rail.
+                } else if is_panel {
                     let br = egui::Rect::from_center_size(
                         egui::pos2(scr.max.x - 14.0, scr.min.y + TITLE_H * 0.5),
                         egui::vec2(22.0, 22.0),
@@ -3297,10 +3328,25 @@ impl WindowManager {
                         &self.windows[i].tabs[self.windows[i].active].content,
                         Content::TaskManager(v) if v.collapsed
                     );
+                    // Vertical (right-docked) panel: chevrons point at the
+                    // right edge as before. Expanded horizontal: collapse
+                    // points at the docked edge — `scr` vs the desktop area
+                    // says whether that's the top or the bottom.
+                    let glyph = if collapsed {
+                        "«"
+                    } else if scr.width() > scr.height() {
+                        if scr.center().y < area.center().y {
+                            "⌃"
+                        } else {
+                            "⌄"
+                        }
+                    } else {
+                        "»"
+                    };
                     ui.painter().text(
                         br.center(),
                         egui::Align2::CENTER_CENTER,
-                        if collapsed { "«" } else { "»" },
+                        glyph,
                         egui::FontId::proportional(13.0),
                         if is_focus { TEXT } else { DIM },
                     );
@@ -3680,8 +3726,12 @@ impl WindowManager {
         interacted
     }
 
-    /// After layout, store the panel's tiled width into `expanded_width` when
-    /// expanded so divider drags persist.
+    /// After layout, store the panel's tiled extent along its dock axis into
+    /// `expanded_width` when expanded so divider drags persist. A horizontal
+    /// (bottom/top-docked) panel pinned only by a V divider persists its
+    /// height; anything width-pinnable persists its width, as before. (The
+    /// persisted `panel_width` setting means "expanded extent along the dock
+    /// axis" — the key is deliberately not renamed.)
     fn sync_panel_width_from_layout(&mut self) {
         let Some(pid) = self.panel_id() else {
             return;
@@ -3689,12 +3739,17 @@ impl WindowManager {
         if !self.tree.contains(pid) {
             return;
         }
-        let w = self
-            .windows
-            .iter()
-            .find(|w| w.id == pid)
-            .map(|w| w.rect.width())
-            .unwrap_or(0.0);
+        let Some(rect) = self.windows.iter().find(|w| w.id == pid).map(|w| w.rect) else {
+            return;
+        };
+        let has_h = self.tree.has_divider(pid, Dir::Left) || self.tree.has_divider(pid, Dir::Right);
+        let has_v = self.tree.has_divider(pid, Dir::Up) || self.tree.has_divider(pid, Dir::Down);
+        let horizontal = rect.width() > rect.height();
+        let w = if horizontal && !has_h && has_v {
+            rect.height()
+        } else {
+            rect.width()
+        };
         if w < 1.0 {
             return;
         }
@@ -7508,6 +7563,76 @@ mod tests {
         let w = desk.windows.iter().find(|w| w.id == id).unwrap();
         assert!(!w.minimized);
         assert_eq!(desk.windows.iter().filter(|w| w.is_panel()).count(), 1);
+    }
+
+    #[test]
+    fn apply_panel_ratio_pins_width_for_a_right_docked_panel() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1000.0, 800.0);
+        desk.ensure_panel(false, 300.0);
+        let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
+        desk.tree.insert_root(999, Dir::Left); // [other | panel]
+        desk.apply_panel_ratio(1000.0);
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, desk.last_area);
+        let r = |t: &crate::layout::LayoutTree| {
+            t.layout(local, SNAP_GAP)
+                .into_iter()
+                .find(|(w, _)| *w == pid)
+                .unwrap()
+                .1
+        };
+        let w = r(&desk.tree).width();
+        assert!((w - 300.0).abs() < 0.5, "expanded got {w}");
+        desk.toggle_panel();
+        let w = r(&desk.tree).width();
+        assert!((w - crate::panel::RAIL_W).abs() < 0.5, "collapsed got {w}");
+    }
+
+    #[test]
+    fn apply_panel_ratio_pins_height_for_a_bottom_docked_panel() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1000.0, 800.0);
+        desk.ensure_panel(false, 300.0);
+        let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
+        // Re-dock by hand: another leaf on top, panel across the bottom.
+        desk.tree = crate::layout::LayoutTree::default();
+        desk.tree.insert_root(999, Dir::Right);
+        desk.tree.insert_root(pid, Dir::Down);
+        desk.apply_panel_ratio(1000.0);
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, desk.last_area);
+        let r = |t: &crate::layout::LayoutTree| {
+            t.layout(local, SNAP_GAP)
+                .into_iter()
+                .find(|(w, _)| *w == pid)
+                .unwrap()
+                .1
+        };
+        let h = r(&desk.tree).height();
+        assert!((h - 300.0).abs() < 0.5, "expanded got {h}");
+        desk.toggle_panel();
+        let h = r(&desk.tree).height();
+        assert!((h - crate::panel::RAIL_W).abs() < 0.5, "collapsed got {h}");
+    }
+
+    #[test]
+    fn sync_panel_width_persists_height_for_a_horizontal_panel() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1000.0, 800.0);
+        desk.ensure_panel(false, 300.0);
+        let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
+        desk.tree = crate::layout::LayoutTree::default();
+        desk.tree.insert_root(999, Dir::Right);
+        desk.tree.insert_root(pid, Dir::Down);
+        // Post-layout rect of a bottom-docked panel after a divider drag.
+        if let Some(w) = desk.windows.iter_mut().find(|w| w.id == pid) {
+            w.rect = egui::Rect::from_min_size(egui::pos2(0.0, 550.0), egui::vec2(1000.0, 250.0));
+        }
+        desk.sync_panel_width_from_layout();
+        assert_eq!(
+            desk.panel_prefs().unwrap(),
+            (false, 250.0),
+            "horizontal dock must persist height, not width"
+        );
     }
 
     #[test]
