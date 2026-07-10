@@ -51,17 +51,6 @@ fn settle_tick(
 
 const BORDER_W: f32 = 0.75; // uniform window border width; focus is shown by colour
 
-const CHAT_BOARD_W: f32 = 160.0;
-const CHAT_BOARD_MIN_W: f32 = 480.0; // window narrower than this hides the board
-
-fn chat_color(id: &str) -> egui::Color32 {
-    if id == "you" {
-        return CHAT_COLORS[0];
-    }
-    let n: u64 = id.trim_start_matches('t').parse().unwrap_or(0);
-    CHAT_COLORS[(n as usize) % CHAT_COLORS.len()]
-}
-
 const TITLE_H: f32 = 26.0;
 
 // Leader (prefix) key — tmux-style. After it is pressed the next chord is a
@@ -128,321 +117,9 @@ impl Content {
                 wm.show(ui, rect, active, base.with(("proj", win_id)), app_modal)
             }
             Content::Chat(view) => {
-                // Reserve the input strip up front and shrink the working
-                // rect so the board/log lay out above it. The painter keeps
-                // the FULL rect (it must draw the strip chrome too).
-                const INPUT_H: f32 = 32.0;
-                let input_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.max.y - INPUT_H),
-                    rect.max,
-                );
-                let p = ui.painter_at(rect);
-                p.rect_filled(rect, 0.0, WIN_BG);
-                let rect =
-                    egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
-                let pad = 8.0;
-                let meta_font = egui::FontId::proportional(11.0);
-                let body_font = egui::FontId::proportional(12.5);
-                let compact = rect.width() < CHAT_BOARD_MIN_W;
-
-                // ---- crew board (comfortable widths only) ----
-                let mut log_left = rect.min.x;
-                if !compact {
-                    let board = egui::Rect::from_min_max(
-                        rect.min,
-                        egui::pos2(rect.min.x + CHAT_BOARD_W, rect.max.y),
-                    );
-                    log_left = board.max.x;
-                    p.line_segment(
-                        [
-                            egui::pos2(board.max.x, rect.min.y),
-                            egui::pos2(board.max.x, rect.max.y),
-                        ],
-                        egui::Stroke::new(1.0, BORDER),
-                    );
-                    p.text(
-                        egui::pos2(board.min.x + pad, board.min.y + pad),
-                        egui::Align2::LEFT_TOP,
-                        "CREW · BY LAST HEARD",
-                        egui::FontId::proportional(9.5),
-                        DIM,
-                    );
-                    let now = std::time::SystemTime::now();
-                    let row_h = 20.0;
-                    let mut y = board.min.y + pad + 16.0;
-                    // Pull crew rows from the room; the borrow is dropped before
-                    // the paint loop (it borrows nothing else from the room).
-                    let crew = view.room.borrow().crew(std::time::Instant::now());
-                    for r in &crew {
-                        let row = egui::Rect::from_min_size(
-                            egui::pos2(board.min.x + 4.0, y),
-                            egui::vec2(board.width() - 8.0, row_h),
-                        );
-                        let hovered =
-                            resp.hovered() && resp.hover_pos().is_some_and(|p| row.contains(p));
-                        if hovered {
-                            p.rect_filled(row, 3.0, TITLE_BG);
-                        }
-                        if hovered && resp.clicked() {
-                            view.click = Some(r.id.clone());
-                        }
-                        let dot = if r.exited { BORDER } else { CHAT_LIVE };
-                        p.circle_filled(egui::pos2(row.min.x + 7.0, row.center().y), 3.0, dot);
-                        let name_col = if r.exited { DIM } else { chat_color(&r.id) };
-                        // The pane identity has name == id ("you") — a bare
-                        // label beats the silly-looking "you · you".
-                        let label = if r.name == r.id {
-                            r.name.clone()
-                        } else {
-                            format!("{} · {}", r.name, r.id)
-                        };
-                        let (age, stale) = if r.exited {
-                            ("exited".to_string(), false)
-                        } else {
-                            match r.last.and_then(|t| now.duration_since(t).ok()) {
-                                Some(d) => crate::chat::age_label(d),
-                                None => ("—".to_string(), false),
-                            }
-                        };
-                        // Age paints first so the label can truncate into the
-                        // space that's left — an unconstrained p.text label runs
-                        // straight under the age column on long tab titles.
-                        let age_rect = p.text(
-                            egui::pos2(row.max.x - 4.0, row.center().y),
-                            egui::Align2::RIGHT_CENTER,
-                            age,
-                            egui::FontId::proportional(10.5),
-                            if stale { CHAT_STALE } else { DIM },
-                        );
-                        let label_x = row.min.x + 16.0;
-                        let mut job = egui::text::LayoutJob::simple_singleline(
-                            label,
-                            egui::FontId::proportional(11.5),
-                            name_col,
-                        );
-                        job.wrap = egui::text::TextWrapping::truncate_at_width(
-                            (age_rect.min.x - 6.0 - label_x).max(0.0),
-                        );
-                        let g = p.layout_job(job);
-                        p.galley(
-                            egui::pos2(label_x, row.center().y - g.size().y * 0.5),
-                            g,
-                            name_col,
-                        );
-                        y += row_h;
-                        if y + row_h > board.max.y {
-                            break; // board overflow: clip; the log is the priority
-                        }
-                    }
-                }
-
-                // ---- log: layout pass (galleys + heights), then paint ----
-                let log_rect = egui::Rect::from_min_max(
-                    egui::pos2(log_left + pad, rect.min.y + pad),
-                    egui::pos2(rect.max.x - pad, rect.max.y - pad),
-                );
-                let wrap = (log_rect.width() - 10.0).max(40.0);
-                // Borrow stays scoped — never held across recursion into other
-                // windows' show() (post paths borrow_mut the room).
-                let blocks = view.room.borrow().blocks(view.last_seen, compact);
-                enum Painted {
-                    Galley(
-                        std::sync::Arc<egui::Galley>,
-                        egui::Color32,
-                        f32,  /*indent*/
-                        bool, /*edge*/
-                    ),
-                    Centered(std::sync::Arc<egui::Galley>),
-                    MetaPair(std::sync::Arc<egui::Galley>, std::sync::Arc<egui::Galley>),
-                    Rule(Option<std::sync::Arc<egui::Galley>>),
-                    Gap(f32),
-                }
-                let mut items: Vec<Painted> = Vec::new();
-                let mut total = 0.0f32;
-                for b in &blocks {
-                    match b {
-                        crate::chat::ChatBlock::Sys(s) => {
-                            let g = p.layout(s.clone(), meta_font.clone(), DIM, wrap);
-                            total += g.size().y + 6.0;
-                            items.push(Painted::Centered(g));
-                            items.push(Painted::Gap(6.0));
-                        }
-                        crate::chat::ChatBlock::Divider => {
-                            let g = p.layout(
-                                "NEW".into(),
-                                egui::FontId::proportional(9.0),
-                                CHAT_STALE,
-                                wrap,
-                            );
-                            total += 14.0;
-                            items.push(Painted::Rule(Some(g)));
-                        }
-                        crate::chat::ChatBlock::Header { name, id, meta } => {
-                            let gn = p.layout_no_wrap(
-                                name.clone(),
-                                egui::FontId::proportional(12.0),
-                                chat_color(id),
-                            );
-                            let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), DIM);
-                            total += gn.size().y + 2.0 + 4.0; // header + breathing room above
-                            items.push(Painted::Gap(4.0));
-                            items.push(Painted::MetaPair(gn, gm));
-                        }
-                        crate::chat::ChatBlock::Text { text, to } => {
-                            // Mention chips: lay the body out as a LayoutJob so
-                            // @tokens get their own colored sections inline.
-                            let mut job = egui::text::LayoutJob::default();
-                            job.wrap.max_width = wrap;
-                            for (i, word) in text.split(' ').enumerate() {
-                                let lead = if i == 0 { "" } else { " " };
-                                let (col, bg) = if word.starts_with('@') && word.len() > 1 {
-                                    (CHAT_COLORS[0], CHAT_MENTION_BG)
-                                } else {
-                                    (TEXT, egui::Color32::TRANSPARENT)
-                                };
-                                job.append(
-                                    &format!("{lead}{word}"),
-                                    0.0,
-                                    egui::text::TextFormat {
-                                        font_id: body_font.clone(),
-                                        color: col,
-                                        background: bg,
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                            let g = p.layout_job(job);
-                            total += g.size().y + 2.0;
-                            items.push(Painted::Galley(
-                                g,
-                                TEXT,
-                                if to.is_empty() { 0.0 } else { 10.0 },
-                                !to.is_empty(),
-                            ));
-                            items.push(Painted::Gap(2.0));
-                        }
-                    }
-                }
-
-                // Scroll: stick-to-bottom by default; the math (clamp, stick
-                // threshold, unstick-on-wheel-up, re-stick-at-bottom) lives in
-                // `chat::scroll_step` (pure + tested). Only read the wheel when
-                // the log is hovered.
-                let wheel_dy = if resp.hovered() {
-                    ui.input(|i| i.smooth_scroll_delta.y)
-                } else {
-                    0.0
-                };
-                let (scroll, stick, offset) = crate::chat::scroll_step(
-                    total,
-                    log_rect.height(),
-                    wheel_dy,
-                    view.scroll,
-                    view.stick,
-                );
-                view.scroll = scroll;
-                view.stick = stick;
-                let mut y = log_rect.min.y - offset;
-                for it in items {
-                    match it {
-                        Painted::Gap(h) => y += h,
-                        Painted::Centered(g) => {
-                            let h = g.size().y;
-                            let x = log_rect.center().x - g.size().x / 2.0;
-                            p.galley(egui::pos2(x, y), g, DIM);
-                            y += h;
-                        }
-                        Painted::Rule(label) => {
-                            let mid = y + 7.0;
-                            // The rule is intentionally dim (mockup: 1px #45402f); the amber NEW label is the affordance.
-                            p.line_segment(
-                                [
-                                    egui::pos2(log_rect.min.x, mid),
-                                    egui::pos2(log_rect.max.x, mid),
-                                ],
-                                egui::Stroke::new(1.0, CHAT_MENTION_BG),
-                            );
-                            if let Some(g) = label {
-                                let w = g.size().x;
-                                let lx = log_rect.center().x - w / 2.0;
-                                p.rect_filled(
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(lx - 4.0, y),
-                                        egui::vec2(w + 8.0, 14.0),
-                                    ),
-                                    0.0,
-                                    WIN_BG,
-                                );
-                                p.galley(egui::pos2(lx, y + 1.0), g, CHAT_STALE);
-                            }
-                            y += 14.0;
-                        }
-                        Painted::MetaPair(gn, gm) => {
-                            let h = gn.size().y;
-                            let nw = gn.size().x;
-                            p.galley(egui::pos2(log_rect.min.x, y), gn, TEXT);
-                            p.galley(egui::pos2(log_rect.min.x + nw + 6.0, y + 1.5), gm, DIM);
-                            y += h + 2.0;
-                        }
-                        Painted::Galley(g, col, indent, edge) => {
-                            let h = g.size().y;
-                            if edge {
-                                p.line_segment(
-                                    [
-                                        egui::pos2(log_rect.min.x + 2.0, y),
-                                        egui::pos2(log_rect.min.x + 2.0, y + h),
-                                    ],
-                                    egui::Stroke::new(2.0, CHAT_EDGE),
-                                );
-                            }
-                            p.galley(egui::pos2(log_rect.min.x + indent, y), g, col);
-                            y += h;
-                        }
-                    }
-                }
-                view.on_frame(active);
-
-                // ---- input strip (slice 2): the human posts from here ----
-                // Repaint the strip ground first: the painter's clip spans
-                // the full window, so a partially-scrolled log line can bleed
-                // under the strip.
-                p.rect_filled(input_rect, 0.0, WIN_BG);
-                p.line_segment(
-                    [
-                        input_rect.min,
-                        egui::pos2(input_rect.max.x, input_rect.min.y),
-                    ],
-                    egui::Stroke::new(1.0, BORDER),
-                );
-                let te_rect = input_rect.shrink2(egui::vec2(8.0, 5.0));
-                p.rect_filled(te_rect, egui::CornerRadius::same(3), DESK_BG);
-                p.rect_stroke(
-                    te_rect,
-                    egui::CornerRadius::same(3),
-                    egui::Stroke::new(1.0, BORDER),
-                    egui::StrokeKind::Inside,
-                );
-                ui.visuals_mut().selection.bg_fill = SELECTION_TEXT_BG;
-                let te = ui.put(
-                    te_rect,
-                    egui::TextEdit::singleline(&mut view.input)
-                        .id(base.with((win_id, "chat-input")))
-                        .font(egui::FontId::proportional(12.5))
-                        .text_color(TEXT)
-                        .hint_text("Message…")
-                        .vertical_align(egui::Align::Center)
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::symmetric(6, 0))
-                        .desired_width(te_rect.width()),
-                );
-                if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    view.pending_post = Some(std::mem::take(&mut view.input));
-                    te.request_focus(); // keep typing; multi-post sessions are the norm
-                // Escape defocuses the field at frame start (egui Focus::begin_pass),
-                // so detect it as lost_focus + Escape — has_focus() is already false here.
-                } else if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    view.input.clear();
-                }
+                // Paint lives in chat_view.rs; click/pending_post drained after
+                // apply_acts (see ChatView::show docs).
+                view.show(ui, rect, active, resp, base.with((win_id, "chat-input")));
                 false
             }
         }
@@ -1401,12 +1078,9 @@ impl WindowManager {
             .ok_or("snapshot: missing terminal")?;
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
         let session = self.session_mut(pid, tid)?;
-        // Each accessor pumps; calling them in sequence on the one &mut borrow is
-        // fine. text always; cells/cursor only when the opt-in flag is set.
-        let lines = session.snapshot_text(None);
-        let cells = req.attrs.then(|| session.snapshot_cells(None));
-        let cursor = req.cursor.then(|| session.cursor_info());
-        Ok((lines, cells, cursor))
+        // One pump for the whole reply — chaining snapshot_text/cells/cursor_info
+        // would pump per field and can stitch gens under active output.
+        Ok(session.snapshot_all(req.attrs, req.cursor))
     }
 
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
@@ -2595,6 +2269,13 @@ impl WindowManager {
 
         let focused = self.focused;
         let asz = area.size();
+        // Minimized windows never enter draw_order(), but their PTYs still
+        // need to answer DSR/CPR and drain output. Pump every tab headlessly;
+        // Content::keepalive recurses through minimized project windows.
+        for w in self.windows.iter_mut().filter(|w| w.minimized) {
+            w.keepalive_inactive();
+            w.active_content().keepalive();
+        }
         let mut order = self.draw_order();
 
         let placements: std::collections::HashMap<WinId, egui::Rect> = self
@@ -3706,8 +3387,8 @@ impl WindowManager {
     fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
             match picker.show_modal(ui) {
-                // PassedEnd: nothing sits below the leader modal's field —
-                // treat ↓-past-the-end like Pending and keep the picker up.
+                // show_modal clamps ↓ on the last row (never emits PassedEnd);
+                // keep the Pending arm defensive in case that changes.
                 Outcome::Pending | Outcome::PassedEnd => self.picker = Some(picker),
                 Outcome::Cancelled => {}
                 Outcome::Accepted(path) => {
@@ -4654,6 +4335,47 @@ mod tests {
             wm.merge_target_at(9999, titlebar_point(), origin_area(), &[0, 1]),
             Some(0)
         );
+    }
+
+    #[test]
+    fn minimized_window_keeps_its_active_terminal_alive() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .expect("spawn failed");
+        wm.windows
+            .iter_mut()
+            .find(|w| w.id == id)
+            .unwrap()
+            .minimized = true;
+        assert!(wm.draw_order().is_empty());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            ));
+            let _ = ctx.run_ui(input, |ui| {
+                let area = ui.max_rect();
+                wm.show(ui, area, true, egui::Id::new("minimized-keepalive"), false);
+            });
+
+            let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &w.tabs[w.active].content else {
+                panic!("test window stopped being a terminal");
+            };
+            if session.ready() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "minimized terminal never answered its startup DSR"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

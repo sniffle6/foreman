@@ -57,8 +57,10 @@ the child and it hangs forever.
 **Fix / fence.** The wiring already exists and must not be undone:
 `Session`'s `Listener` captures `Event::PtyWrite` into a shared buffer
 (src/terminal.rs:187) and `Session::pump()` flushes that buffer back into the
-PTY (src/terminal.rs:713). The first flushed reply also latches the Session
-**Ready** (src/terminal.rs:722-724). **Never give a live Session a
+PTY after the RX chunk that completed the query. A successful first reply plus
+the child's first visible paint latch the Session **Ready**; a failed write must
+not. Minimized windows still call the headless keepalive path so this handshake
+does not time out. **Never give a live Session a
 `VoidListener`** — that is exactly the listener that discards `PtyWrite`.
 
 **Nuance — VoidListener is legitimate in one place:** driven `Term` fixtures
@@ -111,16 +113,15 @@ then press Up-arrow (history recall). The recalled line renders rows too high,
 mangling the prompt. Persists until a full redraw.
 
 **Immediate cause.** ConPTY's internal resize reflow diverges from the hosting
-terminal's, and ConPTY then reports a cursor position inconsistent with its
-own repaint — off by exactly the prompt's wrapped-row count. PSReadLine renders
-history recall at that wrong cursor. Upstream bug
-[microsoft/terminal #18725](https://github.com/microsoft/terminal/issues/18725),
-open and unshipped.
+terminal's. Older builds returned the wrong host-grid cursor to PSReadLine.
+Upstream [#18725](https://github.com/microsoft/terminal/issues/18725) is now
+closed by #19535; Foreman bundles that demand-triggered DSR/CPR mitigation.
 
-**Fix / fence.** No foreman fix. Workaround: **Ctrl+L** (full redraw heals
-it). This is a **settled verdict** — the full write-up with byte-level
-evidence is docs/conpty-resize-reflow.md; the do-not-re-litigate entry is in
-**foreman-change-control**.
+**Fix / fence.** Cursor synchronization is shipped, but it cannot reconstruct
+dropped rows or clear stale PSReadLine text. **Ctrl+L** remains the residual
+full-redraw repair. The settled fence is specifically against re-trying redraw
+ownership or conhost-parity reflow without a user decision. Full evidence:
+`docs/conpty-resize-reflow.md`; registry: **foreman-change-control**.
 
 **Story (both wrong turns already taken).**
 1. The original diagnosis blamed a "double reflow" in `Session::resize`
@@ -129,7 +130,7 @@ evidence is docs/conpty-resize-reflow.md; the do-not-re-litigate entry is in
    (docs/conpty-resize-reflow.md §"Root cause").
 2. "Let ConPTY own the redraw" was then built and tested — vendored
    `portable-pty` with the resize quirk toggled, a grid-reset on resize, and a
-   sideloaded newer ConPTY. **All four combinations failed** because ConPTY's
+   sideloaded ConPTY 1.24 stable. **All four combinations failed** because that build's
    reported cursor is internally inconsistent with its own VT repaint; no
    frontend redraw-ownership strategy can fix that
    (docs/conpty-resize-reflow.md §"What was tried and rejected").
@@ -367,7 +368,7 @@ root `H:/claude code/foreman`):
 | DSR reply path: `PtyWrite` captured, `pump()` flushes, Ready latch | `rg -n "PtyWrite\|fn pump\|ready = true" src/terminal.rs` |
 | VoidListener only in test fixtures | `rg -n "VoidListener" src/` (expect hits only in `#[cfg(test)]`/test mods of inspect.rs, frame.rs) |
 | Kill hook matcher is Bash-only | `Get-Content .claude/settings.json` |
-| ConPTY verdict unchanged upstream | `Get-Content docs/conpty-resize-reflow.md -TotalCount 5`; check microsoft/terminal #18725 status |
+| ConPTY mitigation/residual status | `Get-Content docs/conpty-resize-reflow.md -TotalCount 8`; check bundled pair + #18725/#19535 status |
 | CURSOR_SETTLE 50ms / INPUT_GRACE 150ms / adjacency `<= 1` | `rg -n "CURSOR_SETTLE\|INPUT_GRACE\|abs\(\) <= 1" src/caret.rs` |
 | Area landmine fixes (`constrain(false)`) | `rg -n "constrain\(false\)" src/main.rs` and docs/os-chrome.md §Gotchas |
 | egui zoom opt-out still present | `rg -n "zoom_with_keyboard\|zoom_modifier" src/main.rs` |

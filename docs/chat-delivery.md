@@ -69,9 +69,10 @@ The engine adapter (`src/wm.rs`):
   after `show()`, so every session has pumped and its `ready()` is current.
 - **`chat_post`** verifies the sender is a live terminal, then delegates to
   `room.post`. **`chat_post_human`** delegates to `room.post_human`.
-- The **viewer pulls**: `Content::Chat`'s render borrows the room and calls
-  `crew()` / `blocks()` directly (no pushed snapshot). A crew click records a
-  member id; `drain_chat_clicks` resolves that id back to its window.
+- The **viewer pulls**: `ChatView::show` (`src/chat_view.rs`) borrows the room
+  and calls `crew()` / `blocks()` directly (no pushed snapshot). A crew click
+  records a member id; `drain_chat_clicks` resolves that id back to its window
+  after `apply_acts` (ordering is load-bearing).
 
 ## Gotchas
 

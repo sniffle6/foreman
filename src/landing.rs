@@ -224,7 +224,14 @@ fn step(nav: Nav, n_btns: usize, n_recs: usize, key: NavKey) -> (Nav, StepAct) {
         ),
         (Zone::Recents, Tab | Esc | Text) => to(Zone::Field),
         (Zone::Recents, ShiftTab) => to(Zone::Buttons),
-        (Zone::Recents, Enter) => (Nav { zone: Zone::Field, btn, rec }, StepAct::OpenRecent(rec)),
+        (Zone::Recents, Enter) => (
+            Nav {
+                zone: Zone::Field,
+                btn,
+                rec,
+            },
+            StepAct::OpenRecent(rec),
+        ),
         (Zone::Recents, Left | Right) => (nav, Move),
     }
 }
@@ -470,7 +477,11 @@ impl Landing {
         // repaints continuously for the wordmark sweep, and is_dir() on a dead
         // network path can block the GUI thread for seconds.
         if std::mem::take(&mut self.refilter) {
-            self.visible = recents.iter().filter(|e| e.path.is_dir()).cloned().collect();
+            self.visible = recents
+                .iter()
+                .filter(|e| e.path.is_dir())
+                .cloned()
+                .collect();
         }
         let visible = &self.visible;
         let l = layout(area, ICON_ORDER.len(), visible.len());

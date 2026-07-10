@@ -161,6 +161,16 @@ MOUSE/FOCUS, so do it sparingly and tell them.
    takes `StrokeKind`. Ctrl+C/X/V may arrive as `Event::Copy`/`Cut`/`Paste`
    (handle both those AND key events — see `read_input`).
 6. **`Access is denied (os error 5)`** = app still running; kill it first.
+7. **ConPTY resize (Windows).** Bundled OpenConsole **1.25.260512002-preview**
+   implements post-resize cursor re-sync with the host (#19535); Foreman answers
+   DSR/CPR per RX chunk and keeps minimized panes pumping. Height grow uses
+   `resize_anchored` so typing does not land mid-scrollback. Residual content
+   glitches (stale wrap paint, empty band after shrink→grow, wrap-overflow) are
+   **known** — full conhost reflow parity is parked. **`Ctrl+L`** heals a pane.
+   Authority: `docs/conpty-resize-reflow.md`. Do not re-try “let ConPTY own
+   redraw” or blame a double reflow in `Session::resize`. The bundled pair is a
+   **preview** package — swap to stable 1.25 when Microsoft publishes it
+   (hashes + provenance: `assets/conpty/README.md`).
 
 ---
 

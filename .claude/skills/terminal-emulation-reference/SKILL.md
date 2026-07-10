@@ -52,16 +52,22 @@ The reply path (all src/terminal.rs):
 child sends ESC[6n ──reader thread──> pump(): parser.advance()
   └─> alacritty Term computes the answer and emits Event::PtyWrite(reply)
         └─> Listener::send_event appends it to the shared `resp` buffer (:187-191)
-              └─> pump() flushes `resp` back into the PTY writer (:718-725)
-                    └─> first flush latches `ready = true`
+              └─> pump() successfully flushes `resp` after that RX chunk
+                    └─> successful first flush + first child paint latch Ready
 ```
 
 **Ready** is a domain state (CONTEXT.md): injected input only lands after a
-Session is Ready. Precisely: the latch fires on the first *any* reply bytes
-flushed back (in practice the startup DSR reply). Before Ready,
+Session is Ready. Precisely: the latch requires both the first successfully
+flushed reply bytes (in practice the startup CPR) and the child's first visible
+paint. Before Ready,
 `inject_input()` queues text in `pending_inject` instead of writing it — a
 paste sent during the startup scan gets eaten by it (src/terminal.rs:659-671).
 After the latch, `pump()` flushes the queue.
+
+CPR is latency-sensitive: `pump()` flushes replies after each parsed RX chunk,
+not after draining an unbounded backlog, and minimized windows pump every tab
+headlessly. Either invariant regressing can make ConPTY screen-buffer queries
+hit their 500ms timeout.
 
 Rest of the lifecycle, in order:
 
@@ -176,12 +182,12 @@ Removing either regresses TUI appearance silently. The full env-axis inventory
 is **foreman-config-and-flags**' home; the ConPTY resize saga chronicle is
 **foreman-failure-archaeology**'s.
 
-ConPTY resize corruption (settled, do-not-re-litigate — see
-**foreman-change-control**): narrowing past a wrapped prompt then Up-arrow
-recall corrupts until Ctrl+L. It is ConPTY's reflow diverging from
-alacritty's, with ConPTY reporting a cursor inconsistent with its own repaint
-(microsoft/terminal #18725). Four redraw-ownership variants were tested and
-failed. Read `docs/conpty-resize-reflow.md` before touching `Session::resize`.
+ConPTY resize corruption (read before touching `Session::resize`): ConPTY's
+reflow diverges from alacritty's. Foreman now bundles #19535's lazy cursor
+resynchronization, but content reflow still differs and `Ctrl+L` still heals
+residual artifacts. The settled fence applies to the four failed
+redraw-ownership variants and full conhost-parity reflow, not to the adopted
+cursor mitigation. Details: `docs/conpty-resize-reflow.md`.
 
 ## 8. Where each concept lives
 
@@ -227,4 +233,4 @@ and constants drift; re-verify from `H:/claude code/foreman` (PowerShell 7+):
 | Caret constants 50 ms / 150 ms | `git grep -n "CURSOR_SETTLE\|INPUT_GRACE" src/caret.rs` |
 | SUBMIT_DELAY 150 ms | `git grep -n "SUBMIT_DELAY" src/terminal.rs` |
 | Spacer-skip locations | `git grep -n "WIDE_CHAR_SPACER" src/` |
-| ConPTY bug status (upstream open) | `docs/conpty-resize-reflow.md` header; microsoft/terminal #18725 |
+| ConPTY cursor mitigation + residual status | `docs/conpty-resize-reflow.md` header; microsoft/terminal #18725/#19535 |

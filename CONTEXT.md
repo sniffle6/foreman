@@ -172,6 +172,15 @@ is actively editing, and holds far jumps and self-running animations. The caret
 is what Foreman paints; the cursor is the program's, owned by the grid model.
 _Avoid_: cursor (that's the model's), blink, debounce.
 
+**Ready gate**:
+The step that decides when a Session may accept injected chat input, and what
+bytes that injection becomes. It latches Ready only after the startup
+device-status reply has been flushed *and* the child has painted first visible
+output; holds posts that arrive earlier; and turns a post into bracketed-paste
+bytes plus a deferred submit. Pure decisions only — it does not write the PTY.
+_Avoid_: ready flag, inject queue (those are pieces; the gate is the whole
+contract), DSR (one half of the latch, not the gate).
+
 **Cell metrics**:
 One frame's pixel↔cell geometry for a Session's pane — where the pane starts,
 how big a cell is, and how many cells fit. Every pointer→cell and cell→rect

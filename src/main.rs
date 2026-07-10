@@ -1,5 +1,6 @@
 mod caret;
 mod chat;
+mod chat_view;
 mod config;
 mod confirm;
 mod conpty_install;
@@ -17,6 +18,7 @@ mod landing;
 mod layout;
 mod notify;
 mod proc;
+mod ready;
 mod recents;
 mod settings;
 mod skills_install;
@@ -32,10 +34,14 @@ use wm::WindowManager;
 struct App {
     desktop: WindowManager,
     started: bool,
-    /// Is the hover-revealed OS title bar currently shown?
+    /// Target state for the hover-revealed OS title bar (drives the slide).
     chrome_open: bool,
-    /// When the pointer entered the top reveal zone (for the dwell timer).
-    chrome_hot_since: Option<f64>,
+    /// When the pointer left the keep-open zone while the bar was open
+    /// (coyote timer: close only after this ages past `CHROME_COYOTE`).
+    chrome_leave_since: Option<f64>,
+    /// Last frame's slide progress (0 closed → 1 open). Used so a mid-close
+    /// re-hover over the still-visible bar can re-expand before `t` hits 0.
+    chrome_t: f32,
     /// Agent-dispatch requests from the control pipe thread.
     ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
     /// Persisted app settings (terminal font size today). Seeded into egui's
@@ -78,7 +84,8 @@ impl App {
             desktop: WindowManager::new().as_desktop(),
             started: false,
             chrome_open: false,
-            chrome_hot_since: None,
+            chrome_leave_since: None,
+            chrome_t: 0.0,
             ctrl,
             settings: config::Settings::load(),
             font_dirty_at: None,
@@ -97,19 +104,25 @@ impl App {
 
 // ---- OS chrome -------------------------------------------------------------
 // Native decorations are off (`with_decorations(false)` in `main`); we draw our
-// own title bar, revealed only while the pointer dwells at the very top edge of
-// the app window, plus an invisible perimeter rim that restores edge-resize.
+// own title bar, revealed instantly when the pointer hits the top-edge border,
+// held open by a short coyote timer after leave, plus an invisible perimeter
+// rim that restores edge-resize.
 const CHROME_H: f32 = 30.0; // revealed bar height
-const CHROME_REVEAL: f32 = APP_BORDER_W; // the visible border is the hover target...
-const CHROME_DWELL: f64 = 0.2; // ...rest on it this long (s) before the bar shows
+/// Vertical depth of the top-edge open zone (from the window top). A few px
+/// past the painted border so the strip is easier to hit, but short of the
+/// project/terminal titleband so the in-app ✕ isn't stolen.
+const CHROME_REVEAL: f32 = 10.0;
+const CHROME_KEEP: f32 = CHROME_H + 4.0; // depth that keeps/reopens the bar
+const CHROME_COYOTE: f64 = 0.25; // seconds after leave before close starts
 const CHROME_GRAB: f32 = 5.0; // outer rim that acts as the OS resize handle
 const CHROME_BTN_W: f32 = 42.0;
 const APP_BORDER_W: f32 = 7.0; // visible frame around the undecorated window
 
 impl App {
-    /// Hover-revealed replacement for the native title bar. Hidden until the
-    /// pointer rests on the painted window border at the top edge (the dwell
-    /// keeps a stray brush past it from triggering), then overlays the content.
+    /// Hover-revealed replacement for the native title bar. Opens the moment
+    /// the pointer hits the top painted border; stays up for a coyote grace
+    /// after leave so a brief miss doesn't retract it; re-hover mid-close
+    /// reverses the slide smoothly.
     fn show_os_chrome(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -132,32 +145,37 @@ impl App {
 
         let (pointer, any_down, now) =
             ctx.input(|i| (i.pointer.latest_pos(), i.pointer.any_down(), i.time));
-        match pointer {
-            Some(p) if !self.chrome_open => {
-                // `!any_down` keeps the bar away while an in-app window is being
-                // dragged to the top edge (snap/maximize gestures).
-                if p.y <= screen.min.y + CHROME_REVEAL && !any_down {
-                    let since = *self.chrome_hot_since.get_or_insert(now);
-                    if now - since >= CHROME_DWELL {
-                        self.chrome_open = true;
-                    }
-                } else {
-                    self.chrome_hot_since = None;
-                }
-            }
-            Some(p) => {
-                self.chrome_hot_since = None;
-                if p.y > screen.min.y + CHROME_H + 4.0 {
-                    self.chrome_open = false;
-                }
-            }
-            None => {
+        // Prior-frame slide progress: while the bar is still visible mid-close,
+        // the full keep zone (not just the thin reveal strip) counts as hot so
+        // re-entering reverse-opens the animation.
+        let anim_t = self.chrome_t;
+        let in_zone = |p: egui::Pos2, depth: f32| p.y <= screen.min.y + depth;
+        let hot = match pointer {
+            Some(p) if self.chrome_open => in_zone(p, CHROME_KEEP),
+            // `!any_down` keeps the bar away while an in-app window is dragged
+            // to the top edge (snap/maximize gestures).
+            Some(p) if anim_t > 0.0 => in_zone(p, CHROME_KEEP) && !any_down,
+            Some(p) => in_zone(p, CHROME_REVEAL) && !any_down,
+            None => false,
+        };
+        if hot {
+            self.chrome_open = true;
+            self.chrome_leave_since = None;
+        } else if self.chrome_open {
+            let since = *self.chrome_leave_since.get_or_insert(now);
+            if now - since >= CHROME_COYOTE {
                 self.chrome_open = false;
-                self.chrome_hot_since = None;
+                self.chrome_leave_since = None;
+            } else {
+                // Idle frames would otherwise stall the coyote clock.
+                ctx.request_repaint();
             }
+        } else {
+            self.chrome_leave_since = None;
         }
 
         let t = ctx.animate_bool(egui::Id::new("os_chrome_slide"), self.chrome_open);
+        self.chrome_t = t;
         if t <= 0.0 {
             return;
         }
@@ -537,6 +555,90 @@ fn install_panic_logger() {
     }));
 }
 
+/// Decode an embedded app-icon PNG to unpremultiplied RGBA. Separate from the
+/// terminal graphics decoder: no MAX_PIXELS gate, soft-fail at launch only.
+fn decode_app_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
+    let mut dec = png::Decoder::new(data);
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().map_err(|_| "bad png")?;
+    let (w, h) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if w == 0 || h == 0 {
+        return Err("empty png");
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|_| "bad png")?;
+    buf.truncate(info.buffer_size());
+    match info.color_type {
+        png::ColorType::Rgba => Ok((w, h, buf)),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(buf.len() / 3 * 4);
+            for p in buf.chunks_exact(3) {
+                rgba.extend_from_slice(p);
+                rgba.push(255);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(buf.len() * 2);
+            for p in buf.chunks_exact(2) {
+                rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            }
+            Ok((w, h, rgba))
+        }
+        png::ColorType::Grayscale => {
+            let mut rgba = Vec::with_capacity(buf.len() * 4);
+            for &v in &buf {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+            Ok((w, h, rgba))
+        }
+        _ => Err("bad png"),
+    }
+}
+
+/// Center `rgba` (w×h) on a transparent square whose side is a multiple of 4
+/// (egui IconData guidance). Does not stretch.
+fn pad_to_square_rgba(w: u32, h: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) {
+    let side = w.max(h).div_ceil(4) * 4;
+    let mut out = vec![0u8; (side as usize) * (side as usize) * 4];
+    let ox = ((side - w) / 2) as usize;
+    let oy = ((side - h) / 2) as usize;
+    let src_stride = (w as usize) * 4;
+    let dst_stride = (side as usize) * 4;
+    for row in 0..(h as usize) {
+        let src = row * src_stride;
+        let dst = (oy + row) * dst_stride + ox * 4;
+        out[dst..dst + src_stride].copy_from_slice(&rgba[src..src + src_stride]);
+    }
+    (side, side, out)
+}
+
+/// Taskbar / Alt-Tab icon from the embedded PNG. Soft-fails (None) so a bad
+/// asset never blocks launch.
+fn load_app_icon() -> Option<egui::IconData> {
+    const BYTES: &[u8] = include_bytes!("../assets/icons/app-icon.png");
+    let (w, h, rgba) = match decode_app_png(BYTES) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("foreman: app icon decode failed: {e}");
+            return None;
+        }
+    };
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        eprintln!("foreman: app icon size mismatch");
+        return None;
+    }
+    let (sw, sh, square) = pad_to_square_rgba(w, h, &rgba);
+    Some(egui::IconData {
+        rgba: square,
+        width: sw,
+        height: sh,
+    })
+}
+
 fn main() -> eframe::Result {
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
@@ -545,12 +647,17 @@ fn main() -> eframe::Result {
     }
     install_panic_logger();
     skills_install::install();
-    conpty_install::ensure_conpty();
+    conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_decorations(false);
+    match load_app_icon() {
+        Some(icon) => viewport = viewport.with_icon(icon),
+        None => eprintln!("foreman: using default window icon"),
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_decorations(false),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -565,4 +672,43 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(rx)))
         }),
     )
+}
+
+#[cfg(test)]
+mod app_icon_tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_square_centers_and_rounds_side_to_multiple_of_4() {
+        // 3×5 red pixel field → side max(3,5)=5 → round up to 8.
+        let mut src = vec![0u8; 3 * 5 * 4];
+        for px in src.chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let (sw, sh, out) = pad_to_square_rgba(3, 5, &src);
+        assert_eq!((sw, sh), (8, 8));
+        assert_eq!(out.len(), 8 * 8 * 4);
+        // Center offset: ((8-3)/2, (8-5)/2) = (2, 1).
+        let at = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        assert_eq!(at(2, 1), [255, 0, 0, 255]); // top-left of blit
+        assert_eq!(at(4, 5), [255, 0, 0, 255]); // bottom-right of blit
+        assert_eq!(at(0, 0), [0, 0, 0, 0]); // padding
+        assert_eq!(at(7, 7), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn embedded_app_icon_loads_as_square_icon_data() {
+        let icon = load_app_icon().expect("app-icon.png should decode");
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.width % 4, 0);
+        assert_eq!(
+            icon.rgba.len(),
+            (icon.width as usize) * (icon.height as usize) * 4
+        );
+        // Asset is non-trivial art; must not be an empty transparent square.
+        assert!(icon.rgba.iter().any(|&b| b != 0));
+    }
 }
