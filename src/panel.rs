@@ -18,13 +18,17 @@ pub const RAIL_W: f32 = 36.0;
 /// Semantics depend on the manager that interprets the path:
 /// - **Desktop:** `project` is a desktop window id. When `window` is `None`,
 ///   optional `tab` selects a project tab on that window. When `window` is
-///   `Some`, it is a child window inside a nested project manager; `tab` is the
-///   child's tab index (the owning project tab is found by scanning).
+///   `Some`, it is a child window inside a nested project manager, `ptab` is
+///   the project tab owning it, and `tab` is the child's tab index.
 /// - **Project manager (crew board):** `project` is a local window id, `window`
 ///   is `None`, and `tab` selects a tab on that window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TargetPath {
     pub project: WinId,
+    /// Owning project-tab index on `project` when `window` is `Some`. Nested
+    /// managers number child windows independently (each starts at 1), so
+    /// tabbed projects collide under a bare child-id scan — this pins the tab.
+    pub ptab: Option<usize>,
     pub window: Option<WinId>,
     pub tab: Option<usize>,
 }

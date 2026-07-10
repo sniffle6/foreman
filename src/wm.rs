@@ -1179,6 +1179,7 @@ impl WindowManager {
         }) {
             self.surface_target(crate::panel::TargetPath {
                 project: win,
+                ptab: None,
                 window: None,
                 tab: Some(tab),
             });
@@ -1229,6 +1230,7 @@ impl WindowManager {
             // Local-level surface: this manager owns both viewer and terminal.
             self.surface_target(crate::panel::TargetPath {
                 project: win,
+                ptab: None,
                 window: None,
                 tab: Some(tab),
             });
@@ -1259,17 +1261,9 @@ impl WindowManager {
                 }
             }
             Some(wid) => {
-                // Find the project tab that owns this child window.
-                let mut found_pi = None;
-                for (i, t) in self.windows[pidx].tabs.iter().enumerate() {
-                    if let Content::Project(inner) = &t.content {
-                        if inner.windows.iter().any(|cw| cw.id == wid) {
-                            found_pi = Some(i);
-                            break;
-                        }
-                    }
-                }
-                let Some(pi) = found_pi else { return };
+                let Some(pi) = self.owning_project_tab(pidx, wid, path.ptab) else {
+                    return;
+                };
                 self.windows[pidx].active = pi;
                 if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
                     inner.unminimize(wid);
@@ -1303,6 +1297,7 @@ impl WindowManager {
                 };
                 let ppath = TargetPath {
                     project: w.id,
+                    ptab: None,
                     window: None,
                     tab: Some(pi),
                 };
@@ -1323,6 +1318,7 @@ impl WindowManager {
                         tabs.push(TabEntry {
                             path: TargetPath {
                                 project: w.id,
+                                ptab: Some(pi),
                                 window: Some(cw.id),
                                 tab: Some(ti),
                             },
@@ -1493,10 +1489,7 @@ impl WindowManager {
                     return;
                 };
                 // Activate the project tab that owns this child, then minimize.
-                let pi = self.windows[pidx].tabs.iter().position(|t| {
-                    matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
-                });
-                if let Some(pi) = pi {
+                if let Some(pi) = self.owning_project_tab(pidx, wid, p.ptab) {
                     self.windows[pidx].active = pi;
                     if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
                         inner.minimize(wid);
@@ -1516,10 +1509,9 @@ impl WindowManager {
                 let Some(pidx) = self.windows.iter().position(|w| w.id == p.project) else {
                     return;
                 };
-                let pi = self.windows[pidx].tabs.iter().position(|t| {
-                    matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
-                });
-                let Some(pi) = pi else { return };
+                let Some(pi) = self.owning_project_tab(pidx, wid, p.ptab) else {
+                    return;
+                };
                 self.windows[pidx].active = pi;
                 // Route through the nested manager's confirm path.
                 if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
@@ -1535,6 +1527,24 @@ impl WindowManager {
                 }
             }
         }
+    }
+
+    /// Index of the project tab on `self.windows[pidx]` that owns child window
+    /// `wid`. Prefers the path's recorded `ptab`: nested managers number child
+    /// windows independently (each starts at 1), so when projects are tabbed a
+    /// bare child-id scan always resolves to the FIRST project tab. The scan
+    /// remains as a fallback for stale paths (tab reordered since the model
+    /// snapshot).
+    fn owning_project_tab(&self, pidx: usize, wid: WinId, ptab: Option<usize>) -> Option<usize> {
+        let owns = |t: &Tab| {
+            matches!(&t.content, Content::Project(inner) if inner.windows.iter().any(|cw| cw.id == wid))
+        };
+        if let Some(pi) = ptab {
+            if self.windows[pidx].tabs.get(pi).is_some_and(|t| owns(t)) {
+                return Some(pi);
+            }
+        }
+        self.windows[pidx].tabs.iter().position(|t| owns(t))
     }
 
     /// Apply input-line submissions recorded during the draw. Human posts
@@ -4852,6 +4862,7 @@ mod tests {
 
         wm.surface_target(crate::panel::TargetPath {
             project: b,
+            ptab: None,
             window: None,
             tab: None,
         });
@@ -4868,12 +4879,50 @@ mod tests {
         wm.minimize(a);
         wm.surface_target(crate::panel::TargetPath {
             project: a,
+            ptab: None,
             window: None,
             tab: None,
         });
         let wa = wm.windows.iter().find(|w| w.id == a).unwrap();
         assert!(!wa.minimized);
         assert!(!wm.tree.contains(a), "floating windows restore floating");
+    }
+
+    #[test]
+    fn surface_target_disambiguates_tabbed_projects_with_colliding_child_ids() {
+        let mut desk = WindowManager::new();
+        let w = push(&mut desk, "a");
+        // Two inner managers: each numbers its child windows from 1, so the
+        // child ids collide — exactly what tabbing two projects produces.
+        let mut inner_a = WindowManager::new();
+        let ca = push(&mut inner_a, "term-a");
+        let mut inner_b = WindowManager::new();
+        let cb = push(&mut inner_b, "term-b");
+        assert_eq!(ca, cb, "the collision under test");
+        let win = desk.windows.iter_mut().find(|x| x.id == w).unwrap();
+        win.tabs = vec![
+            Tab {
+                title: "a".into(),
+                content: Content::Project(Box::new(inner_a)),
+            },
+            Tab {
+                title: "b".into(),
+                content: Content::Project(Box::new(inner_b)),
+            },
+        ];
+        win.active = 0;
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: w,
+            ptab: Some(1),
+            window: Some(cb),
+            tab: Some(0),
+        });
+        assert_eq!(
+            desk.windows.iter().find(|x| x.id == w).unwrap().active,
+            1,
+            "the second project tab owns the clicked terminal"
+        );
     }
 
     #[test]
@@ -7341,6 +7390,7 @@ mod tests {
             p.path,
             crate::panel::TargetPath {
                 project: proj,
+                ptab: None,
                 window: None,
                 tab: Some(0),
             }
@@ -7396,6 +7446,7 @@ mod tests {
 
         desk.surface_target(crate::panel::TargetPath {
             project: proj,
+            ptab: None,
             window: Some(cw),
             tab: Some(1),
         });
@@ -7419,6 +7470,7 @@ mod tests {
         desk.focus(a);
         desk.surface_target(crate::panel::TargetPath {
             project: 999,
+            ptab: None,
             window: None,
             tab: None,
         });
@@ -7486,11 +7538,13 @@ mod tests {
                 Act::Min(1),
                 Act::FocusPath(crate::panel::TargetPath {
                     project: 2,
+                    ptab: None,
                     window: None,
                     tab: None,
                 }),
                 Act::MinPath(crate::panel::TargetPath {
                     project: 1,
+                    ptab: None,
                     window: None,
                     tab: None,
                 }),

@@ -17,6 +17,11 @@ and the landing site for future agent-state badges.
 - **Write seam:** `surface_target(TargetPath)` restores project + child + tab
   and focuses. Panel rows and the chat crew board both route here via
   `Act::{FocusPath,MinPath,ClosePath}`.
+- **Tabbed projects need `ptab`:** nested managers number child windows
+  independently (each starts at 1), so when projects are tabbed a bare
+  child-id scan always resolves to the first project tab. `TargetPath.ptab`
+  records the owning project-tab index; `owning_project_tab` prefers it and
+  falls back to the scan only for stale paths.
 - **Restore returns to the tree:** `minimize` records whether the window was
   tiled (`Win::min_from_tree`); `unminimize` re-enters the tree at the leaf
   under the window's old center (best effort — the tree may have changed).
