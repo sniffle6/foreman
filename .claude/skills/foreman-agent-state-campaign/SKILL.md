@@ -11,6 +11,12 @@ description of shipped code. Every phase has an exit gate; do not skip gates.
 Nothing here authorizes routing around **foreman-change-control** — thresholds,
 state names, and any new Control-plane verb are user sign-off items.
 
+**Roadmap cross-link (2026-07-10):** `docs/warp-feature-candidates.md` treats
+this campaign as the **product goal**, not the next shovel. Shovel first:
+font fallback, snapshot `--tail`, then **Phase 0 READY_GRACE** before any
+detector or badges. Task-manager panel is the future badge landing site.
+OSC 133 (warp doc #1) is a Phase 1 *signal candidate*, not a parallel track.
+
 Baseline for all citations: commit `7fda1c2` (working tree clean when audited,
 2026-07-01). Re-check `git status` before building — this repo carries active
 TDD work between commits.
