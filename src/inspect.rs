@@ -283,13 +283,14 @@ pub fn parse_keys_wide(
     line: &[crate::input::CellWide],
     mut col: usize,
 ) -> Result<Vec<u8>, String> {
+    let mut line = line.to_vec();
     let mut out = Vec::new();
     for token in names {
         if token.is_empty() {
             continue;
         }
         let (key, mods) = parse_one_key(token)?;
-        let hint = crate::input::wide_hint_at(line, col);
+        let hint = crate::input::wide_hint_at(&line, col);
         let bytes = crate::input::encode_key_wide(key, mods, mode, hint);
         if bytes.is_empty() {
             return Err(format!(
@@ -297,7 +298,7 @@ pub fn parse_keys_wide(
             ));
         }
         out.extend_from_slice(&bytes);
-        col = crate::input::col_after_wide_key(col, key, mods, hint);
+        col = crate::input::apply_wide_key_to_line(&mut line, col, key, mods);
     }
     Ok(out)
 }

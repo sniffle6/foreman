@@ -71,6 +71,20 @@ pub fn wide_hint_at(line: &[CellWide], col: usize) -> WideCursorHint {
     }
 }
 
+/// Whether this physical keypress should emit two terminal sequences so a
+/// width-2 glyph is crossed/removed as one unit.
+pub fn wide_key_doubles(key: Key, mods: Modifiers, wide: WideCursorHint) -> bool {
+    let ctrl = mods.ctrl || mods.command;
+    if ctrl || mods.alt {
+        return false;
+    }
+    match key {
+        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
+        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
+        _ => false,
+    }
+}
+
 /// Encode one physical keypress with wide-cell policy (deep module).
 ///
 /// All keyboard and `send --keys` paths should go through this so ←/→/BS/Del
@@ -86,16 +100,7 @@ pub fn encode_key_wide(
     if seq.is_empty() {
         return seq;
     }
-    let ctrl = mods.ctrl || mods.command;
-    if ctrl || mods.alt {
-        return seq;
-    }
-    let double = match key {
-        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
-        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
-        _ => false,
-    };
-    if !double {
+    if !wide_key_doubles(key, mods, wide) {
         return seq;
     }
     let mut out = Vec::with_capacity(seq.len() * 2);
@@ -105,30 +110,75 @@ pub fn encode_key_wide(
 }
 
 /// Simulate cursor column after one physical keypress (horizontal only).
-/// Used so multi-key batches re-derive [`WideCursorHint`] without re-reading
-/// the live grid (PTY has not advanced yet).
 pub fn col_after_wide_key(
     col: usize,
     key: Key,
     mods: Modifiers,
     wide: WideCursorHint,
 ) -> usize {
-    let ctrl = mods.ctrl || mods.command;
-    if ctrl || mods.alt {
-        return col;
-    }
-    let double = match key {
-        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
-        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
-        _ => false,
+    let step = if wide_key_doubles(key, mods, wide) {
+        2usize
+    } else {
+        1
     };
-    let step = if double { 2usize } else { 1 };
     match key {
         Key::ArrowRight => col.saturating_add(step),
         Key::ArrowLeft | Key::Backspace => col.saturating_sub(step),
         // Delete typically does not move the cursor in VT hosts.
         _ => col,
     }
+}
+
+/// Clear a width-2 pair from a simulated row after Backspace/Delete so
+/// hold-to-repeat / multi-key batches do not re-see a ghost base+spacer.
+fn clear_wide_pair(line: &mut [CellWide], base_col: usize) {
+    if base_col < line.len() {
+        line[base_col] = CellWide::Narrow;
+    }
+    if base_col + 1 < line.len() {
+        line[base_col + 1] = CellWide::Narrow;
+    }
+}
+
+/// Apply one physical key to a simulated row: encode-policy mutation + new col.
+///
+/// Call after [`encode_key_wide`] with the same `key`/`mods`. Updates `line` so
+/// the next key in a hold-Backspace burst does not re-double against stale
+/// wide cells (the live grid has not been pumped yet).
+pub fn apply_wide_key_to_line(
+    line: &mut [CellWide],
+    col: usize,
+    key: Key,
+    mods: Modifiers,
+) -> usize {
+    let hint = wide_hint_at(line, col);
+    if wide_key_doubles(key, mods, hint) {
+        match key {
+            Key::Backspace if hint.left_is_spacer && col >= 2 => {
+                clear_wide_pair(line, col - 2);
+            }
+            Key::Backspace if hint.on_wide_spacer && col >= 1 => {
+                clear_wide_pair(line, col - 1);
+            }
+            Key::Delete if hint.on_wide_base => {
+                clear_wide_pair(line, col);
+            }
+            Key::Delete if hint.on_wide_spacer && col >= 1 => {
+                clear_wide_pair(line, col - 1);
+            }
+            _ => {}
+        }
+    } else if matches!(key, Key::Backspace) && col > 0 {
+        // Single cell delete to the left (narrow).
+        if let Some(cell) = line.get_mut(col - 1) {
+            *cell = CellWide::Narrow;
+        }
+    } else if matches!(key, Key::Delete) && col < line.len() {
+        if let Some(cell) = line.get_mut(col) {
+            *cell = CellWide::Narrow;
+        }
+    }
+    col_after_wide_key(col, key, mods, hint)
 }
 
 /// Decide what this frame's egui events mean for the terminal. Pure: real
@@ -151,10 +201,11 @@ pub fn process_input(
 /// Like [`process_input`], plus wide-char encoding from an optional cursor row.
 ///
 /// `wide_cursor` is `(line_flags, cursor_col)`. When `None`, every key uses a
-/// default (no-wide) hint — tests and non-Session callers. When `Some`, each
-/// key is encoded via [`encode_key_wide`] and the column is advanced with
-/// [`col_after_wide_key`] so multi-key / key-repeat batches do not reuse a
-/// stale base/spacer fact.
+/// default (no-wide) hint — tests and non-Session callers. When `Some`, the
+/// row is **cloned** into a working buffer: each key is encoded via
+/// [`encode_key_wide`], then [`apply_wide_key_to_line`] clears deleted wide
+/// pairs and advances the column so hold-Backspace / multi-key batches do not
+/// re-hit ghost base+spacer cells (the live grid is not pumped yet).
 pub fn process_input_wide(
     events: &[Event],
     mods: Modifiers,
@@ -162,10 +213,8 @@ pub fn process_input_wide(
     has_selection: bool,
     wide_cursor: Option<(&[CellWide], usize)>,
 ) -> InputOutcome {
-    let (wide_line, mut wide_col) = match wide_cursor {
-        Some((line, col)) => (Some(line), col),
-        None => (None, 0),
-    };
+    let mut wide_line: Option<Vec<CellWide>> = wide_cursor.map(|(line, _)| line.to_vec());
+    let mut wide_col = wide_cursor.map(|(_, col)| col).unwrap_or(0);
     let mut out = InputOutcome::default();
     let mut saw_paste = false;
     let mut want_clip_paste = false; // Ctrl+V family
@@ -240,7 +289,7 @@ pub fn process_input_wide(
                             continue;
                         }
                         (Key::X, _) => continue, // cut handled via Event::Cut
-                        // Ctrl+0: reset the global terminal zoom. Consumed here so
+                        // Ctrl+0: reset the global terminal font size. Consumed here so
                         // the shell never sees a stray NUL.
                         (Key::Num0, false) => {
                             out.zoom_reset = true;
@@ -249,14 +298,16 @@ pub fn process_input_wide(
                         _ => {}
                     }
                 }
-                // Deep encode: wide-cell policy lives only in encode_key_wide.
+                // Deep encode: policy in encode_key_wide; line mutation so the
+                // next key in this frame (or hold-repeat batch) sees clears.
                 let hint = wide_line
+                    .as_deref()
                     .map(|line| wide_hint_at(line, wide_col))
                     .unwrap_or_default();
                 let seq = encode_key_wide(k, m, mode, hint);
                 out.pty_bytes.extend_from_slice(&seq);
-                if wide_line.is_some() {
-                    wide_col = col_after_wide_key(wide_col, k, m, hint);
+                if let Some(line) = wide_line.as_mut() {
+                    wide_col = apply_wide_key_to_line(line, wide_col, k, m);
                 }
             }
             _ => {}
@@ -1068,6 +1119,43 @@ mod tests {
         );
         // First doubles (leave wide), second single (on narrow) → 3 CSI C.
         assert_eq!(out.pty_bytes, b"\x1b[C\x1b[C\x1b[C");
+    }
+    #[test]
+    fn hold_backspace_clears_two_wide_glyphs_without_ghost_double() {
+        // Hold-BS batch: after first wide delete, simulated line must clear the
+        // pair so the second BS doubles against the *previous* glyph, not a
+        // ghost spacer (which left white half-cells on screen).
+        let line = [
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow, // cursor starts here (col 4)
+        ];
+        let out = process_input_wide(
+            &[
+                key_ev(Key::Backspace, none()),
+                key_ev(Key::Backspace, none()),
+            ],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            Some((&line, 4)),
+        );
+        // Two wide deletes → four DEL bytes.
+        assert_eq!(out.pty_bytes, [0x7f, 0x7f, 0x7f, 0x7f]);
+    }
+    #[test]
+    fn apply_wide_key_to_line_backspace_clears_pair() {
+        let mut line = [
+            CellWide::WideBase,
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+        ];
+        let col = apply_wide_key_to_line(&mut line, 2, Key::Backspace, none());
+        assert_eq!(col, 0);
+        assert_eq!(line[0], CellWide::Narrow);
+        assert_eq!(line[1], CellWide::Narrow);
     }
 
     // ---- zoom ----------------------------------------------------------------
