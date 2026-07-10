@@ -23,13 +23,27 @@ Fig completion specs (MIT).
 | 3 | Renderer: custom GPU framework (warpui-style) | **REJECT** (egui optimizations: ADOPT-LATER, gated) | S–M (opts) / L–XL (renderer) | 4K perf measurement; real bottleneck is VTE parsing, not rendering |
 | 4 | Fig completion specs (autocomplete) | **REJECT for now** | L | Reconsider only if composer ships AND humans demonstrably type raw shell |
 | 5 | Keybinding enablement predicates | **REJECT** (20-line `keyboard_owner` extraction: worthwhile) | M | Revisit only if non-leader globals or rebindable modal keys arrive |
-| 6 | Per-terminal composer/input pane | **ADOPT** | S | Decide submit chord + `term_mode()` gating; reuses `inject_input` verbatim |
-| 7 | Fleet dashboard / agent-state badges | **ADOPT-LATER** | M + M | Execute foreman-agent-state-campaign phases 0–2 first; badges are its planned phase 3 |
-| 8 | Warp's dependency stack (Tokio/font-kit/fork) | **KEEP-AS-IS** — except **font fallback: ADOPT** (S) | S | Load YaHei + Segoe UI Emoji into egui `FontDefinitions`; CJK is tofu today |
+| 6 | Per-terminal composer/input pane | **OPTIONAL** (not equal to the S fixes above) | S | Only if multi-line *unframed* draft is wanted; chat multiline is a cheaper partial sub |
+| 7 | Fleet dashboard / agent-state badges | **ADOPT-LATER** | M + M | Campaign phases 0–2 first; badges = phase 3. No lying dots. |
+| 8 | Warp's dependency stack (Tokio/font-kit/fork) | **KEEP-AS-IS** — except **font fallback: ADOPT** (S) | S | Load YaHei + Segoe into egui fallbacks; only matters when non-ASCII hits the screen |
 
-**Quick wins surfaced by the review:** snapshot `--tail N` (S, no dependencies),
-font fallback (S, ~30 lines, fixes real CJK/emoji tofu), composer pane (S,
-plumbing exists), `keyboard_owner()` guard extraction (~20 lines).
+### Goal vs do-next (do not confuse)
+
+| | What | Meaning |
+|---|------|---------|
+| **Product goal** | Agent-state detector | "Which pane needs me" — HANDOFF differentiator. Hard. Research. Not badges first. |
+| **Do next** | Ranked shovel list below | Small, real gaps. No research theater. |
+| **Not yet** | Fleet / badges / block model | Need honest detector (or self-report) first. |
+
+**Do next (ranked — not equal):**
+
+1. **Font fallback** — **shipped** (`docs/font-fallback.md`). CJK/emoji glyphs via YaHei + Segoe fallbacks.
+2. **snapshot `--tail N`** — agents only see the viewport today; long builds fall off.
+3. **READY_GRACE** (agent-state campaign Phase 0) — inject/chat can stick forever if DSR never latches. Foundation for state later.
+4. **`keyboard_owner()`** — ~20-line cleanup when touching keymap/wm. Lowest product value.
+5. **Composer** — optional human multi-line draft. Not the fleet problem. Soft adopt only.
+
+Then: OSC 133 spike (signal experiment) → campaign Phase 1 audit → detector or `foreman state` verb → badges last.
 
 ---
 
@@ -451,8 +465,11 @@ egui multiline defaults the opposite)? Draft state per-Session or transient
 egui memory? Gate `paste_wrap` on BRACKETED_PASTE from day one? Composer on
 agent panes only (reuse Claude/Codex tab-icon detection) or any terminal?
 
-**Verdict: ADOPT** — near-pure reuse of proven plumbing plus one widget; fills
-a genuine gap the singleline framed chat input doesn't cover.
+**Verdict: OPTIONAL** — plumbing is real and cheap, but this is a *human draft*
+aid, not the product thesis. Distinct value = multi-line + unframed + no chat
+broadcast. Upgrading chat to multi-line covers ~60% cheaper (still framed). Do
+not treat as equal to font / `--tail` / READY_GRACE. Ship only if we care about
+that draft UX; primary typists are agents that never use a composer.
 
 ---
 
@@ -556,11 +573,16 @@ Alacritty model.
   foreman rides egui defaults (Hack + Ubuntu + monochrome Noto emoji). The
   *data model* is wide-char-correct (WIDE_CHAR_SPACER, CJK selection acid-
   tested per docs/terminal-selection.md) but the *renderer* has **no CJK
-  glyphs (tofu)** and monochrome-only emoji. Chinese filenames or emoji-heavy
-  agent output render degraded today.
-- Fix needs no font-kit: read `C:\Windows\Fonts\msyh.ttc` (YaHei) +
-  `seguiemj.ttf` (Segoe UI Emoji — shapes render, color layers won't in
-  epaint) into egui `FontDefinitions` at startup, ~30 lines in main.rs.
+  glyphs (tofu)** and weak emoji coverage.
+- **When you see it:** CJK in paths/`ls`/`git`/agent errors; emoji in agent
+  replies or CLIs. **When you don't:** plain ASCII panes only — you may never
+  notice. Display bug, not a new feature.
+- Fix needs no font-kit: at `eframe::run_native` startup, best-effort
+  `std::fs::read` of `C:\Windows\Fonts\msyh.ttc` (YaHei) + `seguiemj.ttf`
+  (Segoe UI Emoji — shapes only in egui 0.34; not color), insert into
+  `FontDefinitions::default()` and **push** onto Monospace + Proportional
+  fallback lists (keep defaults first). ~30 lines in `main.rs`. Missing file
+  = skip, don't crash.
 - One acknowledged wart: a wedged control-handler thread is reclaimed only
   when its client dies (control.rs:252-255 comments) — bounded by the 64 cap.
 
@@ -586,54 +608,51 @@ font discovery only if foreman ever leaves Windows.
 
 ---
 
-## Recommendation: the single most important thing (2026-07-09)
+## Product goal vs first shovel (2026-07-10)
 
-**Agent-state detection — the needs-input / working / done signal per pane.**
-Not the badges or the fleet view; the *detector* underneath them.
+**Product goal (not "code this tomorrow"):** agent-state *detector* —
+needs-input / working / done / idle per pane. Not badges. Not fleet UI.
+Runbook: `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
 
-1. **It's the product thesis.** The binding constraint on how many agents one
-   human can run is attention, not panes or speed. Today you visually poll
-   every pane to find the one blocked on you. Warp's Oz dashboard is market
-   confirmation that "which agent needs me" *is* the product. HANDOFF.md
-   already calls state detection the differentiator; the campaign runbook
-   (`.claude/skills/foreman-agent-state-campaign/SKILL.md`) exists with
-   nothing built.
-2. **It's upstream of nearly everything else in this doc.** The fleet
-   dashboard (#7) and per-pane badges are renderings of it. Chat
-   quiescence-gating (safe injection timing — known chat gap) needs it.
-   "Agent finished" notifications need it. The OSC 133 spike (#1) is best
-   understood as one candidate *signal* for it. Build the detector once as a
-   pure module (`agentstate.rs`, fixture-tested, as the campaign prescribes)
-   and four features fall out.
-3. **It's the hardest, which is why it's a moat.** Passive signals cleanly
-   give *working* (output flowing), but done vs idle vs waiting-on-you is
-   ambiguous from PTY bytes — Claude Code idles at a TUI input box where no
-   prompt mark ever fires. Nobody solves this well from the outside. If the
-   passive route fails, foreman's control plane + skill-install mechanism are
-   unusually well positioned to ship the escalation: a `foreman state` verb
-   agents self-report through (the real Oz-parity mechanism, since Warp has
-   first-party state).
+Why it matters: attention is the bottleneck, not pane count. HANDOFF names
+this the differentiator. Badges, fleet, chat quiescence gating, and "agent
+finished" pings all sit on top of it. OSC 133 is one *signal*, not the feature.
 
-**Tradeoff:** M-effort with genuine research risk, vs the S-effort sure things
-(composer, font fallback, `--tail`). Plan: knock out the S items for momentum,
-then commit to campaign Phase 0-1 (signal audit) as the main line. If the
-audit shows passive signals can't separate needs-input from resting, don't
-grind on heuristics — go straight to the self-reporting verb. A detector
-that's right 99% of the time beats a clever one that flaps; a flappy
-"needs you" badge trains the user to ignore it.
+**Honest ceiling from outside the agent (PTY only):**
 
-## Suggested sequencing (if/when adopted)
+| Often works | Often impossible without help |
+|-------------|-------------------------------|
+| working (bytes flowing) | needs-you vs done vs idle |
+| quiet | (all look: quiet + cursor parked) |
+| exited / dead process | |
 
-1. **Now / cheap:** font fallback (S), snapshot `--tail N` (S),
-   `keyboard_owner()` extraction (~20 lines), composer pane (S).
-2. **Spike:** OSC 133 ConPTY passthrough + detect-only marks (1 day) — the
-   result gates #2's block model and feeds the agent-state campaign.
-3. **Campaign-gated:** agent-state detection (existing campaign phases 0-2) →
-   badges → fleet overview (#7); command addressability block model (#2).
-4. **Rejected / dormant:** custom renderer (#3 — revisit only on a failed 4K
-   perf gate), Fig completions (#4 — only after composer + observed demand),
-   keybinding predicates (#5 — only if non-leader globals arrive).
+Warp Oz is first-party (Warp hosts the agent). Foreman is third-party
+(bytes only). Copy the *problem* ("who needs me"), not the mechanism.
 
-All decisions above are candidates, not commitments — several (state
-vocabulary, injection policy, wire changes) are ask-first per
-foreman-change-control.
+If Phase 1 audit cannot separate needs-input from resting → stop grinding
+heuristics → ship `foreman state` self-report via skills. Flappy "needs you"
+trains humans to ignore it. Prefer a boring 3-bin detector that is right over
+a 4-state theater that flaps.
+
+**Campaign order (when you leave the shovel list):**
+
+0. READY_GRACE — state-detection v0; unwedge inject/outbox  
+1. Signal audit — measure; no `agentstate.rs` yet  
+2. Pure detector *or* self-report verb (audit decides)  
+3. Badges / fleet / jump-to-needs-you last  
+
+Features "fall out" only if the detector is trustworthy.
+
+## Suggested sequencing
+
+1. **Now (ranked):** font fallback → snapshot `--tail N` → READY_GRACE
+   (Phase 0) → `keyboard_owner()` when convenient → composer only if wanted.
+2. **Spike:** OSC 133 ConPTY passthrough + detect-only (1 day). Gates block
+   model (#2); feeds campaign as a signal candidate.
+3. **Campaign:** Phase 1 audit → Phase 2 detector or `foreman state` →
+   Phase 3 badges/fleet (#7); full command addressability after marks.
+4. **Dormant:** custom renderer (#3 — only if 4K perf gate fails), Fig (#4 —
+   after composer + real demand), keybind predicates (#5 — non-leader globals).
+
+Candidates, not commitments. State vocabulary, injection policy, wire changes
+= ask-first per foreman-change-control.
