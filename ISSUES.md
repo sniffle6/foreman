@@ -69,6 +69,75 @@ from.
 
 ---
 
+### #2 — Feature: panel row click = focus if unfocused, minimize if already focused (projects and terminals)
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** In the task-manager/sessions panel (`src/panel.rs`, the desktop
+right-edge list of projects and their terminals), a single click on a row
+should behave like a taskbar button: if the target window is not the focused
+one (or is minimized), the click focuses/restores it; if it is already the
+focused window, the same click minimizes it. Applies to both project rows and
+terminal rows (for a terminal, "focused" means it is the focused terminal of
+the focused project, per the focus cascade).
+
+**Current behavior.** A row click unconditionally records
+`self.click = Some(path)` (`src/panel.rs` — row handling around
+`resp.clicked()` at ~272, ~597, ~782), which the window manager consumes to
+surface/focus the target. Clicking an already-focused row is a no-op; minimize
+is only reachable via the row's hover `min` button (~732–754).
+
+**Sketch.** Two options: (a) the panel model already paints rows differently
+for the focused target, so it knows focus state at click time — emit a
+distinct output (e.g. `toggle: Option<TargetPath>` next to `click`) when the
+clicked row is the focused one; or (b) keep the single `click` output and let
+the wm, when consuming it, check "is this path already the focused, visible
+window?" and minimize instead of surfacing. (b) keeps the model dumber and
+puts the policy where minimize/restore already lives (`src/wm.rs`).
+
+**Scope note.** Restoring must respect the existing focus-cascade rules in
+`src/wm.rs`; minimized windows restore via the panel today, so the
+minimize-on-second-click path must not strand a window with no way back
+(the panel row itself remains the restore affordance).
+
+---
+
+### #3 — Feature: Grok as a first-class agent — landing-page button + Grok icon on sessions
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** Add Grok (xAI's CLI agent) alongside Claude and Codex: a Grok
+launch button on the landing page, and a Grok icon shown on terminals/tabs that
+are running a grok session (everywhere the Claude/Codex logos appear today).
+
+**Current behavior.** Only Claude and Codex are first-class. The landing page
+(`src/landing.rs`) has a `SessionKind` enum (~line 13) with per-kind display
+name (~377), kind string (~388), launch command (~397), and icon mapping
+(~242); `src/main.rs` (~443) launches a shell running the agent, with an error
+toast if the binary is missing. Icons live in `src/icons.rs`: `IconKind` with
+an `include_str!` SVG from `assets/icons/` (~13), a tint color (~44), and
+detection by title/argv substring (~63–90) plus process-tree stem detection in
+`src/proc.rs` (`detect_agent`). `src/recents.rs` persists the kind as a plain
+string ("claude" | "codex" | ...).
+
+**Sketch.** Mirror the Codex plumbing end to end:
+1. `assets/icons/grok.svg` + `IconKind::Grok` (SVG const, tint, `all()` list,
+   `from_title`/`from_argv` matching a "grok" substring).
+2. `src/proc.rs` stem detection for `grok` (including the node-script case if
+   the CLI is a JS entrypoint, like codex.js).
+3. `SessionKind::Grok` in `src/landing.rs`: display name "Grok", kind string
+   "grok", launch command (verify the actual CLI binary name — assumed `grok`),
+   icon mapping, and inclusion in the landing button list (~26).
+4. `src/recents.rs` kind mapping for "grok".
+5. Update the unit tests that enumerate kinds/icons (icons.rs ~155–207,
+   landing.rs ~793–913, proc.rs, recents.rs ~137).
+
+**Open question.** Confirm the grok CLI's install name and how it appears in
+titles/process trees on Windows (binary vs `node …\grok.js`) before wiring
+detection — Claude/Codex icon detection has already been a bug surface.
+
+---
+
 ## Closed
 
 _(none yet)_
