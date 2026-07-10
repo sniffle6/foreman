@@ -29,7 +29,9 @@ At GUI startup (`src/main.rs`), `load_font_definitions` reads:
 | seguiemj | `C:\Windows\Fonts\seguiemj.ttf` | Emoji shapes (Segoe UI Emoji) |
 
 Missing file → skip. Fonts are **appended** after defaults (primary mono
-stays first). Color emoji layers are not supported in egui 0.34 — shapes only.
+stays first). egui 0.34's atlas still does mono outline shapes only —
+multi-color emoji is additive (texture stamps on top), not atlas color
+layers. See **Color stamps** below.
 
 ## Gotchas
 
@@ -41,3 +43,43 @@ stays first). Color emoji layers are not supported in egui 0.34 — shapes only.
 
 - `src/main.rs` — `append_font_fallbacks`, `windows_fallback_font_paths`,
   `load_font_definitions`, `set_fonts` in `run_native` create callback
+
+## Color stamps (optional)
+
+### What / why
+
+Multi-color single-codepoint emoji (🥒, 🚀) need bitmaps, not another solid
+`Color32` on a `LayoutJob`. DirectWrite rasters color glyphs; Foreman
+stamps those RGBA textures over the grid (same idea as kitty graphics
+overlays). Mono fallbacks (Segoe UI Emoji via egui) still load for outline
+shapes when a stamp misses or the char is not emoji presentation.
+
+### Paint-only
+
+ConPTY and alacritty stay the only model for cells, cursor, and bytes.
+No PTY width hacks, no spacer injection, no copy/selection changes — stamps
+are paint overlays only.
+
+### Emoji_Presentation
+
+v1 stamps only scalars with **default emoji presentation** (wide color
+emoji). Text-default symbols (☁ and friends) stay mono outlines.
+
+### Grid lock / caret
+
+Phase 1 paints **every** cell at `col × cell_w` (from `"M"` metrics), not
+free-flow galleys. That keeps the caret and text on the same grid after
+emoji/CJK. Design + rules:
+`docs/superpowers/specs/2026-07-10-color-emoji-grid-paint-design.md`.
+
+### Perf
+
+Unchanged frame → **no** re-layout of mono glyphs (memoized plan/shapes).
+Stamp cache is separate from the mono path so color lookup cost does not
+hit every frame's layout gate.
+
+### Key files (stamps)
+
+- `src/frame.rs` — `plan_paint` (mono placements + `emoji_sites`)
+- `src/emoji_raster.rs` — DirectWrite / atlas raster + stamp cache
+- `src/terminal.rs` — `Session::show` replays plan and draws stamps
