@@ -4,9 +4,9 @@
 
 **Goal:** Paint every terminal cell on the grid (`col × cell_w`) so the caret tracks text after emoji/CJK, and stamp multi-color single-codepoint emoji from Windows color fonts — paint-only, fail-open, with zero layout work on unchanged frames.
 
-**Architecture:** Deepen the existing **Frame plan** seam (`src/frame.rs`) with `plan_paint` → grid-locked glyphs + `emoji_sites`. `Session::show` caches positioned mono shapes under a `GalleyKey`-equivalent key (0 layout calls when the key is unchanged). New **EmojiAtlas** (`src/emoji_raster.rs`): small interface `color_glyph(ch, px) -> Option<RgbaImage>`; DirectWrite prod adapter + fake test adapter; stamps are a **separate** overlay cache that must not bust mono memoization. Spec: `docs/superpowers/specs/2026-07-10-color-emoji-grid-paint-design.md`.
+**Architecture:** Deepen the existing **Frame plan** seam (`src/frame.rs`) with `plan_paint` → grid-locked glyphs + `emoji_sites`. `Session::show` caches positioned mono shapes under a `GalleyKey`-equivalent key (0 layout calls when the key is unchanged). New **EmojiAtlas** (`src/emoji_raster.rs`): small interface `color_glyph(ch, px) -> Option<RgbaGlyph>` (raw RGBA bytes + size — no `image` crate); DirectWrite prod adapter + fake test adapter; stamps are a **separate** overlay cache that must not bust mono memoization. Spec: `docs/superpowers/specs/2026-07-10-color-emoji-grid-paint-design.md`.
 
-**Tech Stack:** Rust, egui/epaint 0.34, alacritty_terminal 0.26, Windows DirectWrite (phase 3 only). No new crates for phases 1–2. Phase 3 may use `windows` crate APIs already pulled transitively via `windows-sys` if possible; prefer minimal new deps — ask before adding.
+**Tech Stack:** Rust, egui/epaint 0.34, alacritty_terminal 0.26, Windows DirectWrite (phase 3 only). No new crates for phases 1–2. Phase 3 needs DirectWrite, which means an **explicit** `windows` crate dependency with the right features — `windows-sys` being present transitively does not help (different crate, and transitive deps can't be used without declaring them). A dependency add is a change-control gate: ask before adding.
 
 ## Global Constraints
 
@@ -98,61 +98,26 @@
 
     #[test]
     fn plan_paint_wide_char_one_glyph_skips_spacer() {
-        // 你好 is two width-2 CJK glyphs when the terminal classifies them wide.
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        // 你好: two width-2 CJK glyphs at cols 0 and 2; spacer cells emit nothing.
         let term = term_with("你好".as_bytes(), 8, 1);
         let m = metrics(8, 1);
         let plan = plan_paint(term.grid(), &m);
-        let non_space: Vec<_> = plan
-            .glyphs
-            .iter()
-            .filter(|g| g.ch != ' ' && g.ch != '\0')
-            .cloned()
-            .collect();
-        // Expect two logical glyphs at cols 0 and 2, each width_cells == 2.
-        // If the fixture shell doesn't mark wide, skip with a clear assert message.
-        assert!(
-            non_space.len() >= 2,
-            "expected CJK cells; got {non_space:?}"
-        );
-        let wides: Vec<_> = non_space.iter().filter(|g| g.width_cells == 2).collect();
-        if wides.is_empty() {
-            // Grid didn't flag WIDE_CHAR — still must not emit spacer as its own char.
-            assert!(
-                plan.glyphs.iter().all(|g| {
-                    !term.grid()[alacritty_terminal::index::Line(0)]
-                        [alacritty_terminal::index::Column(g.col)]
-                        .flags
-                        .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
-                        || g.ch == ' ' || g.ch == '\0'
-                }) == false
-                    || plan
-                        .glyphs
-                        .iter()
-                        .filter(|g| {
-                            term.grid()[alacritty_terminal::index::Line(0)]
-                                [alacritty_terminal::index::Column(g.col)]
-                                .flags
-                                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
-                        })
-                        .count()
-                        == 0
-            );
-        } else {
-            assert_eq!(wides[0].col, 0);
-            assert_eq!(wides[0].width_cells, 2);
-            assert_eq!(wides[1].col, 2);
-        }
-        // No placement that is only a WIDE_CHAR_SPACER with a real char
+
+        // Invariant: no GlyphPlacement may sit on a WIDE_CHAR_SPACER cell.
         for g in &plan.glyphs {
-            let cell = &term.grid()[alacritty_terminal::index::Line(0 as i32)]
-                [alacritty_terminal::index::Column(g.col)];
-            if cell
-                .flags
-                .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
-            {
-                panic!("spacer cell must not appear as a GlyphPlacement: {g:?}");
-            }
+            let cell = &term.grid()[Line(0)][Column(g.col)];
+            assert!(
+                !cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+                "spacer cell must not appear as a GlyphPlacement: {g:?}"
+            );
         }
+
+        let wides: Vec<_> = plan.glyphs.iter().filter(|g| g.width_cells == 2).collect();
+        assert_eq!(wides.len(), 2, "expected two wide CJK glyphs; got {:?}", plan.glyphs);
+        assert_eq!((wides[0].col, wides[0].ch), (0, '你'));
+        assert_eq!((wides[1].col, wides[1].ch), (2, '好'));
     }
 
     #[test]
@@ -170,7 +135,7 @@
     }
 ```
 
-Simplify the wide-char test if the double-negative is messy — intent: **WIDE_CHAR_SPACER cells never become `GlyphPlacement`s**; wide base cell has `width_cells == 2`.
+If the fixture `Term` does not mark these cells wide, fix the fixture (alacritty's `Processor` sets `WIDE_CHAR`/`WIDE_CHAR_SPACER` for CJK) — do **not** weaken the asserts.
 
 - [ ] **Step 2: Run RED**
 
@@ -236,7 +201,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
   fn reset_layout_call_count()
   fn note_layout_call() // called at every Session paint path that creates a Galley
   ```
-  Use `AtomicU64` + `Relaxed`, or `thread_local!` — process-wide is fine for unit tests that run serially on paint helpers.
+  Use `thread_local!` — **required**, not a process-wide `AtomicU64`: `cargo test` runs tests on parallel threads, and multiple tests resetting/reading one global counter is an intermittent failure waiting to happen (this repo already has one flaky-test scar). Paint helpers run on a single thread, so thread-local is sufficient.
 
 - [ ] **Step 1: Failing test** — after a pure helper that will wrap layout:
 
@@ -253,7 +218,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
     }
 ```
 
-- [ ] **Step 2: RED** then implement atomics; **GREEN**; commit:
+- [ ] **Step 2: RED** then implement with `thread_local!` (not process-wide atomics); **GREEN**; commit:
 
 ```text
 test(terminal): layout_call_count seam for paint perf gate
@@ -277,42 +242,99 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 **Strategy P (recommended):** For each `GlyphPlacement`, call `painter.layout_no_wrap(ch.to_string(), font, color)` **only when building the cache entry**, store `Vec<(egui::Pos2, Arc<Galley>)>` (or one big custom mesh). On cache hit: only `painter.galley(pos, g, …)` — **no** `layout_*`. Call `note_layout_call()` once per `layout_no_wrap` / `layout_job` during rebuild.
 
+**Mandatory blit-cost mitigations (not optional — "0 layout calls" alone does not bound cache-HIT cost, and repaints fire on every mouse move):**
+1. **Skip blank cells:** no galley stored or blitted for space/`'\0'` placements (backgrounds paint as today). Screens are mostly blank; this cuts shapes emitted per repaint by roughly 5–10×. Without it an 80×40 pane emits ~3200 `painter.galley` shapes per frame vs today's 1.
+2. **Dedupe galleys by `(char, style/font)`:** one `Arc<Galley>` per distinct pair in a small map; cells store `(pos, Arc)` clones. Cuts rebuild layout calls from #cells to #distinct chars and memory from thousands of galleys to dozens.
+
 **Strategy Q (alternative):** One `LayoutJob` per row with each glyph as its own section and `extra_letter_spacing` hacks — usually wrong; avoid unless P is too slow on rebuild.
 
 Position: `metrics.cell_rect(row, col).min` (or baseline-adjust if needed so mono baseline matches today — visual check).
 
 Overhang: do not clip; allow galley wider than `cell_w`.
 
-- [ ] **Step 1: Integration-style unit test** (no GUI window if possible): extract rebuild into a function testable with a mock painter is hard — instead:
+- [ ] **Step 1: Concrete unit tests** (no full Session / no window). Extract a Session-free memo helper in `terminal.rs` (or next to paint code) with this shape:
+
+```rust
+/// Key matches GalleyKey fields (content_gen, off, cols, rows, font_bits).
+struct MonoPaintKey { /* same 5 fields as GalleyKey */ }
+
+struct MonoGlyph {
+    pos: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+struct MonoPaintCache {
+    key: MonoPaintKey,
+    items: std::sync::Arc<Vec<MonoGlyph>>,
+}
+
+/// Rebuild items from plan. Calls `note_layout_call()` once per real
+/// `layout_no_wrap` / `layout_job`. Skips space/`'\0'`. Dedupes by (ch, style, font).
+/// `layout` is injected so tests can count without a full egui painter:
+///   layout: FnMut(char, GlyphStyle) -> Arc<Galley>
+fn mono_paint_items_for_test(
+    plan: &crate::frame::PaintPlan,
+    metrics: &crate::geom::CellMetrics,
+    layout: &mut dyn FnMut(char, crate::terminal::GlyphStyle) -> std::sync::Arc<egui::Galley>,
+) -> Vec<MonoGlyph> { /* … */ }
+
+impl MonoPaintCache {
+    /// On key match: return cached items, zero layouts.
+    /// On miss: rebuild via mono_paint_items_*, store, return.
+    fn get_or_rebuild(
+        &mut self,
+        key: MonoPaintKey,
+        plan: &crate::frame::PaintPlan,
+        metrics: &crate::geom::CellMetrics,
+        layout: &mut dyn FnMut(char, crate::terminal::GlyphStyle) -> std::sync::Arc<egui::Galley>,
+    ) -> std::sync::Arc<Vec<MonoGlyph>> { /* … */ }
+}
+```
+
+Tests (in `terminal.rs` `#[cfg(test)]`):
 
 ```rust
     #[test]
-    fn paint_cache_second_build_does_zero_layouts() {
-        // Build a fake plan twice through the same Session-level helper.
-        // If the helper is `fn rebuild_mono_paint(...)` and `fn paint_mono_cached(...)`,
-        // call rebuild once (N layout notes), then paint path with same key (0 new notes).
+    fn mono_paint_skips_blanks_and_dedupes_layouts() {
         reset_layout_call_count();
-        // ... construct Session or free function that takes PaintPlan + key ...
-        // First miss: layout_call_count() > 0
-        // Reset counter; second hit with same key: layout_call_count() == 0
+        let plan = /* PaintPlan with: 'a','a',' ','b' at cols 0..3, same style */;
+        let m = /* CellMetrics 4x1 */;
+        let mut n = 0u32;
+        let mut layout = |ch: char, _style: GlyphStyle| {
+            note_layout_call();
+            n += 1;
+            // return a dummy Arc<Galley> — use ui/ctx from egui Context::default()
+            // in test if needed, or a thin test double if Galley is hard to fake.
+            dummy_galley_for_tests(ch)
+        };
+        let items = mono_paint_items_for_test(&plan, &m, &mut layout);
+        assert_eq!(items.len(), 3, "blank skipped");
+        assert_eq!(layout_call_count(), 2, "two 'a's share one layout; + 'b'");
+    }
+
+    #[test]
+    fn mono_paint_cache_hit_does_zero_layouts() {
+        reset_layout_call_count();
+        let plan = /* non-empty plan */;
+        let m = /* metrics */;
+        let key = MonoPaintKey { /* fixed */ };
+        let mut cache = MonoPaintCache::empty();
+        let mut layout = |_ch, _s| {
+            note_layout_call();
+            dummy_galley_for_tests('x')
+        };
+        let _ = cache.get_or_rebuild(key, &plan, &m, &mut layout);
+        let first = layout_call_count();
+        assert!(first > 0);
+        reset_layout_call_count();
+        let _ = cache.get_or_rebuild(key, &plan, &m, &mut layout);
+        assert_eq!(layout_call_count(), 0, "cache hit must not layout");
     }
 ```
 
-Implement a small pure-ish helper on Session:
+If `Galley` cannot be constructed without a live `Fonts`/`Context`, use `eframe::egui::Context::default()` in the test and `ctx.fonts_mut(|f| f.layout_no_wrap(...))` inside the injected `layout` closure — still no window. Do **not** leave the test as a comment sketch.
 
-```rust
-struct MonoPaintCache {
-    key: GalleyKey, // reuse existing struct
-    items: Arc<Vec<MonoGlyph>>, // pos + Arc<Galley> + style extras
-}
-struct MonoGlyph {
-    pos: egui::Pos2,
-    galley: Arc<egui::Galley>,
-    // fg already in galley; underline may need separate strokes from style
-}
-```
-
-Underlines/strikethrough: either bake into TextFormat when laying out, or draw strokes from placement style using `cell_rect` (prefer TextFormat like today).
+Underlines/strikethrough: bake into TextFormat when laying out (prefer, matches today).
 
 - [ ] **Step 2: Replace free-flow whole-pane `LayoutJob` loop** with:
   1. `let plan = frame::plan_paint(...)`
@@ -336,7 +358,8 @@ feat(terminal): grid-locked mono paint with GalleyKey memo
 
 Replace free-flow whole-pane LayoutJob with per-placement layout
 cached under content_gen/scroll/dims/font. Unchanged frames re-blit
-only (0 layout_*). Overhang allowed; no column reflow.
+only (0 layout_*). Skip blank cells; dedupe galleys by (char, style).
+Overhang allowed; no column reflow.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ```
@@ -383,16 +406,23 @@ if is_default_emoji_presentation(ch) && width_cells == 2 {
         let term = term_with("🥒".as_bytes(), 8, 1);
         let m = metrics(8, 1);
         let plan = plan_paint(term.grid(), &m);
-        // If ConPTY/alacritty in unit test marks wide:
-        if plan.glyphs.iter().any(|g| g.width_cells == 2 && g.ch == '🥒') {
-            assert_eq!(plan.emoji_sites.len(), 1);
-            assert_eq!(plan.emoji_sites[0].ch, '🥒');
-            assert_eq!(plan.emoji_sites[0].width_cells, 2);
-        }
+        // Hard asserts: alacritty marks default-presentation emoji wide (like CJK).
+        // If this fails, fix term_with / feed path — do not soften.
+        let g = plan
+            .glyphs
+            .iter()
+            .find(|g| g.ch == '🥒')
+            .expect("cucumber glyph placement");
+        assert_eq!(g.width_cells, 2);
+        assert_eq!(g.col, 0);
+        assert_eq!(plan.emoji_sites.len(), 1);
+        assert_eq!(plan.emoji_sites[0].ch, '🥒');
+        assert_eq!(plan.emoji_sites[0].width_cells, 2);
+        assert_eq!(plan.emoji_sites[0].col, 0);
     }
 ```
 
-Unit tests that feed UTF-8 into alacritty `Term` (like existing `term_with`) should mark emoji wide — verify; if not, still test classifier in isolation.
+Classifier unit tests above always run; the site test requires the grid wide-flag path (same bar as Task 1 CJK).
 
 - [ ] **Step 2: RED → implement → GREEN → commit**
 
@@ -416,10 +446,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 **Interfaces:**
 
 ```rust
-pub trait EmojiRaster: Send {
-    fn color_glyph(&mut self, ch: char, px: u32) -> Option<image::RgbaImage>;
-    // Prefer no new dep: return Vec<u8> RGBA + (w,h):
-}
+// No new image crate dep: return raw RGBA bytes + dimensions.
 
 pub struct RgbaGlyph {
     pub w: u32,
@@ -518,13 +545,13 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 
 **Rules:**
 - Hold `Box<dyn EmojiRaster>` on Session or App (prefer **one shared** on App/`Context` data if easy; else per-Session).
-- Texture cache: `HashMap<(char, u32), egui::TextureHandle>` (px includes font-derived size).
+- Texture cache: `HashMap<(char, u32), egui::TextureHandle>` (px includes font-derived size). **Eviction (spec promises LRU-or-equivalent):** zoom churns the px key and stale textures linger forever — on paint, drop entries whose px no longer matches the current font-derived size (or cap the map). One line of `retain` is enough.
 - For each `plan.emoji_sites` after mono paint:
   - if texture cached → image
   - else `color_glyph` → load_texture → cache → image
   - `None` → leave mono
-- Skip mono for that span when stamp succeeds (rebuild mono cache **without** those glyphs, **or** draw stamps after mono and cover — covering is OK if stamp is opaque).
-- **Must not** change mono `PaintKey` when only atlas fills in.
+- On stamp success: paint the cell's **bg-colored rect over the span, then the stamp**. Color emoji bitmaps are RGBA with transparent backgrounds — stamping over the mono glyph shows it through the alpha (double-drawn emoji), so plain covering is NOT ok. The bg-rect underlay needs no relayout and no mono-cache change.
+- Never rebuild the mono cache because of atlas results — **must not** change mono `PaintKey` when only atlas fills in (the bg-rect approach is what makes both rules satisfiable).
 
 Draw: `painter.image(tex.id(), metrics.span_rect(row, col, col + width_cells as usize - 1), …)` with white tint / full UV.
 
@@ -565,8 +592,8 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 After Task 3, before calling phase 1 done:
 
 1. Counter test: two paint paths same key → second has `layout_call_count() == 0`.
-2. Optional: reuse `docs/superpowers/plans/2026-07-04-render-read-perf.md` style `[DEBUG-perf]` **throwaway** show-ms; compare relative to baseline in `docs/followups-latency-and-control.md`. Do not commit debug prints.
-3. Report mentally: shapes/vertices if easy; not a hard number gate.
+2. **Required, recorded:** reuse `docs/superpowers/plans/2026-07-04-render-read-perf.md` style `[DEBUG-perf]` **throwaway** show-ms; before/after on idle / echo / one-flood / 12-pane-flood at a maxed grid; gate on **relative** delta vs the baselines in `docs/followups-latency-and-control.md` (the counter test cannot catch blit/tessellation cost — 0 layouts with frame time up still fails spec success #6, and a fast dev box hides absolute-ms regressions that hurt weaker machines). Record the numbers in the phase-1 commit or session notes. Do not commit debug prints.
+3. **Required report:** shapes/glyph-items blitted per changed frame (a throwaway count of cache items is enough) vs today's single galley — this is the machine-independent number that catches a missing blank-skip/dedupe mitigation.
 
 ---
 
