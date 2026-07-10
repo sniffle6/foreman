@@ -168,7 +168,9 @@ MOUSE/FOCUS, so do it sparingly and tell them.
    glitches (stale wrap paint, empty band after shrink→grow, wrap-overflow) are
    **known** — full conhost reflow parity is parked. **`Ctrl+L`** heals a pane.
    Authority: `docs/conpty-resize-reflow.md`. Do not re-try “let ConPTY own
-   redraw” or blame a double reflow in `Session::resize`.
+   redraw” or blame a double reflow in `Session::resize`. The bundled pair is a
+   **preview** package — swap to stable 1.25 when Microsoft publishes it
+   (hashes + provenance: `assets/conpty/README.md`).
 
 ---
 
