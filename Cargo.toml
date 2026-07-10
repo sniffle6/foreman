@@ -25,6 +25,18 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ] }
+# Color emoji raster (DirectWrite + D2D → WIC bitmap). Not the same crate as windows-sys.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+] }
+# Used by D2D DrawTextLayout origin (Vector2); already a windows crate dep.
+windows-numerics = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

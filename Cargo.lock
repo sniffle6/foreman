@@ -1215,6 +1215,8 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "unicode-width",
+ "windows 0.62.2",
+ "windows-numerics",
  "windows-sys 0.61.2",
 ]
 
