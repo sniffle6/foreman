@@ -69,6 +69,8 @@ PTY bytes → ConPTY → alacritty grid  (unchanged)
 | Wide char = model’s 2 cells | Insert/delete spacers in the grid |
 | Raster `None` → mono | Panic or blank the pane |
 | Overlay ≠ selection text (like kitty) | Put stamp images into copy/snapshot |
+| Unchanged frame ⇒ **no re-layout** (memoized plan/shapes, `GalleyKey`-style) | Re-lay-out the pane every frame |
+| Mono glyph wider than `cell_w` overhangs its neighbor (standard terminal behavior) | Shift columns or reflow to "make room" |
 
 ## Components (deep modules)
 
@@ -145,6 +147,21 @@ duplication becomes real pain later.
 
 No detection logic, no DirectWrite types, no cache policy in `show`.
 
+**Performance contract (phase 1 is the hot path).** Today the pane is one
+whole-pane galley memoized in `galley_cache` (`GalleyKey`,
+`src/terminal.rs:325`) — steady-state frames are a single cached blit.
+Grid-locked paint must preserve an equivalent memoization: the built
+plan/positioned shapes are cached under the same key inputs
+(content gen / scroll / dims / font), and an **unchanged frame performs zero
+layout calls**. Naive per-cell layout-every-frame (rows × cols shapes even when
+idle) is rejected up front. Exact cache mechanism is a plan detail; the
+invariant is not.
+
+**Stamp vs mono cache:** emoji atlas hits/misses must **not** invalidate the
+mono plan/shape cache every frame. Stamps are a separate overlay cache (keyed
+by codepoint + px + dpr). First miss may paint mono for that site; color can
+appear on a later frame without rebuilding the whole-pane mono layout.
+
 ## Data flow (one frame)
 
 ```
@@ -173,7 +190,7 @@ so zoom invalidates naturally (same idea as galley `font_bits` today).
 | Non-emoji / ZWJ | `None` → mono |
 | Cache pressure | LRU (or equivalent) eviction; re-raster on demand |
 | Stale grid vs metrics | Frame clamp; no panic |
-| Slow first raster | Prefer sync v1 if measured OK; must not block the GUI on network; keep fail-open |
+| Slow first raster | Prefer sync v1 if measured OK; must not block the GUI on slow raster I/O; keep fail-open |
 
 ## Phased delivery
 
@@ -181,7 +198,7 @@ Same design; independent reviewable landings:
 
 | Phase | Deliverable | Value |
 |-------|-------------|--------|
-| **1** | Grid-locked mono via plan for all cells | Caret/CJK/emoji width alignment |
+| **1** | Grid-locked mono via plan for all cells; passes the perf gate (0 layout calls on unchanged frames, relative harness deltas) | Caret/CJK/emoji width alignment |
 | **2** | `emoji_sites` populated in plan | Detect + tests; still mono paint |
 | **3** | DirectWrite atlas + stamps in `show` | Color pickles |
 
@@ -197,6 +214,7 @@ Phase 1 alone meets half the bar (align). Phase 3 meets color. Both required for
 | Fail-open | `None` still has mono placement |
 | Manual | Paste color emoji, type `abc`, caret after letters; emoji multi-color |
 | Model untouched | No new PTY width hacks; snapshot/copy still UTF-8 text |
+| **Perf (phase 1 gate)** | Counter test: unchanged frame ⇒ **0 layout calls** (machine-independent). A "layout call" is any path that shapes text into new galleys/meshes for the pane (egui/epaint `layout*` / `Fonts` layout entry points used by terminal paint — named exactly in the implementation plan). Harness before/after on idle / echo / one-flood / 12-pane-flood at a maxed grid; gate on **relative** delta vs baseline (`docs/followups-latency-and-control.md` numbers), not absolute ms — a fast dev box hides regressions that hurt weaker machines. Also report shapes/vertices emitted per changed frame vs today's single galley. |
 
 Visual claims need screenshot evidence (build-screenshot / user capture).
 
@@ -230,9 +248,10 @@ Visual claims need screenshot evidence (build-screenshot / user capture).
 
 ## Open points for the implementation plan (not design blockers)
 
-- Exact emoji scalar classifier (range tables vs `unicode-segmentation` / existing crates — prefer minimal, tested list/ranges for v1).
+- Exact emoji scalar classifier (range tables vs `unicode-segmentation` / existing crates — prefer minimal, tested list/ranges for v1). **Must require default emoji presentation (`Emoji_Presentation=Yes`)**: single scalars like `☁` U+2601 default to *text* presentation and get width 1 from alacritty — stamping a square color glyph into a 1-cell text site is wrong. Text-presentation defaults and VS15/VS16 sequences → mono in v1 (**known limit**: `☁`+VS16 may be width-2 emoji presentation in the model but still mono until a later phase).
 - Sync vs deferred raster on first miss (measure after spike).
 - Texture cache ownership: per-`Context` vs per-`Session` (prefer shared per Context to reuse across panes).
+- Exact instrumentation for the "layout call" counter (which egui/epaint entry points).
 
 ## Success criteria (done bar)
 
@@ -241,3 +260,5 @@ Visual claims need screenshot evidence (build-screenshot / user capture).
 3. CJK paths/names also stay grid-aligned (all-cells paint).  
 4. Failure of color path leaves **readable mono**, app stable.  
 5. ConPTY/alacritty behavior unchanged (paint-only).  
+6. **Phase 1 perf gate green:** unchanged frame ⇒ 0 layout calls; relative harness deltas acceptable vs baseline.  
+
