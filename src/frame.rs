@@ -36,7 +36,7 @@ pub struct GlyphPlacement {
     pub width_cells: u8, // 1 or 2
 }
 
-/// Site reserved for color-emoji paint (empty until detector task).
+/// Site reserved for color-emoji stamp paint (populated; stamps later phase).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmojiSite {
     pub row: usize,
@@ -49,17 +49,76 @@ pub struct EmojiSite {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaintPlan {
     pub glyphs: Vec<GlyphPlacement>,
-    pub emoji_sites: Vec<EmojiSite>, // empty until Task 4
+    pub emoji_sites: Vec<EmojiSite>,
+}
+
+/// True when `ch` has Unicode default emoji presentation (`Emoji_Presentation=Yes`).
+///
+/// Minimal single-scalar v1: range table only — no VS15/VS16, no ZWJ sequences.
+/// Text-default symbols (e.g. ☁ U+2601) return false even if they are emoji.
+pub fn is_default_emoji_presentation(ch: char) -> bool {
+    let c = ch as u32;
+    // Core emoji blocks (most codepoints here are EP=Yes).
+    if (0x1F300..=0x1FAFF).contains(&c) {
+        return true;
+    }
+    // Selected BMP / SMP singles and ranges with Emoji_Presentation=Yes.
+    // Intentionally omits text-default emoji like U+2601 CLOUD.
+    matches!(
+        c,
+        0x231A..=0x231B
+            | 0x23E9..=0x23EC
+            | 0x23F0
+            | 0x23F3
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x1F004
+            | 0x1F0CF
+            | 0x1F18E
+            | 0x1F191..=0x1F19A
+            | 0x1F1E6..=0x1F1FF
+    )
 }
 
 /// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per
 /// logical cell at its grid column. Skips `WIDE_CHAR_SPACER`; wide chars get
 /// `width_cells = 2`. Clamps to real grid bounds (same process-abort guard).
+///
+/// Also records [`EmojiSite`]s for wide default-emoji-presentation scalars
+/// (stamp paint is a later phase — mono placement still always emitted).
 pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
     let off = grid.display_offset() as i32;
     let ncols = metrics.cols().min(grid.columns());
     let nrows = metrics.rows().min(grid.screen_lines());
     let mut glyphs = Vec::with_capacity(nrows * ncols);
+    let mut emoji_sites = Vec::new();
     for row in 0..nrows {
         for col in 0..ncols {
             let cell = &grid[Line(row as i32 - off)][Column(col)];
@@ -79,11 +138,21 @@ pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
                 style: glyph_style(cell.flags, cell.fg, cell.bg),
                 width_cells,
             });
+            // Stamp candidates: default emoji presentation + wide cell only.
+            // Narrow (width 1) stays mono-only even if the range matches.
+            if is_default_emoji_presentation(ch) && width_cells == 2 {
+                emoji_sites.push(EmojiSite {
+                    row,
+                    col,
+                    ch,
+                    width_cells,
+                });
+            }
         }
     }
     PaintPlan {
         glyphs,
-        emoji_sites: Vec::new(),
+        emoji_sites,
     }
 }
 
@@ -477,5 +546,35 @@ mod tests {
         );
         let plan = plan_paint(term.grid(), &m);
         assert!(plan.glyphs.iter().all(|g| g.row < 2 && g.col < 4));
+    }
+
+    // ---- emoji_sites: default-presentation wide scalars ----------------------
+    #[test]
+    fn cucumber_is_default_emoji_presentation() {
+        assert!(is_default_emoji_presentation('🥒'));
+    }
+    #[test]
+    fn cloud_text_default_is_not_emoji_presentation() {
+        assert!(!is_default_emoji_presentation('☁'));
+        assert!(!is_default_emoji_presentation('A'));
+    }
+    #[test]
+    fn plan_paint_emits_emoji_site_for_wide_emoji() {
+        let term = term_with("🥒".as_bytes(), 8, 1);
+        let m = metrics(8, 1);
+        let plan = plan_paint(term.grid(), &m);
+        // Hard asserts: alacritty marks default-presentation emoji wide (like CJK).
+        // If this fails, fix term_with / feed path — do not soften.
+        let g = plan
+            .glyphs
+            .iter()
+            .find(|g| g.ch == '🥒')
+            .expect("cucumber glyph placement");
+        assert_eq!(g.width_cells, 2);
+        assert_eq!(g.col, 0);
+        assert_eq!(plan.emoji_sites.len(), 1);
+        assert_eq!(plan.emoji_sites[0].ch, '🥒');
+        assert_eq!(plan.emoji_sites[0].width_cells, 2);
+        assert_eq!(plan.emoji_sites[0].col, 0);
     }
 }
