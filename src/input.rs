@@ -32,17 +32,17 @@ pub struct InputOutcome {
     pub zoom_reset: bool,
 }
 
-/// Live-cursor grid facts for wide-char arrow skipping (width-2 CJK/emoji).
+/// Live-cursor grid facts for wide-char key skipping (width-2 CJK/emoji).
 /// Default is a no-op so pure input tests stay free of grid fixtures.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WideCursorHint {
-    /// Cursor sits on a `WIDE_CHAR` base cell — Right should skip the spacer.
+    /// Cursor sits on a `WIDE_CHAR` base cell — Right / Delete should skip the spacer.
     pub on_wide_base: bool,
-    /// Cursor sits on a `WIDE_CHAR_SPACER` — Left should leave the whole glyph
-    /// (one physical keypress, not base-then-before).
+    /// Cursor sits on a `WIDE_CHAR_SPACER` — Left / Backspace should treat the
+    /// whole wide glyph as one unit (not base-then-before).
     pub on_wide_spacer: bool,
-    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — Left
-    /// should jump back to before the wide glyph (skip the spacer column).
+    /// Cell immediately left of the cursor is a `WIDE_CHAR_SPACER` — Left /
+    /// Backspace should remove/skip the full wide glyph (not leave a half-cell).
     pub left_is_spacer: bool,
 }
 
@@ -51,9 +51,9 @@ pub struct WideCursorHint {
 /// frame modifier state (distinct from any per-event `Key` modifiers), used to
 /// tell a genuine Alt+letter Text event apart from AltGr.
 ///
-/// Wide-char arrow skipping defaults off; Session calls [`process_input_wide`]
-/// with a live [`WideCursorHint`] so one Left/Right keypress crosses a width-2
-/// emoji/CJK cell instead of landing on the spacer.
+/// Wide-char key skipping defaults off; Session calls [`process_input_wide`]
+/// with a live [`WideCursorHint`] so one Left/Right/Backspace/Delete crosses
+/// or removes a width-2 emoji/CJK glyph instead of half a cell.
 pub fn process_input(
     events: &[Event],
     mods: Modifiers,
@@ -69,7 +69,8 @@ pub fn process_input(
     )
 }
 
-/// Like [`process_input`], plus wide-char Left/Right doubling from `wide`.
+/// Like [`process_input`], plus wide-char Left/Right/Backspace/Delete doubling
+/// from `wide`.
 pub fn process_input_wide(
     events: &[Event],
     mods: Modifiers,
@@ -163,13 +164,20 @@ pub fn process_input_wide(
                 // Everything else → the pure encoder.
                 let seq = encode_key(k, m, mode);
                 out.pty_bytes.extend_from_slice(&seq);
-                // Left/Right across width-2 cells (emoji/CJK): double the CSI so
-                // one keypress skips the spacer. Covers plain move *and*
-                // Shift+←/→ selection extend. Ctrl/Alt chords stay single
-                // (word-nav / other bindings). Empty seq = unmapped, no double.
+                // Width-2 cells (emoji/CJK): double the key so one physical
+                // press crosses/removes the whole glyph (base+spacer), not a
+                // half-cell white square. Covers move, Shift+←/→ select,
+                // Backspace, and Delete. Ctrl/Alt chords stay single (word-nav
+                // / other bindings). Empty seq = unmapped, no double.
                 let skip_wide = match k {
-                    Key::ArrowRight => wide.on_wide_base,
-                    Key::ArrowLeft => wide.left_is_spacer || wide.on_wide_spacer,
+                    // Right / Delete: on base → skip spacer; on spacer → leave glyph.
+                    Key::ArrowRight | Key::Delete => {
+                        wide.on_wide_base || wide.on_wide_spacer
+                    }
+                    // Left / Backspace: after glyph or mid-glyph → full unit.
+                    Key::ArrowLeft | Key::Backspace => {
+                        wide.left_is_spacer || wide.on_wide_spacer
+                    }
                     _ => false,
                 };
                 if !seq.is_empty() && !ctrl && !m.alt && skip_wide {
@@ -917,6 +925,83 @@ mod tests {
             wide,
         );
         assert_eq!(out.pty_bytes, b"\x1b[D\x1b[D");
+    }
+    #[test]
+    fn backspace_when_left_is_spacer_emits_two_del() {
+        // After a width-2 emoji: one Backspace must remove base+spacer, not
+        // leave a white half-cell (spacer orphan).
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            on_wide_spacer: false,
+            left_is_spacer: true,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::Backspace, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, [0x7f, 0x7f]);
+    }
+    #[test]
+    fn backspace_on_wide_spacer_emits_two_del() {
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            on_wide_spacer: true,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::Backspace, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, [0x7f, 0x7f]);
+    }
+    #[test]
+    fn backspace_without_wide_hint_is_single() {
+        let out = process_input(
+            &[key_ev(Key::Backspace, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, [0x7f]);
+    }
+    #[test]
+    fn delete_on_wide_base_emits_two() {
+        let wide = WideCursorHint {
+            on_wide_base: true,
+            on_wide_spacer: false,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::Delete, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        // encode_key Delete → CSI 3~
+        assert_eq!(out.pty_bytes, b"\x1b[3~\x1b[3~");
+    }
+    #[test]
+    fn delete_on_wide_spacer_emits_two() {
+        let wide = WideCursorHint {
+            on_wide_base: false,
+            on_wide_spacer: true,
+            left_is_spacer: false,
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::Delete, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            wide,
+        );
+        assert_eq!(out.pty_bytes, b"\x1b[3~\x1b[3~");
     }
 
     // ---- zoom ----------------------------------------------------------------

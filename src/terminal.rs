@@ -1241,8 +1241,8 @@ impl Session {
             .as_ref()
             .and_then(|s| s.to_range(&self.term))
             .is_some();
-        // Wide-char arrow skip: one Left/Right keypress should cross emoji/CJK
-        // (base+spacer), not park the caret mid-glyph.
+        // Wide-char key skip: one Left/Right/Backspace/Delete should cross or
+        // remove a full emoji/CJK glyph (base+spacer), not leave a half-cell.
         let wide = {
             use alacritty_terminal::term::cell::Flags;
             let g = self.term.grid();
