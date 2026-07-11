@@ -180,6 +180,28 @@ alacritty's `input_needs_wrap` (last-column/wrap-pending) state is also not
 carried by the point-only alias; the verified repros end at ordinary columns 2
 and 83 rather than that state.
 
+Residual variant (live repro 2026-07-11, parked): a LARGE multi-row emoji
+paste (10+ wrapped rows) comes back from ConPTY as hard-positioned,
+fully-packed rows — zero `LEADING_WIDE_CHAR_SPACER` pads and zero `WRAPLINE`
+flags in the grid (measured: every row's cell widths sum to exactly the
+column count). The alias's exact-match gate (difference == pad count) then
+compares a shortfall of N against 0 expected pads and fails CLOSED — by
+design — so the caret sits N cells behind the rendered end. N = the number
+of emoji PSReadLine split at row margins (measured live: 4 cells behind over
+a 21-row paste, with a lone-surrogate `�` in the buffer proving the split).
+PSReadLine's edits stay content-correct — its buffer offset is right, only
+its screen math is wrong — so this is display-only; Enter or `Ctrl+L`
+resyncs, and the buffer `�` is upstream corruption foreman cannot heal.
+
+Tracked follow-up if this recurs enough to hurt: REPLACE the CUP scanner
+with paste simulation. Foreman already knows the pasted string and the
+pre-paste cursor (`arm_psreadline_paste_cursor`), so the expected endpoint
+is pure width-aware wrap arithmetic — no VT interception; alias when the
+settled cursor lands short of it, same fail-closed gates (pwsh, primary
+screen, single-line, no input since). Covers both the pad variant and this
+one, likely with less code. Do it as its own reviewed change, not a bolt-on
+to the scanner.
+
 Cosmetic residue that remains (upstream, do not chase): between the two
 DELs of a doubled press the child buffer transiently holds a lone
 surrogate; if ConPTY renders that instant it writes a `�` and never clears
