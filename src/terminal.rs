@@ -769,11 +769,10 @@ fn mono_paint_items(
         if g.ch == ' ' || g.ch == '\0' {
             continue;
         }
-        // Color stamps own default-emoji-presentation scalars. Laying them out
-        // as mono produces tofu □ (esp. width-1 orphans after wrap/BS).
-        if crate::frame::is_default_emoji_presentation(g.ch) {
-            continue;
-        }
+        // Default-emoji-presentation scalars stay in items: the paint loop
+        // suppresses their mono blit only when a color stamp actually resolved
+        // (`stamped.contains`). Dropping them here painted NOTHING whenever the
+        // raster failed (NullEmojiRaster) — tofu is the fail-open, not blank.
         let galley = match dedupe.get(&(g.ch, g.style)) {
             Some(arc) => arc.clone(),
             None => {
@@ -2320,7 +2319,8 @@ impl Session {
             if stamped.contains(&(g.row, g.col)) {
                 continue; // color stamp covers this cell; mono would fringe
             }
-            // EP emoji never enter `items` (mono_paint_items skips them).
+            // Unstamped EP emoji fall through here on purpose: mono tofu is
+            // the fail-open when the color raster has no glyph.
             painter.galley(metrics.cell_rect(g.row, g.col).min, g.galley.clone(), FG);
         }
 
@@ -3098,6 +3098,35 @@ mod tests {
         assert_eq!((bgs[0].row, bgs[0].col), (0, 2));
         assert_eq!(bgs[0].width_cells, 1);
         assert_eq!(bgs[0].color, egui::Color32::from_rgb(0, 0, 80));
+    }
+
+    #[test]
+    fn mono_paint_keeps_emoji_glyphs_for_fail_open() {
+        // d5bc017 regression: default-emoji-presentation glyphs were dropped
+        // from mono items unconditionally, so a failed color stamp
+        // (NullEmojiRaster — DirectWrite init/COM failure) painted NOTHING.
+        // The paint loop already suppresses mono under a *successful* stamp
+        // (`stamped.contains`), so items must keep EP glyphs: tofu is the
+        // fail-open, invisible is content loss.
+        let style = default_style();
+        let plan = crate::frame::PaintPlan {
+            glyphs: vec![crate::frame::GlyphPlacement {
+                row: 0,
+                col: 0,
+                ch: '🤣',
+                style,
+                width_cells: 2,
+            }],
+            emoji_sites: Vec::new(),
+        };
+        let mut layout = |ch: char, _style: GlyphStyle| dummy_galley_for_tests(ch);
+        let (items, _bgs) = mono_paint_items_for_test(&plan, &mut layout);
+        assert_eq!(
+            items.len(),
+            1,
+            "EP glyph must stay in mono items (fail-open tofu when unstamped)"
+        );
+        assert_eq!((items[0].row, items[0].col), (0, 0));
     }
 
     #[test]
