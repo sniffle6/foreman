@@ -277,20 +277,28 @@ pub fn parse_keys(names: &[String], mode: TermMode) -> Result<Vec<u8>, String> {
 /// Like [`parse_keys`], with a cursor-line of [`crate::input::CellWide`] so
 /// Left/Right/Backspace/Delete skip width-2 glyphs the same as the live
 /// keyboard. `col` is the starting cursor column; advanced after each key.
+/// An unmodeled key (Home/End/Enter/…) stops wide encoding for the token
+/// remainder — the shadow can no longer know the cursor position.
 pub fn parse_keys_wide(
     names: &[String],
     mode: TermMode,
     line: &[crate::input::CellWide],
     mut col: usize,
 ) -> Result<Vec<u8>, String> {
+    use egui::Key;
     let mut line = line.to_vec();
+    let mut tracking = true;
     let mut out = Vec::new();
     for token in names {
         if token.is_empty() {
             continue;
         }
         let (key, mods) = parse_one_key(token)?;
-        let hint = crate::input::wide_hint_at(&line, col);
+        let hint = if tracking {
+            crate::input::wide_hint_at(&line, col)
+        } else {
+            crate::input::WideCursorHint::default()
+        };
         let bytes = crate::input::encode_key_wide(key, mods, mode, hint);
         if bytes.is_empty() {
             return Err(format!(
@@ -298,7 +306,16 @@ pub fn parse_keys_wide(
             ));
         }
         out.extend_from_slice(&bytes);
-        col = crate::input::apply_wide_key_to_line(&mut line, col, key, mods);
+        if tracking {
+            if matches!(
+                key,
+                Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
+            ) {
+                col = crate::input::apply_wide_key_to_line(&mut line, col, key, mods);
+            } else {
+                tracking = false;
+            }
+        }
     }
     Ok(out)
 }

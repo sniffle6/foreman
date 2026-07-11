@@ -64,6 +64,20 @@ emoji; `中中中` + BS leaves `中中` (over-delete gone); CJK/emoji Left both
 move 2 cells; Delete on emoji base removes one clean emoji; 8 rapid
 no-settle Backspace sends over a mixed emoji line leave **zero** U+FFFD.
 
+Review finding (e538e4a, fixed): the shadow originally CLEARED deleted
+cells; deleting a narrow char in front of an emoji left a stale cell under
+the cursor and the next same-batch Delete under-doubled (half-delete). The
+shadow now REMOVES cells and shifts the tail left, matching cooked-editor
+semantics (`Left Left Backspace Delete` over `a🤣z` verified live → `z`,
+zero U+FFFD).
+
+Known limitation: unmodeled keys (Home/End/Enter/…) and text insertion
+drop the shadow — the cursor position is no longer knowable (Home jumps to
+the prompt boundary). Wide encoding falls back to single sequences for the
+batch remainder (standard-terminal parity: Windows Terminal half-deletes
+there too) and the grid is resampled when the echo lands. Keep wide-glyph
+edits and navigation keys in separate `send` requests when it matters.
+
 Known limitation: `foreman send --keys` samples the live grid per REQUEST.
 A burst of separate no-settle send calls can still race the echo — put the
 whole burst in one `--keys "Backspace Backspace …"` list (simulated
