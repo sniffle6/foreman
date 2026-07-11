@@ -258,7 +258,14 @@ pub fn apply_wide_key_to_line(
                 if hint.left_is_spacer && col >= 2 {
                     remove_cells(line, col - 2, 2);
                 } else if hint.on_wide_spacer && col >= 1 {
+                    // Mid-glyph: one DEL removes the glyph's first unit
+                    // (1 cell — probed: CSI 3~ mid-glyph leaves 🤣�). The
+                    // surviving half renders as a narrow U+FFFD — normalize
+                    // it so the shadow keeps no orphan spacer.
                     remove_cells(line, col - 1, 1);
+                    if let Some(cell) = line.get_mut(col - 1) {
+                        *cell = CellWide::Narrow;
+                    }
                 } else if col > 0 {
                     remove_cells(line, col - 1, 1);
                 }
@@ -268,6 +275,14 @@ pub fn apply_wide_key_to_line(
                 // single for BMP, both remove the full glyph), else one cell.
                 if hint.on_wide_base {
                     remove_cells(line, col, 2);
+                } else if hint.on_wide_spacer {
+                    // Mid-glyph: one CSI 3~ removes the glyph's second unit
+                    // (1 cell); the surviving first half (base at col-1)
+                    // renders as a narrow U+FFFD — normalize, no orphan base.
+                    remove_cells(line, col, 1);
+                    if let Some(cell) = col.checked_sub(1).and_then(|c| line.get_mut(c)) {
+                        *cell = CellWide::Narrow;
+                    }
                 } else {
                     remove_cells(line, col, 1);
                 }
@@ -1335,6 +1350,41 @@ mod tests {
         assert_eq!(col, 0);
         assert_eq!(line[0], CellWide::Narrow);
         assert_eq!(line[1], CellWide::Narrow);
+    }
+    #[test]
+    fn backspace_on_spacer_normalizes_surviving_half() {
+        // b8cfe9b re-review finding: mid-glyph BS removes the first unit
+        // (1 cell); the survivor renders as a narrow U+FFFD — the shadow
+        // must not keep an orphan spacer at the cursor.
+        let mut line = vec![
+            CellWide::WideBase { non_bmp: true },
+            CellWide::WideSpacer,
+            CellWide::Narrow,
+        ];
+        let col = apply_wide_key_to_line(&mut line, 1, Key::Backspace, none());
+        assert_eq!(col, 0);
+        assert_eq!(line[0], CellWide::Narrow); // ex-spacer normalized
+        assert_eq!(line[1], CellWide::Narrow);
+    }
+    #[test]
+    fn delete_on_spacer_normalizes_survivor_and_keeps_alignment() {
+        // Two emoji, cursor parked on the first glyph's spacer. One CSI 3~
+        // removes one UNIT = one cell (probed live: mid-glyph CSI 3~ turns
+        // 🤣🤣 into 🤣�), so the second glyph's BASE truly lands under the
+        // cursor and a following Delete correctly doubles. (The 2-cell
+        // removal proposed in review would misalign the shadow here.)
+        let mut line = vec![
+            CellWide::WideBase { non_bmp: true },
+            CellWide::WideSpacer,
+            CellWide::WideBase { non_bmp: true },
+            CellWide::WideSpacer,
+        ];
+        let col = apply_wide_key_to_line(&mut line, 1, Key::Delete, none());
+        assert_eq!(col, 1);
+        assert_eq!(line[0], CellWide::Narrow); // surviving half normalized
+        assert_eq!(line[1], CellWide::WideBase { non_bmp: true });
+        let hint = wide_hint_at(&line, col);
+        assert!(wide_key_doubles(Key::Delete, none(), TermMode::empty(), hint));
     }
     #[test]
     fn backspace_narrow_before_wide_shifts_shadow_left() {
