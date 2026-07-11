@@ -108,7 +108,7 @@ pub fn is_default_emoji_presentation(ch: char) -> bool {
 }
 
 fn is_wide_spacer(flags: Flags) -> bool {
-    crate::input::CellWide::from_flags(flags) == crate::input::CellWide::WideSpacer
+    crate::input::CellWide::is_wide_spacer(flags)
 }
 
 /// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per

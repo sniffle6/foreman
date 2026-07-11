@@ -30,6 +30,11 @@ pub struct InputOutcome {
     /// Ctrl+0 — reset the global terminal font size to the default. The shell
     /// applies it to the shared zoom value; nothing is sent to the PTY.
     pub zoom_reset: bool,
+    /// Post-batch shadow row + column when `wide_cursor` was supplied. The
+    /// shell persists this across frames while the child's echo is pending
+    /// (`output_gen` unchanged) — re-sampling a stale grid restarts the
+    /// simulation mid-burst and corrupts hold-Backspace (docs/wide-chars.md).
+    pub wide_after: Option<(Vec<CellWide>, usize)>,
 }
 
 /// Width class of one grid cell for key encoding (not paint).
@@ -37,9 +42,13 @@ pub struct InputOutcome {
 pub enum CellWide {
     #[default]
     Narrow,
-    /// Base cell of a width-2 glyph (`WIDE_CHAR`).
-    WideBase,
-    /// Trailing half of a width-2 glyph (`WIDE_CHAR_SPACER`).
+    /// Base cell of a width-2 glyph (`WIDE_CHAR`). `non_bmp` = the char needs
+    /// a UTF-16 surrogate pair (emoji): conhost's cooked buffer edits/moves
+    /// per UTF-16 unit, so these need 2 key sequences where BMP CJK needs 1.
+    /// Evidence: docs/wide-chars.md (2026-07-10 probe matrix).
+    WideBase { non_bmp: bool },
+    /// Trailing half of a width-2 glyph (`WIDE_CHAR_SPACER` or the wrap
+    /// placeholder `LEADING_WIDE_CHAR_SPACER`).
     WideSpacer,
 }
 
@@ -48,15 +57,33 @@ impl CellWide {
     /// about width-2 glyphs — paint plan, snapshot text/cells, key-hint
     /// sampling — classifies through this, so a new alacritty spacer flag is
     /// one edit here (see df46b2d: LEADING_WIDE_CHAR_SPACER needed 4 edits).
-    pub fn from_flags(flags: alacritty_terminal::term::cell::Flags) -> Self {
+    /// `ch` is the cell's char; it only matters for `WideBase` (non-BMP test).
+    pub fn classify(flags: alacritty_terminal::term::cell::Flags, ch: char) -> Self {
         use alacritty_terminal::term::cell::Flags;
         if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
             CellWide::WideSpacer
         } else if flags.contains(Flags::WIDE_CHAR) {
-            CellWide::WideBase
+            CellWide::WideBase {
+                non_bmp: ch > '\u{FFFF}',
+            }
         } else {
             CellWide::Narrow
         }
+    }
+
+    /// Flags-only spacer test for walks that never look at the base char
+    /// (paint plan, snapshots). Routes through [`Self::classify`] so the flag
+    /// set still lives in exactly one place.
+    pub fn is_wide_spacer(flags: alacritty_terminal::term::cell::Flags) -> bool {
+        Self::classify(flags, '\0').is_spacer()
+    }
+
+    pub fn is_spacer(self) -> bool {
+        self == CellWide::WideSpacer
+    }
+
+    fn is_base(self) -> bool {
+        matches!(self, CellWide::WideBase { .. })
     }
 }
 
@@ -65,48 +92,87 @@ impl CellWide {
 /// invent fields by hand outside tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WideCursorHint {
-    /// Cursor sits on a wide base — Right / Delete should skip the spacer.
+    /// Cursor sits on a wide base — Right crosses the whole glyph.
     pub on_wide_base: bool,
-    /// Cursor sits on a spacer — Left / Backspace / Right / Delete treat the
-    /// whole glyph as one unit.
+    /// Cursor sits on a spacer — Left / Backspace / Right treat the whole
+    /// glyph as one unit.
     pub on_wide_spacer: bool,
     /// Cell immediately left of the cursor is a spacer — Left / Backspace
-    /// remove/skip the full wide glyph (not a half-cell orphan).
+    /// cross/remove the full wide glyph (not a half-cell orphan).
     pub left_is_spacer: bool,
+    /// The wide glyph a Left/Backspace would cross/remove is non-BMP
+    /// (surrogate pair → conhost needs 2 sequences; BMP CJK needs 1).
+    pub left_glyph_non_bmp: bool,
+    /// The wide glyph a Right would cross is non-BMP.
+    pub at_glyph_non_bmp: bool,
 }
 
 /// Derive the encode-time hint for cursor column `col` on `line`.
 pub fn wide_hint_at(line: &[CellWide], col: usize) -> WideCursorHint {
+    let cell = |c: Option<usize>| c.and_then(|c| line.get(c).copied());
+    let non_bmp = |c: Option<CellWide>| matches!(c, Some(CellWide::WideBase { non_bmp: true }));
     let at = line.get(col).copied().unwrap_or(CellWide::Narrow);
-    let left = col
-        .checked_sub(1)
-        .and_then(|c| line.get(c).copied());
+    let left = cell(col.checked_sub(1));
+    let on_wide_base = at.is_base();
+    let on_wide_spacer = at.is_spacer();
+    let left_is_spacer = left.map(CellWide::is_spacer).unwrap_or(false);
+    // Base cell of the glyph Right would cross: at-col when on its base,
+    // col-1 when parked on its spacer.
+    let at_glyph_non_bmp = if on_wide_base {
+        non_bmp(Some(at))
+    } else if on_wide_spacer {
+        non_bmp(left)
+    } else {
+        false
+    };
+    // Base cell of the glyph Left/Backspace would cross/remove: col-2 when the
+    // spacer is left of us, col-1 when we sit on the spacer. A LEADING (wrap)
+    // spacer has no base on this row → stays false → no doubling (safe).
+    let left_glyph_non_bmp = if on_wide_spacer {
+        non_bmp(left)
+    } else if left_is_spacer {
+        non_bmp(cell(col.checked_sub(2)))
+    } else {
+        false
+    };
     WideCursorHint {
-        on_wide_base: at == CellWide::WideBase,
-        on_wide_spacer: at == CellWide::WideSpacer,
-        left_is_spacer: left == Some(CellWide::WideSpacer),
+        on_wide_base,
+        on_wide_spacer,
+        left_is_spacer,
+        left_glyph_non_bmp,
+        at_glyph_non_bmp,
     }
 }
 
-/// Whether this physical keypress should emit two terminal sequences so a
-/// width-2 glyph is crossed/removed as one unit.
-pub fn wide_key_doubles(key: Key, mods: Modifiers, wide: WideCursorHint) -> bool {
+/// Whether this physical keypress should emit two terminal sequences.
+///
+/// Policy from the 2026-07-10 probe matrix (docs/wide-chars.md): conhost's
+/// cooked editing is UTF-16-unit-based for Backspace/Delete/arrows — only
+/// surrogate-pair (non-BMP) glyphs need 2 sequences; BMP CJK needs 1 (doubling
+/// over-deleted/over-moved it). Parked mid-glyph (on a spacer) one unit
+/// finishes the glyph → always single (doubling there crossed into the NEXT
+/// glyph — the doubled-Delete tofu). Alt-screen TUIs (vim, lazygit) are
+/// grapheme-correct — never compensate. Ctrl/Alt chords stay single.
+pub fn wide_key_doubles(key: Key, mods: Modifiers, mode: TermMode, wide: WideCursorHint) -> bool {
+    if mode.contains(TermMode::ALT_SCREEN) {
+        return false;
+    }
     let ctrl = mods.ctrl || mods.command;
     if ctrl || mods.alt {
         return false;
     }
     match key {
-        Key::ArrowRight | Key::Delete => wide.on_wide_base || wide.on_wide_spacer,
-        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer || wide.on_wide_spacer,
+        Key::ArrowRight | Key::Delete => wide.on_wide_base && wide.at_glyph_non_bmp,
+        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer && wide.left_glyph_non_bmp,
         _ => false,
     }
 }
 
 /// Encode one physical keypress with wide-cell policy (deep module).
 ///
-/// All keyboard and `send --keys` paths should go through this so ←/→/BS/Del
-/// (and Shift variants) skip width-2 glyphs in one place. Ctrl/Alt chords stay
-/// single (word-nav / other bindings). Empty when `encode_key` does not map.
+/// All keyboard and `send --keys` paths should go through this so ←/→/BS
+/// (and Shift variants) cross width-2 glyphs in one place. Empty when
+/// `encode_key` does not map.
 pub fn encode_key_wide(
     key: Key,
     mods: Modifiers,
@@ -117,7 +183,7 @@ pub fn encode_key_wide(
     if seq.is_empty() {
         return seq;
     }
-    if !wide_key_doubles(key, mods, wide) {
+    if !wide_key_doubles(key, mods, mode, wide) {
         return seq;
     }
     let mut out = Vec::with_capacity(seq.len() * 2);
@@ -127,21 +193,29 @@ pub fn encode_key_wide(
 }
 
 /// Simulate cursor column after one physical keypress (horizontal only).
+///
+/// Cell-space movement depends on GLYPH WIDTH (both emoji and CJK are 2 cells
+/// per crossing), independent of how many sequences were sent (unit count).
 pub fn col_after_wide_key(
     col: usize,
     key: Key,
     mods: Modifiers,
     wide: WideCursorHint,
 ) -> usize {
-    let step = if wide_key_doubles(key, mods, wide) {
-        2usize
-    } else {
-        1
-    };
+    let ctrl = mods.ctrl || mods.command;
+    if ctrl || mods.alt {
+        // Word-nav and other bindings move unpredictably; leave col alone
+        // (resynced from the live grid when the echo lands).
+        return col;
+    }
+    // Whole-glyph crossings span 2 cells (emoji AND CJK — width, not units);
+    // spacer-parked (mid-glyph) exits are 1 cell.
+    let left_step = if wide.left_is_spacer { 2 } else { 1 };
+    let right_step = if wide.on_wide_base { 2 } else { 1 };
     match key {
-        Key::ArrowRight => col.saturating_add(step),
-        Key::ArrowLeft | Key::Backspace => col.saturating_sub(step),
-        // Delete typically does not move the cursor in VT hosts.
+        Key::ArrowRight => col.saturating_add(right_step),
+        Key::ArrowLeft | Key::Backspace => col.saturating_sub(left_step),
+        // Forward-Delete does not move the cursor.
         _ => col,
     }
 }
@@ -157,11 +231,14 @@ fn clear_wide_pair(line: &mut [CellWide], base_col: usize) {
     }
 }
 
-/// Apply one physical key to a simulated row: encode-policy mutation + new col.
+/// Apply one physical key to a simulated row: shadow mutation + new col.
 ///
-/// Call after [`encode_key_wide`] with the same `key`/`mods`. Updates `line` so
-/// the next key in a hold-Backspace burst does not re-double against stale
-/// wide cells (the live grid has not been pumped yet).
+/// Call after [`encode_key_wide`] with the same `key`/`mods`. The shadow
+/// CLEARS deleted cells instead of shifting the tail left: everything left of
+/// the cursor is unaffected by deletions at the cursor (so Backspace runs stay
+/// exact), and forward-Delete never doubles, so right-of-cursor staleness
+/// cannot change what we send. Mixed Backspace-then-Right inside one stale
+/// echo window can misjudge — resynced from the live grid when output arrives.
 pub fn apply_wide_key_to_line(
     line: &mut [CellWide],
     col: usize,
@@ -169,30 +246,32 @@ pub fn apply_wide_key_to_line(
     mods: Modifiers,
 ) -> usize {
     let hint = wide_hint_at(line, col);
-    if wide_key_doubles(key, mods, hint) {
+    let ctrl = mods.ctrl || mods.command;
+    if !ctrl && !mods.alt {
         match key {
-            Key::Backspace if hint.left_is_spacer && col >= 2 => {
-                clear_wide_pair(line, col - 2);
+            Key::Backspace => {
+                // Remove the glyph left of the cursor: wide pair or one narrow.
+                if hint.left_is_spacer && col >= 2 {
+                    clear_wide_pair(line, col - 2);
+                } else if hint.on_wide_spacer && col >= 1 {
+                    clear_wide_pair(line, col - 1);
+                } else if col > 0 {
+                    if let Some(cell) = line.get_mut(col - 1) {
+                        *cell = CellWide::Narrow;
+                    }
+                }
             }
-            Key::Backspace if hint.on_wide_spacer && col >= 1 => {
-                clear_wide_pair(line, col - 1);
-            }
-            Key::Delete if hint.on_wide_base => {
-                clear_wide_pair(line, col);
-            }
-            Key::Delete if hint.on_wide_spacer && col >= 1 => {
-                clear_wide_pair(line, col - 1);
+            Key::Delete => {
+                // Grapheme-aware forward delete: whole glyph under the cursor.
+                if hint.on_wide_base {
+                    clear_wide_pair(line, col);
+                } else if hint.on_wide_spacer && col >= 1 {
+                    clear_wide_pair(line, col - 1);
+                } else if let Some(cell) = line.get_mut(col) {
+                    *cell = CellWide::Narrow;
+                }
             }
             _ => {}
-        }
-    } else if matches!(key, Key::Backspace) && col > 0 {
-        // Single cell delete to the left (narrow).
-        if let Some(cell) = line.get_mut(col - 1) {
-            *cell = CellWide::Narrow;
-        }
-    } else if matches!(key, Key::Delete) && col < line.len() {
-        if let Some(cell) = line.get_mut(col) {
-            *cell = CellWide::Narrow;
         }
     }
     col_after_wide_key(col, key, mods, hint)
@@ -346,6 +425,9 @@ pub fn process_input_wide(
     }
     if copy_only && has_selection {
         out.copy = true; // copy_clears stays false — Ctrl+Shift+C keeps the selection
+    }
+    if let Some(line) = wide_line {
+        out.wide_after = Some((line, wide_col));
     }
     out
 }
@@ -958,11 +1040,15 @@ mod tests {
     }
 
     // ---- wide-char encode (deep seam) ----------------------------------------
+    // Fixtures model EMOJI (non-BMP surrogate pairs) — the only glyph class
+    // that doubles. BMP CJK fixtures live in the dedicated tests below.
     fn hint_base() -> WideCursorHint {
         WideCursorHint {
             on_wide_base: true,
             on_wide_spacer: false,
             left_is_spacer: false,
+            left_glyph_non_bmp: false,
+            at_glyph_non_bmp: true,
         }
     }
     fn hint_spacer() -> WideCursorHint {
@@ -970,6 +1056,8 @@ mod tests {
             on_wide_base: false,
             on_wide_spacer: true,
             left_is_spacer: false,
+            left_glyph_non_bmp: true,
+            at_glyph_non_bmp: true,
         }
     }
     fn hint_after_wide() -> WideCursorHint {
@@ -977,7 +1065,17 @@ mod tests {
             on_wide_base: false,
             on_wide_spacer: false,
             left_is_spacer: true,
+            left_glyph_non_bmp: true,
+            at_glyph_non_bmp: false,
         }
+    }
+    /// Emoji cell pair (surrogate pair → doubles).
+    fn emoji() -> [CellWide; 2] {
+        [CellWide::WideBase { non_bmp: true }, CellWide::WideSpacer]
+    }
+    /// BMP CJK cell pair (one UTF-16 unit → never doubles).
+    fn cjk() -> [CellWide; 2] {
+        [CellWide::WideBase { non_bmp: false }, CellWide::WideSpacer]
     }
 
     #[test]
@@ -1035,10 +1133,12 @@ mod tests {
         );
     }
     #[test]
-    fn encode_key_wide_left_on_spacer_doubles() {
+    fn encode_key_wide_left_on_spacer_is_single() {
+        // Parked mid-glyph: one unit exits to the glyph start; doubling would
+        // cross into the previous glyph (probe E2/E3 family).
         assert_eq!(
             encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), hint_spacer()),
-            b"\x1b[D\x1b[D"
+            b"\x1b[D"
         );
     }
     #[test]
@@ -1049,10 +1149,12 @@ mod tests {
         );
     }
     #[test]
-    fn encode_key_wide_backspace_on_spacer_doubles() {
+    fn encode_key_wide_backspace_on_spacer_is_single() {
+        // Mid-glyph: one DEL removes the glyph's first unit; doubling ate into
+        // the previous glyph.
         assert_eq!(
             encode_key_wide(Key::Backspace, none(), TermMode::empty(), hint_spacer()),
-            [0x7f, 0x7f]
+            [0x7f]
         );
     }
     #[test]
@@ -1068,22 +1170,30 @@ mod tests {
         );
     }
     #[test]
-    fn encode_key_wide_delete_on_base_and_spacer_doubles() {
+    fn encode_key_wide_delete_matches_right_arrow_policy() {
+        // Delete is unit-based like everything else (probes E/E2/E3): double
+        // on a non-BMP base, single on a BMP base, single when parked on a
+        // spacer (doubling there crossed into the next glyph — the tofu).
         assert_eq!(
             encode_key_wide(Key::Delete, none(), TermMode::empty(), hint_base()),
             b"\x1b[3~\x1b[3~"
         );
         assert_eq!(
             encode_key_wide(Key::Delete, none(), TermMode::empty(), hint_spacer()),
-            b"\x1b[3~\x1b[3~"
+            b"\x1b[3~"
+        );
+        let c = cjk();
+        assert_eq!(
+            encode_key_wide(Key::Delete, none(), TermMode::empty(), wide_hint_at(&c, 0)),
+            b"\x1b[3~"
         );
     }
     #[test]
     fn wide_hint_at_reads_base_spacer_after() {
-        // cols: 0 narrow, 1 base, 2 spacer, 3 narrow
+        // cols: 0 narrow, 1 emoji base, 2 emoji spacer, 3 narrow
         let line = [
             CellWide::Narrow,
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
             CellWide::Narrow,
         ];
@@ -1092,32 +1202,42 @@ mod tests {
         assert_eq!(wide_hint_at(&line, 3), hint_after_wide());
     }
     #[test]
-    fn cellwide_from_flags_is_the_single_classification_home() {
+    fn cellwide_classify_is_the_single_classification_home() {
         use alacritty_terminal::term::cell::Flags;
-        assert_eq!(CellWide::from_flags(Flags::empty()), CellWide::Narrow);
-        assert_eq!(CellWide::from_flags(Flags::WIDE_CHAR), CellWide::WideBase);
+        assert_eq!(CellWide::classify(Flags::empty(), 'a'), CellWide::Narrow);
+        // BMP wide (CJK) vs non-BMP wide (emoji) — the conhost editing unit.
         assert_eq!(
-            CellWide::from_flags(Flags::WIDE_CHAR_SPACER),
+            CellWide::classify(Flags::WIDE_CHAR, '中'),
+            CellWide::WideBase { non_bmp: false }
+        );
+        assert_eq!(
+            CellWide::classify(Flags::WIDE_CHAR, '🤣'),
+            CellWide::WideBase { non_bmp: true }
+        );
+        assert_eq!(
+            CellWide::classify(Flags::WIDE_CHAR_SPACER, ' '),
             CellWide::WideSpacer
         );
         // The df46b2d lesson: wrap placeholders are spacers too.
         assert_eq!(
-            CellWide::from_flags(Flags::LEADING_WIDE_CHAR_SPACER),
+            CellWide::classify(Flags::LEADING_WIDE_CHAR_SPACER, ' '),
             CellWide::WideSpacer
         );
-        // Style flags must not affect classification.
+        // Style flags must not affect classification; flags-only helper agrees.
         assert_eq!(
-            CellWide::from_flags(Flags::BOLD | Flags::WIDE_CHAR),
-            CellWide::WideBase
+            CellWide::classify(Flags::BOLD | Flags::WIDE_CHAR, '中'),
+            CellWide::WideBase { non_bmp: false }
         );
+        assert!(CellWide::is_wide_spacer(Flags::LEADING_WIDE_CHAR_SPACER));
+        assert!(!CellWide::is_wide_spacer(Flags::WIDE_CHAR));
     }
     #[test]
     fn multi_right_across_two_wide_glyphs_doubles_each() {
-        // Two width-2 glyphs at cols 0-1 and 2-3; start at col 0.
+        // Two emoji at cols 0-1 and 2-3; start at col 0.
         let line = [
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
             CellWide::Narrow,
         ];
@@ -1139,7 +1259,7 @@ mod tests {
         // Regression: fixed hint on_wide_base for two Rights must not emit
         // four CSI when the second press is after the glyph (narrow).
         let line = [
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
             CellWide::Narrow,
             CellWide::Narrow,
@@ -1163,9 +1283,9 @@ mod tests {
         // pair so the second BS doubles against the *previous* glyph, not a
         // ghost spacer (which left white half-cells on screen).
         let line = [
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
             CellWide::Narrow, // cursor starts here (col 4)
         ];
@@ -1185,7 +1305,7 @@ mod tests {
     #[test]
     fn apply_wide_key_to_line_backspace_clears_pair() {
         let mut line = [
-            CellWide::WideBase,
+            CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
             CellWide::Narrow,
         ];
@@ -1193,6 +1313,89 @@ mod tests {
         assert_eq!(col, 0);
         assert_eq!(line[0], CellWide::Narrow);
         assert_eq!(line[1], CellWide::Narrow);
+    }
+    #[test]
+    fn backspace_after_emoji_doubles_but_after_cjk_stays_single() {
+        // conhost cooked editing deletes per UTF-16 unit: emoji (surrogate
+        // pair) needs 2 DELs, BMP CJK needs 1 — doubling CJK over-deleted
+        // (probe #3, docs/wide-chars.md).
+        let e = emoji();
+        let c = cjk();
+        assert_eq!(
+            encode_key_wide(Key::Backspace, none(), TermMode::empty(), wide_hint_at(&e, 2)),
+            [0x7f, 0x7f]
+        );
+        assert_eq!(
+            encode_key_wide(Key::Backspace, none(), TermMode::empty(), wide_hint_at(&c, 2)),
+            [0x7f]
+        );
+    }
+    #[test]
+    fn arrows_double_only_for_non_bmp_glyphs() {
+        // Probes #4/#5: doubled Left over CJK moved two chars; emoji needs the
+        // double (one CSI = one UTF-16 unit = half the glyph).
+        let e = emoji();
+        let c = cjk();
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), wide_hint_at(&e, 2)),
+            b"\x1b[D\x1b[D"
+        );
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), wide_hint_at(&c, 2)),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            encode_key_wide(Key::ArrowRight, none(), TermMode::empty(), wide_hint_at(&e, 0)),
+            b"\x1b[C\x1b[C"
+        );
+        assert_eq!(
+            encode_key_wide(Key::ArrowRight, none(), TermMode::empty(), wide_hint_at(&c, 0)),
+            b"\x1b[C"
+        );
+    }
+    #[test]
+    fn alt_screen_never_doubles() {
+        // vim/lazygit edit per-grapheme; never compensate on the alt screen.
+        let e = emoji();
+        assert_eq!(
+            encode_key_wide(Key::ArrowLeft, none(), TermMode::ALT_SCREEN, wide_hint_at(&e, 2)),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            encode_key_wide(Key::Backspace, none(), TermMode::ALT_SCREEN, wide_hint_at(&e, 2)),
+            [0x7f]
+        );
+    }
+    #[test]
+    fn cjk_backspace_still_crosses_two_cells_in_shadow() {
+        // Sequences follow UTF-16 units; cell movement follows glyph width.
+        // One DEL removes a whole CJK glyph = the cursor jumps 2 cells.
+        let mut line = cjk().to_vec();
+        line.push(CellWide::Narrow);
+        let col = apply_wide_key_to_line(&mut line, 2, Key::Backspace, none());
+        assert_eq!(col, 0);
+        assert_eq!(line[0], CellWide::Narrow);
+        assert_eq!(line[1], CellWide::Narrow);
+    }
+    #[test]
+    fn outcome_returns_shadow_for_cross_frame_persistence() {
+        // Hold-repeat: Session must carry the mutated shadow row into the next
+        // frame while echo is pending, not re-sample the stale grid (that
+        // restart corrupted hold-Backspace — docs/wide-chars.md).
+        let mut line = emoji().to_vec();
+        line.extend_from_slice(&emoji());
+        let out = process_input_wide(
+            &[key_ev(Key::Backspace, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            Some((&line, 4)),
+        );
+        assert_eq!(out.pty_bytes, [0x7f, 0x7f]);
+        let (after_line, after_col) = out.wide_after.expect("shadow returned");
+        assert_eq!(after_col, 2);
+        assert_eq!(after_line[2], CellWide::Narrow); // deleted pair cleared
+        assert_eq!(after_line[3], CellWide::Narrow);
     }
 
     // ---- zoom ----------------------------------------------------------------

@@ -565,6 +565,11 @@ pub struct Session {
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
     output_gen: u64,
+    // Shadow cursor row for wide-key encoding, persisted while the child's
+    // echo is pending: (row classes, col, output_gen at store time). Reused
+    // only while output_gen is unchanged; any new child output invalidates it
+    // and read_input re-samples the live grid (docs/wide-chars.md).
+    wide_shadow: Option<(Vec<crate::input::CellWide>, usize, u64)>,
     // Grid-content version for the render galley cache. Distinct from
     // output_gen (which means "child produced PTY bytes" and drives settle
     // quiescence): content_gen bumps on EVERY grid-content mutation, including
@@ -866,6 +871,7 @@ impl Session {
             pending_note: None,
             ready_gate: crate::ready::ReadyGate::new(),
             output_gen: 0,
+            wide_shadow: None,
             content_gen: 0,
             mono_paint: None,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
@@ -1000,8 +1006,8 @@ impl Session {
         let cols = g.columns();
         let mut line = Vec::with_capacity(cols);
         for c in 0..cols {
-            let f = g[p.line][alacritty_terminal::index::Column(c)].flags;
-            line.push(CellWide::from_flags(f));
+            let cell = &g[p.line][alacritty_terminal::index::Column(c)];
+            line.push(CellWide::classify(cell.flags, cell.c));
         }
         (line, p.column.0)
     }
@@ -1261,11 +1267,15 @@ impl Session {
             .as_ref()
             .and_then(|s| s.to_range(&self.term))
             .is_some();
-        // Wide-char key encode: sample the cursor line once; process_input_wide
-        // advances the simulated column after each key so multi-key batches
-        // re-derive the hint (encode_key_wide is the only policy).
-        let (wide_line, wide_col) = self.wide_line_at_cursor();
-        let outcome = ui.input(|i| {
+        // Wide-char key encode: reuse the persisted shadow row while the
+        // child's echo is pending (output_gen unchanged) — re-sampling the
+        // stale grid would restart the simulation mid-burst and corrupt
+        // hold-Backspace (docs/wide-chars.md). Fresh output → fresh sample.
+        let (wide_line, wide_col) = match self.wide_shadow.take() {
+            Some((line, col, sampled_gen)) if sampled_gen == self.output_gen => (line, col),
+            _ => self.wide_line_at_cursor(),
+        };
+        let mut outcome = ui.input(|i| {
             crate::input::process_input_wide(
                 &i.events,
                 i.modifiers,
@@ -1274,6 +1284,13 @@ impl Session {
                 Some((wide_line.as_slice(), wide_col)),
             )
         });
+
+        // Persist the simulated row unconditionally (even a no-key frame must
+        // not lose mid-burst progress); the gen check above drops it as soon
+        // as real child output arrives.
+        if let Some((line, col)) = outcome.wide_after.take() {
+            self.wide_shadow = Some((line, col, self.output_gen));
+        }
 
         if let Some(s) = outcome.scroll {
             self.term.scroll_display(s);

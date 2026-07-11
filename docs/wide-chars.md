@@ -21,21 +21,40 @@ per physical press).
 | 3 | `中中中`, one Backspace press (doubled) | only `中` remains — **two chars eaten** | BMP wide chars are 1 unit; doubling **over-deletes CJK** |
 | 4 | `中中`, one Left press (doubled) | cursor col 31 → 27 (−4 cols, two chars) | arrows are unit-based too; doubling **over-moves CJK** |
 | 5 | `🤣🤣`, one Left press (doubled) | cursor col 31 → 29 (−2 cols, one emoji) | doubling **correct** for non-BMP arrows |
-| 6 | Delete on emoji (doubled → 2×`CSI 3~`), live user test | 1 emoji deleted, caret shifted, tofu left | **forward-Delete is grapheme-aware**; doubling eats 1.5 emoji |
+| 6 | Delete on emoji (doubled → 2×`CSI 3~`), live user test | 1 emoji deleted, caret shifted, tofu left | doubling fired from a **spacer-parked** cursor and crossed into the next glyph (see E2/E3) |
+| E | one `CSI 3~` (single) on emoji base | `�🤣` — half-deleted | forward-Delete is unit-based too (first amendment "grapheme-aware" was wrong) |
+| E2 | raw 2×`CSI 3~` on emoji base (Home first) | one emoji cleanly deleted | doubled Delete correct **on a base** |
+| E3 | raw 1×`CSI 3~` on CJK base | whole `中` deleted | single Delete correct on BMP base |
 
-Verdict: **BRANCH B, amended.** conhost's cooked editing is UTF-16-unit-based
-for Backspace and cursor movement, grapheme-based for forward-Delete. Cell
-width (2 columns) is NOT the editing unit — surrogate-pair-ness is:
+Verdict: **BRANCH B, amended twice.** conhost's cooked editing is
+UTF-16-unit-based for Backspace, Delete, and cursor movement — uniformly.
+Cell width (2 columns) is NOT the editing unit — surrogate-pair-ness is:
 
-- non-BMP glyph (emoji, 2 units): Backspace/←/→ need **2** sequences
+- non-BMP glyph (emoji, 2 units): crossing/removing a **whole** glyph needs
+  **2** sequences (Backspace/Delete/←/→ alike)
 - BMP wide glyph (CJK, 1 unit): everything needs **1** sequence
-- Delete: always **1** sequence
+- parked mid-glyph (cursor on a spacer): **1** sequence finishes the glyph;
+  doubling there crosses into the neighboring glyph (probe #6's tofu)
+
+Cursor CELL movement follows glyph width (2 cells per whole crossing for
+both emoji and CJK), independent of sequence count.
 
 Hold-Backspace corruption root cause: correct-per-press doubling still
 desyncs during key repeat because each frame re-sampled the **stale** grid
 (echo not yet landed) and restarted the shadow simulation from the old
 cursor. Fix: persist the shadow row across frames until `output_gen`
-advances.
+advances (`Session.wide_shadow`).
+
+Re-verification (post-fix, same pwsh session): emoji BS removes exactly one
+emoji; `中中中` + BS leaves `中中` (over-delete gone); CJK/emoji Left both
+move 2 cells; Delete on emoji base removes one clean emoji; 8 rapid
+no-settle Backspace sends over a mixed emoji line leave **zero** U+FFFD.
+
+Known limitation: `foreman send --keys` samples the live grid per REQUEST.
+A burst of separate no-settle send calls can still race the echo — put the
+whole burst in one `--keys "Backspace Backspace …"` list (simulated
+in-batch) or use `--settle-ms`. The live keyboard path has no such gap
+(shadow persists across frames).
 
 Also observed, out of scope: after any corruption, ConPTY's line redraw
 leaves `�` residue mid-line and on rows below the prompt; `Ctrl+L` heals.
