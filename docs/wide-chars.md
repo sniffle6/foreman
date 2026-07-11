@@ -64,6 +64,23 @@ emoji; `中中中` + BS leaves `中中` (over-delete gone); CJK/emoji Left both
 move 2 cells; Delete on emoji base removes one clean emoji; 8 rapid
 no-settle Backspace sends over a mixed emoji line leave **zero** U+FFFD.
 
+Wrap-boundary finding (live repro 2026-07-10, fixed): the shadow was ONE
+grid row, so with the cursor at col 0 after a soft wrap it knew nothing
+about the previous row's tail — Backspace sent a single DEL and
+half-deleted the emoji ending that row (probed: raw DEL at the boundary →
+`…🥒🤣🤣�`). One U+FFFD per wrap crossing = the diagonal tofu squares.
+Fix: `inspect::wide_row_at_cursor` concatenates soft-wrapped rows
+(`WRAPLINE`) and drops wrap padding (`LEADING_WIDE_CHAR_SPACER`), so the
+boundary does not exist in the shadow. Verified: 44-press Backspace batch
+over a 2-row wrapped emoji line clears it completely, buffer stays clean.
+
+Cosmetic residue that remains (upstream, do not chase): between the two
+DELs of a doubled press the child buffer transiently holds a lone
+surrogate; if ConPTY renders that instant it writes a `�` and never clears
+cells past its new content end. The buffer itself is clean — typing
+continues fine — and `Ctrl+L` heals the display (verified). Same family as
+`docs/conpty-resize-reflow.md`.
+
 Review finding (e538e4a, fixed): the shadow originally CLEARED deleted
 cells; deleting a narrow char in front of an emoji left a stale cell under
 the cursor and the next same-batch Delete under-doubled (half-delete). The

@@ -997,19 +997,11 @@ impl Session {
         *self.term.mode()
     }
 
-    /// Cursor line as [`CellWide`] classes + column — input seam for wide-char
-    /// key encoding (`encode_key_wide` / `send --keys`).
+    /// Cursor's logical (wrap-concatenated) row as [`crate::input::CellWide`]
+    /// classes + cursor index — input seam for wide-char key encoding
+    /// (`encode_key_wide` / `send --keys`). See `inspect::wide_row_at_cursor`.
     pub fn wide_line_at_cursor(&self) -> (Vec<crate::input::CellWide>, usize) {
-        use crate::input::CellWide;
-        let g = self.term.grid();
-        let p = g.cursor.point;
-        let cols = g.columns();
-        let mut line = Vec::with_capacity(cols);
-        for c in 0..cols {
-            let cell = &g[p.line][alacritty_terminal::index::Column(c)];
-            line.push(CellWide::classify(cell.flags, cell.c));
-        }
-        (line, p.column.0)
+        crate::inspect::wide_row_at_cursor(&self.term)
     }
 
     /// Counter bumped every time new PTY bytes arrive in `pump()`. The settle

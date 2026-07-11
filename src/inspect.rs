@@ -320,6 +320,59 @@ pub fn parse_keys_wide(
     Ok(out)
 }
 
+/// The cursor's LOGICAL row as [`crate::input::CellWide`] classes + the
+/// cursor's index within it — the sampling seam for wide-char key encoding
+/// (`encode_key_wide`, `send --keys`, and the live keyboard).
+///
+/// Soft-wrapped neighbors (rows whose last cell carries `WRAPLINE`) are
+/// concatenated and wrap-padding cells (`LEADING_WIDE_CHAR_SPACER`) dropped,
+/// so a hold-Backspace crossing a wrap boundary still knows the glyph left of
+/// the cursor — a single-row shadow sent a lone DEL there and half-deleted
+/// the emoji (one U+FFFD per wrap crossing; docs/wide-chars.md). Walks are
+/// capped at 8 rows each way.
+pub fn wide_row_at_cursor<L: EventListener>(
+    term: &Term<L>,
+) -> (Vec<crate::input::CellWide>, usize) {
+    use crate::input::CellWide;
+    let g = term.grid();
+    let p = g.cursor.point;
+    let cols = g.columns();
+    let wraps = |l: Line| g[l][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    let mut start = p.line;
+    for _ in 0..8 {
+        let prev = Line(start.0 - 1);
+        if prev.0 < -(g.history_size() as i32) || !wraps(prev) {
+            break;
+        }
+        start = prev;
+    }
+    let mut end = p.line;
+    let last = Line(g.screen_lines() as i32 - 1);
+    for _ in 0..8 {
+        if end >= last || !wraps(end) {
+            break;
+        }
+        end = Line(end.0 + 1);
+    }
+    let mut line = Vec::with_capacity(cols * (end.0 - start.0 + 1) as usize);
+    let mut cursor_idx = 0;
+    let mut l = start;
+    while l <= end {
+        for c in 0..cols {
+            if l == p.line && c == p.column.0 {
+                cursor_idx = line.len();
+            }
+            let cell = &g[l][Column(c)];
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue; // wrap padding — not logical content
+            }
+            line.push(CellWide::classify(cell.flags, cell.c));
+        }
+        l = Line(l.0 + 1);
+    }
+    (line, cursor_idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +558,61 @@ mod tests {
         ];
         let out = parse_keys_wide(&[s("Right")], TermMode::empty(), &line, 0).unwrap();
         assert_eq!(out, b"\x1b[C\x1b[C");
+    }
+
+    #[test]
+    fn wide_row_at_cursor_concatenates_soft_wrapped_rows() {
+        // 8-col term: "abcd" + two emoji = 4 + 4 cells fill row 0 (WRAPLINE),
+        // one more emoji lands on row 1. Cursor ends at row 1 col 2. The
+        // logical row must span both rows so Backspace at a wrap boundary
+        // still sees the glyph left of the cursor (the live hold-BS tofu:
+        // one U+FFFD per wrap crossing).
+        use crate::input::CellWide;
+        let e = "🤣".as_bytes();
+        let mut bytes = b"abcd".to_vec();
+        bytes.extend_from_slice(e);
+        bytes.extend_from_slice(e);
+        bytes.extend_from_slice(e);
+        let term = term_with(&bytes, 8, 3);
+        let (line, idx) = wide_row_at_cursor(&term);
+        // Concatenated: a b c d [e1 base spacer] [e2 base spacer] on row 0,
+        // [e3 base spacer] on row 1 → 12 content cells + row-1 blanks.
+        assert_eq!(line.len(), 16); // two 8-col rows, no wrap padding here
+        assert_eq!(idx, 10); // cursor after e3 (row 1 col 2 → 8 + 2)
+        assert_eq!(line[8], CellWide::WideBase { non_bmp: true }); // e3 base
+        assert_eq!(line[9], CellWide::WideSpacer);
+        // Boundary check: at a cursor parked at row 1 col 0 (idx 8), the
+        // left neighbor is e2's spacer on ROW 0 — visible only because the
+        // rows are concatenated.
+        assert_eq!(line[7], CellWide::WideSpacer); // e2 spacer, last col row 0
+        let hint = crate::input::wide_hint_at(&line, 8);
+        assert!(hint.left_is_spacer && hint.left_glyph_non_bmp);
+    }
+
+    #[test]
+    fn wide_row_at_cursor_drops_wrap_padding() {
+        // 7-col term: "abcd" (4) + emoji (2) = 6 cells, next emoji needs 2
+        // but only col 6 remains → alacritty pads col 6 with
+        // LEADING_WIDE_CHAR_SPACER and wraps the glyph to row 1. The padding
+        // is not logical content: dropping it keeps left-neighbor adjacency
+        // exact across the boundary.
+        use crate::input::CellWide;
+        let e = "🤣".as_bytes();
+        let mut bytes = b"abcd".to_vec();
+        bytes.extend_from_slice(e);
+        bytes.extend_from_slice(e);
+        let term = term_with(&bytes, 7, 3);
+        let (line, idx) = wide_row_at_cursor(&term);
+        // Row 0: a b c d base spacer [pad dropped] = 6 cells; row 1: base
+        // spacer + 5 blanks = 7 cells → 13 total.
+        assert_eq!(line.len(), 13);
+        assert_eq!(idx, 8); // cursor row 1 col 2 → 6 (row 0 content) + 2
+        assert_eq!(line[6], CellWide::WideBase { non_bmp: true }); // wrapped glyph
+        assert_eq!(line[5], CellWide::WideSpacer); // e1 spacer directly adjacent
+        // A cursor at the wrapped glyph's base (idx 6) sees e1 as its true
+        // left neighbor — the padding cell no longer sits between them.
+        let hint = crate::input::wide_hint_at(&line, 6);
+        assert!(hint.left_is_spacer && hint.left_glyph_non_bmp);
     }
 
     #[test]
