@@ -3,9 +3,23 @@
 What: how foreman handles width-2 glyphs (one `WIDE_CHAR` base cell + one
 spacer cell) across paint, snapshots, and key input.
 
-Status: evidence recorded 2026-07-10; fix in progress per
-`docs/superpowers/plans/2026-07-10-wide-char-tofu-and-drift.md` (Task 4B,
-amended). Ownership rules section will be finalized with the fix.
+## Ownership rules
+
+- **Paint never renders spacer cells** (either spacer flag). The one
+  classifier is `CellWide::classify` in `src/input.rs` (flags + base char);
+  walks that only need spacer-ness use `CellWide::is_wide_spacer`. A new
+  alacritty flag is one edit there — do not add a second inline flag check
+  (df46b2d needed 4 edits because there were 4 copies).
+- **Snapshot text/cells skip spacers** through the same classifier.
+- **Key input doubling** lives only in `wide_key_doubles` (src/input.rs):
+  double iff the crossed glyph is non-BMP AND the position is a whole-glyph
+  crossing (base for Right/Delete, left-spacer for Left/Backspace) AND not
+  alt-screen AND no Ctrl/Alt. Everything else is single. Do not "fix" a
+  wide-char symptom by adding doubling elsewhere — re-run the probe matrix
+  below first.
+- **Hold-repeat**: `Session.wide_shadow` carries the simulated row across
+  frames while the child echo is pending; it dies the moment `output_gen`
+  advances. Do not re-sample the grid mid-burst.
 
 ## Evidence 2026-07-10 (pwsh 7.5.8, ConPTY, foreman HEAD df46b2d)
 
