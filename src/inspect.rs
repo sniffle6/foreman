@@ -337,6 +337,11 @@ pub fn wide_row_at_cursor<L: EventListener>(
     let g = term.grid();
     let p = g.cursor.point;
     let cols = g.columns();
+    if cols == 0 {
+        // Self-contained guard: don't rely on Session::resize's cols<2 clamp
+        // holding forever (Column(cols-1) below would underflow-panic).
+        return (Vec::new(), 0);
+    }
     let wraps = |l: Line| g[l][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
     let mut start = p.line;
     for _ in 0..8 {
