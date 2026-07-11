@@ -234,6 +234,21 @@ fn remove_cells(line: &mut Vec<CellWide>, start: usize, width: usize) {
     line.resize(len, CellWide::Narrow);
 }
 
+/// Can the wide shadow simulate this key press? Only UNMODIFIED
+/// Left/Right/Backspace/Delete move or edit by amounts the shadow can know.
+/// Ctrl/Alt variants jump or delete by whole words — unknowable from the
+/// row classes alone, so callers must drop tracking instead of simulating
+/// a no-op (a stale shadow that claims to be tracked is worse than none).
+pub fn wide_key_modeled(key: Key, mods: Modifiers) -> bool {
+    let ctrl = mods.ctrl || mods.command;
+    !ctrl
+        && !mods.alt
+        && matches!(
+            key,
+            Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
+        )
+}
+
 /// Apply one physical key to a simulated row: shadow mutation + new col.
 ///
 /// Call after [`encode_key_wide`] with the same `key`/`mods`. Destructive
@@ -426,19 +441,18 @@ pub fn process_input_wide(
                 let sent = !seq.is_empty();
                 out.pty_bytes.extend_from_slice(&seq);
                 if wide_line.is_some() {
-                    if matches!(
-                        k,
-                        Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
-                    ) {
+                    if wide_key_modeled(k, m) {
                         if let Some(line) = wide_line.as_mut() {
                             wide_col = apply_wide_key_to_line(line, wide_col, k, m);
                         }
                     } else if sent {
-                        // Unmodeled key (Home/End/Enter/…) — the shadow can no
-                        // longer know the cursor (e.g. Home jumps to the prompt
-                        // boundary). Stop wide encoding for the batch remainder
-                        // and drop the shadow; standard-terminal behavior until
-                        // the echo lands and the grid is resampled.
+                        // Unmodeled key (Home/End/Enter/…) or a modified
+                        // edit/nav (Ctrl+Backspace word-deletes, Ctrl/Alt
+                        // arrows word-jump) — the shadow can no longer know
+                        // the row or the cursor. Stop wide encoding for the
+                        // batch remainder and drop the shadow;
+                        // standard-terminal behavior until the echo lands and
+                        // the grid is resampled.
                         wide_line = None;
                     }
                 }
@@ -1421,6 +1435,37 @@ mod tests {
             Some((&line, 2)),
         );
         assert_eq!(out.pty_bytes, b"\x1b[H\x1b[C");
+        assert!(out.wide_after.is_none());
+    }
+
+    #[test]
+    fn ctrl_backspace_drops_the_shadow() {
+        // Ctrl+Backspace word-deletes in the child — the shadow cannot know
+        // what was removed, so tracking must STOP (a no-op simulation that
+        // stays "tracked" is a stale shadow that later doubles from phantom
+        // positions). The plain Backspace that follows must encode single,
+        // and no shadow may survive the frame.
+        let line = vec![
+            CellWide::WideBase { non_bmp: true },
+            CellWide::WideSpacer,
+            CellWide::WideBase { non_bmp: true },
+            CellWide::WideSpacer,
+        ];
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let out = process_input_wide(
+            &[key_ev(Key::Backspace, ctrl), key_ev(Key::Backspace, none())],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            Some((&line, 4)),
+        );
+        // ctrl press: single DEL (no doubling under ctrl); plain press:
+        // single DEL (tracking dropped — would be doubled if the stale
+        // shadow still claimed col 4 sits after an emoji).
+        assert_eq!(out.pty_bytes, b"\x7f\x7f");
         assert!(out.wide_after.is_none());
     }
     #[test]

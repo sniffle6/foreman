@@ -285,7 +285,6 @@ pub fn parse_keys_wide(
     line: &[crate::input::CellWide],
     mut col: usize,
 ) -> Result<Vec<u8>, String> {
-    use egui::Key;
     let mut line = line.to_vec();
     let mut tracking = true;
     let mut out = Vec::new();
@@ -307,10 +306,7 @@ pub fn parse_keys_wide(
         }
         out.extend_from_slice(&bytes);
         if tracking {
-            if matches!(
-                key,
-                Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
-            ) {
+            if crate::input::wide_key_modeled(key, mods) {
                 col = crate::input::apply_wide_key_to_line(&mut line, col, key, mods);
             } else {
                 tracking = false;

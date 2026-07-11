@@ -18,8 +18,17 @@ spacer cell) across paint, snapshots, and key input.
   wide-char symptom by adding doubling elsewhere — re-run the probe matrix
   below first.
 - **Hold-repeat**: `Session.wide_shadow` carries the simulated row across
-  frames while the child echo is pending; it dies the moment `output_gen`
-  advances. Do not re-sample the grid mid-burst.
+  frames and is replaced by a fresh grid sample only when the grid is
+  TRUSTWORTHY: the PTY quiet for `WIDE_RESAMPLE_SETTLE` (50ms) AND no
+  modeled key press within `WIDE_INPUT_GRACE` (150ms). `output_gen`
+  advancing is NOT the signal — one keypress echo on a long soft-wrapped
+  line arrives across many chunks over multiple frames, and a grid sampled
+  between chunks reports a transient mid-redraw cursor.
+- **Modeled keys** are UNMODIFIED Left/Right/Backspace/Delete only
+  (`wide_key_modeled`, src/input.rs). Ctrl/Alt variants word-jump or
+  word-delete — unknowable — so they DROP the shadow like Home/End do.
+  Never simulate them as a no-op: a stale shadow that claims to be tracked
+  doubles from phantom positions.
 
 ## Evidence 2026-07-10 (pwsh 7.5.8, ConPTY, foreman HEAD df46b2d)
 
@@ -73,6 +82,22 @@ Fix: `inspect::wide_row_at_cursor` concatenates soft-wrapped rows
 (`WRAPLINE`) and drops wrap padding (`LEADING_WIDE_CHAR_SPACER`), so the
 boundary does not exist in the shadow. Verified: 44-press Backspace batch
 over a 2-row wrapped emoji line clears it completely, buffer stays clean.
+
+Long-line finding (live repro 2026-07-10, fixed): with a ~15-row wrapped
+mixed narrow+emoji input, hold-Backspace still corrupted (`…🥒�` at the
+cursor + stray rows below) even WITH the wrap-spanning shadow. Root cause:
+the shadow was invalidated the moment `output_gen` advanced, but one
+keypress echo on a line that long is redrawn by ConPTY across MANY chunks
+over multiple frames — every intermediate frame re-sampled a mid-redraw
+grid (cursor transiently anywhere), adopted the garbage as the new shadow,
+and the next repeat press doubled (or failed to) from a phantom position.
+Short lines redraw in one chunk, which is why the small repro was fixed
+first and this one survived. Fix: shadow lifetime is now quiescence-based
+(`keep_wide_shadow`, src/terminal.rs) — resample only after 50ms of PTY
+silence and 150ms of key silence, the same trust model as the caret gate.
+In the same pass, modified edits (Ctrl+Backspace = word delete) switched
+from "simulate as no-op" to "drop the shadow": persistence would otherwise
+lock in the stale row for a whole burst (the user's Ctrl+Backspace repro).
 
 Cosmetic residue that remains (upstream, do not chase): between the two
 DELs of a doubled press the child buffer transiently holds a lone

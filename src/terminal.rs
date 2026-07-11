@@ -565,10 +565,19 @@ pub struct Session {
     // Bumped in pump() each time a batch of new PTY bytes arrives. A cheap
     // freshness signal the settle machinery polls to detect terminal activity.
     output_gen: u64,
-    // Shadow cursor row for wide-key encoding, persisted while the child's
-    // echo is pending: (row classes, col, output_gen at store time). Reused
-    // only while output_gen is unchanged; any new child output invalidates it
-    // and read_input re-samples the live grid (docs/wide-chars.md).
+    // When the last PTY chunk arrived; None until the child's first output.
+    // Feeds keep_wide_shadow: output_gen advancing alone does not mean the
+    // grid is trustworthy — one keypress echo on a long soft-wrapped line
+    // arrives across many chunks over multiple frames.
+    last_output_at: Option<std::time::Instant>,
+    // Last time a modeled wide key (Backspace, Delete, Left, Right) was pressed.
+    // Keeps the shadow alive even during ConPTY echo latency.
+    last_wide_key_at: Option<std::time::Instant>,
+    // Shadow cursor row for wide-key encoding: (row classes, col, output_gen
+    // of the grid sample it was built from). Kept while that sample is still
+    // current OR the child is still emitting (a mid-redraw grid lies about
+    // the cursor); replaced by a fresh sample only after the PTY has been
+    // quiet for WIDE_RESAMPLE_SETTLE (docs/wide-chars.md).
     wide_shadow: Option<(Vec<crate::input::CellWide>, usize, u64)>,
     // Grid-content version for the render galley cache. Distinct from
     // output_gen (which means "child produced PTY bytes" and drives settle
@@ -871,6 +880,8 @@ impl Session {
             pending_note: None,
             ready_gate: crate::ready::ReadyGate::new(),
             output_gen: 0,
+            last_output_at: None,
+            last_wide_key_at: None,
             wide_shadow: None,
             content_gen: 0,
             mono_paint: None,
@@ -1083,6 +1094,7 @@ impl Session {
             );
             self.output_gen = self.output_gen.wrapping_add(1);
             self.content_gen = self.content_gen.wrapping_add(1);
+            self.last_output_at = Some(now);
             // A DSR can block the child inside GetConsoleScreenBufferInfo. Do
             // not leave its CPR behind later queued output; flush after the
             // exact chunk that completed the query.
@@ -1246,6 +1258,37 @@ impl Session {
         (point, side)
     }
 
+    /// How long the PTY must stay quiet before a fresh grid sample is trusted
+    /// for wide-key encoding. `output_gen` advancing means "a chunk arrived",
+    /// not "the redraw finished": one keypress echo on a long soft-wrapped
+    /// line spans many chunks across frames, and mid-redraw the cursor is
+    /// transiently anywhere. Same trust model as the caret gate's settle.
+    const WIDE_RESAMPLE_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Typing grace: a recent unmodified wide-modeled key press keeps the
+    /// shadow alive even across a briefly-settled PTY, so a redraw that
+    /// stalls >50ms mid-burst cannot slip a mid-redraw sample in. Mirrors
+    /// the caret gate's INPUT_GRACE (150ms).
+    const WIDE_INPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Wide-shadow lifetime policy (pure; unit-tested): keep the simulated
+    /// row while the grid sample it was built from is still current, while
+    /// the child is still emitting (a mid-redraw grid lies about the cursor),
+    /// or while the user is actively pressing modeled wide keys. Resample
+    /// only after [`Self::WIDE_RESAMPLE_SETTLE`] of PTY silence AND
+    /// [`Self::WIDE_INPUT_GRACE`] of key silence.
+    fn keep_wide_shadow(
+        sampled_gen: u64,
+        output_gen: u64,
+        last_output: Option<std::time::Instant>,
+        last_wide_key: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> bool {
+        sampled_gen == output_gen
+            || last_output.is_some_and(|t| now.duration_since(t) < Self::WIDE_RESAMPLE_SETTLE)
+            || last_wide_key.is_some_and(|t| now.duration_since(t) < Self::WIDE_INPUT_GRACE)
+    }
+
     /// Read this frame's keyboard input and apply it. The pure encoding lives in
     /// `crate::input::process_input` (terminal-completeness epic, Phase 2); this is
     /// the thin shell that supplies live state (term mode, selection), performs the
@@ -1260,14 +1303,39 @@ impl Session {
             .and_then(|s| s.to_range(&self.term))
             .is_some();
         // Wide-char key encode: reuse the persisted shadow row while the
-        // child's echo is pending (output_gen unchanged) — re-sampling the
-        // stale grid would restart the simulation mid-burst and corrupt
-        // hold-Backspace (docs/wide-chars.md). Fresh output → fresh sample.
-        let (wide_line, wide_col) = match self.wide_shadow.take() {
-            Some((line, col, sampled_gen)) if sampled_gen == self.output_gen => (line, col),
-            _ => self.wide_line_at_cursor(),
+        // child's echo is pending. output_gen advancing is NOT the signal to
+        // resample — one keypress echo on a long soft-wrapped line arrives
+        // across many chunks over multiple frames, and a grid sampled between
+        // chunks reports a transient mid-redraw cursor (the second
+        // diagonal-tofu bug, docs/wide-chars.md). Resample only once the PTY
+        // has been quiet for WIDE_RESAMPLE_SETTLE and the user is inactive.
+        let now = std::time::Instant::now();
+        let (wide_line, wide_col, wide_basis_gen) = match self.wide_shadow.take() {
+            Some((line, col, basis))
+                if Self::keep_wide_shadow(
+                    basis,
+                    self.output_gen,
+                    self.last_output_at,
+                    self.last_wide_key_at,
+                    now,
+                ) =>
+            {
+                (line, col, basis)
+            }
+            _ => {
+                let (line, col) = self.wide_line_at_cursor();
+                (line, col, self.output_gen)
+            }
         };
+        let mut has_modeled_key = false;
         let mut outcome = ui.input(|i| {
+            // Grace stamp: only UNMODIFIED modeled keys count. Ctrl+Backspace
+            // word-deletes (unmodeled — it DROPS the shadow), so it must not
+            // extend the grace window that keeps shadows alive.
+            has_modeled_key = i.events.iter().any(|ev| {
+                matches!(ev, egui::Event::Key { key, pressed: true, modifiers, .. }
+                    if crate::input::wide_key_modeled(*key, *modifiers))
+            });
             crate::input::process_input_wide(
                 &i.events,
                 i.modifiers,
@@ -1276,12 +1344,16 @@ impl Session {
                 Some((wide_line.as_slice(), wide_col)),
             )
         });
+        if has_modeled_key {
+            self.last_wide_key_at = Some(now);
+        }
 
         // Persist the simulated row unconditionally (even a no-key frame must
-        // not lose mid-burst progress); the gen check above drops it as soon
-        // as real child output arrives.
+        // not lose mid-burst progress), stamped with the gen of the grid
+        // sample it was BUILT from — not the current gen — so a settled grid
+        // with newer output still triggers a fresh sample above.
         if let Some((line, col)) = outcome.wide_after.take() {
-            self.wide_shadow = Some((line, col, self.output_gen));
+            self.wide_shadow = Some((line, col, wide_basis_gen));
         }
 
         if let Some(s) = outcome.scroll {
@@ -1720,6 +1792,53 @@ mod tests {
     use alacritty_terminal::index::Line;
 
     type RecordedWrites = Arc<Mutex<Vec<(Vec<u8>, Option<String>)>>>;
+
+    // -- keep_wide_shadow: shadow lifetime vs PTY quiescence -----------------
+
+    #[test]
+    fn wide_shadow_kept_while_gen_unchanged() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_secs(60);
+        // Same gen: keep regardless of how long the PTY has been quiet.
+        assert!(Session::keep_wide_shadow(5, 5, None, None, now));
+        assert!(Session::keep_wide_shadow(5, 5, Some(t0), None, now));
+    }
+
+    #[test]
+    fn wide_shadow_survives_mid_redraw_chunks() {
+        // Gen advanced but the chunk landed 10ms ago — the long-line redraw
+        // may still be in flight; the mid-redraw grid must not be trusted.
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_millis(10);
+        assert!(Session::keep_wide_shadow(5, 7, Some(t0), None, now));
+    }
+
+    #[test]
+    fn wide_shadow_resampled_once_pty_settles() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + Session::WIDE_RESAMPLE_SETTLE + std::time::Duration::from_millis(10);
+        // Quiet past the settle window: the echo has fully landed.
+        assert!(!Session::keep_wide_shadow(5, 7, Some(t0), None, now));
+        // Gen advanced with no output timestamp at all: trust the grid.
+        assert!(!Session::keep_wide_shadow(5, 7, None, None, now));
+    }
+
+    #[test]
+    fn wide_shadow_kept_while_user_actively_typing_modeled_keys() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_millis(100);
+        // Gen advanced and PTY quiet for 100ms (> 50ms settle), but user pressed
+        // a wide key 100ms ago (< 150ms grace) -> keep shadow to avoid stale grid.
+        assert!(Session::keep_wide_shadow(5, 7, Some(t0), Some(t0), now));
+    }
+
+    #[test]
+    fn wide_shadow_resampled_after_user_inactivity() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_millis(160);
+        // Gen advanced, PTY quiet, and user inactive for 160ms (> 150ms grace) -> resample.
+        assert!(!Session::keep_wide_shadow(5, 7, Some(t0), Some(t0), now));
+    }
 
     struct TitleRecordingWriter {
         title: Arc<Mutex<Option<String>>>,
