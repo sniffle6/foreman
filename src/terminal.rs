@@ -994,7 +994,6 @@ impl Session {
     /// Cursor line as [`CellWide`] classes + column — input seam for wide-char
     /// key encoding (`encode_key_wide` / `send --keys`).
     pub fn wide_line_at_cursor(&self) -> (Vec<crate::input::CellWide>, usize) {
-        use alacritty_terminal::term::cell::Flags;
         use crate::input::CellWide;
         let g = self.term.grid();
         let p = g.cursor.point;
@@ -1002,16 +1001,7 @@ impl Session {
         let mut line = Vec::with_capacity(cols);
         for c in 0..cols {
             let f = g[p.line][alacritty_terminal::index::Column(c)].flags;
-            line.push(if f.contains(Flags::WIDE_CHAR) {
-                CellWide::WideBase
-            } else if f.intersects(
-                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
-            ) {
-                // LEADING = wrap placeholder at end of line (or col-0 after wrap).
-                CellWide::WideSpacer
-            } else {
-                CellWide::Narrow
-            });
+            line.push(CellWide::from_flags(f));
         }
         (line, p.column.0)
     }

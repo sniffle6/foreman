@@ -43,6 +43,23 @@ pub enum CellWide {
     WideSpacer,
 }
 
+impl CellWide {
+    /// The one home for wide-cell classification. Every grid walk that cares
+    /// about width-2 glyphs — paint plan, snapshot text/cells, key-hint
+    /// sampling — classifies through this, so a new alacritty spacer flag is
+    /// one edit here (see df46b2d: LEADING_WIDE_CHAR_SPACER needed 4 edits).
+    pub fn from_flags(flags: alacritty_terminal::term::cell::Flags) -> Self {
+        use alacritty_terminal::term::cell::Flags;
+        if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            CellWide::WideSpacer
+        } else if flags.contains(Flags::WIDE_CHAR) {
+            CellWide::WideBase
+        } else {
+            CellWide::Narrow
+        }
+    }
+}
+
 /// Live-cursor neighborhood for wide-char key encoding.
 /// Built from a row of [`CellWide`] via [`wide_hint_at`] — callers should not
 /// invent fields by hand outside tests.
@@ -1073,6 +1090,26 @@ mod tests {
         assert_eq!(wide_hint_at(&line, 1), hint_base());
         assert_eq!(wide_hint_at(&line, 2), hint_spacer()); // left is base, not spacer
         assert_eq!(wide_hint_at(&line, 3), hint_after_wide());
+    }
+    #[test]
+    fn cellwide_from_flags_is_the_single_classification_home() {
+        use alacritty_terminal::term::cell::Flags;
+        assert_eq!(CellWide::from_flags(Flags::empty()), CellWide::Narrow);
+        assert_eq!(CellWide::from_flags(Flags::WIDE_CHAR), CellWide::WideBase);
+        assert_eq!(
+            CellWide::from_flags(Flags::WIDE_CHAR_SPACER),
+            CellWide::WideSpacer
+        );
+        // The df46b2d lesson: wrap placeholders are spacers too.
+        assert_eq!(
+            CellWide::from_flags(Flags::LEADING_WIDE_CHAR_SPACER),
+            CellWide::WideSpacer
+        );
+        // Style flags must not affect classification.
+        assert_eq!(
+            CellWide::from_flags(Flags::BOLD | Flags::WIDE_CHAR),
+            CellWide::WideBase
+        );
     }
     #[test]
     fn multi_right_across_two_wide_glyphs_doubles_each() {

@@ -107,10 +107,8 @@ pub fn is_default_emoji_presentation(ch: char) -> bool {
     )
 }
 
-/// Spacer halves of width-2 glyphs — never paint as their own cell (shows as
-/// tofu □). Includes wrap placeholders at line end (`LEADING_WIDE_CHAR_SPACER`).
 fn is_wide_spacer(flags: Flags) -> bool {
-    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    crate::input::CellWide::from_flags(flags) == crate::input::CellWide::WideSpacer
 }
 
 /// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per

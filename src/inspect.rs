@@ -90,9 +90,8 @@ pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -
             let cell = &grid[line][Column(col)];
             // A wide (2-column) glyph lives in one cell; its trailing spacer is a
             // placeholder — skip it so the text isn't padded with a stray space.
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            if crate::input::CellWide::from_flags(cell.flags)
+                == crate::input::CellWide::WideSpacer
             {
                 col += 1;
                 continue;
@@ -151,9 +150,8 @@ pub fn snapshot_cells<L: EventListener>(
         while col < c1 {
             let cell = &grid[line][Column(col)];
             // Skip the trailing spacer of a wide glyph (same rule as snapshot_text).
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            if crate::input::CellWide::from_flags(cell.flags)
+                == crate::input::CellWide::WideSpacer
             {
                 col += 1;
                 continue;
