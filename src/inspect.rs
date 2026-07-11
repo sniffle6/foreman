@@ -13,7 +13,7 @@
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::CursorShape;
@@ -277,8 +277,9 @@ pub fn parse_keys(names: &[String], mode: TermMode) -> Result<Vec<u8>, String> {
 /// Like [`parse_keys`], with a cursor-line of [`crate::input::CellWide`] so
 /// Left/Right/Backspace/Delete skip width-2 glyphs the same as the live
 /// keyboard. `col` is the starting cursor column; advanced after each key.
-/// An unmodeled key (Home/End/Enter/…) stops wide encoding for the token
-/// remainder — the shadow can no longer know the cursor position.
+/// An unmodeled key (Home/End/Enter/… or a modified edit/navigation chord)
+/// stops wide encoding for the token remainder — the shadow can no longer
+/// know the complete child-owned editing state.
 pub fn parse_keys_wide(
     names: &[String],
     mode: TermMode,
@@ -325,13 +326,23 @@ pub fn parse_keys_wide(
 /// so a hold-Backspace crossing a wrap boundary still knows the glyph left of
 /// the cursor — a single-row shadow sent a lone DEL there and half-deleted
 /// the emoji (one U+FFFD per wrap crossing; docs/wide-chars.md). Walks are
-/// capped at 8 rows each way.
+/// bounded at 4096 rows each way so long pasted commands retain their complete
+/// logical line without permitting an unbounded walk through corrupt flags.
 pub fn wide_row_at_cursor<L: EventListener>(
     term: &Term<L>,
 ) -> (Vec<crate::input::CellWide>, usize) {
+    wide_row_at_point(term, term.grid().cursor.point)
+}
+
+/// Point-explicit form of [`wide_row_at_cursor`]. `Session` uses this with its
+/// paste-scoped PSReadLine cursor alias, while generic terminal inspection keeps
+/// the authoritative alacritty cursor through the wrapper above.
+pub fn wide_row_at_point<L: EventListener>(
+    term: &Term<L>,
+    p: Point,
+) -> (Vec<crate::input::CellWide>, usize) {
     use crate::input::CellWide;
     let g = term.grid();
-    let p = g.cursor.point;
     let cols = g.columns();
     if cols == 0 {
         // Self-contained guard: don't rely on Session::resize's cols<2 clamp
@@ -340,7 +351,7 @@ pub fn wide_row_at_cursor<L: EventListener>(
     }
     let wraps = |l: Line| g[l][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
     let mut start = p.line;
-    for _ in 0..8 {
+    for _ in 0..4096 {
         let prev = Line(start.0 - 1);
         if prev.0 < -(g.history_size() as i32) || !wraps(prev) {
             break;
@@ -349,7 +360,7 @@ pub fn wide_row_at_cursor<L: EventListener>(
     }
     let mut end = p.line;
     let last = Line(g.screen_lines() as i32 - 1);
-    for _ in 0..8 {
+    for _ in 0..4096 {
         if end >= last || !wraps(end) {
             break;
         }

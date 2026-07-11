@@ -1086,11 +1086,10 @@ impl WindowManager {
             (s.term_mode(), line, col)
         };
         // Same deep encode as live keyboard (wide-char skip when line known).
-        let key_bytes =
-            crate::inspect::parse_keys_wide(&req.keys, mode, &wide_line, wide_col)?;
+        let key_bytes = crate::inspect::parse_keys_wide(&req.keys, mode, &wide_line, wide_col)?;
         let session = self.session_mut(pid, tid)?;
         if let Some(text) = &req.text {
-            session.feed(text.as_bytes());
+            session.feed_text(text);
         }
         if !key_bytes.is_empty() {
             session.feed(&key_bytes);

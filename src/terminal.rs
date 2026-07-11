@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, GridCell, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
@@ -289,6 +289,289 @@ fn advance_scanned<L: EventListener>(
     parser.advance(term, &bytes[at..]);
 }
 
+/// Lightweight second parser used only during a paste-scoped PowerShell
+/// compatibility epoch. It identifies the byte that completes an absolute CUP
+/// (`CSI H` / `CSI f`) so [`advance_psreadline_scanned`] can sample the natural
+/// flow cursor immediately before alacritty applies that CUP.
+///
+/// PSReadLine 2.4.5 measures a non-BMP emoji as two independent UTF-16 chars.
+/// When the pair reaches the final column it computes the final CUP as though
+/// the glyph split across rows. Alacritty correctly defers the complete width-2
+/// glyph, so that CUP lands one cell behind per straddled boundary. The raw VT
+/// stream is otherwise ambiguous, hence this scanner is armed only for a
+/// single-line, append-at-end PowerShell paste on the primary screen.
+#[derive(Default)]
+struct CupScanner {
+    parser: alacritty_terminal::vte::Parser,
+}
+
+#[derive(Default)]
+struct CupSink {
+    cup: bool,
+    invalidates_alias: bool,
+    mode_barrier: bool,
+}
+
+impl alacritty_terminal::vte::Perform for CupSink {
+    fn print(&mut self, _c: char) {
+        self.invalidates_alias = true;
+    }
+
+    fn execute(&mut self, _byte: u8) {
+        self.invalidates_alias = true;
+    }
+
+    fn hook(
+        &mut self,
+        _params: &alacritty_terminal::vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        _action: char,
+    ) {
+        self.invalidates_alias = true;
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &alacritty_terminal::vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        self.cup = !ignore && intermediates.is_empty() && matches!(action, 'H' | 'f');
+        self.mode_barrier = !ignore
+            && intermediates == b"?"
+            && matches!(action, 'h' | 'l')
+            && params
+                .iter()
+                .flatten()
+                .any(|param| matches!(*param, 47 | 1047 | 1049 | 2004));
+        // SGR, cursor visibility/modes, and cursor style do not alter cells or
+        // the numeric cursor. Everything else fails closed. Alternate-screen
+        // and bracketed-paste transitions are explicit barriers so an enter +
+        // exit pair in one PTY chunk cannot leave the paste epoch armed.
+        self.invalidates_alias =
+            (!self.cup && !matches!(action, 'm' | 'h' | 'l' | 'q')) || self.mode_barrier;
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
+        self.invalidates_alias = true;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CupScanEvent {
+    cup: bool,
+    invalidates_alias: bool,
+    mode_barrier: bool,
+}
+
+impl CupScanner {
+    fn scan_byte(&mut self, byte: u8) -> CupScanEvent {
+        let mut sink = CupSink::default();
+        self.parser.advance(&mut sink, &[byte]);
+        CupScanEvent {
+            cup: sink.cup,
+            invalidates_alias: sink.invalidates_alias,
+            mode_barrier: sink.mode_barrier,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorAlias {
+    /// The authoritative point stored in alacritty after the CUP.
+    raw: Point,
+    /// The natural whole-glyph flow endpoint immediately before the CUP.
+    physical: Point,
+}
+
+#[derive(Default)]
+struct CupScanResult {
+    saw_cup: bool,
+    hit_mode_barrier: bool,
+    refreshed_alias: bool,
+    alias: Option<CursorAlias>,
+}
+
+/// Serial-number ordering for the wrapping PTY generation counter. A value is
+/// newer when it is within the forward half of the `u64` space.
+fn generation_after(candidate: u64, baseline: u64) -> bool {
+    let delta = candidate.wrapping_sub(baseline);
+    delta != 0 && delta < (1u64 << 63)
+}
+
+/// Validate that `raw` is exactly `physical` with alacritty's whole-glyph wrap
+/// padding removed. This walks the entire soft-wrapped chain: the live repro
+/// spans 16 rows and six pads, so the input shadow's historical eight-row cap
+/// is not sufficient here.
+fn psreadline_cursor_alias<L: EventListener>(
+    term: &Term<L>,
+    raw: Point,
+    physical: Point,
+) -> Option<CursorAlias> {
+    if raw == physical {
+        return None;
+    }
+    let grid = term.grid();
+    let cols = grid.columns();
+    if cols == 0 || raw.column.0 >= cols || physical.column.0 >= cols {
+        return None;
+    }
+
+    let history_top = -(grid.history_size() as i32);
+    let mut start = physical.line;
+    let mut walked = 0usize;
+    while start.0 > history_top && walked < 4096 {
+        let prev = Line(start.0 - 1);
+        if !grid[prev][Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+            break;
+        }
+        start = prev;
+        walked += 1;
+    }
+    if walked == 4096 || raw.line < start || raw.line > physical.line {
+        return None;
+    }
+
+    // Every intervening row must belong to the same soft-wrapped logical line.
+    for line in start.0..physical.line.0 {
+        if !grid[Line(line)][Column(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+        {
+            return None;
+        }
+    }
+
+    let flat =
+        |point: Point| -> usize { (point.line.0 - start.0) as usize * cols + point.column.0 };
+    let raw_flat = flat(raw);
+    let physical_flat = flat(physical);
+    if raw_flat >= physical_flat {
+        return None;
+    }
+
+    let mut surrogate_pads = 0usize;
+    for offset in 0..physical_flat {
+        let line = Line(start.0 + (offset / cols) as i32);
+        let col = Column(offset % cols);
+        if grid[line][col]
+            .flags
+            .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            // PSReadLine already defers a BMP width-2 glyph (for example CJK)
+            // as a unit, so its CUP includes that pad. The mismatch exists only
+            // for a non-BMP glyph measured as two independent UTF-16 chars.
+            let next = offset + 1;
+            if next < physical_flat {
+                let next_line = Line(start.0 + (next / cols) as i32);
+                let next_col = Column(next % cols);
+                let base = &grid[next_line][next_col];
+                if base.flags.contains(Flags::WIDE_CHAR) && base.c > '\u{FFFF}' {
+                    surrogate_pads += 1;
+                }
+            }
+        }
+    }
+
+    (surrogate_pads > 0 && raw_flat + surrogate_pads == physical_flat)
+        .then_some(CursorAlias { raw, physical })
+}
+
+/// Conservative arming gate for the compatibility epoch: the paste must begin
+/// at the visible end of the current soft-wrapped line. Inline prediction text,
+/// a mid-line cursor, or stale nonblank cells after the caret all fail closed.
+fn cursor_at_content_end<L: EventListener>(term: &Term<L>, point: Point) -> bool {
+    let grid = term.grid();
+    let cols = grid.columns();
+    if cols == 0 || point.column.0 >= cols {
+        return false;
+    }
+    if grid.cursor.input_needs_wrap && point == grid.cursor.point {
+        return true;
+    }
+
+    let last = Line(grid.screen_lines() as i32 - 1);
+    let mut line = point.line;
+    let mut first_col = point.column.0;
+    let mut walked = 0usize;
+    loop {
+        for col in first_col..cols {
+            if !grid[line][Column(col)].is_empty() {
+                return false;
+            }
+        }
+        if line >= last || !grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+            return true;
+        }
+        walked += 1;
+        if walked == 4096 {
+            return false;
+        }
+        line += 1;
+        first_col = 0;
+    }
+}
+
+/// Byte-identical terminal advance with CUP endpoint observation layered over
+/// the normal graphics scanner. No grid state is rewritten: a validated alias
+/// is consumed only by caret/display reporting and wide-key sampling, leaving
+/// subsequent VT parsing and CPR replies anchored to alacritty's authoritative
+/// cursor.
+fn advance_psreadline_scanned<L: EventListener>(
+    parser: &mut Processor,
+    term: &mut Term<L>,
+    graphics: &mut crate::graphics::Graphics,
+    scanner: &mut CupScanner,
+    bytes: &[u8],
+    replies: &mut Vec<u8>,
+    initial_alias: Option<CursorAlias>,
+) -> CupScanResult {
+    let mut result = CupScanResult {
+        alias: initial_alias,
+        ..CupScanResult::default()
+    };
+    let mut at = 0usize;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let event = scanner.scan_byte(byte);
+        result.hit_mode_barrier |= event.mode_barrier;
+        if event.invalidates_alias {
+            result.alias = None;
+        }
+        if !event.cup {
+            continue;
+        }
+        result.saw_cup = true;
+        // Feed through the parameters but stop before H/f, while alacritty's
+        // parser is still holding the CSI and the grid cursor is the flow end.
+        advance_scanned(parser, term, graphics, &bytes[at..i], replies);
+        let physical = term.grid().cursor.point;
+        advance_scanned(parser, term, graphics, &bytes[i..=i], replies);
+        let raw = term.grid().cursor.point;
+        let candidate = psreadline_cursor_alias(term, raw, physical);
+        if candidate.is_some() {
+            result.alias = candidate;
+            result.refreshed_alias = true;
+        } else if !result.alias.is_some_and(|alias| alias.raw == raw) {
+            // A redundant CUP to the same raw point preserves a validated
+            // alias; any different unmatched CUP supersedes it.
+            result.alias = None;
+        }
+        at = i + 1;
+    }
+    advance_scanned(parser, term, graphics, &bytes[at..], replies);
+
+    // Printable output or a later relative cursor move invalidates an alias.
+    if result
+        .alias
+        .is_some_and(|alias| term.grid().cursor.point != alias.raw)
+    {
+        result.alias = None;
+    }
+    result
+}
+
 fn term_view<L: EventListener>(term: &Term<L>) -> crate::graphics::TermView {
     let g = term.grid();
     crate::graphics::TermView {
@@ -412,11 +695,7 @@ impl MonoPaintCache {
     fn get_or_rebuild(
         &mut self,
         key: MonoPaintKey,
-        rebuild: impl FnOnce() -> (
-            Vec<MonoGlyph>,
-            Vec<MonoBg>,
-            Vec<crate::frame::EmojiSite>,
-        ),
+        rebuild: impl FnOnce() -> (Vec<MonoGlyph>, Vec<MonoBg>, Vec<crate::frame::EmojiSite>),
     ) -> (
         std::sync::Arc<Vec<MonoGlyph>>,
         std::sync::Arc<Vec<MonoBg>>,
@@ -444,10 +723,7 @@ impl MonoPaintCache {
 
 /// Drop emoji textures whose px size no longer matches the live font-derived
 /// size (zoom churn). Pure so unit tests can cover the eviction policy.
-fn retain_emoji_textures_at_px<T>(
-    map: &mut std::collections::HashMap<(char, u32), T>,
-    px: u32,
-) {
+fn retain_emoji_textures_at_px<T>(map: &mut std::collections::HashMap<(char, u32), T>, px: u32) {
     map.retain(|(_, entry_px), _| *entry_px == px);
 }
 
@@ -524,6 +800,115 @@ fn mono_paint_items_for_test(
     mono_paint_items(plan, layout)
 }
 
+/// Cross-frame state for wide-character key compensation.
+///
+/// `AwaitingEcho` is deliberately distinct from `Uninitialized`: after text,
+/// paste, or an unmodeled chord, the live grid is known to be pre-input or
+/// mid-redraw and must not immediately seed a new shadow.
+enum WideShadowState {
+    Uninitialized,
+    Tracking {
+        line: Vec<crate::input::CellWide>,
+        col: usize,
+        basis_gen: u64,
+    },
+    AwaitingEcho {
+        invalidated_gen: u64,
+    },
+}
+
+/// Keys whose press this Session actually processed. egui's key state is
+/// global, while only the focused Session calls `read_input`; ownership keeps a
+/// release from another pane from extending this Session's shadow lifetime.
+#[derive(Default)]
+struct WideKeyLatch(u8);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WideKeyActivity {
+    active: bool,
+    blocks_reseed: bool,
+}
+
+impl WideKeyLatch {
+    fn bit(key: egui::Key) -> Option<u8> {
+        match key {
+            egui::Key::ArrowLeft => Some(1 << 0),
+            egui::Key::ArrowRight => Some(1 << 1),
+            egui::Key::Backspace => Some(1 << 2),
+            egui::Key::Delete => Some(1 << 3),
+            _ => None,
+        }
+    }
+
+    /// Update per-session ownership and report activity for this frame. Global
+    /// `keys_down` bridges repeat gaps. A release missed while this Session was
+    /// inactive clears stale ownership without inventing new activity.
+    fn update(&mut self, input: &egui::InputState) -> WideKeyActivity {
+        let owned_before = self.0;
+        let mut active = false;
+        let mut blocks_reseed = false;
+        let mut fresh_bits = 0u8;
+        for event in &input.events {
+            let egui::Event::Key {
+                key,
+                pressed,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let Some(bit) = Self::bit(*key) else {
+                continue;
+            };
+            if *pressed {
+                if !*repeat {
+                    // A new physical press starts a new ownership epoch. This
+                    // also discards a stale bit left by a release missed while
+                    // the Session was inactive.
+                    self.0 &= !bit;
+                    fresh_bits |= bit;
+                }
+                if crate::input::wide_key_uses_shadow(*key, *modifiers) || self.0 & bit != 0 {
+                    self.0 |= bit;
+                    active = true;
+                    blocks_reseed |= owned_before & bit != 0 && fresh_bits & bit == 0;
+                }
+            } else if self.0 & bit != 0 {
+                self.0 &= !bit;
+                active = true;
+                blocks_reseed |= owned_before & bit != 0 && fresh_bits & bit == 0;
+            }
+        }
+
+        for key in [
+            egui::Key::ArrowLeft,
+            egui::Key::ArrowRight,
+            egui::Key::Backspace,
+            egui::Key::Delete,
+        ] {
+            let bit = Self::bit(key).expect("listed wide key has a latch bit");
+            if self.0 & bit == 0 {
+                continue;
+            }
+            if input.key_down(key) {
+                active = true;
+                blocks_reseed |= owned_before & bit != 0 && fresh_bits & bit == 0;
+            } else {
+                // The release happened while this Session was inactive. Clear
+                // stale ownership without pretending it happened just now;
+                // the previous input timestamp already owns any real tail.
+                self.0 &= !bit;
+            }
+        }
+        WideKeyActivity {
+            active,
+            blocks_reseed,
+        }
+    }
+}
+
 pub struct Session {
     term: Term<Listener>,
     parser: Processor,
@@ -570,15 +955,25 @@ pub struct Session {
     // grid is trustworthy — one keypress echo on a long soft-wrapped line
     // arrives across many chunks over multiple frames.
     last_output_at: Option<std::time::Instant>,
-    // Last time a modeled wide key (Backspace, Delete, Left, Right) was pressed.
-    // Keeps the shadow alive even during ConPTY echo latency.
+    // Last time a shadow-using wide key (Backspace, Delete, Left, Right) was active.
+    // Refreshed from egui's held-key state, not just repeat events, and retained
+    // briefly after release so the final echo can drain.
     last_wide_key_at: Option<std::time::Instant>,
-    // Shadow cursor row for wide-key encoding: (row classes, col, output_gen
-    // of the grid sample it was built from). Kept while that sample is still
-    // current OR the child is still emitting (a mid-redraw grid lies about
-    // the cursor); replaced by a fresh sample only after the PTY has been
-    // quiet for WIDE_RESAMPLE_SETTLE (docs/wide-chars.md).
-    wide_shadow: Option<(Vec<crate::input::CellWide>, usize, u64)>,
+    wide_key_latch: WideKeyLatch,
+    // Shadow cursor row for wide-key encoding, or an explicit wait-for-echo
+    // state after tracking becomes unknowable. A plain Option cannot express
+    // that distinction and used to re-sample the same stale grid next frame.
+    wide_shadow: WideShadowState,
+    // Paste-scoped PSReadLine compatibility. PSReadLine 2.4.5 can emit a final
+    // CUP that omits alacritty's whole-glyph wrap pads for non-BMP emoji. The
+    // scanner observes CUP endpoints only while armed; the alias never mutates
+    // the grid and is used solely for caret/display reporting + wide-key sampling.
+    psreadline_cup_scanner: Option<CupScanner>,
+    psreadline_cursor_alias: Option<CursorAlias>,
+    // PTY generation whose bytes established the current alias. A carried alias
+    // must not immediately re-seed wide-key modeling after later input: until a
+    // newer CUP observation arrives it describes the pre-input row.
+    psreadline_cursor_alias_gen: Option<u64>,
     // Grid-content version for the render galley cache. Distinct from
     // output_gen (which means "child produced PTY bytes" and drives settle
     // quiescence): content_gen bumps on EVERY grid-content mutation, including
@@ -882,7 +1277,11 @@ impl Session {
             output_gen: 0,
             last_output_at: None,
             last_wide_key_at: None,
-            wide_shadow: None,
+            wide_key_latch: WideKeyLatch::default(),
+            wide_shadow: WideShadowState::Uninitialized,
+            psreadline_cup_scanner: None,
+            psreadline_cursor_alias: None,
+            psreadline_cursor_alias_gen: None,
             content_gen: 0,
             mono_paint: None,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
@@ -992,14 +1391,25 @@ impl Session {
     pub fn inject_input(&mut self, text: &str) {
         let now = std::time::Instant::now();
         if let Some(crate::ready::Action::Write(bytes)) = self.ready_gate.try_inject(text, now) {
-            self.send(&bytes);
+            self.send_external_input(&bytes);
         }
     }
 
     /// Raw PTY write — bypasses bracketed-paste and the submit delay. Used by
     /// `foreman send` to deliver pre-encoded bytes (text + key sequences).
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.send(bytes);
+        self.send_external_input(bytes);
+    }
+
+    /// Text half of `foreman send`. Keeping this distinct from raw key bytes
+    /// lets the control path arm the same append-at-end PowerShell paste
+    /// compatibility as the GUI clipboard paths.
+    pub fn feed_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.arm_psreadline_paste_cursor(text);
+        self.send_external_input(text.as_bytes());
     }
 
     /// The terminal's current mode flags — used by `foreman send` to encode
@@ -1012,7 +1422,72 @@ impl Session {
     /// classes + cursor index — input seam for wide-char key encoding
     /// (`encode_key_wide` / `send --keys`). See `inspect::wide_row_at_cursor`.
     pub fn wide_line_at_cursor(&self) -> (Vec<crate::input::CellWide>, usize) {
-        crate::inspect::wide_row_at_cursor(&self.term)
+        crate::inspect::wide_row_at_point(&self.term, self.input_cursor_point())
+    }
+
+    /// Grid point for input modeling. With no compatibility alias this remains
+    /// alacritty's authoritative raw point (including a possible spacer).
+    fn input_cursor_point(&self) -> Point {
+        let raw = self.term.grid().cursor.point;
+        self.psreadline_cursor_alias
+            .filter(|alias| alias.raw == raw)
+            .map(|alias| alias.physical)
+            .unwrap_or(raw)
+    }
+
+    fn has_valid_cursor_alias(&self) -> bool {
+        let raw = self.term.grid().cursor.point;
+        self.psreadline_cursor_alias
+            .is_some_and(|alias| alias.raw == raw)
+    }
+
+    fn has_fresh_cursor_alias(&self, invalidated_gen: u64) -> bool {
+        self.has_valid_cursor_alias()
+            && self
+                .psreadline_cursor_alias_gen
+                .is_some_and(|observed_gen| generation_after(observed_gen, invalidated_gen))
+    }
+
+    /// Point Foreman paints/reports. Preserve alacritty's normal renderable
+    /// cursor normalization (wide-spacer snap, VI cursor) unless a validated
+    /// PSReadLine paste alias explicitly overrides it.
+    fn display_cursor_point(&self) -> Point {
+        let raw = self.term.grid().cursor.point;
+        self.psreadline_cursor_alias
+            .filter(|alias| alias.raw == raw)
+            .map(|alias| alias.physical)
+            .unwrap_or_else(|| self.term.renderable_content().cursor.point)
+    }
+
+    fn effective_cursor_info(&self) -> crate::inspect::CursorInfo {
+        let mut info = crate::inspect::cursor_info(&self.term);
+        let point = self.display_cursor_point();
+        info.row = point.line.0;
+        info.col = point.column.0;
+        info
+    }
+
+    fn clear_psreadline_paste_cursor(&mut self) {
+        self.psreadline_cup_scanner = None;
+        self.psreadline_cursor_alias = None;
+        self.psreadline_cursor_alias_gen = None;
+    }
+
+    fn arm_psreadline_paste_cursor(&mut self, text: &str) {
+        // Every new paste starts a new decision epoch. Multiline input and
+        // app-owned bracketed-paste/TUI modes deliberately fail closed.
+        let point = self.display_cursor_point();
+        self.clear_psreadline_paste_cursor();
+        let mode = *self.term.mode();
+        if self.shell != Shell::PowerShell
+            || mode.intersects(TermMode::ALT_SCREEN | TermMode::BRACKETED_PASTE)
+            || text.is_empty()
+            || text.contains(['\r', '\n'])
+            || !cursor_at_content_end(&self.term, point)
+        {
+            return;
+        }
+        self.psreadline_cup_scanner = Some(CupScanner::default());
     }
 
     /// Counter bumped every time new PTY bytes arrive in `pump()`. The settle
@@ -1049,7 +1524,7 @@ impl Session {
     /// Each call pumps. For a consistent multi-field read use [`snapshot_all`].
     pub fn cursor_info(&mut self) -> crate::inspect::CursorInfo {
         self.pump();
-        crate::inspect::cursor_info(&self.term)
+        self.effective_cursor_info()
     }
 
     /// One pump, then the requested Inspection fields from that grid state.
@@ -1068,7 +1543,7 @@ impl Session {
         self.pump();
         let text = crate::inspect::snapshot_text(&self.term, None);
         let cells = attrs.then(|| crate::inspect::snapshot_cells(&self.term, None));
-        let cursor = cursor.then(|| crate::inspect::cursor_info(&self.term));
+        let cursor = cursor.then(|| self.effective_cursor_info());
         (text, cells, cursor)
     }
 
@@ -1085,13 +1560,43 @@ impl Session {
                 let _ = f.write_all(&bytes);
             }
             self.ready_gate.on_rx_chunk(&bytes);
-            advance_scanned(
-                &mut self.parser,
-                &mut self.term,
-                &mut self.graphics,
-                &bytes,
-                &mut greplies,
-            );
+            if let Some(scanner) = self.psreadline_cup_scanner.as_mut() {
+                let carried_alias_gen = self.psreadline_cursor_alias_gen;
+                let result = advance_psreadline_scanned(
+                    &mut self.parser,
+                    &mut self.term,
+                    &mut self.graphics,
+                    scanner,
+                    &bytes,
+                    &mut greplies,
+                    self.psreadline_cursor_alias,
+                );
+                if result.hit_mode_barrier {
+                    self.clear_psreadline_paste_cursor();
+                } else {
+                    self.psreadline_cursor_alias = result.alias;
+                    self.psreadline_cursor_alias_gen = match result.alias {
+                        None => None,
+                        Some(_) if result.refreshed_alias => Some(self.output_gen.wrapping_add(1)),
+                        Some(_) => carried_alias_gen,
+                    };
+                }
+            } else {
+                advance_scanned(
+                    &mut self.parser,
+                    &mut self.term,
+                    &mut self.graphics,
+                    &bytes,
+                    &mut greplies,
+                );
+            }
+            if self
+                .term
+                .mode()
+                .intersects(TermMode::ALT_SCREEN | TermMode::BRACKETED_PASTE)
+            {
+                self.clear_psreadline_paste_cursor();
+            }
             self.output_gen = self.output_gen.wrapping_add(1);
             self.content_gen = self.content_gen.wrapping_add(1);
             self.last_output_at = Some(now);
@@ -1107,7 +1612,7 @@ impl Session {
         // Ready gate: flush queued injects + deferred submit (pure; we write).
         for action in self.ready_gate.poll(now) {
             match action {
-                crate::ready::Action::Write(bytes) => self.send(&bytes),
+                crate::ready::Action::Write(bytes) => self.send_external_input(&bytes),
             }
         }
     }
@@ -1168,6 +1673,7 @@ impl Session {
             return;
         }
         if cols != self.cols || rows != self.rows {
+            self.clear_psreadline_paste_cursor();
             let (oldc, oldr) = (self.cols, self.rows);
             self.cols = cols;
             self.rows = rows;
@@ -1238,8 +1744,12 @@ impl Session {
     /// clipboard bytes submit multi-line pastes line by line and let a
     /// malicious clipboard inject escape sequences.
     fn paste_text(&mut self, txt: &str) {
+        if txt.is_empty() {
+            return;
+        }
+        self.arm_psreadline_paste_cursor(txt);
         let seq = crate::input::paste_seq(*self.term.mode(), txt);
-        self.send(&seq);
+        self.send_external_input(&seq);
     }
 
     /// Pointer → buffer-coord selection point + cell side: the viewport cell
@@ -1265,28 +1775,73 @@ impl Session {
     /// transiently anywhere. Same trust model as the caret gate's settle.
     const WIDE_RESAMPLE_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 
-    /// Typing grace: a recent unmodified wide-modeled key press keeps the
-    /// shadow alive even across a briefly-settled PTY, so a redraw that
-    /// stalls >50ms mid-burst cannot slip a mid-redraw sample in. Mirrors
-    /// the caret gate's INPUT_GRACE (150ms).
+    /// Typing grace: recent shadow-using key activity keeps the
+    /// shadow alive briefly after release so the final echo can drain. The
+    /// actual held-key signal comes from egui's `key_down`; this timeout is a
+    /// tail, not the definition of an active hold.
     const WIDE_INPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
     /// Wide-shadow lifetime policy (pure; unit-tested): keep the simulated
     /// row while the grid sample it was built from is still current, while
     /// the child is still emitting (a mid-redraw grid lies about the cursor),
-    /// or while the user is actively pressing modeled wide keys. Resample
-    /// only after [`Self::WIDE_RESAMPLE_SETTLE`] of PTY silence AND
-    /// [`Self::WIDE_INPUT_GRACE`] of key silence.
+    /// or while a shadow-using key is physically held/reported this frame. Resample
+    /// only after [`Self::WIDE_RESAMPLE_SETTLE`] of PTY silence and
+    /// [`Self::WIDE_INPUT_GRACE`] after the active hold.
     fn keep_wide_shadow(
         sampled_gen: u64,
         output_gen: u64,
         last_output: Option<std::time::Instant>,
         last_wide_key: Option<std::time::Instant>,
+        modeled_key_active: bool,
         now: std::time::Instant,
     ) -> bool {
         sampled_gen == output_gen
+            || modeled_key_active
             || last_output.is_some_and(|t| now.duration_since(t) < Self::WIDE_RESAMPLE_SETTLE)
             || last_wide_key.is_some_and(|t| now.duration_since(t) < Self::WIDE_INPUT_GRACE)
+    }
+
+    /// An explicitly invalidated shadow may be rebuilt only after a later PTY
+    /// generation is observed and both activity windows have closed. This is
+    /// an observation heuristic, not a causal echo acknowledgement: unrelated
+    /// output can advance the generation. It still prevents `None` from meaning
+    /// "sample the same stale grid on the next frame".
+    fn can_reseed_wide_shadow(
+        invalidated_gen: u64,
+        output_gen: u64,
+        last_output: Option<std::time::Instant>,
+        last_wide_key: Option<std::time::Instant>,
+        current_activity_blocks: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        invalidated_gen != output_gen
+            && !current_activity_blocks
+            && !last_output.is_some_and(|t| now.duration_since(t) < Self::WIDE_RESAMPLE_SETTLE)
+            && !last_wide_key.is_some_and(|t| now.duration_since(t) < Self::WIDE_INPUT_GRACE)
+    }
+
+    fn invalidate_wide_shadow(&mut self) {
+        self.wide_shadow = WideShadowState::AwaitingEcho {
+            invalidated_gen: self.output_gen,
+        };
+        self.last_wide_key_at = None;
+    }
+
+    /// Input written outside the modeled live-key path invalidates its shadow.
+    /// Protocol replies intentionally use `send`/writer directly and never pass
+    /// here: they do not represent child editing operations.
+    fn send_external_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0x03))
+        {
+            self.clear_psreadline_paste_cursor();
+        }
+        self.invalidate_wide_shadow();
+        self.send(bytes);
     }
 
     /// Read this frame's keyboard input and apply it. The pure encoding lives in
@@ -1310,50 +1865,98 @@ impl Session {
         // diagonal-tofu bug, docs/wide-chars.md). Resample only once the PTY
         // has been quiet for WIDE_RESAMPLE_SETTLE and the user is inactive.
         let now = std::time::Instant::now();
-        let (wide_line, wide_col, wide_basis_gen) = match self.wide_shadow.take() {
-            Some((line, col, basis))
-                if Self::keep_wide_shadow(
-                    basis,
-                    self.output_gen,
-                    self.last_output_at,
-                    self.last_wide_key_at,
-                    now,
-                ) =>
-            {
-                (line, col, basis)
-            }
-            _ => {
-                let (line, col) = self.wide_line_at_cursor();
-                (line, col, self.output_gen)
-            }
-        };
-        let mut has_modeled_key = false;
-        let mut outcome = ui.input(|i| {
-            // Grace stamp: only UNMODIFIED modeled keys count. Ctrl+Backspace
-            // word-deletes (unmodeled — it DROPS the shadow), so it must not
-            // extend the grace window that keeps shadows alive.
-            has_modeled_key = i.events.iter().any(|ev| {
-                matches!(ev, egui::Event::Key { key, pressed: true, modifiers, .. }
-                    if crate::input::wide_key_modeled(*key, *modifiers))
-            });
-            crate::input::process_input_wide(
-                &i.events,
-                i.modifiers,
-                mode,
-                has_selection,
-                Some((wide_line.as_slice(), wide_col)),
-            )
-        });
-        if has_modeled_key {
+        let last_wide_key_before_activity = self.last_wide_key_at;
+        let key_activity = ui.input(|i| self.wide_key_latch.update(i));
+        if key_activity.active {
+            // Observe/stamp before the keep/reseed decision. The latch tells
+            // that decision whether this is an ongoing owned hold/release
+            // (must keep) or a fresh press that may use a settled grid.
             self.last_wide_key_at = Some(now);
         }
 
-        // Persist the simulated row unconditionally (even a no-key frame must
-        // not lose mid-burst progress), stamped with the gen of the grid
-        // sample it was BUILT from — not the current gen — so a settled grid
-        // with newer output still triggers a fresh sample above.
-        if let Some((line, col)) = outcome.wide_after.take() {
-            self.wide_shadow = Some((line, col, wide_basis_gen));
+        let prior = std::mem::replace(&mut self.wide_shadow, WideShadowState::Uninitialized);
+        let (wide_cursor, wide_basis_gen, awaiting_gen) = match prior {
+            WideShadowState::Tracking {
+                line,
+                col,
+                basis_gen,
+            } if Self::keep_wide_shadow(
+                basis_gen,
+                self.output_gen,
+                self.last_output_at,
+                last_wide_key_before_activity,
+                key_activity.blocks_reseed,
+                now,
+            ) =>
+            {
+                (Some((line, col)), Some(basis_gen), None)
+            }
+            WideShadowState::Tracking { .. } | WideShadowState::Uninitialized => {
+                let (line, col) = self.wide_line_at_cursor();
+                (Some((line, col)), Some(self.output_gen), None)
+            }
+            // A validated paste alias was sampled at the natural flow endpoint
+            // immediately before PSReadLine's final CUP. Unlike an arbitrary
+            // just-arrived output chunk, this point is safe to seed from without
+            // waiting another 50ms, so the first Backspace after visible paste
+            // cannot split the trailing surrogate pair.
+            WideShadowState::AwaitingEcho { invalidated_gen }
+                if self.has_fresh_cursor_alias(invalidated_gen) =>
+            {
+                let (line, col) = self.wide_line_at_cursor();
+                (Some((line, col)), Some(self.output_gen), None)
+            }
+            WideShadowState::AwaitingEcho { invalidated_gen }
+                if Self::can_reseed_wide_shadow(
+                    invalidated_gen,
+                    self.output_gen,
+                    self.last_output_at,
+                    last_wide_key_before_activity,
+                    key_activity.blocks_reseed,
+                    now,
+                ) =>
+            {
+                let (line, col) = self.wide_line_at_cursor();
+                (Some((line, col)), Some(self.output_gen), None)
+            }
+            WideShadowState::AwaitingEcho { invalidated_gen } => {
+                (None, None, Some(invalidated_gen))
+            }
+        };
+        let had_wide_cursor = wide_cursor.is_some();
+        let (mut outcome, pasted_text, submitted) = ui.input(|i| {
+            let pasted_text = i.events.iter().find_map(|event| match event {
+                egui::Event::Paste(text) if !text.is_empty() => Some(text.clone()),
+                _ => None,
+            });
+            let submitted = i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+            (
+                crate::input::process_input_wide(
+                    &i.events,
+                    i.modifiers,
+                    mode,
+                    has_selection,
+                    wide_cursor
+                        .as_ref()
+                        .map(|(line, col)| (line.as_slice(), *col)),
+                ),
+                pasted_text,
+                submitted,
+            )
+        });
+        if submitted || outcome.interrupt {
+            self.clear_psreadline_paste_cursor();
+        } else if let Some(text) = pasted_text.as_deref() {
+            self.arm_psreadline_paste_cursor(text);
         }
 
         if let Some(s) = outcome.scroll {
@@ -1365,19 +1968,67 @@ impl Session {
             set_font_size(ui.ctx(), crate::config::DEFAULT_FONT_SIZE);
         }
 
-        let mut bytes = outcome.pty_bytes;
+        let mut bytes = std::mem::take(&mut outcome.pty_bytes);
         // Ctrl+Shift+V: the pure pass can't read the clipboard, so it flags the
         // request and we wrap the text here through the same mode-gated helper.
+        let encoded_len = bytes.len();
         if outcome.paste_clipboard {
-            if let Some(txt) = read_clipboard() {
+            if let Some(txt) = read_clipboard().filter(|txt| !txt.is_empty()) {
+                if !submitted {
+                    self.arm_psreadline_paste_cursor(&txt);
+                }
                 bytes.extend_from_slice(&crate::input::paste_seq(mode, &txt));
             } else if clipboard_has_image() {
+                self.clear_psreadline_paste_cursor();
                 // Image-only clipboard: forward raw Ctrl+V so agents (Claude,
                 // Codex) run their native clipboard-image paste. Plain shells
                 // see readline quoted-insert — harmless. (spec WS2)
                 bytes.push(0x16);
             }
         }
+        let clipboard_input_added = bytes.len() != encoded_len;
+        if clipboard_input_added {
+            outcome.wide_after = None;
+        }
+        // Key chords like Ctrl+J/Ctrl+M submit with encoded LF/CR without an
+        // egui Enter event. End the paste epoch according to bytes actually
+        // sent, matching the external-input path.
+        if bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | 0x03))
+        {
+            self.clear_psreadline_paste_cursor();
+        }
+
+        // Persist a modeled shadow with the generation it was BUILT from, not
+        // the current generation. When tracking drops, enter AwaitingEcho and
+        // do not sample again until a later-observed PTY generation is quiet.
+        // If already awaiting, any newly-sent input moves the required
+        // generation forward so the same stale generation cannot re-seed it.
+        let input_may_change_grid = !bytes.is_empty() || outcome.interrupt;
+        self.wide_shadow = match outcome.wide_after.take() {
+            Some((line, col)) => WideShadowState::Tracking {
+                line,
+                col,
+                basis_gen: wide_basis_gen.expect("tracked input has a sampled basis"),
+            },
+            None => {
+                if had_wide_cursor {
+                    // A text/paste/unmodeled event dropped a previously valid
+                    // model. Its earlier key grace must not protect a future,
+                    // unrelated sample.
+                    self.last_wide_key_at = None;
+                }
+                WideShadowState::AwaitingEcho {
+                    invalidated_gen: if had_wide_cursor || input_may_change_grid {
+                        self.output_gen
+                    } else {
+                        awaiting_gen.unwrap_or(self.output_gen)
+                    },
+                }
+            }
+        };
+
         if !bytes.is_empty() {
             self.term.scroll_display(Scroll::Bottom);
             self.caret.note_input(std::time::Instant::now());
@@ -1522,12 +2173,9 @@ impl Session {
         }
 
         let (cur_line, cur_col, cur_shape) = {
-            let c = self.term.renderable_content();
-            (
-                c.cursor.point.line.0,
-                c.cursor.point.column.0,
-                c.cursor.shape,
-            )
+            let shape = self.term.renderable_content().cursor.shape;
+            let point = self.display_cursor_point();
+            (point.line.0, point.column.0, shape)
         };
         // De-jitter the caret through the Caret gate: a non-synchronized TUI
         // moves the cursor all over the screen while it redraws, so the gate
@@ -1673,11 +2321,7 @@ impl Session {
                 continue; // color stamp covers this cell; mono would fringe
             }
             // EP emoji never enter `items` (mono_paint_items skips them).
-            painter.galley(
-                metrics.cell_rect(g.row, g.col).min,
-                g.galley.clone(),
-                FG,
-            );
+            painter.galley(metrics.cell_rect(g.row, g.col).min, g.galley.clone(), FG);
         }
 
         if !stamp_ready.is_empty() {
@@ -1800,8 +2444,8 @@ mod tests {
         let t0 = std::time::Instant::now();
         let now = t0 + std::time::Duration::from_secs(60);
         // Same gen: keep regardless of how long the PTY has been quiet.
-        assert!(Session::keep_wide_shadow(5, 5, None, None, now));
-        assert!(Session::keep_wide_shadow(5, 5, Some(t0), None, now));
+        assert!(Session::keep_wide_shadow(5, 5, None, None, false, now));
+        assert!(Session::keep_wide_shadow(5, 5, Some(t0), None, false, now));
     }
 
     #[test]
@@ -1810,17 +2454,18 @@ mod tests {
         // may still be in flight; the mid-redraw grid must not be trusted.
         let t0 = std::time::Instant::now();
         let now = t0 + std::time::Duration::from_millis(10);
-        assert!(Session::keep_wide_shadow(5, 7, Some(t0), None, now));
+        assert!(Session::keep_wide_shadow(5, 7, Some(t0), None, false, now));
     }
 
     #[test]
     fn wide_shadow_resampled_once_pty_settles() {
         let t0 = std::time::Instant::now();
         let now = t0 + Session::WIDE_RESAMPLE_SETTLE + std::time::Duration::from_millis(10);
-        // Quiet past the settle window: the echo has fully landed.
-        assert!(!Session::keep_wide_shadow(5, 7, Some(t0), None, now));
+        // Quiet past the settle window: the grid is eligible under the
+        // observed-quiescence heuristic.
+        assert!(!Session::keep_wide_shadow(5, 7, Some(t0), None, false, now));
         // Gen advanced with no output timestamp at all: trust the grid.
-        assert!(!Session::keep_wide_shadow(5, 7, None, None, now));
+        assert!(!Session::keep_wide_shadow(5, 7, None, None, false, now));
     }
 
     #[test]
@@ -1829,7 +2474,30 @@ mod tests {
         let now = t0 + std::time::Duration::from_millis(100);
         // Gen advanced and PTY quiet for 100ms (> 50ms settle), but user pressed
         // a wide key 100ms ago (< 150ms grace) -> keep shadow to avoid stale grid.
-        assert!(Session::keep_wide_shadow(5, 7, Some(t0), Some(t0), now));
+        assert!(Session::keep_wide_shadow(
+            5,
+            7,
+            Some(t0),
+            Some(t0),
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn wide_shadow_kept_for_a_physical_hold_past_timestamp_grace() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_secs(2);
+        // Slow repeat settings and a scheduler stall can both exceed 150ms.
+        // egui's held state is authoritative for the active burst.
+        assert!(Session::keep_wide_shadow(
+            5,
+            7,
+            Some(t0),
+            Some(t0),
+            true,
+            now
+        ));
     }
 
     #[test]
@@ -1837,7 +2505,448 @@ mod tests {
         let t0 = std::time::Instant::now();
         let now = t0 + std::time::Duration::from_millis(160);
         // Gen advanced, PTY quiet, and user inactive for 160ms (> 150ms grace) -> resample.
-        assert!(!Session::keep_wide_shadow(5, 7, Some(t0), Some(t0), now));
+        assert!(!Session::keep_wide_shadow(
+            5,
+            7,
+            Some(t0),
+            Some(t0),
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn invalidated_shadow_cannot_reseed_from_the_same_generation() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_secs(2);
+        assert!(!Session::can_reseed_wide_shadow(
+            5, 5, None, None, false, now
+        ));
+    }
+
+    #[test]
+    fn invalidated_shadow_waits_for_new_output_to_settle() {
+        let t0 = std::time::Instant::now();
+        let recent = t0 + std::time::Duration::from_millis(10);
+        assert!(!Session::can_reseed_wide_shadow(
+            5,
+            6,
+            Some(t0),
+            None,
+            false,
+            recent
+        ));
+
+        let settled = t0 + Session::WIDE_RESAMPLE_SETTLE + std::time::Duration::from_millis(10);
+        assert!(Session::can_reseed_wide_shadow(
+            5,
+            6,
+            Some(t0),
+            None,
+            false,
+            settled
+        ));
+    }
+
+    #[test]
+    fn invalidated_shadow_can_reseed_before_a_fresh_press_after_prior_settle() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_secs(2);
+        // The current press is applied after this decision. Only activity from
+        // earlier frames should block a settled pre-key grid sample.
+        assert!(Session::can_reseed_wide_shadow(
+            5,
+            6,
+            Some(t0),
+            Some(t0),
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn invalidated_shadow_does_not_reseed_during_an_owned_hold_after_a_stall() {
+        let t0 = std::time::Instant::now();
+        let now = t0 + std::time::Duration::from_secs(2);
+        assert!(!Session::can_reseed_wide_shadow(
+            5,
+            6,
+            Some(t0),
+            Some(t0),
+            true,
+            now
+        ));
+    }
+
+    #[test]
+    fn wide_key_activity_spans_repeat_gaps_and_observes_release_frame() {
+        fn key_event(pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+            egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut latch = WideKeyLatch::default();
+        let mut activity = WideKeyActivity::default();
+        let mut press = egui::RawInput::default();
+        press
+            .events
+            .push(key_event(true, egui::Modifiers::default()));
+        let _ = ctx.run_ui(press, |ui| activity = ui.input(|i| latch.update(i)));
+        assert!(activity.active, "press frame is active");
+        assert!(
+            !activity.blocks_reseed,
+            "first press may use a settled grid"
+        );
+
+        // No repeat event this frame: egui's persistent keys_down state keeps
+        // the burst active through the OS repeat delay.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            activity = ui.input(|i| latch.update(i))
+        });
+        assert!(activity.active, "held key remains active between repeats");
+        assert!(activity.blocks_reseed, "an owned hold cannot reseed");
+
+        let mut release = egui::RawInput::default();
+        release.events.push(key_event(
+            false,
+            egui::Modifiers {
+                ctrl: true,
+                ..egui::Modifiers::default()
+            },
+        ));
+        let _ = ctx.run_ui(release, |ui| activity = ui.input(|i| latch.update(i)));
+        assert!(
+            activity.active && activity.blocks_reseed,
+            "owned release starts grace even if modifiers changed"
+        );
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            activity = ui.input(|i| latch.update(i))
+        });
+        assert!(!activity.active, "activity ends after release events drain");
+    }
+
+    #[test]
+    fn wide_key_latch_ignores_a_release_owned_by_another_session() {
+        let ctx = egui::Context::default();
+        let mut latch = WideKeyLatch::default();
+        let mut release = egui::RawInput::default();
+        release.events.push(egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut activity = WideKeyActivity {
+            active: true,
+            blocks_reseed: true,
+        };
+        let _ = ctx.run_ui(release, |ui| activity = ui.input(|i| latch.update(i)));
+        assert_eq!(activity, WideKeyActivity::default());
+    }
+
+    #[test]
+    fn wide_key_latch_clears_a_release_missed_while_inactive_without_new_grace() {
+        let ctx = egui::Context::default();
+        let mut latch = WideKeyLatch::default();
+        let mut press = egui::RawInput::default();
+        press.events.push(egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run_ui(press, |ui| assert!(ui.input(|i| latch.update(i)).active));
+
+        // The global release is processed while this Session is inactive, so
+        // its latch does not see the release event.
+        let mut release = egui::RawInput::default();
+        release.events.push(egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run_ui(release, |_| {});
+
+        let mut activity = WideKeyActivity {
+            active: true,
+            blocks_reseed: true,
+        };
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            activity = ui.input(|i| latch.update(i))
+        });
+        assert_eq!(
+            activity,
+            WideKeyActivity::default(),
+            "reactivation cleanup must not invent a current release"
+        );
+    }
+
+    #[test]
+    fn wide_key_latch_treats_a_new_press_after_missed_release_as_fresh() {
+        let ctx = egui::Context::default();
+        let mut latch = WideKeyLatch::default();
+        let key_event = |pressed| egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let mut first_press = egui::RawInput::default();
+        first_press.events.push(key_event(true));
+        let _ = ctx.run_ui(first_press, |ui| {
+            assert!(ui.input(|i| latch.update(i)).active)
+        });
+
+        let mut missed_release = egui::RawInput::default();
+        missed_release.events.push(key_event(false));
+        let _ = ctx.run_ui(missed_release, |_| {});
+
+        // No intermediate active frame clears the stale latch bit. The next
+        // non-repeat press must still begin a fresh ownership epoch.
+        let mut next_press = egui::RawInput::default();
+        next_press.events.push(key_event(true));
+        let mut activity = WideKeyActivity::default();
+        let _ = ctx.run_ui(next_press, |ui| activity = ui.input(|i| latch.update(i)));
+        assert_eq!(
+            activity,
+            WideKeyActivity {
+                active: true,
+                blocks_reseed: false,
+            }
+        );
+    }
+
+    /// Live ConPTY/PSReadLine verification for the real Session::read_input
+    /// path. Unlike `foreman send --keys`, this drives egui press/repeat/release
+    /// frames, including a >150ms held-key gap, against a real cooked prompt.
+    #[test]
+    #[ignore = "diagnostic: drives a real PowerShell cooked-input session"]
+    fn live_held_backspace_clears_wrapped_mixed_wide_input_buffer() {
+        fn pump_for(session: &mut Session, duration: std::time::Duration) {
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                session.pump();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        fn input_frame(ctx: &egui::Context, session: &mut Session, pressed: bool, repeat: bool) {
+            let mut raw = egui::RawInput::default();
+            raw.events.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed,
+                repeat,
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = ctx.run_ui(raw, |ui| session.read_input(ui));
+        }
+
+        let ctx = egui::Context::default();
+        let shell = preferred_powershell(std::env::var_os("PATH").as_deref(), &|p| p.is_file());
+        let argv = vec![
+            shell.to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            "function global:prompt { 'P> ' }".to_string(),
+        ];
+        let mut session = Session::spawn_argv(&argv, None, &[], ctx.clone()).expect("spawn");
+        // P> occupies 3 cells; 40 content cells then fit exactly into 43 cols,
+        // so the fixture wraps without putting a wide glyph across the margin.
+        session.resize(43, 12);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !session.ready() {
+            session.pump();
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "PowerShell never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pump_for(&mut session, std::time::Duration::from_millis(300));
+
+        let payload = "a🤣中🥒b".repeat(30);
+        let presses = payload.chars().count();
+        session.feed(payload.as_bytes());
+        pump_for(&mut session, std::time::Duration::from_millis(800));
+        assert!(session.snapshot_text(None).join("\n").contains('🤣'));
+
+        // External feed invalidated the old shadow. Once its output is quiet,
+        // one event-free UI frame re-seeds from the settled grid.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        session.pump();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| session.read_input(ui));
+        assert!(matches!(
+            &session.wide_shadow,
+            WideShadowState::Tracking { .. }
+        ));
+
+        for index in 0..presses {
+            if index == 60 {
+                // Expire both timestamp windows while the Backspace key remains
+                // logically down. The per-session latch must still preserve the
+                // simulated row rather than sampling a partial redraw.
+                session.pump();
+                std::thread::sleep(std::time::Duration::from_millis(220));
+            } else {
+                session.pump();
+            }
+            input_frame(&ctx, &mut session, true, index != 0);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        input_frame(&ctx, &mut session, false, false);
+        pump_for(&mut session, std::time::Duration::from_millis(1200));
+
+        let screen = session.snapshot_text(None).join("\n");
+        assert!(
+            !screen.contains('🤣'),
+            "emoji input was not fully deleted: {screen:?}"
+        );
+        assert!(screen.contains("P>"), "prompt disappeared: {screen:?}");
+
+        // Prove PSReadLine's input buffer is clean, independently of ConPTY's
+        // known stale-cell residue: a surviving surrogate would prefix/corrupt
+        // this command instead of producing a second marker as output.
+        session.feed(b"Write-Output __WIDE_HOLD_OK__\r");
+        pump_for(&mut session, std::time::Duration::from_millis(800));
+        let command_screen = session.snapshot_text(None).join("\n");
+        assert!(
+            command_screen.matches("__WIDE_HOLD_OK__").count() >= 2,
+            "post-hold command did not execute cleanly: {command_screen:?}"
+        );
+
+        // A doubled DEL can still leave one stale U+FFFD paint cell in ConPTY's
+        // emitted redraw even though the cooked buffer is clean. Ctrl+L is the
+        // documented upstream-residue repair and must clear it.
+        session.feed(&[0x0c]);
+        pump_for(&mut session, std::time::Duration::from_millis(500));
+        let cleared = session.snapshot_text(None).join("\n");
+        assert!(
+            !cleared.contains('\u{FFFD}'),
+            "Ctrl+L did not heal residue: {cleared:?}"
+        );
+    }
+
+    /// Live paste-only proof for the PSReadLine surrogate-at-margin mismatch.
+    /// The raw alacritty cursor remains at PSReadLine's CUP, while Foreman's
+    /// effective caret and wide-key seam use the validated natural flow end.
+    #[test]
+    #[ignore = "diagnostic: drives a real PowerShell paste through ConPTY"]
+    fn live_psreadline_paste_wrap_uses_the_whole_emoji_endpoint() {
+        fn pump_for(session: &mut Session, duration: std::time::Duration) {
+            let deadline = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < deadline {
+                session.pump();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let shell = preferred_powershell(std::env::var_os("PATH").as_deref(), &|p| p.is_file());
+        let argv = vec![
+            shell.to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            "function global:prompt { 'P> ' }".to_string(),
+        ];
+        let mut session = Session::spawn_argv(&argv, None, &[], ctx.clone()).expect("spawn");
+        // spawn_argv labels arbitrary programs as Cmd for icon/encoding policy;
+        // this fixture is explicitly PowerShell and needs the production gate.
+        session.shell = Shell::PowerShell;
+        session.resize(20, 8);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !session.ready() {
+            session.pump();
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "PowerShell never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pump_for(&mut session, std::time::Duration::from_millis(300));
+
+        // P>_ starts input at zero-based col 3. Sixteen ASCII cells leave the
+        // emoji at the final column, which is the exact PSReadLine failure case.
+        let payload = format!("{}🤣", "a".repeat(16));
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Paste(payload));
+        let _ = ctx.run_ui(raw, |ui| session.read_input(ui));
+        let alias_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session.psreadline_cursor_alias.is_none() {
+            session.pump();
+            assert!(
+                std::time::Instant::now() < alias_deadline,
+                "live PSReadLine final CUP was not reconciled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let alias = session
+            .psreadline_cursor_alias
+            .expect("live PSReadLine final CUP was not reconciled");
+        assert_eq!(alias.physical.line, alias.raw.line);
+        assert_eq!(alias.physical.column.0, alias.raw.column.0 + 1);
+        assert_eq!(session.input_cursor_point(), alias.physical);
+        assert_eq!(session.display_cursor_point(), alias.physical);
+        let info = session.cursor_info();
+        assert_eq!(
+            (info.row, info.col),
+            (alias.physical.line.0, alias.physical.column.0)
+        );
+        assert!(
+            session
+                .last_output_at
+                .is_some_and(|at| at.elapsed() < Session::WIDE_RESAMPLE_SETTLE),
+            "fixture accidentally waited past the ordinary shadow settle window"
+        );
+
+        // Drive the real GUI-key path. Starting from the alias must make this
+        // one physical Backspace send the two DEL units PSReadLine needs for
+        // the surrogate pair; a single DEL leaves U+FFFD in the cooked buffer.
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut press = egui::RawInput::default();
+        press.events.push(key(true));
+        let _ = ctx.run_ui(press, |ui| session.read_input(ui));
+        let mut release = egui::RawInput::default();
+        release.events.push(key(false));
+        let _ = ctx.run_ui(release, |ui| session.read_input(ui));
+        pump_for(&mut session, std::time::Duration::from_millis(800));
+        let screen = session.snapshot_text(None).join("\n");
+        assert!(
+            !screen.contains('🤣'),
+            "emoji survived one Backspace: {screen:?}"
+        );
+        assert!(
+            !screen.contains('\u{FFFD}'),
+            "Backspace left a surrogate half: {screen:?}"
+        );
+        assert!(
+            screen.contains(&"a".repeat(16)),
+            "Backspace over-deleted the narrow prefix: {screen:?}"
+        );
     }
 
     struct TitleRecordingWriter {
@@ -1975,16 +3084,15 @@ mod tests {
         };
         let (items, bgs) = mono_paint_items_for_test(&plan, &mut layout);
         assert_eq!(items.len(), 3, "blank galley skipped");
-        assert_eq!(
-            layout_call_count(),
-            2,
-            "two 'a's share one layout; + 'b'"
-        );
+        assert_eq!(layout_call_count(), 2, "two 'a's share one layout; + 'b'");
         // Grid identity (not free-flow advances); blit pos from live metrics.
         assert_eq!((items[0].row, items[0].col), (0, 0));
         assert_eq!((items[1].row, items[1].col), (0, 1));
         assert_eq!((items[2].row, items[2].col), (0, 3));
-        assert_eq!(m.cell_rect(items[0].row, items[0].col).min, m.cell_rect(0, 0).min);
+        assert_eq!(
+            m.cell_rect(items[0].row, items[0].col).min,
+            m.cell_rect(0, 0).min
+        );
         // Colored blank still yields a bg rect with no layout call.
         assert_eq!(bgs.len(), 1);
         assert_eq!((bgs[0].row, bgs[0].col), (0, 2));
@@ -2523,17 +3631,56 @@ mod tests {
         // App enables bracketed paste → wrapped, payload ESC stripped.
         tx.send(b"\x1b[?2004h".to_vec()).unwrap();
         s.pump();
+        let basis = s.output_gen;
+        s.wide_shadow = WideShadowState::Tracking {
+            line: Vec::new(),
+            col: 0,
+            basis_gen: basis,
+        };
+        let before_empty = writes.lock().unwrap().len();
+        s.paste_text("");
+        assert_eq!(writes.lock().unwrap().len(), before_empty);
+        assert!(matches!(
+            &s.wide_shadow,
+            WideShadowState::Tracking { basis_gen, .. } if *basis_gen == basis
+        ));
+        s.psreadline_cup_scanner = Some(CupScanner::default());
+        s.psreadline_cursor_alias = Some(CursorAlias {
+            raw: Point::new(Line(0), Column(0)),
+            physical: Point::new(Line(0), Column(1)),
+        });
+        s.feed_text("");
+        assert!(s.psreadline_cup_scanner.is_some());
+        assert!(s.psreadline_cursor_alias.is_some());
+
         s.paste_text("a\x1b[201~b\nc");
         assert_eq!(
             writes.lock().unwrap().last().unwrap().0,
             b"\x1b[200~a[201~b\nc\x1b[201~"
         );
+        assert!(matches!(
+            &s.wide_shadow,
+            WideShadowState::AwaitingEcho { invalidated_gen } if *invalidated_gen == basis
+        ));
 
         // App disables it → plain bytes, ESC still stripped.
         tx.send(b"\x1b[?2004l".to_vec()).unwrap();
         s.pump();
         s.paste_text("a\x1b[201~b\nc");
         assert_eq!(writes.lock().unwrap().last().unwrap().0, b"a[201~b\nc");
+
+        // Raw external feed follows the same invalidation path.
+        let feed_gen = s.output_gen;
+        s.wide_shadow = WideShadowState::Tracking {
+            line: Vec::new(),
+            col: 0,
+            basis_gen: feed_gen,
+        };
+        s.feed(b"x");
+        assert!(matches!(
+            &s.wide_shadow,
+            WideShadowState::AwaitingEcho { invalidated_gen } if *invalidated_gen == feed_gen
+        ));
     }
 
     #[test]
@@ -2754,7 +3901,18 @@ mod tests {
         let t0 = std::time::Instant::now();
         // Drive inject with a known clock via the gate + pump_at (inject_input
         // uses Instant::now(); pin deadline by overwriting after inject).
+        let inject_gen = s.output_gen;
+        s.wide_shadow = WideShadowState::Tracking {
+            line: Vec::new(),
+            col: 0,
+            basis_gen: inject_gen,
+        };
         s.inject_input("hello");
+        assert!(matches!(
+            &s.wide_shadow,
+            WideShadowState::AwaitingEcho { invalidated_gen }
+                if *invalidated_gen == inject_gen
+        ));
         assert!(
             s.ready_gate.pending_submit.is_some(),
             "submit must be deferred, not written with the paste"
@@ -2768,11 +3926,22 @@ mod tests {
         let due2 = s.ready_gate.pending_submit.expect("still armed");
         s.pump_at(due2 - std::time::Duration::from_millis(1));
         assert!(s.ready_gate.pending_submit.is_some());
+        let submit_gen = s.output_gen;
+        s.wide_shadow = WideShadowState::Tracking {
+            line: Vec::new(),
+            col: 0,
+            basis_gen: submit_gen,
+        };
         s.pump_at(due2 + std::time::Duration::from_millis(1));
         assert!(
             s.ready_gate.pending_submit.is_none(),
             "a pump past the deadline fires the submit exactly once"
         );
+        assert!(matches!(
+            &s.wide_shadow,
+            WideShadowState::AwaitingEcho { invalidated_gen }
+                if *invalidated_gen == submit_gen
+        ));
         let recorded = writes.lock().unwrap().clone();
         assert!(
             recorded.iter().any(|(b, _)| b == b"\r"),
@@ -2863,6 +4032,250 @@ mod tests {
         };
         assert!(row(0).starts_with("AB"));
         assert!(row(4).contains("tail")); // vte ignored the APC
+    }
+
+    fn scan_psreadline_cup(bytes: &[u8], cols: usize) -> (Term<VoidListener>, CupScanResult) {
+        let mut term = term_with(b"", cols, 8);
+        let mut parser = Processor::new();
+        let mut graphics = crate::graphics::Graphics::default();
+        let mut scanner = CupScanner::default();
+        let mut replies = Vec::new();
+        let result = advance_psreadline_scanned(
+            &mut parser,
+            &mut term,
+            &mut graphics,
+            &mut scanner,
+            bytes,
+            &mut replies,
+            None,
+        );
+        assert!(replies.is_empty());
+        (term, result)
+    }
+
+    #[test]
+    fn psreadline_cup_aliases_non_bmp_wrap_to_the_natural_flow_end() {
+        // Seven columns: six ASCII cells leave one at the margin. PSReadLine
+        // treats the surrogate halves as width 1 + 1 and emits CUP 2;2, while
+        // alacritty defers the whole emoji and naturally ends at 2;3.
+        let (term, result) = scan_psreadline_cup("abcdef🤣\x1b[2;2H".as_bytes(), 7);
+        let alias = result.alias.expect("PSReadLine CUP should be aliased");
+        assert!(result.saw_cup);
+        assert_eq!(alias.raw, Point::new(Line(1), Column(1)));
+        assert_eq!(alias.physical, Point::new(Line(1), Column(2)));
+        assert_eq!(
+            term.grid().cursor.point,
+            alias.raw,
+            "grid stays authoritative"
+        );
+
+        let (_, raw_idx) = crate::inspect::wide_row_at_cursor(&term);
+        let (_, effective_idx) = crate::inspect::wide_row_at_point(&term, alias.physical);
+        assert_eq!(raw_idx, 7, "raw CUP parks inside the emoji spacer");
+        assert_eq!(effective_idx, 8, "alias parks after the complete emoji");
+    }
+
+    #[test]
+    fn psreadline_cup_alias_accumulates_every_wrap_pad_in_a_long_line() {
+        // Three straddled boundaries. The raw split-wide CUP is three cells
+        // behind alacritty's natural whole-glyph endpoint.
+        let bytes = "abcdef🤣abcd🤣abcd🤣\x1b[3;7H";
+        let (term, result) = scan_psreadline_cup(bytes.as_bytes(), 7);
+        let alias = result.alias.expect("all leading pads should reconcile");
+        assert_eq!(alias.raw, Point::new(Line(2), Column(6)));
+        assert_eq!(alias.physical, Point::new(Line(3), Column(2)));
+        assert_eq!(term.grid().cursor.point, alias.raw);
+    }
+
+    #[test]
+    fn psreadline_cup_does_not_alias_a_correct_whole_glyph_position() {
+        let (term, result) = scan_psreadline_cup("abcdef🤣\x1b[2;3H".as_bytes(), 7);
+        assert!(result.saw_cup);
+        assert!(result.alias.is_none(), "correct CUP must remain untouched");
+        assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(2)));
+
+        // BMP CJK is one UTF-16 char of width 2, so PSReadLine already defers it
+        // whole and produces the same correct position as alacritty.
+        let (term, result) = scan_psreadline_cup("abcdef中\x1b[2;3H".as_bytes(), 7);
+        assert!(result.alias.is_none());
+        assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(2)));
+    }
+
+    #[test]
+    fn psreadline_cup_counts_only_non_bmp_pads_on_a_mixed_wrapped_line() {
+        // Both glyphs hit a one-cell margin. PSReadLine correctly includes the
+        // CJK pad but omits the emoji pad, so the final CUP is behind by one,
+        // not by the two LEADING spacers present in alacritty's grid.
+        let bytes = "abcdef中abcd🤣\x1b[3;2H";
+        let (term, result) = scan_psreadline_cup(bytes.as_bytes(), 7);
+        let alias = result
+            .alias
+            .expect("non-BMP pad should reconcile beside CJK");
+        assert_eq!(alias.raw, Point::new(Line(2), Column(1)));
+        assert_eq!(alias.physical, Point::new(Line(2), Column(2)));
+        assert_eq!(term.grid().cursor.point, alias.raw);
+    }
+
+    #[test]
+    fn psreadline_cup_scanner_handles_a_sequence_split_between_pty_chunks() {
+        let mut term = term_with(b"", 7, 4);
+        let mut parser = Processor::new();
+        let mut graphics = crate::graphics::Graphics::default();
+        let mut scanner = CupScanner::default();
+        let mut replies = Vec::new();
+        let first = advance_psreadline_scanned(
+            &mut parser,
+            &mut term,
+            &mut graphics,
+            &mut scanner,
+            "abcdef🤣\x1b[2;2".as_bytes(),
+            &mut replies,
+            None,
+        );
+        assert!(!first.saw_cup);
+        let second = advance_psreadline_scanned(
+            &mut parser,
+            &mut term,
+            &mut graphics,
+            &mut scanner,
+            b"H",
+            &mut replies,
+            first.alias,
+        );
+        assert_eq!(
+            second.alias,
+            Some(CursorAlias {
+                raw: Point::new(Line(1), Column(1)),
+                physical: Point::new(Line(1), Column(2)),
+            })
+        );
+    }
+
+    #[test]
+    fn psreadline_paste_gate_requires_the_cursor_at_the_visible_line_end() {
+        let term = term_with(b"PS> ", 20, 2);
+        assert!(cursor_at_content_end(&term, term.grid().cursor.point));
+
+        // Inline prediction or a mid-line paste leaves nonblank cells after the
+        // cursor and must not arm the compatibility scanner.
+        let term = term_with(b"PS> suggestion\x1b[1;5H", 20, 2);
+        assert_eq!(term.grid().cursor.point, Point::new(Line(0), Column(4)));
+        assert!(!cursor_at_content_end(&term, term.grid().cursor.point));
+    }
+
+    #[test]
+    fn psreadline_alias_is_dropped_when_output_moves_after_the_cup() {
+        let (_, result) = scan_psreadline_cup("abcdef🤣\x1b[2;2HX".as_bytes(), 7);
+        assert!(result.saw_cup);
+        assert!(
+            result.alias.is_none(),
+            "the alias applies only while the raw CUP remains the resting cursor"
+        );
+    }
+
+    #[test]
+    fn psreadline_alias_survives_a_redundant_cup_to_the_same_raw_point() {
+        let (_, result) = scan_psreadline_cup("abcdef🤣\x1b[2;2H\x1b[2;2H".as_bytes(), 7);
+        assert_eq!(
+            result.alias,
+            Some(CursorAlias {
+                raw: Point::new(Line(1), Column(1)),
+                physical: Point::new(Line(1), Column(2)),
+            })
+        );
+    }
+
+    #[test]
+    fn psreadline_alias_drops_on_grid_mutation_even_if_cursor_returns() {
+        let (term, result) = scan_psreadline_cup("abcdef🤣\x1b[2;2HX\x08".as_bytes(), 7);
+        assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(1)));
+        assert!(
+            result.alias.is_none(),
+            "print + BS must invalidate the alias"
+        );
+
+        let (term, result) = scan_psreadline_cup("abcdef🤣\x1b[2;2H\x1b[2J".as_bytes(), 7);
+        assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(1)));
+        assert!(result.alias.is_none(), "ED must invalidate the alias");
+    }
+
+    #[test]
+    fn psreadline_alias_drops_on_alt_screen_enter_and_exit_in_one_chunk() {
+        let (_, result) = scan_psreadline_cup(
+            "abcdef🤣\x1b[2;2H\x1b[?1049h\x1b[2;2H\x1b[?1049l".as_bytes(),
+            7,
+        );
+        assert!(result.hit_mode_barrier);
+        assert!(result.alias.is_none());
+    }
+
+    #[test]
+    fn psreadline_alias_drops_on_bracketed_paste_enter_and_exit_in_one_chunk() {
+        let (_, result) = scan_psreadline_cup(
+            "abcdef🤣\x1b[2;2H\x1b[?2004h\x1b[2;2H\x1b[?2004l".as_bytes(),
+            7,
+        );
+        assert!(result.hit_mode_barrier);
+        assert!(result.alias.is_none());
+    }
+
+    #[test]
+    fn paste_alias_must_be_observed_after_the_input_that_invalidated_shadow() {
+        // The paste's final CUP (gen 1) is newer than the paste write (gen 0),
+        // so it is safe to seed the first immediate wide-key event.
+        assert!(generation_after(1, 0));
+
+        // Harmless later output may advance the session to gen 2 while carrying
+        // that same alias. Text entered at gen 2 invalidates the shadow; the old
+        // gen-1 alias must not be reused before a new CUP observation.
+        assert!(!generation_after(1, 2));
+        assert!(generation_after(3, 2));
+
+        // Preserve serial ordering when the process-lifetime counter wraps.
+        assert!(generation_after(0, u64::MAX));
+        assert!(!generation_after(u64::MAX, 0));
+    }
+
+    #[test]
+    fn session_rejects_a_carried_paste_alias_after_later_input_invalidation() {
+        let ctx = egui::Context::default();
+        let argv = vec!["cmd.exe".to_string(), "/c".to_string(), "pause".to_string()];
+        let mut session = Session::spawn_argv(&argv, None, &[], ctx).expect("spawn failed");
+        session.resize(7, 8);
+        session.shell = Shell::PowerShell;
+
+        // Replace the live reader with a deterministic PTY-output seam. The
+        // crafted stream establishes the same one-cell emoji alias as the live
+        // PSReadLine fixture.
+        let (tx, rx) = std::sync::mpsc::channel();
+        session.rx = rx;
+        session.psreadline_cup_scanner = Some(CupScanner::default());
+        let invalidated_before_paste = session.output_gen;
+        tx.send("\x1b[2J\x1b[Habcdef🤣\x1b[2;2H".as_bytes().to_vec())
+            .unwrap();
+        session.pump();
+
+        let alias_gen = session
+            .psreadline_cursor_alias_gen
+            .expect("candidate CUP must stamp its PTY generation");
+        assert!(session.has_fresh_cursor_alias(invalidated_before_paste));
+        assert_eq!(alias_gen, session.output_gen);
+
+        // SGR is deliberately non-mutating, so it carries the alias while the
+        // session generation advances. Later input invalidates at that newer
+        // generation; the carried pre-input alias must no longer bypass settle.
+        tx.send(b"\x1b[31m".to_vec()).unwrap();
+        session.pump();
+        assert_eq!(session.psreadline_cursor_alias_gen, Some(alias_gen));
+        assert!(session.has_valid_cursor_alias());
+        session.invalidate_wide_shadow();
+        let invalidated_after_input = session.output_gen;
+        assert!(matches!(
+            session.wide_shadow,
+            WideShadowState::AwaitingEcho { invalidated_gen }
+                if invalidated_gen == invalidated_after_input
+        ));
+        assert!(!session.has_fresh_cursor_alias(invalidated_after_input));
     }
 
     /// The codex pet frame rides INSIDE a synchronized update (?2026h..?2026l):

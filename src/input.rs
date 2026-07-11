@@ -31,9 +31,9 @@ pub struct InputOutcome {
     /// applies it to the shared zoom value; nothing is sent to the PTY.
     pub zoom_reset: bool,
     /// Post-batch shadow row + column when `wide_cursor` was supplied. The
-    /// shell persists this across frames while the child's echo is pending
-    /// (`output_gen` unchanged) — re-sampling a stale grid restarts the
-    /// simulation mid-burst and corrupts hold-Backspace (docs/wide-chars.md).
+    /// shell persists this across frames while the child's echo is pending.
+    /// Re-sampling a stale or partially redrawn grid restarts the simulation
+    /// mid-burst and corrupts hold-Backspace (docs/wide-chars.md).
     pub wide_after: Option<(Vec<CellWide>, usize)>,
 }
 
@@ -152,18 +152,21 @@ pub fn wide_hint_at(line: &[CellWide], col: usize) -> WideCursorHint {
 /// over-deleted/over-moved it). Parked mid-glyph (on a spacer) one unit
 /// finishes the glyph → always single (doubling there crossed into the NEXT
 /// glyph — the doubled-Delete tofu). Alt-screen TUIs (vim, lazygit) are
-/// grapheme-correct — never compensate. Ctrl/Alt chords stay single.
+/// grapheme-correct — never compensate. Ctrl/Alt chords stay single except
+/// Backspace, whose current encoder discards modifiers and always sends DEL.
 pub fn wide_key_doubles(key: Key, mods: Modifiers, mode: TermMode, wide: WideCursorHint) -> bool {
     if mode.contains(TermMode::ALT_SCREEN) {
         return false;
     }
     let ctrl = mods.ctrl || mods.command;
-    if ctrl || mods.alt {
-        return false;
-    }
     match key {
-        Key::ArrowRight | Key::Delete => wide.on_wide_base && wide.at_glyph_non_bmp,
-        Key::ArrowLeft | Key::Backspace => wide.left_is_spacer && wide.left_glyph_non_bmp,
+        // encode_key emits the same raw DEL for Backspace under every modifier,
+        // so compensate according to the bytes the child actually receives.
+        Key::Backspace => wide.left_is_spacer && wide.left_glyph_non_bmp,
+        Key::ArrowRight | Key::Delete if !ctrl && !mods.alt => {
+            wide.on_wide_base && wide.at_glyph_non_bmp
+        }
+        Key::ArrowLeft if !ctrl && !mods.alt => wide.left_is_spacer && wide.left_glyph_non_bmp,
         _ => false,
     }
 }
@@ -173,12 +176,7 @@ pub fn wide_key_doubles(key: Key, mods: Modifiers, mode: TermMode, wide: WideCur
 /// All keyboard and `send --keys` paths should go through this so ←/→/BS
 /// (and Shift variants) cross width-2 glyphs in one place. Empty when
 /// `encode_key` does not map.
-pub fn encode_key_wide(
-    key: Key,
-    mods: Modifiers,
-    mode: TermMode,
-    wide: WideCursorHint,
-) -> Vec<u8> {
+pub fn encode_key_wide(key: Key, mods: Modifiers, mode: TermMode, wide: WideCursorHint) -> Vec<u8> {
     let seq = encode_key(key, mods, mode);
     if seq.is_empty() {
         return seq;
@@ -196,14 +194,9 @@ pub fn encode_key_wide(
 ///
 /// Cell-space movement depends on GLYPH WIDTH (both emoji and CJK are 2 cells
 /// per crossing), independent of how many sequences were sent (unit count).
-pub fn col_after_wide_key(
-    col: usize,
-    key: Key,
-    mods: Modifiers,
-    wide: WideCursorHint,
-) -> usize {
+pub fn col_after_wide_key(col: usize, key: Key, mods: Modifiers, wide: WideCursorHint) -> usize {
     let ctrl = mods.ctrl || mods.command;
-    if ctrl || mods.alt {
+    if (ctrl || mods.alt) && key != Key::Backspace {
         // Word-nav and other bindings move unpredictably; leave col alone
         // (resynced from the live grid when the echo lands).
         return col;
@@ -234,19 +227,24 @@ fn remove_cells(line: &mut Vec<CellWide>, start: usize, width: usize) {
     line.resize(len, CellWide::Narrow);
 }
 
-/// Can the wide shadow simulate this key press? Only UNMODIFIED
-/// Left/Right/Backspace/Delete move or edit by amounts the shadow can know.
-/// Ctrl/Alt variants jump or delete by whole words — unknowable from the
-/// row classes alone, so callers must drop tracking instead of simulating
-/// a no-op (a stale shadow that claims to be tracked is worse than none).
-pub fn wide_key_modeled(key: Key, mods: Modifiers) -> bool {
+/// Does this key need the current wide-shadow hint to encode safely?
+///
+/// Shift variants still use the same current hint. Ctrl/Alt variants are left
+/// to the child because their encoded bindings can use different editing units,
+/// except Backspace: `encode_key` currently sends raw DEL for every modifier.
+pub fn wide_key_uses_shadow(key: Key, mods: Modifiers) -> bool {
     let ctrl = mods.ctrl || mods.command;
-    !ctrl
-        && !mods.alt
-        && matches!(
-            key,
-            Key::ArrowLeft | Key::ArrowRight | Key::Backspace | Key::Delete
-        )
+    key == Key::Backspace
+        || (!ctrl && !mods.alt && matches!(key, Key::ArrowLeft | Key::ArrowRight | Key::Delete))
+}
+
+/// Can the wide shadow simulate the state after this key press? Backspace (all
+/// modifiers, because they encode identically) and Left/Right/Delete without
+/// Ctrl/Alt have a knowable row+cursor result. Other modified bindings may use
+/// different units, so callers drop tracking rather than preserving a shadow
+/// that omits child-owned state.
+pub fn wide_key_modeled(key: Key, mods: Modifiers) -> bool {
+    wide_key_uses_shadow(key, mods)
 }
 
 /// Apply one physical key to a simulated row: shadow mutation + new col.
@@ -265,45 +263,43 @@ pub fn apply_wide_key_to_line(
 ) -> usize {
     let hint = wide_hint_at(line, col);
     let ctrl = mods.ctrl || mods.command;
-    if !ctrl && !mods.alt {
-        match key {
-            Key::Backspace => {
-                // Remove what the DEL(s) delete left of the cursor: a whole
-                // wide glyph (2 cells), or one unit (1 cell).
-                if hint.left_is_spacer && col >= 2 {
-                    remove_cells(line, col - 2, 2);
-                } else if hint.on_wide_spacer && col >= 1 {
-                    // Mid-glyph: one DEL removes the glyph's first unit
-                    // (1 cell — probed: CSI 3~ mid-glyph leaves 🤣�). The
-                    // surviving half renders as a narrow U+FFFD — normalize
-                    // it so the shadow keeps no orphan spacer.
-                    remove_cells(line, col - 1, 1);
-                    if let Some(cell) = line.get_mut(col - 1) {
-                        *cell = CellWide::Narrow;
-                    }
-                } else if col > 0 {
-                    remove_cells(line, col - 1, 1);
+    match key {
+        Key::Backspace => {
+            // Remove what the DEL(s) delete left of the cursor: a whole
+            // wide glyph (2 cells), or one unit (1 cell).
+            if hint.left_is_spacer && col >= 2 {
+                remove_cells(line, col - 2, 2);
+            } else if hint.on_wide_spacer && col >= 1 {
+                // Mid-glyph: one DEL removes the glyph's first unit
+                // (1 cell — probed: CSI 3~ mid-glyph leaves 🤣�). The
+                // surviving half renders as a narrow U+FFFD — normalize
+                // it so the shadow keeps no orphan spacer.
+                remove_cells(line, col - 1, 1);
+                if let Some(cell) = line.get_mut(col - 1) {
+                    *cell = CellWide::Narrow;
                 }
+            } else if col > 0 {
+                remove_cells(line, col - 1, 1);
             }
-            Key::Delete => {
-                // Whole glyph under the cursor (2 cells — doubled for emoji,
-                // single for BMP, both remove the full glyph), else one cell.
-                if hint.on_wide_base {
-                    remove_cells(line, col, 2);
-                } else if hint.on_wide_spacer {
-                    // Mid-glyph: one CSI 3~ removes the glyph's second unit
-                    // (1 cell); the surviving first half (base at col-1)
-                    // renders as a narrow U+FFFD — normalize, no orphan base.
-                    remove_cells(line, col, 1);
-                    if let Some(cell) = col.checked_sub(1).and_then(|c| line.get_mut(c)) {
-                        *cell = CellWide::Narrow;
-                    }
-                } else {
-                    remove_cells(line, col, 1);
-                }
-            }
-            _ => {}
         }
+        Key::Delete if !ctrl && !mods.alt => {
+            // Whole glyph under the cursor (2 cells — doubled for emoji,
+            // single for BMP, both remove the full glyph), else one cell.
+            if hint.on_wide_base {
+                remove_cells(line, col, 2);
+            } else if hint.on_wide_spacer {
+                // Mid-glyph: one CSI 3~ removes the glyph's second unit
+                // (1 cell); the surviving first half (base at col-1)
+                // renders as a narrow U+FFFD — normalize, no orphan base.
+                remove_cells(line, col, 1);
+                if let Some(cell) = col.checked_sub(1).and_then(|c| line.get_mut(c)) {
+                    *cell = CellWide::Narrow;
+                }
+            } else {
+                remove_cells(line, col, 1);
+            }
+        }
+        _ => {}
     }
     col_after_wide_key(col, key, mods, hint)
 }
@@ -447,10 +443,10 @@ pub fn process_input_wide(
                         }
                     } else if sent {
                         // Unmodeled key (Home/End/Enter/…) or a modified
-                        // edit/nav (Ctrl+Backspace word-deletes, Ctrl/Alt
-                        // arrows word-jump) — the shadow can no longer know
-                        // the row or the cursor. Stop wide encoding for the
-                        // batch remainder and drop the shadow;
+                        // edit/nav (Ctrl/Alt bindings can jump/delete by a
+                        // different unit) — the shadow can no longer know all
+                        // child-owned editing state. Stop wide encoding for
+                        // the batch remainder;
                         // standard-terminal behavior until the echo lands and
                         // the grid is resampled.
                         wide_line = None;
@@ -476,6 +472,12 @@ pub fn process_input_wide(
     }
     if copy_only && has_selection {
         out.copy = true; // copy_clears stays false — Ctrl+Shift+C keeps the selection
+    }
+    // Interrupt is written outside the ordinary encoded-event path and can
+    // replace the entire prompt. Clipboard reads are also external, but the
+    // Session invalidates only if the read actually yields bytes.
+    if out.interrupt {
+        wide_line = None;
     }
     if let Some(line) = wide_line {
         out.wide_after = Some((line, wide_col));
@@ -1398,7 +1400,12 @@ mod tests {
         assert_eq!(line[0], CellWide::Narrow); // surviving half normalized
         assert_eq!(line[1], CellWide::WideBase { non_bmp: true });
         let hint = wide_hint_at(&line, col);
-        assert!(wide_key_doubles(Key::Delete, none(), TermMode::empty(), hint));
+        assert!(wide_key_doubles(
+            Key::Delete,
+            none(),
+            TermMode::empty(),
+            hint
+        ));
     }
     #[test]
     fn backspace_narrow_before_wide_shifts_shadow_left() {
@@ -1418,7 +1425,12 @@ mod tests {
         assert_eq!(line[0], CellWide::WideBase { non_bmp: true });
         assert_eq!(line[1], CellWide::WideSpacer);
         let hint = wide_hint_at(&line, col);
-        assert!(wide_key_doubles(Key::Delete, none(), TermMode::empty(), hint));
+        assert!(wide_key_doubles(
+            Key::Delete,
+            none(),
+            TermMode::empty(),
+            hint
+        ));
     }
     #[test]
     fn unmodeled_key_stops_wide_doubling_for_batch_remainder() {
@@ -1439,12 +1451,11 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_backspace_drops_the_shadow() {
-        // Ctrl+Backspace word-deletes in the child — the shadow cannot know
-        // what was removed, so tracking must STOP (a no-op simulation that
-        // stays "tracked" is a stale shadow that later doubles from phantom
-        // positions). The plain Backspace that follows must encode single,
-        // and no shadow may survive the frame.
+    fn modified_backspace_models_the_raw_del_bytes_foreman_actually_sends() {
+        // encode_key currently discards Backspace modifiers. The child receives
+        // the same DEL bytes as plain Backspace, so compensation and the shadow
+        // must model those bytes too; treating Ctrl+Backspace as an unknowable
+        // word-delete sent one DEL and orphaned half an emoji.
         let line = vec![
             CellWide::WideBase { non_bmp: true },
             CellWide::WideSpacer,
@@ -1462,11 +1473,43 @@ mod tests {
             false,
             Some((&line, 4)),
         );
-        // ctrl press: single DEL (no doubling under ctrl); plain press:
-        // single DEL (tracking dropped — would be doubled if the stale
-        // shadow still claimed col 4 sits after an emoji).
-        assert_eq!(out.pty_bytes, b"\x7f\x7f");
-        assert!(out.wide_after.is_none());
+        assert_eq!(out.pty_bytes, b"\x7f\x7f\x7f\x7f");
+        assert_eq!(out.wide_after.unwrap().1, 0);
+    }
+    #[test]
+    fn clipboard_request_defers_invalidation_but_interrupt_drops_shadow() {
+        let line = vec![CellWide::WideBase { non_bmp: true }, CellWide::WideSpacer];
+        let ctrl_shift_v = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        let paste = process_input_wide(
+            &[key_ev(Key::V, ctrl_shift_v)],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            Some((&line, 2)),
+        );
+        assert!(paste.paste_clipboard);
+        assert!(
+            paste.wide_after.is_some(),
+            "the pure pass has not read or sent clipboard bytes yet"
+        );
+
+        let ctrl_c = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let interrupt = process_input_wide(
+            &[key_ev(Key::C, ctrl_c)],
+            Modifiers::default(),
+            TermMode::empty(),
+            false,
+            Some((&line, 2)),
+        );
+        assert!(interrupt.interrupt);
+        assert!(interrupt.wide_after.is_none());
     }
     #[test]
     fn typing_text_drops_the_shadow() {
@@ -1495,10 +1538,7 @@ mod tests {
             CellWide::Narrow,
         ];
         let out = process_input_wide(
-            &[
-                key_ev(Key::Backspace, none()),
-                key_ev(Key::Delete, none()),
-            ],
+            &[key_ev(Key::Backspace, none()), key_ev(Key::Delete, none())],
             Modifiers::default(),
             TermMode::empty(),
             false,
@@ -1514,11 +1554,21 @@ mod tests {
         let e = emoji();
         let c = cjk();
         assert_eq!(
-            encode_key_wide(Key::Backspace, none(), TermMode::empty(), wide_hint_at(&e, 2)),
+            encode_key_wide(
+                Key::Backspace,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&e, 2)
+            ),
             [0x7f, 0x7f]
         );
         assert_eq!(
-            encode_key_wide(Key::Backspace, none(), TermMode::empty(), wide_hint_at(&c, 2)),
+            encode_key_wide(
+                Key::Backspace,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&c, 2)
+            ),
             [0x7f]
         );
     }
@@ -1529,19 +1579,39 @@ mod tests {
         let e = emoji();
         let c = cjk();
         assert_eq!(
-            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), wide_hint_at(&e, 2)),
+            encode_key_wide(
+                Key::ArrowLeft,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&e, 2)
+            ),
             b"\x1b[D\x1b[D"
         );
         assert_eq!(
-            encode_key_wide(Key::ArrowLeft, none(), TermMode::empty(), wide_hint_at(&c, 2)),
+            encode_key_wide(
+                Key::ArrowLeft,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&c, 2)
+            ),
             b"\x1b[D"
         );
         assert_eq!(
-            encode_key_wide(Key::ArrowRight, none(), TermMode::empty(), wide_hint_at(&e, 0)),
+            encode_key_wide(
+                Key::ArrowRight,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&e, 0)
+            ),
             b"\x1b[C\x1b[C"
         );
         assert_eq!(
-            encode_key_wide(Key::ArrowRight, none(), TermMode::empty(), wide_hint_at(&c, 0)),
+            encode_key_wide(
+                Key::ArrowRight,
+                none(),
+                TermMode::empty(),
+                wide_hint_at(&c, 0)
+            ),
             b"\x1b[C"
         );
     }
@@ -1550,11 +1620,21 @@ mod tests {
         // vim/lazygit edit per-grapheme; never compensate on the alt screen.
         let e = emoji();
         assert_eq!(
-            encode_key_wide(Key::ArrowLeft, none(), TermMode::ALT_SCREEN, wide_hint_at(&e, 2)),
+            encode_key_wide(
+                Key::ArrowLeft,
+                none(),
+                TermMode::ALT_SCREEN,
+                wide_hint_at(&e, 2)
+            ),
             b"\x1b[D"
         );
         assert_eq!(
-            encode_key_wide(Key::Backspace, none(), TermMode::ALT_SCREEN, wide_hint_at(&e, 2)),
+            encode_key_wide(
+                Key::Backspace,
+                none(),
+                TermMode::ALT_SCREEN,
+                wide_hint_at(&e, 2)
+            ),
             [0x7f]
         );
     }

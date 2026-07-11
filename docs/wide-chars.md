@@ -14,21 +14,33 @@ spacer cell) across paint, snapshots, and key input.
 - **Key input doubling** lives only in `wide_key_doubles` (src/input.rs):
   double iff the crossed glyph is non-BMP AND the position is a whole-glyph
   crossing (base for Right/Delete, left-spacer for Left/Backspace) AND not
-  alt-screen AND no Ctrl/Alt. Everything else is single. Do not "fix" a
-  wide-char symptom by adding doubling elsewhere — re-run the probe matrix
-  below first.
+  alt-screen. Ctrl/Alt crossings stay single except Backspace, because its
+  current encoder discards modifiers and sends the same DEL bytes. Everything
+  else is single. Do not "fix" a wide-char symptom by adding doubling elsewhere
+  — re-run the probe matrix below first.
 - **Hold-repeat**: `Session.wide_shadow` carries the simulated row across
-  frames and is replaced by a fresh grid sample only when the grid is
-  TRUSTWORTHY: the PTY quiet for `WIDE_RESAMPLE_SETTLE` (50ms) AND no
-  modeled key press within `WIDE_INPUT_GRACE` (150ms). `output_gen`
-  advancing is NOT the signal — one keypress echo on a long soft-wrapped
-  line arrives across many chunks over multiple frames, and a grid sampled
-  between chunks reports a transient mid-redraw cursor.
-- **Modeled keys** are UNMODIFIED Left/Right/Backspace/Delete only
-  (`wide_key_modeled`, src/input.rs). Ctrl/Alt variants word-jump or
-  word-delete — unknowable — so they DROP the shadow like Home/End do.
-  Never simulate them as a no-op: a stale shadow that claims to be tracked
-  doubles from phantom positions.
+  frames and is replaced by a fresh grid sample only after the observed settle
+  heuristic: the PTY is quiet for `WIDE_RESAMPLE_SETTLE` (50ms), there is no
+  session-owned ongoing key hold, and there was no prior
+  key activity within `WIDE_INPUT_GRACE` (150ms). A fresh press may sample a
+  settled pre-key grid; once owned, egui's `key_down` bridges repeat delay and
+  slow repeat settings so they do not expire a live burst. `output_gen`
+  advancing alone is NOT a resample signal — one
+  keypress echo on a long soft-wrapped line arrives across many chunks over
+  multiple frames, and a grid sampled between chunks reports a transient
+  mid-redraw cursor.
+- **Invalidated shadows wait for observed post-input activity**: text, paste,
+  interrupt, external injection, or an unmodeled chord enters
+  `AwaitingEcho { invalidated_gen }`. Standard single encoding remains in
+  effect until a later PTY generation is observed and the settle heuristic
+  passes; an absent shadow never re-seeds from the same pre-input generation.
+  A generation change is not a causal child acknowledgement—unrelated output
+  can satisfy it—so this remains a conservative observation-based heuristic.
+- **Modeled keys** are Left/Right/Delete without Ctrl/Alt plus Backspace under
+  all modifiers (`wide_key_modeled`, src/input.rs). Backspace is the exception
+  because `encode_key` currently emits the same raw DEL regardless of modifiers;
+  compensation follows bytes actually sent, not the physical chord. Other
+  Ctrl/Alt edit/navigation bindings DROP the shadow like Home/End do.
 
 ## Evidence 2026-07-10 (pwsh 7.5.8, ConPTY, foreman HEAD df46b2d)
 
@@ -65,8 +77,10 @@ both emoji and CJK), independent of sequence count.
 Hold-Backspace corruption root cause: correct-per-press doubling still
 desyncs during key repeat because each frame re-sampled the **stale** grid
 (echo not yet landed) and restarted the shadow simulation from the old
-cursor. Fix: persist the shadow row across frames until `output_gen`
-advances (`Session.wide_shadow`).
+cursor. The first fix persisted the shadow only until any `output_gen`
+advance; that was enough for short, single-chunk redraws but not the long-line
+case below. The current policy keeps it through active holds and partial PTY
+redraws (`Session.wide_shadow`).
 
 Re-verification (post-fix, same pwsh session): emoji BS removes exactly one
 emoji; `中中中` + BS leaves `中中` (over-delete gone); CJK/emoji Left both
@@ -93,11 +107,78 @@ grid (cursor transiently anywhere), adopted the garbage as the new shadow,
 and the next repeat press doubled (or failed to) from a phantom position.
 Short lines redraw in one chunk, which is why the small repro was fixed
 first and this one survived. Fix: shadow lifetime is now quiescence-based
-(`keep_wide_shadow`, src/terminal.rs) — resample only after 50ms of PTY
-silence and 150ms of key silence, the same trust model as the caret gate.
-In the same pass, modified edits (Ctrl+Backspace = word delete) switched
-from "simulate as no-op" to "drop the shadow": persistence would otherwise
-lock in the stale row for a whole burst (the user's Ctrl+Backspace repro).
+(`keep_wide_shadow`, src/terminal.rs) — do not resample during a session-owned
+ongoing hold; after release, require 50ms of observed PTY silence and
+150ms of key silence. These time windows are a practical quiescence heuristic,
+not an acknowledgement from the child that its redraw is complete. In the
+same pass, modified edit/navigation sequences switched from "simulate as
+no-op" to "drop the shadow": their post-key state is not represented by
+row+cursor tracking. Backspace remains modeled under modifiers because its
+current encoder sends the same DEL bytes either way.
+
+Paste-only caret finding (live repro 2026-07-10, compatibility-fixed): this
+is separate from shadow lifetime and reproduces before any edit key. At 102
+columns, a prompt ending at zero-based col 27 followed by 74 `a` cells leaves
+one cell at the margin. Pasting `🤣` produced this final PSReadLine redraw:
+
+```text
+CUP 7;28  +  74 x "a"  +  🤣  +  CUP 8;2
+```
+
+Alacritty correctly defers the complete width-2 glyph, inserts one
+`LEADING_WIDE_CHAR_SPACER`, and naturally ends at zero-based `(7,2)`. The
+final CUP parks it at `(7,1)`, inside the emoji spacer. Repeating a mixed unit
+over a long line accumulated six such pads: PSReadLine's CUP ended at col 77
+while the rendered text ended at col 83.
+
+The exact cause is PSReadLine 2.4.5, not a stale shadow or an old ConPTY.
+`ConvertOffsetToPoint` iterates UTF-16 `char`s and
+`LengthInBufferCells(char)` explicitly does not combine surrogate pairs, so
+`🤣` is measured as width 1 + 1 and can split at the margin. BMP `中` is one
+UTF-16 char of width 2 and already defers correctly. The limitation remains in
+PSReadLine main; see
+[Render.cs](https://github.com/PowerShell/PSReadLine/blob/v2.4.5/PSReadLine/Render.cs#L1364-L1418),
+[Render.Helper.cs](https://github.com/PowerShell/PSReadLine/blob/v2.4.5/PSReadLine/Render.Helper.cs#L49-L120),
+and upstream issue
+[#1329](https://github.com/PowerShell/PSReadLine/issues/1329). Foreman already
+ships Microsoft's newest ConPTY package, so a package bump cannot repair this.
+
+Foreman's correction is deliberately narrow and reversible. A single-line
+PowerShell paste on the primary screen arms a CUP observer only when the paste
+began at the visible line end. At each completed `CSI H/f`, it samples the
+natural whole-glyph flow endpoint before applying the CUP, then accepts a
+`raw -> physical` cursor alias only when the entire difference is exactly the
+count of leading pads whose following wide base is non-BMP across the complete
+`WRAPLINE` chain. BMP/CJK pads are deliberately excluded because PSReadLine
+already includes them in its coordinate. The alias
+feeds caret painting, `foreman snapshot --cursor`, and wide-key shadow
+sampling; alacritty's grid cursor, subsequent VT parsing, and CPR replies stay
+untouched. Correct CUPs, BMP CJK,
+alternate-screen apps, bracketed-paste TUIs, multiline paste, mid-line paste,
+resize, and unmatched cursor movement all fail closed to standard behavior.
+Pure tests cover one pad, three cumulative pads, a mixed CJK+emoji line, a
+correct-CUP/BMP control, and a CUP split across PTY chunks. An ignored live
+PowerShell/ConPTY test drives a
+real egui `Event::Paste`, observes the one-cell raw/effective split, and proves
+the corrected endpoint makes the following Backspace encode two DEL bytes.
+
+This compatibility alias fixes the reported paste-at-end caret and subsequent
+held-Backspace starting position without globally rewriting CUP bytes. The
+PowerShell session label does not prove PSReadLine is still the foreground
+program, however, and an armed primary-screen application that emits the exact
+same flow-end/padding pattern is indistinguishable. The append-at-end,
+single-line, mode, endpoint, and mutation gates minimize that compatibility
+risk and fail closed on any unmatched movement. A custom prompt that itself
+soft-wraps across a non-BMP boundary may also fail closed because its pad is
+outside PSReadLine's input offset. The alias does not promise to heal stale
+cells already emitted by a child redraw; those remain upstream display residue.
+Once the final CUP establishes an alias, a fresh wide key may seed from it
+immediately without the ordinary 50ms settle delay. A key event that outruns
+the paste echo and arrives before that CUP still has no trustworthy endpoint
+and falls back to standard single encoding. A natural endpoint exactly in
+alacritty's `input_needs_wrap` (last-column/wrap-pending) state is also not
+carried by the point-only alias; the verified repros end at ordinary columns 2
+and 83 rather than that state.
 
 Cosmetic residue that remains (upstream, do not chase): between the two
 DELs of a doubled press the child buffer transiently holds a lone
@@ -115,10 +196,10 @@ zero U+FFFD).
 
 Known limitation: unmodeled keys (Home/End/Enter/…) and text insertion
 drop the shadow — the cursor position is no longer knowable (Home jumps to
-the prompt boundary). Wide encoding falls back to single sequences for the
-batch remainder (standard-terminal parity: Windows Terminal half-deletes
-there too) and the grid is resampled when the echo lands. Keep wide-glyph
-edits and navigation keys in separate `send` requests when it matters.
+the prompt boundary). Wide encoding falls back to single sequences across
+frames until a later PTY generation is observed and the quiet-window
+heuristic permits a fresh sample. Keep wide-glyph edits and navigation keys
+in separate `send` requests when it matters.
 
 Known limitation: `foreman send --keys` samples the live grid per REQUEST.
 A burst of separate no-settle send calls can still race the echo — put the
