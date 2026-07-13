@@ -1070,8 +1070,8 @@ impl WindowManager {
     ) -> Result<(WinId, WinId), String> {
         let terminal = req.terminal.as_deref().ok_or("send: missing terminal")?;
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
-        // Read mode + wide line BEFORE mutably borrowing the session for feed.
-        let (mode, wide_line, wide_col) = {
+        // Read the term mode BEFORE mutably borrowing the session for feed.
+        let mode = {
             let child = self.project_child(pid)?;
             let tw = child
                 .windows
@@ -1082,11 +1082,10 @@ impl WindowManager {
             let Content::Terminal(s) = &tw.tabs[idx].content else {
                 return Err("not a terminal tab".into());
             };
-            let (line, col) = s.wide_line_at_cursor();
-            (s.term_mode(), line, col)
+            s.term_mode()
         };
-        // Same deep encode as live keyboard (wide-char skip when line known).
-        let key_bytes = crate::inspect::parse_keys_wide(&req.keys, mode, &wide_line, wide_col)?;
+        // Same encoder as the live keyboard.
+        let key_bytes = crate::inspect::parse_keys(&req.keys, mode)?;
         let session = self.session_mut(pid, tid)?;
         if let Some(text) = &req.text {
             session.feed_text(text);

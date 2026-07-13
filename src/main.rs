@@ -20,6 +20,7 @@ mod layout;
 mod notify;
 mod panel;
 mod proc;
+mod psreadline;
 mod ready;
 mod recents;
 mod settings;
@@ -679,10 +680,7 @@ fn append_font_fallbacks(
             name.clone(),
             std::sync::Arc::new(egui::FontData::from_owned(bytes)),
         );
-        for family in [
-            egui::FontFamily::Monospace,
-            egui::FontFamily::Proportional,
-        ] {
+        for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
             if let Some(list) = fonts.families.get_mut(&family) {
                 if !list.iter().any(|n| n == &name) {
                     list.push(name.clone());

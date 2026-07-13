@@ -1,7 +1,78 @@
 # Wide characters (CJK / emoji)
 
 What: how foreman handles width-2 glyphs (one `WIDE_CHAR` base cell + one
-spacer cell) across paint, snapshots, and key input.
+spacer cell) across paint and snapshots — and why foreman deliberately does
+**not** compensate for PowerShell/PSReadLine's broken wide-char caret math.
+
+## Status: fixed IN PSREADLINE, not in the terminal (2026-07-13)
+
+Windows' line editor edits by **UTF-16 unit**. A non-BMP emoji is two units,
+so one Backspace deletes half a glyph (leaving `�`) and one Left parks the
+caret inside it. Foreman spent three escalating attempts compensating for
+this from the terminal side — key doubling, a simulated "wide shadow" input
+row, and a dual-simulation paste caret alias (`src/paste_sim.rs`). Every one
+of them modeled the shell's state, every one desynced, and the last one broke
+arrow-key navigation outright. **All of it is deleted (~2,600 lines).**
+
+The fix now lives where the bug lives. At pwsh spawn, foreman asks PSReadLine
+— which owns the input buffer and always knows the truth — to bind
+**Backspace / Delete / LeftArrow** to surrogate-aware handlers
+(`src/psreadline.rs`, PowerShell as a const). **Foreman models nothing.** It
+sends one keypress per keypress and paints alacritty's cursor.
+
+Measured, live, on the production spawn path
+(`live_psreadline_wide_edits_delete_and_cross_whole_emoji`):
+
+| | stock pwsh | with the fix |
+|---|---|---|
+| Backspace over emoji | `�`, glyph split | whole glyph deleted, zero `�` |
+| Delete over emoji | glyph split | whole glyph deleted |
+| Left over emoji | parks mid-glyph | crosses the whole glyph |
+| Delete with caret parked INSIDE a glyph | splits it | removes the glyph whole |
+| **Held** Backspace, 30 repeats over a wrapped line | half-glyphs | 30 whole glyphs, zero `�` |
+
+The held-repeat case is the one that defeated every terminal-side model: with
+no state to desync, key repeat is just key repeat.
+
+### RightArrow is deliberately NOT bound (do not "finish the set")
+
+Binding RightArrow — **even to a handler that immediately delegates back to
+`ForwardChar`** — destroyed PSReadLine's active-suggestion state, so the inline
+prediction could no longer be accepted. That shipped once and was reported
+within minutes ("I can't press right arrow to autocomplete anymore"). Measured:
+with the override in place, the shell ran the typed prefix instead of the
+suggestion.
+
+The cost of leaving it stock is that Right steps one UTF-16 unit and can park
+the caret *inside* an emoji. That is handled, not ignored: Backspace and Delete
+each cover the caret-inside-a-pair case and still remove the glyph whole, so no
+edit can split a surrogate pair. `wide_edit_fix_binds_three_keys_and_never_rightarrow`
+pins the decision.
+
+Same lesson, second instance: a handler must **delegate to the built-in** in
+every case it does not specifically own. The first version of these handlers
+replaced the built-ins outright and silently killed `Ctrl+A` + Backspace
+(selection delete), because deleting an active selection is what the built-in
+`BackwardDeleteChar` does.
+
+**Still upstream, still unfixed (accepted):** the *caret position* after a
+wrapped emoji paste. PSReadLine's `LengthInBufferCells` miscounts surrogate
+pairs when it renders (#1329), so its caret parks short of the visible text
+end. No key handler can reach that math, and Windows Terminal and VS Code show
+it too. `Enter` or `Ctrl+L` resyncs. Foreman does **not** compensate — that
+compensation is exactly what broke navigation before.
+
+### Two gotchas that cost real time
+
+- **The UTF-8 line in `WIDE_EDIT_FIX` is load-bearing.** Running *any*
+  ScriptBlock key handler makes PSReadLine re-render the line through
+  `[Console]::OutputEncoding`, which defaults to a legacy codepage — without
+  setting it to UTF-8, every emoji on the line renders as `?` the moment you
+  press Backspace. Measured, not theorized.
+- **`$n = 2` only for surrogate pairs, never for cell width.** CJK `中` is
+  width-2 on screen but a *single* UTF-16 unit — doubling it over-deletes.
+  That was the old terminal-side approach's probe-#3 bug; the handlers key off
+  `IsHighSurrogate`/`IsLowSurrogate`, not width.
 
 ## Ownership rules
 
@@ -11,43 +82,26 @@ spacer cell) across paint, snapshots, and key input.
   alacritty flag is one edit there — do not add a second inline flag check
   (df46b2d needed 4 edits because there were 4 copies).
 - **Snapshot text/cells skip spacers** through the same classifier.
-- **Key input doubling** lives only in `wide_key_doubles` (src/input.rs):
-  double iff the crossed glyph is non-BMP AND the position is a whole-glyph
-  crossing (base for Right/Delete, left-spacer for Left/Backspace) AND not
-  alt-screen. Ctrl/Alt crossings stay single except Backspace, because its
-  current encoder discards modifiers and sends the same DEL bytes. Everything
-  else is single. Do not "fix" a wide-char symptom by adding doubling elsewhere
-  — re-run the probe matrix below first.
-- **Hold-repeat**: `Session.wide_shadow` carries the simulated row across
-  frames and is replaced by a fresh grid sample only after the observed settle
-  heuristic: the PTY is quiet for `WIDE_RESAMPLE_SETTLE` (50ms), there is no
-  session-owned ongoing key hold, and there was no prior
-  key activity within `WIDE_INPUT_GRACE` (150ms). A fresh press may sample a
-  settled pre-key grid; once owned, egui's `key_down` bridges repeat delay and
-  slow repeat settings so they do not expire a live burst. `output_gen`
-  advancing alone is NOT a resample signal — one
-  keypress echo on a long soft-wrapped line arrives across many chunks over
-  multiple frames, and a grid sampled between chunks reports a transient
-  mid-redraw cursor.
-- **Invalidated shadows wait for observed post-input activity**: text, paste,
-  interrupt, external injection, or an unmodeled chord enters
-  `AwaitingEcho { invalidated_gen }`. Standard single encoding remains in
-  effect until a later PTY generation is observed and the settle heuristic
-  passes; an absent shadow never re-seeds from the same pre-input generation.
-  A generation change is not a causal child acknowledgement—unrelated output
-  can satisfy it—so this remains a conservative observation-based heuristic.
-- **Modeled keys** are Left/Right/Delete without Ctrl/Alt plus Backspace under
-  all modifiers (`wide_key_modeled`, src/input.rs). Backspace is the exception
-  because `encode_key` currently emits the same raw DEL regardless of modifiers;
-  compensation follows bytes actually sent, not the physical chord. Other
-  Ctrl/Alt edit/navigation bindings DROP the shadow like Home/End do.
+- **Key input is never doubled, rewritten, or modeled.** One physical press =
+  one encoded sequence. Foreman does not track a shadow of the input row and
+  does not predict where the shell's caret "should" be. Whole-glyph editing is
+  PSReadLine's job (`src/psreadline.rs`).
+- **The painted caret is alacritty's caret.** No alias, no correction layer.
+  `foreman snapshot --cursor` reports the same point.
+- **Wide-char editing belongs to the shell, not the terminal.** If a wide-char
+  edit symptom appears, fix it in `WIDE_EDIT_FIX` (or upstream). Do not add
+  terminal-side compensation — see "Why the terminal-side approach failed".
 
 ## Evidence 2026-07-10 (pwsh 7.5.8, ConPTY, foreman HEAD df46b2d)
 
+**This section measures CONHOST/PSReadLine, not foreman.** It is retained
+because it is the ground truth about the platform. The doubling it refers to
+was foreman's (now deleted) compensation, used here only as an experimental
+lever to reveal how the shell edits.
+
 All probes ran headlessly via `foreman send` / `foreman snapshot --cursor`
 against a live PowerShell session; codepoints read straight from the
-snapshot text. "Doubled" = foreman's wide-key doubling fired (2 sequences
-per physical press).
+snapshot text. "Doubled" = two sequences were sent per physical press.
 
 | # | Probe | Result | Meaning |
 |---|-------|--------|---------|
@@ -74,49 +128,18 @@ Cell width (2 columns) is NOT the editing unit — surrogate-pair-ness is:
 Cursor CELL movement follows glyph width (2 cells per whole crossing for
 both emoji and CJK), independent of sequence count.
 
-Hold-Backspace corruption root cause: correct-per-press doubling still
-desyncs during key repeat because each frame re-sampled the **stale** grid
-(echo not yet landed) and restarted the shadow simulation from the old
-cursor. The first fix persisted the shadow only until any `output_gen`
-advance; that was enough for short, single-chunk redraws but not the long-line
-case below. The current policy keeps it through active holds and partial PTY
-redraws (`Session.wide_shadow`).
+**Historical (the shadow chase, 2026-07-10 — machinery now deleted).**
+Correct-per-press doubling still desynced under key repeat: each frame
+re-sampled a **stale** grid (the echo had not landed) and restarted the
+simulation from the old cursor. Three successive fixes — persist across
+`output_gen`, span soft-wrapped rows, then gate resampling on observed
+quiescence (50ms PTY silence + 150ms key silence + no owned hold) — each
+cured its repro and left the next one alive. The lesson that survives: **the
+grid always lags the input stream**, so any model seeded from the grid
+during typing is seeded from the past. All of this code is gone; the
+sequence is recorded so nobody rebuilds it step by step.
 
-Re-verification (post-fix, same pwsh session): emoji BS removes exactly one
-emoji; `中中中` + BS leaves `中中` (over-delete gone); CJK/emoji Left both
-move 2 cells; Delete on emoji base removes one clean emoji; 8 rapid
-no-settle Backspace sends over a mixed emoji line leave **zero** U+FFFD.
-
-Wrap-boundary finding (live repro 2026-07-10, fixed): the shadow was ONE
-grid row, so with the cursor at col 0 after a soft wrap it knew nothing
-about the previous row's tail — Backspace sent a single DEL and
-half-deleted the emoji ending that row (probed: raw DEL at the boundary →
-`…🥒🤣🤣�`). One U+FFFD per wrap crossing = the diagonal tofu squares.
-Fix: `inspect::wide_row_at_cursor` concatenates soft-wrapped rows
-(`WRAPLINE`) and drops wrap padding (`LEADING_WIDE_CHAR_SPACER`), so the
-boundary does not exist in the shadow. Verified: 44-press Backspace batch
-over a 2-row wrapped emoji line clears it completely, buffer stays clean.
-
-Long-line finding (live repro 2026-07-10, fixed): with a ~15-row wrapped
-mixed narrow+emoji input, hold-Backspace still corrupted (`…🥒�` at the
-cursor + stray rows below) even WITH the wrap-spanning shadow. Root cause:
-the shadow was invalidated the moment `output_gen` advanced, but one
-keypress echo on a line that long is redrawn by ConPTY across MANY chunks
-over multiple frames — every intermediate frame re-sampled a mid-redraw
-grid (cursor transiently anywhere), adopted the garbage as the new shadow,
-and the next repeat press doubled (or failed to) from a phantom position.
-Short lines redraw in one chunk, which is why the small repro was fixed
-first and this one survived. Fix: shadow lifetime is now quiescence-based
-(`keep_wide_shadow`, src/terminal.rs) — do not resample during a session-owned
-ongoing hold; after release, require 50ms of observed PTY silence and
-150ms of key silence. These time windows are a practical quiescence heuristic,
-not an acknowledgement from the child that its redraw is complete. In the
-same pass, modified edit/navigation sequences switched from "simulate as
-no-op" to "drop the shadow": their post-key state is not represented by
-row+cursor tracking. Backspace remains modeled under modifiers because its
-current encoder sends the same DEL bytes either way.
-
-Paste-only caret finding (live repro 2026-07-10, compatibility-fixed): this
+Paste-only caret finding (live repro 2026-07-10 — upstream, NOT fixed): this
 is separate from shadow lifetime and reproduces before any edit key. At 102
 columns, a prompt ending at zero-based col 27 followed by 74 `a` cells leaves
 one cell at the margin. Pasting `🤣` produced this final PSReadLine redraw:
@@ -143,101 +166,63 @@ and upstream issue
 [#1329](https://github.com/PowerShell/PSReadLine/issues/1329). Foreman already
 ships Microsoft's newest ConPTY package, so a package bump cannot repair this.
 
-Foreman's correction is deliberately narrow and reversible. A single-line
-PowerShell paste on the primary screen arms a CUP observer only when the paste
-began at the visible line end. At each completed `CSI H/f`, it samples the
-natural whole-glyph flow endpoint before applying the CUP, then accepts a
-`raw -> physical` cursor alias only when the entire difference is exactly the
-count of leading pads whose following wide base is non-BMP across the complete
-`WRAPLINE` chain. BMP/CJK pads are deliberately excluded because PSReadLine
-already includes them in its coordinate. The alias
-feeds caret painting, `foreman snapshot --cursor`, and wide-key shadow
-sampling; alacritty's grid cursor, subsequent VT parsing, and CPR replies stay
-untouched. Correct CUPs, BMP CJK,
-alternate-screen apps, bracketed-paste TUIs, multiline paste, mid-line paste,
-resize, and unmatched cursor movement all fail closed to standard behavior.
-Pure tests cover one pad, three cumulative pads, a mixed CJK+emoji line, a
-correct-CUP/BMP control, and a CUP split across PTY chunks. An ignored live
-PowerShell/ConPTY test drives a
-real egui `Event::Paste`, observes the one-cell raw/effective split, and proves
-the corrected endpoint makes the following Backspace encode two DEL bytes.
+## Why the terminal-side approach failed (do not re-litigate)
 
-This compatibility alias fixes the reported paste-at-end caret and subsequent
-held-Backspace starting position without globally rewriting CUP bytes. The
-PowerShell session label does not prove PSReadLine is still the foreground
-program, however, and an armed primary-screen application that emits the exact
-same flow-end/padding pattern is indistinguishable. The append-at-end,
-single-line, mode, endpoint, and mutation gates minimize that compatibility
-risk and fail closed on any unmatched movement. A custom prompt that itself
-soft-wraps across a non-BMP boundary may also fail closed because its pad is
-outside PSReadLine's input offset. The alias does not promise to heal stale
-cells already emitted by a child redraw; those remain upstream display residue.
-Once the final CUP establishes an alias, a fresh wide key may seed from it
-immediately without the ordinary 50ms settle delay. A key event that outruns
-the paste echo and arrives before that CUP still has no trustworthy endpoint
-and falls back to standard single encoding. A natural endpoint exactly in
-alacritty's `input_needs_wrap` (last-column/wrap-pending) state is also not
-carried by the point-only alias; the verified repros end at ordinary columns 2
-and 83 rather than that state.
+Every compensation foreman built was a model of a shell that is lying about
+its own geometry. Three escalating attempts, each fixing its predecessor's
+symptom and exposing a worse one:
 
-Residual variant (live repro 2026-07-11, parked): a LARGE multi-row emoji
-paste (10+ wrapped rows) comes back from ConPTY as hard-positioned,
-fully-packed rows — zero `LEADING_WIDE_CHAR_SPACER` pads and zero `WRAPLINE`
-flags in the grid (measured: every row's cell widths sum to exactly the
-column count). The alias's exact-match gate (difference == pad count) then
-compares a shortfall of N against 0 expected pads and fails CLOSED — by
-design — so the caret sits N cells behind the rendered end. N = the number
-of emoji PSReadLine split at row margins (measured live: 4 cells behind over
-a 21-row paste, with a lone-surrogate `�` in the buffer proving the split).
-PSReadLine's edits stay content-correct — its buffer offset is right, only
-its screen math is wrong — so this is display-only; Enter or `Ctrl+L`
-resyncs, and the buffer `�` is upstream corruption foreman cannot heal.
+1. **Wide-key doubling + wide shadow** (be4901b…c0bdb7c). One press = two
+   sequences when crossing a non-BMP glyph, driven by a simulated copy of
+   the input row. Correct per-press, but the shadow must be re-sampled from
+   the grid, and the grid *lags the input stream* — every long-line hold
+   re-anchored on a mid-redraw screen. Fixed with quiescence gating, wrap
+   spanning, cell-shift semantics… and it still desynced.
+2. **CUP interception** (c0bdb7c). Watch PSReadLine's final cursor-position
+   escape and alias it forward by the pad count. Failed closed on exactly
+   the big pastes that hurt (F2: alacritty scrubs the pad flags the
+   validator counted).
+3. **Dual-simulation paste alias** (`src/paste_sim.rs`, 2026-07-12).
+   Simulate both width models, alias the caret to the whole-glyph flow end
+   on an exact grid fingerprint match. It worked — the *caret* landed
+   correctly — and that is precisely what exposed the fatal flaw.
 
-Tracked follow-up if this recurs enough to hurt: REPLACE the CUP scanner
-with paste simulation. Foreman already knows the pasted string and the
-pre-paste cursor (`arm_psreadline_paste_cursor`), so the expected endpoint
-is pure width-aware wrap arithmetic — no VT interception; alias when the
-settled cursor lands short of it, same fail-closed gates (pwsh, primary
-screen, single-line, no input since). Covers both the pad variant and this
-one, likely with less code. Do it as its own reviewed change, not a bolt-on
-to the scanner.
+**The fatal flaw:** the alias is display-only, but **PSReadLine's internal
+caret is genuinely wrong**, and PSReadLine is what processes your arrow
+keys, Backspace, and Home/End. Painting the caret at the true text end while
+the shell edits from a different coordinate made navigation *worse*: Left/
+Right jumped over glyphs and could not come back (live report, 2026-07-12).
+A visibly-wrong caret you can navigate with beats a correct-looking caret
+you cannot. Fixing the display without fixing the shell's model is not a
+fix; it is a lie that the editing keys then contradict.
 
-Cosmetic residue that remains (upstream, do not chase): between the two
-DELs of a doubled press the child buffer transiently holds a lone
-surrogate; if ConPTY renders that instant it writes a `�` and never clears
-cells past its new content end. The buffer itself is clean — typing
-continues fine — and `Ctrl+L` heals the display (verified). Same family as
-`docs/conpty-resize-reflow.md`.
+There is no display-layer fix. The only real fixes live upstream
+(PSReadLine #1329 — `LengthInBufferCells` does not combine surrogate pairs)
+or in a full local line-editor, which foreman is not. Windows Terminal and
+VS Code exhibit the same bug and also do not compensate.
 
-Review finding (e538e4a, fixed): the shadow originally CLEARED deleted
-cells; deleting a narrow char in front of an emoji left a stale cell under
-the cursor and the next same-batch Delete under-doubled (half-delete). The
-shadow now REMOVES cells and shifts the tail left, matching cooked-editor
-semantics (`Left Left Backspace Delete` over `a🤣z` verified live → `z`,
-zero U+FFFD).
+**Retry condition:** only if PSReadLine ships a fix (then delete nothing —
+just verify), or if foreman ever owns line editing itself. A new "narrow,
+reversible" compensation layer is not a new idea; it is attempt #4.
 
-Known limitation: unmodeled keys (Home/End/Enter/…) and text insertion
-drop the shadow — the cursor position is no longer knowable (Home jumps to
-the prompt boundary). Wide encoding falls back to single sequences across
-frames until a later PTY generation is observed and the quiet-window
-heuristic permits a fresh sample. Keep wide-glyph edits and navigation keys
-in separate `send` requests when it matters.
+Research record (measurements, byte traces, the P/E width models, and the
+Phase 0 protocol): `docs/superpowers/specs/2026-07-12-paste-sim-phase0-protocol.md`
+and `…-results.md`. The code they describe no longer exists.
 
-Known limitation: `foreman send --keys` samples the live grid per REQUEST.
-A burst of separate no-settle send calls can still race the echo — put the
-whole burst in one `--keys "Backspace Backspace …"` list (simulated
-in-batch) or use `--settle-ms`. The live keyboard path has no such gap
-(shadow persists across frames).
+## Residue you will still see (upstream — do not chase)
 
-Also observed, out of scope: after any corruption, ConPTY's line redraw
-leaves `�` residue mid-line and on rows below the prompt; `Ctrl+L` heals.
-Same family as the settled resize-reflow divergence
-(`docs/conpty-resize-reflow.md`) — do not chase.
+- After a wrapped emoji paste, the caret sits short of the text end. Enter or
+  `Ctrl+L` resyncs. PSReadLine also stops clearing cells at its (short)
+  believed content end, so stale glyphs can survive select-all + Backspace;
+  `clear`/`Ctrl+L` heals them.
+- `�` (U+FFFD) in the grid means a lone surrogate half is in the console
+  buffer — buffer corruption upstream of foreman's renderer, which foreman
+  paints faithfully. Backspace on an emoji deletes one UTF-16 unit (half a
+  glyph) because conhost's cooked editing is unit-based; that is the shell's
+  behavior, not foreman's.
+- ConPTY line redraws leave `�` residue mid-line and below the prompt after
+  corruption. Same family as `docs/conpty-resize-reflow.md`.
 
-Gotcha for readers: `�` (U+FFFD) in the grid means someone put a lone
-surrogate half in the console buffer. That is buffer corruption upstream of
-foreman's renderer; foreman paints it faithfully.
-
-Key files: `src/input.rs` (CellWide + doubling policy), `src/frame.rs`
-(paint spacer skip), `src/inspect.rs` (snapshot spacer skip),
-`src/terminal.rs` (cursor-row sampling / shadow persistence).
+Key files: `src/input.rs` (`CellWide` classifier + key encoding),
+`src/frame.rs` (paint spacer skip), `src/inspect.rs` (snapshot spacer skip),
+`src/terminal.rs` (emoji raster/paint).
