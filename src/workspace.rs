@@ -1,11 +1,13 @@
 //! Cold workspace snapshot: types + serde + `%APPDATA%\foreman\workspace.json`
-//! load/save. Capture/apply and dirty-flag wiring live in later tasks; this
-//! module is pure data + I/O only.
+//! load/save, plus pure layout-tree ↔ `NodeSnap` conversion. Capture/apply and
+//! dirty-flag wiring live in later tasks.
 //!
 //! Mirrors `recents.rs` / `config.rs`: defaults in code, corruption-tolerant
 //! load, atomic save via `config::save_json`. Future file versions are rejected
 //! (not partially applied) so a newer foreman never leaves a half-restored tree.
 
+use crate::layout::{LayoutTree, Node, SplitDir, MIN_RATIO};
+use crate::wm::WinId;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -182,6 +184,105 @@ pub fn shell_from_str(s: &str) -> crate::terminal::Shell {
     }
 }
 
+// ── Layout tree ↔ NodeSnap conversion (pure) ───────────────────────────────
+
+/// Convert a live layout node to a snapshot node via `map` for leaf ids.
+pub fn node_to_snap(n: &Node, map: &dyn Fn(WinId) -> SnapId) -> NodeSnap {
+    match n {
+        Node::Leaf(id) => NodeSnap::Leaf { id: map(*id) },
+        Node::Split {
+            dir,
+            ratios,
+            children,
+        } => NodeSnap::Split {
+            dir: match dir {
+                SplitDir::H => "H".into(),
+                SplitDir::V => "V".into(),
+            },
+            ratios: ratios.clone(),
+            children: children.iter().map(|c| node_to_snap(c, map)).collect(),
+        },
+    }
+}
+
+/// Convert a snapshot node to a live layout node. Returns `None` if a leaf id
+/// fails to map (caller drops that branch). Splits collapse after filtering:
+/// 0 children → `None`, 1 child → that child, 2+ → re-normalized split.
+pub fn node_from_snap(n: &NodeSnap, map: &dyn Fn(SnapId) -> Option<WinId>) -> Option<Node> {
+    match n {
+        NodeSnap::Leaf { id } => map(*id).map(Node::Leaf),
+        NodeSnap::Split {
+            dir,
+            ratios,
+            children,
+        } => {
+            let mut kept_children = Vec::new();
+            let mut kept_ratios = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(node) = node_from_snap(child, map) {
+                    kept_children.push(node);
+                    kept_ratios.push(ratios.get(i).copied().unwrap_or(0.0));
+                }
+            }
+            match kept_children.len() {
+                0 => None,
+                1 => Some(kept_children.into_iter().next().unwrap()),
+                n => {
+                    let split_dir = match dir.as_str() {
+                        "V" | "v" => SplitDir::V,
+                        _ => SplitDir::H,
+                    };
+                    Some(Node::Split {
+                        dir: split_dir,
+                        ratios: fix_ratios(&kept_ratios, n),
+                        children: kept_children,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot the tree root, if any.
+pub fn tree_to_snap(tree: &LayoutTree, map: &dyn Fn(WinId) -> SnapId) -> Option<NodeSnap> {
+    tree.root.as_ref().map(|n| node_to_snap(n, map))
+}
+
+/// Rebuild a `LayoutTree` from an optional snapshot root.
+pub fn tree_from_snap(
+    snap: Option<&NodeSnap>,
+    map: &dyn Fn(SnapId) -> Option<WinId>,
+) -> LayoutTree {
+    LayoutTree {
+        root: snap.and_then(|n| node_from_snap(n, map)),
+    }
+}
+
+/// Fix ratios to match `n` children and sum to ~1.0.
+///
+/// If `ratios.len() != n` or the sum is ≈ 0, redistribute equal weights.
+/// When the set is a full match, clamp each ratio ≥ `MIN_RATIO` then
+/// renormalize so the vector sums to 1.0. (No new tree math beyond that.)
+fn fix_ratios(ratios: &[f32], n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let sum: f32 = ratios.iter().copied().sum();
+    if ratios.len() != n || sum.abs() < 1e-6 {
+        return vec![1.0 / n as f32; n];
+    }
+    // Full set: clamp ≥ MIN_RATIO, then renormalize to sum 1.0.
+    let mut out: Vec<f32> = ratios.iter().map(|r| r.max(MIN_RATIO)).collect();
+    let s: f32 = out.iter().copied().sum();
+    if s.abs() < 1e-6 {
+        return vec![1.0 / n as f32; n];
+    }
+    for r in &mut out {
+        *r /= s;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +452,135 @@ mod tests {
     fn version_zero_is_treated_as_one() {
         let s = parse_workspace_json(r#"{"version":0,"desktop":{}}"#);
         assert_eq!(s.version, 1);
+    }
+
+    #[test]
+    fn tree_round_trip_preserves_h_split_ratios() {
+        use crate::layout::{LayoutTree, Node, SplitDir};
+        let tree = LayoutTree {
+            root: Some(Node::Split {
+                dir: SplitDir::H,
+                ratios: vec![0.3, 0.7],
+                children: vec![Node::Leaf(10), Node::Leaf(20)],
+            }),
+        };
+        let to_snap = |id: WinId| id; // identity
+        let snap = tree_to_snap(&tree, &to_snap).unwrap();
+        let from_snap = |id: SnapId| Some(id);
+        let back = tree_from_snap(Some(&snap), &from_snap);
+        match back.root.unwrap() {
+            Node::Split {
+                dir,
+                ratios,
+                children,
+            } => {
+                assert_eq!(dir, SplitDir::H);
+                assert!((ratios[0] - 0.3).abs() < 1e-5);
+                assert!((ratios[1] - 0.7).abs() < 1e-5);
+                assert!(matches!(children[0], Node::Leaf(10)));
+                assert!(matches!(children[1], Node::Leaf(20)));
+            }
+            _ => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn tree_from_snap_drops_unmapped_leaves() {
+        let snap = NodeSnap::Split {
+            dir: "V".into(),
+            ratios: vec![0.5, 0.5],
+            children: vec![
+                NodeSnap::Leaf { id: 1 },
+                NodeSnap::Leaf { id: 999 }, // unmapped
+            ],
+        };
+        let map = |id: SnapId| if id == 1 { Some(5) } else { None };
+        let tree = tree_from_snap(Some(&snap), &map);
+        // Sole remaining leaf becomes root leaf 5 (collapse split with one child)
+        assert!(matches!(tree.root, Some(Node::Leaf(5))));
+    }
+
+    #[test]
+    fn fix_ratios_equal_split_on_mismatch() {
+        // length mismatch → equal weights
+        let r = fix_ratios(&[0.3], 2);
+        assert_eq!(r.len(), 2);
+        assert!((r[0] - 0.5).abs() < 1e-5);
+        assert!((r[1] - 0.5).abs() < 1e-5);
+
+        // sum ≈ 0 → equal weights
+        let r = fix_ratios(&[0.0, 0.0], 2);
+        assert!((r[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn nested_split_round_trip() {
+        let tree = LayoutTree {
+            root: Some(Node::Split {
+                dir: SplitDir::V,
+                ratios: vec![0.4, 0.6],
+                children: vec![
+                    Node::Leaf(1),
+                    Node::Split {
+                        dir: SplitDir::H,
+                        ratios: vec![0.25, 0.75],
+                        children: vec![Node::Leaf(2), Node::Leaf(3)],
+                    },
+                ],
+            }),
+        };
+        let to_snap = |id: WinId| id;
+        let snap = tree_to_snap(&tree, &to_snap).unwrap();
+        let from_snap = |id: SnapId| Some(id);
+        let back = tree_from_snap(Some(&snap), &from_snap);
+        match back.root.unwrap() {
+            Node::Split {
+                dir,
+                ratios,
+                children,
+            } => {
+                assert_eq!(dir, SplitDir::V);
+                assert!((ratios[0] - 0.4).abs() < 1e-5);
+                assert!((ratios[1] - 0.6).abs() < 1e-5);
+                assert!(matches!(children[0], Node::Leaf(1)));
+                match &children[1] {
+                    Node::Split {
+                        dir,
+                        ratios,
+                        children,
+                    } => {
+                        assert_eq!(*dir, SplitDir::H);
+                        assert!((ratios[0] - 0.25).abs() < 1e-5);
+                        assert!((ratios[1] - 0.75).abs() < 1e-5);
+                        assert!(matches!(children[0], Node::Leaf(2)));
+                        assert!(matches!(children[1], Node::Leaf(3)));
+                    }
+                    _ => panic!("expected nested split"),
+                }
+            }
+            _ => panic!("expected root split"),
+        }
+    }
+
+    #[test]
+    fn empty_tree_round_trips() {
+        let tree = LayoutTree { root: None };
+        let to_snap = |id: WinId| id;
+        assert!(tree_to_snap(&tree, &to_snap).is_none());
+        let from_snap = |id: SnapId| Some(id);
+        let back = tree_from_snap(None, &from_snap);
+        assert!(back.root.is_none());
+    }
+
+    #[test]
+    fn unmapped_split_collapses_to_none() {
+        let snap = NodeSnap::Split {
+            dir: "H".into(),
+            ratios: vec![0.5, 0.5],
+            children: vec![NodeSnap::Leaf { id: 1 }, NodeSnap::Leaf { id: 2 }],
+        };
+        let map = |_id: SnapId| None;
+        let tree = tree_from_snap(Some(&snap), &map);
+        assert!(tree.root.is_none());
     }
 }
