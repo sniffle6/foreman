@@ -28,6 +28,7 @@ mod skills_install;
 mod terminal;
 mod theme;
 mod wm;
+mod workspace;
 
 use eframe::egui;
 use terminal::Shell;
