@@ -5,13 +5,30 @@
 //! fields drained after the draw pass (same deferred-Act pattern as chat).
 
 use crate::theme::*;
-use crate::wm::WinId;
+use crate::wm::{Dir, WinId};
 use eframe::egui;
 
 /// Expanded panel width target (px).
 pub const PANEL_W: f32 = 260.0;
 /// Collapsed rail width (px).
 pub const RAIL_W: f32 = 36.0;
+/// Hard cap on expanded extent when side-docked (width), px.
+pub const PANEL_MAX_SIDE: f32 = 420.0;
+/// Hard cap on expanded extent when top/bottom-docked (height), px.
+/// Header + ~8 rows — enough to browse sessions without crushing the landing
+/// (or a sole project) when the panel is the only other leaf.
+pub const PANEL_MAX_EDGE: f32 = 240.0;
+
+/// Clamp for expanded panel extent along the dock axis.
+/// Hard max depends on dock edge; also never more than half the available axis.
+pub fn max_expanded(dock: Dir, axis_len: f32) -> f32 {
+    let hard = match dock {
+        Dir::Left | Dir::Right => PANEL_MAX_SIDE,
+        Dir::Up | Dir::Down => PANEL_MAX_EDGE,
+    };
+    hard.min((axis_len * 0.5).max(RAIL_W))
+        .max(RAIL_W + 40.0)
+}
 /// Per-project column width in horizontal (columns) mode (px).
 const GROUP_W: f32 = 200.0;
 /// Horizontal body shorter than this (project row + one tab row) falls back
@@ -88,6 +105,11 @@ pub struct PanelView {
     pub model: PanelModel,
     pub collapsed: bool,
     pub expanded_width: f32,
+    /// Edge the panel is docked against (`Right` default). Updated from the
+    /// live tree while the panel has a sibling; retained when it is the sole
+    /// leaf (all projects minimized) so re-tile does not shove it back to the
+    /// right rail. Only changes when the user moves the panel in the tree.
+    pub dock: Dir,
     pub scroll: f32,
     pub click: Option<TargetPath>,
     pub hover_act: Option<(TargetPath, PanelBtn)>,
@@ -96,10 +118,16 @@ pub struct PanelView {
 
 impl PanelView {
     pub fn new(collapsed: bool, expanded_width: f32) -> Self {
+        Self::with_dock(collapsed, expanded_width, Dir::Right)
+    }
+
+    pub fn with_dock(collapsed: bool, expanded_width: f32, dock: Dir) -> Self {
+        let max = max_expanded(dock, 10_000.0); // no area yet; hard cap only
         Self {
             model: PanelModel::default(),
             collapsed,
-            expanded_width: expanded_width.clamp(RAIL_W + 40.0, 600.0),
+            expanded_width: expanded_width.clamp(RAIL_W + 40.0, max),
+            dock,
             scroll: 0.0,
             click: None,
             hover_act: None,

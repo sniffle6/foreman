@@ -68,11 +68,12 @@ struct App {
     /// intercepted again.
     force_quit: bool,
     /// The empty-state landing screen (wordmark + inline picker + session
-    /// icons), shown when the desktop is deserted and `landing_enabled`.
+    /// icons), shown when no project is visible (`should_show_landing`) and
+    /// `landing_enabled` — including when every project is merely minimized.
     landing: landing::Landing,
     /// Gated behind `FOREMAN_LANDING`: when unset, startup auto-opens a project
     /// and closing the last one quits (today's behavior); when set, an empty
-    /// desktop shows the landing instead.
+    /// *visible* desktop shows the landing beside the Sessions panel.
     landing_enabled: bool,
     /// Whether the landing rendered last frame. Its false→true edge re-opens and
     /// re-focuses the landing's picker (whose one-shot focus flag is otherwise
@@ -451,10 +452,13 @@ impl eframe::App for App {
                     );
                 }
             }
-            // Task-manager panel is always present (right-edge leaf); not in the
+            // Task-manager panel is always present (docked leaf); not in the
             // workspace snapshot — prefs come from settings.json.
-            self.desktop
-                .ensure_panel(self.settings.panel_collapsed, self.settings.panel_width);
+            self.desktop.ensure_panel(
+                self.settings.panel_collapsed,
+                self.settings.panel_width,
+                self.settings.panel_dock,
+            );
             if !restored && !self.landing_enabled {
                 let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
@@ -484,12 +488,29 @@ impl eframe::App for App {
         }
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
-        if self.landing_enabled && self.desktop.deserted() {
+        // Landing when nothing is *visible* (closed or all minimized). Always
+        // still run the desktop so the Sessions panel stays docked at its
+        // remembered size and minimized PTYs keep pumping; the landing paints
+        // in the content rect beside/above that strip.
+        let show_landing = self.landing_enabled && self.desktop.should_show_landing();
+        if show_landing {
             if !self.landing_shown {
                 self.landing.reopen(); // re-focus the field each time we land here
                 self.landing_shown = true;
             }
-            if let Some(act) = self.landing.show(ui, area, self.recents.entries()) {
+        } else {
+            self.landing_shown = false;
+        }
+        // Skip the desktop only when quitting on a truly empty desktop (no
+        // landing gate) — otherwise the panel / minimized keepalive must run.
+        let quitting_empty = self.started && !self.landing_enabled && self.desktop.deserted();
+        if !quitting_empty {
+            self.desktop
+                .show(ui, area, true, egui::Id::new("desktop"), false);
+        }
+        if show_landing {
+            let content = self.desktop.landing_content_rect(area);
+            if let Some(act) = self.landing.show(ui, content, self.recents.entries()) {
                 match act.kind.launch_command() {
                     // Terminal: a plain shell, as before.
                     None => {
@@ -509,10 +530,6 @@ impl eframe::App for App {
                     ),
                 }
             }
-        } else {
-            self.landing_shown = false;
-            self.desktop
-                .show(ui, area, true, egui::Id::new("desktop"), false);
         }
         // Quit guard: the window's title-bar X and Alt+F4 send
         // ViewportCommand::Close straight to the viewport, bypassing every WM
@@ -547,12 +564,14 @@ impl eframe::App for App {
             self.settings.font_size = live;
             settings_dirty = true;
         }
-        if let Some((collapsed, width)) = self.desktop.panel_prefs() {
+        if let Some((collapsed, width, dock)) = self.desktop.panel_prefs() {
             if collapsed != self.settings.panel_collapsed
                 || (width - self.settings.panel_width).abs() > 0.5
+                || dock != self.settings.panel_dock
             {
                 self.settings.panel_collapsed = collapsed;
                 self.settings.panel_width = width;
+                self.settings.panel_dock = dock;
                 settings_dirty = true;
             }
         }

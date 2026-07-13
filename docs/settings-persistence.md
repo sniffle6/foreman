@@ -16,7 +16,7 @@ setting instead of hand-rolling file I/O again.
   rename over the real file). A crash mid-write leaves the old good file intact.
 - `Settings` → the actual app-settings struct, saved to
   `%APPDATA%\foreman\settings.json`. Today it holds `font_size`,
-  `panel_collapsed`, and `panel_width`.
+  `panel_collapsed`, `panel_width`, and `panel_dock`.
 
 ## Why it exists
 

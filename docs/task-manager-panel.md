@@ -31,6 +31,25 @@ and the landing site for future agent-state badges.
   tiled (`Win::min_from_tree`); `unminimize` re-enters the tree at the leaf
   under the window's old center (best effort — the tree may have changed).
   Windows minimized while floating restore floating.
+- **Dock edge is sticky:** the panel remembers which edge it occupies
+  (`PanelView::dock`, default right). While it has a sibling the live tree
+  re-derives the edge each frame; when every project is minimized the panel is
+  a sole leaf (no dividers) and the last edge is kept. `tile_new` /
+  `unminimize` fall back to inserting on the *opposite* side of that edge, so
+  minimize-all → restore does not shove a bottom-docked panel back to the
+  right rail. The dock only changes when the user moves the panel in the tree.
+- **Sole-leaf strip:** when the panel is the only tiled leaf (all projects
+  closed or minimized), layout pins it to a dock strip of the remembered
+  `expanded_width` / rail extent instead of filling the desktop. That keeps
+  size stable across minimize-all → restore. With `FOREMAN_LANDING`, the
+  landing paints in the remaining content rect (`should_show_landing` —
+  no visible non-panel window, including all-minimized).
+- **Re-pin after tree moves:** any structural tree change that can reshuffle
+  ratios (`insert_beside_panel`, drag-drop split/root, `move_dir`,
+  `place_split`, float toggle, unminimize) calls `repin_panel` — refresh dock
+  from dividers, then `apply_panel_ratio` — so the Sessions panel keeps its
+  remembered extent when dragged to another edge or swapped, not `insert_*`'s
+  50/50.
 - **Collapsed rail is pinned:** while collapsed the desktop re-applies the
   rail extent every frame via `LayoutTree::set_leaf_extent` (which may go below
   `MIN_RATIO`, unlike a normal divider drag), so resizing it — from its own
@@ -70,7 +89,11 @@ and the landing site for future agent-state badges.
 
 - `panel_collapsed` (bool)
 - `panel_width` (f32, expanded px along the dock axis — width when side-docked,
-  height when bottom/top-docked; the key name is persisted, don't rename it)
+  height when bottom/top-docked; the key name is persisted, don't rename it).
+  Capped at `PANEL_MAX_SIDE` (420) side-docked / `PANEL_MAX_EDGE` (240)
+  top/bottom-docked, and never more than half the available axis.
+- `panel_dock` (`"Left"` / `"Right"` / `"Up"` / `"Down"`, default `"Right"`) —
+  edge the panel occupies; restored via `ensure_panel` on next launch
 
 ## Key files
 

@@ -34,7 +34,7 @@ No agents are re-dispatched; no scrollback or Ready state is recovered.
 ## Persistence map
 
 ```text
-settings.json      → font_size, panel_collapsed, panel_width
+settings.json      → font_size, panel_collapsed, panel_width, panel_dock
 keybindings.json   → leader + chords
 recents.json       → MRU open list
 workspace.json     → last desktop layout (this feature)
@@ -68,6 +68,8 @@ if snapshot has restorable projects:
 ensure_panel from settings   # always; panel never in workspace.json
 if nothing restored && !FOREMAN_LANDING:
     auto-open project at cwd (legacy path)
+# With FOREMAN_LANDING: empty *or all-minimized* desktop shows the landing
+# beside the Sessions panel strip (should_show_landing).
 discard take_opened + poll dirty   # restore must not write recents or re-save
 ```
 

@@ -1,8 +1,10 @@
 # Landing: Recent Projects
 
-The landing page (shown when `FOREMAN_LANDING` is set and the desktop is
-empty) keeps a short list of the projects you actually opened, so getting
-back into one is a single click — or Tab, arrows, Enter.
+The landing page (shown when `FOREMAN_LANDING` is set and no project is
+*visible* — none open, or every project minimized) keeps a short list of the
+projects you actually opened, so getting back into one is a single click —
+or Tab, arrows, Enter. The Sessions panel stays docked at its normal size
+beside/above the landing; click a minimized row there to restore it.
 
 ## What it does
 

@@ -97,6 +97,9 @@ pub struct Settings {
     pub panel_collapsed: bool,
     /// Task-manager panel width when expanded (px).
     pub panel_width: f32,
+    /// Edge the task-manager panel is docked against. Survives minimize-all
+    /// and restart; only changes when the user moves the panel in the tree.
+    pub panel_dock: crate::wm::Dir,
 }
 
 impl Default for Settings {
@@ -105,6 +108,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             panel_collapsed: false,
             panel_width: crate::panel::PANEL_W,
+            panel_dock: crate::wm::Dir::Right,
         }
     }
 }
@@ -133,6 +137,7 @@ mod tests {
         assert_eq!(s.font_size, DEFAULT_FONT_SIZE);
         assert!(!s.panel_collapsed);
         assert_eq!(s.panel_width, crate::panel::PANEL_W);
+        assert_eq!(s.panel_dock, crate::wm::Dir::Right);
     }
 
     #[test]
