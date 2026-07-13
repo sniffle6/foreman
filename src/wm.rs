@@ -10,6 +10,26 @@ use std::rc::Rc;
 
 pub type WinId = u64;
 
+/// Result of [`WindowManager::apply_workspace`] / nested manager restore.
+/// Used for startup logs and unit tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub projects_restored: usize,
+    pub projects_skipped: usize,
+}
+
+impl ApplyReport {
+    fn merge(&mut self, other: ApplyReport) {
+        self.projects_restored += other.projects_restored;
+        self.projects_skipped += other.projects_skipped;
+    }
+}
+
+/// Reconstruct an egui rect from a workspace snapshot rect (local min + size).
+fn rect_from_snap(r: &crate::workspace::RectSnap) -> egui::Rect {
+    egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h))
+}
+
 // Default quiescence window for `foreman send`: after writing input, wait this
 // long with no new PTY bytes before replying so a following snapshot reads
 // settled state. MAX_SETTLE_MS is a hard cap on the total wait; it stays under
@@ -512,6 +532,133 @@ impl WindowManager {
             version: crate::workspace::WORKSPACE_VERSION,
             desktop: self.capture_manager(),
         }
+    }
+
+    /// Rebuild this manager (and nested projects) from a cold workspace snapshot.
+    ///
+    /// Clears windows/tree/focus on this manager, remaps snapshot ids to fresh
+    /// `WinId`s, spawns shells for terminal tabs, and restores the layout tree.
+    /// Does **not** call `add_project` (no default terminal, no recents drain)
+    /// and does **not** create a TaskManager panel — callers run `ensure_panel`
+    /// after apply.
+    pub fn apply_workspace(
+        &mut self,
+        snap: &crate::workspace::WorkspaceSnapshot,
+        ctx: &egui::Context,
+    ) -> ApplyReport {
+        self.apply_manager(&snap.desktop, ctx)
+    }
+
+    /// Apply one `ManagerSnap` into `self` (desktop or nested project child).
+    fn apply_manager(
+        &mut self,
+        snap: &crate::workspace::ManagerSnap,
+        ctx: &egui::Context,
+    ) -> ApplyReport {
+        use crate::workspace::{shell_from_str, tree_from_snap, ContentSnap, SnapId};
+        use std::collections::HashMap;
+
+        // Replace live structure; do not reset `next`/`z` so re-apply on a
+        // long-lived manager never reuses ids that may still be referenced.
+        self.windows.clear();
+        self.tree = Default::default();
+        self.focused = None;
+        self.last_focused = None;
+        self.zoomed = None;
+
+        let mut report = ApplyReport::default();
+        let mut snap_id_to_win: HashMap<SnapId, WinId> = HashMap::new();
+
+        for win_snap in &snap.windows {
+            // Provisional id used for term env / project tags; only consumed
+            // if at least one tab materializes.
+            let provisional_id = self.next;
+            let mut tabs: Vec<Tab> = Vec::new();
+            let mut new_active = 0usize;
+            let mut found_active = false;
+
+            for (i, tab_snap) in win_snap.tabs.iter().enumerate() {
+                let content = match &tab_snap.content {
+                    ContentSnap::Terminal { shell } => {
+                        let shell = shell_from_str(shell);
+                        let env = self.term_env(provisional_id);
+                        match Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()) {
+                            Ok(mut s) => {
+                                s.set_term_id(provisional_id);
+                                Content::Terminal(s)
+                            }
+                            Err(e) => {
+                                eprintln!("foreman: restore terminal spawn failed: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                    ContentSnap::Chat => {
+                        Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat)))
+                    }
+                    ContentSnap::Project { child } => {
+                        if child.cwd.as_ref().is_none_or(|p| !p.is_dir()) {
+                            report.projects_skipped += 1;
+                            continue;
+                        }
+                        let mut nested = WindowManager::new();
+                        nested.cwd = child.cwd.clone();
+                        // Tag before nested apply so child terminals get
+                        // FOREMAN_PROJECT_ID (id == provisional, finalized below).
+                        nested.tag = Some(format!("p{provisional_id}"));
+                        let nested_rep = nested.apply_manager(child, ctx);
+                        report.merge(nested_rep);
+                        report.projects_restored += 1;
+                        Content::Project(Box::new(nested))
+                    }
+                };
+                if i == win_snap.active {
+                    new_active = tabs.len();
+                    found_active = true;
+                }
+                tabs.push(Tab {
+                    title: tab_snap.title.clone(),
+                    content,
+                });
+            }
+
+            if tabs.is_empty() {
+                continue;
+            }
+            if !found_active {
+                new_active = 0;
+            }
+            if new_active >= tabs.len() {
+                new_active = tabs.len() - 1;
+            }
+
+            let id = self.next;
+            self.next += 1;
+            self.z += 1;
+            debug_assert_eq!(id, provisional_id);
+            snap_id_to_win.insert(win_snap.id, id);
+
+            self.windows.push(Win {
+                id,
+                tabs,
+                active: new_active,
+                rect: rect_from_snap(&win_snap.rect),
+                z: self.z,
+                minimized: win_snap.minimized,
+                min_from_tree: win_snap.min_from_tree,
+                prev: win_snap.prev.as_ref().map(rect_from_snap),
+            });
+        }
+
+        self.tree = tree_from_snap(snap.tree.as_ref(), &|sid| {
+            snap_id_to_win.get(&sid).copied()
+        });
+        let map = |id: Option<SnapId>| id.and_then(|s| snap_id_to_win.get(&s).copied());
+        self.focused = map(snap.focused);
+        self.last_focused = map(snap.last_focused);
+        self.zoomed = map(snap.zoomed);
+
+        report
     }
 
     // Cascading offset for a freshly spawned window, plus a fresh id + z.
@@ -4894,6 +5041,157 @@ mod tests {
             crate::workspace::ContentSnap::Chat
         ));
         assert_eq!(snap.windows[0].id, id);
+    }
+
+    #[test]
+    fn apply_restores_project_cwd_and_one_shell() {
+        use crate::workspace::{
+            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WinSnap, WorkspaceSnapshot,
+            WORKSPACE_VERSION,
+        };
+        let dir = std::env::temp_dir().join(format!("foreman-ws-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ctx = egui::Context::default();
+        let snap = WorkspaceSnapshot {
+            version: WORKSPACE_VERSION,
+            desktop: ManagerSnap {
+                cwd: None,
+                focused: Some(1),
+                last_focused: None,
+                zoomed: None,
+                windows: vec![WinSnap {
+                    id: 1,
+                    active: 0,
+                    tabs: vec![TabSnap {
+                        title: "proj".into(),
+                        content: ContentSnap::Project {
+                            child: ManagerSnap {
+                                cwd: Some(dir.clone()),
+                                focused: Some(2),
+                                last_focused: None,
+                                zoomed: None,
+                                windows: vec![WinSnap {
+                                    id: 2,
+                                    active: 0,
+                                    tabs: vec![TabSnap {
+                                        title: "cmd".into(),
+                                        content: ContentSnap::Terminal {
+                                            shell: "cmd".into(),
+                                        },
+                                    }],
+                                    minimized: false,
+                                    min_from_tree: false,
+                                    rect: RectSnap {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        w: 580.0,
+                                        h: 380.0,
+                                    },
+                                    prev: None,
+                                }],
+                                tree: Some(NodeSnap::Leaf { id: 2 }),
+                            },
+                        },
+                    }],
+                    minimized: false,
+                    min_from_tree: false,
+                    rect: RectSnap {
+                        x: 10.0,
+                        y: 20.0,
+                        w: 720.0,
+                        h: 480.0,
+                    },
+                    prev: None,
+                }],
+                tree: Some(NodeSnap::Leaf { id: 1 }),
+            },
+        };
+        let mut d = WindowManager::new().as_desktop();
+        let rep = d.apply_workspace(&snap, &ctx);
+        assert_eq!(rep.projects_restored, 1);
+        assert_eq!(rep.projects_skipped, 0);
+
+        let w = d
+            .windows
+            .iter()
+            .find(|w| w.is_project())
+            .expect("project window");
+        assert_eq!(w.rect.min, egui::pos2(10.0, 20.0));
+        assert!(d.tree.contains(w.id), "tree leaf remapped to runtime id");
+        assert_eq!(d.focused, Some(w.id));
+        match &w.tabs[0].content {
+            Content::Project(child) => {
+                assert_eq!(child.cwd.as_ref(), Some(&dir));
+                assert_eq!(child.tag.as_deref(), Some(format!("p{}", w.id).as_str()));
+                assert!(
+                    child.windows.iter().any(|cw| {
+                        cw.tabs
+                            .iter()
+                            .any(|t| matches!(t.content, Content::Terminal(_)))
+                    }),
+                    "expected at least one Terminal tab inside restored project"
+                );
+            }
+            _ => panic!("expected Project content"),
+        }
+        // Apply must not pollute the recents open-drain.
+        assert!(d.take_opened().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_skips_missing_project_dir() {
+        use crate::workspace::{
+            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WinSnap, WorkspaceSnapshot,
+            WORKSPACE_VERSION,
+        };
+        let ctx = egui::Context::default();
+        let snap = WorkspaceSnapshot {
+            version: WORKSPACE_VERSION,
+            desktop: ManagerSnap {
+                cwd: None,
+                focused: Some(1),
+                last_focused: None,
+                zoomed: None,
+                windows: vec![WinSnap {
+                    id: 1,
+                    active: 0,
+                    tabs: vec![TabSnap {
+                        title: "gone".into(),
+                        content: ContentSnap::Project {
+                            child: ManagerSnap {
+                                cwd: Some(std::path::PathBuf::from(
+                                    r"C:\foreman-ws-does-not-exist-xyz",
+                                )),
+                                focused: None,
+                                last_focused: None,
+                                zoomed: None,
+                                windows: vec![],
+                                tree: None,
+                            },
+                        },
+                    }],
+                    minimized: false,
+                    min_from_tree: false,
+                    rect: RectSnap {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 100.0,
+                        h: 100.0,
+                    },
+                    prev: None,
+                }],
+                tree: Some(NodeSnap::Leaf { id: 1 }),
+            },
+        };
+        let mut d = WindowManager::new().as_desktop();
+        let rep = d.apply_workspace(&snap, &ctx);
+        assert_eq!(rep.projects_restored, 0);
+        assert!(rep.projects_skipped >= 1);
+        assert!(d.windows.iter().all(|w| !w.is_project()));
+        assert!(d.windows.is_empty(), "full skip leaves desktop empty");
+        assert!(d.tree.root.is_none());
+        assert!(d.take_opened().is_empty());
     }
 
     #[test]
