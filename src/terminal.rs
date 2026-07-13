@@ -1412,16 +1412,12 @@ impl Session {
                     };
                     let mode = *self.term.mode();
                     let action = crate::input::wheel_input(lines, mode, col, row);
-                    match action {
-                        // Forwarding writes INPUT to the app, so gate on `active`
-                        // (focus) like the key path — hovering an unfocused pane
-                        // must not inject keys/mouse into it. Scrollback is
-                        // read-only and stays available on any hovered pane.
-                        crate::input::WheelAction::Pty(b) => {
-                            if active {
-                                self.send(&b);
-                            }
-                        }
+                    // Hover is the gate (we're inside `resp.hovered()`). Pty
+                    // wheel is navigation under the pointer (SGR / arrows), not
+                    // typed input — so it is not focus-gated (issue #7). Keyboard
+                    // remains focus-gated in `read_input` above.
+                    match crate::input::wheel_action_for_hover(action, active) {
+                        crate::input::WheelAction::Pty(b) => self.send(&b),
                         crate::input::WheelAction::Scrollback(s) => {
                             self.term.scroll_display(s);
                         }

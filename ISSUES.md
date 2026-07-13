@@ -240,52 +240,6 @@ which types the agent command into a default-named PowerShell terminal).
 
 ---
 
-### #7 — Feature: wheel-scroll works over any hovered terminal, focused or not
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
-
-**Request.** Scrolling the mouse wheel over any terminal pane should scroll
-*that* pane — the one under the cursor — without having to focus it first.
-Today this works for some terminals and silently does nothing for others.
-
-**Current behavior (root cause already located).** `Session::show`
-(`src/terminal.rs` ~1164–1217) handles the wheel on `resp.hovered()`, so
-hover-scroll is already the design. The split is in `input::wheel_input`'s
-outcome:
-- `WheelAction::Scrollback` (normal screen — plain shell output): scrolls
-  local scrollback on any hovered pane. **Already works unfocused.**
-- `WheelAction::Pty` (alternate screen / mouse reporting — agent TUIs like
-  Claude Code and Codex, `less`, `vim`): the wheel is translated to mouse
-  events or arrow keys written to the PTY, and this write is gated on
-  `active` (focus) at terminal.rs ~1202–1210, with the comment "hovering an
-  unfocused pane must not inject keys/mouse into it."
-
-So the symptom is: hovering an *unfocused agent terminal* (alt screen) and
-scrolling does nothing — which is most panes in an agent-heavy layout.
-
-**Fix options.**
-1. **Allow wheel-only PTY forwarding on hover** (recommended): relax the
-   `active` gate for `WheelAction::Pty` specifically. The original safety
-   rationale was about injecting input into an unfocused pane; wheel-derived
-   bytes (SGR mouse wheel codes or Up/Down arrows) only navigate/scroll the
-   TUI — they don't type text. Residual risk: in DECCKM arrow-key fallback
-   mode, arrows sent to a TUI whose "cursor" is a menu selection do move that
-   selection (e.g. a fuzzy-finder), which a user hover-scrolling probably
-   expects anyway.
-2. **Focus-follows-scroll**: focus the pane on wheel, then forward. Changes
-   the focus model as a side effect of scrolling (yanks the keyboard from the
-   terminal the user was typing in) — worse; rejected unless (1) proves
-   confusing.
-
-**Verify.** Two terminals side by side, focus A, run `less` (or an agent) in
-B, hover B and scroll: content should move without B taking focus, and
-keystrokes must still go to A. Also confirm Ctrl+Scroll zoom (same handler,
-~1178) keeps working over unfocused panes, and that panes inside an
-*unfocused project* get hover at all (the focus cascade in `src/wm.rs` must
-not have swallowed the pointer before the pane's `resp.hovered()` is set).
-
----
-
 ### #8 — Terminal wheel scrolling feels too sensitive / inconsistent (jumps more than expected)
 
 **Status:** open · **Filed:** 2026-07-10 · **Severity:** medium (core-interaction feel)
@@ -616,3 +570,12 @@ sibling-zoom does not count as visible (interacts with #17). Hover min still
 window (project-level and nested). Tests:
 `surface_target_clears_a_sibling_zoom_*`,
 `surface_target_keeps_the_zoom_when_the_target_is_the_zoomed_window`.
+
+### #7 — Feature: wheel-scroll works over any hovered terminal, focused or not
+
+**Resolved:** Dropped the focus gate on `WheelAction::Pty` in `Session::show`.
+Hover remains the only gate; wheel Pty (SGR / alt-scroll arrows) is navigation
+under the pointer, not typed input. Policy seam
+`input::wheel_action_for_hover`; tests: `wheel_pty_forwards_on_unfocused_hover`,
+`wheel_pty_forwards_when_focused`, `wheel_scrollback_applies_on_unfocused_hover`.
+Keyboard stays focus-gated.

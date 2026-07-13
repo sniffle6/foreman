@@ -307,6 +307,20 @@ pub fn wheel_input(delta_lines: i32, mode: TermMode, col: u16, row: u16) -> Whee
     WheelAction::Scrollback(Scroll::Delta(delta_lines))
 }
 
+/// Resolve a wheel action for a hovered pane.
+///
+/// Caller already gated on hover. Focus is intentionally ignored: both
+/// scrollback and `WheelAction::Pty` (SGR mouse wheel / alt-scroll arrows)
+/// apply under the pointer without requiring the pane to be focused
+/// (issue #7). Pty bytes from the wheel are navigation, not typed text.
+/// Keyboard input stays focus-gated elsewhere in `Session::show`.
+///
+/// The `focused` parameter is accepted so call sites stay explicit and unit
+/// tests pin the unfocused path.
+pub fn wheel_action_for_hover(action: WheelAction, _focused: bool) -> WheelAction {
+    action
+}
+
 /// xterm modifier parameter: `1 + shift + 2*alt + 4*ctrl`. `None` when no
 /// modifiers are held (caller emits the unparameterized form).
 fn mods_param(m: Modifiers) -> Option<u8> {
@@ -948,6 +962,35 @@ mod tests {
     #[test]
     fn wheel_zero_delta_is_a_noop_scrollback() {
         assert_eq!(scrollback_delta(wheel_input(0, TermMode::empty(), 1, 1)), 0);
+    }
+
+    // ---- wheel_action_for_hover (issue #7) -----------------------------------
+    // Hover is the only gate for wheel. Focus is irrelevant: Pty bytes from
+    // the wheel are navigation (SGR / arrows), not typed input.
+
+    #[test]
+    fn wheel_pty_forwards_on_unfocused_hover() {
+        let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        let action = wheel_input(1, mode, 1, 1);
+        assert!(matches!(action, WheelAction::Pty(_)));
+        // Unfocused must still forward — regression pin for issue #7.
+        let applied = wheel_action_for_hover(action, false);
+        assert_eq!(pty(applied), b"\x1b[A");
+    }
+
+    #[test]
+    fn wheel_pty_forwards_when_focused() {
+        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        let action = wheel_input(1, mode, 5, 10);
+        let applied = wheel_action_for_hover(action, true);
+        assert_eq!(pty(applied), b"\x1b[<64;5;10M");
+    }
+
+    #[test]
+    fn wheel_scrollback_applies_on_unfocused_hover() {
+        let action = wheel_input(3, TermMode::empty(), 1, 1);
+        let applied = wheel_action_for_hover(action, false);
+        assert_eq!(scrollback_delta(applied), 3);
     }
 
     // ---- wheel_steps ---------------------------------------------------------
