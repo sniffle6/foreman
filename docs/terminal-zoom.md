@@ -73,13 +73,13 @@ the entire window. If zoom ever "stops working," check these options first.
   path). Zoom is a terminal concept, so that's fine.
 - Smoothing: like line-scroll, the wheel notch arrives as fractional
   `smooth_scroll_delta`, so a per-pane `zoom_accum` carries the remainder and
-  emits whole steps (`ZOOM_NOTCH_PX` ≈ one physical notch).
+  emits whole steps (`input::WHEEL_NOTCH_PX` ≈ one physical notch).
 
 ## Key files
 
 - `src/terminal.rs` — `font_size`/`set_font_size` (the global value),
   `Session::show` (the Ctrl+Scroll branch + reading the live size for the font),
-  `read_input` (Ctrl+0 reset), `zoom_accum`, `ZOOM_NOTCH_PX`.
+  `read_input` (Ctrl+0 reset), `zoom_accum`, `input::WHEEL_NOTCH_PX`.
 - `src/input.rs` — pure `zoom_step`, and the `zoom_reset` flag set by Ctrl+0.
 - `src/main.rs` — `App` seeds/reads-back/persists the size each frame.
 - `src/config.rs` — the size constants and the persisted `Settings`. See

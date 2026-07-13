@@ -240,56 +240,6 @@ which types the agent command into a default-named PowerShell terminal).
 
 ---
 
-### #8 — Terminal wheel scrolling feels too sensitive / inconsistent (jumps more than expected)
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** medium (core-interaction feel)
-
-**Symptom.** Wheel-scrolling a terminal moves more lines than expected, and
-the amount feels inconsistent — sometimes a small flick jumps a large chunk.
-Reporter can't tell if it's oversensitivity or inconsistency.
-
-**How scrolling works today** (`src/terminal.rs` ~1189, `src/input.rs`
-~170/~213): each frame, `smooth_scroll_delta.y` (points) is fed to
-`wheel_steps(accum, dy, rh)` — divide by the row height `rh`, truncate to
-whole lines, carry the remainder. The resulting line count then goes through
-`wheel_input`: local scrollback scrolls that many lines; under mouse
-reporting it emits **one wheel event per line**; on alt-screen with
-alternate-scroll it emits one arrow key per line.
-
-**Candidate causes (all plausible; measure before fixing):**
-1. **Unit mismatch — lines per notch is `notch_points / rh`, not a chosen
-   number.** egui delivers one wheel notch as ~50pt of smooth delta
-   (× the Windows "lines per notch" setting, default 3, via
-   `points_per_scroll_line`). With a row height of ~16–20pt, one physical
-   notch can compute to 5–9 lines. It also means scroll speed silently
-   changes with Ctrl+Scroll font zoom (rh changes) and with the user's
-   Windows wheel setting — "inconsistent."
-2. **Multiplication inside TUIs.** Under mouse reporting we send one wheel
-   *event per computed line*, but most TUIs scroll several lines *per wheel
-   event* (they assume an event ≈ a notch). 6 computed lines → 6 SGR events →
-   the TUI scrolls 6×3 = 18 lines. This makes agent TUIs/pagers jump far more
-   than plain scrollback for the same flick — matching "inconsistent between
-   panes."
-3. **Smoothing + on-demand repaint lumping.** `smooth_scroll_delta` spreads a
-   notch across frames; if foreman isn't repainting continuously when the
-   wheel starts, the first frame can carry several frames' worth, emitting a
-   burst.
-
-**Suggested approach.** First instrument: log (notch points, rh, computed
-lines, emitted events) for one physical notch in (a) plain shell scrollback,
-(b) Claude Code, (c) `less`. Then likely fixes: define lines-per-notch as an
-explicit constant (e.g. 3) independent of `rh` — i.e. accumulate against
-`notch_px / LINES_PER_NOTCH` instead of `rh`; and for mouse-reporting mode,
-emit one wheel event per *notch*, not per line (keep per-line only for the
-arrow-key fallback, where one arrow really is one line). `wheel_steps` /
-`wheel_input` are pure and unit-tested (input.rs ~876–923), so the new ratio
-is a test-first change.
-
-**Verify.** One physical notch scrolls a comparable, modest amount (~3 lines)
-in shell scrollback, `less`, and an agent TUI, at both default and zoomed
-font sizes.
-
----
 
 ### #9 — Chat injection gating + delivery ACK/retry, composed from EXISTING quiescence signals (fixes stuck-input)
 
@@ -579,3 +529,14 @@ under the pointer, not typed input. Policy seam
 `input::wheel_action_for_hover`; tests: `wheel_pty_forwards_on_unfocused_hover`,
 `wheel_pty_forwards_when_focused`, `wheel_scrollback_applies_on_unfocused_hover`.
 Keyboard stays focus-gated.
+
+### #8 — Terminal wheel scrolling feels too sensitive / inconsistent
+
+**Resolved:** Wheel accumulates whole physical notches against
+`input::WHEEL_NOTCH_PX` (not row height). One notch → `LINES_PER_NOTCH` (3)
+scrollback lines or alt-scroll arrows; mouse-reporting emits **one** SGR/X10
+event per notch (not per line). Zoom shares the same notch unit. Tests:
+`wheel_one_notch_scrolls_lines_per_notch`,
+`wheel_sgr_mouse_one_event_per_notch_not_per_line`,
+`wheel_full_notch_points_map_to_one_step_independent_of_row_height`,
+`wheel_alt_scroll_emits_lines_per_notch_arrows`.

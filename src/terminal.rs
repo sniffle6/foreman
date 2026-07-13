@@ -583,23 +583,18 @@ pub struct Session {
     /// egui textures for graphics images, keyed by image id → (data generation,
     /// handle). The egui adapter stays here so `graphics` remains egui-free.
     textures: std::collections::HashMap<u32, (u64, egui::TextureHandle)>,
-    /// Sub-line remainder of wheel scrolling. egui delivers a notch as smoothed
-    /// per-frame fractions; carrying the remainder keeps gentle scrolls from
-    /// rounding to nothing and fast flicks from over-emitting lines.
+    /// Sub-notch remainder of wheel scrolling. Accumulated against
+    /// `input::WHEEL_NOTCH_PX` (not row height) so one physical notch is one
+    /// logical step independent of font zoom (issue #8).
     scroll_accum: f32,
-    /// Sub-notch remainder of Ctrl+Scroll zooming. Same smoothing problem as
-    /// `scroll_accum`, but accumulated against the zoom notch size so a gentle
-    /// Ctrl+wheel still eventually steps the font and a fast flick doesn't lurch.
+    /// Sub-notch remainder of Ctrl+Scroll zooming. Same unit as `scroll_accum`
+    /// (`WHEEL_NOTCH_PX`) so a gentle Ctrl+wheel still eventually steps the font
+    /// and a fast flick doesn't lurch.
     zoom_accum: f32,
     /// Diagnostic trace (FOREMAN_RX_DUMP=<file>): raw PTY chunks plus resize and
     /// host-reply markers. None (zero-cost) when the variable is unset.
     rx_dump: Option<std::fs::File>,
 }
-
-/// Smoothed-scroll points that equal one Ctrl+Scroll zoom notch. egui reports a
-/// wheel notch as ~50 points of `smooth_scroll_delta`, so dividing by this gives
-/// roughly one font step per physical notch.
-const ZOOM_NOTCH_PX: f32 = 50.0;
 
 fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
@@ -1391,27 +1386,36 @@ impl Session {
             });
             if ctrl && dy != 0.0 {
                 // Ctrl+Scroll zooms the GLOBAL terminal font instead of scrolling.
-                // Accumulate against the notch size (same smoothing as line scroll)
-                // and step whole notches; the wheel is fully consumed here so it
-                // neither moves scrollback nor reaches the app.
-                let (steps, rem) = crate::input::wheel_steps(self.zoom_accum, dy, ZOOM_NOTCH_PX);
+                // Same notch unit as scroll (`WHEEL_NOTCH_PX`); the wheel is fully
+                // consumed here so it neither moves scrollback nor reaches the app.
+                let (steps, rem) = crate::input::wheel_steps(
+                    self.zoom_accum,
+                    dy,
+                    crate::input::WHEEL_NOTCH_PX,
+                );
                 self.zoom_accum = rem;
                 if steps != 0.0 {
                     let next = crate::input::zoom_step(font_size(ui.ctx()), steps);
                     set_font_size(ui.ctx(), next);
                 }
             } else if dy != 0.0 {
-                let (steps, rem) = crate::input::wheel_steps(self.scroll_accum, dy, rh);
+                // Accumulate whole physical notches (not row-height lines) so
+                // scroll speed is independent of font zoom (issue #8).
+                let (steps, rem) = crate::input::wheel_steps(
+                    self.scroll_accum,
+                    dy,
+                    crate::input::WHEEL_NOTCH_PX,
+                );
                 self.scroll_accum = rem;
-                let lines = steps as i32;
-                if lines != 0 {
+                let notches = steps as i32;
+                if notches != 0 {
                     // pointer → 1-based viewport cell (mouse-protocol order)
                     let (col, row) = match resp.hover_pos() {
                         Some(p) => metrics.mouse_cell(p),
                         None => (1, 1),
                     };
                     let mode = *self.term.mode();
-                    let action = crate::input::wheel_input(lines, mode, col, row);
+                    let action = crate::input::wheel_input(notches, mode, col, row);
                     // Hover is the gate (we're inside `resp.hovered()`). Pty
                     // wheel is navigation under the pointer (SGR / arrows), not
                     // typed input — so it is not focus-gated (issue #7). Keyboard

@@ -204,14 +204,24 @@ pub fn zoom_step(cur: f32, steps: f32) -> f32 {
         .clamp(crate::config::MIN_FONT_SIZE, crate::config::MAX_FONT_SIZE)
 }
 
+/// egui reports ~50 points of `smooth_scroll_delta` per physical wheel notch
+/// (Windows default). Scroll and Ctrl+Scroll zoom both accumulate against this
+/// so one physical notch is one logical step — independent of font size / row
+/// height (issue #8).
+pub const WHEEL_NOTCH_PX: f32 = 50.0;
+
+/// Lines of local scrollback (or alt-scroll arrow keys) per physical notch.
+/// Keeps one notch a modest, predictable jump (~3 lines) across font zooms
+/// and OS "lines per notch" settings (issue #8).
+pub const LINES_PER_NOTCH: i32 = 3;
+
 /// Accumulate a smoothed wheel delta and emit only whole steps. egui delivers a
-/// wheel notch as sub-frame fractions; dividing `delta` by `unit` (a line height
-/// for scrollback, the zoom notch for Ctrl+Scroll) and truncating both drops
-/// gentle scrolls (→0) and over-emits fast ones, so the caller carries the
-/// fractional part between frames. Returns `(whole_steps, remainder)`: apply
-/// `whole_steps` (sign = direction) and feed `remainder` back as the next
-/// frame's `accum`. Pure so the accumulate→trunc glue is unit-testable without a
-/// live egui `Context`.
+/// wheel notch as sub-frame fractions; dividing `delta` by `unit` (typically
+/// [`WHEEL_NOTCH_PX`]) and truncating both drops gentle scrolls (→0) and
+/// over-emits fast ones, so the caller carries the fractional part between
+/// frames. Returns `(whole_steps, remainder)`: apply `whole_steps` (sign =
+/// direction) and feed `remainder` back as the next frame's `accum`. Pure so
+/// the accumulate→trunc glue is unit-testable without a live egui `Context`.
 pub fn wheel_steps(accum: f32, delta: f32, unit: f32) -> (f32, f32) {
     let acc = accum + delta / unit;
     let steps = acc.trunc();
@@ -247,27 +257,31 @@ pub enum WheelAction {
 
 /// Decide what one wheel gesture means for the terminal under the pointer.
 ///
-/// `delta_lines`: + = wheel up / toward older history, - = wheel down. `(col,
-/// row)`: the 1-based viewport cell under the pointer, used only for mouse
-/// encoding. Pure: same inputs → same bytes.
+/// `delta_notches`: whole physical wheel notches from
+/// `wheel_steps(..., WHEEL_NOTCH_PX)` — + = wheel up / toward older history,
+/// − = wheel down. `(col, row)`: the 1-based viewport cell under the pointer,
+/// used only for mouse encoding. Pure: same inputs → same bytes.
 ///
-/// Precedence: (1) if the app is in any mouse-reporting mode, forward wheel as
-/// mouse events; (2) else if it's on the alternate screen with alternate-scroll
-/// enabled, translate the wheel to arrow keys (so pagers/TUIs scroll); (3) else
-/// scroll foreman's scrollback.
-pub fn wheel_input(delta_lines: i32, mode: TermMode, col: u16, row: u16) -> WheelAction {
-    if delta_lines == 0 {
+/// Precedence: (1) if the app is in any mouse-reporting mode, forward **one
+/// wheel event per notch** (TUIs already multi-line per event — one event per
+/// computed line overshoots, issue #8); (2) else if it's on the alternate
+/// screen with alternate-scroll enabled, emit `LINES_PER_NOTCH` arrow keys per
+/// notch (one arrow = one line); (3) else scroll local scrollback by
+/// `delta_notches * LINES_PER_NOTCH` lines.
+pub fn wheel_input(delta_notches: i32, mode: TermMode, col: u16, row: u16) -> WheelAction {
+    if delta_notches == 0 {
         return WheelAction::Scrollback(Scroll::Delta(0));
     }
-    let up = delta_lines > 0;
-    let count = delta_lines.unsigned_abs() as usize;
+    let up = delta_notches > 0;
+    let notches = delta_notches.unsigned_abs() as usize;
+    let lines = delta_notches.saturating_mul(LINES_PER_NOTCH);
 
-    // (1) Mouse reporting: emit one wheel event per line. Wheel up = button 64,
+    // (1) Mouse reporting: one wheel event per notch. Wheel up = button 64,
     // wheel down = button 65 (xterm's wheel buttons). Wheel has no release.
     if mode.intersects(TermMode::MOUSE_MODE) {
         let button: u16 = if up { 64 } else { 65 };
         let mut bytes = Vec::new();
-        for _ in 0..count {
+        for _ in 0..notches {
             if mode.contains(TermMode::SGR_MOUSE) {
                 // ESC [ < button ; col ; row M   (press; ASCII decimal params)
                 bytes.extend_from_slice(b"\x1b[<");
@@ -290,12 +304,14 @@ pub fn wheel_input(delta_lines: i32, mode: TermMode, col: u16, row: u16) -> Whee
         return WheelAction::Pty(bytes);
     }
 
-    // (2) Alternate screen + alternate-scroll: feed arrow keys. Reuse encode_key
-    // so APP_CURSOR (ESC O A vs ESC [ A) is honored exactly as for real arrows.
+    // (2) Alternate screen + alternate-scroll: one arrow per line. Reuse
+    // encode_key so APP_CURSOR (ESC O A vs ESC [ A) is honored exactly as for
+    // real arrows.
     if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
         let key = if up { Key::ArrowUp } else { Key::ArrowDown };
         let no_mods = Modifiers::default();
         let one = encode_key(key, no_mods, mode);
+        let count = notches * (LINES_PER_NOTCH as usize);
         let mut bytes = Vec::with_capacity(one.len() * count);
         for _ in 0..count {
             bytes.extend_from_slice(&one);
@@ -304,7 +320,7 @@ pub fn wheel_input(delta_lines: i32, mode: TermMode, col: u16, row: u16) -> Whee
     }
 
     // (3) Default: scroll foreman's own scrollback.
-    WheelAction::Scrollback(Scroll::Delta(delta_lines))
+    WheelAction::Scrollback(Scroll::Delta(lines))
 }
 
 /// Resolve a wheel action for a hovered pane.
@@ -891,7 +907,7 @@ mod tests {
         );
     }
 
-    // ---- wheel_input ---------------------------------------------------------
+    // ---- wheel_input (delta = whole notches; issue #8) ------------------------
     // Scroll doesn't derive PartialEq, so match and read the inner delta.
     fn scrollback_delta(a: WheelAction) -> i32 {
         match a {
@@ -905,63 +921,129 @@ mod tests {
             other => panic!("expected Pty, got {other:?}"),
         }
     }
+    fn arrows_up(n: usize) -> Vec<u8> {
+        std::iter::repeat_n(b"\x1b[A".as_slice(), n)
+            .flatten()
+            .copied()
+            .collect()
+    }
+    fn arrows_down(n: usize) -> Vec<u8> {
+        std::iter::repeat_n(b"\x1b[B".as_slice(), n)
+            .flatten()
+            .copied()
+            .collect()
+    }
+    fn ss3_up(n: usize) -> Vec<u8> {
+        std::iter::repeat_n(b"\x1bOA".as_slice(), n)
+            .flatten()
+            .copied()
+            .collect()
+    }
+    fn ss3_down(n: usize) -> Vec<u8> {
+        std::iter::repeat_n(b"\x1bOB".as_slice(), n)
+            .flatten()
+            .copied()
+            .collect()
+    }
 
     #[test]
-    fn wheel_primary_screen_scrolls_local_scrollback() {
-        assert_eq!(scrollback_delta(wheel_input(3, TermMode::empty(), 1, 1)), 3);
+    fn wheel_one_notch_scrolls_lines_per_notch() {
+        // Issue #8: one physical notch → fixed line count, not rh-dependent.
         assert_eq!(
-            scrollback_delta(wheel_input(-2, TermMode::empty(), 1, 1)),
-            -2
+            scrollback_delta(wheel_input(1, TermMode::empty(), 1, 1)),
+            LINES_PER_NOTCH
+        );
+        assert_eq!(
+            scrollback_delta(wheel_input(-1, TermMode::empty(), 1, 1)),
+            -LINES_PER_NOTCH
+        );
+        assert_eq!(
+            scrollback_delta(wheel_input(2, TermMode::empty(), 1, 1)),
+            2 * LINES_PER_NOTCH
         );
     }
+
     #[test]
-    fn wheel_alt_scroll_emits_arrow_keys() {
+    fn wheel_alt_scroll_emits_lines_per_notch_arrows() {
         let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
-        // Up 3 → ArrowUp ×3 (plain CSI, since APP_CURSOR is off).
-        assert_eq!(pty(wheel_input(3, mode, 1, 1)), b"\x1b[A\x1b[A\x1b[A");
-        // Down 3 → ArrowDown ×3.
-        assert_eq!(pty(wheel_input(-3, mode, 1, 1)), b"\x1b[B\x1b[B\x1b[B");
+        let n = LINES_PER_NOTCH as usize;
+        // One notch → LINES_PER_NOTCH arrows (plain CSI; APP_CURSOR off).
+        assert_eq!(pty(wheel_input(1, mode, 1, 1)), arrows_up(n));
+        assert_eq!(pty(wheel_input(-1, mode, 1, 1)), arrows_down(n));
+        // Two notches → 2× lines.
+        assert_eq!(pty(wheel_input(2, mode, 1, 1)), arrows_up(2 * n));
     }
+
     #[test]
     fn wheel_alt_scroll_honors_app_cursor_mode() {
         let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL | TermMode::APP_CURSOR;
-        // SS3 form (ESC O A / ESC O B) when the app set DECCKM.
-        assert_eq!(pty(wheel_input(1, mode, 1, 1)), b"\x1bOA");
-        assert_eq!(pty(wheel_input(-1, mode, 1, 1)), b"\x1bOB");
+        // SS3 form (ESC O A / ESC O B) when the app set DECCKM — still one
+        // arrow per line within the notch.
+        let n = LINES_PER_NOTCH as usize;
+        assert_eq!(pty(wheel_input(1, mode, 1, 1)), ss3_up(n));
+        assert_eq!(pty(wheel_input(-1, mode, 1, 1)), ss3_down(n));
     }
+
     #[test]
-    fn wheel_sgr_mouse_one_line() {
+    fn wheel_sgr_mouse_one_event_per_notch_not_per_line() {
+        // Issue #8 cause (2): TUIs already multi-line per wheel event, so one
+        // notch must be ONE SGR event — not LINES_PER_NOTCH events.
         let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
-        assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
+        let one = pty(wheel_input(1, mode, 5, 10));
+        assert_eq!(one, b"\x1b[<64;5;10M");
         assert_eq!(pty(wheel_input(-1, mode, 5, 10)), b"\x1b[<65;5;10M");
-    }
-    #[test]
-    fn wheel_sgr_mouse_repeats_per_line() {
-        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        // Two notches → two events (still not 2×LINES_PER_NOTCH).
         assert_eq!(
             pty(wheel_input(2, mode, 5, 10)),
             b"\x1b[<64;5;10M\x1b[<64;5;10M"
         );
+        // Must not emit one event per scrollback line within a notch.
+        let mut if_per_line = Vec::new();
+        for _ in 0..LINES_PER_NOTCH {
+            if_per_line.extend_from_slice(&one);
+        }
+        assert_ne!(one, if_per_line);
     }
+
     #[test]
-    fn wheel_x10_mouse_one_line() {
+    fn wheel_x10_mouse_one_event_per_notch() {
         let mode = TermMode::MOUSE_MODE; // no SGR → legacy X10 encoding
         // ESC [ M then (32+button), (32+col), (32+row).
         let expected = vec![0x1b, b'[', b'M', 32 + 64, 32 + 5, 32 + 10];
         assert_eq!(pty(wheel_input(1, mode, 5, 10)), expected);
     }
+
     #[test]
     fn wheel_mouse_mode_beats_alt_scroll() {
-        // Both mouse-reporting AND alt-scroll flags set → mouse wins.
+        // Both mouse-reporting AND alt-scroll flags set → mouse wins (one event,
+        // not LINES_PER_NOTCH arrows).
         let mode = TermMode::MOUSE_MODE
             | TermMode::SGR_MOUSE
             | TermMode::ALT_SCREEN
             | TermMode::ALTERNATE_SCROLL;
         assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
     }
+
     #[test]
     fn wheel_zero_delta_is_a_noop_scrollback() {
         assert_eq!(scrollback_delta(wheel_input(0, TermMode::empty(), 1, 1)), 0);
+    }
+
+    #[test]
+    fn wheel_full_notch_points_map_to_one_step_independent_of_row_height() {
+        // Issue #8 cause (1): accumulate against WHEEL_NOTCH_PX, not row height.
+        let (steps, rem) = wheel_steps(0.0, WHEEL_NOTCH_PX, WHEEL_NOTCH_PX);
+        assert_eq!(steps, 1.0);
+        assert_eq!(rem, 0.0);
+        assert_eq!(
+            scrollback_delta(wheel_input(steps as i32, TermMode::empty(), 1, 1)),
+            LINES_PER_NOTCH
+        );
+        // A row-height unit of 16pt would have emitted 3 steps for 50pt; we must
+        // not use that path — one notch is still one step.
+        let (if_rh, _) = wheel_steps(0.0, WHEEL_NOTCH_PX, 16.0);
+        assert!(if_rh > 1.0, "documents the old over-sensitive rh path");
+        assert_ne!(if_rh, steps);
     }
 
     // ---- wheel_action_for_hover (issue #7) -----------------------------------
@@ -975,7 +1057,7 @@ mod tests {
         assert!(matches!(action, WheelAction::Pty(_)));
         // Unfocused must still forward — regression pin for issue #7.
         let applied = wheel_action_for_hover(action, false);
-        assert_eq!(pty(applied), b"\x1b[A");
+        assert_eq!(pty(applied), arrows_up(LINES_PER_NOTCH as usize));
     }
 
     #[test]
@@ -988,9 +1070,9 @@ mod tests {
 
     #[test]
     fn wheel_scrollback_applies_on_unfocused_hover() {
-        let action = wheel_input(3, TermMode::empty(), 1, 1);
+        let action = wheel_input(1, TermMode::empty(), 1, 1);
         let applied = wheel_action_for_hover(action, false);
-        assert_eq!(scrollback_delta(applied), 3);
+        assert_eq!(scrollback_delta(applied), LINES_PER_NOTCH);
     }
 
     // ---- wheel_steps ---------------------------------------------------------
