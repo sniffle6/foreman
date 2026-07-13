@@ -59,6 +59,8 @@ struct App {
     /// written to disk only after a short debounce so a whole scroll gesture
     /// persists once, not once per notch.
     font_dirty_at: Option<std::time::Instant>,
+    /// Set when the desktop workspace layout changed; written after debounce.
+    workspace_dirty_at: Option<std::time::Instant>,
     /// Last time anything happened (input, PTY output, control msg). Drives the
     /// adaptive repaint cadence: fast while recently active, slow when idle.
     last_activity: Option<std::time::Instant>,
@@ -84,6 +86,9 @@ struct App {
 
 /// Wait this long after the last zoom change before writing `settings.json`.
 const FONT_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+/// Wait this long after the last structural workspace change before writing
+/// `workspace.json` (slightly longer than font — capture walks the full tree).
+const WORKSPACE_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl App {
     fn new(ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>) -> Self {
@@ -97,6 +102,7 @@ impl App {
             ctrl,
             settings: config::Settings::load(),
             font_dirty_at: None,
+            workspace_dirty_at: None,
             last_activity: None,
             force_quit: false,
             landing: landing::Landing::new(
@@ -107,6 +113,16 @@ impl App {
             notify: notify::Notifications::new(),
             recents: recents::Recents::load(),
         }
+    }
+
+    /// Capture the live desktop tree and write `workspace.json` immediately.
+    /// Clears any pending debounce so a later frame does not double-write.
+    fn flush_workspace(&mut self) {
+        let snap = self.desktop.capture_workspace();
+        if let Err(e) = snap.save() {
+            eprintln!("foreman: could not save workspace: {e}");
+        }
+        self.workspace_dirty_at = None;
     }
 }
 
@@ -421,20 +437,33 @@ impl eframe::App for App {
                 o.zoom_with_keyboard = false;
                 o.input_options.zoom_modifier = egui::Modifiers::NONE;
             });
-            // Desktop hosts project windows; each project is its own sandbox.
-            // Task-manager panel is always present (right-edge leaf).
+            // Restore prior layout when possible; otherwise auto-open cwd project
+            // unless the landing screen owns the empty desktop.
+            let snap = workspace::WorkspaceSnapshot::load();
+            let mut restored = false;
+            if !snap.is_empty() {
+                let rep = self.desktop.apply_workspace(&snap, &ctx);
+                restored = rep.projects_restored > 0;
+                if rep.projects_skipped > 0 {
+                    eprintln!(
+                        "foreman: restored {} project(s), skipped {}",
+                        rep.projects_restored, rep.projects_skipped
+                    );
+                }
+            }
+            // Task-manager panel is always present (right-edge leaf); not in the
+            // workspace snapshot — prefs come from settings.json.
             self.desktop
                 .ensure_panel(self.settings.panel_collapsed, self.settings.panel_width);
-            // With the landing enabled, an empty desktop is the landing screen,
-            // so skip the startup auto-project and let the user pick a directory.
-            if !self.landing_enabled {
+            if !restored && !self.landing_enabled {
                 let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
                 self.desktop.tile_new(nid, None);
             }
-            // The startup auto-project is implicit (launch cwd), not a choice —
-            // discard its drain entry so it never pollutes recents (spec).
+            // Auto-project / restore must not pollute recents (spec).
             let _ = self.desktop.take_opened();
+            // Do not leave restore-induced dirty true on first frame.
+            let _ = self.desktop.poll_workspace_dirty();
             self.started = true;
         }
 
@@ -497,6 +526,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         if self.desktop.take_quit_confirmed() {
+            self.flush_workspace();
             self.force_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -505,6 +535,7 @@ impl eframe::App for App {
         // last session. `deserted` stays false while the dir picker or the
         // settings modal is up, so a project being created mid-modal survives.
         if self.started && !self.landing_enabled && self.desktop.deserted() {
+            self.flush_workspace();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
@@ -534,6 +565,15 @@ impl eframe::App for App {
                     eprintln!("foreman: could not save settings: {e}");
                 }
                 self.font_dirty_at = None;
+            }
+        }
+        // Workspace layout: poll structural dirty, debounce write to workspace.json.
+        if self.desktop.poll_workspace_dirty() {
+            self.workspace_dirty_at = Some(std::time::Instant::now());
+        }
+        if let Some(t) = self.workspace_dirty_at {
+            if t.elapsed() >= WORKSPACE_SAVE_DEBOUNCE {
+                self.flush_workspace();
             }
         }
         // Deliver chat now that every Session has pumped this frame: the room
@@ -575,6 +615,10 @@ impl eframe::App for App {
             self.recents
                 .record(path, recents::kind_of_command(cmd.as_deref()));
         }
+    }
+
+    fn on_exit(&mut self) {
+        self.flush_workspace();
     }
 }
 

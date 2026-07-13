@@ -388,6 +388,9 @@ pub struct WindowManager {
     /// frame to record recents. The engine never learns what a "recent" is —
     /// it only reports (spec: open-drain seam).
     opened: Vec<(PathBuf, Option<String>)>,
+    /// Structural workspace change since last poll (layout/open/close/focus/…).
+    /// Desktop `poll_workspace_dirty` ORs this with nested project children.
+    workspace_dirty: bool,
 }
 
 impl WindowManager {
@@ -419,6 +422,7 @@ impl WindowManager {
             quit_confirmed: false,
             app_modal: false,
             opened: Vec::new(),
+            workspace_dirty: false,
         }
     }
 
@@ -532,6 +536,31 @@ impl WindowManager {
             version: crate::workspace::WORKSPACE_VERSION,
             desktop: self.capture_manager(),
         }
+    }
+
+    /// Flag that the workspace layout (or nested project layout) changed.
+    pub fn mark_workspace_dirty(&mut self) {
+        self.workspace_dirty = true;
+    }
+
+    /// Consume this manager's local dirty bit (does not recurse).
+    pub fn take_workspace_dirty(&mut self) -> bool {
+        let d = self.workspace_dirty;
+        self.workspace_dirty = false;
+        d
+    }
+
+    /// True if this manager or any nested project child is dirty; clears all.
+    pub fn poll_workspace_dirty(&mut self) -> bool {
+        let mut dirty = self.take_workspace_dirty();
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Project(child) = &mut t.content {
+                    dirty |= child.poll_workspace_dirty();
+                }
+            }
+        }
+        dirty
     }
 
     /// Rebuild this manager (and nested projects) from a cold workspace snapshot.
@@ -699,6 +728,7 @@ impl WindowManager {
             rect,
             Content::Terminal(s),
         );
+        self.mark_workspace_dirty();
         Some(id)
     }
 
@@ -759,6 +789,7 @@ impl WindowManager {
             child.tile_new(tid, None);
         }
         self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        self.mark_workspace_dirty();
         id
     }
 
@@ -798,6 +829,7 @@ impl WindowManager {
             }
         }
         self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        self.mark_workspace_dirty();
         id
     }
 
@@ -1375,6 +1407,7 @@ impl WindowManager {
         if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid) {
             if let Content::Project(child) = &mut win.tabs[win.active].content {
                 child.close(tid);
+                child.mark_workspace_dirty();
             }
         }
     }
@@ -1416,6 +1449,7 @@ impl WindowManager {
             debug_assert!(false, "just-pushed window {id} missing");
         }
         self.focused = prev_focus;
+        self.mark_workspace_dirty();
         Ok(id)
     }
 
@@ -1443,6 +1477,7 @@ impl WindowManager {
             rect,
             Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
         );
+        self.mark_workspace_dirty();
     }
 
     /// Apply crew-board clicks recorded during the draw (content cannot
@@ -2210,6 +2245,11 @@ impl WindowManager {
                 }
             }
         }
+        // Keyboard commands bypass `apply_acts`; over-mark is fine (extra saves).
+        match cmd {
+            Command::Help | Command::OpenSettings | Command::NewProject => {}
+            _ => self.mark_workspace_dirty(),
+        }
     }
 
     /// Open the keybindings editor modal (desktop only). Closes the read-only
@@ -2264,6 +2304,7 @@ impl WindowManager {
         if self.last_focused == Some(id) {
             self.last_focused = None;
         }
+        self.mark_workspace_dirty();
         // End an in-flight rename of this window: the rename editor lives in
         // the (now gone) header, and a dangling `renaming` blocks focus for
         // EVERY window until restart.
@@ -2462,11 +2503,16 @@ impl WindowManager {
         match outcome {
             crate::confirm::ConfirmOutcome::Pending => self.pending_close = Some(pending),
             crate::confirm::ConfirmOutcome::Cancelled => {}
-            crate::confirm::ConfirmOutcome::Confirmed => match pending.target {
-                CloseTarget::ActiveTab(id) => self.close_active_tab(id),
-                CloseTarget::Tab(id, idx) => self.close_tab(id, idx),
-                CloseTarget::Quit => self.quit_confirmed = true,
-            },
+            crate::confirm::ConfirmOutcome::Confirmed => {
+                match pending.target {
+                    CloseTarget::ActiveTab(id) => self.close_active_tab(id),
+                    CloseTarget::Tab(id, idx) => self.close_tab(id, idx),
+                    CloseTarget::Quit => self.quit_confirmed = true,
+                }
+                // Close (and quit-accept) are structural; empty desktop after
+                // last-project close should persist as empty on next launch.
+                self.mark_workspace_dirty();
+            }
         }
     }
 
@@ -3211,6 +3257,7 @@ impl WindowManager {
                     w.rect = w.rect.translate(dr.drag_delta());
                     clamp(&mut w.rect, asz);
                 }
+                self.mark_workspace_dirty();
                 scr = self.windows[i].rect.translate(area.min.to_vec2());
 
                 // --- merge target detection: is the pointer over another window? ---
@@ -3268,6 +3315,7 @@ impl WindowManager {
                                     }
                                 }
                                 self.tree.insert_split(t, id, side);
+                                self.mark_workspace_dirty();
                             }
                             crate::layout::DropTarget::Root(side) => {
                                 if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -3276,6 +3324,7 @@ impl WindowManager {
                                     }
                                 }
                                 self.tree.insert_root(id, side);
+                                self.mark_workspace_dirty();
                             }
                         }
                         // Rect refits from the tree next frame (one frame at the drop
@@ -3429,6 +3478,7 @@ impl WindowManager {
                         if !t.is_empty() {
                             let a = self.windows[i].active;
                             self.windows[i].tabs[a].title = t;
+                            self.mark_workspace_dirty();
                         }
                         self.renaming = None;
                     }
@@ -4026,6 +4076,7 @@ impl WindowManager {
                 } else {
                     resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz);
                 }
+                self.mark_workspace_dirty();
             }
         }
 
@@ -4173,6 +4224,9 @@ impl WindowManager {
         if self.app_modal || self.picker.is_some() || self.settings.is_some() {
             return;
         }
+        if acts.is_empty() {
+            return;
+        }
         for a in acts {
             match a {
                 Act::Focus(id) => self.focus(id),
@@ -4229,6 +4283,8 @@ impl WindowManager {
                 Act::ClosePath(p) => self.apply_close_path(p),
             }
         }
+        // Any applied act can change focus/layout/tabs; over-dirty is intentional.
+        self.mark_workspace_dirty();
     }
 
     /// Desktop-level modal overlays drawn last, on top of everything: the dir
@@ -4940,6 +4996,18 @@ mod tests {
         });
         wm.focused = Some(id);
         id
+    }
+
+    #[test]
+    fn nested_mark_surfaces_on_desktop_poll() {
+        let mut d = WindowManager::new().as_desktop();
+        let _id = push(&mut d, "p");
+        // mark dirty on nested project manager
+        if let Content::Project(child) = &mut d.windows[0].tabs[0].content {
+            child.mark_workspace_dirty();
+        }
+        assert!(d.poll_workspace_dirty());
+        assert!(!d.poll_workspace_dirty(), "take clears");
     }
 
     #[test]
