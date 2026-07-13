@@ -1251,6 +1251,13 @@ impl WindowManager {
             return;
         };
         self.unminimize(path.project);
+        // Zoom is render-order only, so a zoomed *other* window keeps painting
+        // full-area over the target we are about to focus — surfacing it must
+        // drop that zoom or focus lands on a window the user cannot see. A click
+        // on the zoomed window itself keeps its zoom.
+        if self.zoomed.is_some_and(|z| z != path.project) {
+            self.unzoom();
+        }
 
         match path.window {
             None => {
@@ -1266,6 +1273,9 @@ impl WindowManager {
                 };
                 self.windows[pidx].active = pi;
                 if let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content {
+                    if inner.zoomed.is_some_and(|z| z != wid) {
+                        inner.unzoom();
+                    }
                     inner.unminimize(wid);
                     if let Some(cw) = inner.windows.iter_mut().find(|w| w.id == wid) {
                         if let Some(t) = path.tab {
@@ -2374,14 +2384,7 @@ impl WindowManager {
     /// rect round-trips via `prev`.
     fn toggle_zoom(&mut self, id: WinId) {
         if self.zoomed == Some(id) {
-            self.zoomed = None;
-            if !self.tree.contains(id) {
-                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                    if let Some(pr) = w.prev.take() {
-                        w.rect = pr;
-                    }
-                }
-            }
+            self.unzoom();
         } else {
             if !self.tree.contains(id) {
                 if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -2391,6 +2394,22 @@ impl WindowManager {
             self.zoomed = Some(id);
         }
         self.focus(id);
+    }
+
+    /// Drop any zoom, restoring a floating window's pre-zoom rect (the per-frame
+    /// re-fit overwrites `rect` while zoomed). No-op when nothing is zoomed, and
+    /// unlike `toggle_zoom` it does not move focus.
+    fn unzoom(&mut self) {
+        let Some(id) = self.zoomed.take() else {
+            return;
+        };
+        if !self.tree.contains(id) {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                if let Some(pr) = w.prev.take() {
+                    w.rect = pr;
+                }
+            }
+        }
     }
 
     /// Move the focused window within the tiled layer. Tiled: swap with the
@@ -7512,6 +7531,151 @@ mod tests {
         assert!(!c.minimized, "child window must be restored");
         assert_eq!(c.active, 1, "background tab must become active");
         assert_eq!(inner.focused, Some(cw), "child must take inner focus");
+    }
+
+    /// Builds a desktop with one project window holding an inner manager of two
+    /// tiled child windows (a, b), `a` zoomed. Returns (desk, proj, a, b).
+    fn zoomed_project(desk: &mut WindowManager) -> (WinId, WinId, WinId) {
+        let proj = push(desk, "proj");
+        let mut inner = WindowManager::new();
+        inner.last_area = egui::vec2(800.0, 600.0);
+        let a = push(&mut inner, "a");
+        let b = push(&mut inner, "b");
+        inner.tree.insert_root(a, Dir::Right);
+        inner.tree.insert_root(b, Dir::Right);
+        inner.toggle_zoom(a);
+        assert_eq!(inner.zoomed, Some(a), "precondition: a is zoomed");
+        desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
+            Content::Project(Box::new(inner));
+        (proj, a, b)
+    }
+
+    fn inner_of(desk: &WindowManager, proj: WinId) -> &WindowManager {
+        let pw = desk.windows.iter().find(|w| w.id == proj).unwrap();
+        let Content::Project(inner) = &pw.tabs[0].content else {
+            panic!("expected a project")
+        };
+        inner
+    }
+
+    #[test]
+    fn surface_target_clears_a_sibling_zoom_inside_a_project() {
+        // Zoom is render-order only: a zoomed sibling keeps painting full-area on
+        // top, so focusing another terminal without un-zooming focuses a window
+        // the user cannot see.
+        let mut desk = WindowManager::new();
+        let (proj, _a, b) = zoomed_project(&mut desk);
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: proj,
+            ptab: None,
+            window: Some(b),
+            tab: None,
+        });
+
+        let inner = inner_of(&desk, proj);
+        assert_eq!(
+            inner.zoomed, None,
+            "a sibling's zoom must not cover the newly focused target"
+        );
+        assert_eq!(
+            inner.focused,
+            Some(b),
+            "the clicked child takes inner focus"
+        );
+    }
+
+    #[test]
+    fn surface_target_keeps_the_zoom_when_the_target_is_the_zoomed_window() {
+        let mut desk = WindowManager::new();
+        let (proj, a, _b) = zoomed_project(&mut desk);
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: proj,
+            ptab: None,
+            window: Some(a),
+            tab: None,
+        });
+
+        let inner = inner_of(&desk, proj);
+        assert_eq!(
+            inner.zoomed,
+            Some(a),
+            "clicking the zoomed window's own row must not un-zoom it"
+        );
+    }
+
+    #[test]
+    fn surface_target_restores_a_floating_zoomed_siblings_rect() {
+        // A floating window's rect is overwritten by the per-frame re-fit while
+        // zoomed; un-zooming must round-trip it through `prev`, exactly as
+        // toggle_zoom does.
+        let mut desk = WindowManager::new();
+        let proj = push(&mut desk, "proj");
+        let mut inner = WindowManager::new();
+        inner.last_area = egui::vec2(800.0, 600.0);
+        let a = push(&mut inner, "a"); // floating: never tiled
+        let b = push(&mut inner, "b");
+        inner.tree.insert_root(b, Dir::Right);
+        let home = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(300.0, 200.0));
+        inner.windows.iter_mut().find(|w| w.id == a).unwrap().rect = home;
+        inner.toggle_zoom(a);
+        // what the per-frame re-fit does to the zoomed window
+        inner.windows.iter_mut().find(|w| w.id == a).unwrap().rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, inner.last_area);
+        desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
+            Content::Project(Box::new(inner));
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: proj,
+            ptab: None,
+            window: Some(b),
+            tab: None,
+        });
+
+        let inner = inner_of(&desk, proj);
+        assert_eq!(inner.zoomed, None);
+        let aw = inner.windows.iter().find(|w| w.id == a).unwrap();
+        assert_eq!(
+            aw.rect, home,
+            "the un-zoomed floater returns to its own rect"
+        );
+    }
+
+    #[test]
+    fn surface_target_clears_a_zoomed_sibling_project_on_the_desktop() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1200.0, 800.0);
+        let p1 = push(&mut desk, "p1");
+        let p2 = push(&mut desk, "p2");
+        desk.tree.insert_root(p1, Dir::Right);
+        desk.tree.insert_root(p2, Dir::Right);
+        desk.toggle_zoom(p1);
+
+        desk.surface_target(crate::panel::TargetPath {
+            project: p2,
+            ptab: None,
+            window: None,
+            tab: None,
+        });
+        assert_eq!(
+            desk.zoomed, None,
+            "a zoomed project must not cover another project focused from the panel"
+        );
+        assert_eq!(desk.focused, Some(p2));
+
+        desk.toggle_zoom(p2);
+        desk.surface_target(crate::panel::TargetPath {
+            project: p2,
+            ptab: None,
+            window: None,
+            tab: None,
+        });
+        assert_eq!(
+            desk.zoomed,
+            Some(p2),
+            "clicking the zoomed project's own row keeps the zoom"
+        );
     }
 
     #[test]

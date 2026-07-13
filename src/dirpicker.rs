@@ -505,10 +505,7 @@ impl DirPicker {
             // rows already includes Parent when the base has one; still count
             // height as directories + 1 so the '../' row always has a slot (and so a
             // slightly short row_h never clips the last line).
-            let n_dirs = rows
-                .iter()
-                .filter(|r| matches!(r, Row::Dir(_)))
-                .count();
+            let n_dirs = rows.iter().filter(|r| matches!(r, Row::Dir(_))).count();
             let n_rows = n_dirs + 1; // +1 for ../
             let drop_h = if rows.is_empty() {
                 0.0
@@ -545,8 +542,7 @@ impl DirPicker {
                                                 .to_string_lossy()
                                                 .into_owned(),
                                         };
-                                        let resp =
-                                            ui.selectable_label(idx == self.selected, label);
+                                        let resp = ui.selectable_label(idx == self.selected, label);
                                         if resp.clicked() {
                                             clicked = Some(idx);
                                         }

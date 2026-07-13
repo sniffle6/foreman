@@ -53,29 +53,28 @@ pub fn system_emoji_raster() -> Box<dyn EmojiRaster> {
 #[cfg(windows)]
 mod dwrite_impl {
     use super::{EmojiRaster, RgbaGlyph};
-    use windows::core::w;
     use windows::Win32::Graphics::Direct2D::Common::{
         D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
     };
     use windows::Win32::Graphics::Direct2D::{
-        D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
-        D2D1_FACTORY_TYPE_MULTI_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-        D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1_RENDER_TARGET_USAGE_NONE,
+        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_MULTI_THREADED,
+        D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget,
     };
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
         DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS, DWriteCreateFactory, IDWriteFactory,
+        IDWriteTextFormat, IDWriteTextLayout,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, IWICBitmap, IWICImagingFactory, GUID_WICPixelFormat32bppPBGRA,
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
         WICBitmapCacheOnDemand,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
     };
+    use windows::core::w;
 
     /// Color-glyph rasterizer via Segoe UI Emoji + D2D color-font draw.
     ///
@@ -102,16 +101,12 @@ mod dwrite_impl {
                 let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
                     .map_err(|e| format!("DWriteCreateFactory: {e}"))?;
 
-                let d2d: ID2D1Factory =
-                    D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None)
-                        .map_err(|e| format!("D2D1CreateFactory: {e}"))?;
+                let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, None)
+                    .map_err(|e| format!("D2D1CreateFactory: {e}"))?;
 
-                let wic: IWICImagingFactory = CoCreateInstance(
-                    &CLSID_WICImagingFactory,
-                    None,
-                    CLSCTX_INPROC_SERVER,
-                )
-                .map_err(|e| format!("WIC CoCreateInstance: {e}"))?;
+                let wic: IWICImagingFactory =
+                    CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                        .map_err(|e| format!("WIC CoCreateInstance: {e}"))?;
 
                 Ok(Self { dwrite, d2d, wic })
             }
@@ -178,7 +173,12 @@ mod dwrite_impl {
 
                 let bitmap: IWICBitmap = self
                     .wic
-                    .CreateBitmap(bw, bh, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand)
+                    .CreateBitmap(
+                        bw,
+                        bh,
+                        &GUID_WICPixelFormat32bppPBGRA,
+                        WICBitmapCacheOnDemand,
+                    )
                     .map_err(|e| format!("CreateBitmap: {e}"))?;
 
                 let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
@@ -231,7 +231,9 @@ mod dwrite_impl {
                 rt.EndDraw(None, None)
                     .map_err(|e| format!("EndDraw: {e}"))?;
 
-                let stride = bw.checked_mul(4).ok_or_else(|| "stride overflow".to_string())?;
+                let stride = bw
+                    .checked_mul(4)
+                    .ok_or_else(|| "stride overflow".to_string())?;
                 let nbytes = (stride as usize)
                     .checked_mul(bh as usize)
                     .ok_or_else(|| "buf overflow".to_string())?;
@@ -247,11 +249,7 @@ mod dwrite_impl {
                     return Ok(None);
                 }
 
-                Ok(Some(RgbaGlyph {
-                    w: bw,
-                    h: bh,
-                    rgba,
-                }))
+                Ok(Some(RgbaGlyph { w: bw, h: bh, rgba }))
             }
         }
     }

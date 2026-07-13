@@ -47,10 +47,8 @@ impl ChatView {
         // board/log lay out above it. The painter keeps the FULL rect (it must
         // draw the strip chrome too).
         const INPUT_H: f32 = 32.0;
-        let input_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x, rect.max.y - INPUT_H),
-            rect.max,
-        );
+        let input_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - INPUT_H), rect.max);
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, WIN_BG);
         let rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
@@ -133,8 +131,9 @@ impl ChatView {
                     egui::FontId::proportional(11.5),
                     name_col,
                 );
-                job.wrap =
-                    egui::text::TextWrapping::truncate_at_width((age_rect.min.x - 6.0 - label_x).max(0.0));
+                job.wrap = egui::text::TextWrapping::truncate_at_width(
+                    (age_rect.min.x - 6.0 - label_x).max(0.0),
+                );
                 let g = p.layout_job(job);
                 p.galley(
                     egui::pos2(label_x, row.center().y - g.size().y * 0.5),
@@ -344,8 +343,8 @@ impl ChatView {
         if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             self.pending_post = Some(std::mem::take(&mut self.input));
             te.request_focus(); // keep typing; multi-post sessions are the norm
-                                 // Escape defocuses the field at frame start (egui Focus::begin_pass),
-                                 // so detect it as lost_focus + Escape — has_focus() is already false.
+        // Escape defocuses the field at frame start (egui Focus::begin_pass),
+        // so detect it as lost_focus + Escape — has_focus() is already false.
         } else if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.input.clear();
         }

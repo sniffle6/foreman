@@ -1809,7 +1809,11 @@ mod tests {
             34,
             "Delete must remove exactly one whole emoji: {t:?}"
         );
-        assert_eq!(t.matches('\u{1F952}').count(), 11, "Delete hit the wrong glyph: {t:?}");
+        assert_eq!(
+            t.matches('\u{1F952}').count(),
+            11,
+            "Delete hit the wrong glyph: {t:?}"
+        );
     }
 
     /// Regression (live report 2026-07-13): the wide-edit handlers must
@@ -1848,11 +1852,7 @@ mod tests {
         // Condition-based waiting (repo rule: no sleep-tuning). A live shell's
         // echo latency varies with machine load; fixed settles made this test
         // flake 3 times before this rewrite.
-        fn wait_until(
-            s: &mut Session,
-            what: &str,
-            mut cond: impl FnMut(&mut Session) -> bool,
-        ) {
+        fn wait_until(s: &mut Session, what: &str, mut cond: impl FnMut(&mut Session) -> bool) {
             let dl = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 s.pump();
@@ -1885,9 +1885,15 @@ mod tests {
                     // hash the enum variants cheaply; exact values don't matter,
                     // only that the row's coloring CHANGED.
                     let f = format!("{:?}", cell.fg).len() as u32
-                        + format!("{:?}", cell.fg).chars().map(|ch| ch as u32).sum::<u32>();
+                        + format!("{:?}", cell.fg)
+                            .chars()
+                            .map(|ch| ch as u32)
+                            .sum::<u32>();
                     let b = format!("{:?}", cell.bg).len() as u32
-                        + format!("{:?}", cell.bg).chars().map(|ch| ch as u32).sum::<u32>();
+                        + format!("{:?}", cell.bg)
+                            .chars()
+                            .map(|ch| ch as u32)
+                            .sum::<u32>();
                     (f, b)
                 })
                 .collect()
@@ -1926,7 +1932,12 @@ mod tests {
         wait_until(&mut s, "Ctrl+A to repaint the row as selected", |s| {
             row_colors(s) != before_ctrl_a
         });
-        press(&ctx, &mut s, egui::Key::Backspace, egui::Modifiers::default());
+        press(
+            &ctx,
+            &mut s,
+            egui::Key::Backspace,
+            egui::Modifiers::default(),
+        );
         // NOTE: assert on a PREFIX. A one-char delete (the bug) leaves
         // "ZZmarkerZ", which no longer contains "ZZmarkerZZ" — asserting the
         // full marker's absence would be a false green. Verified: this fails
@@ -1977,7 +1988,12 @@ mod tests {
         // If RightArrow did NOT accept, Enter runs `Write-Output QQ` instead:
         // the prediction text vanishes with the redraw and the count DROPS.
         let before = screen(&mut s).matches("QQpredictQQ").count();
-        press(&ctx, &mut s, egui::Key::ArrowRight, egui::Modifiers::default());
+        press(
+            &ctx,
+            &mut s,
+            egui::Key::ArrowRight,
+            egui::Modifiers::default(),
+        );
         press(&ctx, &mut s, egui::Key::Enter, egui::Modifiers::default());
         wait_until(
             &mut s,
@@ -2017,7 +2033,10 @@ mod tests {
         ));
         let _ = ctx.run_ui(ri, |ui| s.read_input(ui));
         settle(&mut s, 1800);
-        assert_eq!(s.snapshot_text(None).join("").matches('\u{FFFD}').count(), 0);
+        assert_eq!(
+            s.snapshot_text(None).join("").matches('\u{FFFD}').count(),
+            0
+        );
 
         // 30 repeats at ~25ms — far faster than the wrapped-line redraw.
         for _ in 0..30 {

@@ -560,11 +560,7 @@ mod tests {
         let term = term_with(b"ab", 4, 1);
         let m = metrics(4, 1);
         let plan = plan_paint(term.grid(), &m);
-        let visible: Vec<_> = plan
-            .glyphs
-            .iter()
-            .filter(|g| g.ch != ' ')
-            .collect();
+        let visible: Vec<_> = plan.glyphs.iter().filter(|g| g.ch != ' ').collect();
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].col, 0);
         assert_eq!(visible[0].ch, 'a');
@@ -592,7 +588,12 @@ mod tests {
         }
 
         let wides: Vec<_> = plan.glyphs.iter().filter(|g| g.width_cells == 2).collect();
-        assert_eq!(wides.len(), 2, "expected two wide CJK glyphs; got {:?}", plan.glyphs);
+        assert_eq!(
+            wides.len(),
+            2,
+            "expected two wide CJK glyphs; got {:?}",
+            plan.glyphs
+        );
         assert_eq!((wides[0].col, wides[0].ch), (0, '你'));
         assert_eq!((wides[1].col, wides[1].ch), (2, '好'));
     }
@@ -637,9 +638,7 @@ mod tests {
         let m = metrics(4, 2);
         let plan = plan_paint(term.grid(), &m);
         assert!(
-            plan.glyphs
-                .iter()
-                .all(|g| !(g.row == 1 && g.col == 0)),
+            plan.glyphs.iter().all(|g| !(g.row == 1 && g.col == 0)),
             "LEADING_WIDE_CHAR_SPACER must not be painted: {:?}",
             plan.glyphs
         );

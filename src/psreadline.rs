@@ -95,8 +95,14 @@ mod tests {
     /// every PowerShell spawn, so pin it.
     #[test]
     fn wide_edit_fix_is_spawn_safe() {
-        assert!(!WIDE_EDIT_FIX.contains('"'), "double quote breaks spawn_argv");
-        assert!(!WIDE_EDIT_FIX.contains('\''), "single quote breaks spawn_argv");
+        assert!(
+            !WIDE_EDIT_FIX.contains('"'),
+            "double quote breaks spawn_argv"
+        );
+        assert!(
+            !WIDE_EDIT_FIX.contains('\''),
+            "single quote breaks spawn_argv"
+        );
         assert!(!WIDE_EDIT_FIX.contains('\n'), "newline breaks spawn_argv");
         assert!(!WIDE_EDIT_FIX.contains('\r'), "newline breaks spawn_argv");
     }
@@ -118,14 +124,19 @@ mod tests {
             "RightArrow must stay stock or inline-prediction accept breaks"
         );
         assert!(
-            WIDE_EDIT_FIX.contains("Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue"),
+            WIDE_EDIT_FIX
+                .contains("Get-Command Set-PSReadLineKeyHandler -ErrorAction SilentlyContinue"),
             "must degrade to a no-op when PSReadLine is absent"
         );
         // The re-render encoding fix is load-bearing (emoji -> '?' without it).
         assert!(WIDE_EDIT_FIX.contains("[Console]::OutputEncoding=[Text.Encoding]::UTF8"));
         // Every handler must fall through to the built-in, or defaults (like
         // deleting an active selection) silently die.
-        for builtin in ["BackwardDeleteChar($key,$arg)", "DeleteChar($key,$arg)", "BackwardChar($key,$arg)"] {
+        for builtin in [
+            "BackwardDeleteChar($key,$arg)",
+            "DeleteChar($key,$arg)",
+            "BackwardChar($key,$arg)",
+        ] {
             assert!(
                 WIDE_EDIT_FIX.contains(builtin),
                 "handler must delegate to {builtin}"
@@ -138,6 +149,9 @@ mod tests {
         let args = wide_edit_fix_args();
         assert_eq!(args[0], "-NoExit");
         assert_eq!(args[1], "-Command");
-        assert!(!args.contains(&"-NoProfile".to_string()), "profile must load");
+        assert!(
+            !args.contains(&"-NoProfile".to_string()),
+            "profile must load"
+        );
     }
 }
