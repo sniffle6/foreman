@@ -9,15 +9,16 @@ app is fully chromeless and the content runs edge to edge.
 
 ## How to use it
 
-- **Reveal the bar:** move the pointer to the top edge of the app — it opens
-  **instantly**. The open zone is `CHROME_REVEAL` (10px from the top): a few
+- **Reveal the bar:** move the pointer to the top edge of the app and hold
+  briefly — a short **open dwell** (`CHROME_OPEN_DWELL`, ~150ms) skips
+  pass-throughs. The open zone is `CHROME_REVEAL` (10px from the top): a few
   px past the painted border for an easier hit, short of the project/terminal
   titleband so the in-app ✕ isn't stolen.
 - **Hide it:** move the pointer back down past the bar. A short **coyote
   timer** (`CHROME_COYOTE`, ~250ms) holds it open so a brief miss doesn't
   retract it; only after that does it slide up (drawer-style). Re-hovering
   during the coyote window or mid-close cancels the hide and reverse-slides
-  the bar back open.
+  the bar back open **immediately** (no open dwell).
 - **Move the window:** drag the revealed bar (hands off to the OS move loop, so
   Aero Snap drag-to-edge still works). Double-click toggles maximize.
 - **Resize the window:** grab the outer 5px rim of the window on any edge or
@@ -49,10 +50,10 @@ follow-up.
 
 ## Gotchas
 
-- Open is instant on the thin top border; close is delayed (coyote). Mid-close
-  re-hover uses the full bar height (`CHROME_KEEP`) while the slide progress
-  is still > 0, so you can catch the retracting bar without finding the 7px
-  strip again.
+- First open dwells ~150ms on the thin top border; close is delayed longer
+  (coyote ~250ms). Mid-close re-hover skips the open dwell and uses the full
+  bar height (`CHROME_KEEP`) while the slide progress is still > 0, so you
+  can catch the retracting bar without finding the 7px strip again.
 - The bar won't *open* (or re-open mid-close) while a mouse button is down —
   deliberate, so dragging an in-app window to the top edge (snap/maximize
   gesture) never pops the OS bar over the snap zone. While already open,

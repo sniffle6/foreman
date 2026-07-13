@@ -39,6 +39,9 @@ struct App {
     started: bool,
     /// Target state for the hover-revealed OS title bar (drives the slide).
     chrome_open: bool,
+    /// When the pointer entered the reveal zone while fully closed (dwell
+    /// timer: open only after this ages past `CHROME_OPEN_DWELL`).
+    chrome_enter_since: Option<f64>,
     /// When the pointer left the keep-open zone while the bar was open
     /// (coyote timer: close only after this ages past `CHROME_COYOTE`).
     chrome_leave_since: Option<f64>,
@@ -87,6 +90,7 @@ impl App {
             desktop: WindowManager::new().as_desktop(),
             started: false,
             chrome_open: false,
+            chrome_enter_since: None,
             chrome_leave_since: None,
             chrome_t: 0.0,
             ctrl,
@@ -107,9 +111,9 @@ impl App {
 
 // ---- OS chrome -------------------------------------------------------------
 // Native decorations are off (`with_decorations(false)` in `main`); we draw our
-// own title bar, revealed instantly when the pointer hits the top-edge border,
-// held open by a short coyote timer after leave, plus an invisible perimeter
-// rim that restores edge-resize.
+// own title bar, revealed after a short dwell on the top-edge border, held open
+// by a longer coyote timer after leave, plus an invisible perimeter rim that
+// restores edge-resize.
 const CHROME_H: f32 = 30.0; // revealed bar height
 /// Vertical depth of the top-edge open zone (from the window top). A few px
 /// past the painted border so the strip is easier to hit, but short of the
@@ -117,15 +121,18 @@ const CHROME_H: f32 = 30.0; // revealed bar height
 const CHROME_REVEAL: f32 = 10.0;
 const CHROME_KEEP: f32 = CHROME_H + 4.0; // depth that keeps/reopens the bar
 const CHROME_COYOTE: f64 = 0.25; // seconds after leave before close starts
+/// Dwell before first reveal — 150ms so a pass-through doesn't pop the bar;
+/// mid-close re-hover still opens immediately (see state machine).
+const CHROME_OPEN_DWELL: f64 = 0.15;
 const CHROME_GRAB: f32 = 5.0; // outer rim that acts as the OS resize handle
 const CHROME_BTN_W: f32 = 42.0;
 const APP_BORDER_W: f32 = 7.0; // visible frame around the undecorated window
 
 impl App {
-    /// Hover-revealed replacement for the native title bar. Opens the moment
-    /// the pointer hits the top painted border; stays up for a coyote grace
-    /// after leave so a brief miss doesn't retract it; re-hover mid-close
-    /// reverses the slide smoothly.
+    /// Hover-revealed replacement for the native title bar. Opens after a short
+    /// dwell on the top painted border (skips pass-throughs); stays up for a
+    /// coyote grace after leave so a brief miss doesn't retract it; re-hover
+    /// mid-close reverses the slide smoothly with no extra dwell.
     fn show_os_chrome(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -162,9 +169,25 @@ impl App {
             None => false,
         };
         if hot {
-            self.chrome_open = true;
             self.chrome_leave_since = None;
+            // Already open, or still sliding closed: open immediately so the
+            // retracting bar is catchable. Only the fully-closed first reveal
+            // pays the open dwell.
+            if self.chrome_open || anim_t > 0.0 {
+                self.chrome_open = true;
+                self.chrome_enter_since = None;
+            } else {
+                let since = *self.chrome_enter_since.get_or_insert(now);
+                if now - since >= CHROME_OPEN_DWELL {
+                    self.chrome_open = true;
+                    self.chrome_enter_since = None;
+                } else {
+                    // Idle frames would otherwise stall the dwell clock.
+                    ctx.request_repaint();
+                }
+            }
         } else if self.chrome_open {
+            self.chrome_enter_since = None;
             let since = *self.chrome_leave_since.get_or_insert(now);
             if now - since >= CHROME_COYOTE {
                 self.chrome_open = false;
@@ -174,6 +197,7 @@ impl App {
                 ctx.request_repaint();
             }
         } else {
+            self.chrome_enter_since = None;
             self.chrome_leave_since = None;
         }
 
