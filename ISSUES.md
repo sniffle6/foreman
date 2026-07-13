@@ -138,6 +138,539 @@ detection — Claude/Codex icon detection has already been a bug surface.
 
 ---
 
+### #4 — Feature: rename terminals from the sessions panel by double-clicking the name
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** In the task-manager/sessions panel (`src/panel.rs`, the desktop
+right-edge list of projects and their terminals), double-clicking a terminal
+row's name should turn it into an inline text edit; committing (Enter or focus
+loss) sets a user-chosen name for that terminal, Escape cancels. The custom
+name should stick — i.e. override the automatic title the terminal would
+otherwise display.
+
+**Current behavior.** Terminal names in the panel are display-only. Rows are
+painted from `WindowManager::panel_model()` and only handle single click
+(`self.click = Some(path)` to surface/focus) plus hover min/close buttons;
+there is no `double_clicked()` handling and no rename affordance anywhere.
+Titles come from the terminal itself (OSC title set by the shell/agent, with
+process-tree fallback via `src/proc.rs` — see `src/terminal.rs` ~356–569),
+so they change as the session runs.
+
+**Sketch.**
+1. Add a user-override name field on the window/terminal (likely on `Win` in
+   `src/wm.rs` or on the terminal session): `custom_name: Option<String>`.
+   Display logic everywhere a title is shown (panel row, window header, tab
+   label) prefers `custom_name` over the live OSC/process title.
+2. Panel edit state: the panel model gets `renaming: Option<TargetPath>` plus
+   an edit buffer. `resp.double_clicked()` on a terminal row enters rename
+   mode; the row paints a `TextEdit` instead of the label while active. Enter
+   commits (wm drains e.g. `rename: Option<(TargetPath, String)>`), Escape or
+   clicking elsewhere cancels.
+3. Interaction with issue #2 (click = focus/minimize toggle): egui fires
+   `clicked()` before `double_clicked()` on the same row, so entering rename
+   mode will also have surfaced/toggled the window. Acceptable; if it feels
+   bad, suppress the minimize half when a double-click lands.
+4. Persistence: decide whether the name survives restart. Terminals themselves
+   are not persisted across app runs today, so session-lifetime-only is fine;
+   note it in the doc (`docs/task-manager-panel.md`).
+
+**Scope note.** The request is terminals only, but the same mechanism applies
+to project rows for free if wanted later. Keyboard focus while editing must
+not leak to the focused terminal (the panel edit must swallow keys — see the
+focus-cascade rules in `src/wm.rs`).
+
+---
+
+### #5 — Feature: drag-reorder terminals and projects in the sessions panel
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** In the task-manager/sessions panel (`src/panel.rs`), allow
+dragging rows to reorder them: project rows reorder among projects, and
+terminal rows reorder among the terminals of their own project. Dragging a
+terminal into a *different* project is out of scope for this issue (that's a
+move-between-projects feature with PTY/env implications).
+
+**Current behavior.** Row order is not user-controllable. The panel is a
+read-mostly view of `WindowManager::panel_model()` (`src/wm.rs` ~1287), which
+builds the list by iterating `self.windows` in vec order and each `Win`'s
+`tabs` in index order. So panel order today falls out of window-creation /
+tab order, and rows only sense clicks (`egui::Sense::click()`) — there is no
+drag handling in `panel.rs`.
+
+**Design decision required first.** The `windows` vec order likely doubles as
+z-order/stacking (and tab index is the layout-tree/tab-stack identity used by
+`TargetPath.tab`), so naively reordering the underlying vecs to move a panel
+row can have side effects: restacking windows, or invalidating `TargetPath`s
+held elsewhere (panel `click`, pending renames, etc.). Two options:
+1. **Separate display order** — a per-panel (or per-wm) ordering key
+   (`Vec<WinId>` / sort index) that only the panel sorts by; the wm's vecs
+   stay untouched. Safer; panel-only concern; needs persistence if order
+   should survive restarts (it should at least survive within a session).
+2. **Reorder the source vecs** — panel order, z-order, and tab order stay one
+   concept. Simpler mentally but must audit every index-based path
+   (`TargetPath.tab`, layout-tree leaf mapping, active-tab index) before
+   moving entries.
+
+**Sketch (assuming option 1).** Rows use `Sense::click_and_drag()`; a drag
+past a small threshold enters reorder mode (so plain clicks — see issue #2 —
+still work), paints the dragged row floating with an insertion indicator, and
+on release emits e.g. `reorder: Option<(TargetPath, usize)>` for the wm to
+drain into the display-order key. `panel_model()` then sorts projects and each
+project's terminal list by that key.
+
+**Interaction notes.** Must coexist with the row hover min/close buttons
+(~732), single-click focus/minimize (issue #2), and double-click rename
+(issue #4) — the drag threshold is what keeps these from colliding. The panel
+also scrolls vertically; dragging near the panel edge should auto-scroll or at
+minimum not break the clamped-scroll behavior from commit 24729ef.
+
+---
+
+### #6 — Feature: auto-rename a default-named terminal to the agent's name when an agent starts in it
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** When an agent (Claude, Codex, later Grok — see #3) starts running
+inside a terminal whose title is still the default, automatically rename the
+terminal to the agent's name (e.g. "Claude · #3"). If the user has renamed the
+terminal, never overwrite their name.
+
+**Current behavior.** A tab's `title: String` (`src/wm.rs` ~164) is set once
+at creation and only changes via the manual rename editor (`Command::Rename`,
+wm.rs ~1909/~3077 — commits to `tabs[a].title`). Defaults are:
+- plain terminal: `"{shell.label()}  ·  #{id}"` (`add_terminal`, wm.rs ~447),
+  e.g. `PowerShell  ·  #3`;
+- dispatched agent: explicit `--title` or `"agent · {argv[0]}"`
+  (`add_terminal_cmd`, wm.rs ~1147).
+Hand-typing `claude` into a shell changes the icon (agent detection already
+exists: OSC-title match, throttled process-tree fallback —
+`Session::icon_kind`, src/terminal.rs ~566–580, `detect_agent` in src/proc.rs)
+but the tab title stays "PowerShell · #3".
+
+**Sketch.**
+1. Track "still default": store the generated default on the tab (e.g.
+   `default_title: Option<String>`, or a `user_named: bool` set by the rename
+   editor and by explicit dispatch `--title`). Comparing against the known
+   default pattern also works but breaks if the pattern ever changes.
+2. In the per-frame pass where the wm already consults the session (icon
+   refresh), when `icon_kind()` transitions from None/shell to an agent AND
+   the title is still the default, set `tabs[i].title` to the agent's display
+   name, keeping the id suffix: `"Claude  ·  #3"`.
+3. When the agent exits back to the shell, either leave the name (simple) or
+   revert to the stored default (nicer — and `default_title` from step 1 makes
+   it trivial). Decide at implementation; leaving it is acceptable v1.
+4. A manual rename (or a panel rename, #4) permanently opts the terminal out
+   of auto-renaming.
+
+**Scope note.** Agent display names should come from the same source as the
+icon mapping (`IconKind` → name) so #3's Grok gets this for free. The
+dispatched-agent path (`add_terminal_cmd`) already names the window
+sensibly — this issue is mainly for agents hand-launched inside a shell and
+for the landing-page launch path (`add_project_with_command`, wm.rs ~524,
+which types the agent command into a default-named PowerShell terminal).
+
+---
+
+### #7 — Feature: wheel-scroll works over any hovered terminal, focused or not
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+
+**Request.** Scrolling the mouse wheel over any terminal pane should scroll
+*that* pane — the one under the cursor — without having to focus it first.
+Today this works for some terminals and silently does nothing for others.
+
+**Current behavior (root cause already located).** `Session::show`
+(`src/terminal.rs` ~1164–1217) handles the wheel on `resp.hovered()`, so
+hover-scroll is already the design. The split is in `input::wheel_input`'s
+outcome:
+- `WheelAction::Scrollback` (normal screen — plain shell output): scrolls
+  local scrollback on any hovered pane. **Already works unfocused.**
+- `WheelAction::Pty` (alternate screen / mouse reporting — agent TUIs like
+  Claude Code and Codex, `less`, `vim`): the wheel is translated to mouse
+  events or arrow keys written to the PTY, and this write is gated on
+  `active` (focus) at terminal.rs ~1202–1210, with the comment "hovering an
+  unfocused pane must not inject keys/mouse into it."
+
+So the symptom is: hovering an *unfocused agent terminal* (alt screen) and
+scrolling does nothing — which is most panes in an agent-heavy layout.
+
+**Fix options.**
+1. **Allow wheel-only PTY forwarding on hover** (recommended): relax the
+   `active` gate for `WheelAction::Pty` specifically. The original safety
+   rationale was about injecting input into an unfocused pane; wheel-derived
+   bytes (SGR mouse wheel codes or Up/Down arrows) only navigate/scroll the
+   TUI — they don't type text. Residual risk: in DECCKM arrow-key fallback
+   mode, arrows sent to a TUI whose "cursor" is a menu selection do move that
+   selection (e.g. a fuzzy-finder), which a user hover-scrolling probably
+   expects anyway.
+2. **Focus-follows-scroll**: focus the pane on wheel, then forward. Changes
+   the focus model as a side effect of scrolling (yanks the keyboard from the
+   terminal the user was typing in) — worse; rejected unless (1) proves
+   confusing.
+
+**Verify.** Two terminals side by side, focus A, run `less` (or an agent) in
+B, hover B and scroll: content should move without B taking focus, and
+keystrokes must still go to A. Also confirm Ctrl+Scroll zoom (same handler,
+~1178) keeps working over unfocused panes, and that panes inside an
+*unfocused project* get hover at all (the focus cascade in `src/wm.rs` must
+not have swallowed the pointer before the pane's `resp.hovered()` is set).
+
+---
+
+### #8 — Terminal wheel scrolling feels too sensitive / inconsistent (jumps more than expected)
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** medium (core-interaction feel)
+
+**Symptom.** Wheel-scrolling a terminal moves more lines than expected, and
+the amount feels inconsistent — sometimes a small flick jumps a large chunk.
+Reporter can't tell if it's oversensitivity or inconsistency.
+
+**How scrolling works today** (`src/terminal.rs` ~1189, `src/input.rs`
+~170/~213): each frame, `smooth_scroll_delta.y` (points) is fed to
+`wheel_steps(accum, dy, rh)` — divide by the row height `rh`, truncate to
+whole lines, carry the remainder. The resulting line count then goes through
+`wheel_input`: local scrollback scrolls that many lines; under mouse
+reporting it emits **one wheel event per line**; on alt-screen with
+alternate-scroll it emits one arrow key per line.
+
+**Candidate causes (all plausible; measure before fixing):**
+1. **Unit mismatch — lines per notch is `notch_points / rh`, not a chosen
+   number.** egui delivers one wheel notch as ~50pt of smooth delta
+   (× the Windows "lines per notch" setting, default 3, via
+   `points_per_scroll_line`). With a row height of ~16–20pt, one physical
+   notch can compute to 5–9 lines. It also means scroll speed silently
+   changes with Ctrl+Scroll font zoom (rh changes) and with the user's
+   Windows wheel setting — "inconsistent."
+2. **Multiplication inside TUIs.** Under mouse reporting we send one wheel
+   *event per computed line*, but most TUIs scroll several lines *per wheel
+   event* (they assume an event ≈ a notch). 6 computed lines → 6 SGR events →
+   the TUI scrolls 6×3 = 18 lines. This makes agent TUIs/pagers jump far more
+   than plain scrollback for the same flick — matching "inconsistent between
+   panes."
+3. **Smoothing + on-demand repaint lumping.** `smooth_scroll_delta` spreads a
+   notch across frames; if foreman isn't repainting continuously when the
+   wheel starts, the first frame can carry several frames' worth, emitting a
+   burst.
+
+**Suggested approach.** First instrument: log (notch points, rh, computed
+lines, emitted events) for one physical notch in (a) plain shell scrollback,
+(b) Claude Code, (c) `less`. Then likely fixes: define lines-per-notch as an
+explicit constant (e.g. 3) independent of `rh` — i.e. accumulate against
+`notch_px / LINES_PER_NOTCH` instead of `rh`; and for mouse-reporting mode,
+emit one wheel event per *notch*, not per line (keep per-line only for the
+arrow-key fallback, where one arrow really is one line). `wheel_steps` /
+`wheel_input` are pure and unit-tested (input.rs ~876–923), so the new ratio
+is a test-first change.
+
+**Verify.** One physical notch scrolls a comparable, modest amount (~3 lines)
+in shell scrollback, `less`, and an agent TUI, at both default and zoomed
+font sizes.
+
+---
+
+### #9 — Chat injection gating + delivery ACK/retry, composed from EXISTING quiescence signals (fixes stuck-input)
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** high (messages silently lost in real use) · **Priority:** 1 of the chat-reliability series (#9–#15) · **Depends on:** nothing
+
+**Background (shared by #9–#15).** The project chat room delivers posts by
+injecting them into each member terminal's PTY as typed input (push model —
+`ChatRoom::tick` in `src/chat.rs` ~598 produces per-member `Delivery`
+batches; the wm writes them into the `Session`). The
+chat-mentions design doc (`docs/superpowers/specs/2026-06-10-chat-mentions-design.md`)
+already flags quiescence-gating of this injection as a known unsolved gap.
+The state model across this series is deliberately **minimal**: passive
+safe-to-inject (this issue) + self-reported turn-boundary state (#12).
+Richer semantics ("reviewing", "blocked on X") belong in chat messages, not
+the state system.
+
+**Symptom.** Chat posts injected into a recipient CLI sometimes sit in its
+input field and never submit — the synthetic keystrokes (and the Enter) race
+the TUI's rendering and get swallowed mid-repaint. Delivery is
+fire-and-forget; nobody notices the loss. Worst observed chat bug.
+
+**Request — delivery-safety, NOT agent-state.** Three parts:
+1. **Gate: do NOT build new detection.** Compose the quiescence signals that
+   already exist in-process into a per-terminal "safe-to-inject" gate:
+   `Session::ready` + `output_gen` (src/terminal.rs), the output-settle
+   machinery (`advance_settles`, `DEFAULT_SETTLE_MS=120`, src/wm.rs), and the
+   cursor-rest gate (src/caret.rs, `CURSOR_SETTLE=50ms`). Hold keystroke
+   injection for a member until the gate opens.
+2. **ACK:** after injecting, verify the frame was consumed — injected text
+   echoed back / input buffer cleared — rather than assuming.
+3. **Retry:** if swallowed, re-inject with backoff (bounded attempts);
+   sender gets per-recipient **delivered/pending** status (`foreman chat`
+   reply path in `src/control.rs`).
+
+**Notes.** The delivery cursor (`Tab::last_delivered_seq`, chat.rs ~436)
+currently advances at hand-off; with ACK it should advance only on confirmed
+delivery so a swallowed message is re-delivered, not skipped. Echo detection
+must tolerate TUIs that render input boxes (transformed echo) — match the
+message body substring in recent output; treat no-echo-within-timeout as
+swallowed. Keep the gate/ACK seams pure and unit-testable (synthetic output
+streams), per the PTY-test conventions. This issue gates *when it is safe to
+type*; it does not claim to know the agent is done — that ambiguity is #12's
+domain.
+
+---
+
+### #10 — Route idle/join/exit chat notifications to the human only, never into agent PTYs
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (trivial, high value) · **Priority:** 2 of the chat-reliability series · **Depends on:** nothing
+
+**Symptom.** Idle notifications (and join/exit housekeeping noise) are
+delivered into agent members' terminals as typed input. For an agent this is
+pure noise — a fake user message forcing a context switch; only the human
+watching the chat window needs it.
+
+**Request.** Deliver idle/join/exit notifications to the human's chat viewer
+(`Content::Chat`) only — visible in the log/transcript, never injected into
+member PTYs.
+
+**Notes.** `src/chat.rs` already has an entry class that is "never injected
+into PTYs and never appears in `--history`" (chat.rs ~9, ~237 — system
+entries are excluded from `deliver_after`). Implementation is likely: post
+idle notifications as that class (or a variant that shows in the viewer and
+`--history` but is excluded from delivery) rather than as ordinary member
+posts. Verify with a two-member room: trigger an idle notification, confirm
+the human viewer shows it and neither agent PTY receives bytes.
+
+---
+
+### #11 — Chat seen-seq dedupe: live injection and `--history` share one delivered marker
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** bug (duplicate delivery) · **Priority:** 3 of the chat-reliability series · **Depends on:** nothing
+
+**Symptom.** A member can receive the same message twice — once via live PTY
+injection and once by reading `foreman chat --history` — because the two
+paths don't share a seen-seq marker. Messages carry seq numbers, so dedupe
+is cheap; the marker just isn't shared.
+
+**Request.** One per-member delivered-seq marker consulted by both paths:
+live injection already advances `Tab::last_delivered_seq` (chat.rs ~436,
+consumed by `deliver_after` ~240); `--history` (served in `src/control.rs`)
+should default to a "since my cursor" view so a catching-up agent doesn't
+re-read what was already injected. Full history stays available behind a
+flag (`--all`) — agents legitimately re-read context.
+
+**Design note.** Decide the semantics deliberately: does reading history
+*consume* (advance the cursor, so live injection skips those seqs), or is
+the cursor advanced only by injection with history default-filtered by it?
+The latter is safer (no risk of a history read suppressing live delivery the
+recipient never saw). Interacts with #9: once ACK exists the cursor means
+"confirmed delivered" — a history read must not fake an ACK.
+
+---
+
+### #12 — `foreman state` cooperative verb + CLI hook adapters (turn-boundary signal; campaign-gated)
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 4 of the chat-reliability series · **Depends on:** nothing hard; **must route through the agent-state campaign** (`.claude/skills/foreman-agent-state-campaign/SKILL.md`)
+
+**Request.** Implement the campaign's pre-planned cooperative verb —
+`foreman state working|blocked|done|idle` — and ship adapters that auto-wire
+it for known CLIs. Per the campaign, **self-reporting is the primary
+mechanism, not a fallback**: passive PTY signals cleanly detect *working*
+(output flowing), but done vs idle vs waiting-on-you is observationally
+ambiguous (TUI spinners keep the screen changing while parked at an input
+box). Heuristics for needs-input are explicitly out of scope, as are the
+campaign's fenced-off approaches (keyword-sniffing screen text, parsing
+agent session files).
+
+1. **Verb:** new control-plane subcommand in `src/control.rs` (same
+   named-pipe plane as `open`/`chat`/`close`; `FOREMAN_TERMINAL_ID` makes it
+   self-targeting). **Additive wire change — ask-first per
+   foreman-change-control**; this issue notes the gate, it does not preempt
+   the decision. The exact state vocabulary is owned by the campaign (its
+   G1–G3 anti-flap validation gates and phase structure apply) — don't
+   finalize the word list in this issue.
+2. **Claude Code adapter:** wire Claude Code's Stop hook (fires at end of
+   turn) and Notification hooks to call `foreman state`, installed via the
+   existing skill/config-install mechanism (`src/skills_install.rs` pattern —
+   best-effort, never blocks launch).
+3. **Codex adapter:** same via Codex's `notify` config.
+4. **Degradation:** unadapted/unknown CLIs simply have no turn-boundary
+   state; consumers (e.g. #13) fall back to #9's safe-to-inject gate only.
+
+**Notes.** Agent identity for choosing an adapter already exists
+(process-tree scan in `src/proc.rs` + OSC-title fallback). Staleness: a
+`working` report from a process that died must not wedge consumers — clear
+state on process exit (foreman owns the PTY and sees it) plus a long
+staleness timeout back to unknown. Self-reported state is a scheduling
+signal, not a security boundary.
+
+---
+
+### #13 — Turn-boundary chat queueing: hold routine posts until the recipient's turn ends; `--urgent` bypass
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 5 of the chat-reliability series · **Depends on:** #9, #12
+
+**Symptom.** Chat posts land mid-task as fake user input while the recipient
+agent is mid-turn, forcing a context switch. There is no way to hold routine
+messages until the agent finishes its turn.
+
+**Request.** Default chat delivery waits for the recipient's **turn
+boundary** — #12's self-reported state (`done`/`idle`) when available,
+falling back to #9's passive safe-to-inject gate for CLIs with no adapter.
+Add an `--urgent`/`--interrupt` flag to `foreman chat` preserving today's
+immediate-inject behavior; urgent should be human-only or role-gated
+(see #14) so agents can't stampede each other.
+
+**Notes.** Two layers compose, and stay distinct: turn-boundary decides
+*when a message becomes eligible*; #9's gate + ACK decide *when the
+keystrokes are physically safe and whether they landed*. The per-member
+delivery cursor already provides ordering — a held member accumulates and
+then receives the batch in seq order (existing `deliver_after` semantics).
+Beware starvation: an agent that never reports `idle`/`done` must not hold
+messages forever — #12's staleness fallback plus the sender-visible
+`pending` state from #9 (so a human can escalate with `--urgent`) cover it.
+
+---
+
+### #14 — Chat member roles: `--role` on open/dispatch, role in roster and message frames
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 6 of the chat-reliability series · **Depends on:** nothing
+
+**Symptom.** Chat members don't know each other's function: agents burn chat
+posts announcing what they are, and self-assign work outside their intended
+scope.
+
+**Request.**
+1. `--role <string>` on `foreman open`/dispatch (`src/control.rs`) and on
+   first join for members that joined by posting; stored on the member
+   (`src/chat.rs` member records, join-order roster ~464).
+2. Role rendered in the roster and in **every** chat frame — injection
+   framing and history lines share one format (chat.rs ~85–115:
+   `[chat p1 #14] t2: text` becomes `[chat p1 #7] t1(reviewer): ...`).
+3. Roster-with-roles injected into each member's context at join and on any
+   membership change, so every agent always knows who's who without asking.
+
+**Notes.** Role is a free-form string label, not an enforcement mechanism —
+scope discipline still comes from prompts; the role line just gives agents
+the information. Changing the frame format touches the transcript/wire
+format agents parse — **ask-first per foreman-change-control** (OpenReply /
+wire-compat rules), and keep untargeted frames byte-identical where existing
+chat.rs frame tests assert on them. `--role` also pairs with #13's "urgent
+is role-gated".
+
+---
+
+### #15 — (Optional, parallel) OSC 133 spike — verify ConPTY passthrough of semantic prompt marks, detect-only
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** spike (1 day, timeboxed) · **Priority:** 7 of the chat-reliability series — optional, parallel; **nothing above depends on it**
+
+**Request.** Run the spike exactly as scoped in
+`docs/warp-feature-candidates.md` §1 (verdict there: SPIKE-FIRST):
+1. Verify the vendored-OpenConsole ConPTY actually passes `ESC]133;D;N`
+   (command-finished-with-exit-code) marks through to foreman — passthrough
+   is currently **unverified**; if ConPTY eats them, the whole feature is
+   dead and the spike ends there.
+2. **Detect-only** — interception seam is `advance_scanned`
+   (src/terminal.rs:242), no alacritty fork needed. No shell-profile
+   injection in this spike.
+3. Check empirically whether Claude Code/Codex emit 133 marks around
+   embedded tool executions (expectation from the analysis: marks stop
+   flowing while a TUI agent runs, so this signal helps **plain-shell panes
+   only**).
+
+**Outcome.** A written verdict feeding the agent-state campaign
+(`.claude/skills/foreman-agent-state-campaign/SKILL.md`) as a candidate
+passive signal for plain-shell panes — it does not change the campaign's
+position that self-reporting (#12) is the primary turn-boundary mechanism
+for agent TUIs.
+
+---
+
+### #16 — Text selection vs scrolling: highlight doesn't track content; can't scroll mid-selection
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** medium (core-interaction correctness)
+
+**Symptom (as reported).** Selecting text and scrolling interact
+inconsistently: (a) the selection highlight often "stays put on the screen"
+instead of scrolling with the text it covers; (b) you cannot scroll while a
+selection drag is in progress (so a selection can't extend past the visible
+viewport).
+
+**Why this is suspicious, not just missing polish.** Selection is stored in
+*buffer* coordinates (alacritty's `Selection`, `src/terminal.rs` ~1131–1147;
+pointer→buffer mapping at ~1022 accounts for the scrollback offset), and the
+contract "highlight sticks to its content" is pinned by unit tests:
+`sel_viewport_range_shifts_with_display_offset_so_selection_sticks_to_content`
+(~2941) and `height_grow_keeps_selection_on_its_content` (~2669). So the
+reported screen-anchored behavior contradicts the tested model — the bug is
+in the live path those tests don't cover. Candidates to check:
+1. **Paint path:** the per-frame viewport-coords conversion of the one
+   `term.selection` (~1239–1264) — e.g. using a stale display offset or the
+   overlay cache (`Overlays`/Arc-clone fast path, ~1264) not invalidating on
+   scroll, leaving last frame's highlight rects on screen.
+2. **Live output while selected:** new lines rotating the grid — resize
+   re-anchor rotates the selection (~309–315), but confirm ordinary
+   scroll-up from child output does too in our integration.
+3. **Mid-drag scrolling:** the selection drag is handed in by the WM
+   ("content-area drag", ~1127). While the drag is active, check whether the
+   wheel handler (`resp.hovered()` branch, ~1168) still runs, whether wheel
+   deltas are consumed elsewhere during a drag, and whether the per-frame
+   drag update recomputes the buffer point with the *new* display offset
+   (if it reuses press-time offset, scrolling mid-drag would corrupt the
+   anchor — possibly why it feels inconsistent).
+
+**Expected behavior (acceptance).**
+- A completed selection stays glued to its text: wheel-scrolling moves the
+  highlight with the content, off-screen and back, unchanged.
+- Wheel-scrolling during an active drag works and extends the selection
+  sensibly (anchor stays on its content; the moving end follows the pointer
+  over the newly revealed lines).
+- Stretch (separate commit if done): drag past the top/bottom edge
+  auto-scrolls, the standard terminal way to select more than a screenful.
+
+**Caveats.** `docs/terminal-selection.md` is known to potentially disagree
+with the code (see failure-archaeology notes) — trust the code and tests,
+not that doc. On the alternate screen there is no scrollback, so the
+mid-drag-scroll expectations apply to the primary screen; alt-screen wheel
+forwards to the app (see #7/#8) and selection there is screen-static by
+nature. Repro before fixing: two panes, generate scrollback (`dir -r` /
+long build log), select mid-screen, wheel both ways; then repeat holding the
+drag.
+
+---
+
+### #17 — Sessions-panel click on a sibling should un-zoom a zoomed/maximized subwindow
+
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (focus lands on an invisible window today)
+
+**Symptom.** If a project has a subwindow zoomed (tmux-style zoom — the
+window renders full-area on top of the project's tiles: `zoomed:
+Option<WinId>` in `src/wm.rs` ~344, `toggle_zoom` ~2375, painted last at
+~2706), clicking a *different* terminal of that project in the sessions
+panel focuses the clicked terminal but leaves the sibling's zoom overlay
+covering it — you focused a window you cannot see.
+
+**Request.** When a panel click targets a subwindow in a manager whose
+`zoomed` is some *other* window, clear the zoom as part of surfacing the
+target. Keep it if the click targets the zoomed window itself.
+
+**Where.** The wm consumes the panel's `click: Option<TargetPath>`
+(`src/panel.rs` model → drained in wm.rs). In the focus/surface handling for
+a terminal path, after resolving the project's inner `WindowManager`: if
+`child.zoomed` is `Some(z)` with `z != target`, set it to `None`. The
+equivalent case one level up (a zoomed *project* on the desktop, clicking a
+different project's row) should get the same treatment for consistency.
+
+**Alternative considered.** Transfer the zoom to the clicked window instead
+of clearing it (tmux users sometimes expect zoom-follows-switch). Clearing
+is the requested and less surprising default; if zoom-transfer is ever
+wanted, make it a setting, not the default.
+
+**Notes.** Zoom is an overlay — the layout tree is untouched (`zoomed` is
+render-order only, ~2372–2391), so clearing it is side-effect-free; `forget`
+already clears it when the zoomed window goes away (~1924). Check the same
+staleness for minimize/close-from-panel while zoomed. Interaction with #2
+(click on focused row = minimize): "focused" for the toggle should be
+evaluated *after* the un-zoom rule, so clicking the covered-but-focused
+window's row doesn't minimize a window the user never actually saw.
+
+---
+
 ## Closed
 
 _(none yet)_
