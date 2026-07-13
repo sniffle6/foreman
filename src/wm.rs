@@ -410,6 +410,110 @@ impl WindowManager {
         self
     }
 
+    /// Cold-snapshot this manager (and nested projects) for workspace persistence.
+    ///
+    /// Capture rules:
+    /// - Live `WinId` is stored as `SnapId` (identity). Apply still allocates
+    ///   fresh runtime ids and remaps.
+    /// - Windows whose every tab is `TaskManager` are omitted entirely; mixed
+    ///   TaskManager tabs (should not happen) are skipped per-tab.
+    /// - `windows` is ordered by ascending `z` (low index = back, high = front).
+    /// - Layout tree leaves for omitted windows are dropped (splits collapse).
+    /// - `focused` / `last_focused` / `zoomed` are kept only when the id remains.
+    pub fn capture_manager(&self) -> crate::workspace::ManagerSnap {
+        use crate::workspace::{
+            rect_to_snap, shell_to_str, tree_from_snap, tree_to_snap, ContentSnap, ManagerSnap,
+            TabSnap, WinSnap,
+        };
+        use std::collections::HashSet;
+
+        // Back → front: sort by ascending z before filtering.
+        let mut ordered: Vec<&Win> = self.windows.iter().collect();
+        ordered.sort_by_key(|w| w.z);
+
+        let mut windows: Vec<WinSnap> = Vec::with_capacity(ordered.len());
+        for w in ordered {
+            let mut tabs: Vec<TabSnap> = Vec::new();
+            let mut new_active = 0usize;
+            let mut found_active = false;
+            for (i, t) in w.tabs.iter().enumerate() {
+                if matches!(t.content, Content::TaskManager(_)) {
+                    continue;
+                }
+                if i == w.active {
+                    new_active = tabs.len();
+                    found_active = true;
+                }
+                let content = match &t.content {
+                    Content::Terminal(s) => ContentSnap::Terminal {
+                        shell: shell_to_str(s.shell).into(),
+                    },
+                    Content::Chat(_) => ContentSnap::Chat,
+                    Content::Project(child) => ContentSnap::Project {
+                        child: child.capture_manager(),
+                    },
+                    Content::TaskManager(_) => unreachable!("filtered above"),
+                };
+                tabs.push(TabSnap {
+                    title: t.title.clone(),
+                    content,
+                });
+            }
+            if tabs.is_empty() {
+                // TaskManager-only window (desktop panel): omit entirely.
+                continue;
+            }
+            if !found_active {
+                new_active = 0;
+            }
+            if new_active >= tabs.len() {
+                new_active = tabs.len() - 1;
+            }
+            windows.push(WinSnap {
+                id: w.id, // SnapId == live WinId at capture time
+                active: new_active,
+                tabs,
+                minimized: w.minimized,
+                min_from_tree: w.min_from_tree,
+                rect: rect_to_snap(w.rect),
+                prev: w.prev.map(rect_to_snap),
+            });
+        }
+
+        let included: HashSet<WinId> = windows.iter().map(|w| w.id).collect();
+        // Identity map for included leaves; drop leaves for omitted windows
+        // (panel) via tree_from_snap collapse, then re-encode as NodeSnap.
+        let identity = |id: WinId| id;
+        let raw = tree_to_snap(&self.tree, &identity);
+        let filtered = tree_from_snap(raw.as_ref(), &|id| {
+            if included.contains(&id) {
+                Some(id)
+            } else {
+                None
+            }
+        });
+        let tree = tree_to_snap(&filtered, &identity);
+
+        let keep = |id: Option<WinId>| id.filter(|i| included.contains(i));
+
+        ManagerSnap {
+            cwd: self.cwd.clone(),
+            focused: keep(self.focused),
+            last_focused: keep(self.last_focused),
+            zoomed: keep(self.zoomed),
+            windows,
+            tree,
+        }
+    }
+
+    /// Snapshot the full desktop document (`version` + this manager as `desktop`).
+    pub fn capture_workspace(&self) -> crate::workspace::WorkspaceSnapshot {
+        crate::workspace::WorkspaceSnapshot {
+            version: crate::workspace::WORKSPACE_VERSION,
+            desktop: self.capture_manager(),
+        }
+    }
+
     // Cascading offset for a freshly spawned window, plus a fresh id + z.
     fn next_slot(&mut self, size: egui::Vec2) -> (WinId, egui::Rect) {
         let n = self.windows.len() as f32;
@@ -4689,6 +4793,107 @@ mod tests {
         });
         wm.focused = Some(id);
         id
+    }
+
+    #[test]
+    fn capture_workspace_skips_panel_and_records_tree() {
+        let mut d = WindowManager::new().as_desktop();
+        // panel-like window
+        let pid = {
+            let id = d.next;
+            d.next += 1;
+            d.z += 1;
+            d.windows.push(Win {
+                id,
+                tabs: vec![Tab {
+                    title: "sessions".into(),
+                    content: Content::TaskManager(crate::panel::PanelView::new(
+                        false,
+                        crate::panel::PANEL_W,
+                    )),
+                }],
+                active: 0,
+                rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(260.0, 800.0)),
+                z: d.z,
+                minimized: false,
+                min_from_tree: false,
+                prev: None,
+            });
+            id
+        };
+        let a = push(&mut d, "proj-a");
+        let b = push(&mut d, "proj-b");
+        // Mark as projects with cwd (mutate stub content)
+        for (id, cwd) in [(a, r"C:\a"), (b, r"C:\b")] {
+            if let Some(w) = d.windows.iter_mut().find(|w| w.id == id) {
+                if let Content::Project(child) = &mut w.tabs[0].content {
+                    child.cwd = Some(std::path::PathBuf::from(cwd));
+                }
+            }
+        }
+        d.tree = crate::layout::LayoutTree {
+            root: Some(crate::layout::Node::Split {
+                dir: crate::layout::SplitDir::H,
+                ratios: vec![0.4, 0.6],
+                children: vec![
+                    crate::layout::Node::Leaf(a),
+                    crate::layout::Node::Leaf(b),
+                ],
+            }),
+        };
+        // Panel not in tree for this test (or is — either way capture must omit panel win)
+        d.focused = Some(b);
+
+        let snap = d.capture_workspace();
+        assert_eq!(snap.version, crate::workspace::WORKSPACE_VERSION);
+        assert_eq!(snap.desktop.windows.len(), 2, "panel window omitted");
+        assert!(snap.desktop.windows.iter().all(|w| w.id != pid));
+        assert_eq!(snap.desktop.focused, Some(b));
+        assert!(snap.desktop.tree.is_some());
+        // Nested project cwds preserved
+        let cwds: Vec<_> = snap
+            .desktop
+            .windows
+            .iter()
+            .filter_map(|w| match &w.tabs[0].content {
+                crate::workspace::ContentSnap::Project { child } => child.cwd.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(cwds.iter().any(|p| p == std::path::Path::new(r"C:\a")));
+        assert!(cwds.iter().any(|p| p == std::path::Path::new(r"C:\b")));
+        // z-order: a pushed before b → a.z < b.z → a appears first (back)
+        assert_eq!(snap.desktop.windows[0].id, a);
+        assert_eq!(snap.desktop.windows[1].id, b);
+    }
+
+    #[test]
+    fn capture_records_chat_tab() {
+        let mut m = WindowManager::new();
+        m.cwd = Some(std::path::PathBuf::from(r"C:\p"));
+        let id = m.next;
+        m.next += 1;
+        m.z += 1;
+        m.windows.push(Win {
+            id,
+            tabs: vec![Tab {
+                title: "chat".into(),
+                content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::clone(&m.chat))),
+            }],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
+            z: m.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let snap = crate::workspace::capture_manager(&m);
+        assert_eq!(snap.cwd.as_deref(), Some(std::path::Path::new(r"C:\p")));
+        assert!(matches!(
+            snap.windows[0].tabs[0].content,
+            crate::workspace::ContentSnap::Chat
+        ));
+        assert_eq!(snap.windows[0].id, id);
     }
 
     #[test]

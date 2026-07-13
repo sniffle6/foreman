@@ -1,6 +1,7 @@
 //! Cold workspace snapshot: types + serde + `%APPDATA%\foreman\workspace.json`
-//! load/save, plus pure layout-tree ↔ `NodeSnap` conversion. Capture/apply and
-//! dirty-flag wiring live in later tasks.
+//! load/save, pure layout-tree ↔ `NodeSnap` conversion, and capture of a live
+//! `WindowManager` into `ManagerSnap` / `WorkspaceSnapshot`. Apply and dirty-flag
+//! wiring live in later tasks.
 //!
 //! Mirrors `recents.rs` / `config.rs`: defaults in code, corruption-tolerant
 //! load, atomic save via `config::save_json`. Future file versions are rejected
@@ -172,6 +173,25 @@ pub fn shell_to_str(shell: crate::terminal::Shell) -> &'static str {
         crate::terminal::Shell::Cmd => "cmd",
         crate::terminal::Shell::Bash => "bash",
     }
+}
+
+/// Snapshot an egui rect as absolute min + size (local to the manager area).
+pub fn rect_to_snap(r: eframe::egui::Rect) -> RectSnap {
+    RectSnap {
+        x: r.min.x,
+        y: r.min.y,
+        w: r.width(),
+        h: r.height(),
+    }
+}
+
+/// Capture a live manager into a pure snapshot. Delegates to
+/// [`crate::wm::WindowManager::capture_manager`] so private fields stay private.
+///
+/// Live `WinId` values are stored as `SnapId`s (identity). Restore still
+/// allocates fresh runtime ids and remaps.
+pub fn capture_manager(wm: &crate::wm::WindowManager) -> ManagerSnap {
+    wm.capture_manager()
 }
 
 /// Parse a shell string; unknown values degrade to PowerShell.
