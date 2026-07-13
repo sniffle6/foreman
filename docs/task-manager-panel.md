@@ -1,8 +1,9 @@
 # Task-manager panel
 
 Desktop right-edge panel listing every project and its terminal/chat tabs.
-Click a row to focus/restore; hover for minimize and close. Fully replaces the
-old bottom-left minimize chips.
+Click a row to focus/restore; click the already-focused visible row again to
+minimize (taskbar-style). Hover for explicit minimize and close. Fully replaces
+the old bottom-left minimize chips.
 
 ## Why
 
@@ -15,8 +16,12 @@ and the landing site for future agent-state badges.
 - **Read seam:** `WindowManager::panel_model()` builds a plain `PanelModel`
   snapshot each frame (projects → nested windows → tabs).
 - **Write seam:** `surface_target(TargetPath)` restores project + child + tab
-  and focuses. Panel rows and the chat crew board both route here via
-  `Act::{FocusPath,MinPath,ClosePath}`.
+  and focuses. Panel row clicks go through `Act::FocusPath` →
+  `toggle_surface_target`: if the path is already the focused *visible* target,
+  minimize it; otherwise surface. "Visible" excludes a focused window covered
+  by a zoomed sibling (un-zoom first; do not minimize a window the user cannot
+  see). Explicit hover min still uses `MinPath`; crew-board/chat click paths
+  call `surface_target` directly (no toggle).
 - **Tabbed projects need `ptab`:** nested managers number child windows
   independently (each starts at 1), so when projects are tabbed a bare
   child-id scan always resolves to the first project tab. `TargetPath.ptab`

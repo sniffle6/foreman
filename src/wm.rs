@@ -1291,6 +1291,70 @@ impl WindowManager {
         self.focus(path.project);
     }
 
+    /// Panel-row click policy (taskbar-style): if the path is already the
+    /// focused, *visible* target, minimize it; otherwise surface/focus it.
+    ///
+    /// "Visible" is evaluated after the un-zoom rule: a focused window covered
+    /// by a zoomed sibling is not considered already-surfaced, so the click
+    /// clears the overlay instead of minimizing a window the user never saw.
+    fn toggle_surface_target(&mut self, path: crate::panel::TargetPath) {
+        if self.is_already_surfaced(path) {
+            self.apply_min_path(path);
+        } else {
+            self.surface_target(path);
+        }
+    }
+
+    /// True when `path` is the current focus cascade leaf and not covered by a
+    /// zoomed sibling (or minimized). Used only by the panel click toggle.
+    fn is_already_surfaced(&self, path: crate::panel::TargetPath) -> bool {
+        let Some(pidx) = self.windows.iter().position(|w| w.id == path.project) else {
+            return false;
+        };
+        let w = &self.windows[pidx];
+        if w.minimized || self.focused != Some(path.project) {
+            return false;
+        }
+        // Covered by a zoomed sibling at this level → not visible.
+        if self.zoomed.is_some_and(|z| z != path.project) {
+            return false;
+        }
+        match path.window {
+            None => match path.tab {
+                Some(t) => w.active == t,
+                None => true,
+            },
+            Some(wid) => {
+                let Some(pi) = self.owning_project_tab(pidx, wid, path.ptab) else {
+                    return false;
+                };
+                if w.active != pi {
+                    return false;
+                }
+                let Content::Project(inner) = &w.tabs[pi].content else {
+                    return false;
+                };
+                if inner.focused != Some(wid) {
+                    return false;
+                }
+                // Covered by a zoomed sibling inside the project → not visible.
+                if inner.zoomed.is_some_and(|z| z != wid) {
+                    return false;
+                }
+                let Some(cw) = inner.windows.iter().find(|c| c.id == wid) else {
+                    return false;
+                };
+                if cw.minimized {
+                    return false;
+                }
+                match path.tab {
+                    Some(t) => cw.active == t,
+                    None => true,
+                }
+            }
+        }
+    }
+
     /// Pure snapshot of the whole tree for the task-manager panel (read seam).
     /// One `ProjectEntry` per `Content::Project` tab; the panel window itself is
     /// skipped. Cheap; rebuilt each frame by the desktop `show`.
@@ -3909,7 +3973,7 @@ impl WindowManager {
                 Act::Min(id) => self.minimize(id),
                 Act::Max(id) => self.toggle_zoom(id),
                 Act::Float(id) => self.toggle_float_for(id),
-                Act::FocusPath(p) => self.surface_target(p),
+                Act::FocusPath(p) => self.toggle_surface_target(p),
                 Act::MinPath(p) => self.apply_min_path(p),
                 Act::ClosePath(p) => self.apply_close_path(p),
             }
@@ -7690,6 +7754,260 @@ mod tests {
             tab: None,
         });
         assert_eq!(desk.focused, Some(a), "stale path must change nothing");
+    }
+
+    fn apply_focus_path(desk: &mut WindowManager, path: crate::panel::TargetPath) {
+        let ctx = egui::Context::default();
+        desk.apply_acts(
+            vec![Act::FocusPath(path)],
+            egui::vec2(800.0, 600.0),
+            egui::Id::new("panel-toggle"),
+            &ctx,
+        );
+    }
+
+    #[test]
+    fn focus_path_minimizes_already_focused_project() {
+        // Taskbar-style: click the focused project row → minimize.
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1200.0, 800.0);
+        let p1 = push(&mut desk, "p1");
+        let _p2 = push(&mut desk, "p2");
+        desk.tree.insert_root(p1, Dir::Right);
+        desk.focus(p1);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: p1,
+                ptab: None,
+                window: None,
+                tab: Some(0),
+            },
+        );
+
+        let w = desk.windows.iter().find(|w| w.id == p1).unwrap();
+        assert!(w.minimized, "second click on the focused project minimizes it");
+        assert_ne!(desk.focused, Some(p1), "minimized project drops desktop focus");
+    }
+
+    #[test]
+    fn focus_path_surfaces_unfocused_project() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1200.0, 800.0);
+        let p1 = push(&mut desk, "p1");
+        let p2 = push(&mut desk, "p2");
+        desk.tree.insert_root(p1, Dir::Right);
+        desk.tree.insert_root(p2, Dir::Right);
+        desk.focus(p1);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: p2,
+                ptab: None,
+                window: None,
+                tab: Some(0),
+            },
+        );
+
+        assert_eq!(desk.focused, Some(p2));
+        assert!(
+            !desk.windows.iter().find(|w| w.id == p2).unwrap().minimized,
+            "unfocused project is focused, not minimized"
+        );
+    }
+
+    #[test]
+    fn focus_path_minimizes_already_focused_terminal() {
+        let mut desk = WindowManager::new();
+        let (proj, a, _b) = zoomed_project(&mut desk);
+        // Drop zoom so `a` is simply the focused visible child.
+        {
+            let pw = desk.windows.iter_mut().find(|w| w.id == proj).unwrap();
+            let Content::Project(inner) = &mut pw.tabs[0].content else {
+                panic!()
+            };
+            inner.unzoom();
+            inner.focus(a);
+        }
+        desk.focus(proj);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: proj,
+                ptab: Some(0),
+                window: Some(a),
+                tab: Some(0),
+            },
+        );
+
+        let inner = inner_of(&desk, proj);
+        let aw = inner.windows.iter().find(|w| w.id == a).unwrap();
+        assert!(aw.minimized, "second click on the focused terminal minimizes it");
+        assert_ne!(inner.focused, Some(a));
+    }
+
+    #[test]
+    fn focus_path_surfaces_sibling_terminal() {
+        let mut desk = WindowManager::new();
+        let (proj, a, b) = zoomed_project(&mut desk);
+        {
+            let pw = desk.windows.iter_mut().find(|w| w.id == proj).unwrap();
+            let Content::Project(inner) = &mut pw.tabs[0].content else {
+                panic!()
+            };
+            inner.unzoom();
+            inner.focus(a);
+        }
+        desk.focus(proj);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: proj,
+                ptab: Some(0),
+                window: Some(b),
+                tab: Some(0),
+            },
+        );
+
+        let inner = inner_of(&desk, proj);
+        assert_eq!(inner.focused, Some(b));
+        assert!(
+            !inner.windows.iter().find(|w| w.id == b).unwrap().minimized,
+            "sibling click focuses, does not minimize"
+        );
+    }
+
+    #[test]
+    fn focus_path_restores_minimized_instead_of_reminimizing() {
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1200.0, 800.0);
+        let p1 = push(&mut desk, "p1");
+        desk.tree.insert_root(p1, Dir::Right);
+        desk.minimize(p1);
+        assert!(desk.windows.iter().find(|w| w.id == p1).unwrap().minimized);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: p1,
+                ptab: None,
+                window: None,
+                tab: Some(0),
+            },
+        );
+
+        let w = desk.windows.iter().find(|w| w.id == p1).unwrap();
+        assert!(!w.minimized, "clicking a minimized row restores it");
+        assert_eq!(desk.focused, Some(p1));
+    }
+
+    #[test]
+    fn focus_path_does_not_minimize_when_covered_by_sibling_zoom() {
+        // #17 interaction: focused-but-covered must un-zoom, not minimize.
+        // `zoomed_project` leaves `a` zoomed and focused; focus `b` under that
+        // overlay, then panel-click `b` — user wants to *see* b, not hide it.
+        let mut desk = WindowManager::new();
+        let (proj, a, b) = zoomed_project(&mut desk);
+        {
+            let pw = desk.windows.iter_mut().find(|w| w.id == proj).unwrap();
+            let Content::Project(inner) = &mut pw.tabs[0].content else {
+                panic!()
+            };
+            // Keep a's zoom; move focus to the covered sibling.
+            assert_eq!(inner.zoomed, Some(a));
+            inner.focus(b);
+        }
+        desk.focus(proj);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: proj,
+                ptab: Some(0),
+                window: Some(b),
+                tab: Some(0),
+            },
+        );
+
+        let inner = inner_of(&desk, proj);
+        assert_eq!(inner.zoomed, None, "sibling zoom must clear");
+        assert_eq!(inner.focused, Some(b));
+        assert!(
+            !inner.windows.iter().find(|w| w.id == b).unwrap().minimized,
+            "must not minimize a window the user could not see under zoom"
+        );
+    }
+
+    #[test]
+    fn focus_path_minimizes_zoomed_focused_window() {
+        // The zoomed window *is* visible — second click still minimizes.
+        // zoomed_project leaves focus on `b` (last push); pin focus on `a`.
+        let mut desk = WindowManager::new();
+        let (proj, a, _b) = zoomed_project(&mut desk);
+        {
+            let pw = desk.windows.iter_mut().find(|w| w.id == proj).unwrap();
+            let Content::Project(inner) = &mut pw.tabs[0].content else {
+                panic!()
+            };
+            inner.focus(a);
+            assert_eq!(inner.zoomed, Some(a));
+        }
+        desk.focus(proj);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: proj,
+                ptab: Some(0),
+                window: Some(a),
+                tab: Some(0),
+            },
+        );
+
+        let inner = inner_of(&desk, proj);
+        assert!(
+            inner.windows.iter().find(|w| w.id == a).unwrap().minimized,
+            "clicking the zoomed focused row minimizes it"
+        );
+        assert_eq!(inner.zoomed, None, "minimize detaches and clears zoom");
+    }
+
+    #[test]
+    fn focus_path_switches_background_tab_instead_of_minimizing() {
+        let mut desk = WindowManager::new();
+        let proj = push(&mut desk, "proj");
+        let mut inner = WindowManager::new();
+        let cw = push(&mut inner, "t1");
+        inner.windows[0].tabs.push(Tab {
+            title: "t2".into(),
+            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+                std::cell::RefCell::new(crate::chat::ChatRoom::new()),
+            ))),
+        });
+        inner.windows[0].active = 0;
+        desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
+            Content::Project(Box::new(inner));
+        desk.focus(proj);
+
+        apply_focus_path(
+            &mut desk,
+            crate::panel::TargetPath {
+                project: proj,
+                ptab: Some(0),
+                window: Some(cw),
+                tab: Some(1),
+            },
+        );
+
+        let inner = inner_of(&desk, proj);
+        let c = inner.windows.iter().find(|w| w.id == cw).unwrap();
+        assert_eq!(c.active, 1, "background tab becomes active");
+        assert!(!c.minimized, "tab switch is not a minimize");
+        assert_eq!(inner.focused, Some(cw));
     }
 
     #[test]

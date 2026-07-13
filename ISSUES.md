@@ -69,39 +69,6 @@ from.
 
 ---
 
-### #2 — Feature: panel row click = focus if unfocused, minimize if already focused (projects and terminals)
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
-
-**Request.** In the task-manager/sessions panel (`src/panel.rs`, the desktop
-right-edge list of projects and their terminals), a single click on a row
-should behave like a taskbar button: if the target window is not the focused
-one (or is minimized), the click focuses/restores it; if it is already the
-focused window, the same click minimizes it. Applies to both project rows and
-terminal rows (for a terminal, "focused" means it is the focused terminal of
-the focused project, per the focus cascade).
-
-**Current behavior.** A row click unconditionally records
-`self.click = Some(path)` (`src/panel.rs` — row handling around
-`resp.clicked()` at ~272, ~597, ~782), which the window manager consumes to
-surface/focus the target. Clicking an already-focused row is a no-op; minimize
-is only reachable via the row's hover `min` button (~732–754).
-
-**Sketch.** Two options: (a) the panel model already paints rows differently
-for the focused target, so it knows focus state at click time — emit a
-distinct output (e.g. `toggle: Option<TargetPath>` next to `click`) when the
-clicked row is the focused one; or (b) keep the single `click` output and let
-the wm, when consuming it, check "is this path already the focused, visible
-window?" and minimize instead of surfacing. (b) keeps the model dumber and
-puts the policy where minimize/restore already lives (`src/wm.rs`).
-
-**Scope note.** Restoring must respect the existing focus-cascade rules in
-`src/wm.rs`; minimized windows restore via the panel today, so the
-minimize-on-second-click path must not strand a window with no way back
-(the panel row itself remains the restore affordance).
-
----
-
 ### #3 — Feature: Grok as a first-class agent — landing-page button + Grok icon on sessions
 
 **Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
@@ -634,43 +601,18 @@ drag.
 
 ---
 
-### #17 — Sessions-panel click on a sibling should un-zoom a zoomed/maximized subwindow
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (focus lands on an invisible window today)
-
-**Symptom.** If a project has a subwindow zoomed (tmux-style zoom — the
-window renders full-area on top of the project's tiles: `zoomed:
-Option<WinId>` in `src/wm.rs` ~344, `toggle_zoom` ~2375, painted last at
-~2706), clicking a *different* terminal of that project in the sessions
-panel focuses the clicked terminal but leaves the sibling's zoom overlay
-covering it — you focused a window you cannot see.
-
-**Request.** When a panel click targets a subwindow in a manager whose
-`zoomed` is some *other* window, clear the zoom as part of surfacing the
-target. Keep it if the click targets the zoomed window itself.
-
-**Where.** The wm consumes the panel's `click: Option<TargetPath>`
-(`src/panel.rs` model → drained in wm.rs). In the focus/surface handling for
-a terminal path, after resolving the project's inner `WindowManager`: if
-`child.zoomed` is `Some(z)` with `z != target`, set it to `None`. The
-equivalent case one level up (a zoomed *project* on the desktop, clicking a
-different project's row) should get the same treatment for consistency.
-
-**Alternative considered.** Transfer the zoom to the clicked window instead
-of clearing it (tmux users sometimes expect zoom-follows-switch). Clearing
-is the requested and less surprising default; if zoom-transfer is ever
-wanted, make it a setting, not the default.
-
-**Notes.** Zoom is an overlay — the layout tree is untouched (`zoomed` is
-render-order only, ~2372–2391), so clearing it is side-effect-free; `forget`
-already clears it when the zoomed window goes away (~1924). Check the same
-staleness for minimize/close-from-panel while zoomed. Interaction with #2
-(click on focused row = minimize): "focused" for the toggle should be
-evaluated *after* the un-zoom rule, so clicking the covered-but-focused
-window's row doesn't minimize a window the user never actually saw.
-
----
-
 ## Closed
 
-_(none yet)_
+### #2 — Feature: panel row click = focus if unfocused, minimize if already focused (projects and terminals)
+
+**Resolved:** `Act::FocusPath` → `toggle_surface_target` in `src/wm.rs` —
+already-focused *visible* path minimizes; otherwise surfaces. Covered-by-
+sibling-zoom does not count as visible (interacts with #17). Hover min still
+`MinPath`. Tests: `focus_path_*`.
+
+### #17 — Sessions-panel click on a sibling should un-zoom a zoomed/maximized subwindow
+
+**Resolved:** `surface_target` clears zoom when the target is a different
+window (project-level and nested). Tests:
+`surface_target_clears_a_sibling_zoom_*`,
+`surface_target_keeps_the_zoom_when_the_target_is_the_zoomed_window`.
