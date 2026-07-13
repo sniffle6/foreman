@@ -195,7 +195,9 @@ substance:
    engine is reused.
 4. **Daemon/client split** — move PTYs into a headless core so sessions persist
    across UI restarts (true tmux-style). Native launch is already instant, so this
-   is about persistence, not open-speed.
+   is about live process survival, not open-speed. **Cold layout restore**
+   (fresh shells at saved project cwds) already ships via `workspace.json` —
+   see `docs/workspace-persistence.md`; that is not this item.
 
 Smaller polish backlog: scrollback + scroll-wheel, word/line select (double/triple
 click), tab-merge windows (drop one window onto another), keyboard tiling

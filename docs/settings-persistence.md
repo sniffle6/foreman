@@ -15,7 +15,8 @@ setting instead of hand-rolling file I/O again.
 - `save_json(file, &value)` → writes JSON **atomically** (write a `.tmp`, then
   rename over the real file). A crash mid-write leaves the old good file intact.
 - `Settings` → the actual app-settings struct, saved to
-  `%APPDATA%\foreman\settings.json`. Today it holds `font_size`.
+  `%APPDATA%\foreman\settings.json`. Today it holds `font_size`,
+  `panel_collapsed`, and `panel_width`.
 
 ## Why it exists
 
@@ -54,6 +55,10 @@ Read with `Settings::load()`, write with `settings.save()`. That's it.
 - **This is for settings, not logs.** A growing append-only log (e.g. the chat
   history in `docs/chat-persistence.md`) is a different problem — JSONL, one line
   per event — and intentionally does not go through here.
+- **Layout is not settings.** Desktop layout (projects, tiling, tabs, floats)
+  lives in `%APPDATA%\foreman\workspace.json` — see
+  `docs/workspace-persistence.md`. Do not add layout fields to `Settings`; the
+  panel prefs above stay here so wipe-layout and wipe-prefs stay independent.
 - `keybindings.json` still uses its own older code (it has bespoke merge-over-
   defaults semantics). Fine to leave; migrate it onto `config_dir()` /
   `save_json` opportunistically if you touch it.
