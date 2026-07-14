@@ -21,17 +21,21 @@ Plain ASCII-only panes: you may never notice.
 
 ## How it works
 
-At GUI startup (`src/main.rs`), `load_font_definitions` reads:
+At GUI startup (`src/main.rs` → `terminal_font::load_font_definitions`)
+registers four matched **Hack v3.003** faces as named terminal families
+(regular/bold/italic/bold-italic; see `docs/terminal-font-styles.md`), then
+appends system fallbacks:
 
 | Name | Path | Role |
 |------|------|------|
 | yahei | `C:\Windows\Fonts\msyh.ttc` | CJK (Microsoft YaHei) |
 | seguiemj | `C:\Windows\Fonts\seguiemj.ttf` | Emoji shapes (Segoe UI Emoji) |
 
-Missing file → skip. Fonts are **appended** after defaults (primary mono
-stays first). egui 0.34's atlas still does mono outline shapes only —
-multi-color emoji is additive (texture stamps on top), not atlas color
-layers. See **Color stamps** below.
+Missing file → skip. System fonts are **appended** after defaults (primary
+mono stays first for non-terminal UI). Each terminal style family starts with
+its Hack face, then carries the full Monospace fallback list. egui 0.34's
+atlas still does mono outline shapes only — multi-color emoji is additive
+(texture stamps on top), not atlas color layers. See **Color stamps** below.
 
 ## Gotchas
 
@@ -41,8 +45,10 @@ layers. See **Color stamps** below.
 
 ## Key files
 
-- `src/main.rs` — `append_font_fallbacks`, `windows_fallback_font_paths`,
-  `load_font_definitions`, `set_fonts` in `run_native` create callback
+- `src/terminal_font.rs` — `append_font_fallbacks`, `windows_fallback_font_paths`,
+  `load_font_definitions`, four-face terminal families
+- `src/main.rs` — `set_fonts` in `run_native` create callback
+- `assets/fonts/` — pinned Hack faces + license/provenance
 
 ## Color stamps (optional)
 

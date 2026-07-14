@@ -56,6 +56,18 @@ pub const CARET: egui::Color32 = unmultiplied(231, 169, 63, 130);
 /// Scrollback indicator thumb at a pane's right edge.
 pub const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
 
+// ---- scrollback search ----
+/// Ordinary match highlight (distinct from selection).
+pub const SEARCH_MATCH: egui::Color32 = unmultiplied(96, 143, 176, 90);
+/// Current/focused match highlight (brighter than ordinary).
+pub const SEARCH_CURRENT: egui::Color32 = unmultiplied(231, 169, 63, 120);
+/// Search bar background (top-right overlay).
+pub const SEARCH_BAR_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
+/// Search bar border.
+pub const SEARCH_BAR_BORDER: egui::Color32 = egui::Color32::from_rgb(80, 74, 60);
+/// Invalid-regex text in the search bar.
+pub const SEARCH_ERROR: egui::Color32 = egui::Color32::from_rgb(214, 102, 84);
+
 // ---- app chrome (hover-revealed OS bar + window frame) ----
 pub const CHROME_BG: egui::Color32 = egui::Color32::from_rgb(42, 42, 42);
 pub const CHROME_BORDER: egui::Color32 = egui::Color32::from_rgb(58, 58, 58);

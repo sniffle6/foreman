@@ -7,3 +7,6 @@ run-stderr.log
 /.idea/
 /.serena/
 /.superpowers/
+
+docs/superpowers/specs/__pycache__/
+/rxdump*.bin

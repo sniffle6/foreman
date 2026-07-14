@@ -26,8 +26,7 @@ pub fn max_expanded(dock: Dir, axis_len: f32) -> f32 {
         Dir::Left | Dir::Right => PANEL_MAX_SIDE,
         Dir::Up | Dir::Down => PANEL_MAX_EDGE,
     };
-    hard.min((axis_len * 0.5).max(RAIL_W))
-        .max(RAIL_W + 40.0)
+    hard.min((axis_len * 0.5).max(RAIL_W)).max(RAIL_W + 40.0)
 }
 /// Per-project column width in horizontal (columns) mode (px).
 const GROUP_W: f32 = 200.0;

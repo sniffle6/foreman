@@ -37,12 +37,18 @@ as distinct.
 
 ---
 
-## 2. Current state — ALL verified (build + screenshot)
+## 2. Current state — build green; terminal-completeness remainder not signed off
 
 - **Toolchain** working (GNU + w64devkit — see gotchas).
 - **Native terminal**: spawns real shells (**PowerShell / cmd / bash via WSL**)
   through `portable-pty` (ConPTY); `alacritty_terminal` emulation with **ANSI
-  colors, cursor, inverse/dim**; resizes the shell to the window.
+  colors, cursor, inverse/dim, real bold/italic faces** (Hack four-face set);
+  **mouse reporting** (click/drag/motion + prior wheel); **Ctrl+F scrollback
+  search** (bounded, one shared budget/frame). Automated tests cover the
+  correctness seams; human acid + screenshot sign-off for the remainder epic
+  is still open — see `docs/epics/terminal-completeness-epic.md`. Docs:
+  `docs/terminal-font-styles.md`, `docs/terminal-mouse-reporting.md`,
+  `docs/terminal-scrollback-search.md`.
 - **Window manager** (shared engine, used at desktop + project levels):
   - drag by titlebar, click-to-focus + raise (z-order), minimize→task-manager panel→restore,
     maximize/restore, resize (corner), close. Confined to the area.
@@ -73,10 +79,13 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
 
 ### Architecture / files
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread + writer +
-  `resp` reply buffer), color resolver, selection (`sel_anchor`/`sel_head`,
-  `selection_text`, `cell_at`), `read_input` (keys + clipboard), `show(ui, rect,
-  active, resp)` renders the grid + cursor + selection highlight. `read_clipboard`
-  uses `arboard`; copy uses `ctx.copy_text`.
+  `resp` reply buffer), color resolver, selection, mouse capture, search
+  adapter, `read_input` (keys + clipboard), `show(ui, rect, active, resp)`
+  renders the grid + overlays. `read_clipboard` uses `arboard`; copy uses
+  `ctx.copy_text`.
+- `src/terminal_font.rs` — four Hack faces + system fallbacks; `font_id`.
+- `src/input.rs` — pure key/paste/wheel/mouse encoding + Ctrl+F open-search.
+- `src/search.rs` — bounded scrollback-search model.
 - `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
   zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
   z, minimized, prev }`, `Content::{Terminal, Project, Chat}`.

@@ -458,8 +458,8 @@ impl WindowManager {
     /// - `focused` / `last_focused` / `zoomed` are kept only when the id remains.
     pub fn capture_manager(&self) -> crate::workspace::ManagerSnap {
         use crate::workspace::{
-            rect_to_snap, shell_to_str, tree_from_snap, tree_to_snap, ContentSnap, ManagerSnap,
-            TabSnap, WinSnap,
+            ContentSnap, ManagerSnap, TabSnap, WinSnap, rect_to_snap, shell_to_str, tree_from_snap,
+            tree_to_snap,
         };
         use std::collections::HashSet;
 
@@ -596,7 +596,7 @@ impl WindowManager {
         snap: &crate::workspace::ManagerSnap,
         ctx: &egui::Context,
     ) -> ApplyReport {
-        use crate::workspace::{shell_from_str, tree_from_snap, ContentSnap, SnapId};
+        use crate::workspace::{ContentSnap, SnapId, shell_from_str, tree_from_snap};
         use std::collections::HashMap;
 
         // Replace live structure; do not reset `next`/`z` so re-apply on a
@@ -691,9 +691,7 @@ impl WindowManager {
             });
         }
 
-        self.tree = tree_from_snap(snap.tree.as_ref(), &|sid| {
-            snap_id_to_win.get(&sid).copied()
-        });
+        self.tree = tree_from_snap(snap.tree.as_ref(), &|sid| snap_id_to_win.get(&sid).copied());
         let map = |id: Option<SnapId>| id.and_then(|s| snap_id_to_win.get(&s).copied());
         self.focused = map(snap.focused);
         self.last_focused = map(snap.last_focused);
@@ -1775,9 +1773,7 @@ impl WindowManager {
     }
 
     fn panel_dock(&self) -> Dir {
-        self.panel_prefs()
-            .map(|(_, _, d)| d)
-            .unwrap_or(Dir::Right)
+        self.panel_prefs().map(|(_, _, d)| d).unwrap_or(Dir::Right)
     }
 
     /// Insert `id` on the opposite side of the panel's remembered dock edge so
@@ -1834,9 +1830,9 @@ impl WindowManager {
         let Some(pid) = self.panel_id() else {
             return;
         };
-        let (collapsed, expanded_width, dock) = self
-            .panel_prefs()
-            .unwrap_or((false, crate::panel::PANEL_W, Dir::Right));
+        let (collapsed, expanded_width, dock) =
+            self.panel_prefs()
+                .unwrap_or((false, crate::panel::PANEL_W, Dir::Right));
         let axis_len = match dock {
             Dir::Left | Dir::Right => area_w,
             Dir::Up | Dir::Down => self.last_area.y.max(1.0),
@@ -2460,9 +2456,7 @@ impl WindowManager {
     /// True when at least one non-panel window is not minimized (a project the
     /// user can see). The task-manager panel never counts.
     pub fn has_visible_project(&self) -> bool {
-        self.windows
-            .iter()
-            .any(|w| !w.is_panel() && !w.minimized)
+        self.windows.iter().any(|w| !w.is_panel() && !w.minimized)
     }
 
     /// Empty *visible* desktop: no non-minimized projects, and no modal that
@@ -2494,22 +2488,18 @@ impl WindowManager {
         .clamp(crate::panel::RAIL_W, max);
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, asz);
         Some(match dock {
-            Dir::Right => egui::Rect::from_min_max(
-                egui::pos2(full.max.x - extent, full.min.y),
-                full.max,
-            ),
-            Dir::Left => egui::Rect::from_min_max(
-                full.min,
-                egui::pos2(full.min.x + extent, full.max.y),
-            ),
-            Dir::Down => egui::Rect::from_min_max(
-                egui::pos2(full.min.x, full.max.y - extent),
-                full.max,
-            ),
-            Dir::Up => egui::Rect::from_min_max(
-                full.min,
-                egui::pos2(full.max.x, full.min.y + extent),
-            ),
+            Dir::Right => {
+                egui::Rect::from_min_max(egui::pos2(full.max.x - extent, full.min.y), full.max)
+            }
+            Dir::Left => {
+                egui::Rect::from_min_max(full.min, egui::pos2(full.min.x + extent, full.max.y))
+            }
+            Dir::Down => {
+                egui::Rect::from_min_max(egui::pos2(full.min.x, full.max.y - extent), full.max)
+            }
+            Dir::Up => {
+                egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, full.min.y + extent))
+            }
         })
     }
 
@@ -2522,18 +2512,10 @@ impl WindowManager {
         };
         let panel = local.translate(area.min.to_vec2());
         match self.panel_dock() {
-            Dir::Right => {
-                egui::Rect::from_min_max(area.min, egui::pos2(panel.min.x, area.max.y))
-            }
-            Dir::Left => {
-                egui::Rect::from_min_max(egui::pos2(panel.max.x, area.min.y), area.max)
-            }
-            Dir::Down => {
-                egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, panel.min.y))
-            }
-            Dir::Up => {
-                egui::Rect::from_min_max(egui::pos2(area.min.x, panel.max.y), area.max)
-            }
+            Dir::Right => egui::Rect::from_min_max(area.min, egui::pos2(panel.min.x, area.max.y)),
+            Dir::Left => egui::Rect::from_min_max(egui::pos2(panel.max.x, area.min.y), area.max),
+            Dir::Down => egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, panel.min.y)),
+            Dir::Up => egui::Rect::from_min_max(egui::pos2(area.min.x, panel.max.y), area.max),
         }
     }
 
@@ -5300,10 +5282,7 @@ mod tests {
             root: Some(crate::layout::Node::Split {
                 dir: crate::layout::SplitDir::H,
                 ratios: vec![0.4, 0.6],
-                children: vec![
-                    crate::layout::Node::Leaf(a),
-                    crate::layout::Node::Leaf(b),
-                ],
+                children: vec![crate::layout::Node::Leaf(a), crate::layout::Node::Leaf(b)],
             }),
         };
         // Panel not in tree for this test (or is — either way capture must omit panel win)
@@ -5364,8 +5343,8 @@ mod tests {
     #[test]
     fn apply_restores_project_cwd_and_one_shell() {
         use crate::workspace::{
-            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WinSnap, WorkspaceSnapshot,
-            WORKSPACE_VERSION,
+            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WORKSPACE_VERSION, WinSnap,
+            WorkspaceSnapshot,
         };
         let dir = std::env::temp_dir().join(format!("foreman-ws-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -5460,8 +5439,8 @@ mod tests {
     #[test]
     fn apply_skips_missing_project_dir() {
         use crate::workspace::{
-            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WinSnap, WorkspaceSnapshot,
-            WORKSPACE_VERSION,
+            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WORKSPACE_VERSION, WinSnap,
+            WorkspaceSnapshot,
         };
         let ctx = egui::Context::default();
         let snap = WorkspaceSnapshot {
@@ -8628,8 +8607,15 @@ mod tests {
         );
 
         let w = desk.windows.iter().find(|w| w.id == p1).unwrap();
-        assert!(w.minimized, "second click on the focused project minimizes it");
-        assert_ne!(desk.focused, Some(p1), "minimized project drops desktop focus");
+        assert!(
+            w.minimized,
+            "second click on the focused project minimizes it"
+        );
+        assert_ne!(
+            desk.focused,
+            Some(p1),
+            "minimized project drops desktop focus"
+        );
     }
 
     #[test]
@@ -8686,7 +8672,10 @@ mod tests {
 
         let inner = inner_of(&desk, proj);
         let aw = inner.windows.iter().find(|w| w.id == a).unwrap();
-        assert!(aw.minimized, "second click on the focused terminal minimizes it");
+        assert!(
+            aw.minimized,
+            "second click on the focused terminal minimizes it"
+        );
         assert_ne!(inner.focused, Some(a));
     }
 
@@ -9023,7 +9012,11 @@ mod tests {
         desk.apply_panel_ratio(1000.0);
         let local = egui::Rect::from_min_size(egui::Pos2::ZERO, desk.last_area);
         for (w, r) in desk.tree.layout(local, SNAP_GAP) {
-            desk.windows.iter_mut().find(|win| win.id == w).unwrap().rect = r;
+            desk.windows
+                .iter_mut()
+                .find(|win| win.id == w)
+                .unwrap()
+                .rect = r;
         }
         desk.sync_panel_dock_from_layout();
         assert_eq!(desk.panel_dock(), Dir::Down);
@@ -9147,7 +9140,11 @@ mod tests {
         desk.apply_panel_ratio(1000.0);
         let local = egui::Rect::from_min_size(egui::Pos2::ZERO, desk.last_area);
         for (w, r) in desk.tree.layout(local, SNAP_GAP) {
-            desk.windows.iter_mut().find(|win| win.id == w).unwrap().rect = r;
+            desk.windows
+                .iter_mut()
+                .find(|win| win.id == w)
+                .unwrap()
+                .rect = r;
         }
         let before = desk
             .tree
@@ -9266,7 +9263,11 @@ mod tests {
         desk.ensure_panel(false, 200.0, Dir::Right);
         let area = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1000.0, 800.0));
         let content = desk.landing_content_rect(area);
-        assert!((content.width() - 800.0).abs() < 0.5, "got {}", content.width());
+        assert!(
+            (content.width() - 800.0).abs() < 0.5,
+            "got {}",
+            content.width()
+        );
         assert!((content.max.x - (area.max.x - 200.0)).abs() < 0.5);
         assert_eq!(content.min, area.min);
         assert_eq!(content.max.y, area.max.y);

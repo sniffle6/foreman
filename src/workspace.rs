@@ -7,7 +7,7 @@
 //! load, atomic save via `config::save_json`. Future file versions are rejected
 //! (not partially applied) so a newer foreman never leaves a half-restored tree.
 
-use crate::layout::{LayoutTree, Node, SplitDir, MIN_RATIO};
+use crate::layout::{LayoutTree, MIN_RATIO, Node, SplitDir};
 use crate::wm::WinId;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -317,8 +317,7 @@ mod tests {
 
     #[test]
     fn missing_fields_default() {
-        let s: WorkspaceSnapshot =
-            serde_json::from_str(r#"{"version":1,"desktop":{}}"#).unwrap();
+        let s: WorkspaceSnapshot = serde_json::from_str(r#"{"version":1,"desktop":{}}"#).unwrap();
         assert_eq!(s.version, 1);
         assert!(s.desktop.focused.is_none());
         assert!(s.desktop.windows.is_empty());
@@ -400,10 +399,8 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_ignored() {
-        let s: WorkspaceSnapshot = serde_json::from_str(
-            r#"{"version":1,"desktop":{},"future_top":true}"#,
-        )
-        .unwrap();
+        let s: WorkspaceSnapshot =
+            serde_json::from_str(r#"{"version":1,"desktop":{},"future_top":true}"#).unwrap();
         assert_eq!(s.version, 1);
     }
 

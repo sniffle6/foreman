@@ -125,15 +125,18 @@ fn query_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
 }
 
 /// Resolved per-cell display style: foreground/background after the inverse swap
-/// and dim, plus the line decorations. Pure, so the inverse/dim/flag logic is
-/// unit-tested apart from the egui painter; `show` turns this into a `TextFormat`.
-/// `Hash`/`Eq` so mono-paint can dedupe galleys by `(char, GlyphStyle)`.
+/// and dim, plus the line decorations and weight/slant. Pure, so the inverse/
+/// dim/flag logic is unit-tested apart from the egui painter; `show` turns this
+/// into a `TextFormat` + terminal font face. `Hash`/`Eq` so mono-paint can
+/// dedupe galleys by `(char, GlyphStyle)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GlyphStyle {
     pub(crate) fg: egui::Color32,
     pub(crate) bg: Option<egui::Color32>,
     pub(crate) underline: bool,
     pub(crate) strikethrough: bool,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
 }
 
 pub(crate) fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphStyle {
@@ -145,6 +148,7 @@ pub(crate) fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphSt
         bg = Some(old_fg);
     }
     if flags.contains(Flags::DIM) {
+        // Dim darkens color only — bold still selects the bold face.
         fg = fg.gamma_multiply(0.7);
     }
     GlyphStyle {
@@ -152,6 +156,8 @@ pub(crate) fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphSt
         bg,
         underline: flags.contains(Flags::UNDERLINE),
         strikethrough: flags.contains(Flags::STRIKEOUT),
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
     }
 }
 
@@ -591,6 +597,15 @@ pub struct Session {
     /// (`WHEEL_NOTCH_PX`) so a gentle Ctrl+wheel still eventually steps the font
     /// and a fast flick doesn't lurch.
     zoom_accum: f32,
+    /// Per-button mouse captures (left/middle/right). A second button must not
+    /// overwrite the first — each needs its own matching release.
+    mouse_captures: [Option<crate::input::MouseCapture>; 3],
+    /// Last hover cell for 1003 no-button motion dedupe.
+    mouse_hover_last: Option<(u16, u16, u16)>,
+    /// Scrollback search model (Ctrl+F). Closed by default.
+    search: crate::search::SearchState,
+    /// Request TextEdit focus on the next search-bar paint (open / re-edit).
+    search_focus_request: bool,
     /// Diagnostic trace (FOREMAN_RX_DUMP=<file>): raw PTY chunks plus resize and
     /// host-reply markers. None (zero-cost) when the variable is unset.
     rx_dump: Option<std::fs::File>,
@@ -867,6 +882,10 @@ impl Session {
             textures: std::collections::HashMap::new(),
             scroll_accum: 0.0,
             zoom_accum: 0.0,
+            mouse_captures: [None, None, None],
+            mouse_hover_last: None,
+            search: crate::search::SearchState::default(),
+            search_focus_request: false,
             rx_dump: std::env::var_os("FOREMAN_RX_DUMP").and_then(|p| {
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -1288,6 +1307,13 @@ impl Session {
             self.send(&bytes);
         }
 
+        if outcome.open_search {
+            // Opening search cancels any app-owned mouse gestures first.
+            self.cancel_all_mouse_captures();
+            self.search.apply(crate::search::SearchCmd::Open);
+            self.search_focus_request = true;
+            return;
+        }
         if outcome.copy {
             if let Some(txt) = self.term.selection_to_string() {
                 ui.ctx().copy_text(txt);
@@ -1297,6 +1323,289 @@ impl Session {
             }
         } else if outcome.interrupt {
             self.send(&[0x03]); // Ctrl+C with no selection = interrupt
+        }
+    }
+
+    fn mouse_slot(btn: crate::input::MouseBtn) -> usize {
+        btn.code() as usize
+    }
+
+    /// Synthesize matching releases for every app-owned capture and clear all.
+    fn cancel_all_mouse_captures(&mut self) {
+        let mut releases = Vec::new();
+        for slot in self.mouse_captures.iter_mut() {
+            if let Some(cap) = slot.take() {
+                if cap.owner == crate::input::MouseOwner::Application {
+                    if let Some(b) = crate::input::mouse_cancel_release(&cap) {
+                        releases.push(b);
+                    }
+                }
+            }
+        }
+        self.mouse_hover_last = None;
+        for b in releases {
+            self.send(&b);
+        }
+    }
+
+    /// True when any app-owned button is currently captured.
+    fn has_app_mouse_capture(&self) -> bool {
+        self.mouse_captures.iter().any(|c| {
+            c.as_ref()
+                .is_some_and(|c| c.owner == crate::input::MouseOwner::Application)
+        })
+    }
+
+    /// True when any button (local or app) is held.
+    fn has_any_mouse_capture(&self) -> bool {
+        self.mouse_captures.iter().any(|c| c.is_some())
+    }
+
+    /// Whether the content response owns the topmost layer under `pos`.
+    fn content_is_topmost_at(ui: &egui::Ui, resp: &egui::Response, pos: egui::Pos2) -> bool {
+        match ui.ctx().layer_id_at(pos) {
+            Some(layer) => layer == resp.layer_id,
+            // No layer claimed — allow if inside content (fallback).
+            None => resp.rect.contains(pos),
+        }
+    }
+
+    /// Raw pointer → app mouse reporting or local gesture. Returns true when
+    /// local selection/paste must be suppressed this frame.
+    ///
+    /// `search_bar` excludes the overlay hit area from all terminal mouse
+    /// actions (app reporting, selection, paste). `block_new_presses` is set
+    /// after OS-focus loss so raw events later in the same frame cannot
+    /// recreate a capture.
+    fn handle_mouse(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        metrics: &crate::geom::CellMetrics,
+        search_open: bool,
+        search_bar: Option<egui::Rect>,
+        block_new_presses: bool,
+    ) -> bool {
+        if search_open {
+            // Suspend app mouse reporting while search owns input; local
+            // selection outside the bar remains available (caller allows it).
+            self.cancel_all_mouse_captures();
+            // Still process nothing for app; selection path uses search_bar.
+            return false;
+        }
+
+        let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
+        let mut suppress_local = false;
+        let content_rect = resp.rect;
+        let over_bar = |pos: egui::Pos2| search_bar.is_some_and(|b| b.contains(pos));
+
+        for ev in &events {
+            match ev {
+                egui::Event::PointerButton {
+                    button,
+                    pressed,
+                    pos,
+                    modifiers,
+                } => {
+                    let Some(btn) = crate::input::MouseBtn::from_pointer(*button) else {
+                        continue;
+                    };
+                    let slot = Self::mouse_slot(btn);
+                    let mod_bits = crate::input::mouse_mod_bits(*modifiers);
+                    if *pressed {
+                        if block_new_presses {
+                            continue;
+                        }
+                        // Search bar is not terminal content.
+                        if over_bar(*pos) {
+                            continue;
+                        }
+                        // Topmost content ownership (not titlebar / menu / overlay).
+                        let in_content = content_rect.contains(*pos);
+                        let topmost = Self::content_is_topmost_at(ui, resp, *pos);
+                        if !crate::input::mouse_press_topmost_ok(in_content, topmost) {
+                            continue;
+                        }
+                        let (col, row) = metrics.mouse_cell(*pos);
+                        let mode = *self.term.mode();
+                        let off = self.term.grid().display_offset();
+                        let owner = crate::input::mouse_press_owner(modifiers.shift, off, mode);
+                        let cap = crate::input::MouseCapture {
+                            button: btn,
+                            owner,
+                            mode: crate::input::freeze_mouse_mode(mode),
+                            button_code: btn.code(),
+                            last_col: col,
+                            last_row: row,
+                            last_mods: mod_bits,
+                            press_sent: false,
+                        };
+                        if owner == crate::input::MouseOwner::Application {
+                            suppress_local = true;
+                            let mut c = cap;
+                            if let Some(b) = crate::input::mouse_app_event(
+                                &mut c,
+                                crate::input::MouseEventKind::Press,
+                                col,
+                                row,
+                                mod_bits,
+                            ) {
+                                self.send(&b);
+                            }
+                            // Store even when press_sent is false so release
+                            // clears the slot without fabricating a button-up.
+                            self.mouse_captures[slot] = Some(c);
+                        } else {
+                            self.mouse_captures[slot] = Some(cap);
+                        }
+                    } else {
+                        // Release: complete matching capture (even outside pane).
+                        if let Some(mut cap) = self.mouse_captures[slot].take() {
+                            let (col, row) = metrics.mouse_cell(*pos);
+                            if cap.owner == crate::input::MouseOwner::Application {
+                                suppress_local = true;
+                                if let Some(b) = crate::input::mouse_app_event(
+                                    &mut cap,
+                                    crate::input::MouseEventKind::Release,
+                                    col,
+                                    row,
+                                    mod_bits,
+                                ) {
+                                    self.send(&b);
+                                }
+                            }
+                        }
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    let live_mods = ui.input(|i| i.modifiers);
+                    let mod_bits = crate::input::mouse_mod_bits(live_mods);
+                    // Held-button motion for every captured app button.
+                    for slot in 0..3 {
+                        if let Some(cap) = self.mouse_captures[slot].as_mut() {
+                            if cap.owner == crate::input::MouseOwner::Application {
+                                suppress_local = true;
+                                let (col, row) = metrics.mouse_cell(*pos);
+                                if let Some(b) = crate::input::mouse_app_event(
+                                    cap,
+                                    crate::input::MouseEventKind::Motion,
+                                    col,
+                                    row,
+                                    mod_bits,
+                                ) {
+                                    self.send(&b);
+                                }
+                            }
+                        }
+                    }
+                    // 1003 hover: suppress with any capture, history scroll, or
+                    // when not over topmost content.
+                    let off = self.term.grid().display_offset();
+                    let any_cap = self.has_any_mouse_capture();
+                    let in_content = content_rect.contains(*pos) && !over_bar(*pos);
+                    if crate::input::mouse_hover_allowed(any_cap, off, in_content)
+                        && Self::content_is_topmost_at(ui, resp, *pos)
+                    {
+                        let mode = *self.term.mode();
+                        let (col, row) = metrics.mouse_cell(*pos);
+                        if let Some(b) = crate::input::mouse_hover_motion(
+                            mode,
+                            col,
+                            row,
+                            mod_bits,
+                            &mut self.mouse_hover_last,
+                        ) {
+                            self.send(&b);
+                        }
+                    }
+                }
+                egui::Event::PointerGone => {
+                    self.mouse_hover_last = None;
+                }
+                _ => {}
+            }
+        }
+
+        if self.has_app_mouse_capture() {
+            suppress_local = true;
+        }
+        suppress_local
+    }
+
+    /// Navigation / Esc / Ctrl+F while search is open. Text editing is owned by
+    /// the focused TextEdit in `paint_search_bar` (so WM leader stays dormant).
+    /// Does **not** tick the search model — one shared tick runs in `show`.
+    fn handle_search_keys(&mut self, ui: &mut egui::Ui) {
+        let mut close = false;
+        let mut confirm = false;
+        let mut reedit = false;
+
+        let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
+        let phase = self.search.phase();
+
+        for ev in &events {
+            match ev {
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => close = true,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    if phase == crate::search::SearchPhase::Editing {
+                        confirm = true;
+                    } else if modifiers.shift {
+                        self.search.apply(crate::search::SearchCmd::Prev);
+                    } else {
+                        self.search.apply(crate::search::SearchCmd::Next);
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::N,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if phase == crate::search::SearchPhase::Navigating
+                    && !modifiers.ctrl
+                    && !modifiers.command
+                    && !modifiers.alt =>
+                {
+                    if modifiers.shift {
+                        self.search.apply(crate::search::SearchCmd::Prev);
+                    } else {
+                        self.search.apply(crate::search::SearchCmd::Next);
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::F,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if (modifiers.ctrl || modifiers.command)
+                    && !modifiers.shift
+                    && !modifiers.alt =>
+                {
+                    reedit = true;
+                }
+                _ => {}
+            }
+        }
+
+        if close {
+            self.search.apply(crate::search::SearchCmd::Close);
+            return;
+        }
+        if reedit {
+            self.search.apply(crate::search::SearchCmd::Open);
+            self.search.apply(crate::search::SearchCmd::Edit);
+            self.search_focus_request = true;
+        }
+        if confirm {
+            self.search.apply(crate::search::SearchCmd::Confirm);
         }
     }
 
@@ -1310,7 +1619,14 @@ impl Session {
     /// Called every frame for tabs that are not the active tab so a backgrounded
     /// shell never hangs on a query and keeps producing output.
     pub fn keepalive(&mut self) {
+        // Hidden/minimized tabs never run `show`, so cancel any stuck button here.
+        self.cancel_all_mouse_captures();
         self.pump();
+    }
+
+    /// Whether scrollback search is open on this session (for WM focus checks).
+    pub fn search_is_open(&self) -> bool {
+        self.search.is_open()
     }
 
     pub fn show(
@@ -1321,7 +1637,8 @@ impl Session {
         resp: &egui::Response,
     ) {
         let font_px = font_size(ui.ctx());
-        let font = egui::FontId::monospace(font_px);
+        // Metrics probe must use the same regular terminal face as painted glyphs.
+        let font = crate::terminal_font::font_id(font_px, false, false);
         let probe = ui
             .painter()
             .layout_no_wrap("M".to_string(), font.clone(), FG);
@@ -1332,42 +1649,132 @@ impl Session {
         self.resize(cols, rows);
         self.pump();
         let metrics = crate::geom::CellMetrics::new(rect, cw, rh, cols, rows);
+        let search_was_open = self.search.is_open();
+        // Shared bar geometry for mouse hit-testing and paint (before paint).
+        let search_bar = if search_was_open {
+            Some(crate::search::search_bar_rect(rect))
+        } else {
+            None
+        };
+
+        // OS/window focus loss: synthesize button-ups so TUIs are not stuck.
+        // Also block new presses from raw events later in this same frame.
+        let viewport_focused = ui.input(|i| i.viewport().focused).unwrap_or(true);
+        let mut block_new_presses = false;
+        if !viewport_focused {
+            self.cancel_all_mouse_captures();
+            block_new_presses = true;
+        }
+
+        // Cancel app-mouse capture when this pane becomes inactive/hidden.
+        if !active {
+            self.cancel_all_mouse_captures();
+            // Surrender TextEdit focus while hidden; keep query/results.
+        }
+
         if active {
-            // mouse text selection (the WM hands us the content-area drag)
-            if resp.triple_clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let (point, side) = self.sel_point(&metrics, p);
-                    self.term.selection = Some(Selection::new(SelectionType::Lines, point, side));
-                }
-            } else if resp.double_clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let (point, side) = self.sel_point(&metrics, p);
-                    self.term.selection =
-                        Some(Selection::new(SelectionType::Semantic, point, side));
-                }
-            } else if resp.drag_started() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let (point, side) = self.sel_point(&metrics, p);
-                    self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
-                }
-            } else if resp.dragged() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let (point, side) = self.sel_point(&metrics, p);
-                    if let Some(sel) = self.term.selection.as_mut() {
-                        sel.update(point, side);
+            // --- Mouse: raw events before selection (press must be immediate) ---
+            let suppress_local = self.handle_mouse(
+                ui,
+                resp,
+                &metrics,
+                search_was_open,
+                search_bar,
+                block_new_presses,
+            );
+
+            // Local selection allowed when not app-owned, including while search
+            // is open — but never when the pointer is over the search bar.
+            let pointer_over_bar = search_bar.is_some_and(|b| {
+                ui.input(|i| i.pointer.interact_pos().is_some_and(|p| b.contains(p)))
+            });
+            if !suppress_local && !pointer_over_bar {
+                // Local selection — primary button only (middle/right never start it).
+                let primary = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                    || resp.dragged_by(egui::PointerButton::Primary)
+                    || resp.drag_started_by(egui::PointerButton::Primary)
+                    || resp.clicked_by(egui::PointerButton::Primary)
+                    || resp.double_clicked_by(egui::PointerButton::Primary)
+                    || resp.triple_clicked_by(egui::PointerButton::Primary);
+                if primary {
+                    if resp.triple_clicked_by(egui::PointerButton::Primary) {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            if search_bar.is_none_or(|b| !b.contains(p)) {
+                                let (point, side) = self.sel_point(&metrics, p);
+                                self.term.selection =
+                                    Some(Selection::new(SelectionType::Lines, point, side));
+                            }
+                        }
+                    } else if resp.double_clicked_by(egui::PointerButton::Primary) {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            if search_bar.is_none_or(|b| !b.contains(p)) {
+                                let (point, side) = self.sel_point(&metrics, p);
+                                self.term.selection =
+                                    Some(Selection::new(SelectionType::Semantic, point, side));
+                            }
+                        }
+                    } else if resp.drag_started_by(egui::PointerButton::Primary) {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            if search_bar.is_none_or(|b| !b.contains(p)) {
+                                let (point, side) = self.sel_point(&metrics, p);
+                                self.term.selection =
+                                    Some(Selection::new(SelectionType::Simple, point, side));
+                            }
+                        }
+                    } else if resp.dragged_by(egui::PointerButton::Primary) {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            let (point, side) = self.sel_point(&metrics, p);
+                            if let Some(sel) = self.term.selection.as_mut() {
+                                sel.update(point, side);
+                            }
+                        }
+                    } else if resp.clicked_by(egui::PointerButton::Primary) {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            if search_bar.is_none_or(|b| !b.contains(p)) {
+                                self.term.selection = None;
+                            }
+                        } else {
+                            self.term.selection = None;
+                        }
                     }
                 }
-            } else if resp.clicked() {
-                // clicked() also fires on the frame a double/triple-click
-                // completes, so plain-click-clears must stay LAST in the chain.
-                self.term.selection = None;
-            }
-            if resp.secondary_clicked() {
-                if let Some(txt) = read_clipboard() {
-                    self.paste_text(&txt);
+                // Secondary click over the search bar must not paste into the PTY.
+                if resp.secondary_clicked() {
+                    let paste_ok = resp
+                        .interact_pointer_pos()
+                        .is_none_or(|p| search_bar.is_none_or(|b| !b.contains(p)));
+                    if paste_ok {
+                        if let Some(txt) = read_clipboard() {
+                            self.paste_text(&txt);
+                        }
+                    }
                 }
             }
-            self.read_input(ui);
+
+            // Keyboard: search owns input when open at frame start.
+            if search_was_open {
+                self.handle_search_keys(ui);
+            } else {
+                self.read_input(ui);
+                // read_input may have set open_search via process_input side channel —
+                // handled inside read_input.
+            }
+        }
+
+        // One shared search model tick per UI frame while open.
+        if self.search.is_open() {
+            let search_gen = crate::search::SearchGen {
+                content_gen: self.content_gen,
+                cols: self.cols,
+                rows: self.rows,
+            };
+            let off = self.term.grid().display_offset();
+            self.search
+                .tick(&mut self.term, search_gen, off, std::time::Instant::now());
+            // Only repaint while scan/seek/quiescence still has work.
+            if self.search.needs_repaint {
+                ui.ctx().request_repaint();
+            }
         }
 
         // Mouse-wheel (works whenever the pane is hovered). On the alternate
@@ -1388,11 +1795,8 @@ impl Session {
                 // Ctrl+Scroll zooms the GLOBAL terminal font instead of scrolling.
                 // Same notch unit as scroll (`WHEEL_NOTCH_PX`); the wheel is fully
                 // consumed here so it neither moves scrollback nor reaches the app.
-                let (steps, rem) = crate::input::wheel_steps(
-                    self.zoom_accum,
-                    dy,
-                    crate::input::WHEEL_NOTCH_PX,
-                );
+                let (steps, rem) =
+                    crate::input::wheel_steps(self.zoom_accum, dy, crate::input::WHEEL_NOTCH_PX);
                 self.zoom_accum = rem;
                 if steps != 0.0 {
                     let next = crate::input::zoom_step(font_size(ui.ctx()), steps);
@@ -1401,29 +1805,33 @@ impl Session {
             } else if dy != 0.0 {
                 // Accumulate whole physical notches (not row-height lines) so
                 // scroll speed is independent of font zoom (issue #8).
-                let (steps, rem) = crate::input::wheel_steps(
-                    self.scroll_accum,
-                    dy,
-                    crate::input::WHEEL_NOTCH_PX,
-                );
+                let (steps, rem) =
+                    crate::input::wheel_steps(self.scroll_accum, dy, crate::input::WHEEL_NOTCH_PX);
                 self.scroll_accum = rem;
                 let notches = steps as i32;
                 if notches != 0 {
-                    // pointer → 1-based viewport cell (mouse-protocol order)
-                    let (col, row) = match resp.hover_pos() {
-                        Some(p) => metrics.mouse_cell(p),
-                        None => (1, 1),
-                    };
-                    let mode = *self.term.mode();
-                    let action = crate::input::wheel_input(notches, mode, col, row);
-                    // Hover is the gate (we're inside `resp.hovered()`). Pty
-                    // wheel is navigation under the pointer (SGR / arrows), not
-                    // typed input — so it is not focus-gated (issue #7). Keyboard
-                    // remains focus-gated in `read_input` above.
-                    match crate::input::wheel_action_for_hover(action, active) {
-                        crate::input::WheelAction::Pty(b) => self.send(&b),
-                        crate::input::WheelAction::Scrollback(s) => {
-                            self.term.scroll_display(s);
+                    // Search open: wheel is always local history scroll.
+                    if self.search.is_open() {
+                        let lines = notches.saturating_mul(crate::input::LINES_PER_NOTCH);
+                        self.term
+                            .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                    } else {
+                        // pointer → 1-based viewport cell (mouse-protocol order)
+                        let (col, row) = match resp.hover_pos() {
+                            Some(p) => metrics.mouse_cell(p),
+                            None => (1, 1),
+                        };
+                        let mode = *self.term.mode();
+                        let action = crate::input::wheel_input(notches, mode, col, row);
+                        // Hover is the gate (we're inside `resp.hovered()`). Pty
+                        // wheel is navigation under the pointer (SGR / arrows), not
+                        // typed input — so it is not focus-gated (issue #7). Keyboard
+                        // remains focus-gated in `read_input` above.
+                        match crate::input::wheel_action_for_hover(action, active) {
+                            crate::input::WheelAction::Pty(b) => self.send(&b),
+                            crate::input::WheelAction::Scrollback(s) => {
+                                self.term.scroll_display(s);
+                            }
                         }
                     }
                 }
@@ -1512,11 +1920,13 @@ impl Session {
                         &ch.to_string(),
                         0.0,
                         egui::TextFormat {
-                            font_id: egui::FontId::monospace(font_px),
+                            font_id: crate::terminal_font::font_id(font_px, st.bold, st.italic),
                             color: st.fg,
                             background: egui::Color32::TRANSPARENT,
                             underline: line(st.underline),
                             strikethrough: line(st.strikethrough),
+                            // Real italic face — do not also shear the mesh.
+                            italics: false,
                             ..Default::default()
                         },
                     );
@@ -1668,13 +2078,62 @@ impl Session {
             }
         }
 
+        // Search highlights (ordinary then current), then selection, then caret.
+        // Overlays only — never invalidate mono galley cache.
+        if self.search.is_open() {
+            let view = self.search.view();
+            let off = self.term.grid().display_offset();
+            let sl = self.term.grid().screen_lines();
+            let gc = self.term.grid().columns();
+            for m in &view.visible {
+                if let Some(r) = crate::search::match_viewport_range(m, off, sl, gc) {
+                    let is_cur = view.focused.as_ref() == Some(m);
+                    if is_cur {
+                        continue; // paint current second
+                    }
+                    for row in r.start.0..=r.end.0 {
+                        let c0 = if row == r.start.0 { r.start.1 } else { 0 };
+                        let c1 = if row == r.end.0 {
+                            r.end.1
+                        } else {
+                            gc.saturating_sub(1)
+                        };
+                        painter.rect_filled(
+                            metrics.span_rect(row, c0, c1),
+                            egui::CornerRadius::ZERO,
+                            SEARCH_MATCH,
+                        );
+                    }
+                }
+            }
+            if let Some(cur) = &view.focused {
+                if let Some(r) = crate::search::match_viewport_range(cur, off, sl, gc) {
+                    for row in r.start.0..=r.end.0 {
+                        let c0 = if row == r.start.0 { r.start.1 } else { 0 };
+                        let c1 = if row == r.end.0 {
+                            r.end.1
+                        } else {
+                            gc.saturating_sub(1)
+                        };
+                        painter.rect_filled(
+                            metrics.span_rect(row, c0, c1),
+                            egui::CornerRadius::ZERO,
+                            SEARCH_CURRENT,
+                        );
+                    }
+                }
+            }
+        }
+
         for r in &overlays.highlights {
             painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
         }
 
-        // caret — the gate chose the cell; focus (`active`) gates whether we paint.
-        if active && let Some(r) = overlays.caret {
-            painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
+        // caret — hidden while search owns input; otherwise focus-gated.
+        if active && !self.search.is_open() {
+            if let Some(r) = overlays.caret {
+                painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
+            }
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
@@ -1684,6 +2143,81 @@ impl Session {
         {
             painter.rect_filled(r, egui::CornerRadius::same(2), SCROLL_THUMB);
         }
+
+        // Search bar last inside this pane's draw order (not a global layer).
+        // Only the active session keeps the TextEdit focused so a hidden tab
+        // cannot steal keyboard input.
+        if self.search.is_open() {
+            self.paint_search_bar(ui, rect, active);
+        }
+    }
+
+    fn paint_search_bar(&mut self, ui: &mut egui::Ui, content: egui::Rect, active: bool) {
+        let view = self.search.view();
+        let bar = crate::search::search_bar_rect(content);
+        let painter = ui.painter_at(content);
+        painter.rect_filled(bar, egui::CornerRadius::same(4), SEARCH_BAR_BG);
+        painter.rect_stroke(
+            bar,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, SEARCH_BAR_BORDER),
+            egui::StrokeKind::Inside,
+        );
+
+        let total_s = if view.total_capped {
+            format!("{}+", crate::search::COUNT_CAP)
+        } else if view.scanning {
+            format!("{}…", view.total)
+        } else {
+            view.total.to_string()
+        };
+        let cur_s = view
+            .current
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "–".into());
+        let status = if view.invalid_regex {
+            "invalid regex".to_string()
+        } else if view.query.is_empty() {
+            "type to search".to_string()
+        } else {
+            format!("{cur_s} / {total_s}")
+        };
+        let status_color = if view.invalid_regex {
+            SEARCH_ERROR
+        } else {
+            DIM
+        };
+
+        // Focused TextEdit owns keyboard (blocks WM leader via focused().is_some()).
+        // While Navigating, keep the same Id focused but non-interactive so n/N
+        // never mutate the query and leader chords stay dormant.
+        let edit_id = egui::Id::new(("foreman_term_search", self.term_id));
+        let mut query = self.search.query().to_string();
+        let editing = view.phase == crate::search::SearchPhase::Editing;
+        let inner = bar.shrink(4.0);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let te = egui::TextEdit::singleline(&mut query)
+            .id(edit_id)
+            .desired_width(inner.width() * 0.55)
+            .font(egui::TextStyle::Monospace)
+            .text_color(TEXT)
+            .interactive(editing)
+            .frame(egui::Frame::NONE);
+        let te_resp = child.add(te);
+        if active {
+            te_resp.request_focus();
+            self.search_focus_request = false;
+        } else {
+            te_resp.surrender_focus();
+        }
+        if editing && te_resp.changed() {
+            self.search.set_query_str(query);
+        }
+        child.label(egui::RichText::new(format!("  {status}  n/N Esc")).color(status_color));
     }
 }
 
@@ -2127,6 +2661,8 @@ mod tests {
             bg: None,
             underline: false,
             strikethrough: false,
+            bold: false,
+            italic: false,
         }
     }
 
@@ -2546,6 +3082,7 @@ mod tests {
         assert_eq!(s.fg, FG);
         assert_eq!(s.bg, None);
         assert!(!s.underline && !s.strikethrough);
+        assert!(!s.bold && !s.italic);
     }
 
     #[test]
@@ -2557,6 +3094,110 @@ mod tests {
         );
         assert!(s.underline, "UNDERLINE flag must set underline");
         assert!(s.strikethrough, "STRIKEOUT flag must set strikethrough");
+    }
+
+    #[test]
+    fn glyph_style_reads_bold_and_italic_flags() {
+        let bold = glyph_style(
+            Flags::BOLD,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(bold.bold && !bold.italic);
+        let italic = glyph_style(
+            Flags::ITALIC,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(!italic.bold && italic.italic);
+        let both = glyph_style(
+            Flags::BOLD | Flags::ITALIC,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(both.bold && both.italic);
+        let reset = glyph_style(
+            Flags::empty(),
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(!reset.bold && !reset.italic);
+    }
+
+    #[test]
+    fn glyph_style_dim_bold_darkens_color_keeps_weight() {
+        let plain_bold = glyph_style(
+            Flags::BOLD,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        let dim_bold = glyph_style(
+            Flags::DIM | Flags::BOLD,
+            named(NamedColor::Foreground),
+            named(NamedColor::Background),
+        );
+        assert!(dim_bold.bold);
+        assert_ne!(dim_bold.fg, plain_bold.fg);
+        assert_eq!(dim_bold.fg, plain_bold.fg.gamma_multiply(0.7));
+    }
+
+    #[test]
+    fn mono_paint_four_styles_dedupe_separately() {
+        reset_layout_call_count();
+        let styles = [
+            GlyphStyle {
+                bold: false,
+                italic: false,
+                ..default_style()
+            },
+            GlyphStyle {
+                bold: true,
+                italic: false,
+                ..default_style()
+            },
+            GlyphStyle {
+                bold: false,
+                italic: true,
+                ..default_style()
+            },
+            GlyphStyle {
+                bold: true,
+                italic: true,
+                ..default_style()
+            },
+        ];
+        let glyphs: Vec<_> = styles
+            .into_iter()
+            .enumerate()
+            .map(|(i, style)| crate::frame::GlyphPlacement {
+                row: 0,
+                col: i,
+                ch: 'M',
+                style,
+                width_cells: 1,
+            })
+            .collect();
+        let plan = crate::frame::PaintPlan {
+            glyphs,
+            emoji_sites: Vec::new(),
+        };
+        let mut layout = |ch: char, _style: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let (items, _) = mono_paint_items_for_test(&plan, &mut layout);
+        assert_eq!(items.len(), 4);
+        assert_eq!(layout_call_count(), 4, "four styles ⇒ four layouts");
+        // Second pass with same plan keys: layout count stays if we re-dedupe
+        // within one call — mono_paint_items always builds a fresh map, so
+        // exercise cache path separately via mono_paint_items on a MonoPaintKey.
+        reset_layout_call_count();
+        let mut layout2 = |ch: char, _style: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let _ = mono_paint_items_for_test(&plan, &mut layout2);
+        assert_eq!(layout_call_count(), 4);
     }
 
     #[test]

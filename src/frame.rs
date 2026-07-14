@@ -205,6 +205,8 @@ pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>>
             bg: None,
             underline: false,
             strikethrough: false,
+            bold: false,
+            italic: false,
         };
         for col in 0..ncols {
             let cell = &grid[Line(row as i32 - off)][Column(col)];
@@ -686,5 +688,31 @@ mod tests {
         assert_eq!(plan.emoji_sites[0].ch, '🥒');
         assert_eq!(plan.emoji_sites[0].width_cells, 2);
         assert_eq!(plan.emoji_sites[0].col, 0);
+    }
+
+    #[test]
+    fn plan_paint_exposes_four_sgr_weight_slant_styles() {
+        // regular / bold / italic / bold-italic adjacent cells.
+        let bytes = b"\x1b[0ma\x1b[1mb\x1b[0;3mc\x1b[1;3md\x1b[0m";
+        let term = term_with(bytes, 8, 1);
+        let m = metrics(8, 1);
+        let plan = plan_paint(term.grid(), &m);
+        let styles: Vec<_> = plan
+            .glyphs
+            .iter()
+            .filter(|g| matches!(g.ch, 'a' | 'b' | 'c' | 'd'))
+            .map(|g| (g.ch, g.style.bold, g.style.italic))
+            .collect();
+        assert!(styles.contains(&('a', false, false)));
+        assert!(styles.contains(&('b', true, false)));
+        assert!(styles.contains(&('c', false, true)));
+        assert!(styles.contains(&('d', true, true)));
+        let mut keys = std::collections::HashSet::new();
+        for g in &plan.glyphs {
+            if matches!(g.ch, 'a' | 'b' | 'c' | 'd') {
+                keys.insert((g.style.bold, g.style.italic));
+            }
+        }
+        assert_eq!(keys.len(), 4);
     }
 }

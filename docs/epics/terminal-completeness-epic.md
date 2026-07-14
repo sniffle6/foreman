@@ -1,9 +1,24 @@
 # Terminal Completeness — Epic
 
-**Status:** in progress — **Session A (Phase 2 keyboard + Phase 1a underline/
-strikethrough/cursor-shape) built and green (2026-06-26)**: `src/input.rs` seam
-with 27 byte tests, `glyph_style` with 4 tests, 210 tests passing, reviewed
-clean. On-screen appearance not yet acid-tested. The rest is designed, not started.
+**Active remainder plan (2026-07-13):**
+[`docs/superpowers/plans/2026-07-13-terminal-completeness-remainder.md`](../superpowers/plans/2026-07-13-terminal-completeness-remainder.md)
+covers the requested unfinished owner slice: bold/italic, mouse click/drag/
+motion, and scrollback search. The broader phase catalog below remains the
+historical record; unrelated unchecked polish is not silently pulled into that
+plan.
+
+**Status:** remainder slice implemented; correctness fix pass (2026-07-14) —
+**not signed off.** Real bold/italic faces, mouse click/drag/motion, and
+bounded scrollback search land under
+[`docs/superpowers/plans/2026-07-13-terminal-completeness-remainder.md`](../superpowers/plans/2026-07-13-terminal-completeness-remainder.md).
+Correctness fixes: query changes search without Enter; content quiescence
+non-sliding; one shared line/time budget per frame; deep-history wrap once;
+focused ordinal reconcile; search-bar hit exclusion; topmost mouse ownership;
+1003 suppress under any capture/history; same-frame focus-loss block;
+unencodable press no ghost drag/release; pairwise-distinct face proof.
+Optional resize-preservation stays open (not authorized). Full suite still has
+3 pre-existing WM dock test failures. Human acid matrix + screenshot
+acceptance still open — do **not** treat this epic as complete.
 
 **Goal:** make the terminal *feel like a finished product* before any more
 "built for AI" work. Today it renders a shell and verifies green, but it is not
@@ -419,11 +434,11 @@ order):
 - [x] Cursor shape (block / bar / underline) follows the app (Phase 1a) — blink still optional, not done
 - [x] F-keys, Delete, Insert, PageUp/Down, Alt-as-Meta reach the shell (Phase 2) — `src/input.rs`, 27 tests
 - [x] User paste is bracketed when the app supports it (Phase 2) — mode-gated `paste_seq`
-- [ ] Font family/size configurable; zoom keys work (Phase 7)
-- [ ] Bold / italic render with real font faces (Phase 1b)
-- [~] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3) — wheel/scroll forwarding done (2026-06-27); click/drag/motion + Shift-override still to do
+- [~] Font family/size configurable; zoom keys work (Phase 7) — size/zoom shipped; family picker still open
+- [x] Bold / italic render with real font faces (Phase 1b) — Hack four-face set; `docs/terminal-font-styles.md`
+- [x] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3) — wheel (2026-06-27) + click/drag/motion (2026-07-14); `docs/terminal-mouse-reporting.md`
 - [x] Double-click word, triple-click line; CJK selection is correct (Phase 4) — alacritty `Selection` in `term.selection`, acid-tested (word/path/line highlights + CJK copy hex-verified); see `docs/terminal-selection.md`
-- [ ] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5)
+- [~] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5) — **search done** (`docs/terminal-scrollback-search.md`); **resize preservation** still open (optional follow-up, not authorized with the remainder)
 - [ ] Tab title follows OSC 0/2; bell gives feedback (Phase 6)
 - [ ] UI stays at frame rate under `yes` (Phase 9)
 - [ ] OSC 52 clipboard (Phase 8)

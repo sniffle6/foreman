@@ -9,7 +9,7 @@
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
-use eframe::egui::{Event, Key, Modifiers};
+use eframe::egui::{Event, Key, Modifiers, PointerButton};
 
 /// What one frame of input decided. The shell applies these side effects in order.
 #[derive(Default, Debug)]
@@ -30,6 +30,10 @@ pub struct InputOutcome {
     /// Ctrl+0 — reset the global terminal font size to the default. The shell
     /// applies it to the shared zoom value; nothing is sent to the PTY.
     pub zoom_reset: bool,
+    /// Ctrl/Cmd+F — open (or focus) scrollback search. When set, `pty_bytes`
+    /// and other keyboard side effects from this frame are cleared so neither
+    /// `0x06` nor companion Text/Enter leak into the PTY.
+    pub open_search: bool,
 }
 
 /// Width class of one grid cell for key encoding (not paint).
@@ -93,6 +97,24 @@ pub fn process_input(
     let mut want_clip_paste = false; // Ctrl+V family
     let mut copy_or_interrupt = false; // Ctrl+C / Copy / Cut
     let mut copy_only = false; // Ctrl+Shift+C
+
+    // Ctrl/Cmd+F anywhere in the frame opens search and suppresses every
+    // keyboard side effect this frame (companion Text, Enter, other keys).
+    let open_search = events.iter().any(|ev| {
+        matches!(
+            ev,
+            Event::Key {
+                key: Key::F,
+                pressed: true,
+                modifiers: m,
+                ..
+            } if (m.ctrl || m.command) && !m.shift && !m.alt
+        )
+    });
+    if open_search {
+        out.open_search = true;
+        return out;
+    }
 
     for ev in events {
         match ev {
@@ -282,23 +304,8 @@ pub fn wheel_input(delta_notches: i32, mode: TermMode, col: u16, row: u16) -> Wh
         let button: u16 = if up { 64 } else { 65 };
         let mut bytes = Vec::new();
         for _ in 0..notches {
-            if mode.contains(TermMode::SGR_MOUSE) {
-                // ESC [ < button ; col ; row M   (press; ASCII decimal params)
-                bytes.extend_from_slice(b"\x1b[<");
-                bytes.extend_from_slice(button.to_string().as_bytes());
-                bytes.push(b';');
-                bytes.extend_from_slice(col.to_string().as_bytes());
-                bytes.push(b';');
-                bytes.extend_from_slice(row.to_string().as_bytes());
-                bytes.push(b'M');
-            } else {
-                // Legacy X10: ESC [ M then three bytes, each offset by 32 and
-                // clamped to a single byte so col/row past 223 saturate.
-                let enc = |v: u32| -> u8 { (32 + v).min(255) as u8 };
-                bytes.extend_from_slice(b"\x1b[M");
-                bytes.push(enc(button as u32));
-                bytes.push(enc(col as u32));
-                bytes.push(enc(row as u32));
+            if let Some(ev) = encode_mouse_report(button, col, row, false, mode) {
+                bytes.extend_from_slice(&ev);
             }
         }
         return WheelAction::Pty(bytes);
@@ -321,6 +328,350 @@ pub fn wheel_input(delta_notches: i32, mode: TermMode, col: u16, row: u16) -> Wh
 
     // (3) Default: scroll foreman's own scrollback.
     WheelAction::Scrollback(Scroll::Delta(lines))
+}
+
+// ---- Mouse reporting (click / drag / motion) --------------------------------
+
+/// Bits frozen at press for the lifetime of a gesture (encoding + tracking).
+fn mouse_capture_mode_mask() -> TermMode {
+    TermMode::MOUSE_MODE | TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE
+}
+
+/// Snapshot encoding/tracking bits for a new capture.
+pub fn freeze_mouse_mode(mode: TermMode) -> TermMode {
+    mode & mouse_capture_mode_mask()
+}
+
+/// Physical mouse button that terminals report (left/middle/right only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseBtn {
+    Left,
+    Middle,
+    Right,
+}
+
+impl MouseBtn {
+    pub fn from_pointer(b: PointerButton) -> Option<Self> {
+        match b {
+            PointerButton::Primary => Some(MouseBtn::Left),
+            PointerButton::Middle => Some(MouseBtn::Middle),
+            PointerButton::Secondary => Some(MouseBtn::Right),
+            _ => None,
+        }
+    }
+
+    /// xterm base button code: left=0, middle=1, right=2.
+    pub fn code(self) -> u16 {
+        match self {
+            MouseBtn::Left => 0,
+            MouseBtn::Middle => 1,
+            MouseBtn::Right => 2,
+        }
+    }
+}
+
+/// Who owns a gesture for its full press→release lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseOwner {
+    /// Local selection / paste (Shift override, scrollback, or no app mode).
+    Local,
+    /// Application mouse reporting.
+    Application,
+}
+
+/// One captured button gesture: owner and encoding frozen at press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MouseCapture {
+    pub button: MouseBtn,
+    pub owner: MouseOwner,
+    /// `MOUSE_MODE | SGR_MOUSE | UTF8_MOUSE` snapshot at press.
+    pub mode: TermMode,
+    /// Base button code frozen at press (before motion/modifier bits).
+    pub button_code: u16,
+    pub last_col: u16,
+    pub last_row: u16,
+    pub last_mods: u16,
+    /// False when the press was never transmitted (unencodable legacy coords).
+    /// Drag/release/cancel must not synthesize events for a silent press.
+    pub press_sent: bool,
+}
+
+/// Pure mouse-event kind fed into the encoder/router.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    /// Held-button cell motion (drag) or no-button motion (hover).
+    Motion,
+}
+
+/// Modifier bits added to the xterm button code: Shift=4, Alt=8, Ctrl=16.
+pub fn mouse_mod_bits(m: Modifiers) -> u16 {
+    let mut bits = 0u16;
+    if m.shift {
+        bits |= 4;
+    }
+    if m.alt {
+        bits |= 8;
+    }
+    if m.ctrl || m.command {
+        bits |= 16;
+    }
+    bits
+}
+
+/// Decide gesture owner at press. Frozen until matching release.
+///
+/// Local when: Shift held, main-screen scrolled into history, or no app mouse
+/// mode. Otherwise Application.
+pub fn mouse_press_owner(shift: bool, display_offset: usize, mode: TermMode) -> MouseOwner {
+    if shift || display_offset > 0 || !mode.intersects(TermMode::MOUSE_MODE) {
+        MouseOwner::Local
+    } else {
+        MouseOwner::Application
+    }
+}
+
+/// Whether the frozen tracking mode emits motion events for this situation.
+///
+/// - 1000 click-only: never
+/// - 1002 drag: only while a button is held
+/// - 1003 motion: held drag and no-button hover
+pub fn mouse_motion_allowed(mode: TermMode, button_held: bool) -> bool {
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        true
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        button_held
+    } else {
+        false // MOUSE_REPORT_CLICK only
+    }
+}
+
+/// Encode one mouse report. `button` is the full xterm code (incl. motion 32+
+/// and mod bits). Release uses lowercase `m` in SGR and code `3+mods` in
+/// legacy/UTF-8. Returns `None` when the coordinate is unencodable (legacy
+/// col/row > 223, UTF-8 > 2015) so callers drop the event instead of
+/// saturating to a wrong cell.
+pub fn encode_mouse_report(
+    button: u16,
+    col: u16,
+    row: u16,
+    release: bool,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        // SGR 1006: ESC [ < b ; col ; row M/m  (release keeps original button)
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(b"\x1b[<");
+        v.extend_from_slice(button.to_string().as_bytes());
+        v.push(b';');
+        v.extend_from_slice(col.to_string().as_bytes());
+        v.push(b';');
+        v.extend_from_slice(row.to_string().as_bytes());
+        v.push(if release { b'm' } else { b'M' });
+        return Some(v);
+    }
+
+    // Release in non-SGR: button code becomes 3 + modifiers (mods already in
+    // `button` for press; for release callers pass 3+mods).
+    let code = if release {
+        // Callers pass the release code directly when release=true for legacy.
+        button
+    } else {
+        button
+    };
+
+    if mode.contains(TermMode::UTF8_MOUSE) {
+        // UTF-8 mouse 1005: ESC [ M then UTF-8 encoded (32+value) for each field.
+        // Coordinates that need more than one UTF-8 continuation beyond U+07FF
+        // (value > 2047+? actually xterm limit is 2015 for the coord value
+        // before +32 → encoded as 2-byte UTF-8 up to 0x7FF = 2047; plan says 2015).
+        if col > 2015 || row > 2015 || code > 2015 {
+            return None;
+        }
+        let mut v = Vec::with_capacity(10);
+        v.extend_from_slice(b"\x1b[M");
+        push_utf8_mouse_byte(&mut v, code);
+        push_utf8_mouse_byte(&mut v, col);
+        push_utf8_mouse_byte(&mut v, row);
+        return Some(v);
+    }
+
+    // Legacy X10: three single bytes, each value+32, must fit in u8 → max 223.
+    if col > 223 || row > 223 || code > 223 {
+        return None;
+    }
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        (32 + code) as u8,
+        (32 + col) as u8,
+        (32 + row) as u8,
+    ])
+}
+
+fn push_utf8_mouse_byte(out: &mut Vec<u8>, value: u16) {
+    // Encode (32 + value) as UTF-8 so coords past 95 still fit in multi-byte.
+    let n = 32u32 + value as u32;
+    let mut buf = [0u8; 4];
+    let s = char::from_u32(n)
+        .unwrap_or('\u{FFFD}')
+        .encode_utf8(&mut buf);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Build the xterm button code for a press/release/motion event.
+///
+/// - press: base 0/1/2 + mods
+/// - release (SGR): same as press (caller sets release flag in encoder)
+/// - release (legacy): 3 + mods
+/// - held motion: base + 32 + mods
+/// - no-button motion: 35 + mods
+pub fn mouse_button_code(kind: MouseEventKind, base: u16, mods: u16, sgr: bool) -> u16 {
+    match kind {
+        MouseEventKind::Press => base + mods,
+        MouseEventKind::Release => {
+            if sgr {
+                base + mods
+            } else {
+                3 + mods
+            }
+        }
+        MouseEventKind::Motion => {
+            if base == 35 {
+                // already no-button motion marker
+                35 + mods
+            } else {
+                base + 32 + mods
+            }
+        }
+    }
+}
+
+/// Drive app mouse reporting for a single capture (or hover motion).
+///
+/// Call after deciding owner. For Application gestures: press/release/motion
+/// bytes. Dedupes motion when cell+mods unchanged. `capture` is updated in
+/// place (last cell/mods).
+/// True when (col,row) can be encoded under the mode's coordinate limits.
+pub fn mouse_coords_encodable(col: u16, row: u16, mode: TermMode) -> bool {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        true
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        col <= 2015 && row <= 2015
+    } else {
+        col <= 223 && row <= 223
+    }
+}
+
+pub fn mouse_app_event(
+    capture: &mut MouseCapture,
+    kind: MouseEventKind,
+    col: u16,
+    row: u16,
+    mods: u16,
+) -> Option<Vec<u8>> {
+    // A gesture whose press never left the host must not emit drag/release.
+    if !matches!(kind, MouseEventKind::Press) && !capture.press_sent {
+        return None;
+    }
+    let sgr = capture.mode.contains(TermMode::SGR_MOUSE);
+    let release = matches!(kind, MouseEventKind::Release);
+    // Releases must always reach the app: if the pointer cell is unencodable
+    // (legacy >223), fall back to the last encodable cell from this gesture.
+    let (col, row) = if release && !mouse_coords_encodable(col, row, capture.mode) {
+        (capture.last_col, capture.last_row)
+    } else {
+        (col, row)
+    };
+    let code = match kind {
+        MouseEventKind::Motion => {
+            if !mouse_motion_allowed(capture.mode, true) {
+                return None;
+            }
+            if col == capture.last_col && row == capture.last_row && mods == capture.last_mods {
+                return None; // same-cell motion dedupe
+            }
+            mouse_button_code(MouseEventKind::Motion, capture.button_code, mods, sgr)
+        }
+        MouseEventKind::Press => {
+            // Drop unencodable presses rather than saturating a wrong cell.
+            if !mouse_coords_encodable(col, row, capture.mode) {
+                return None;
+            }
+            mouse_button_code(MouseEventKind::Press, capture.button_code, mods, sgr)
+        }
+        MouseEventKind::Release => {
+            mouse_button_code(MouseEventKind::Release, capture.button_code, mods, sgr)
+        }
+    };
+    let bytes = encode_mouse_report(code, col, row, release, capture.mode)?;
+    capture.last_col = col;
+    capture.last_row = row;
+    capture.last_mods = mods;
+    if matches!(kind, MouseEventKind::Press) {
+        capture.press_sent = true;
+    }
+    Some(bytes)
+}
+
+/// No-button hover motion (1003 only). Returns bytes when the cell changed.
+pub fn mouse_hover_motion(
+    mode: TermMode,
+    col: u16,
+    row: u16,
+    mods: u16,
+    last: &mut Option<(u16, u16, u16)>,
+) -> Option<Vec<u8>> {
+    if !mode.contains(TermMode::MOUSE_MOTION) {
+        return None;
+    }
+    if !mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    if let Some((lc, lr, lm)) = *last {
+        if lc == col && lr == row && lm == mods {
+            return None;
+        }
+    }
+    let code = 35 + mods;
+    let bytes = encode_mouse_report(code, col, row, false, mode)?;
+    *last = Some((col, row, mods));
+    Some(bytes)
+}
+
+/// Synthesize a matching release for a captured Application gesture (focus
+/// loss / cancel / search-open). Returns bytes once; caller must clear capture.
+/// No-op when the original press was never transmitted.
+pub fn mouse_cancel_release(capture: &MouseCapture) -> Option<Vec<u8>> {
+    if !capture.press_sent {
+        return None;
+    }
+    let sgr = capture.mode.contains(TermMode::SGR_MOUSE);
+    let code = mouse_button_code(
+        MouseEventKind::Release,
+        capture.button_code,
+        capture.last_mods,
+        sgr,
+    );
+    encode_mouse_report(code, capture.last_col, capture.last_row, true, capture.mode)
+}
+
+/// Pure seam: new press requires content-rect containment AND topmost layer
+/// ownership (not a higher menu/popup layer). Existing captures may complete
+/// outside the pane.
+pub fn mouse_press_topmost_ok(pos_in_content: bool, topmost_is_content_layer: bool) -> bool {
+    pos_in_content && topmost_is_content_layer
+}
+
+/// Hover (1003) is suppressed while any capture exists or history is scrolled.
+pub fn mouse_hover_allowed(
+    any_capture: bool,
+    display_offset: usize,
+    pointer_in_content: bool,
+) -> bool {
+    pointer_in_content && !any_capture && display_offset == 0
 }
 
 /// Resolve a wheel action for a hovered pane.
@@ -1122,5 +1473,307 @@ mod tests {
         let (steps, rem) = wheel_steps(0.42, 0.0, 4.0);
         assert_eq!(steps, 0.0);
         assert_eq!(rem, 0.42);
+    }
+
+    // ---- mouse protocol encoding --------------------------------------------
+
+    #[test]
+    fn sgr_left_press_at_5_10() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_report(0, 5, 10, false, mode).unwrap(),
+            b"\x1b[<0;5;10M"
+        );
+    }
+
+    #[test]
+    fn sgr_right_release() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_report(2, 5, 10, true, mode).unwrap(),
+            b"\x1b[<2;5;10m"
+        );
+    }
+
+    #[test]
+    fn sgr_left_drag() {
+        let mode = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_report(32, 5, 10, false, mode).unwrap(),
+            b"\x1b[<32;5;10M"
+        );
+    }
+
+    #[test]
+    fn sgr_no_button_motion() {
+        let mode = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+        assert_eq!(
+            encode_mouse_report(35, 5, 10, false, mode).unwrap(),
+            b"\x1b[<35;5;10M"
+        );
+    }
+
+    #[test]
+    fn legacy_left_press_bytes() {
+        let mode = TermMode::MOUSE_REPORT_CLICK;
+        // ESC [ M  space(0+32)  %(5+32)  *(10+32)
+        assert_eq!(
+            encode_mouse_report(0, 5, 10, false, mode).unwrap(),
+            vec![0x1b, 0x5b, 0x4d, 0x20, 0x25, 0x2a]
+        );
+    }
+
+    #[test]
+    fn legacy_release_bytes() {
+        let mode = TermMode::MOUSE_REPORT_CLICK;
+        // release code 3 → 32+3 = 0x23 '#'
+        assert_eq!(
+            encode_mouse_report(3, 5, 10, true, mode).unwrap(),
+            vec![0x1b, 0x5b, 0x4d, 0x23, 0x25, 0x2a]
+        );
+    }
+
+    #[test]
+    fn sgr_beats_utf8_when_both_set() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE | TermMode::UTF8_MOUSE;
+        let b = encode_mouse_report(0, 5, 10, false, mode).unwrap();
+        assert!(b.starts_with(b"\x1b[<"), "SGR form wins: {b:?}");
+    }
+
+    #[test]
+    fn legacy_drops_unencodable_coords() {
+        let mode = TermMode::MOUSE_REPORT_CLICK;
+        assert!(encode_mouse_report(0, 224, 1, false, mode).is_none());
+        assert!(encode_mouse_report(0, 1, 224, false, mode).is_none());
+    }
+
+    #[test]
+    fn release_beyond_legacy_limit_uses_clamped_last_cell() {
+        let mode = freeze_mouse_mode(TermMode::MOUSE_REPORT_CLICK);
+        let mut cap = MouseCapture {
+            button: MouseBtn::Left,
+            owner: MouseOwner::Application,
+            mode,
+            button_code: 0,
+            last_col: 5,
+            last_row: 10,
+            last_mods: 0,
+            press_sent: true,
+        };
+        // Press was valid; release at col 300 must still emit button-up at last cell.
+        let rel = mouse_app_event(&mut cap, MouseEventKind::Release, 300, 10, 0);
+        assert!(rel.is_some(), "release must not be dropped");
+        assert_eq!(
+            rel.unwrap(),
+            encode_mouse_report(3, 5, 10, true, mode).unwrap()
+        );
+    }
+
+    #[test]
+    fn utf8_drops_coords_past_2015() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        assert!(encode_mouse_report(0, 2016, 1, false, mode).is_none());
+        assert!(encode_mouse_report(0, 2015, 1, false, mode).is_some());
+    }
+
+    #[test]
+    fn mouse_mod_bits_shift_alt_ctrl() {
+        assert_eq!(mouse_mod_bits(Modifiers::SHIFT), 4);
+        assert_eq!(mouse_mod_bits(Modifiers::ALT), 8);
+        assert_eq!(mouse_mod_bits(Modifiers::CTRL), 16);
+        let all = Modifiers {
+            shift: true,
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(mouse_mod_bits(all), 4 + 8 + 16);
+    }
+
+    #[test]
+    fn press_owner_shift_or_scrollback_or_no_mode_is_local() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(mouse_press_owner(true, 0, mode), MouseOwner::Local);
+        assert_eq!(mouse_press_owner(false, 3, mode), MouseOwner::Local);
+        assert_eq!(
+            mouse_press_owner(false, 0, TermMode::empty()),
+            MouseOwner::Local
+        );
+        assert_eq!(mouse_press_owner(false, 0, mode), MouseOwner::Application);
+    }
+
+    #[test]
+    fn motion_gates_by_mode() {
+        assert!(!mouse_motion_allowed(TermMode::MOUSE_REPORT_CLICK, true));
+        assert!(mouse_motion_allowed(TermMode::MOUSE_DRAG, true));
+        assert!(!mouse_motion_allowed(TermMode::MOUSE_DRAG, false));
+        assert!(mouse_motion_allowed(TermMode::MOUSE_MOTION, false));
+        assert!(mouse_motion_allowed(TermMode::MOUSE_MOTION, true));
+    }
+
+    #[test]
+    fn app_gesture_press_motion_release_and_dedupe() {
+        let mode = freeze_mouse_mode(TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE);
+        let mut cap = MouseCapture {
+            button: MouseBtn::Left,
+            owner: MouseOwner::Application,
+            mode,
+            button_code: 0,
+            last_col: 5,
+            last_row: 10,
+            last_mods: 0,
+            press_sent: false,
+        };
+        assert_eq!(
+            mouse_app_event(&mut cap, MouseEventKind::Press, 5, 10, 0).unwrap(),
+            b"\x1b[<0;5;10M"
+        );
+        // same cell motion → none
+        assert!(mouse_app_event(&mut cap, MouseEventKind::Motion, 5, 10, 0).is_none());
+        assert_eq!(
+            mouse_app_event(&mut cap, MouseEventKind::Motion, 6, 10, 0).unwrap(),
+            b"\x1b[<32;6;10M"
+        );
+        assert_eq!(
+            mouse_app_event(&mut cap, MouseEventKind::Release, 6, 10, 0).unwrap(),
+            b"\x1b[<0;6;10m"
+        );
+    }
+
+    #[test]
+    fn mid_gesture_mode_change_uses_frozen_mode() {
+        // Capture frozen with SGR; live mode later drops SGR — still encodes SGR.
+        let mut cap = MouseCapture {
+            button: MouseBtn::Left,
+            owner: MouseOwner::Application,
+            mode: freeze_mouse_mode(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE),
+            button_code: 0,
+            last_col: 1,
+            last_row: 1,
+            last_mods: 0,
+            press_sent: true,
+        };
+        let rel = mouse_app_event(&mut cap, MouseEventKind::Release, 2, 3, 0).unwrap();
+        assert_eq!(rel, b"\x1b[<0;2;3m");
+    }
+
+    #[test]
+    fn cancel_release_matches_last_cell() {
+        let cap = MouseCapture {
+            button: MouseBtn::Right,
+            owner: MouseOwner::Application,
+            mode: freeze_mouse_mode(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE),
+            button_code: 2,
+            last_col: 5,
+            last_row: 10,
+            last_mods: 0,
+            press_sent: true,
+        };
+        assert_eq!(mouse_cancel_release(&cap).unwrap(), b"\x1b[<2;5;10m");
+    }
+
+    #[test]
+    fn unencodable_press_suppresses_drag_and_release() {
+        let mode = freeze_mouse_mode(TermMode::MOUSE_REPORT_CLICK); // legacy
+        let mut cap = MouseCapture {
+            button: MouseBtn::Left,
+            owner: MouseOwner::Application,
+            mode,
+            button_code: 0,
+            last_col: 224,
+            last_row: 1,
+            last_mods: 0,
+            press_sent: false,
+        };
+        // Press at col 224 is unencodable — no bytes, press_sent stays false.
+        assert!(mouse_app_event(&mut cap, MouseEventKind::Press, 224, 1, 0).is_none());
+        assert!(!cap.press_sent);
+        assert!(mouse_app_event(&mut cap, MouseEventKind::Motion, 10, 1, 0).is_none());
+        assert!(mouse_app_event(&mut cap, MouseEventKind::Release, 10, 1, 0).is_none());
+        assert!(mouse_cancel_release(&cap).is_none());
+    }
+
+    #[test]
+    fn press_requires_topmost_content_ownership() {
+        assert!(mouse_press_topmost_ok(true, true));
+        assert!(!mouse_press_topmost_ok(true, false)); // menu above
+        assert!(!mouse_press_topmost_ok(false, true)); // titlebar / outside
+    }
+
+    #[test]
+    fn hover_suppressed_with_capture_or_history() {
+        assert!(mouse_hover_allowed(false, 0, true));
+        assert!(!mouse_hover_allowed(true, 0, true)); // local or app capture
+        assert!(!mouse_hover_allowed(false, 3, true)); // scrolled history
+        assert!(!mouse_hover_allowed(false, 0, false));
+    }
+
+    #[test]
+    fn hover_motion_only_in_1003_and_dedupes() {
+        let mode = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+        let mut last = None;
+        assert_eq!(
+            mouse_hover_motion(mode, 5, 10, 0, &mut last).unwrap(),
+            b"\x1b[<35;5;10M"
+        );
+        assert!(mouse_hover_motion(mode, 5, 10, 0, &mut last).is_none());
+        assert!(
+            mouse_hover_motion(
+                TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE,
+                6,
+                10,
+                0,
+                &mut last
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_and_suppresses_pty_bytes() {
+        let live = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let events = [
+            key_ev(Key::F, mods(true, false, false)),
+            Event::Text("f".into()),
+            key_ev(Key::Enter, Modifiers::default()),
+        ];
+        let out = process_input(&events, live, TermMode::empty(), false);
+        assert!(out.open_search);
+        assert!(out.pty_bytes.is_empty(), "no 0x06 or companion keys");
+        assert!(!out.interrupt && !out.copy && !out.paste_clipboard);
+    }
+
+    #[test]
+    fn ctrl_f_with_shift_is_not_search() {
+        // Ctrl+Shift+F must not open search (plan: no Shift/Alt).
+        let live = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let out = process_input(
+            &[key_ev(
+                Key::F,
+                Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            )],
+            live,
+            TermMode::empty(),
+            false,
+        );
+        assert!(!out.open_search);
+    }
+
+    #[test]
+    fn wheel_still_uses_shared_encoder_for_sgr() {
+        let mode = TermMode::MOUSE_MODE | TermMode::SGR_MOUSE;
+        assert_eq!(pty(wheel_input(1, mode, 5, 10)), b"\x1b[<64;5;10M");
+        assert_eq!(pty(wheel_input(-1, mode, 5, 10)), b"\x1b[<65;5;10M");
     }
 }
