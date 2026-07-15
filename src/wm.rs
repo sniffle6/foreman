@@ -9000,7 +9000,7 @@ mod tests {
     fn unminimize_keeps_a_bottom_docked_panel_on_the_bottom() {
         // Minimize every project while the Sessions panel is bottom-docked;
         // restoring must not shove the panel back to the right rail.
-        let mut desk = WindowManager::new();
+        let mut desk = WindowManager::new().as_desktop();
         desk.last_area = egui::vec2(1000.0, 800.0);
         desk.ensure_panel(false, 200.0, Dir::Down);
         let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
@@ -9129,7 +9129,7 @@ mod tests {
 
     #[test]
     fn unminimize_keeps_right_docked_panel_width() {
-        let mut desk = WindowManager::new();
+        let mut desk = WindowManager::new().as_desktop();
         desk.last_area = egui::vec2(1000.0, 800.0);
         desk.ensure_panel(false, 260.0, Dir::Right);
         let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
@@ -9179,7 +9179,7 @@ mod tests {
 
     #[test]
     fn tile_new_beside_a_sole_bottom_panel_keeps_bottom_dock() {
-        let mut desk = WindowManager::new();
+        let mut desk = WindowManager::new().as_desktop();
         desk.last_area = egui::vec2(1000.0, 800.0);
         desk.ensure_panel(false, 200.0, Dir::Down);
         let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
