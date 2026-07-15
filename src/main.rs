@@ -54,6 +54,12 @@ struct App {
     chrome_t: f32,
     /// Agent-dispatch requests from the control pipe thread.
     ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
+    /// Update-check events from the worker (update::spawn); drained per-frame.
+    update_rx: std::sync::mpsc::Receiver<update::Event>,
+    /// Effects for the worker to execute (fetch now / open releases page).
+    update_fx: std::sync::mpsc::Sender<update::Effect>,
+    /// Current updater state; rendered by the panel chip (a later task).
+    update_state: update::State,
     /// Persisted app settings (terminal font size today). Seeded into egui's
     /// per-context data each frame and read back to capture Ctrl+Scroll/Ctrl+0
     /// zoom changes any pane made.
@@ -95,7 +101,24 @@ const FONT_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis
 const WORKSPACE_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl App {
-    fn new(ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>) -> Self {
+    fn new(
+        ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
+        update_rx: std::sync::mpsc::Receiver<update::Event>,
+        update_fx: std::sync::mpsc::Sender<update::Effect>,
+    ) -> Self {
+        // Debug-only preview: FOREMAN_UPDATE_TEST=1 fakes an available update
+        // so the chip can be seen/screenshotted without a real newer release.
+        let update_state = if cfg!(debug_assertions)
+            && std::env::var_os("FOREMAN_UPDATE_TEST").is_some()
+        {
+            update::State::UpdateAvailable {
+                version: "v9.9.9".into(),
+                html_url: update::RELEASES_URL.into(),
+                can_apply: false,
+            }
+        } else {
+            update::State::Idle
+        };
         Self {
             desktop: WindowManager::new().as_desktop(),
             started: false,
@@ -104,6 +127,9 @@ impl App {
             chrome_leave_since: None,
             chrome_t: 0.0,
             ctrl,
+            update_rx,
+            update_fx,
+            update_state,
             settings: config::Settings::load(),
             font_dirty_at: None,
             workspace_dirty_at: None,
@@ -482,6 +508,15 @@ impl eframe::App for App {
             ctrl_activity = true;
         }
 
+        while let Ok(ev) = self.update_rx.try_recv() {
+            let state = std::mem::replace(&mut self.update_state, update::State::Idle);
+            let (state, effects) = update::step(state, ev, env!("CARGO_PKG_VERSION"));
+            self.update_state = state;
+            for fx in effects {
+                let _ = self.update_fx.send(fx);
+            }
+        }
+
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let mut area = ui.available_rect_before_wrap();
         if !maximized {
@@ -785,7 +820,14 @@ fn main() -> eframe::Result {
             // arrives, rather than waiting on the idle repaint tick.
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
-            Ok(Box::new(App::new(rx)))
+            let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
+            let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
+            // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch
+            // (spec section 3 gating). Debug builds never phone home.
+            if !cfg!(debug_assertions) && std::env::var_os("FOREMAN_NO_UPDATE").is_none() {
+                update::spawn(cc.egui_ctx.clone(), upd_event_tx, upd_effect_rx);
+            }
+            Ok(Box::new(App::new(rx, upd_event_rx, upd_effect_tx)))
         }),
     )
 }

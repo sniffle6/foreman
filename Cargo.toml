@@ -20,6 +20,10 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.2"
+# Update check only: blocking HTTP on a plain thread, rustls default.
+# NOTE: default TLS roots are webpki, NOT the Windows cert store -- corporate
+# MITM proxies fail the check; that is absorbed by silent-skip (spec Deps section).
+ureq = "3"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

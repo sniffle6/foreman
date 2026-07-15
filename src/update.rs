@@ -110,6 +110,78 @@ pub fn step(state: State, ev: Event, current: &str) -> (State, Vec<Effect>) {
     }
 }
 
+// I/O edge: everything below runs on the worker thread
+
+const API_URL: &str = "https://api.github.com/repos/sniffle6/foreman/releases/latest";
+const FIRST_CHECK: std::time::Duration = std::time::Duration::from_secs(10);
+const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+fn fetch_url(url: &str) -> Result<ReleaseInfo, String> {
+    let ua = concat!(
+        "foreman/",
+        env!("CARGO_PKG_VERSION"),
+        " (+https://github.com/sniffle6/foreman)"
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut resp = agent
+        .get(url)
+        .header("User-Agent", ua)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&body).map_err(|e| e.to_string())
+}
+
+fn fetch_latest() -> Result<ReleaseInfo, String> {
+    fetch_url(API_URL)
+}
+
+/// Worker thread: executes Effects, reports Events (channel + repaint --
+/// the same seam shape as Session's PTY reader thread, terminal.rs:824).
+/// Self-schedules the periodic check; Phase-4 effects are accepted and
+/// dropped so the GUI never needs to know which phase is compiled in.
+pub fn spawn(
+    ctx: eframe::egui::Context,
+    event_tx: std::sync::mpsc::Sender<Event>,
+    effect_rx: std::sync::mpsc::Receiver<Effect>,
+) {
+    std::thread::spawn(move || {
+        let mut next_check = std::time::Instant::now() + FIRST_CHECK;
+        loop {
+            let wait = next_check.saturating_duration_since(std::time::Instant::now());
+            match effect_rx.recv_timeout(wait) {
+                Ok(Effect::FetchLatest) => {}
+                Ok(Effect::OpenReleasesPage(url)) => {
+                    ctx.open_url(eframe::egui::OpenUrl::new_tab(url));
+                    ctx.request_repaint();
+                    continue;
+                }
+                Ok(_) => continue, // Phase-4 effects: not executed yet
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            let ev = match fetch_latest() {
+                Ok(r) => Event::ReleaseFetched(r),
+                Err(e) => {
+                    eprintln!("update: check failed (will retry): {e}");
+                    Event::FetchFailed
+                }
+            };
+            if event_tx.send(ev).is_err() {
+                break;
+            }
+            ctx.request_repaint();
+            next_check = std::time::Instant::now() + CHECK_EVERY;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +326,13 @@ mod tests {
             select_asset(&r.assets).unwrap().browser_download_url,
             "https://x/z"
         );
+    }
+
+    #[test]
+    fn fetch_error_maps_to_fetch_failed_event() {
+        // fetch_latest against an unroutable host must produce Err, which the
+        // worker maps to Event::FetchFailed (never a panic).
+        let err = fetch_url("http://127.0.0.1:9/releases/latest");
+        assert!(err.is_err());
     }
 }
