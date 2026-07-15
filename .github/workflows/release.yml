@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "install.ps1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      # Match local builds (GNU, not MSVC) so release binaries don't
+      # silently differ from what gets tested. Spec §1 requires empirically
+      # verifying this link step on the runner.
+      - name: Use GNU toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
+          rustc -vV
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Tag must match Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if ('v${{ steps.ver.outputs.version }}' -ne '${{ github.ref_name }}') {
+            throw "tag ${{ github.ref_name }} != Cargo.toml v${{ steps.ver.outputs.version }}"
+          }
+
+      - name: Test
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $zip = "foreman-v$v-x86_64-windows.zip"
+          New-Item -ItemType Directory staging | Out-Null
+          Copy-Item target/release/foreman.exe staging/
+          Copy-Item LICENSE-MIT, LICENSE-APACHE staging/
+          Copy-Item assets/fonts/LICENSE-Hack.md staging/THIRD-PARTY-Hack-font.md
+          Copy-Item assets/conpty/LICENSE staging/THIRD-PARTY-ConPTY.txt
+          Compress-Archive -Path staging/* -DestinationPath $zip
+          $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$h  $zip" | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload dry-run artifacts
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run
+          path: |
+            foreman-v*-x86_64-windows.zip
+            SHA256SUMS.txt
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' `
+            "foreman-v${{ steps.ver.outputs.version }}-x86_64-windows.zip" `
+            SHA256SUMS.txt `
+            --generate-notes
