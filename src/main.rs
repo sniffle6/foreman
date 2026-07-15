@@ -1,3 +1,8 @@
+// Release builds are GUI-subsystem so launching foreman.exe from Explorer
+// does not spawn a console window. Debug builds stay console-subsystem so
+// eprintln/panic output lands somewhere during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod caret;
 mod chat;
 mod chat_view;
@@ -798,10 +803,57 @@ fn load_app_icon() -> Option<egui::IconData> {
     })
 }
 
+/// GUI-subsystem processes start with no console, so the CLI path must adopt
+/// the parent shell's console before printing or `foreman status` etc. would
+/// write into the void. Std handles the caller already redirected (pipes,
+/// files) are valid and left untouched; only null handles are bound to the
+/// attached console. No-op when a console is already attached (debug builds)
+/// or when there is no parent console (double-click launch).
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let bind = |slot: u32, name: &[u16], access: u32| {
+            let cur = GetStdHandle(slot);
+            if !cur.is_null() && cur != INVALID_HANDLE_VALUE {
+                return; // caller-redirected pipe/file: keep it
+            }
+            let h = CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if h != INVALID_HANDLE_VALUE {
+                SetStdHandle(slot, h);
+            }
+        };
+        // "CONOUT$" / "CONIN$" as UTF-16, NUL-terminated.
+        let conout: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let conin: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+        bind(STD_OUTPUT_HANDLE, &conout, GENERIC_WRITE);
+        bind(STD_ERROR_HANDLE, &conout, GENERIC_WRITE);
+        bind(STD_INPUT_HANDLE, &conin, GENERIC_READ);
+    }
+}
+
 fn main() -> eframe::Result {
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
+        attach_parent_console();
         std::process::exit(control::client_main(&args[1..]));
     }
     install_panic_logger();
