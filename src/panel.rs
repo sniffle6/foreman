@@ -89,6 +89,8 @@ pub struct ProjectEntry {
 #[derive(Clone, Debug, Default)]
 pub struct PanelModel {
     pub projects: Vec<ProjectEntry>,
+    /// Version string to show as the panel's update chip (None = hidden).
+    pub update: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +115,8 @@ pub struct PanelView {
     pub click: Option<TargetPath>,
     pub hover_act: Option<(TargetPath, PanelBtn)>,
     pub toggle_collapse: bool,
+    /// Latched when the user clicks the update chip; wm drains it each frame.
+    pub update_click: bool,
 }
 
 impl PanelView {
@@ -131,6 +135,7 @@ impl PanelView {
             click: None,
             hover_act: None,
             toggle_collapse: false,
+            update_click: false,
         }
     }
 
@@ -139,6 +144,22 @@ impl PanelView {
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
+
+        // Quiet update-available chip pinned to the bottom edge, expanded
+        // vertical layout only (rail/collapsed and horizontal modes skip it --
+        // YAGNI until someone misses it there). Shrinks the row-layout body so
+        // the last row never overlaps the chip.
+        const UPDATE_CHIP_H: f32 = 26.0;
+        let mut body = rect;
+        if !self.collapsed && self.model.update.is_some() {
+            let footer = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - UPDATE_CHIP_H),
+                rect.max,
+            );
+            body.max.y -= UPDATE_CHIP_H;
+            let ver = self.model.update.clone().unwrap();
+            self.paint_update_chip(ui, footer, base, &ver);
+        }
 
         // Flow follows the rect the leaf was given this frame: wider than tall
         // means the panel is bottom/top-docked and content runs left-to-right.
@@ -172,8 +193,8 @@ impl PanelView {
                 .iter()
                 .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
                 .sum::<f32>();
-        self.scroll = self.scroll.clamp(0.0, (content_h - rect.height()).max(0.0));
-        let mut y = rect.min.y + 4.0 - self.scroll;
+        self.scroll = self.scroll.clamp(0.0, (content_h - body.height()).max(0.0));
+        let mut y = body.min.y + 4.0 - self.scroll;
         let start_y = y;
 
         // Collect paint specs first so we can mutate self (click/hover) without
@@ -181,10 +202,10 @@ impl PanelView {
         let mut specs: Vec<(egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
         for (pi, proj) in self.model.projects.iter().enumerate() {
             let row = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x + 4.0, y),
-                egui::vec2((rect.width() - 8.0).max(0.0), row_h),
+                egui::pos2(body.min.x + 4.0, y),
+                egui::vec2((body.width() - 8.0).max(0.0), row_h),
             );
-            if row_visible(row, rect) {
+            if row_visible(row, body) {
                 specs.push((
                     row,
                     base.with(("prow", pi, proj.path.project)),
@@ -204,10 +225,10 @@ impl PanelView {
 
             for (ti, t) in proj.tabs.iter().enumerate() {
                 let row = egui::Rect::from_min_size(
-                    egui::pos2(rect.min.x + 16.0, y),
-                    egui::vec2((rect.width() - 20.0).max(0.0), row_h),
+                    egui::pos2(body.min.x + 16.0, y),
+                    egui::vec2((body.width() - 20.0).max(0.0), row_h),
                 );
-                if row_visible(row, rect) {
+                if row_visible(row, body) {
                     specs.push((
                         row,
                         base.with(("trow", pi, ti, t.path.window, t.path.tab)),
@@ -228,15 +249,41 @@ impl PanelView {
             y += 4.0;
         }
         for (row, id, rp) in specs {
-            self.paint_row(ui, row, id, rect, rp);
+            self.paint_row(ui, row, id, body, rp);
         }
 
         let content_h = (y - start_y) + self.scroll;
-        let resp = ui.interact(rect, base.with("panel-scroll"), egui::Sense::hover());
+        let resp = ui.interact(body, base.with("panel-scroll"), egui::Sense::hover());
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if resp.hovered() && scroll != 0.0 {
-            let max_scroll = (content_h - rect.height()).max(0.0);
+            let max_scroll = (content_h - body.height()).max(0.0);
             self.scroll = (self.scroll - scroll).clamp(0.0, max_scroll);
+        }
+    }
+
+    /// Quiet update-available chip pinned to the panel's bottom edge.
+    /// Click is recorded (deferred-Act, like `self.click`) and drained by wm.
+    fn paint_update_chip(&mut self, ui: &mut egui::Ui, footer: egui::Rect, base: egui::Id, ver: &str) {
+        let p = ui.painter();
+        let chip = footer.shrink2(egui::vec2(6.0, 3.0));
+        let id = base.with("update-chip");
+        let resp = ui.interact(chip, id, egui::Sense::click());
+        if resp.hovered() {
+            p.rect_filled(chip, egui::CornerRadius::same(5), SEL_BG);
+        }
+        let text = format!("↓ {ver} — click for release notes");
+        let galley = p.layout_no_wrap(
+            text,
+            egui::FontId::proportional(12.0),
+            if resp.hovered() { SNAP_STROKE } else { DIM },
+        );
+        let pos = egui::pos2(
+            chip.min.x + 6.0,
+            chip.center().y - galley.size().y / 2.0,
+        );
+        p.galley(pos, galley, SNAP_STROKE);
+        if resp.clicked() {
+            self.update_click = true;
         }
     }
 

@@ -517,6 +517,11 @@ impl eframe::App for App {
             }
         }
 
+        self.desktop.set_update_chip(match &self.update_state {
+            update::State::UpdateAvailable { version, .. } => Some(version.clone()),
+            _ => None,
+        });
+
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let mut area = ui.available_rect_before_wrap();
         if !maximized {
@@ -545,6 +550,14 @@ impl eframe::App for App {
         if !quitting_empty {
             self.desktop
                 .show(ui, area, true, egui::Id::new("desktop"), false);
+        }
+        if self.desktop.take_update_click() {
+            let state = std::mem::replace(&mut self.update_state, update::State::Idle);
+            let (state, effects) = update::step(state, update::Event::ClickChip, env!("CARGO_PKG_VERSION"));
+            self.update_state = state;
+            for fx in effects {
+                let _ = self.update_fx.send(fx);
+            }
         }
         if show_landing {
             let content = self.desktop.landing_content_rect(area);

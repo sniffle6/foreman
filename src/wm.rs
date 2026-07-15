@@ -403,6 +403,10 @@ pub struct WindowManager {
     /// Structural workspace change since last poll (layout/open/close/focus/…).
     /// Desktop `poll_workspace_dirty` ORs this with nested project children.
     workspace_dirty: bool,
+    /// Version string to show as the panel's update chip (None = hidden).
+    update_chip: Option<String>,
+    /// Latched when the user clicks the chip; App drains it each frame.
+    update_clicked: bool,
 }
 
 impl WindowManager {
@@ -435,6 +439,8 @@ impl WindowManager {
             app_modal: false,
             opened: Vec::new(),
             workspace_dirty: false,
+            update_chip: None,
+            update_clicked: false,
         }
     }
 
@@ -1714,7 +1720,20 @@ impl WindowManager {
                 });
             }
         }
-        PanelModel { projects }
+        PanelModel {
+            projects,
+            update: self.update_chip.clone(),
+        }
+    }
+
+    /// Version string to show as the panel's update chip (None = hidden).
+    pub fn set_update_chip(&mut self, v: Option<String>) {
+        self.update_chip = v;
+    }
+
+    /// Latched when the user clicks the chip; App drains it each frame.
+    pub fn take_update_click(&mut self) -> bool {
+        std::mem::take(&mut self.update_clicked)
     }
 
     /// Desktop-only, idempotent: create the task-manager panel as a docked
@@ -1894,6 +1913,10 @@ impl WindowManager {
                     if v.toggle_collapse {
                         v.toggle_collapse = false;
                         toggle = true;
+                    }
+                    if v.update_click {
+                        v.update_click = false;
+                        self.update_clicked = true;
                     }
                 }
             }
