@@ -108,17 +108,16 @@ impl App {
     ) -> Self {
         // Debug-only preview: FOREMAN_UPDATE_TEST=1 fakes an available update
         // so the chip can be seen/screenshotted without a real newer release.
-        let update_state = if cfg!(debug_assertions)
-            && std::env::var_os("FOREMAN_UPDATE_TEST").is_some()
-        {
-            update::State::UpdateAvailable {
-                version: "v9.9.9".into(),
-                html_url: update::RELEASES_URL.into(),
-                can_apply: false,
-            }
-        } else {
-            update::State::Idle
-        };
+        let update_state =
+            if cfg!(debug_assertions) && std::env::var_os("FOREMAN_UPDATE_TEST").is_some() {
+                update::State::UpdateAvailable {
+                    version: "v9.9.9".into(),
+                    html_url: update::RELEASES_URL.into(),
+                    can_apply: false,
+                }
+            } else {
+                update::State::Idle
+            };
         Self {
             desktop: WindowManager::new().as_desktop(),
             started: false,
@@ -553,7 +552,8 @@ impl eframe::App for App {
         }
         if self.desktop.take_update_click() {
             let state = std::mem::replace(&mut self.update_state, update::State::Idle);
-            let (state, effects) = update::step(state, update::Event::ClickChip, env!("CARGO_PKG_VERSION"));
+            let (state, effects) =
+                update::step(state, update::Event::ClickChip, env!("CARGO_PKG_VERSION"));
             self.update_state = state;
             for fx in effects {
                 let _ = self.update_fx.send(fx);

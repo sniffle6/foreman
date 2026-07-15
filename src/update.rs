@@ -26,9 +26,13 @@ pub enum State {
         html_url: String,
         can_apply: bool,
     },
-    Downloading { progress: f32 },
+    Downloading {
+        progress: f32,
+    },
     ReadyToRestart,
-    Error { retryable: bool },
+    Error {
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +99,14 @@ pub fn step(state: State, ev: Event, current: &str) -> (State, Vec<Effect>) {
                 _ => (S::Idle, vec![]),
             }
         }
-        (S::UpdateAvailable { version, html_url, can_apply: false }, E::ClickChip) => {
+        (
+            S::UpdateAvailable {
+                version,
+                html_url,
+                can_apply: false,
+            },
+            E::ClickChip,
+        ) => {
             let url = html_url.clone();
             (
                 S::UpdateAvailable {
@@ -220,7 +231,10 @@ mod tests {
     // select_asset
     #[test]
     fn selects_zip_by_suffix_never_by_full_name() {
-        let r = rel("v0.2.1", &["SHA256SUMS.txt", "foreman-v0.2.1-x86_64-windows.zip"]);
+        let r = rel(
+            "v0.2.1",
+            &["SHA256SUMS.txt", "foreman-v0.2.1-x86_64-windows.zip"],
+        );
         assert_eq!(
             select_asset(&r.assets).unwrap().name,
             "foreman-v0.2.1-x86_64-windows.zip"
@@ -234,7 +248,11 @@ mod tests {
     // step: fetch outcomes
     #[test]
     fn newer_release_shows_chip_with_can_apply_false() {
-        let (s, fx) = step(State::Idle, Event::ReleaseFetched(rel("v0.2.1", &[])), "0.2.0");
+        let (s, fx) = step(
+            State::Idle,
+            Event::ReleaseFetched(rel("v0.2.1", &[])),
+            "0.2.0",
+        );
         assert_eq!(
             s,
             State::UpdateAvailable {
