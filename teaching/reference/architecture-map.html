@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reference · Install &amp; Update Architecture Map</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="kicker">Reference · Foreman install &amp; update</p>
+  <h1>Architecture map</h1>
+  <p class="lede">One page. The modules, the invariants, the names, the states.
+  Compressed from the <a href="../../docs/superpowers/specs/2026-07-14-install-and-update-design.md">spec</a>.</p>
+
+  <h2 id="journey">The journey (happy path)</h2>
+  <div class="stages">
+    <div class="stage"><span class="who">Andy</span><span class="what">Bump <code>Cargo.toml</code> → commit → push tag <code>vX.Y.Z</code><span class="inv">Invariant: tag must equal Cargo.toml version or CI refuses</span></span></div>
+    <div class="stage"><span class="who">CI (release.yml)</span><span class="what"><code>cargo test</code> → <code>cargo build --release</code> (stable-gnu) → zip + <code>SHA256SUMS.txt</code> → <code>gh release create</code><span class="inv">Invariant: CI is the ONLY writer of full asset names</span></span></div>
+    <div class="stage"><span class="who">GitHub Release</span><span class="what">Becomes <code>releases/latest</code> (excludes drafts &amp; prereleases). This IS the manifest — no separate file.<span class="inv">Invariant: immutable once published; the trust anchor</span></span></div>
+    <div class="stage"><span class="who">install.ps1</span><span class="what">Select zip by suffix → download → verify SHA256 → extract to layout dir → user PATH<span class="inv">Invariant: refuses if foreman.exe is running — no swap in PowerShell</span></span></div>
+    <div class="stage"><span class="who">Updater (in app)</span><span class="what">Check every 6 h → chip <code>↓ v0.2.1</code> → (P4) download, verify, extract<span class="inv">Invariant: never interrupts; user chooses when</span></span></div>
+    <div class="stage"><span class="who">The swap (P4)</span><span class="what"><code>foreman.exe</code>→<code>.old</code>, <code>.new</code>→<code>foreman.exe</code> — legal because Windows lets you RENAME (not delete) a running exe<span class="inv">Invariant: swap exists in exactly one language (Rust)</span></span></div>
+    <div class="stage"><span class="who">Restart</span><span class="what">User clicks → workspace save → spawn new exe → exit → cold restore. Next launch deletes <code>.old</code>.</span></div>
+  </div>
+
+  <h2 id="modules">Module census</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Module</th><th>Interface (all a caller must know)</th><th>Depth verdict</th></tr>
+    <tr><td><code>release.yml</code></td><td>push tag <code>vX.Y.Z</code>; tag==Cargo.toml; emits named assets</td><td>Deep — delete it and the manual release ritual reappears</td></tr>
+    <tr><td><code>install.ps1</code></td><td>one URL, zero params</td><td>Very deep — whole install behind one line</td></tr>
+    <tr><td>Releases-API-as-manifest</td><td><code>releases/latest</code> JSON + asset suffixes + SHA256SUMS format</td><td>Correctly NOT built — a custom manifest would fail the deletion test</td></tr>
+    <tr><td><code>src/update.rs</code></td><td>state enum + clicks in, Effects out; <code>FOREMAN_NO_UPDATE</code></td><td>Deep because the core is pure (see below)</td></tr>
+    <tr><td>Install layout</td><td>fact table below</td><td>Real seam: script + (later) Inno both write it</td></tr>
+  </table>
+  </div>
+
+  <h2 id="naming">Asset naming (single definition)</h2>
+  <pre><code>zip:        foreman-v{VERSION}-x86_64-windows.zip
+checksums:  SHA256SUMS.txt          (&lt;hex&gt;  &lt;filename&gt; lines)
+installer:  foreman-v{VERSION}-setup.exe   (deferred)</code></pre>
+  <p><strong>CI writes full names. Consumers only match suffixes</strong>
+  (e.g. ends-with <code>-x86_64-windows.zip</code>) over the release's asset
+  list — <code>select_asset()</code> in Rust, pure and unit-tested. Nobody
+  reconstructs a filename from a version string.</p>
+
+  <h2 id="layout">Install layout fact table</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Fact</th><th>Value</th><th>Writers</th></tr>
+    <tr><td>Install dir</td><td><code>%LOCALAPPDATA%\Programs\foreman</code></td><td>script, (Inno later)</td></tr>
+    <tr><td>Exe name</td><td><code>foreman.exe</code></td><td>CI zip, script, (Inno)</td></tr>
+    <tr><td>PATH entry</td><td>install dir, <strong>user</strong> PATH, append-if-absent</td><td>script, (Inno)</td></tr>
+    <tr><td>Swap staging</td><td><code>foreman.exe.new</code> / <code>foreman.exe.old</code> beside exe</td><td>updater ONLY</td></tr>
+    <tr><td>Startup cleanup</td><td>delete <code>.old</code>, ignore failure</td><td>exe itself</td></tr>
+  </table>
+  </div>
+  <p>The updater does <em>not</em> consume this seam — it keys off
+  <code>current_exe()</code>. That's why portable installs self-update too.</p>
+
+  <h2 id="statemachine">Updater state machine (pure core)</h2>
+  <pre><code>decide(current_version, release_json) -&gt; Decision      // semver + select_asset
+step(State, Event) -&gt; (State, Vec&lt;Effect&gt;)             // ALL transitions live here
+
+States:  Idle
+         UpdateAvailable { version, can_apply }   // chip ↓ v0.2.1
+         Downloading { progress }                 // P4
+         ReadyToRestart                           // P4: "Restart to update"
+         Error { retryable }
+
+Events:  ReleaseFetched | FetchFailed | ClickChip | Progress
+         HashOk | HashBad | SwapOk | SwapFailed | ClickRestart
+
+Effects: FetchLatest | OpenReleasesPage | Download
+         VerifyAndSwap | SaveWorkspaceAndRestart</code></pre>
+  <p>The background thread is a dumb adapter: executes Effects, feeds Events
+  back over a channel + repaint — the same seam shape as <code>Session</code>'s
+  PTY reader thread. egui renders the state and forwards clicks. Unit tests
+  hit <code>step</code>/<code>decide</code> directly (layout/wm/chat convention).</p>
+
+  <h2 id="phases">Phasing</h2>
+  <div class="tablewrap">
+  <table>
+    <tr><th>Phase</th><th>Ships</th><th>New deps</th></tr>
+    <tr><td>1</td><td>release.yml: tag → zip + checksums + Release (verify gnu link on runner; LICENSE prerequisite)</td><td>—</td></tr>
+    <tr><td>2</td><td>install.ps1 + README one-liner</td><td>—</td></tr>
+    <tr><td>3</td><td>update check + notify chip (<code>can_apply=false</code>)</td><td><code>ureq</code></td></tr>
+    <tr><td>4</td><td>one-click apply: download/verify/swap/restart — after v0.2.x pilot</td><td><code>zip</code></td></tr>
+    <tr><td>5 (deferred)</td><td>Inno installer, winget, signing, custom domain</td><td>—</td></tr>
+  </table>
+  </div>
+
+  <h2 id="glossary">Glossary</h2>
+  <dl class="gloss">
+    <dt>Manifest</dt>
+    <dd>The machine-readable answer to "what is the latest version and where do I get it." Foreman's manifest is the GitHub Releases API itself, not a file we maintain.</dd>
+    <dt>Mark-of-the-Web (MotW)</dt>
+    <dd>A hidden NTFS stream (<code>Zone.Identifier</code>) tagging a file as internet-sourced. Browsers and Explorer-zip-extraction write/propagate it; <code>Invoke-WebRequest</code> and <code>Expand-Archive</code> don't. <span class="src">Verified empirically 2026-07-15.</span></dd>
+    <dt>SmartScreen</dt>
+    <dd>Windows' reputation check, triggered <em>only</em> for MotW-tagged executables. No MotW → no scary dialog. Why the <code>irm|iex</code> path is frictionless without code signing.</dd>
+    <dt>Rename-swap</dt>
+    <dd>The self-update trick: Windows forbids deleting/overwriting a running exe but allows renaming it. Rename running→<code>.old</code>, slide <code>.new</code> into place. rustup's mechanism (see <a href="https://docs.rs/self-replace">self-replace</a>).</dd>
+    <dt>Seam</dt>
+    <dd>A place where behaviour can vary without editing there. The install layout is a seam: script and Inno are adapters writing the same facts.</dd>
+    <dt>Pure core / thin adapter</dt>
+    <dd>All decisions in pure functions (<code>step</code>, <code>decide</code>); all I/O in a thread that just executes Effects. Tests exercise the shipping logic, not a shadow copy.</dd>
+    <dt>Silent-skip</dt>
+    <dd>Background-check failures (offline, rate-limit, corporate TLS proxy) log and retry later — never a visible error.</dd>
+    <dt>Cold restore</dt>
+    <dd>Foreman's workspace persistence: save on exit, rebuild sessions on launch. What makes "restart to update" cheap.</dd>
+  </dl>
+
+  <div class="lesson-nav">
+    <span><a href="../lessons/0001-anatomy-of-a-release.html">Lesson 0001 — Anatomy of a release</a></span>
+    <span><a href="../RESOURCES.md">Resources</a></span>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0001 · Anatomy of a Foreman Release</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="kicker">Lesson 0001 · ~10 minutes · Mission: own it as maintainer</p>
+  <h1>Anatomy of a foreman release</h1>
+  <p class="lede">Follow one release — <code>v0.2.1</code> — from your keyboard
+  to a user's restarted app, and learn the three invariants that decide
+  whether any change to this system is safe.</p>
+
+  <h2>The single mental model</h2>
+  <p>Everything in the
+  <a href="../../docs/superpowers/specs/2026-07-14-install-and-update-design.md">spec</a>
+  is one pipeline with <strong>one producer, one source of truth, and several
+  consumers that deliberately know as little as possible</strong>:</p>
+
+  <div class="stages">
+    <div class="stage"><span class="who">1 · You</span><span class="what">Edit <code>Cargo.toml</code> to <code>0.2.1</code>, commit, push tag <code>v0.2.1</code>.</span></div>
+    <div class="stage"><span class="who">2 · CI</span><span class="what">Checks tag == Cargo.toml, runs <code>cargo test</code>, builds release, zips, checksums, publishes a GitHub Release.</span></div>
+    <div class="stage"><span class="who">3 · The Release</span><span class="what">Now <em>is</em> <code>releases/latest</code>. Immutable. Every consumer below reads only this.</span></div>
+    <div class="stage"><span class="who">4a · New user</span><span class="what"><code>irm …/install.ps1 | iex</code> → verify → extract → PATH. Installed.</span></div>
+    <div class="stage"><span class="who">4b · Existing user</span><span class="what">Running foreman's 6-hourly check sees <code>0.2.1 &gt; 0.2.0</code> → quiet chip <code>↓ v0.2.1</code>.</span></div>
+    <div class="stage"><span class="who">5 · Click</span><span class="what">(Phase 4) download → verify → rename-swap → <em>"Restart to update"</em> → user restarts on <em>their</em> schedule; cold restore rebuilds the workspace.</span></div>
+  </div>
+
+  <p>Notice what does <strong>not</strong> exist: no update server, no manifest
+  file, no version database. The GitHub Release object is the manifest. This
+  passed the review's <em>deletion test</em>: if we built a custom manifest and
+  then deleted it, nothing would be lost — it would be a pass-through over data
+  GitHub already serves. Modules that fail the deletion test don't get built.</p>
+
+  <h2>The three invariants</h2>
+  <p>Every future PR against this system — yours or an agent's — is safe or
+  dangerous depending on whether it preserves these:</p>
+
+  <h3>1. Version truth lives in <code>Cargo.toml</code>; the tag must agree</h3>
+  <p>Two places could claim to know the version (file and tag), so CI makes
+  disagreement impossible: mismatch = no release. One fact, one owner,
+  mechanically enforced. When something reports the wrong version, you know
+  exactly where truth lives.</p>
+
+  <h3>2. CI is the only writer of asset names; consumers match suffixes</h3>
+  <p>The name <code>foreman-v0.2.1-x86_64-windows.zip</code> is spelled in
+  <em>one</em> place: <code>release.yml</code>. The install script and the
+  updater never rebuild that string from a version — they scan the release's
+  asset list for <em>ends-with</em> <code>-x86_64-windows.zip</code>
+  (<code>select_asset()</code>, pure, unit-tested). A rename typo therefore
+  breaks one writer, not three consumers on tag day.</p>
+
+  <h3>3. The swap exists in exactly one language</h3>
+  <p>Windows won't let you delete or overwrite a running exe — but it will let
+  you <strong>rename</strong> one (<a href="https://docs.rs/self-replace">how
+  rustup updates itself</a>; verified empirically on this machine during the
+  design fact-check). So the updater renames the running
+  <code>foreman.exe</code> → <code>foreman.exe.old</code> and slides the new
+  exe into place. That dance is subtle (rollback, AV interference,
+  <code>.old</code> cleanup), so it lives <em>only</em> in
+  <code>src/update.rs</code>. The install script refuses to touch a running
+  foreman rather than re-implement it in PowerShell.</p>
+
+  <div class="note"><span class="tag">Why the one-liner beats SmartScreen</span>
+  SmartScreen only screens files carrying <strong>Mark-of-the-Web</strong> — a
+  hidden <code>Zone.Identifier</code> stream browsers attach to downloads.
+  <code>Invoke-WebRequest</code> doesn't write it and
+  <code>Expand-Archive</code> doesn't propagate it, so a script-installed
+  <code>foreman.exe</code> has no MotW and launches clean, unsigned. But
+  Explorer's built-in zip extraction <em>does</em> propagate MotW — a
+  browser-downloaded, Explorer-extracted portable zip still hits the scary
+  dialog. Details: <a href="https://www.outflank.nl/blog/2020/03/30/mark-of-the-web-from-a-red-teams-perspective/">Outflank's MotW analysis</a>.</div>
+
+  <h2>Where the risk was moved</h2>
+  <p>Two review decisions shaped the plan's risk profile, and you'll see them
+  in the phasing: the updater ships <strong>notify-only first</strong> (Phase 3
+  — chip links to the Releases page) and gains one-click apply in Phase 4 only
+  after a real v0.2.x release cycle proves the loop. The swap is the most
+  dangerous code in the app — it now sits behind evidence instead of ahead of
+  it. And the Inno installer was deferred entirely: two installers writing the
+  same layout meant silent drift, so until someone asks for a
+  <code>setup.exe</code>, the script and zip are the only writers.</p>
+
+  <h2>Check yourself</h2>
+  <p>From memory — the point is retrieval, not recognition:</p>
+  <div class="quiz" id="quiz1"></div>
+
+  <div class="win"><span class="tag">Your win</span>
+  You can now trace <code>v0.2.1</code> through all six stages and name the
+  invariant each one protects. That's the review lens for every future PR
+  touching <code>release.yml</code>, <code>install.ps1</code>, or
+  <code>src/update.rs</code>.</div>
+
+  <h2>Go deeper</h2>
+  <p><strong>Primary source:</strong> read the
+  <a href="https://docs.rs/self-replace">self-replace crate docs</a> (5
+  minutes) — the cleanest explanation of why Windows self-updating works at
+  all, from the crate rustup's own updater informed.</p>
+  <p>Keep the <a href="../reference/architecture-map.html">architecture map</a>
+  within reach — it's the one-page compression of this lesson plus the state
+  machine you'll meet in lesson 0002.</p>
+
+  <p class="ask-teacher"><em>Anything unclear — why the tag check exists, what
+  a <code>Zone.Identifier</code> stream actually looks like, why suffix-match
+  instead of exact-match — ask your teacher in the foreman session. Follow-up
+  questions are the fastest way to turn this into storage strength.</em></p>
+
+  <div class="lesson-nav">
+    <span>0001 · Anatomy of a release</span>
+    <span>Next: 0002 · The updater state machine (planned)</span>
+  </div>
+</main>
+
+<script src="../assets/quiz.js"></script>
+<script>
+renderQuiz(document.getElementById("quiz1"), [
+  {
+    prompt: "Where does the version number live as the source of truth?",
+    options: [
+      "In the Cargo.toml file",
+      "In the git tag name",
+      "In a manifest file",
+      "In the release notes"
+    ],
+    answer: 0,
+    expl: "The tag must <em>agree</em> with Cargo.toml or CI refuses to release — but Cargo.toml is the truth the exe itself is compiled with (CARGO_PKG_VERSION)."
+  },
+  {
+    prompt: "Who is allowed to write full asset filenames?",
+    options: [
+      "Only the CI pipeline",
+      "Only the install script",
+      "Only the Rust updater",
+      "Only the release author"
+    ],
+    answer: 0,
+    expl: "release.yml is the single writer. Everything else — install.ps1, select_asset() in the updater, winget later — only ever matches suffixes."
+  },
+  {
+    prompt: "How do consumers locate the zip inside a release?",
+    options: [
+      "Match the asset suffix",
+      "Rebuild the full name",
+      "Read a manifest file",
+      "Take the first asset"
+    ],
+    answer: 0,
+    expl: "Ends-with '-x86_64-windows.zip' over the release's asset list. Rebuilding names from versions is exactly the coupling the review removed."
+  },
+  {
+    prompt: "The irm|iex install dodges SmartScreen because the extracted exe lacks…",
+    options: [
+      "the Mark-of-the-Web stream",
+      "a valid Authenticode signature",
+      "the publisher reputation score",
+      "an installer manifest entry"
+    ],
+    answer: 0,
+    expl: "No Zone.Identifier stream → SmartScreen never engages. Signatures and reputation only matter for files that carry MotW in the first place."
+  },
+  {
+    prompt: "The self-update swap is possible because Windows allows you to…",
+    options: [
+      "rename a running executable",
+      "delete a running executable",
+      "replace a running executable",
+      "unlock a running executable"
+    ],
+    answer: 0,
+    expl: "Delete and overwrite are forbidden while the exe runs; rename is legal. running → .old, new → foreman.exe. That asymmetry is the entire trick."
+  }
+]);
+</script>
+</body>
+</html>
