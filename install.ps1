@@ -1,9 +1,10 @@
 #Requires -Version 5.1
 # Foreman installer / manual updater.
 #   irm https://raw.githubusercontent.com/sniffle6/foreman/main/install.ps1 | iex
-# Does exactly four things: download latest release zip, verify SHA256,
-# extract to %LOCALAPPDATA%\Programs\foreman, add that dir to the USER PATH.
-# No shortcuts, no registry. Re-run any time to update.
+# Does exactly five things: download latest release zip, verify SHA256,
+# extract to %LOCALAPPDATA%\Programs\foreman, add that dir to the USER PATH,
+# drop a Start-menu shortcut (that's how Windows Search finds apps).
+# No registry. Re-run any time to update.
 # NOTE: runs inside the user's shell via iex - never call `exit` here.
 
 $ErrorActionPreference = 'Stop'
@@ -48,6 +49,14 @@ try {
         [Environment]::SetEnvironmentVariable('Path', "$userPath;$dest", 'User')
         Write-Host "added $dest to your user PATH (new terminals will pick it up)"
     }
+
+    # Start-menu shortcut: Windows Search only surfaces apps that have one.
+    # Exe path is stable across updates, so re-creating is harmless.
+    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
+    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+    $sc.TargetPath = Join-Path $dest 'foreman.exe'
+    $sc.WorkingDirectory = $dest
+    $sc.Save()
     Write-Host "foreman $($rel.tag_name) installed to $dest" -ForegroundColor Green
     Write-Host "run it: `"$dest\foreman.exe`" (or 'foreman' from a new terminal)"
 }

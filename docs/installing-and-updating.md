@@ -7,8 +7,9 @@ version exists. Spec with the full decision history:
 ## What it does
 
 - **Install**: one PowerShell line downloads the latest GitHub Release,
-  verifies its SHA-256, extracts to `%LOCALAPPDATA%\Programs\foreman`, and
-  appends that dir to the user PATH:
+  verifies its SHA-256, extracts to `%LOCALAPPDATA%\Programs\foreman`,
+  appends that dir to the user PATH, and drops a Start-menu shortcut
+  (Windows Search only surfaces apps that have one):
 
   ```powershell
   irm https://raw.githubusercontent.com/sniffle6/foreman/main/install.ps1 | iex
