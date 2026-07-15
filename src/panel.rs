@@ -145,10 +145,11 @@ impl PanelView {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
 
-        // Quiet update-available chip pinned to the bottom edge of the
-        // expanded vertical layout; the collapsed rails get a lone ↓ glyph
-        // instead (paint_rail / paint_rail_h). Shrinks the row-layout body so
-        // the last row never overlaps the chip.
+        // Quiet update-available chip pinned to the bottom edge of every
+        // expanded layout (rows, columns, strip); the collapsed rails get a
+        // lone ↓ glyph instead (paint_rail / paint_rail_h). Shrinks `body` so
+        // row layout never overlaps the chip — every expanded painter below
+        // must take `body`, not `rect`.
         const UPDATE_CHIP_H: f32 = 26.0;
         let mut body = rect;
         if !self.collapsed && self.model.update.is_some() {
@@ -175,9 +176,9 @@ impl PanelView {
         }
         if horizontal {
             if rect.height() < STRIP_H {
-                self.paint_strip(ui, rect, base);
+                self.paint_strip(ui, body, base);
             } else {
-                self.paint_columns(ui, rect, base);
+                self.paint_columns(ui, body, base);
             }
             return;
         }
@@ -278,13 +279,10 @@ impl PanelView {
             p.rect_filled(chip, egui::CornerRadius::same(5), SEL_BG);
         }
         let text = format!("↓ {ver} — click for release notes");
-        let galley = p.layout_no_wrap(
-            text,
-            egui::FontId::proportional(12.0),
-            if resp.hovered() { SNAP_STROKE } else { DIM },
-        );
+        let col = if resp.hovered() { SNAP_STROKE } else { DIM };
+        let galley = p.layout_no_wrap(text, egui::FontId::proportional(12.0), col);
         let pos = egui::pos2(chip.min.x + 6.0, chip.center().y - galley.size().y / 2.0);
-        p.galley(pos, galley, SNAP_STROKE);
+        p.galley(pos, galley, col);
         if resp.clicked() {
             self.update_click = true;
         }
@@ -309,18 +307,15 @@ impl PanelView {
         if resp.hovered() {
             p.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
         }
-        let galley = p.layout_no_wrap(
-            "↓".into(),
-            egui::FontId::proportional(14.0),
-            if resp.hovered() { TEXT } else { SNAP_STROKE },
-        );
+        let col = if resp.hovered() { TEXT } else { SNAP_STROKE };
+        let galley = p.layout_no_wrap("↓".into(), egui::FontId::proportional(14.0), col);
         p.galley(
             egui::pos2(
                 cell.center().x - galley.size().x / 2.0,
                 cell.center().y - galley.size().y / 2.0,
             ),
             galley,
-            SNAP_STROKE,
+            col,
         );
         if resp.clicked() {
             self.update_click = true;
