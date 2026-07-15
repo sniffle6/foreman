@@ -145,9 +145,9 @@ impl PanelView {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
 
-        // Quiet update-available chip pinned to the bottom edge, expanded
-        // vertical layout only (rail/collapsed and horizontal modes skip it --
-        // YAGNI until someone misses it there). Shrinks the row-layout body so
+        // Quiet update-available chip pinned to the bottom edge of the
+        // expanded vertical layout; the collapsed rails get a lone ↓ glyph
+        // instead (paint_rail / paint_rail_h). Shrinks the row-layout body so
         // the last row never overlaps the chip.
         const UPDATE_CHIP_H: f32 = 26.0;
         let mut body = rect;
@@ -263,7 +263,13 @@ impl PanelView {
 
     /// Quiet update-available chip pinned to the panel's bottom edge.
     /// Click is recorded (deferred-Act, like `self.click`) and drained by wm.
-    fn paint_update_chip(&mut self, ui: &mut egui::Ui, footer: egui::Rect, base: egui::Id, ver: &str) {
+    fn paint_update_chip(
+        &mut self,
+        ui: &mut egui::Ui,
+        footer: egui::Rect,
+        base: egui::Id,
+        ver: &str,
+    ) {
         let p = ui.painter();
         let chip = footer.shrink2(egui::vec2(6.0, 3.0));
         let id = base.with("update-chip");
@@ -277,11 +283,45 @@ impl PanelView {
             egui::FontId::proportional(12.0),
             if resp.hovered() { SNAP_STROKE } else { DIM },
         );
-        let pos = egui::pos2(
-            chip.min.x + 6.0,
-            chip.center().y - galley.size().y / 2.0,
-        );
+        let pos = egui::pos2(chip.min.x + 6.0, chip.center().y - galley.size().y / 2.0);
         p.galley(pos, galley, SNAP_STROKE);
+        if resp.clicked() {
+            self.update_click = true;
+        }
+    }
+
+    /// Collapsed-rail counterpart of the footer chip: a lone ↓ glyph carrying
+    /// the same id, tooltip, and `update_click` latch, so an update is
+    /// noticeable without expanding the panel. Fills BG behind itself because
+    /// the vertical rail has no scroll clamp and icons can flow underneath.
+    fn paint_rail_update_glyph(
+        &mut self,
+        ui: &mut egui::Ui,
+        cell: egui::Rect,
+        base: egui::Id,
+        ver: &str,
+    ) {
+        let p = ui.painter();
+        p.rect_filled(cell, egui::CornerRadius::same(5), BG);
+        let resp = ui
+            .interact(cell, base.with("update-chip"), egui::Sense::click())
+            .on_hover_text(format!("{ver} — click for release notes"));
+        if resp.hovered() {
+            p.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
+        }
+        let galley = p.layout_no_wrap(
+            "↓".into(),
+            egui::FontId::proportional(14.0),
+            if resp.hovered() { TEXT } else { SNAP_STROKE },
+        );
+        p.galley(
+            egui::pos2(
+                cell.center().x - galley.size().x / 2.0,
+                cell.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            SNAP_STROKE,
+        );
         if resp.clicked() {
             self.update_click = true;
         }
@@ -347,6 +387,13 @@ impl PanelView {
                 self.click = Some(path);
             }
             y += 32.0;
+        }
+        if let Some(ver) = self.model.update.clone() {
+            let cell = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.max.y - 16.0),
+                egui::vec2(22.0, 22.0),
+            );
+            self.paint_rail_update_glyph(ui, cell, base, &ver);
         }
     }
 
@@ -599,8 +646,10 @@ impl PanelView {
         // the expanded header's collapse glyph in wm.rs, mirrored.
         let up = rect.center().y >= ui.max_rect().center().y;
         let p = ui.painter_at(rect);
-        // Icons clip against the reserved expand-toggle zone at the right end.
-        let icons_max_x = rect.max.x - 28.0;
+        // Icons clip against the reserved expand-toggle zone at the right end
+        // (widened when the update glyph rides beside it).
+        let update_ver = self.model.update.clone();
+        let icons_max_x = rect.max.x - 28.0 - if update_ver.is_some() { 26.0 } else { 0.0 };
         let ip = ui.painter_at(egui::Rect::from_min_max(
             rect.min,
             egui::pos2(icons_max_x, rect.max.y),
@@ -682,6 +731,13 @@ impl PanelView {
         paint_chevron(&p, br.center(), up, if resp.hovered() { TEXT } else { DIM });
         if resp.clicked() {
             self.toggle_collapse = true;
+        }
+        if let Some(ver) = update_ver {
+            let cell = egui::Rect::from_center_size(
+                egui::pos2(rect.max.x - 40.0, rect.center().y),
+                egui::vec2(22.0, 22.0),
+            );
+            self.paint_rail_update_glyph(ui, cell, base, &ver);
         }
         self.hscroll(ui, rect, base, max_scroll);
     }
