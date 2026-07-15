@@ -467,7 +467,7 @@ impl SearchState {
             // Provisional ordinal until the count walk reconciles.
             match seek.dir {
                 Direction::Right => {
-                    if seek.wrapped && eng.focused.is_none() {
+                    if seek.wrapped {
                         eng.focused_ord = Some(1);
                     } else if let Some(ord) = eng.focused_ord.as_mut() {
                         *ord = ord.saturating_add(1);
@@ -1167,6 +1167,54 @@ mod tests {
     }
 
     #[test]
+    fn next_wrap_keeps_exact_four_match_counter() {
+        let mut term = term_with(
+            "WRAP_HIT one\r\nWRAP_HIT two\r\nWRAP_HIT three\r\nWRAP_HIT four\r\n",
+            40,
+            8,
+        );
+        let mut s = SearchState::default();
+        s.apply(SearchCmd::Open);
+        s.apply(SearchCmd::SetQuery("WRAP_HIT".into()));
+        let t_far = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        for _ in 0..10 {
+            s.tick(&mut term, sgen(1, 40, 8), 0, t_far);
+            let v = s.view();
+            if !v.scanning && v.total == 4 {
+                break;
+            }
+        }
+        assert_eq!(s.view().current, Some(1));
+        assert_eq!(s.view().total, 4);
+
+        for expected in [2, 3, 4] {
+            s.apply(SearchCmd::Next);
+            s.tick(&mut term, sgen(1, 40, 8), 0, t_far);
+            let v = s.view();
+            assert_eq!(v.current, Some(expected));
+            assert_eq!(v.total, 4);
+        }
+
+        s.apply(SearchCmd::Next);
+        for _ in 0..3 {
+            s.tick(&mut term, sgen(1, 40, 8), 0, t_far);
+            if s.view().current != Some(4) {
+                break;
+            }
+        }
+        let wrapped = s.view();
+        assert_eq!(wrapped.current, Some(1), "4/4 must wrap to 1/4");
+        assert_eq!(wrapped.total, 4, "wrapping must not inflate the total");
+
+        s.apply(SearchCmd::Next);
+        s.tick(&mut term, sgen(1, 40, 8), 0, t_far);
+        let after_wrap = s.view();
+        assert_eq!(after_wrap.current, Some(2));
+        assert_eq!(after_wrap.total, 4);
+    }
+
+    #[test]
     fn focused_ordinal_counts_matches_above_and_below() {
         // Three matches: viewport sits on the middle one after initial seek.
         let mut body = String::new();
@@ -1194,14 +1242,82 @@ mod tests {
         }
         let v = s.view();
         assert_eq!(v.total, 3, "must count all three");
-        // Initial focus is the first match at/after viewport → middle (2) or last.
-        assert!(
-            v.current.is_some_and(|c| c >= 1 && c <= 3),
-            "ordinal in range, got {:?}",
+        // Initial seek starts at viewport top → first hit at/after that is the
+        // middle match (2 of 3). Count walk must reconcile exact ordinal, not
+        // leave the provisional "1" from the seek path.
+        assert_eq!(
+            v.current,
+            Some(2),
+            "focused ordinal must be exact after count reconcile, got {:?}",
             v.current
         );
-        // After full count, ordinal must be exact for the focused span.
-        assert!(v.current.unwrap() <= v.total);
+    }
+
+    #[test]
+    fn match_viewport_range_clips_bottom_edge() {
+        let span = MatchSpan {
+            start: Point::new(Line(8), Column(2)),
+            end: Point::new(Line(12), Column(4)),
+        };
+        let r = match_viewport_range(&span, 0, 10, 20).unwrap();
+        assert_eq!(r.start, (8, 2));
+        assert_eq!(r.end, (9, 19)); // clamped to last viewport row/col
+    }
+
+    #[test]
+    fn match_viewport_range_none_when_fully_above() {
+        let span = MatchSpan {
+            start: Point::new(Line(-20), Column(0)),
+            end: Point::new(Line(-15), Column(5)),
+        };
+        assert!(match_viewport_range(&span, 0, 10, 40).is_none());
+    }
+
+    #[test]
+    fn editing_phase_keeps_n_as_non_nav_until_confirm() {
+        let mut s = SearchState::default();
+        s.apply(SearchCmd::Open);
+        s.apply(SearchCmd::SetQuery("x".into()));
+        assert_eq!(s.phase(), SearchPhase::Editing);
+        // Confirm transitions; Next while open forces Navigating.
+        s.apply(SearchCmd::Confirm);
+        assert_eq!(s.phase(), SearchPhase::Navigating);
+        s.apply(SearchCmd::Edit);
+        assert_eq!(s.phase(), SearchPhase::Editing);
+        s.apply(SearchCmd::Next);
+        assert_eq!(s.phase(), SearchPhase::Navigating);
+    }
+
+    #[test]
+    fn search_bar_hit_is_disjoint_from_content_origin() {
+        // Pure geometry: pointer at content top-left is never over the bar;
+        // pointer at bar center is. Session routing uses this exclusion for
+        // selection + secondary paste (see terminal.rs show path).
+        let content = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let bar = search_bar_rect(content);
+        assert!(!bar.contains(egui::pos2(10.0, 10.0)));
+        assert!(bar.contains(bar.center()));
+        assert!(bar.max.x <= content.max.x && bar.min.y >= content.min.y);
+    }
+
+    #[test]
+    fn needs_repaint_false_when_scan_and_seek_idle() {
+        let mut term = term_with("only_one_hit\r\n", 40, 5);
+        let mut s = SearchState::default();
+        s.apply(SearchCmd::Open);
+        s.apply(SearchCmd::SetQuery("only_one_hit".into()));
+        let t_far = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for _ in 0..20 {
+            s.tick(&mut term, sgen(1, 40, 5), 0, t_far);
+            if !s.needs_repaint && s.view().focused.is_some() {
+                break;
+            }
+        }
+        assert!(s.view().focused.is_some());
+        assert!(
+            !s.needs_repaint,
+            "idle search must not request endless repaint"
+        );
     }
 
     #[test]
