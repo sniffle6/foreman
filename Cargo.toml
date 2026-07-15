@@ -2,6 +2,9 @@
 name = "foreman"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sniffle6/foreman"
+description = "Fast native desktop for running many AI-agent terminal sessions"
 
 [dependencies]
 alacritty_terminal = "0.26.0"
