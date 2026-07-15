@@ -85,9 +85,9 @@ struct App {
     /// icons), shown when no project is visible (`should_show_landing`) and
     /// `landing_enabled` — including when every project is merely minimized.
     landing: landing::Landing,
-    /// Gated behind `FOREMAN_LANDING`: when unset, startup auto-opens a project
-    /// and closing the last one quits (today's behavior); when set, an empty
-    /// *visible* desktop shows the landing beside the Sessions panel.
+    /// Default-on: an empty *visible* desktop shows the landing beside the
+    /// Sessions panel. `FOREMAN_NO_LANDING=1` restores the old behavior
+    /// (startup auto-opens a project in cwd, closing the last project quits).
     landing_enabled: bool,
     /// Whether the landing rendered last frame. Its false→true edge re-opens and
     /// re-focuses the landing's picker (whose one-shot focus flag is otherwise
@@ -142,7 +142,7 @@ impl App {
             landing: landing::Landing::new(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             ),
-            landing_enabled: std::env::var_os("FOREMAN_LANDING").is_some(),
+            landing_enabled: std::env::var_os("FOREMAN_NO_LANDING").is_none(),
             landing_shown: false,
             notify: notify::Notifications::new(),
             recents: recents::Recents::load(),
