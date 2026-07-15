@@ -8,6 +8,19 @@ manager where each **project** is a window, and each project is a sandbox hostin
 **Start here:** [`docs/HANDOFF.md`](docs/HANDOFF.md) — full state, architecture,
 the build/verify loop, the gotchas, and what's next.
 
+## Install (Windows)
+
+```powershell
+irm https://raw.githubusercontent.com/sniffle6/foreman/main/install.ps1 | iex
+```
+
+Installs the [latest release](https://github.com/sniffle6/foreman/releases/latest)
+to `%LOCALAPPDATA%\Programs\foreman` and adds it to your user PATH — no admin,
+no installer wizard. Re-run the same line to update. Prefer manual? Grab the
+zip from the releases page (note: extracting with Explorer may trigger
+SmartScreen; the one-liner doesn't). Foreman will show a quiet chip in the
+Sessions panel when a new version is available.
+
 ## Run
 
 ```
