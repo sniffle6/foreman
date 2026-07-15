@@ -29,6 +29,7 @@ mod skills_install;
 mod terminal;
 mod terminal_font;
 mod theme;
+mod update;
 mod wm;
 mod workspace;
 
