@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paste-Simulation Rework — Design Brief</title>
+<style>
+  :root {
+    --bg: #fafaf8;
+    --panel: #ffffff;
+    --ink: #1c1e21;
+    --ink-2: #55595f;
+    --ink-3: #8a8f96;
+    --line: #e3e2dd;
+    --accent: #b45309;        /* caret amber */
+    --accent-soft: #fef3e2;
+    --good: #1a7f4b;
+    --good-soft: #e9f6ef;
+    --bad: #b3383e;
+    --bad-soft: #faeceb;
+    --code-bg: #f1f0ec;
+    --shadow: 0 1px 2px rgba(28,30,33,.05), 0 4px 16px rgba(28,30,33,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181b;
+      --panel: #1f2125;
+      --ink: #e8e6e1;
+      --ink-2: #a7a49d;
+      --ink-3: #6f6d67;
+      --line: #33352f;
+      --accent: #e8a04c;
+      --accent-soft: #2c2317;
+      --good: #58b98a;
+      --good-soft: #172a20;
+      --bad: #e08085;
+      --bad-soft: #2e1a1b;
+      --code-bg: #26282c;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #fafaf8; --panel: #ffffff; --ink: #1c1e21; --ink-2: #55595f; --ink-3: #8a8f96;
+    --line: #e3e2dd; --accent: #b45309; --accent-soft: #fef3e2;
+    --good: #1a7f4b; --good-soft: #e9f6ef; --bad: #b3383e; --bad-soft: #faeceb;
+    --code-bg: #f1f0ec; --shadow: 0 1px 2px rgba(28,30,33,.05), 0 4px 16px rgba(28,30,33,.05);
+  }
+  :root[data-theme="dark"] {
+    --bg: #17181b; --panel: #1f2125; --ink: #e8e6e1; --ink-2: #a7a49d; --ink-3: #6f6d67;
+    --line: #33352f; --accent: #e8a04c; --accent-soft: #2c2317;
+    --good: #58b98a; --good-soft: #172a20; --bad: #e08085; --bad-soft: #2e1a1b;
+    --code-bg: #26282c; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 4px 16px rgba(0,0,0,.25);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 28px 96px; }
+  code, .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; font-size: .86em; }
+
+  .eyebrow {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 10px;
+  }
+  h1 { font-size: 34px; line-height: 1.15; margin: 0 0 10px; text-wrap: balance; letter-spacing: -.015em; }
+  .sub { color: var(--ink-2); max-width: 64ch; margin: 0; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px;
+  }
+  .chip {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; color: var(--ink-2);
+    background: var(--panel);
+  }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .chip.status { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+  section { margin-top: 56px; }
+  h2 { font-size: 22px; margin: 0 0 6px; letter-spacing: -.01em; }
+  .kicker { color: var(--ink-3); font-size: 14px; margin: 0 0 20px; }
+  h3 { font-size: 16px; margin: 26px 0 8px; }
+  p { max-width: 70ch; }
+  section > p { color: var(--ink); }
+
+  /* problem cards */
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
+  @media (max-width: 720px) { .duo { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px; box-shadow: var(--shadow);
+  }
+  .card h4 { margin: 0 0 8px; font-size: 15px; }
+  .card p { font-size: 14.5px; color: var(--ink-2); margin: 0; }
+  .tag {
+    display: inline-block; font-family: ui-monospace, Consolas, monospace; font-size: 11px;
+    letter-spacing: .08em; text-transform: uppercase; border-radius: 4px; padding: 2px 8px; margin-bottom: 10px;
+  }
+  .tag.covered { background: var(--good-soft); color: var(--good); }
+  .tag.uncovered { background: var(--bad-soft); color: var(--bad); }
+
+  /* terminal strip */
+  .term {
+    background: #16181c; color: #d6d3cc; border-radius: 10px; padding: 16px 20px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13.5px; line-height: 1.7;
+    overflow-x: auto; border: 1px solid #2b2e33; margin-top: 18px;
+  }
+  :root[data-theme="light"] .term { box-shadow: var(--shadow); }
+  .term .dim { color: #6f6d67; }
+  .term .caret { background: #e8a04c; color: #16181c; padding: 0 1px; border-radius: 1px; }
+  .term .ghost { outline: 1px dashed #7c5a2b; outline-offset: -1px; padding: 0 1px; border-radius: 1px; color: #b98c4a; }
+
+  /* pipeline diagram */
+  .pipes { display: grid; gap: 16px; margin-top: 20px; }
+  .pipe {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px 20px; box-shadow: var(--shadow); overflow-x: auto;
+  }
+  .pipe-label {
+    font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; letter-spacing: .1em;
+    text-transform: uppercase; margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
+  }
+  .pipe-label .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .pipe.before .pipe-label { color: var(--bad); } .pipe.before .dot { background: var(--bad); }
+  .pipe.after .pipe-label { color: var(--good); } .pipe.after .dot { background: var(--good); }
+  .flow { display: flex; align-items: stretch; gap: 0; min-width: 640px; }
+  .node {
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--bg);
+    font-size: 12.5px; line-height: 1.45; flex: 1 1 0; min-width: 118px;
+  }
+  .node b { display: block; font-family: ui-monospace, Consolas, monospace; font-size: 12px; margin-bottom: 3px; }
+  .node span { color: var(--ink-2); font-size: 11.8px; }
+  .node.hot { border-color: var(--bad); background: var(--bad-soft); }
+  .node.hot b { color: var(--bad); }
+  .node.cool { border-color: var(--good); background: var(--good-soft); }
+  .node.cool b { color: var(--good); }
+  .node.amber { border-color: var(--accent); background: var(--accent-soft); }
+  .node.amber b { color: var(--accent); }
+  .arrow {
+    flex: 0 0 26px; display: flex; align-items: center; justify-content: center;
+    color: var(--ink-3); font-size: 15px;
+  }
+  .pipe-note { font-size: 12.5px; color: var(--ink-3); margin: 12px 2px 0; }
+
+  /* arm-time simulation diagram */
+  .simgrid {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: center;
+    margin-top: 16px; min-width: 0;
+  }
+  @media (max-width: 720px) { .simgrid { grid-template-columns: 1fr; } .simgrid .vs { display: none; } }
+  .simbox { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--panel); font-size: 13.5px; }
+  .simbox h5 { margin: 0 0 6px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .simbox p { margin: 0; color: var(--ink-2); font-size: 13px; }
+  .vs { font-family: ui-monospace, Consolas, monospace; color: var(--ink-3); font-size: 12px; }
+
+  /* tables */
+  .tablewrap { overflow-x: auto; margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th {
+    text-align: left; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+    letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3);
+    padding: 12px 16px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.dim { color: var(--ink-2); }
+  .pill {
+    display: inline-block; font-family: ui-monospace, Consolas, monospace; font-size: 11px;
+    border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+  }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.bad { background: var(--bad-soft); color: var(--bad); }
+  .pill.warn { background: var(--accent-soft); color: var(--accent); }
+
+  ul.tight { padding-left: 20px; margin: 8px 0 0; }
+  ul.tight li { margin: 6px 0; max-width: 72ch; }
+  ul.tight li::marker { color: var(--accent); }
+
+  .foot { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 12.5px; font-family: ui-monospace, Consolas, monospace; }
+  a { color: var(--accent); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">foreman · terminal emulation · design brief</p>
+    <h1>Replace the CUP scanner with paste simulation</h1>
+    <p class="sub">Foreman already knows the exact pasted string and the pre-paste cursor. Instead of intercepting
+    PSReadLine's escape sequences with a second VT parser, predict where PSReadLine <em>will</em> park the cursor —
+    and where it <em>should</em> have parked it — with pure arithmetic, then alias only on an exact match.</p>
+    <div class="meta">
+      <span class="chip status"><b>Status</b>&nbsp;IMPLEMENTED &amp; REVIEWED — Task 0 gate green (v4) · live tests + benchmarks reproduced · post-review fixes in · uncommitted, awaits commit go</span>
+      <span class="chip"><b>Replaces</b>&nbsp;c0bdb7c CupScanner</span>
+      <span class="chip"><b>Approach</b>&nbsp;A — dual-sim exact-match</span>
+      <span class="chip"><b>Accept</b>&nbsp;per-chunk opportunistic</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>The bug being healed</h2>
+    <p class="kicker">PSReadLine 2.4.5 measures a non-BMP emoji as two width-1 UTF-16 units (upstream #1329).</p>
+    <p>When a pasted emoji reaches a row margin, the real renderer defers the whole width-2 glyph to the next row;
+    PSReadLine's coordinate math splits it 1+1 across the boundary instead. Every such split leaves its final
+    cursor-position command (<code>CUP</code>) one cell behind reality. The text is fine — the caret is wrong.</p>
+
+    <div class="term" role="img" aria-label="Terminal mock-up showing the caret rendered behind the pasted emoji text">
+      <div class="dim">PS&gt; paste 🥒🤣🤣🤣 🥒🤣🤣🤣 🥒🤣🤣🤣 …  (wraps 21 rows)</div>
+      <div>…🤣🤣🤣 🥒🤣🤣🤣 🥒🤣<span class="caret">&nbsp;</span><span class="dim">&nbsp;&nbsp;&nbsp;</span><span class="ghost">&nbsp;</span> <span class="dim">← caret paints here; text ends 4 cells later</span></div>
+    </div>
+
+    <div class="duo">
+      <div class="card">
+        <span class="tag covered">covered today</span>
+        <h4>Pad variant</h4>
+        <p>Short wrapped pastes echo back as soft-wrapped rows with <code>LEADING_WIDE_CHAR_SPACER</code> pads and
+        <code>WRAPLINE</code> flags. The scanner counts non-BMP pads over the wrap chain and aliases when the CUP
+        shortfall matches exactly.</p>
+      </div>
+      <div class="card">
+        <span class="tag uncovered">uncovered — the reason for this rework</span>
+        <h4>Hard-positioned variant</h4>
+        <p>Large multi-row pastes (10+ rows) come back from ConPTY as hard-positioned, fully-packed rows —
+        <em>zero pads, zero WRAPLINE flags</em>. The pad-count gate compares a shortfall of N against 0 expected pads
+        and fails closed; the caret sits N cells behind (measured: 4 cells over a 21-row paste).</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <p class="kicker">Two pure simulations at paste time, an O(1)-gated check per PTY chunk.</p>
+    <p>At paste time the arming gates stay exactly as shipped (PowerShell, primary screen, single line,
+    cursor at content end — plus new fail-closed gates for control characters and wrap-pending endpoints).
+    If armed, foreman runs the pasted string through <b>two width models</b> from the recorded pre-paste cursor:</p>
+
+    <div class="simgrid">
+      <div class="simbox">
+        <h5 style="color:var(--bad)">P — PSReadLine's math</h5>
+        <p>Per UTF-16 unit. A non-BMP emoji is two independent width-1 units that <em>can split</em> at a row margin.
+        P predicts exactly where PSReadLine's final CUP will park the raw cursor.</p>
+      </div>
+      <div class="vs">P&nbsp;≠&nbsp;E&nbsp;?</div>
+      <div class="simbox">
+        <h5 style="color:var(--good)">E — whole-glyph flow</h5>
+        <p>Per char, widths from <code>unicode-width 0.2.2</code> — the same single crate version alacritty parses
+        with, so E is byte-identical to what the grid will do. E is where the caret truly belongs.</p>
+      </div>
+    </div>
+
+    <p style="margin-top:18px">If <code>P == E</code> (no emoji straddles a margin) nothing arms — zero ongoing cost. Otherwise, after each
+    pumped chunk, a <b>scroll-invariant</b> check (amended twice under review — no absolute rows, no scroll
+    bookkeeping): an O(1) column compare gates everything — the raw cursor's <em>column</em> must equal P's; only
+    then do the bounded row-walks run: the raw cursor must sit <em>strictly behind</em> content
+    (<code>!cursor_at_content_end(raw)</code>), and the point E′ = raw advanced by the precomputed
+    <code>E − P</code> cell delta must satisfy the <b>v3 fingerprint</b> (settled by Phase 0's byte-at-a-time scans):
+    (a) every cell from E′ to the end of the viewport is empty, and (b) walking back from E′, the grid matches the
+    <em>full expected E-layout</em> of the pasted text — char, wide-base, and spacer/pad identity, all of it.
+    Weaker forms are measured-dead: "raw strictly behind content" loses coverage when raw lands on a trailing-space
+    cell (blind holdout, delta = 1), and any bounded-length local tail fingerprint accepts <em>wrong rows</em> on
+    periodic payloads whose rep divides the width (9 wrong aliases in the holdout scan). Full extent is the only
+    check that survived both captures with zero wrong aliases across ~33k possible chunk boundaries. All true →
+    alias <code>raw → E′</code>, re-verified on every subsequent chunk; <b>a failed re-verification ends the epoch
+    permanently</b> — no later re-acceptance. The caret paints at E′, <code>snapshot --cursor</code> reports it, and
+    the very next Backspace seeds the wide-key shadow from it immediately — no 50&nbsp;ms settle wait, same as
+    today.</p>
+    <p>Epoch lifetime tightens versus today: <b>any user-sent bytes end the epoch</b> (today only CR/LF/^C do).
+    This replaces the scanner's per-byte echo-print invalidation at its cause — the pinned type-then-Backspace
+    case dies with the keystroke instead of with its echo — while the first post-paste Backspace still consumes
+    the alias to seed the shadow in the same frame before its bytes go out. One residual is accepted and
+    documented: <em>child-originated</em> output after acceptance that keeps the cursor on P's column and
+    preserves the tail fingerprint survives re-verification (today's per-byte print detection would have dropped
+    it). The stricter variant — any post-acceptance output ends the epoch — is a spec decision deferred until
+    Phase 0's replay shows how often ConPTY delivers trailing fragments after the final CUP.</p>
+    <p>The exact-match on P is the safety story: width behavior the model doesn't capture — ZWJ sequences, exotic
+    prompts, apps that merely look like PSReadLine — lands the cursor off P's column and the alias never engages.
+    The stated residual: a geometric collision needs the cursor at P's exact column <em>and</em> content ending at
+    exactly raw+(E−P) inside an armed epoch. Wrong predictions cost coverage; correctness requires that double
+    coincidence.</p>
+  </section>
+
+  <section>
+    <h2>Architecture</h2>
+    <p class="kicker">The armed byte path collapses from a per-byte second parser to a per-chunk point compare.</p>
+
+    <div class="pipes">
+      <div class="pipe before">
+        <div class="pipe-label"><span class="dot"></span>Today — c0bdb7c (interception)</div>
+        <div class="flow">
+          <div class="node"><b>paste</b><span>arm gates<br>(pwsh, 1-line, at end)</span></div>
+          <div class="arrow">→</div>
+          <div class="node hot"><b>CupScanner</b><span>2nd VTE parser,<br>per <em>byte</em>, while armed</span></div>
+          <div class="arrow">→</div>
+          <div class="node hot"><b>split at each CUP</b><span>sample flow-end before,<br>raw after the CUP</span></div>
+          <div class="arrow">→</div>
+          <div class="node hot"><b>pad-count validate</b><span>walk WRAPLINE chain,<br>count non-BMP pads</span></div>
+          <div class="arrow">→</div>
+          <div class="node amber"><b>CursorAlias</b><span>raw → physical</span></div>
+        </div>
+        <p class="pipe-note">Grid-flag dependent: needs pads + WRAPLINE to exist — exactly what the hard-positioned variant erases.</p>
+      </div>
+
+      <div class="pipe after">
+        <div class="pipe-label"><span class="dot"></span>Proposed — simulation (prediction)</div>
+        <div class="flow">
+          <div class="node"><b>paste</b><span>same gates<br>+ ctrl-chars, wrap-pending</span></div>
+          <div class="arrow">→</div>
+          <div class="node cool"><b>simulate P &amp; E</b><span>once, O(len),<br>pure arithmetic</span></div>
+          <div class="arrow">→</div>
+          <div class="node cool"><b>plain advance_scanned</b><span>single parser,<br>CPR cadence untouched</span></div>
+          <div class="arrow">→</div>
+          <div class="node cool"><b>per-chunk check</b><span>col == P · raw behind<br>content · ends at raw+(E−P)</span></div>
+          <div class="arrow">→</div>
+          <div class="node amber"><b>CursorAlias</b><span>raw → physical<br>(identical surface)</span></div>
+        </div>
+        <p class="pipe-note">The <em>simulation</em> is grid-flag independent — P and E come from the pasted text. Validation's content-end helper still follows WRAPLINE where present; its packed-row (no-WRAPLINE) behavior is a stated precondition the Phase 0 oracle checks independently.</p>
+      </div>
+    </div>
+
+    <h3>What the alias feeds — unchanged</h3>
+    <p>The three consumers are untouched: caret paint (<code>display_cursor_point</code>),
+    <code>foreman snapshot --cursor</code> (<code>effective_cursor_info</code>), and wide-key shadow seeding
+    (<code>input_cursor_point</code> + <code>has_fresh_cursor_alias</code>). Alacritty's grid, CPR replies, and VT
+    parsing stay authoritative. All of <code>WideShadowState</code> / <code>WideKeyLatch</code> /
+    <code>keep_wide_shadow</code> stays — hold-repeat is a different problem, and it remains solved.</p>
+  </section>
+
+  <section>
+    <h2>Improvements vs. costs</h2>
+    <p class="kicker">Honest ledger — the cons column includes findings from the adversarial review pass.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th style="width:50%">Improvement</th><th>Why it matters</th></tr></thead>
+        <tbody>
+          <tr><td><span class="pill good">coverage</span>&nbsp; Covers the residual variant — <b>measured</b>, Phase 0 green</td>
+              <td class="dim">P predicted the settled raw cursor to the exact cell on the primary (flat 435) <em>and</em> the untouched blind holdout (flat 336); delta matched on both. Probe also found the residual's true mechanism: alacritty's overwrite cleanup <b>scrubs pad flags</b> under PSReadLine's repaint style — the pads were never absent, and the scanner failed because it counts a flag the app's redraw erases. See the Phase 0 results doc.</td></tr>
+          <tr><td><span class="pill good">correctness</span>&nbsp; Stronger fail-closed story</td>
+              <td class="dim">Today's gate proves "shortfall == pads". The new gate proves "cursor is exactly where PSReadLine's known bug puts it" — position <em>and</em> tail-content fingerprint. Unmodeled widths fail closed via raw ≠ P except geometric collisions, which now additionally require the pasted tail's glyphs in the grid.</td></tr>
+          <tr><td><span class="pill good">perf</span>&nbsp; Armed path: per-byte double parse → O(1) column gate + bounded row-walks on match</td>
+              <td class="dim">CupScanner re-parses every byte through a second VTE state machine (allocating a sink per byte). The new check walks cells only when the column matches (third review: it is <em>not</em> O(1) — the walks get their own benchmark; the existing perf test covers only the graphics scanner). Unarmed stays zero-cost.</td></tr>
+          <tr><td><span class="pill good">simplicity</span>&nbsp; Deletes ~5 types + the split-advance machinery</td>
+              <td class="dim"><code>CupScanner</code>, <code>CupSink</code>, <code>CupScanEvent</code>, <code>CupScanResult</code>, <code>advance_psreadline_scanned</code>, the pad-counting validator. <code>pump_at</code> loses its branched parse path. Net LOC likely negative.</td></tr>
+          <tr><td><span class="pill good">testability</span>&nbsp; The core becomes a pure function</td>
+              <td class="dim">Endpoint arithmetic is table-testable with no Term, no PTY, no clock — fixtures come straight from the live-measured repros (1-pad, 6-pad, CJK control, mixed line).</td></tr>
+          <tr><td><span class="pill good">compat</span>&nbsp; Alias surface is byte-identical</td>
+              <td class="dim">Same <code>CursorAlias</code>, same consumers, same generation-freshness guard. Epoch clearing <em>tightens</em> (any user bytes end it, and a failed re-verification ends it permanently) — strictly more conservative, never looser. The existing ignored live test is expected to pass unchanged; no wire changes.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th style="width:50%">Cost / risk</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td><span class="pill bad">fidelity</span>&nbsp; P must model PSReadLine's exact wrap rule</td>
+              <td class="dim">Pinned against Render.cs L1364–1418 during implementation, with live-measured fixtures. A mismatch loses coverage (raw ≠ P → no alias), never aliases wrongly.</td></tr>
+          <tr><td><span class="pill bad">timing</span>&nbsp; Naive per-chunk acceptance had a mid-redraw false-accept window</td>
+              <td class="dim"><b>Found by review, fixed in design:</b> a chunk boundary falling exactly after P columns of echo satisfied the first two checks. The strictly-behind and tail-fingerprint conditions close the known cases; whether that fully matches the scanner's CUP-anchored timing is <em>measured</em>, not asserted — Phase 0's byte-at-a-time prefix replay evaluates the predicate at every possible boundary.</td></tr>
+          <tr><td><span class="pill bad">assumption</span>&nbsp; Original scroll compensation broke at scrollback saturation</td>
+              <td class="dim"><b>Found by review, fixed in design:</b> <code>history_size</code> stops growing at the 10k scrollback cap — exactly in long-lived agent sessions. Replaced with scroll-invariant relative validation (column match + E−P delta); the absolute-row prediction and <code>armed_history</code> field are gone entirely.</td></tr>
+          <tr><td><span class="pill bad">spoofable</span>&nbsp; An app matching the endpoint geometry is indistinguishable</td>
+              <td class="dim">Same residual c0bdb7c documents, but review notes it <em>widens</em>: the scanner demanded the pad pattern exist in the grid; the sim only demands endpoint geometry. Bounded by the epoch dying on any user input, resize, submit, or mode barrier. Documented, accepted.</td></tr>
+          <tr><td><span class="pill good">decided</span>&nbsp; Same-chunk mode round-trip: minimal streaming sniff (sixth review)</td>
+              <td class="dim">A transient alt-exit restores the primary grid, so v3 could match across a semantic barrier — and the alias feeds wide-key <em>input</em>, not just paint. PasteSim carries an allocation-free byte scanner for CSI ?47/?1047/?1049/?2004 h/l with state across chunks; hits → Dead; false positives only lose coverage. The two pinning tests keep their expectation, retargeted at the sniffer. Post-chunk mode check stays as backstop.</td></tr>
+          <tr><td><span class="pill good">measured</span>&nbsp; P/E geometry green — predicate v3 still a candidate</td>
+              <td class="dim">raw == P exact on primary and blind holdout (P fully validated). But the fifth review's grading stands: the frozen O1 oracle <em>failed</em> (trailing-space blindspot, revised mid-run and recorded as a failure); S2 is v3's training data so cannot validate it; and the Python scan never modeled the F2 flag scrub — hiding a latent v3 bug (pad cells must match char-only). v3 validation = spec Task 0: real-Term replay over checked-in fixtures + a fresh frozen holdout + non-BMP P==E control. Results: <code>2026-07-12-paste-sim-phase0-results.md</code>.</td></tr>
+          <tr><td><span class="pill bad">lost detail</span>&nbsp; Per-byte print/execute invalidation dies with the scanner</td>
+              <td class="dim"><b>Third-review finding:</b> geometry-only rechecking could re-accept after type-X-then-Backspace returns the cursor to raw — a pinned drop today. Fixed in design: any user-sent bytes end the epoch entirely, re-verification runs per chunk, and (fourth review) a failed re-verification ends the epoch permanently instead of allowing re-acceptance. Remaining documented residual: child-originated post-acceptance output that preserves both P's column and the tail fingerprint; the stricter any-output-ends-epoch variant is deferred to the spec pending Phase 0 replay data.</td></tr>
+          <tr><td><span class="pill warn">unrepresentable</span>&nbsp; Wrap-pending endpoints stay uncovered</td>
+              <td class="dim">A point-only alias can't express <code>input_needs_wrap</code>; endpoints landing there fail closed — same documented hedge as today, now enforced at arm time.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Evidence gates before "fixed"</h2>
+    <ul class="tight">
+      <li><b>Phase 0 — frozen protocol, then probe (blocks everything below):</b> no product code. A short immutable protocol doc fixes: exact build, prompt, dimensions, codepoints, coordinate types (flat cell offsets from pre-paste start), predicted P, E, delta, settle rule, and three scenarios — primary (21-row repro), a <em>frozen blind holdout</em> (different cols/prompt/emoji mix — defined now, its output never inspected while refining P; a holdout-informed revision doesn't count as validation), and a P==E control. The probe carries an <b>independent actual_end oracle</b> (full-viewport scan from the bottom, not the production predicate evaluated twice) plus the expected tail fingerprint; <code>raw &lt; actual_end &lt; E′</code> is pre-registered as fail-closed <em>only as verified by that oracle</em> — stale residue at E′−1 can defeat the predicate alone (fourth review). Instrument: a release-mode <code>#[ignore]</code>d harness that captures RX as <b>typed, length-framed records</b> (raw <code>rx_dump</code> concatenates chunks unframed and interleaves replies/resizes — unusable for replay as-is), logs each CUP's byte offset with pre/post cursor, then replays the stream <b>byte-at-a-time</b> through a <code>VoidListener</code> term, evaluating the acceptance predicate after every byte — every possible chunk boundary, not just the ones one run happened to observe. The CLI snapshot loop is a secondary black-box check only (<code>--cursor</code> reports the <em>effective</em> cursor and can't see the internals). Kill-switch: settled raw ≠ P → refine P against the primary's bytes and grade the revision on the untouched holdout, or park the rework with the negative result recorded. A green Phase 0 establishes <em>feasibility on the frozen fixtures</em> — not global safety, and not yet permission to delete the scanner.</li>
+      <li><b>Pure tests:</b> P/E arithmetic tables (both policies, both variants' fixtures), acceptance + invalidation transitions, wrap-pending and control-char fail-closed gates, one ZWJ-sequence fixture pinning the fail-closed outcome for widths PSReadLine models differently, and a chunk-boundary-exactly-at-P regression pinning the third acceptance condition.</li>
+      <li><b>Live tests (ignored, real ConPTY):</b> the existing <code>live_psreadline_paste_wrap_uses_the_whole_emoji_endpoint</code> must pass unchanged; a new hard-positioned multi-row test pastes 10+ wrapped rows of <code>🥒🤣🤣🤣</code> and asserts caret == content end + first Backspace doubles.</li>
+      <li><b>Headless probes:</b> the handoff's <code>foreman snapshot --cursor / --attrs</code> loop against a release build, both variants, before any claim.</li>
+      <li><b>Perf guard:</b> <code>scanner_overhead_on_plain_and_ansi_floods</code> keeps pinning the unarmed path, plus a new benchmark for the <em>armed</em> path (column-gated walks under a flood) — the existing test never measured it.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Prior art — how everyone else handles this</h2>
+    <p class="kicker">The bug is not foreman's: it reproduces in Windows Terminal (#529) and VS Code (PSReadLine #2358). Upstream PSReadLine #1329 has been open since 2019.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Technique</th><th style="width:130px">Who applies it</th><th>Why it doesn't close this bug for foreman</th></tr></thead>
+        <tbody>
+          <tr><td><b>Fix the line editor</b> — PSReadLine #1329: <code>LengthInBufferCells</code> doesn't combine surrogate pairs</td><td class="dim">upstream</td>
+              <td class="dim">The right layer, stalled ~7 years. Foreman already ships Microsoft's newest ConPTY; a package bump can't repair it. Waiting is not a plan.</td></tr>
+          <tr><td><b>Width negotiation</b> — DEC mode 2027 / Terminal Unicode Core (Contour spec; WezTerm, foot, kitty, WT 1.22 all discuss/ship it)</td><td class="dim">terminal + app</td>
+              <td class="dim">Solves multi-codepoint <em>grapheme</em> disagreement between app and terminal — but only for apps that opt in. PSReadLine doesn't, and its bug is self-inconsistency (its cursor math disagrees with its own output), not a table mismatch with us.</td></tr>
+          <tr><td><b>Compatibility measurement mode</b> — WT 1.22 <code>compatibility.textMeasurement: console</code> measures like the vintage console</td><td class="dim">terminal, globally</td>
+              <td class="dim">The closest cousin to our design: model the legacy math so old apps stay self-consistent. But it's global — it would degrade every modern TUI (Claude Code, lazygit) to heal one paste case, and alacritty's width tables aren't pluggable anyway.</td></tr>
+          <tr><td><b>App-side probing &amp; correction tables</b> — fish/ucs-detect-style CPR probing, <code>wcstwidth</code> per-terminal correction tables</td><td class="dim">app / line editor</td>
+              <td class="dim">The app measures reality instead of assuming it. Effective — and entirely in the app's hands. PSReadLine doesn't probe.</td></tr>
+          <tr><td><b>Render faithfully, caret be damned</b> — Windows Terminal default, VS Code/xterm.js</td><td class="dim">terminal</td>
+              <td class="dim">The mainstream answer: humans shrug and press Ctrl+L. Foreman can't — agents read <code>snapshot --cursor</code> headlessly and wide-key doubling needs the true cursor; a lying caret misleads machines, not just eyes.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:16px">The dual-simulation is best understood as a <b>per-epoch, fail-closed version of WT's <code>console</code>
+    compatibility mode</b>: we model PSReadLine's legacy math (P) exactly as that setting does — but only to <em>recognize</em>
+    the known bug's fingerprint for the duration of one paste echo, while continuing to render modern widths (E) everywhere.
+    Global degradation is the cost WT pays; the epoch's gates are the cost we pay.</p>
+  </section>
+
+  <section>
+    <h2>Adversarial review verdicts</h2>
+    <p class="kicker">Second research pass: a reviewer with full context attacked each design claim against the code.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Claim</th><th style="width:110px">Verdict</th><th>Evidence</th></tr></thead>
+        <tbody id="verdicts">
+          <tr><td>Existing live test passes unchanged</td><td><span class="pill warn">nuanced</span></td>
+              <td class="dim">All assertions target kept surfaces, and per-chunk acceptance satisfies the no-settle-wait assertion. But the un-amended design's transient accept added a flake window — closed by the third acceptance condition.</td></tr>
+          <tr><td>Borrow-checker feasibility in <code>pump_at</code></td><td><span class="pill good">confirmed</span></td>
+              <td class="dim">All reads are sequential disjoint borrows after <code>advance_scanned</code> returns; the new check needs strictly less than today's scanner branch already holds.</td></tr>
+          <tr><td>Alacritty wrap semantics the E-sim must copy</td><td><span class="pill good">confirmed</span></td>
+              <td class="dim">Vendored 0.26 source quoted: width-2 defers only from the <em>last</em> column; the cursor never occupies col == cols — pending wrap applies lazily <em>before</em> the next printable; width-0 chars attach without moving the cursor.</td></tr>
+          <tr><td>Width tables identical between sim and parser</td><td><span class="pill good">confirmed</span></td>
+              <td class="dim">One <code>unicode-width 0.2.2</code> in the lockfile, shared by foreman and alacritty_terminal; both call <code>UnicodeWidthChar::width</code>. No VS16 special-casing to copy.</td></tr>
+          <tr><td>Scroll compensation via <code>history_size</code> delta</td><td><span class="pill bad">refuted</span></td>
+              <td class="dim">Undercounts once scrollback saturates (10k-line cap) — permanent coverage loss in long-lived sessions. Replaced with scroll-invariant relative validation (design amendment B).</td></tr>
+          <tr><td>Mid-echo transient accept "no worse than scanner"</td><td><span class="pill bad">refuted</span></td>
+              <td class="dim">The scanner accepts only at a completed CUP byte; the naive per-chunk check had a real inter-chunk window. Fixed by requiring raw strictly behind content (design amendment A).</td></tr>
+          <tr><td>No invalidation path silently lost</td><td><span class="pill warn">nuanced</span></td>
+              <td class="dim">OSC never invalidated (no loss); cursor-moving sequences covered by the raw-filter; non-cell DCS loss negligible. One real loss: same-chunk alt-screen/bracketed-paste round trip — decision item at spec review.</td></tr>
+          <tr><td><code>feed_text</code> arms via <code>foreman send --text</code></td><td><span class="pill good">confirmed</span></td>
+              <td class="dim">Full control-plane trace: send verb → <code>send_dispatch</code> → <code>feed_text</code> → <code>arm_psreadline_paste_cursor</code>. The handoff's contrary claim is wrong at HEAD; the new live test can arm headlessly. (docs/wide-chars.md repeats the wrong claim — gets a one-line fix when the spec lands.)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="foot">
+    foreman · docs/wide-chars.md is the evidence doc · spec → docs/superpowers/specs/ · plan → docs/superpowers/plans/ · generated 2026-07-12
+  </div>
+</div>
+</body>
+</html>
