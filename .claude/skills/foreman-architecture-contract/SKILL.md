@@ -14,7 +14,7 @@ against that commit; line numbers drift, symbols mostly don't. Re-verify
 commands are in "Provenance and maintenance" at the bottom.
 
 Vocabulary is `CONTEXT.md`'s ubiquitous language (Win, Session, Content,
-Project, Ready, Deferred action, Quiescence settle, Caret gate, Cell metrics,
+Project, Ready, Deferred action, Quiescence settle, Caret, Cell metrics,
 Outbox, Control plane, Snapshot, Dispatch, Leader, Chord, Keymap). Read
 `CONTEXT.md` first if any term reads oddly.
 
@@ -154,7 +154,7 @@ each — put new logic of that kind THERE.
 | Deferred action | src/wm.rs `enum Act` (line 552) + apply pass | Window mutations out of the render borrow |
 | Input-encoding seam | src/input.rs `process_input(events, mode, has_selection) -> InputOutcome` (line 37) | egui events → exact PTY bytes, GUI-free |
 | Quiescence settle | src/wm.rs `settle_tick` (line 34), `PendingSettle` (line 22), `advance_settles` (line 1275) | "wait until the Session quiets" without blocking the GUI. `DEFAULT_SETTLE_MS = 120`, `MAX_SETTLE_MS = 4000` — deliberately under `REPLY_TIMEOUT` (5 s) so a settle reply always beats the pipe timeout (wm.rs:12-18) |
-| Caret gate | src/caret.rs `CaretGate` (line 55) | Which cell the painted caret rests at; time injected, no clock reads, no GUI |
+| Caret | src/caret.rs `draw` | What to paint for the model cursor (pure mapping; the de-jitter gate was retired 2026-07-15) |
 | Cell metrics | src/geom.rs `CellMetrics` (line 12) | One frame's pixel↔cell geometry; all clamping in one place |
 | Outbox | src/chat.rs `ChatRoom::tick` (line 598) | Per-frame chat delivery decision (who gets which framed lines); the engine wiring (`WindowManager::chat_tick`, wm.rs:1576) only injects what the Outbox returns |
 | Frame plan | src/frame.rs `plan() -> FramePlan` (lines 45/59) | One frame's paint geometry/content for a Session, pure; `Session::show` replays it (terminal.rs:990). Clamps the grid walk to the grid's REAL bounds first because a stale index panic aborts the whole process (frame.rs:11-17) |

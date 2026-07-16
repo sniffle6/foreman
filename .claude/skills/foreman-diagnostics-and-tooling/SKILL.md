@@ -84,9 +84,9 @@ blocks. Interpretation:
 - Reply took ~4 s: the Session **never went quiet** (streaming/flooding/TUI
   animation) — the snapshot is a mid-stream frame. `--settle-ms` up to 4000
   widens the quiet window; beyond 4000 is clamped.
-- Quiescence settle is **output** stability. It is not the Caret gate, which is
-  **cursor-position** stability for painting (~50 ms window, `CURSOR_SETTLE`,
-  src/caret.rs:24). Different signals, different purposes.
+- Quiescence settle is **output** stability. It is unrelated to caret painting
+  (the caret tracks the model cursor directly since the gate's retirement,
+  2026-07-15, src/caret.rs). Different signals, different purposes.
 
 > **Doc drift — do not be misled (as of 2026-07-01):** `foreman send --help`
 > (src/control.rs:763), the `SendRequest` doc comments (src/control.rs:129,
@@ -100,10 +100,9 @@ blocks. Interpretation:
 - Default reply: one line per visible grid row, **trailing spaces trimmed**,
   blank rows are empty strings (src/inspect.rs:89) — remember this when diffing.
 - `--cursor` reports the **raw model cursor** from the grid
-  (`term.renderable_content().cursor`, src/inspect.rs:95) — never the gated
-  caret that foreman paints. Diagnostics want ground truth; the painted caret
-  intentionally lags/holds during redraw storms. If snapshot-cursor and the
-  painted caret disagree briefly, that is the Caret gate working, not a bug.
+  (`term.renderable_content().cursor`, src/inspect.rs:95). Since the Caret
+  gate's retirement (2026-07-15) the painted caret is the same cell — any
+  disagreement now IS a bug (paint layer, frame::overlays / show()).
 - `--attrs` resolves colors through the same palette the GUI paints with
   (src/inspect.rs:152), so attrs reads match pixels — use it to prove color/style
   claims without a screenshot.

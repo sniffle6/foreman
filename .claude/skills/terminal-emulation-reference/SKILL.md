@@ -12,7 +12,7 @@ triage lives in **foreman-debugging-playbook**, measurement recipes in
 **foreman-diagnostics-and-tooling**, CLI ground truth in
 **foreman-run-and-operate**.
 
-Vocabulary is CONTEXT.md's glossary (Session, Ready, Caret gate, Cell metrics,
+Vocabulary is CONTEXT.md's glossary (Session, Ready, Caret, Cell metrics,
 Quiescence settle, Frame plan). A **Session** is one running terminal — process
 + PTY + emulated screen; never call the whole thing "a PTY".
 
@@ -99,7 +99,7 @@ foreman writes into the PTY.
 | DECSCUSR `ESC[n q` | app→foreman | Cursor shape (block/beam/underline/hollow/hidden) — parsed by alacritty, read from `renderable_content().cursor.shape` | inspect.rs:96-103; painted via `geom::caret_rect` |
 | SGR styling `ESC[4m` etc. | app→foreman | Cell `Flags` (UNDERLINE, STRIKEOUT, INVERSE, DIM, BOLD, ITALIC) → resolved by pure `glyph_style` | terminal.rs:134-151 |
 | Wide chars (CJK/emoji) | app→foreman | A 2-column glyph = one `WIDE_CHAR` cell + one spacer cell (`WIDE_CHAR_SPACER`, or `LEADING_WIDE_CHAR_SPACER` at wrap). **Text-extraction walks must skip spacers** or output gains stray padding. Full classification + key-doubling policy (conhost edits per UTF-16 unit — probe-verified): `docs/wide-chars.md` | one classifier: `input::CellWide::classify` / `is_wide_spacer` (paint plan, both snapshot walks, hint sampling); key doubling only in `input::wide_key_doubles`; hold-repeat shadow in `Session::wide_shadow` |
-| DEC 2026 synchronized output | app→foreman | Frame-bracketing TUIs *don't* strobe; TUIs that lack it move the cursor all over mid-redraw — that jitter is what the **Caret gate** exists to absorb (§5) | caret.rs module docs |
+| DEC 2026 synchronized output | app→foreman | Frame-bracketing TUIs *don't* strobe; TUIs that lack it move the cursor all over mid-redraw — that jitter is why non-2026 apps hide-bracket their redraws (§5) | caret.rs module docs |
 
 ## 4. Grid model: buffer vs viewport, and the panic hazard
 
@@ -142,13 +142,14 @@ Two different things, per CONTEXT.md:
 
 - The **cursor** is the model's: `term.renderable_content().cursor` (point +
   shape), owned by alacritty, moved by the app's escape sequences.
-- The **caret** is what foreman paints. The **Caret gate**
-  (`caret::CaretGate`, src/caret.rs) de-jitters it: adopt a cell only after
-  the cursor holds it for `CURSOR_SETTLE` = 50 ms (caret.rs:24); follow
-  single-row steps immediately only within `INPUT_GRACE` = 150 ms of real
-  typing (caret.rs:30); hold far (≥2-row) jumps and autonomous animations;
-  honor Hidden instantly. All time is injected — the policy is a pure function
-  (`cursor_to_draw`) plus timeline unit tests. Background: docs/cursor-rendering.md.
+- The **caret** is what foreman paints: the model cursor drawn directly every
+  frame (`caret::draw`, src/caret.rs) — `?25l` honored instantly, no
+  debouncing, no blink. Focused pane = filled rect; unfocused panes = hollow
+  Block outline. The old de-jitter "Caret gate" (50 ms settle / 150 ms input
+  grace) was retired 2026-07-15: DEC 2026 sync blocks (Claude Code, Codex) and
+  hide-bracketed single-chunk redraws (PSReadLine) keep the model cursor
+  stream clean, and the gate's holds were themselves the visible lag/flash.
+  Evidence + fallback policy: docs/cursor-rendering.md.
 
 `frame::plan` then suppresses the caret unless `line >= 0` **and**
 `display_offset == 0` (live viewport only); `show()` adds the focus gate.
@@ -196,7 +197,7 @@ cursor mitigation. Details: `docs/conpty-resize-reflow.md`.
 | Session (PTY + Term + reader thread), Ready latch, inject, resize, render replay | src/terminal.rs |
 | Pure input encoding: keys, paste gating, wheel policy, zoom steps (the Input-encoding seam) | src/input.rs |
 | Pure GUI-free screen reads (Snapshot text/cells/cursor) + `--keys` name→byte encoding | src/inspect.rs |
-| Caret gate (de-jitter policy + timeline state) | src/caret.rs |
+| Caret draw decision (pure model-cursor → paint mapping; gate retired) | src/caret.rs |
 | Cell metrics (pixel↔cell), thumb + caret rect math | src/geom.rs |
 | Frame plan (pure per-frame paint geometry; the clamp home) | src/frame.rs |
 | Env injection (`term_env`), keepalive walks, send/snapshot plumbing | src/wm.rs |
@@ -230,7 +231,7 @@ and constants drift; re-verify from `H:/claude code/foreman` (PowerShell 7+):
 | Key/mouse encodings byte-for-byte | `cargo test --lib input` (byte-equality tests; mind the shared target/ lock) |
 | Env advertisement | `git grep -n "COLORTERM" src/wm.rs` |
 | Selection wiring (alacritty Selection in use since Phase 4) | `git grep -n "term.selection" src/terminal.rs ; cargo test selection` |
-| Caret constants 50 ms / 150 ms | `git grep -n "CURSOR_SETTLE\|INPUT_GRACE" src/caret.rs` |
+| Caret gate retired (pure `draw` mapping only) | `git grep -n "CaretGate\|CURSOR_SETTLE" src/` — any hit means the gate came back |
 | SUBMIT_DELAY 150 ms | `git grep -n "SUBMIT_DELAY" src/terminal.rs` |
 | Spacer-skip locations | `git grep -n "WIDE_CHAR_SPACER" src/` |
 | ConPTY cursor mitigation + residual status | `docs/conpty-resize-reflow.md` header; microsoft/terminal #18725/#19535 |

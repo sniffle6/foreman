@@ -1,8 +1,8 @@
 //! Frame plan — one frame's paint geometry and content for a Session's pane.
 //!
 //! This is the pure half of `Session::show`: given the grid model, the pane's
-//! [`CellMetrics`], the current selection, and the [`CursorDraw`] the caret gate
-//! already decided, it computes *what* to paint this frame — the styled text
+//! [`CellMetrics`], the current selection, and the [`CursorDraw`] for the model
+//! cursor, it computes *what* to paint this frame — the styled text
 //! runs, the selection highlight rects, the caret rect, and the scrollback thumb
 //! rect. It decides nothing about *whether* to paint: focus (the caret's `active`
 //! gate) and hover (the thumb's reveal) stay in `show()`, which replays this plan
@@ -234,9 +234,9 @@ pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>>
 }
 
 /// The cheap, per-frame half: selection highlights (O(selected rows)), the
-/// gated caret rect (O(1)), and the scrollback thumb (O(1)). None touch the
+/// caret rect (O(1)), and the scrollback thumb (O(1)). None touch the
 /// galley, so show() recomputes these every frame even on a cache hit — the
-/// caret settles over time (Caret gate) and selection changes on drag.
+/// cursor moves between content changes and selection changes on drag.
 pub struct Overlays {
     pub highlights: Vec<egui::Rect>,
     pub caret: Option<egui::Rect>,

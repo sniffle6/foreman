@@ -162,15 +162,16 @@ reading it — the default way `send` returns a settled screen instead of a
 mid-update race.
 _Avoid_: sleep, debounce, delay.
 
-**Caret gate**:
-The step that decides which cell the painted caret rests at, given a stream of
-cursor observations and the user's recent typing. It de-jitters a full-screen
-program that moves its cursor mid-redraw: it adopts a new resting cell only once
-the cursor has stopped moving for a beat (cursor stability, distinct from
-Quiescence settle's output stability), follows a single-row step while the user
-is actively editing, and holds far jumps and self-running animations. The caret
-is what Foreman paints; the cursor is the program's, owned by the grid model.
-_Avoid_: cursor (that's the model's), blink, debounce.
+**Caret**:
+What Foreman paints for a Session's cursor: the grid model's cursor cell, drawn
+every frame exactly where the model says it is — `?25l` (hide) honored, no
+blink, no position debouncing. Focused pane: filled rect; unfocused panes: a
+hollow full-cell outline. The caret is what Foreman paints; the cursor is the
+program's, owned by the grid model. (The old "Caret gate" — a settle/grace
+debounce against mid-redraw cursor teleports — was retired 2026-07-15 after
+measurement showed modern TUIs bracket redraws in synchronized output;
+evidence in docs/cursor-rendering.md.)
+_Avoid_: cursor (that's the model's), Caret gate (retired), blink, debounce.
 
 **Ready gate**:
 The step that decides when a Session may accept injected chat input, and what
@@ -193,7 +194,7 @@ hit-testing.
 One frame's paint geometry and content for a Session's pane — the styled text
 runs, the selection-highlight rects, the caret rect, and the scrollback-thumb
 rect — computed purely from the grid, its Cell metrics, the selection, and the
-Caret gate's decision. `show()` only decides visibility (focus for the caret,
+caret draw decision. `show()` only decides visibility (focus for the caret,
 hover for the thumb) and the paint style (colors, corner radii), then replays the
 plan. The grid walk is clamped to the grid's real bounds first, so a stale index
 can't panic and abort the process.

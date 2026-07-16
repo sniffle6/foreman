@@ -579,10 +579,6 @@ pub struct Session {
     /// zoom changes miss rather than stretching stale bitmaps. Evicted by px on
     /// paint — never invalidates the mono paint memo.
     emoji_textures: std::collections::HashMap<(char, u32), egui::TextureHandle>,
-    // The Caret gate: decides which cell the painted caret rests at, de-jittering
-    // a TUI's mid-redraw cursor moves. Owns cursor-stability and input-recency
-    // state; fed every frame in show(). See `crate::caret`.
-    caret: crate::caret::CaretGate,
     /// Kitty graphics state: overlay images only — the grid stays pure text.
     /// See src/graphics.rs and the spec.
     graphics: crate::graphics::Graphics,
@@ -877,7 +873,6 @@ impl Session {
             mono_paint: None,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
             emoji_textures: std::collections::HashMap::new(),
-            caret: crate::caret::CaretGate::new(std::time::Instant::now()),
             graphics: crate::graphics::Graphics::default(),
             textures: std::collections::HashMap::new(),
             scroll_accum: 0.0,
@@ -1303,7 +1298,6 @@ impl Session {
 
         if !bytes.is_empty() {
             self.term.scroll_display(Scroll::Bottom);
-            self.caret.note_input(std::time::Instant::now());
             self.send(&bytes);
         }
 
@@ -1842,17 +1836,16 @@ impl Session {
             let cursor = self.term.renderable_content().cursor;
             (cursor.point.line.0, cursor.point.column.0, cursor.shape)
         };
-        // De-jitter the caret through the Caret gate: a non-synchronized TUI
-        // moves the cursor all over the screen while it redraws, so the gate
-        // holds the committed spot until the cursor settles. See `crate::caret`.
-        let cursor_draw = self.caret.observe(
-            crate::caret::CursorModel {
-                line: cur_line,
-                col: cur_col,
-                shape: cur_shape,
-            },
-            std::time::Instant::now(),
-        );
+        // The caret is the model cursor, drawn where the grid says it is —
+        // no debouncing (see `crate::caret` module docs for why the old gate
+        // was retired). Unfocused panes show a hollow full-cell outline
+        // (Alacritty/Kitty/Ghostty convention), so force Block for the rect.
+        let mut cursor_draw = crate::caret::draw(cur_line, cur_col, cur_shape);
+        if !active
+            && let crate::caret::CursorDraw::At { shape, .. } = &mut cursor_draw
+        {
+            *shape = alacritty_terminal::vte::ansi::CursorShape::Block;
+        }
 
         // Selection range in viewport coords: the ONE `term.selection` feeds both
         // the copy text (`selection_to_string`) and this highlight range.
@@ -2129,10 +2122,20 @@ impl Session {
             painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
         }
 
-        // caret — hidden while search owns input; otherwise focus-gated.
-        if active && !self.search.is_open() {
-            if let Some(r) = overlays.caret {
+        // caret — hidden while search owns input. Focused pane: filled rect;
+        // unfocused: hollow outline at the cursor cell.
+        if !self.search.is_open()
+            && let Some(r) = overlays.caret
+        {
+            if active {
                 painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
+            } else {
+                painter.rect_stroke(
+                    r,
+                    egui::CornerRadius::ZERO,
+                    egui::Stroke::new(1.0, CARET),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
 
@@ -4009,6 +4012,131 @@ mod tests {
 
     fn resize_probe_scenario(label: &str, from: (usize, usize), to: (usize, usize)) {
         resize_probe_scenario_with(label, from, to, "1..40 | % { \"line $_\" }\r");
+    }
+
+    /// Phase-0 caret probe (temporary): spawn claude, type chars with
+    /// realistic gaps, record raw ConPTY bytes + per-pump model-cursor
+    /// samples. Answers: does Claude Code emit ?2026 sync blocks, does it
+    /// hide-bracket redraws (?25l/h), and how does its cursor move per
+    /// keystroke — the evidence for replacing the caret gate.
+    /// Run: cargo test --lib caret_probe_claude_typing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn caret_probe_claude_typing() {
+        fn esc(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(|&b| match b {
+                    0x1b => "␛".to_string(),
+                    b'\r' => "\\r".to_string(),
+                    b'\n' => "\\n\n".to_string(),
+                    0x20..=0x7e => (b as char).to_string(),
+                    _ => format!("\\x{b:02x}"),
+                })
+                .collect()
+        }
+        fn count(hay: &[u8], needle: &[u8]) -> usize {
+            hay.windows(needle.len()).filter(|w| *w == needle).count()
+        }
+        fn pump_sampled(
+            s: &mut Session,
+            ms: u64,
+            t0: std::time::Instant,
+            out: &mut Vec<(u128, i32, usize, String)>,
+        ) {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                s.pump();
+                let c = s.cursor_info();
+                if out.last().map(|l| (l.1, l.2, l.3.clone()))
+                    != Some((c.row, c.col, c.shape.clone()))
+                {
+                    out.push((t0.elapsed().as_millis(), c.row, c.col, c.shape));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let dump = std::env::temp_dir().join("foreman_caret_probe_claude.bin");
+        let _ = std::fs::remove_file(&dump);
+        let ctx = egui::Context::default();
+        let argv = vec![std::env::var("CARET_PROBE_CMD").unwrap_or("claude".to_string())];
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut s =
+            Session::spawn_argv(&argv, Some(cwd.as_path()), &[], ctx).expect("spawn failed");
+        s.rx_dump = std::fs::File::create(&dump).ok();
+        s.resize(100, 30);
+
+        let t0 = std::time::Instant::now();
+        let deadline = t0 + std::time::Duration::from_secs(20);
+        while !s.ready() {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claude never became ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut samples = Vec::new();
+        // Wait until the TUI actually renders (node cold start is slow), then
+        // let the startup animation finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        while s
+            .snapshot_text(None)
+            .iter()
+            .filter(|r| !r.is_empty())
+            .count()
+            < 3
+        {
+            s.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claude UI never rendered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pump_sampled(&mut s, 5000, t0, &mut samples);
+        let startup_len = std::fs::metadata(&dump).map(|m| m.len()).unwrap_or(0) as usize;
+        let startup_samples = samples.len();
+
+        // Type like a human: one char every ~150ms.
+        for ch in "hello world".bytes() {
+            s.send(&[ch]);
+            pump_sampled(&mut s, 150, t0, &mut samples);
+        }
+        pump_sampled(&mut s, 1000, t0, &mut samples);
+
+        let bytes = std::fs::read(&dump).unwrap_or_default();
+        let typing = &bytes[startup_len.min(bytes.len())..];
+        println!("=== caret probe: claude ===");
+        println!(
+            "startup: {} bytes, 2026h={} 25l={} 25h={}",
+            startup_len,
+            count(&bytes[..startup_len], b"\x1b[?2026h"),
+            count(&bytes[..startup_len], b"\x1b[?25l"),
+            count(&bytes[..startup_len], b"\x1b[?25h"),
+        );
+        println!(
+            "typing: {} bytes, 2026h={} 2026l={} 25l={} 25h={}",
+            typing.len(),
+            count(typing, b"\x1b[?2026h"),
+            count(typing, b"\x1b[?2026l"),
+            count(typing, b"\x1b[?25l"),
+            count(typing, b"\x1b[?25h"),
+        );
+        println!("--- model-cursor samples while typing (ms row col shape) ---");
+        for (ms, row, col, shape) in &samples[startup_samples..] {
+            println!("{ms:>7} {row:>3} {col:>3} {shape}");
+        }
+        println!("--- raw typing bytes ---");
+        println!("{}", esc(typing));
+        println!("--- final screen ---");
+        for (i, row) in s.snapshot_text(None).iter().enumerate() {
+            if !row.is_empty() {
+                println!("{i:3} |{row}");
+            }
+        }
     }
 
     fn resize_probe_scenario_with(

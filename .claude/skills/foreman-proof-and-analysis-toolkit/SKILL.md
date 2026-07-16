@@ -167,11 +167,11 @@ state and applies side effects.
 | Seam (CONTEXT.md name) | Pure code | Signature shape |
 |---|---|---|
 | Input-encoding seam | `src/input.rs:37` `process_input` | egui events + term mode + has-selection → `InputOutcome` (bytes + side-effect flags) |
-| Caret gate | `src/caret.rs` `CaretGate::observe` | cursor observation + injected `now` → what to paint |
+| Caret (gate retired 2026-07-15) | `src/caret.rs` `draw` | model cursor (line, col, shape) → what to paint |
 | Outbox | `src/chat.rs:598` `ChatRoom::tick` | project tag + live Member presence → `Vec<Delivery>` |
 | Quiescence settle | `src/wm.rs:34-49` `settle_tick` | (gen, quiet_since, deadline, window, now) → (gen, since, done) |
 | Cell metrics | `src/geom.rs` `CellMetrics` | pane rect + cell size → all pixel↔cell conversions |
-| Frame plan | `src/frame.rs:59` `plan` | grid + Cell metrics + selection + Caret gate output → paint plan |
+| Frame plan | `src/frame.rs:59` `plan` | grid + Cell metrics + selection + caret draw → paint plan |
 
 Cell metrics and Frame plan landed in `7fda1c2` (2026-07-01) — the briefing
 era's "in-flight TDD" state is over; that commit reports 343 → 353 tests, all
@@ -464,15 +464,15 @@ asserted cells mirroring the design table
 and test were deleted in `f3c76f0` (2026-06-11) when zone snapping was
 replaced by the Layout tree — **the code died; the method survives.**
 
-**Worked example — live: the Caret gate.** `cursor_to_draw`
-(`src/caret.rs:130`) is the pure policy table; each policy row is asserted
-directly (`src/caret.rs:182-222`: far-jump-held, same-row-tracked,
-adjacent-followed-while-typing, autonomous-adjacent-held, settled-adopted,
-hide-honored). Timeline tests then drive the time-derived half through
-injected `Instant`s, and boundary tests pin the constants exactly —
-`CURSOR_SETTLE` = 50 ms and `INPUT_GRACE` = 150 ms are asserted at their
-exact thresholds (`src/caret.rs:292-317`). `settle_tick`'s tests
-(`src/wm.rs:5505-5580`) enumerate its cases the same way.
+**Worked example — retired but exemplary: the Caret gate** (deleted
+2026-07-15 when the caret moved to direct model-cursor tracking; see
+docs/cursor-rendering.md). At `7fda1c2`, `cursor_to_draw` (src/caret.rs:130
+of that revision) was the pure policy table with each row asserted directly,
+timeline tests driving the time-derived half through injected `Instant`s, and
+boundary tests pinning `CURSOR_SETTLE`/`INPUT_GRACE` at their exact
+thresholds — **the code died; the method survives** (like compose_zone
+above). `settle_tick`'s tests (`src/wm.rs:5505-5580`) enumerate cases the
+same way and are still live.
 
 **Done when:** asserted cells = |states| × |inputs| (or exclusions are
 explicit), and every assert message names its cell.
@@ -511,7 +511,7 @@ and constants below drift; re-verify before trusting. Run from the repo root
 | Stale-drop guards in the GUI drain | `git grep -n "sent.elapsed() >= REPLY_TIMEOUT" -- src/wm.rs` |
 | Thread-per-connection + `MAX_INFLIGHT` | `git grep -n "MAX_INFLIGHT" -- src/control.rs`; `git log -1 --format="%h %ad %s" 15f675f` |
 | `--wait-for` REPLY_TIMEOUT-exemption ripple (still open?) | `git grep -n "wait-for\|wait_for" -- src/control.rs docs/epics/terminal-inspection-epic.md` (no src hits = still unbuilt) |
-| Caret constants (50 ms / 150 ms) | `git grep -n "CURSOR_SETTLE\|INPUT_GRACE" -- src/caret.rs` |
+| Caret gate retired (caret.rs = pure `draw`) | `git grep -n "CaretGate\|CURSOR_SETTLE" -- src/` — any hit means it came back |
 | Ready gate + inject queue | `git grep -n "pending_inject\|ready = true" -- src/terminal.rs` |
 | Wire-compat test inventory | `git grep -n "wire_compat\|wire_compatible\|omits_none" -- src/control.rs` |
 | Selection buffer-space since `b581240` | `git log --all --oneline -S "Selection::new" -- src/` → `b581240`; `git grep -n "sel_anchor" -- src/terminal.rs` (expect empty) |

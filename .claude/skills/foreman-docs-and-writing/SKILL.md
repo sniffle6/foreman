@@ -125,13 +125,14 @@ meanings, and `_Avoid_:` synonym lists. No implementation detail; that lives in
 `docs/` (CONTEXT.md:4-6 says so itself).
 
 - **Add an entry when you introduce a named seam.** Observed pattern: the
-  Input-encoding seam, Caret gate, Quiescence settle, Cell metrics, Outbox, and
+  Input-encoding seam, Caret (né Caret gate), Quiescence settle, Cell metrics, Outbox, and
   Frame plan entries each landed alongside the code that created them
   ("Frame plan" arrived with `7fda1c2`, the commit that built `src/frame.rs`).
 - **Use the glossary terms exactly** in docs, skills, commit messages, and code
   comments: Win (not pane), Session (not terminal/PTY), Content, Project (not
   workspace), Ready, Leader, Chord, Keymap, Dispatch, Control plane, Snapshot,
-  Outbox, Caret gate, Cell metrics, Quiescence settle, Deferred action.
+  Outbox, Caret (the gate was retired 2026-07-15), Cell metrics, Quiescence
+  settle, Deferred action.
 - **Never use an entry's `_Avoid_:` synonyms.** If you catch a doc using one,
   fixing it is in-scope for any docs pass.
 - Entry shape: bold term, 1-3 line meaning, `_Avoid_:` line. Match the file.

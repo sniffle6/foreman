@@ -32,7 +32,7 @@ All `path:line` citations are as of 2026-07-01, HEAD `7fda1c2`.
 | `Access is denied (os error 5)` linking a build | A running `foreman.exe` holds the binary | §2 |
 | `cannot find -lgcc_eh` at link | w64devkit GCC 16 dropped `libgcc_eh.a` | §3 |
 | Narrow a Session, press Up, prompt corrupts | Upstream ConPTY reflow bug — SETTLED, do not re-investigate | §4 |
-| Caret flickers/strobes across a TUI's status line | Missing/changed Caret gate de-jitter | §5 |
+| Caret flickers/strobes across a TUI's status line | App doesn't sync-bracket redraws (gate retired 2026-07-15) | §5 |
 | A region of the UI ignores all clicks/drags | An egui Area's bounding rect swallows input below it | §6 |
 | Ctrl+Scroll / Ctrl+0 font zoom does nothing | egui's built-in zoom steals the gesture | §7 |
 | Chat post never appears in a member Session | Injection before the Session is Ready, or member never latches Ready | §8 |
@@ -145,35 +145,31 @@ Fuller chronicle: **foreman-failure-archaeology**.
 
 ## §5 Caret strobing in TUIs
 
-**Symptom.** In a full-screen TUI (Claude Code, Codex) the painted caret
-flickers between the input line and a far row (status line / message area),
-or chases a startup animation.
+**Symptom.** The painted caret flickers between the input line and a far row
+(status line / message area), or chases an animation.
 
-**Immediate cause.** TUIs that don't bracket frames in synchronized output
-(DEC mode 2026) move their cursor all over the screen mid-redraw; foreman
-samples the grid at its own repaint rate and would paint the caret wherever
-the parser happens to be (src/caret.rs:1-15).
+**Status (2026-07-15): the Caret gate is RETIRED.** The caret now tracks the
+model cursor directly every frame (`caret::draw`, src/caret.rs — a pure
+mapping; `?25l` hide honored). Why removal was safe, measured: modern TUIs
+(Claude Code, Codex) bracket every redraw in DEC 2026 synchronized output,
+which the vte parser applies atomically, and PSReadLine redraws arrive
+hide-bracketed (`?25l..?25h`) in single PTY chunks — the model cursor stream
+is clean by the time the painter samples it. The old gate's 50ms settle /
+150ms input-grace holds were themselves the user-visible bug (laggy, flashing
+caret while typing). Evidence: docs/cursor-rendering.md and the
+`caret_probe_claude_typing` ignored test (src/terminal.rs) — re-run it against
+any suspect app.
 
-**Fix / fence.** The **Caret gate** (`src/caret.rs`) de-jitters: it adopts a
-new resting cell only after the cursor holds it for `CURSOR_SETTLE` (50ms,
-src/caret.rs:24), follows single-row steps immediately only while the user
-typed within `INPUT_GRACE` (150ms, src/caret.rs:30), and holds far (>=2 row)
-jumps and autonomous animations. The decision table is the pure
-`cursor_to_draw` (src/caret.rs:130) — unit-tested with injected time; change
-policy there, not in paint code.
-
-**Known policy edge (as of 2026-07-01).** The "follow while typing" escape
-hatch is *adjacency*-based (`abs(delta_row) <= 1`, src/caret.rs:146). A TUI
-whose status line sits **one row** from the input caret defeats the strobe
-hold while the user is actively typing — the teleport looks like a legal
-single-row step. Far-row strobes are fully suppressed; one-row strobes during
-typing are not.
+**If a strobe reappears** (a non-2026 app whose redraw bursts split across
+pump batches): probe first, then the agreed fallback is a *far-jump-only*
+hold — decided on fresh evidence, NOT a reinstall of the settle/input-grace
+gate.
 
 **Discriminator.** Is the *model cursor* or the *painted caret* wrong? Run
 `foreman snapshot --cursor` (returns the grid model's cursor,
 src/inspect.rs:95) and compare with what's painted. Model cursor wrong =
 emulation problem (**terminal-emulation-reference**); model right but paint
-wrong = gate/paint problem (here).
+wrong = paint problem (`frame::overlays` / `show()`).
 
 ## §6 Regions of the UI dead to input — the egui Area landmines
 
@@ -335,7 +331,7 @@ Session or pass `--project/--terminal` explicitly):
 | Question | Experiment |
 |---|---|
 | "What is actually on the Session's screen?" (headless ground truth, no pixels) | `foreman send --terminal tN --text "..."` then `foreman snapshot --terminal tN`. `send` waits a Quiescence settle by default — replies after 120ms of PTY silence, hard cap 4000ms (src/wm.rs:17-18) — so the following Snapshot reads a settled screen. `--settle-ms 0` = fire-and-forget. **Drift flag:** the CLI help and `SendRequest` doc-comments still say `--settle-ms` is "not yet honored" (src/control.rs:129-130, 763) — stale; src/wm.rs:938-960 honors it (verified, as of 2026-07-01). |
-| "Is the emulation wrong or the paint wrong?" | `foreman snapshot --cursor` (model cursor) vs what's painted (Caret gate output) — see §5. `--attrs` does the same for colors — see §10. |
+| "Is the emulation wrong or the paint wrong?" | `foreman snapshot --cursor` (model cursor) vs what's painted (same cell since the gate retired) — see §5. `--attrs` does the same for colors — see §10. |
 | "What's the fleet state?" | `foreman status` — running/exited(code) for every Session, chat membership, asked of the live process. |
 | "Is the chrome wrong?" (pixels, not grid) | Build + screenshot via the **build-screenshot** skill. A Snapshot can't see egui chrome; a screenshot can't see cell attributes. Pick by layer. |
 
@@ -375,7 +371,7 @@ root `H:/claude code/foreman`):
 | VoidListener only in test fixtures | `rg -n "VoidListener" src/` (expect hits only in `#[cfg(test)]`/test mods of inspect.rs, frame.rs) |
 | Kill hook matcher is Bash-only | `Get-Content .claude/settings.json` |
 | ConPTY mitigation/residual status | `Get-Content docs/conpty-resize-reflow.md -TotalCount 8`; check bundled pair + #18725/#19535 status |
-| CURSOR_SETTLE 50ms / INPUT_GRACE 150ms / adjacency `<= 1` | `rg -n "CURSOR_SETTLE\|INPUT_GRACE\|abs\(\) <= 1" src/caret.rs` |
+| Caret gate retired (caret.rs is a pure draw mapping) | `rg -n "CaretGate\|CURSOR_SETTLE" src/` — any hit means the gate came back; update §5 |
 | Area landmine fixes (`constrain(false)`) | `rg -n "constrain\(false\)" src/main.rs` and docs/os-chrome.md §Gotchas |
 | egui zoom opt-out still present | `rg -n "zoom_with_keyboard\|zoom_modifier" src/main.rs` |
 | SUBMIT_DELAY 150ms; pre-Ready queueing | `rg -n "SUBMIT_DELAY\|pending_inject" src/terminal.rs` |

@@ -236,8 +236,6 @@ change through **foreman-change-control**.
 | `DEFAULT_HISTORY` | 20 | `src/control.rs:20` | Lines a bare `foreman chat --history` returns |
 | `DEFAULT_SETTLE_MS` | 120 ms | `src/wm.rs:17` | Quiescence settle default for `foreman send` |
 | `MAX_SETTLE_MS` | 4000 ms | `src/wm.rs:18` | Hard cap on total settle wait. **Invariant: `MAX_SETTLE_MS` < `REPLY_TIMEOUT`** so the pipe server's reply timeout never fires before a settle reply lands (`src/wm.rs:13-16`) |
-| `CURSOR_SETTLE` | 50 ms | `src/caret.rs:24` | Caret gate: cursor must hold a cell this long before the painted caret adopts it |
-| `INPUT_GRACE` | 150 ms | `src/caret.rs:30` | Caret gate: recent-typing window in which single-row moves are followed immediately |
 | `STALE_AFTER` | 300 s (5 min) | `src/chat.rs:20` | Crew board: a Member unheard this long renders its age in amber |
 | `MIN_RATIO` | 0.10 | `src/layout.rs:10` | Layout tree: no tile shrinks below this fraction of its split |
 | `REFRESH_EVERY` | 1500 ms | `src/proc.rs:21` | Process-table rescan cadence for tab agent icons |
@@ -325,7 +323,7 @@ rg -n "keymap.save" src/wm.rs
 rg -n "fn term_env" -A 18 src/wm.rs
 rg -n "env::var" src
 # Axis 4: every tuning constant in one sweep
-rg -n "const (SUBMIT_DELAY|ZOOM_NOTCH_PX|REPLY_TIMEOUT|CONNECT_TIMEOUT|MAX_INFLIGHT|DEFAULT_HISTORY|DEFAULT_SETTLE_MS|MAX_SETTLE_MS|CURSOR_SETTLE|INPUT_GRACE|STALE_AFTER|MIN_RATIO|REFRESH_EVERY)" src
+rg -n "const (SUBMIT_DELAY|ZOOM_NOTCH_PX|REPLY_TIMEOUT|CONNECT_TIMEOUT|MAX_INFLIGHT|DEFAULT_HISTORY|DEFAULT_SETTLE_MS|MAX_SETTLE_MS|STALE_AFTER|MIN_RATIO|REFRESH_EVERY)" src
 # settle honored (control.rs:548 comment is the stale one)
 rg -n "settle_ms.unwrap_or|not yet honored" src
 # Axis 5: hooks + matchers

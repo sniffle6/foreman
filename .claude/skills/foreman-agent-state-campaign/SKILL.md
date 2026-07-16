@@ -85,7 +85,7 @@ These are the raw materials. All verified at `7fda1c2` (as of 2026-07-01).
 | Output generation | `output_gen: u64`, src/terminal.rs:278; bumped per PTY batch in `pump()` :716; getter :687 | "New bytes arrived since I last looked" — the freshness counter the settle machinery polls | per-frame delta, per Session |
 | Quiescence settle | `settle_tick` + `PendingSettle` + `advance_settles`, src/wm.rs:17-49, 938-961, 1275-1312; driven per frame from src/main.rs:396-398. `DEFAULT_SETTLE_MS = 120`, `MAX_SETTLE_MS = 4000` (src/wm.rs:17-18) | Output-silence detection already exists as a pure, unit-tested function | window over output_gen |
 | Cursor position/shape | `snapshot --cursor` → `CursorInfo {row, col, shape}`; shape ∈ block/beam/underline/hollow/hidden (src/inspect.rs:33-37, 95-107) | Where the program's cursor rests; TUIs park it at their input box | per Snapshot |
-| Cursor stability | Caret gate: `CURSOR_SETTLE = 50ms` (src/caret.rs:24) — cursor-position stability, explicitly distinct from output quiescence (src/caret.rs:127) | A worked example of "resting vs mid-redraw" discrimination, pure + tested | per frame (internal) |
+| Cursor stability | RETIRED signal: the Caret gate's `CURSOR_SETTLE = 50ms` was deleted 2026-07-15 (caret now tracks the model cursor directly; docs/cursor-rendering.md). The gate's cursor-rest concept (distinct from output quiescence) remains a valid detection idea — reimplement pure if the campaign needs it (`git show 7fda1c2:src/caret.rs`) | The retired code is still the worked example of "resting vs mid-redraw" discrimination | n/a (would be per frame) |
 | OSC title | `Session::osc_title` (src/terminal.rs:238, 433); consumed ONLY by `icon_kind` today (src/terminal.rs:444-462) | Which agent is running — Claude sets `claude`; **Codex sets your username** (docs/tab-icons.md, "Detection" step 2) | identity, not state |
 | Process tree | `proc::agent_for` / pure `detect_agent` (src/proc.rs:69-141); refresh throttle `REFRESH_EVERY = 1500ms` (src/proc.rs:21); **WSL-blind** (src/proc.rs:10-12) | Which agent runs under the shell; running vs exited truth is `Session::exited()` (see src/wm.rs:1062-1064) | coarse, ≤1.5s lag |
 | Outbox Ready gate | `ChatRoom::tick` skips non-Ready Members (`!l.ready` → cursor stays, catch-up later), src/chat.rs:598-666; `LiveMember.ready` :447 | The delivery layer already keys on the one state bit that exists | consumer of Ready |
@@ -263,8 +263,8 @@ note it as a composite-design obligation, don't hand-tune live.
 
 A new pure module (e.g. `src/agentstate.rs`), Outbox-style: fed plain
 observations per frame, returns a state; no egui, no PTY handles — exactly the
-seam pattern of `settle_tick` (src/wm.rs:34-49), the Caret gate
-(src/caret.rs), and `ChatRoom::tick` (src/chat.rs:598). Unit-tested against
+seam pattern of `settle_tick` (src/wm.rs:34-49), the retired Caret gate
+(`git show 7fda1c2:src/caret.rs`), and `ChatRoom::tick` (src/chat.rs:598). Unit-tested against
 **recorded fixtures** from Phase 1 logs.
 
 Inputs (all already obtainable inside the GUI process, zero new plumbing):
