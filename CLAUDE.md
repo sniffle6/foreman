@@ -11,10 +11,14 @@ This file is the quick-load summary; HANDOFF.md wins on any conflict.
 
 ## Build / verify loop (Windows, PowerShell, GNU toolchain — no MSVC)
 
-Kill the running app first or the link fails with `Access is denied (os error 5)`:
+Kill the running app first or the link fails with `Access is denied (os error 5)`.
+**Kill by exe path, never by name** — only a `target\`-built instance holds the
+lock; `Stop-Process -Name foreman` also kills the user's *installed* foreman
+(`%LOCALAPPDATA%\Programs\foreman`), which looks like a crash (incident:
+2026-07-15). From the repo root:
 
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
 cargo run            # debug
 cargo run --release  # the "is it fast" build

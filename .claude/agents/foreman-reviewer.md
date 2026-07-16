@@ -35,8 +35,10 @@ style nits (a PostToolUse hook already runs `cargo fmt`).
 3. Focus only on the changed code and what it touches. Don't redesign; don't
    expand scope.
 4. Compile only when in doubt: `cargo build 2>&1 | tail -20` via Bash (a
-   PreToolUse hook kills the running app first; from any other shell you must
-   `Stop-Process -Name foreman` yourself or linking fails with os error 5).
+   PreToolUse hook kills any repo-target-built app first; from any other shell
+   kill it yourself — by exe path, never by name (`Get-Process foreman |
+   Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force`), or
+   linking fails with os error 5).
    Scoped tests: `cargo test --lib <module>`.
 5. Report findings as **must-fix** (bug / regression / invariant violation) vs
    **consider** (risk / nit). Cite `path:line` from the current tree. If you

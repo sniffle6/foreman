@@ -15,10 +15,13 @@ inspect the image.
    the kill below would take down your own host and this session
    (incident: 2026-07-09). Tell the user and stop.
 
-1. Kill any running Foreman and build:
+1. Kill any Foreman running from this repo's `target\` dir and build. Kill by
+   exe path, never by name — a by-name kill also takes down the user's
+   *installed* Foreman, which holds no lock on the build output (incident:
+   2026-07-15). From the repo root:
 
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
 ```
 
@@ -36,10 +39,10 @@ Pass `-WaitSeconds N` if the app needs longer to settle. The script writes
 3. Inspect `win.png` with Codex's local image viewer and compare what is visible
 against the intended change.
 
-4. Clean up:
+4. Clean up (path-filtered, same reason as step 1):
 
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force
 ```
 
 ## Gotchas

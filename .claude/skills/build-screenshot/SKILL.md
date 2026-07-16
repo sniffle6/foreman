@@ -15,9 +15,12 @@ runs it, and grabs a PNG of its window so you can `Read` the result.
    app; the kill below would take down your own host and this session
    (incident: 2026-07-09). Tell the user and stop.
 
-1. **Kill + build** (the PreToolUse hook also kills foreman, but be explicit):
+1. **Kill + build** (the PreToolUse hook also kills foreman, but be explicit).
+   Kill by exe path, never by name — a by-name kill also takes down the user's
+   *installed* foreman, which holds no lock on the build output (incident:
+   2026-07-15). From the repo root:
    ```powershell
-   Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+   Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
    cargo build 2>&1 | Select-Object -Last 20
    ```
    Stop here and report if the build fails.
@@ -32,9 +35,9 @@ runs it, and grabs a PNG of its window so you can `Read` the result.
 3. **Read** `win.png` and describe what you see vs. what the change intended.
 
 4. **Clean up** — kill the app when done so the next build doesn't hit
-   `Access is denied (os error 5)`:
+   `Access is denied (os error 5)` (path-filtered, same reason as step 1):
    ```powershell
-   Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue
+   Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force
    ```
 
 ## Gotchas

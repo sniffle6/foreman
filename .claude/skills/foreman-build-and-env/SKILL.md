@@ -80,10 +80,14 @@ Two terms used below, defined once:
 ## The build / verify loop
 
 Kill the running app first or the link fails with `Access is denied (os error
-5)` — Windows locks a running exe's file, and the linker cannot overwrite it:
+5)` — Windows locks a running exe's file, and the linker cannot overwrite it.
+**Kill by exe path, never by name** — only a `target\`-built instance holds
+the lock; a by-name kill also takes down the user's *installed* foreman
+(`%LOCALAPPDATA%\Programs\foreman`), which looks like a crash (incident:
+2026-07-15). From the repo root:
 
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
 cargo run              # debug
 cargo run --release    # the "is it fast" build
@@ -106,17 +110,20 @@ is defined in **foreman-validation-and-qa**.
 A Claude Code PreToolUse hook (`.claude/settings.json` →
 `.claude/hooks/kill-foreman.ps1`) auto-kills foreman, but **only** for
 Bash-tool commands matching the regex `cargo\s+(build|run|test)`. It always
-exits 0 (never blocks the command).
+exits 0 (never blocks the command). Since 2026-07-15 it kills **by exe path**
+— only instances running from this repo's `target\` dir — so an installed
+foreman (`%LOCALAPPDATA%\Programs\foreman`) survives builds.
 
 | How you run cargo                              | Kill automated?                          |
 | ---------------------------------------------- | ---------------------------------------- |
 | Claude Code **Bash tool**, `cargo build/run/test` | Yes — PreToolUse hook kills first     |
-| Claude Code **PowerShell tool**                | No — prepend the `Stop-Process` line     |
-| Your own terminal, scripts, CI-like automation | No — prepend the `Stop-Process` line     |
+| Claude Code **PowerShell tool**                | No — prepend the path-filtered kill line |
+| Your own terminal, scripts, CI-like automation | No — prepend the path-filtered kill line |
 
-**Fleet warning:** the hook (and the manual line) kills by process name — it
-takes down **every** `foreman.exe`, debug and release alike. If a live release
-fleet is running agents you care about, do NOT run cargo through the Bash tool.
+**Fleet warning:** the hook (and the manual line) takes down **every**
+`foreman.exe` under `target\` — debug and release alike. If a live release
+fleet built from this repo is running agents you care about, do NOT run cargo
+through the Bash tool.
 
 ### Never kill a live release fleet just to run tests
 

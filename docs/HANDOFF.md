@@ -118,9 +118,13 @@ Set-Location <repo root>   # the foreman/ directory, wherever you cloned it
 ```
 (`C:\w64devkit\bin` is also persisted on the user PATH, so a plain terminal works.)
 
-**Build** (kill the running app first or the link fails with `Access is denied`):
+**Build** (kill the running app first or the link fails with `Access is denied`).
+Kill by exe path, never by name — only a `target\`-built instance holds the lock
+on the build output; killing by name also takes down the user's *installed*
+foreman (`%LOCALAPPDATA%\Programs\foreman`), which looks like a crash
+(incident: 2026-07-15). From the repo root:
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
 ```
 

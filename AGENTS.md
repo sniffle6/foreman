@@ -12,10 +12,13 @@ any conflict.
 ## Build / Verify Loop
 
 Windows, PowerShell, GNU toolchain. Kill the running app first or linking fails
-with `Access is denied (os error 5)`:
+with `Access is denied (os error 5)`. **Kill by exe path, never by name** —
+`Stop-Process -Name foreman` also kills the user's *installed* foreman
+(`%LOCALAPPDATA%\Programs\foreman`), which holds no lock on the build output
+(incident: 2026-07-15). From the repo root:
 
 ```powershell
-Stop-Process -Name foreman -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500
+Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
 cargo build 2>&1 | Select-Object -Last 20
 cargo test
 ```
