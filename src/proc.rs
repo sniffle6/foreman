@@ -247,6 +247,16 @@ mod tests {
     }
 
     #[test]
+    fn direct_child_grok_is_detected() {
+        // Real install is a native `grok.exe` (e.g. `%USERPROFILE%\.grok\bin\grok.exe`).
+        let t = vec![
+            row(100, 1, "powershell.exe", &["powershell"]),
+            row(200, 100, "grok.exe", &["grok"]),
+        ];
+        assert_eq!(detect_agent(&t, 100), Some(IconKind::Grok));
+    }
+
+    #[test]
     fn plain_shell_has_no_agent() {
         let t = vec![row(100, 1, "powershell.exe", &["powershell"])];
         assert_eq!(detect_agent(&t, 100), None);

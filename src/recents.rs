@@ -12,7 +12,7 @@ const RECENTS_FILE: &str = "recents.json";
 /// Store 5, show 5 — one number (grug-review amendment; no ghost entries).
 pub const MAX_RECENTS: usize = 5;
 
-/// One remembered open. `kind` is a plain string ("claude" | "codex" |
+/// One remembered open. `kind` is a plain string ("claude" | "codex" | "grok" |
 /// "terminal") — deliberately NOT the landing's provisional `SessionKind`, so
 /// the disk format survives phase-2 renaming that enum, an unknown kind can
 /// never fail the parse, and this module doesn't depend on a UI module.
@@ -82,6 +82,7 @@ pub fn kind_of_command(cmd: Option<&str>) -> &'static str {
     match cmd.and_then(|c| c.split_whitespace().next()) {
         Some("claude") => "claude",
         Some("codex") => "codex",
+        Some("grok") => "grok",
         _ => "terminal",
     }
 }
@@ -135,6 +136,7 @@ mod tests {
         assert_eq!(kind_of_command(None), "terminal");
         assert_eq!(kind_of_command(Some("claude")), "claude");
         assert_eq!(kind_of_command(Some("codex")), "codex");
+        assert_eq!(kind_of_command(Some("grok")), "grok");
         assert_eq!(kind_of_command(Some("some-other-tool --flag")), "terminal");
     }
 }

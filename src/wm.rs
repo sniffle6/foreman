@@ -195,6 +195,31 @@ impl Content {
 pub struct Tab {
     pub title: String,
     pub content: Content,
+    /// When true, [`WindowManager::refresh_auto_titles`] may replace `title`
+    /// with an agent name once the Session detects one (hand-launched / landing
+    /// agents in a default-named shell). Cleared by manual rename; never set
+    /// for dispatch-spawned titles, projects, chat, or the sessions panel.
+    auto_title: bool,
+}
+
+impl Tab {
+    /// Fixed title (no auto-rename). Used for projects, chat, panel, dispatch.
+    fn fixed(title: impl AsRef<str>, content: Content) -> Self {
+        Self {
+            title: title.as_ref().to_string(),
+            content,
+            auto_title: false,
+        }
+    }
+
+    /// Default shell title — auto-renames when an agent is detected.
+    fn shell_default(title: impl AsRef<str>, content: Content) -> Self {
+        Self {
+            title: title.as_ref().to_string(),
+            content,
+            auto_title: true,
+        }
+    }
 }
 
 pub struct Win {
@@ -663,10 +688,16 @@ impl WindowManager {
                     new_active = tabs.len();
                     found_active = true;
                 }
-                tabs.push(Tab {
-                    title: tab_snap.title.clone(),
-                    content,
-                });
+                // Terminals whose title is still a managed default (shell or
+                // prior agent auto-name) keep auto_title so a re-detected agent
+                // renames them. Custom user names stay fixed.
+                let tab = match &content {
+                    Content::Terminal(_) if title_is_auto_managed(&tab_snap.title) => {
+                        Tab::shell_default(tab_snap.title.clone(), content)
+                    }
+                    _ => Tab::fixed(tab_snap.title.clone(), content),
+                };
+                tabs.push(tab);
             }
 
             if tabs.is_empty() {
@@ -717,10 +748,10 @@ impl WindowManager {
         (id, rect)
     }
 
-    fn push_win(&mut self, id: WinId, title: String, rect: egui::Rect, content: Content) {
+    fn push_win(&mut self, id: WinId, tab: Tab, rect: egui::Rect) {
         self.windows.push(Win {
             id,
-            tabs: vec![Tab { title, content }],
+            tabs: vec![tab],
             active: 0,
             rect,
             z: self.z,
@@ -740,9 +771,11 @@ impl WindowManager {
         s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
         self.push_win(
             id,
-            format!("{}  ·  #{}", shell.label(), id),
+            Tab::shell_default(
+                format!("{}  ·  #{}", shell.label(), id),
+                Content::Terminal(s),
+            ),
             rect,
-            Content::Terminal(s),
         );
         self.mark_workspace_dirty();
         Some(id)
@@ -805,7 +838,11 @@ impl WindowManager {
         if let Some(tid) = child.add_terminal(shell, ctx) {
             child.tile_new(tid, None);
         }
-        self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        self.push_win(
+            id,
+            Tab::fixed(title, Content::Project(Box::new(child))),
+            rect,
+        );
         self.mark_workspace_dirty();
         id
     }
@@ -845,7 +882,11 @@ impl WindowManager {
                 }
             }
         }
-        self.push_win(id, title, rect, Content::Project(Box::new(child)));
+        self.push_win(
+            id,
+            Tab::fixed(title, Content::Project(Box::new(child))),
+            rect,
+        );
         self.mark_workspace_dirty();
         id
     }
@@ -1453,7 +1494,8 @@ impl WindowManager {
         // the new terminal is to LOOK at, not type into). Keep focus where it
         // was; the window still spawns on top visually (z from next_slot).
         let prev_focus = self.focused;
-        self.push_win(id, title, rect, Content::Terminal(s));
+        // Explicit dispatch title — never auto-renamed (already intentional).
+        self.push_win(id, Tab::fixed(title, Content::Terminal(s)), rect);
         self.tile_new(id, prev_focus);
         // Dispatched agents auto-join the project chat room (spec §2) — the
         // room appends the Joined line; the transcript records it.
@@ -1490,9 +1532,11 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(420.0, 320.0));
         self.push_win(
             id,
-            "chat".into(),
+            Tab::fixed(
+                "chat",
+                Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
+            ),
             rect,
-            Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
         );
         self.mark_workspace_dirty();
     }
@@ -1749,14 +1793,14 @@ impl WindowManager {
         let prev_focus = self.focused;
         self.windows.push(Win {
             id,
-            tabs: vec![Tab {
-                title: "Sessions".into(),
-                content: Content::TaskManager(crate::panel::PanelView::with_dock(
+            tabs: vec![Tab::fixed(
+                "Sessions",
+                Content::TaskManager(crate::panel::PanelView::with_dock(
                     collapsed,
                     expanded_width,
                     dock,
                 )),
-            }],
+            )],
             active: 0,
             rect: egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -3174,6 +3218,29 @@ impl WindowManager {
         }
     }
 
+    /// When a shell tab still carries its default title (`auto_title`) and its
+    /// Session now resolves to an agent icon, rename the tab to
+    /// `"Claude  ·  #3"` (etc.). Manual renames and dispatch titles opt out.
+    /// Agent exit leaves the name (v1). Runs over every tab, including
+    /// background ones; recurses into projects like `refresh_exit_titles`.
+    fn refresh_auto_titles(&mut self) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                match &mut t.content {
+                    Content::Terminal(s) => {
+                        if let Some(new) =
+                            auto_agent_title(&t.title, t.auto_title, s.icon_kind(), s.term_id())
+                        {
+                            t.title = new;
+                        }
+                    }
+                    Content::Project(wm) => wm.refresh_auto_titles(),
+                    Content::Chat(_) | Content::TaskManager(_) => {}
+                }
+            }
+        }
+    }
+
     /// Returns whether any window in this manager was interacted with this frame.
     /// The parent uses this to propagate focus upward: clicking a sub-window in a
     /// background project bubbles up and switches the desktop to that project.
@@ -3202,6 +3269,7 @@ impl WindowManager {
 
         if self.desktop {
             self.refresh_exit_titles();
+            self.refresh_auto_titles();
             // First real area (or large area change): size the panel leaf.
             // While collapsed, re-pin every frame so divider drags (from the
             // panel's edge or a neighbour's) spring back to the rail width.
@@ -3660,6 +3728,8 @@ impl WindowManager {
                         if !t.is_empty() {
                             let a = self.windows[i].active;
                             self.windows[i].tabs[a].title = t;
+                            // Manual rename permanently opts out of auto-title.
+                            self.windows[i].tabs[a].auto_title = false;
                             self.mark_workspace_dirty();
                         }
                         self.renaming = None;
@@ -5092,6 +5162,60 @@ fn display_name(title: &str) -> &str {
     title.split("  ·  exited").next().unwrap_or(title).trim()
 }
 
+/// Titles we still own: stock shell defaults (`powershell  ·  #3`) and prior
+/// agent auto-names (`Claude  ·  #3`). Custom renames and exit stamps are not.
+fn title_is_auto_managed(title: &str) -> bool {
+    if title.contains("  ·  exited") {
+        return false;
+    }
+    let Some((label, num)) = title.split_once("  ·  #") else {
+        return false;
+    };
+    if label.is_empty() || num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        label,
+        "powershell" | "cmd" | "bash" | "Claude" | "Codex" | "Grok"
+    )
+}
+
+/// Stock shell default only (`powershell  ·  #3`) — not agent names or custom.
+fn title_is_shell_default(title: &str) -> bool {
+    let Some((label, num)) = title.split_once("  ·  #") else {
+        return false;
+    };
+    matches!(label, "powershell" | "cmd" | "bash")
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Pure: if the tab is auto-title-eligible and `icon` is an agent, propose
+/// `"{Agent}  ·  #{term_id}"`. Also renames when the live title is still a
+/// stock shell default even if the flag was lost (workspace restore). See #6.
+fn auto_agent_title(
+    current: &str,
+    auto_title: bool,
+    icon: crate::icons::IconKind,
+    term_id: u64,
+) -> Option<String> {
+    // Don't clobber the one-shot exit marker from `refresh_exit_titles`.
+    if current.contains("  ·  exited") {
+        return None;
+    }
+    let agent = icon.agent_label()?;
+    let want = format!("{agent}  ·  #{term_id}");
+    if current == want {
+        return None;
+    }
+    // Eligible: shell-spawn flag / managed restore, OR title still stock shell
+    // (covers older restores that forced Tab::fixed and cleared the flag).
+    if !auto_title && !title_is_shell_default(current) {
+        return None;
+    }
+    Some(want)
+}
+
 /// Parse a "t4"-style terminal id.
 fn term_id(spec: &str) -> Result<WinId, String> {
     spec.strip_prefix('t')
@@ -5238,10 +5362,7 @@ mod tests {
         wm.z += 1;
         wm.windows.push(Win {
             id,
-            tabs: vec![Tab {
-                title: title.to_string(),
-                content: stub_content(),
-            }],
+            tabs: vec![Tab::fixed(title.to_string(), stub_content())],
             active: 0,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
             z: wm.z,
@@ -5275,13 +5396,10 @@ mod tests {
             d.z += 1;
             d.windows.push(Win {
                 id,
-                tabs: vec![Tab {
-                    title: "sessions".into(),
-                    content: Content::TaskManager(crate::panel::PanelView::new(
+                tabs: vec![Tab::fixed("sessions", Content::TaskManager(crate::panel::PanelView::new(
                         false,
                         crate::panel::PANEL_W,
-                    )),
-                }],
+                    )))],
                 active: 0,
                 rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(260.0, 800.0)),
                 z: d.z,
@@ -5343,10 +5461,7 @@ mod tests {
         m.z += 1;
         m.windows.push(Win {
             id,
-            tabs: vec![Tab {
-                title: "chat".into(),
-                content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::clone(&m.chat))),
-            }],
+            tabs: vec![Tab::fixed("chat", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::clone(&m.chat))))],
             active: 0,
             rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
             z: m.z,
@@ -5858,14 +5973,8 @@ mod tests {
         assert_eq!(ca, cb, "the collision under test");
         let win = desk.windows.iter_mut().find(|x| x.id == w).unwrap();
         win.tabs = vec![
-            Tab {
-                title: "a".into(),
-                content: Content::Project(Box::new(inner_a)),
-            },
-            Tab {
-                title: "b".into(),
-                content: Content::Project(Box::new(inner_b)),
-            },
+            Tab::fixed("a", Content::Project(Box::new(inner_a))),
+            Tab::fixed("b", Content::Project(Box::new(inner_b))),
         ];
         win.active = 0;
 
@@ -5982,6 +6091,118 @@ mod tests {
     // A Member's id is its Session's stable spawn-time id, NOT the mutable Win id.
     // Untab allocates a new Win id; the detached terminal must keep its identity
     // so chat delivery/self-exclusion/targeting don't break under it.
+    #[test]
+    fn auto_agent_title_renames_default_shell_only() {
+        use crate::icons::IconKind;
+        // Agent detected + auto_title → rename, keep term id suffix.
+        assert_eq!(
+            auto_agent_title("powershell  ·  #3", true, IconKind::Claude, 3),
+            Some("Claude  ·  #3".into())
+        );
+        assert_eq!(
+            auto_agent_title("powershell  ·  #7", true, IconKind::Grok, 7),
+            Some("Grok  ·  #7".into())
+        );
+        // Already agent-named: no-op.
+        assert_eq!(
+            auto_agent_title("Claude  ·  #3", true, IconKind::Claude, 3),
+            None
+        );
+        // Agent switch while still managed: rename.
+        assert_eq!(
+            auto_agent_title("Claude  ·  #3", true, IconKind::Codex, 3),
+            Some("Codex  ·  #3".into())
+        );
+        // Shell icon: leave the default alone.
+        assert_eq!(
+            auto_agent_title("powershell  ·  #3", true, IconKind::PowerShell, 3),
+            None
+        );
+        // Manual/dispatch title: auto_title off, not a shell default.
+        assert_eq!(
+            auto_agent_title("my work", false, IconKind::Claude, 3),
+            None
+        );
+        // Flag lost but title still stock shell default → still rename (restore).
+        assert_eq!(
+            auto_agent_title("powershell  ·  #3", false, IconKind::Claude, 3),
+            Some("Claude  ·  #3".into())
+        );
+        // Exit stamp is sticky — don't overwrite.
+        assert_eq!(
+            auto_agent_title("Claude  ·  #3  ·  exited (0)", true, IconKind::Claude, 3),
+            None
+        );
+        assert!(title_is_auto_managed("powershell  ·  #1"));
+        assert!(title_is_auto_managed("Claude  ·  #2"));
+        assert!(!title_is_auto_managed("my work"));
+        assert!(!title_is_auto_managed("Claude  ·  #2  ·  exited (0)"));
+    }
+
+    #[test]
+    fn refresh_auto_titles_renames_shell_tabs_when_agent_detected() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        // Default title from add_terminal (shell.label() is lowercase).
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().title(),
+            &format!("cmd  ·  #{id}")
+        );
+        // Simulate a hand-launched agent: OSC title stem is the agent binary.
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            s.set_osc_title_for_test(Some("claude".into()));
+        }
+        wm.refresh_auto_titles();
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().title(),
+            &format!("Claude  ·  #{id}")
+        );
+        // Manual rename opts out permanently.
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            w.tabs[0].title = "my pane".into();
+            w.tabs[0].auto_title = false;
+        }
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            s.set_osc_title_for_test(Some("codex".into()));
+        }
+        wm.refresh_auto_titles();
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().title(),
+            "my pane",
+            "user rename must stick"
+        );
+    }
+
+    #[test]
+    fn dispatch_titles_are_not_auto_renamed() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm
+            .add_terminal_cmd(
+                &["claude".into()],
+                None,
+                Some("agent · claude"),
+                &ctx,
+            )
+            .unwrap();
+        // icon_kind is Claude from dispatch argv, but title stays the explicit one.
+        wm.refresh_auto_titles();
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == id).unwrap().title(),
+            "agent · claude"
+        );
+    }
+
     #[test]
     fn term_id_survives_untab() {
         let ctx = egui::Context::default();
@@ -6165,7 +6386,7 @@ mod tests {
         let (id, rect) = m.next_slot(egui::vec2(100.0, 100.0));
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{id}"));
-        m.push_win(id, "proj".into(), rect, Content::Project(Box::new(child)));
+        m.push_win(id, Tab::fixed("proj", Content::Project(Box::new(child))), rect);
         if !id_focused {
             m.focused = None;
         }
@@ -6180,8 +6401,8 @@ mod tests {
         let s1 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
         let s2 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
-        m.push_win(1, "one".into(), r, Content::Terminal(s1));
-        m.push_win(2, "two".into(), r, Content::Terminal(s2));
+        m.push_win(1, Tab::fixed("one", Content::Terminal(s1)), r);
+        m.push_win(2, Tab::fixed("two", Content::Terminal(s2)), r);
 
         let shells = m.terminal_shells();
         assert_eq!(shells.len(), 2);
@@ -6197,7 +6418,7 @@ mod tests {
         let env: Vec<(String, String)> = vec![];
         let s = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
-        m.push_win(1, "idle".into(), r, Content::Terminal(s));
+        m.push_win(1, Tab::fixed("idle", Content::Terminal(s)), r);
         // An idle cmd.exe has no non-plumbing descendants → no group to warn about.
         assert!(m.terminal_groups().is_empty());
         // groups_in_tab agrees: the idle terminal contributes nothing.
@@ -6228,9 +6449,9 @@ mod tests {
         // requires renaming.is_none()), freezing the app until restart.
         let mut m = WindowManager::new();
         let (a, ra) = m.next_slot(egui::vec2(100.0, 100.0));
-        m.push_win(a, "one".into(), ra, stub_content());
+        m.push_win(a, Tab::fixed("one", stub_content()), ra);
         let (b, rb) = m.next_slot(egui::vec2(100.0, 100.0));
-        m.push_win(b, "two".into(), rb, stub_content());
+        m.push_win(b, Tab::fixed("two", stub_content()), rb);
 
         m.focus(a);
         m.begin_rename();
@@ -6478,7 +6699,7 @@ mod tests {
                 Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
             let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
             s.set_term_id(id);
-            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
             id
         };
         assert!(!wm.chat.borrow().is_member(&term_tag(outsider)));
@@ -6590,10 +6811,7 @@ mod tests {
         {
             let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
             let shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
-            w.tabs.push(Tab {
-                title: "shell".into(),
-                content: Content::Terminal(shell),
-            });
+            w.tabs.push(Tab::fixed("shell", Content::Terminal(shell)));
             w.active = 1; // terminal in front, chat behind
         }
         wm.focused = None;
@@ -6624,7 +6842,7 @@ mod tests {
                 Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn plain");
             let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
             s.set_term_id(id);
-            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
             id
         };
         let crew = wm.chat.borrow().crew(std::time::Instant::now());
@@ -6871,7 +7089,7 @@ mod tests {
                 Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
             let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
             s.set_term_id(id);
-            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
             id
         };
         assert!(!wm.chat.borrow().is_member(&term_tag(outsider)));
@@ -6942,7 +7160,7 @@ mod tests {
             .unwrap();
         let mut d = WindowManager::new().as_desktop();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        d.push_win(1, "proj".into(), rect, Content::Project(Box::new(child)));
+        d.push_win(1, Tab::fixed("proj", Content::Project(Box::new(child))), rect);
         (d, a, b)
     }
 
@@ -7266,7 +7484,7 @@ mod tests {
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        d.push_win(2, "other".into(), rect, Content::Project(Box::new(child2)));
+        d.push_win(2, Tab::fixed("other", Content::Project(Box::new(child2))), rect);
 
         // --project p1 lists only p1's header + its two terminals
         let (msg, rrx) = status_msg(Some("p1"), std::time::Instant::now());
@@ -7782,10 +8000,7 @@ mod tests {
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
             let mut shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
             shell.set_term_id(shell_id);
-            w.tabs.push(Tab {
-                title: "shell".into(),
-                content: Content::Terminal(shell),
-            });
+            w.tabs.push(Tab::fixed("shell", Content::Terminal(shell)));
             w.active = 1; // shell in front, member behind
         }
         wm.chat_post(&term_tag(sender), "go", &[], None).unwrap();
@@ -7925,7 +8140,7 @@ mod tests {
                 Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn outsider");
             let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
             s.set_term_id(id);
-            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
             id
         };
         let seq_before = wm.chat.borrow().last_seq();
@@ -7974,7 +8189,7 @@ mod tests {
                 Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).expect("spawn sender");
             let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
             s.set_term_id(id);
-            wm.push_win(id, "plain".into(), rect, Content::Terminal(s));
+            wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
             id
         };
         assert!(!wm.chat.borrow().is_member(&term_tag(sender)));
@@ -8192,7 +8407,7 @@ mod tests {
         let mut m = WindowManager::new();
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         let child = WindowManager::new();
-        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        m.push_win(7, Tab::fixed("proj", Content::Project(Box::new(child))), r);
         m.pending_close = Some(PendingClose {
             target: CloseTarget::ActiveTab(7),
             view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
@@ -8210,7 +8425,7 @@ mod tests {
         let mut m = WindowManager::new();
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         let child = WindowManager::new();
-        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        m.push_win(7, Tab::fixed("proj", Content::Project(Box::new(child))), r);
         m.pending_close = Some(PendingClose {
             target: CloseTarget::ActiveTab(7),
             view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
@@ -8301,7 +8516,7 @@ mod tests {
             target: CloseTarget::ActiveTab(1),
             view: crate::confirm::ConfirmClose::new("t", "l", "close anyway", vec![]),
         });
-        m.push_win(7, "proj".into(), r, Content::Project(Box::new(child)));
+        m.push_win(7, Tab::fixed("proj", Content::Project(Box::new(child))), r);
         assert!(
             m.any_pending_close(),
             "a confirm inside a nested project must be visible app-wide"
@@ -8317,9 +8532,8 @@ mod tests {
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         m.push_win(
             7,
-            "proj".into(),
+            Tab::fixed("proj", Content::Project(Box::new(WindowManager::new()))),
             r,
-            Content::Project(Box::new(WindowManager::new())),
         );
         m.app_modal = true;
         m.request_close_active_tab(7);
@@ -8341,12 +8555,9 @@ mod tests {
         let proj = push(&mut desk, "projA");
         let mut inner = WindowManager::new();
         let a = push(&mut inner, "termA");
-        inner.windows[0].tabs.push(Tab {
-            title: "termA2".into(),
-            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed("termA2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            ))),
-        });
+            )))));
         let b = push(&mut inner, "termB");
         inner
             .windows
@@ -8405,12 +8616,9 @@ mod tests {
         let proj = push(&mut desk, "proj");
         let mut inner = WindowManager::new();
         let cw = push(&mut inner, "t1");
-        inner.windows[0].tabs.push(Tab {
-            title: "t2".into(),
-            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed("t2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            ))),
-        });
+            )))));
         inner.windows[0].minimized = true;
         desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
             Content::Project(Box::new(inner));
@@ -8835,12 +9043,9 @@ mod tests {
         let proj = push(&mut desk, "proj");
         let mut inner = WindowManager::new();
         let cw = push(&mut inner, "t1");
-        inner.windows[0].tabs.push(Tab {
-            title: "t2".into(),
-            content: Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed("t2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            ))),
-        });
+            )))));
         inner.windows[0].active = 0;
         desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
             Content::Project(Box::new(inner));
@@ -9325,15 +9530,13 @@ mod tests {
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         m.push_win(
             1,
-            "a".into(),
+            Tab::fixed("a", Content::Project(Box::new(WindowManager::new()))),
             r,
-            Content::Project(Box::new(WindowManager::new())),
         );
         m.push_win(
             2,
-            "b".into(),
+            Tab::fixed("b", Content::Project(Box::new(WindowManager::new()))),
             r,
-            Content::Project(Box::new(WindowManager::new())),
         );
         m.focus(1);
         m.app_modal = true;
@@ -9386,9 +9589,8 @@ mod tests {
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         m.push_win(
             7,
-            "proj".into(),
+            Tab::fixed("proj", Content::Project(Box::new(WindowManager::new()))),
             r,
-            Content::Project(Box::new(WindowManager::new())),
         );
         m.renaming = Some(7);
         m.request_close_active_tab(7);

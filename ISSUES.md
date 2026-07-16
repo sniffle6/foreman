@@ -69,42 +69,6 @@ from.
 
 ---
 
-### #3 — Feature: Grok as a first-class agent — landing-page button + Grok icon on sessions
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
-
-**Request.** Add Grok (xAI's CLI agent) alongside Claude and Codex: a Grok
-launch button on the landing page, and a Grok icon shown on terminals/tabs that
-are running a grok session (everywhere the Claude/Codex logos appear today).
-
-**Current behavior.** Only Claude and Codex are first-class. The landing page
-(`src/landing.rs`) has a `SessionKind` enum (~line 13) with per-kind display
-name (~377), kind string (~388), launch command (~397), and icon mapping
-(~242); `src/main.rs` (~443) launches a shell running the agent, with an error
-toast if the binary is missing. Icons live in `src/icons.rs`: `IconKind` with
-an `include_str!` SVG from `assets/icons/` (~13), a tint color (~44), and
-detection by title/argv substring (~63–90) plus process-tree stem detection in
-`src/proc.rs` (`detect_agent`). `src/recents.rs` persists the kind as a plain
-string ("claude" | "codex" | ...).
-
-**Sketch.** Mirror the Codex plumbing end to end:
-1. `assets/icons/grok.svg` + `IconKind::Grok` (SVG const, tint, `all()` list,
-   `from_title`/`from_argv` matching a "grok" substring).
-2. `src/proc.rs` stem detection for `grok` (including the node-script case if
-   the CLI is a JS entrypoint, like codex.js).
-3. `SessionKind::Grok` in `src/landing.rs`: display name "Grok", kind string
-   "grok", launch command (verify the actual CLI binary name — assumed `grok`),
-   icon mapping, and inclusion in the landing button list (~26).
-4. `src/recents.rs` kind mapping for "grok".
-5. Update the unit tests that enumerate kinds/icons (icons.rs ~155–207,
-   landing.rs ~793–913, proc.rs, recents.rs ~137).
-
-**Open question.** Confirm the grok CLI's install name and how it appears in
-titles/process trees on Windows (binary vs `node …\grok.js`) before wiring
-detection — Claude/Codex icon detection has already been a bug surface.
-
----
-
 ### #4 — Feature: rename terminals from the sessions panel by double-clicking the name
 
 **Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
@@ -194,52 +158,6 @@ also scrolls vertically; dragging near the panel edge should auto-scroll or at
 minimum not break the clamped-scroll behavior from commit 24729ef.
 
 ---
-
-### #6 — Feature: auto-rename a default-named terminal to the agent's name when an agent starts in it
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
-
-**Request.** When an agent (Claude, Codex, later Grok — see #3) starts running
-inside a terminal whose title is still the default, automatically rename the
-terminal to the agent's name (e.g. "Claude · #3"). If the user has renamed the
-terminal, never overwrite their name.
-
-**Current behavior.** A tab's `title: String` (`src/wm.rs` ~164) is set once
-at creation and only changes via the manual rename editor (`Command::Rename`,
-wm.rs ~1909/~3077 — commits to `tabs[a].title`). Defaults are:
-- plain terminal: `"{shell.label()}  ·  #{id}"` (`add_terminal`, wm.rs ~447),
-  e.g. `PowerShell  ·  #3`;
-- dispatched agent: explicit `--title` or `"agent · {argv[0]}"`
-  (`add_terminal_cmd`, wm.rs ~1147).
-Hand-typing `claude` into a shell changes the icon (agent detection already
-exists: OSC-title match, throttled process-tree fallback —
-`Session::icon_kind`, src/terminal.rs ~566–580, `detect_agent` in src/proc.rs)
-but the tab title stays "PowerShell · #3".
-
-**Sketch.**
-1. Track "still default": store the generated default on the tab (e.g.
-   `default_title: Option<String>`, or a `user_named: bool` set by the rename
-   editor and by explicit dispatch `--title`). Comparing against the known
-   default pattern also works but breaks if the pattern ever changes.
-2. In the per-frame pass where the wm already consults the session (icon
-   refresh), when `icon_kind()` transitions from None/shell to an agent AND
-   the title is still the default, set `tabs[i].title` to the agent's display
-   name, keeping the id suffix: `"Claude  ·  #3"`.
-3. When the agent exits back to the shell, either leave the name (simple) or
-   revert to the stored default (nicer — and `default_title` from step 1 makes
-   it trivial). Decide at implementation; leaving it is acceptable v1.
-4. A manual rename (or a panel rename, #4) permanently opts the terminal out
-   of auto-renaming.
-
-**Scope note.** Agent display names should come from the same source as the
-icon mapping (`IconKind` → name) so #3's Grok gets this for free. The
-dispatched-agent path (`add_terminal_cmd`) already names the window
-sensibly — this issue is mainly for agents hand-launched inside a shell and
-for the landing-page launch path (`add_project_with_command`, wm.rs ~524,
-which types the agent command into a default-named PowerShell terminal).
-
----
-
 
 ### #9 — Chat injection gating + delivery ACK/retry, composed from EXISTING quiescence signals (fixes stuck-input)
 
@@ -506,6 +424,20 @@ drag.
 ---
 
 ## Closed
+
+### #3 — Feature: Grok as a first-class agent — landing-page button + Grok icon on sessions
+
+**Resolved:** `SessionKind::Grok` + landing button; `IconKind::Grok` with
+`assets/icons/grok.svg`; argv/title/process-tree detection for `grok` stem
+(native `grok.exe` under `%USERPROFILE%\.grok\bin`); recents kind `"grok"`.
+Launch command is `grok`.
+
+### #6 — Feature: auto-rename a default-named terminal to the agent's name when an agent starts in it
+
+**Resolved:** `Tab.auto_title` set for shell spawns (`add_terminal`);
+`refresh_auto_titles` renames to `"{Agent}  ·  #{term_id}"` via
+`IconKind::agent_label` when `icon_kind` detects Claude/Codex/Grok. Manual
+rename and dispatch titles opt out. Agent exit leaves the name (v1).
 
 ### #2 — Feature: panel row click = focus if unfocused, minimize if already focused (projects and terminals)
 

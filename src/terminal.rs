@@ -760,6 +760,16 @@ impl Session {
         self.osc_title.lock().ok().and_then(|t| t.clone())
     }
 
+    /// Test hook: force the OSC title used by [`Self::icon_kind`]'s hand-launched
+    /// agent path (wm auto-title tests). Production code never needs this —
+    /// titles arrive via the PTY `Listener`.
+    #[cfg(test)]
+    pub fn set_osc_title_for_test(&self, title: Option<String>) {
+        if let Ok(mut g) = self.osc_title.lock() {
+            *g = title;
+        }
+    }
+
     /// The icon for this terminal's tab, resolved in priority order:
     /// 1. the dispatched agent's argv (instant, `foreman open claude …`),
     /// 2. a hand-launched agent recognized from the program's OSC title (instant;

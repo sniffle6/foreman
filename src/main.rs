@@ -573,12 +573,12 @@ impl eframe::App for App {
                         let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
                         self.desktop.tile_new(nid, None);
                     }
-                    // Claude/Codex, installed: a normal shell that runs the agent.
+                    // Agent (Claude/Codex/Grok), installed: a normal shell that runs it.
                     Some(cmd) if act.kind.installed() => {
                         let nid = self.desktop.add_project_with_command(act.path, cmd, &ctx);
                         self.desktop.tile_new(nid, None);
                     }
-                    // Claude/Codex, missing: an error toast; stay on the landing.
+                    // Agent missing: an error toast; stay on the landing.
                     Some(_) => self.notify.push(
                         notify::Level::Error,
                         format!("{} isn't installed", act.kind.label()),

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 const CLAUDE_SVG: &str = include_str!("../assets/icons/claude.svg");
 const CODEX_SVG: &str = include_str!("../assets/icons/codex.svg");
+const GROK_SVG: &str = include_str!("../assets/icons/grok.svg");
 const TERMINAL_SVG: &str = include_str!("../assets/icons/terminal.svg");
 const FOLDER_SVG: &str = include_str!("../assets/icons/folder.svg");
 
@@ -19,6 +20,7 @@ pub enum IconKind {
     // Agents — official brand logos.
     Claude,
     Codex,
+    Grok,
     // Plain shells — a shared terminal-prompt glyph, tinted per shell.
     PowerShell,
     Cmd,
@@ -32,6 +34,7 @@ impl IconKind {
         match self {
             IconKind::Claude => CLAUDE_SVG,
             IconKind::Codex => CODEX_SVG,
+            IconKind::Grok => GROK_SVG,
             IconKind::PowerShell | IconKind::Cmd | IconKind::Bash => TERMINAL_SVG,
             IconKind::Folder => FOLDER_SVG,
         }
@@ -42,6 +45,7 @@ impl IconKind {
         match self {
             IconKind::Claude => egui::Color32::from_rgb(217, 119, 87), // Claude clay
             IconKind::Codex => egui::Color32::from_rgb(236, 236, 236), // near-white
+            IconKind::Grok => egui::Color32::from_rgb(250, 250, 250), // Grok white
             IconKind::PowerShell => egui::Color32::from_rgb(83, 145, 254), // PS blue
             IconKind::Cmd => egui::Color32::from_rgb(206, 206, 206),   // console gray
             IconKind::Bash => egui::Color32::from_rgb(106, 190, 48),   // bash green
@@ -58,15 +62,31 @@ impl IconKind {
         }
     }
 
+    /// Human label for an agent icon (tab auto-title, etc.). `None` for shells
+    /// and non-agent chrome icons.
+    pub fn agent_label(self) -> Option<&'static str> {
+        match self {
+            IconKind::Claude => Some("Claude"),
+            IconKind::Codex => Some("Codex"),
+            IconKind::Grok => Some("Grok"),
+            IconKind::PowerShell
+            | IconKind::Cmd
+            | IconKind::Bash
+            | IconKind::Folder => None,
+        }
+    }
+
     /// Map a dispatched program's argv to an agent icon, if recognized. Scans
     /// every token (so `npx @anthropic-ai/claude-code` and a bare `claude` both
-    /// hit) for a `claude`/`codex` substring.
+    /// hit) for a `claude`/`codex`/`grok` substring.
     pub fn from_argv(argv: &[String]) -> Option<Self> {
         let hay = argv.join(" ").to_ascii_lowercase();
         if hay.contains("claude") {
             Some(IconKind::Claude)
         } else if hay.contains("codex") {
             Some(IconKind::Codex)
+        } else if hay.contains("grok") {
+            Some(IconKind::Grok)
         } else {
             None
         }
@@ -88,6 +108,8 @@ impl IconKind {
             Some(IconKind::Claude)
         } else if stem.contains("codex") {
             Some(IconKind::Codex)
+        } else if stem.contains("grok") {
+            Some(IconKind::Grok)
         } else {
             None
         }
@@ -152,11 +174,12 @@ mod tests {
 
     #[test]
     fn embedded_svgs_rasterize_to_nonblank_icons() {
-        // One per SVG file: Claude, Codex, the shared terminal glyph (PowerShell),
-        // and the folder.
+        // One per SVG file: Claude, Codex, Grok, the shared terminal glyph
+        // (PowerShell), and the folder.
         for kind in [
             IconKind::Claude,
             IconKind::Codex,
+            IconKind::Grok,
             IconKind::PowerShell,
             IconKind::Folder,
         ] {
@@ -186,6 +209,10 @@ mod tests {
             IconKind::from_argv(&["codex".into()]),
             Some(IconKind::Codex)
         );
+        assert_eq!(
+            IconKind::from_argv(&["grok".into()]),
+            Some(IconKind::Grok)
+        );
         assert_eq!(IconKind::from_argv(&["powershell.exe".into()]), None);
     }
 
@@ -205,5 +232,19 @@ mod tests {
         // — only the title's file stem is considered, not the whole path.
         assert_eq!(IconKind::from_title(r"H:\claude code\foreman"), None);
         assert_eq!(IconKind::from_title("codex"), Some(IconKind::Codex));
+        assert_eq!(
+            IconKind::from_title(r"C:\Users\me\.grok\bin\grok.exe"),
+            Some(IconKind::Grok)
+        );
+        assert_eq!(IconKind::from_title("grok"), Some(IconKind::Grok));
+    }
+
+    #[test]
+    fn agent_label_covers_agents_only() {
+        assert_eq!(IconKind::Claude.agent_label(), Some("Claude"));
+        assert_eq!(IconKind::Codex.agent_label(), Some("Codex"));
+        assert_eq!(IconKind::Grok.agent_label(), Some("Grok"));
+        assert_eq!(IconKind::PowerShell.agent_label(), None);
+        assert_eq!(IconKind::Folder.agent_label(), None);
     }
 }

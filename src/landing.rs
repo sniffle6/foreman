@@ -11,6 +11,7 @@ use crate::theme::{BORDER_FOCUS, DIM, SEL_BG, TEXT, WIN_BG};
 pub enum SessionKind {
     Claude,
     Codex,
+    Grok,
     Terminal,
 }
 
@@ -21,9 +22,10 @@ pub struct LandingAction {
 }
 
 /// Fixed icon order so positional rects and the hit-test agree.
-const ICON_ORDER: [SessionKind; 3] = [
+const ICON_ORDER: [SessionKind; 4] = [
     SessionKind::Claude,
     SessionKind::Codex,
+    SessionKind::Grok,
     SessionKind::Terminal,
 ];
 
@@ -240,6 +242,7 @@ fn icon_of(k: SessionKind) -> IconKind {
     match k {
         SessionKind::Claude => IconKind::Claude,
         SessionKind::Codex => IconKind::Codex,
+        SessionKind::Grok => IconKind::Grok,
         SessionKind::Terminal => IconKind::PowerShell, // shared shell-prompt glyph
     }
 }
@@ -375,6 +378,7 @@ impl SessionKind {
         match self {
             SessionKind::Claude => "Claude",
             SessionKind::Codex => "Codex",
+            SessionKind::Grok => "Grok",
             SessionKind::Terminal => "Terminal",
         }
     }
@@ -386,6 +390,7 @@ impl SessionKind {
         match s {
             "claude" => SessionKind::Claude,
             "codex" => SessionKind::Codex,
+            "grok" => SessionKind::Grok,
             _ => SessionKind::Terminal,
         }
     }
@@ -395,6 +400,7 @@ impl SessionKind {
         match self {
             SessionKind::Claude => Some("claude"),
             SessionKind::Codex => Some("codex"),
+            SessionKind::Grok => Some("grok"),
             SessionKind::Terminal => None,
         }
     }
@@ -791,6 +797,7 @@ mod tests {
     fn launch_command_names_agents_and_skips_shells() {
         assert_eq!(SessionKind::Claude.launch_command(), Some("claude"));
         assert_eq!(SessionKind::Codex.launch_command(), Some("codex"));
+        assert_eq!(SessionKind::Grok.launch_command(), Some("grok"));
         assert_eq!(SessionKind::Terminal.launch_command(), None);
     }
 
@@ -911,6 +918,7 @@ mod tests {
     fn kind_strings_map_back_with_unknown_falling_to_terminal() {
         assert_eq!(SessionKind::from_kind_str("claude"), SessionKind::Claude);
         assert_eq!(SessionKind::from_kind_str("codex"), SessionKind::Codex);
+        assert_eq!(SessionKind::from_kind_str("grok"), SessionKind::Grok);
         assert_eq!(
             SessionKind::from_kind_str("terminal"),
             SessionKind::Terminal
