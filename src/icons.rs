@@ -45,7 +45,7 @@ impl IconKind {
         match self {
             IconKind::Claude => egui::Color32::from_rgb(217, 119, 87), // Claude clay
             IconKind::Codex => egui::Color32::from_rgb(236, 236, 236), // near-white
-            IconKind::Grok => egui::Color32::from_rgb(250, 250, 250), // Grok white
+            IconKind::Grok => egui::Color32::from_rgb(250, 250, 250),  // Grok white
             IconKind::PowerShell => egui::Color32::from_rgb(83, 145, 254), // PS blue
             IconKind::Cmd => egui::Color32::from_rgb(206, 206, 206),   // console gray
             IconKind::Bash => egui::Color32::from_rgb(106, 190, 48),   // bash green
@@ -69,10 +69,7 @@ impl IconKind {
             IconKind::Claude => Some("Claude"),
             IconKind::Codex => Some("Codex"),
             IconKind::Grok => Some("Grok"),
-            IconKind::PowerShell
-            | IconKind::Cmd
-            | IconKind::Bash
-            | IconKind::Folder => None,
+            IconKind::PowerShell | IconKind::Cmd | IconKind::Bash | IconKind::Folder => None,
         }
     }
 
@@ -209,10 +206,7 @@ mod tests {
             IconKind::from_argv(&["codex".into()]),
             Some(IconKind::Codex)
         );
-        assert_eq!(
-            IconKind::from_argv(&["grok".into()]),
-            Some(IconKind::Grok)
-        );
+        assert_eq!(IconKind::from_argv(&["grok".into()]), Some(IconKind::Grok));
         assert_eq!(IconKind::from_argv(&["powershell.exe".into()]), None);
     }
 
