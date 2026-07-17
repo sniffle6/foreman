@@ -100,6 +100,10 @@ pub struct Settings {
     /// Edge the task-manager panel is docked against. Survives minimize-all
     /// and restart; only changes when the user moves the panel in the tree.
     pub panel_dock: crate::wm::Dir,
+    /// Master switch for Bell attention (the visual pulse; any later sound or
+    /// push notification must honor the same key). File-only in v1 — no
+    /// settings UI, no leader chord. Missing key = on.
+    pub bell: bool,
 }
 
 impl Default for Settings {
@@ -109,6 +113,7 @@ impl Default for Settings {
             panel_collapsed: false,
             panel_width: crate::panel::PANEL_W,
             panel_dock: crate::wm::Dir::Right,
+            bell: true,
         }
     }
 }
@@ -146,6 +151,18 @@ mod tests {
         assert_eq!(s.font_size, 20.0);
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.font_size, 20.0);
+    }
+
+    #[test]
+    fn bell_defaults_on_and_round_trips() {
+        // Missing key = on (the #[serde(default)] contract for new fields).
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.bell, "missing bell key must mean on");
+        // Explicit false parses and survives a round trip.
+        let s: Settings = serde_json::from_str(r#"{"bell": false}"#).unwrap();
+        assert!(!s.bell);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.bell);
     }
 
     #[test]
