@@ -329,6 +329,15 @@ need. Also, every resize snaps the viewport to the bottom (`resize`,
 
 ### Phase 6 — Window/tab title (OSC 0/2) + bell · S
 
+**Bell design (2026-07-16):** visual attention pulse only — locked in
+`docs/terminal-bell.md` (Session-owned, caret amber, master `bell` setting).
+Title remains a separate open cut; do not treat the combined “done when” as one
+ship.
+
+**Bell shipped (2026-07-17):** built per `docs/terminal-bell.md` (border, tab
+chip, bare inset ring; `bell` settings gate; focus-gain cancel). Only the OSC
+0/2 title half of this phase remains open.
+
 **Problem.** `Listener::send_event` only handles `Event::PtyWrite`
 (`terminal.rs:113-121`). Shell-set titles (`\e]0;…\a`, common in zsh/bash PS1)
 and `Event::Bell` are dropped — so tabs always show a static label and there's no
