@@ -4358,18 +4358,32 @@ impl WindowManager {
                 if self.tree.contains(id) {
                     // Tiled: each edge maps to the divider it shares with a neighbour
                     // (resize_edge no-ops on outer edges). Corners drive both axes.
+                    // The panel's pinned extent lives below MIN_RATIO, so drags
+                    // touching its divider use the panel's own pixel floor —
+                    // otherwise an expanded panel can grow but never shrink back.
                     let local = egui::Rect::from_min_size(egui::Pos2::ZERO, asz);
-                    if hl {
-                        self.tree.resize_edge(id, Dir::Left, d.x, local, SNAP_GAP);
-                    }
-                    if hrr {
-                        self.tree.resize_edge(id, Dir::Right, d.x, local, SNAP_GAP);
-                    }
-                    if ht {
-                        self.tree.resize_edge(id, Dir::Up, d.y, local, SNAP_GAP);
-                    }
-                    if hb {
-                        self.tree.resize_edge(id, Dir::Down, d.y, local, SNAP_GAP);
+                    let soft = self
+                        .panel_id()
+                        .filter(|p| self.tree.contains(*p))
+                        .map(|p| (p, crate::panel::PANEL_MIN_EXPANDED));
+                    for (on, edge, delta) in [
+                        (hl, Dir::Left, d.x),
+                        (hrr, Dir::Right, d.x),
+                        (ht, Dir::Up, d.y),
+                        (hb, Dir::Down, d.y),
+                    ] {
+                        if !on {
+                            continue;
+                        }
+                        match soft {
+                            Some(s) => {
+                                self.tree
+                                    .resize_edge_soft_min(id, edge, delta, local, SNAP_GAP, s);
+                            }
+                            None => {
+                                self.tree.resize_edge(id, edge, delta, local, SNAP_GAP);
+                            }
+                        }
                     }
                 } else {
                     resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz);
@@ -4495,7 +4509,7 @@ impl WindowManager {
             for t in &mut win.tabs {
                 if let Content::TaskManager(v) = &mut t.content {
                     if !v.collapsed && (w - v.expanded_width).abs() > 0.5 {
-                        v.expanded_width = w.clamp(crate::panel::RAIL_W + 40.0, max);
+                        v.expanded_width = w.clamp(crate::panel::PANEL_MIN_EXPANDED, max);
                     }
                 }
             }

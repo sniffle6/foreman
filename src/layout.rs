@@ -489,6 +489,35 @@ impl LayoutTree {
         area: egui::Rect,
         gap: f32,
     ) -> bool {
+        self.resize_edge_inner(id, edge, delta_px, area, gap, None)
+    }
+
+    /// Like [`Self::resize_edge`], but when leaf `soft.0` sits directly on
+    /// either side of the resolved divider, its floor is `soft.1` px instead
+    /// of MIN_RATIO. The task-manager panel is pinned below MIN_RATIO on wide
+    /// desktops (`set_leaf_extent`), so the plain clamp ratchets: a drag that
+    /// grew the panel could never shrink it back past 10% of the desktop.
+    pub fn resize_edge_soft_min(
+        &mut self,
+        id: WinId,
+        edge: Dir,
+        delta_px: f32,
+        area: egui::Rect,
+        gap: f32,
+        soft: (WinId, f32),
+    ) -> bool {
+        self.resize_edge_inner(id, edge, delta_px, area, gap, Some(soft))
+    }
+
+    fn resize_edge_inner(
+        &mut self,
+        id: WinId,
+        edge: Dir,
+        delta_px: f32,
+        area: egui::Rect,
+        gap: f32,
+        soft: Option<(WinId, f32)>,
+    ) -> bool {
         let axis = SplitDir::of(edge);
         let found = match &self.root {
             Some(r) => find_interior_split(r, area.shrink(gap), id, edge, axis, gap, Vec::new()),
@@ -505,15 +534,22 @@ impl LayoutTree {
             };
             node = &mut children[i];
         }
-        let Node::Split { ratios, .. } = node else {
+        let Node::Split {
+            ratios, children, ..
+        } = node
+        else {
             unreachable!()
         };
         let (a, b) = match edge {
             Dir::Left | Dir::Up => (idx - 1, idx),
             Dir::Right | Dir::Down => (idx, idx + 1),
         };
-        let lo = (MIN_RATIO - ratios[a]).min(0.0);
-        let hi = (ratios[b] - MIN_RATIO).max(0.0);
+        let min_of = |i: usize| match soft {
+            Some((sid, px)) if matches!(children[i], Node::Leaf(w) if w == sid) => px / avail,
+            _ => MIN_RATIO,
+        };
+        let lo = (min_of(a) - ratios[a]).min(0.0);
+        let hi = (ratios[b] - min_of(b)).max(0.0);
         let df = (delta_px / avail).clamp(lo, hi);
         ratios[a] += df;
         ratios[b] -= df;
@@ -829,6 +865,42 @@ mod tests {
         let p = t.layout(area(), 8.0);
         let r1 = p.iter().find(|(w, _)| *w == 1).unwrap().1;
         assert!((r1.width() - 488.0).abs() < 0.5); // back to 50/50
+    }
+
+    #[test]
+    fn resize_edge_soft_min_can_shrink_a_pinned_leaf_back_below_min_ratio() {
+        // Repro: the Sessions panel is pinned to 260px on a wide desktop —
+        // below MIN_RATIO — a drag grows it, and the reverse drag must bring
+        // it back; plain resize_edge ratchets at MIN_RATIO (10% ≈ 298px here).
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(3000.0, 800.0));
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_split(1, 2, Dir::Right); // [project | panel]
+        assert!(t.set_leaf_width(2, 260.0, wide, 8.0));
+        let width_of = |t: &LayoutTree, id: WinId| {
+            t.layout(wide, 8.0)
+                .into_iter()
+                .find(|(w, _)| *w == id)
+                .unwrap()
+                .1
+                .width()
+        };
+        assert!((width_of(&t, 2) - 260.0).abs() < 0.5);
+        let soft = (2, 76.0);
+        // Grow the panel by dragging its left edge 160px left…
+        assert!(t.resize_edge_soft_min(2, Dir::Left, -160.0, wide, 8.0, soft));
+        assert!((width_of(&t, 2) - 420.0).abs() < 0.5);
+        // …and back: must return to 260, not stop at MIN_RATIO.
+        assert!(t.resize_edge_soft_min(2, Dir::Left, 160.0, wide, 8.0, soft));
+        let w = width_of(&t, 2);
+        assert!((w - 260.0).abs() < 0.5, "ratcheted at {w}");
+        // Over-shrinking clamps at the soft floor, not MIN_RATIO.
+        t.resize_edge_soft_min(2, Dir::Left, 100_000.0, wide, 8.0, soft);
+        let w = width_of(&t, 2);
+        assert!((w - 76.0).abs() < 1.0, "floor got {w}");
+        // The non-soft side keeps its MIN_RATIO guarantee.
+        t.resize_edge_soft_min(2, Dir::Left, -100_000.0, wide, 8.0, soft);
+        assert!(width_of(&t, 1) >= 2976.0 * MIN_RATIO - 0.5);
     }
 
     #[test]

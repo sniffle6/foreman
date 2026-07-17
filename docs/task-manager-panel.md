@@ -57,6 +57,14 @@ and the landing site for future agent-state badges.
   tree, not just as the rightmost root leaf. The pin tries the H axis first
   (right/left dock = width), then falls back to the V axis (bottom/top dock =
   height); a panel with dividers on both axes stays width-pinned.
+- **Expanded drags use the panel's pixel floor, not `MIN_RATIO`:** the pinned
+  extent (260px default) sits *below* 10% of a wide desktop, so a plain
+  `resize_edge` clamp would ratchet — grow the panel by dragging and it could
+  never shrink back past ~10% of the screen. Interactive edge drags in `wm.rs`
+  call `LayoutTree::resize_edge_soft_min` with `(panel_id,
+  PANEL_MIN_EXPANDED)` (76px), which applies that pixel floor whenever the
+  panel leaf sits on either side of the dragged divider; every other tile
+  keeps the `MIN_RATIO` clamp.
 - **Horizontal mode:** when the panel's content rect is wider than tall
   (bottom/top dock), `PanelView::show` flows content left-to-right. Derived
   per-frame from the rect — no new state, no persistence; move the leaf back

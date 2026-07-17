@@ -12,6 +12,8 @@ use eframe::egui;
 pub const PANEL_W: f32 = 260.0;
 /// Collapsed rail width (px).
 pub const RAIL_W: f32 = 36.0;
+/// Smallest useful expanded extent (px); below this, collapse to the rail.
+pub const PANEL_MIN_EXPANDED: f32 = RAIL_W + 40.0;
 /// Hard cap on expanded extent when side-docked (width), px.
 pub const PANEL_MAX_SIDE: f32 = 420.0;
 /// Hard cap on expanded extent when top/bottom-docked (height), px.
@@ -26,7 +28,8 @@ pub fn max_expanded(dock: Dir, axis_len: f32) -> f32 {
         Dir::Left | Dir::Right => PANEL_MAX_SIDE,
         Dir::Up | Dir::Down => PANEL_MAX_EDGE,
     };
-    hard.min((axis_len * 0.5).max(RAIL_W)).max(RAIL_W + 40.0)
+    hard.min((axis_len * 0.5).max(RAIL_W))
+        .max(PANEL_MIN_EXPANDED)
 }
 /// Per-project column width in horizontal (columns) mode (px).
 const GROUP_W: f32 = 200.0;
@@ -134,7 +137,7 @@ impl PanelView {
         Self {
             model: PanelModel::default(),
             collapsed,
-            expanded_width: expanded_width.clamp(RAIL_W + 40.0, max),
+            expanded_width: expanded_width.clamp(PANEL_MIN_EXPANDED, max),
             dock,
             scroll: 0.0,
             click: None,
