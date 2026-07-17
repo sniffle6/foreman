@@ -188,10 +188,10 @@ impl Content {
         }
     }
 
-    /// Whether this content is a terminal with a live Bell pulse. Projects do
-    /// not bubble up (project/panel Bell chrome is explicitly out of v1 scope).
-    fn bell_active(&self, now: std::time::Instant) -> bool {
-        matches!(self, Content::Terminal(s) if s.bell_active(now))
+    /// Whether this content is a terminal with a latched Bell. Projects do
+    /// not bubble up on window chrome (the panel carries project-level Bell).
+    fn bell_active(&self) -> bool {
+        matches!(self, Content::Terminal(s) if s.bell_active())
     }
 }
 
@@ -259,8 +259,8 @@ impl Win {
         matches!(self.tabs[self.active].content, Content::Project(_))
     }
     /// Border pulse rule: the whole stack pulses while ANY of its tabs rings.
-    fn bell_active(&self, now: std::time::Instant) -> bool {
-        self.tabs.iter().any(|t| t.content.bell_active(now))
+    fn bell_active(&self) -> bool {
+        self.tabs.iter().any(|t| t.content.bell_active())
     }
     /// Task-manager panel window (any tab). Non-closable / non-minimizable /
     /// non-tabbable; excluded from `deserted` and `panel_model`.
@@ -1762,6 +1762,7 @@ impl WindowManager {
                                 Content::Terminal(s) => s.has_exited(),
                                 _ => false,
                             },
+                            bell: t.content.bell_active(),
                         });
                     }
                 }
@@ -1770,6 +1771,7 @@ impl WindowManager {
                     title: pt.title.clone(),
                     minimized: w.minimized,
                     focused: pfocused,
+                    bell: tabs.iter().any(|t| t.bell),
                     tabs,
                 });
             }
@@ -3424,15 +3426,13 @@ impl WindowManager {
                 // Bare sole pane has no border or chips — the Bell falls back
                 // to an inset ring on the content rect (the only surface that
                 // doesn't invent chrome).
-                if crate::terminal::bell_enabled(ui.ctx())
-                    && self.windows[i].bell_active(std::time::Instant::now())
-                {
+                if crate::terminal::bell_enabled(ui.ctx()) && self.windows[i].bell_active() {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(30));
                     ui.painter_at(scr.intersect(area)).rect_stroke(
                         scr.shrink(1.0),
                         egui::CornerRadius::ZERO,
-                        egui::Stroke::new(2.0, BELL),
+                        egui::Stroke::new(2.0, bell_pulse(ui.input(|inp| inp.time))),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -3766,8 +3766,8 @@ impl WindowManager {
                     // header_layout. Chips are registered after the window-drag
                     // rect so they win pointer priority; dragging a chip off
                     // the bar detaches it (untab).
-                    let bell_now = std::time::Instant::now();
                     let bell_gate = crate::terminal::bell_enabled(ui.ctx());
+                    let bell_col = bell_pulse(ui.input(|inp| inp.time));
                     for ch in chips {
                         let ti = ch.idx;
                         let chip = ch.rect;
@@ -3824,11 +3824,11 @@ impl WindowManager {
                         }
                         // Bell: only the ringing session's chip pulses (the
                         // whole-stack border pulse is painted at the frame).
-                        if bell_gate && self.windows[i].tabs[ti].content.bell_active(bell_now) {
+                        if bell_gate && self.windows[i].tabs[ti].content.bell_active() {
                             p.rect_stroke(
                                 chip,
                                 radius,
-                                egui::Stroke::new(BORDER_W, BELL),
+                                egui::Stroke::new(BORDER_W, bell_col),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -4200,17 +4200,15 @@ impl WindowManager {
             } // end header chrome
 
             // --- border + resize ---
-            // Bell: while ANY tab in this stack rings, the border flashes caret
-            // amber — temporary attention routing that outranks the focus color
-            // for the pulse (a focused session that rings still pulses). The
-            // repaint_after keeps the tail of the pulse from outliving its
-            // deadline on the idle 100ms cadence.
-            let bell_on = crate::terminal::bell_enabled(ui.ctx())
-                && self.windows[i].bell_active(std::time::Instant::now());
+            // Bell: while ANY tab in this stack rings, the border breathes caret
+            // amber — attention routing that outranks the focus color until the
+            // ringing session gains focus. The repaint_after drives the breathe
+            // animation past the idle 100ms cadence.
+            let bell_on = crate::terminal::bell_enabled(ui.ctx()) && self.windows[i].bell_active();
             let border_col = if bell_on {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(30));
-                BELL
+                bell_pulse(ui.input(|inp| inp.time))
             } else if is_focus {
                 if is_project {
                     PROJ_BORDER_FOCUS
@@ -6447,7 +6445,7 @@ mod tests {
     }
 
     #[test]
-    fn bell_pulses_the_stack_until_expiry_or_clear() {
+    fn bell_latches_the_stack_until_cleared_and_reaches_the_panel() {
         let ctx = egui::Context::default();
         let mut m = WindowManager::new();
         let env: Vec<(String, String)> = vec![];
@@ -6459,30 +6457,32 @@ mod tests {
             .tabs
             .push(Tab::fixed("back", Content::Terminal(s2)));
 
-        let now = std::time::Instant::now();
-        assert!(
-            !m.windows[0].bell_active(now),
-            "fresh sessions must not pulse"
-        );
+        assert!(!m.windows[0].bell_active(), "fresh sessions must not ring");
 
-        // Ring the background tab: the whole stack (border rule) pulses, but
-        // only that tab's content does (chip rule).
+        // Ring the background tab: the whole stack (border rule) rings, but
+        // only that tab's content does (chip / panel-row rule).
         let Content::Terminal(s) = &m.windows[0].tabs[1].content else {
             panic!("expected terminal");
         };
-        s.ring_bell_for_test(now + std::time::Duration::from_millis(300));
-        assert!(m.windows[0].bell_active(now));
-        assert!(m.windows[0].tabs[1].content.bell_active(now));
-        assert!(!m.windows[0].tabs[0].content.bell_active(now));
+        s.ring_bell_for_test();
+        assert!(m.windows[0].bell_active());
+        assert!(m.windows[0].tabs[1].content.bell_active());
+        assert!(!m.windows[0].tabs[0].content.bell_active());
 
-        // Past the deadline the pulse is over — no sticky badge.
-        let later = now + std::time::Duration::from_millis(301);
-        assert!(!m.windows[0].bell_active(later));
-
-        // Clearing (focus landed) kills it immediately.
-        s.ring_bell_for_test(now + std::time::Duration::from_millis(300));
+        // Sticky: only clearing (keyboard focus landed) ends it — there is
+        // no self-expiry.
         s.clear_bell();
-        assert!(!m.windows[0].bell_active(now));
+        assert!(!m.windows[0].bell_active());
+
+        // Panel read seam: the ringing tab's row carries bell and the project
+        // row bubbles it up (for the collapsed rail).
+        s.ring_bell_for_test();
+        let mut desk = WindowManager::new();
+        desk.push_win(7, Tab::fixed("proj", Content::Project(Box::new(m))), r);
+        let pm = desk.panel_model();
+        assert!(pm.projects[0].bell, "project row must bubble the ring");
+        let rows: Vec<bool> = pm.projects[0].tabs.iter().map(|t| t.bell).collect();
+        assert_eq!(rows, vec![false, true], "only the ringing tab's row rings");
     }
 
     #[test]

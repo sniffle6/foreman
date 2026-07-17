@@ -1,7 +1,8 @@
 # Terminal Bell (visual attention pulse)
 
-**Status (2026-07-17): built.** Decisions were locked in a design grill
-(2026-07-16); implemented on `feat/terminal-bell`. Phase 6 of
+**Status (2026-07-17): built** (v1 shipped, then reworked same-day to sticky +
+animated + panel per user direction). Original decisions locked in a design
+grill (2026-07-16); implemented on `feat/terminal-bell`. Phase 6 of
 `docs/epics/terminal-completeness-epic.md` bundled title + bell — this doc is
 **Bell only**. OSC tab titles stay a separate cut.
 
@@ -9,9 +10,10 @@ Glossary term: **Bell** in `CONTEXT.md`.
 
 ## What it does
 
-When a Session's program rings BEL (`\a` / ASCII 0x07), Foreman shows a
-**short-lived visual pulse** on that Session's chrome so you can find which pane
-rang without reading the grid.
+When a Session's program rings BEL (`\a` / ASCII 0x07), Foreman **latches** an
+attention state on that Session and shows a **breathing amber pulse** on its
+chrome — and on its row in the Sessions panel — until you give that Session
+keyboard focus. Find the ringing pane, click it, the pulse dies.
 
 It is **attention routing**, not an alarm and not an OS notification.
 
@@ -19,46 +21,52 @@ It is **attention routing**, not an alarm and not an OS notification.
 
 Foreman runs many Sessions. A build finishing with `printf '\a'`, or a TUI
 ringing on a bad key, is useless if nothing moves outside the text cells.
-Alacritty / Windows Terminal flash (and often sound); today Foreman drops
-`Event::Bell` on the floor.
+Alacritty / Windows Terminal flash (and often sound); before this, Foreman
+dropped `Event::Bell` on the floor.
 
 Supervision push (OS toast / sound when an agent needs you) is a **later** job
 — chat already tracks that under human push-notifications. Do not fold it into
 this feature.
 
-## What you see (v1)
+## What you see
 
 | Surface | Behavior |
 |---------|----------|
-| **Win border** | Pulses while **any** tab in that Win's stack has an active Bell |
-| **Tab chip** | Only the ringing Session's chip pulses |
-| **Bare** lone tiled terminal (no chrome) | Edge / inset ring or light overlay on the content rect — only path without inventing chrome |
-| **Minimized** | No visible surface until restored (silent gap, accepted) |
-| **Panel / project bubble-up** | **Not** v1 |
+| **Win border** | Breathes while **any** tab in that Win's stack has a latched Bell |
+| **Tab chip** | Only the ringing Session's chip breathes |
+| **Bare** lone tiled terminal (no chrome) | Thin breathing inset ring on the content rect |
+| **Sessions panel — expanded rows / columns / strip** | Pulsing amber dot on the ringing terminal's row/chip (outranks the "min"/"tab" label slot) |
+| **Sessions panel — collapsed rail** | Pulsing amber dot on the project icon when any child rings (the rail is the only surface for its rows) |
+| **Minimized window** | No window chrome, but its panel row/rail dot still pulses |
 
-- **Color:** caret amber family (`theme::CARET` / RGB `231, 169, 63`). Thin borders
-  may use the same hue at higher/full alpha so the stroke stays readable.
-- **Duration:** about **300 ms** from the last ring.
-- **Spam:** a new BEL while pulsing **restarts** the timer (one continuous pulse,
-  not a disco).
-- **Cancel:** pulse ends early when that Session becomes the **keyboard-focused**
-  terminal. Hover does not cancel. BEL on an already-focused Session still does
-  a short pulse.
-- **Sound / OS toast:** not v1.
+- **Color:** caret amber family (`theme::BELL`, RGB `231, 169, 63`), breathing
+  between ~40% and full strength on a `theme::BELL_PERIOD` (1.2 s) cycle via
+  `theme::bell_pulse(t)` — every surface breathes in sync from egui wall time.
+- **Duration:** **sticky** — the latch holds until the ringing Session becomes
+  the keyboard-focused terminal. There is no timeout.
+- **Spam:** more BELs while latched just refresh the ring timestamp (no
+  visual change — it is already on).
+- **Cancel:** keyboard focus on the ringing Session clears it. Hover does not.
+  A Session that rings **while focused** shows nothing — you are already
+  looking at it (the clear runs after the frame's PTY pump, so there is no
+  one-frame flicker).
+- **Sound / OS toast:** not in scope.
 
-## How to use (once built)
+## How to use
 
 ### Try it
 
-In any terminal Session:
+In any terminal Session (note: **backtick**, not apostrophe — or use the
+unambiguous `[char]7` form):
 
 ```powershell
-printf "`a"
+Write-Host ([char]7)
 # or
-echo `a
+printf "\a"          # sh/bash
 ```
 
-You should see the border / tab chip (or bare edge) flash amber briefly.
+Ring an unfocused pane and its border/chip/panel row breathes amber until you
+click into it.
 
 ### Turn it off
 
@@ -71,85 +79,89 @@ Master switch in `%APPDATA%\foreman\settings.json`:
 ```
 
 - **Default:** `true` (missing key = on, via `#[serde(default)]`).
-- **Scope:** mutes **all** Bell attention — visual now; later sound/push must
-  honor the same key.
-- **UI:** file only in v1 — no settings checkbox, no leader mute chord.
+- **Scope:** mutes **all** Bell attention — window chrome and panel; later
+  sound/push must honor the same key.
+- **UI:** file only — no settings checkbox, no leader mute chord.
 
 ## How it works
 
-1. alacritty emits `Event::Bell` when BEL is parsed.
-2. `Listener` records it on the **Session** (not the Win) — e.g. pulse deadline /
-   last ring time.
-3. Each frame, if `Settings.bell` and the pulse deadline is still in the future:
-   - `wm` paints border (any tab pulsing) + the ringing tab chip(s);
-   - bare / content path paints the bare fallback from the same Session state.
-4. Keyboard focus landing on that Session clears the pulse.
-5. Further BELs while active extend (restart) the deadline.
+1. alacritty emits `Event::Bell` when BEL is parsed; the Session's `Listener`
+   latches `Some(ring_time)` on a shared slot (sibling of title/color handling
+   — never the `PtyWrite` flush path that latches Ready).
+2. `Session::show` clears the latch **after** its pump whenever the Session is
+   the keyboard-focused terminal — attended sessions never show (and never
+   flicker) the pulse.
+3. Each frame, gated by `terminal::bell_enabled(ctx)` (published from
+   `Settings.bell` by App):
+   - `wm` paints the border (any tab), the ringing chip(s), and the bare-pane
+     inset ring in `bell_pulse(time)`;
+   - `panel_model()` carries `bell` per tab row and per project
+     (`any tab`); `panel.rs` paints the row/rail/strip dots.
+4. Every Bell paint site requests a 30 ms repaint while active, driving the
+   breathe animation past the idle repaint cadence (the panel drives its own,
+   since it can be the only visible surface — e.g. a minimized window).
 
-Multiple Sessions can pulse at once.
+Multiple Sessions can ring at once.
 
 ## Out of scope
 
-- OSC 0/2 live tab titles (separate from Bell; title is partly captured for icons only today)
+- OSC 0/2 live tab titles (separate from Bell)
 - Sound, OS notifications, chat `@you` push
-- Task-manager panel row highlight
-- Project-level “something inside rang” chrome
 - In-app settings editor / leader toggle for `bell`
 
 ## Gotchas
 
-- **Not focus.** Focus border stays the near-white focus ladder; Bell is caret
-  amber and temporary. Do not reuse focus color for the pulse.
-- **Not a sticky badge.** When the pulse ends, chrome looks normal. No “unread
-  bell” counter.
-- **Debounce is restart, not drop.** Spam keeps the pulse alive until rings stop;
-  it does not ignore BEL while flashing.
-- **Ready latch.** Wiring must not break `Event::PtyWrite` → ready. Bell is a
-  sibling of title/color handling; do not route it through the PtyWrite flush
-  path that latches Ready.
-- **Bare Wins** have no titlebar border — if you only paint `wm` borders, bare
-  Sessions stay silent. The content-rect fallback is required.
+- **Not focus.** Focus chrome stays the near-white focus ladder; Bell is amber.
+  While ringing, amber outranks the focus color on that window's border.
+- **Not a counter.** One latched state per Session — no unread-bell counts.
+- **Ready latch.** Bell handling must never route through the
+  `Event::PtyWrite` → Ready flush path. It is a sibling arm in
+  `Listener::send_event`.
+- **Bare Wins** have no titlebar border — the content-rect inset ring is the
+  required fallback; wm-border-only painting would leave them silent.
+- **1 px strokes read dimmer than the token.** Antialiasing blends a 1 px
+  amber stroke with the dark background to ~65% strength — expected, still
+  clearly warm against the gray border ladder.
 - Epic Phase 6 still lists title+bell together; implement against **this** doc
-  for Bell, not the epic's combined “done when” alone.
+  for Bell, not the epic's combined "done when" alone.
 
-## Acceptance (verified 2026-07-17)
+## Acceptance (v1 verified 2026-07-17; sticky/panel rework same day)
 
-Visual items verified by screenshot + border-pixel sampling against a demo
-build (`FOREMAN_BELL_DEMO`, since reverted) with continuous `\a` loops; logic
-items by unit tests (`config::tests::bell_*`, `terminal::tests::*bell*`,
-`wm::tests::bell_pulses_the_stack_until_expiry_or_clear`).
+v1 (300 ms pulse) was verified by screenshot + border-pixel sampling against a
+demo build (`FOREMAN_BELL_DEMO`, since reverted) with continuous `\a` loops —
+exact amber on ringing borders/chips/bare ring, gray on quiet neighbors and
+project frames, all-gray with `"bell": false`. The sticky + animated + panel
+rework is covered by unit tests (`config::tests::bell_*`,
+`terminal::tests::listener_bell_latches_until_cleared`,
+`theme::tests::bell_pulse_breathes_within_the_bell_color`,
+`wm::tests::bell_latches_the_stack_until_cleared_and_reaches_the_panel`) and
+interactive user verification.
 
-- [x] `printf '\a'` pulses an unfocused Session's border (and tab chip if stacked)
-- [x] Background tab rings → that chip pulses; border pulses; other chips do not
-      (quiet neighbor window measured plain gray)
-- [x] Bare lone tile still shows a pulse (inset ring, exact `231,169,63`)
-- [x] ~300 ms; second BEL mid-pulse restarts (unit test; live loop stayed lit
-      for minutes as one continuous pulse)
-- [x] Focusing the ringing Session cancels early (unit-tested transition rule)
-- [x] `"bell": false` in settings.json → no pulse (all borders measured gray
-      with three live ringers); default / missing key → on
-- [x] Focused Session that rings still does a short pulse (focused window's
-      border pulsed amber over the focus color)
-- [x] Minimized: no crash; visible only after restore — same `keepalive` path a
-      hidden ringing tab exercised for minutes in the demo
-- [x] Existing Ready / DSR / title / color-request paths still green (671 tests
-      pass)
+- [x] Ringing an unfocused Session breathes its border (and chip if stacked)
+- [x] Background tab rings → that chip + the border; other chips stay quiet
+- [x] Bare lone tile shows the breathing inset ring
+- [x] Latch is sticky: no self-expiry; re-rings refresh, never unlatch
+- [x] Focusing the ringing Session clears it; ringing while focused shows nothing
+- [x] Panel: ringing terminal's row dot pulses; project rail icon dot pulses;
+      minimized windows still surface through the panel
+- [x] `"bell": false` mutes chrome and panel; default / missing key → on
+- [x] Existing Ready / DSR / title / color-request paths still green (671 tests)
 
 ## Key files
 
 | File | Role |
 |------|------|
-| `src/terminal.rs` | `Event::Bell` arm + `BELL_PULSE` (300 ms); Session pulse state (`bell_active`/`clear_bell`); focus-gain cancel (`bell_cancelled_by_focus`); `bell_enabled` ctx gate |
-| `src/wm.rs` | `Win::bell_active` (border rule) + `Content::bell_active` (chip rule); border/chip/bare-ring paint; 30 ms repaint tail |
+| `src/terminal.rs` | `Event::Bell` arm latches the Session's `bell` slot; `bell_active`/`clear_bell`; focused-clear after pump in `show`; `bell_enabled` ctx gate |
+| `src/wm.rs` | `Win::bell_active` (border rule) + `Content::bell_active` (chip/row rule); border/chip/bare-ring paint; `panel_model()` bell flags; 30 ms repaint |
+| `src/panel.rs` | `TabEntry.bell` / `ProjectEntry.bell`; pulsing dots on rows, rails, strip chips; panel-driven repaint |
 | `src/main.rs` | publishes `settings.bell` into the egui ctx each frame (beside `set_font_size`) |
 | `src/config.rs` | `Settings.bell: bool` (default `true`) |
-| `src/theme.rs` | `theme::BELL` — caret amber at full alpha (a 1 px stroke antialiases to ~65%, still clearly warm vs the gray border ladder) |
-| `CONTEXT.md` | Glossary: **Bell** |
-| `docs/epics/terminal-completeness-epic.md` | Historical Phase 6; title half still open |
+| `src/theme.rs` | `BELL`, `BELL_PERIOD`, `bell_pulse(t)` — the shared breathe animation |
 
 ## Related
 
-- `docs/epics/terminal-completeness-epic.md` — Phase 6 (title + bell backlog)
-- `docs/chat-missing-features.md` §7 — human push-notifications (later C, not Bell)
+- `docs/epics/terminal-completeness-epic.md` — Phase 6 (title half still open)
+- `docs/chat-missing-features.md` §7 — human push-notifications (later, not Bell)
 - `docs/cursor-rendering.md` — caret color source of truth for the pulse hue
 - `docs/window-chrome.md` — borders, bare rule, tab chips
+- `docs/task-manager-panel.md` — the panel the row/rail dots live in

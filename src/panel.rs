@@ -75,6 +75,8 @@ pub struct TabEntry {
     pub focused: bool,
     /// Terminal child process has exited (chat rows: always false).
     pub exited: bool,
+    /// Terminal has a latched Bell (rang, not yet focused). Chat rows: false.
+    pub bell: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,9 @@ pub struct ProjectEntry {
     pub title: String,
     pub minimized: bool,
     pub focused: bool,
+    /// Any tab in this project has a latched Bell (drives the rail icons,
+    /// where individual rows are not visible).
+    pub bell: bool,
     pub tabs: Vec<TabEntry>,
 }
 
@@ -142,6 +147,14 @@ impl PanelView {
     /// Paint the panel body (below the window title band). Records row
     /// interactions into `click` / `hover_act` / scroll; does not mutate the tree.
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        // Bell: the panel may be the only visible surface for a ringing
+        // session (minimized window, collapsed rail), so it drives its own
+        // breathe repaint. Gated here like every other Bell paint site.
+        let bell_gate = crate::terminal::bell_enabled(ui.ctx());
+        if bell_gate && self.model.projects.iter().any(|pr| pr.bell) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, BG);
 
@@ -218,6 +231,7 @@ impl PanelView {
                         minimized: proj.minimized,
                         background_tab: false,
                         exited: false,
+                        bell: false,
                         project_row: true,
                     },
                 ));
@@ -241,6 +255,7 @@ impl PanelView {
                             minimized: t.minimized,
                             background_tab: !t.active_tab,
                             exited: t.exited,
+                            bell: bell_gate && t.bell,
                             project_row: false,
                         },
                     ));
@@ -323,6 +338,7 @@ impl PanelView {
     }
 
     fn paint_rail(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let p = ui.painter().with_clip_rect(rect);
         let rails: Vec<_> = self
             .model
@@ -336,11 +352,12 @@ impl PanelView {
                     proj.title.clone(),
                     proj.focused,
                     proj.minimized,
+                    proj.bell,
                 )
             })
             .collect();
         let mut y = rect.min.y + 6.0;
-        for (pi, path, title, focused, minimized) in rails {
+        for (pi, path, title, focused, minimized, bell) in rails {
             let cell = egui::Rect::from_center_size(
                 egui::pos2(rect.center().x, y + 14.0),
                 egui::vec2(28.0, 28.0),
@@ -378,6 +395,15 @@ impl PanelView {
                 crate::icons::IconKind::Folder,
                 tint,
             );
+            // Collapsed rail is the only surface for this project's rows — a
+            // ringing child shows as a pulsing dot on the project icon.
+            if bell_gate && bell {
+                p.circle_filled(
+                    egui::pos2(cell.max.x - 3.0, cell.min.y + 3.0),
+                    3.0,
+                    bell_pulse(ui.input(|i| i.time)),
+                );
+            }
             if resp.clicked() {
                 self.click = Some(path);
             }
@@ -399,6 +425,7 @@ impl PanelView {
     /// comes from the group width. Scroll is horizontal only; rows past the
     /// group height are clipped.
     fn paint_columns(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let row_h = 22.0;
         let gap = 9.0; // pad + hairline + pad between groups
         let n = self.model.projects.len();
@@ -437,6 +464,7 @@ impl PanelView {
                     minimized: proj.minimized,
                     background_tab: false,
                     exited: false,
+                    bell: false,
                     project_row: true,
                 },
             ));
@@ -461,6 +489,7 @@ impl PanelView {
                         minimized: t.minimized,
                         background_tab: !t.active_tab,
                         exited: t.exited,
+                        bell: bell_gate && t.bell,
                         project_row: false,
                     },
                 ));
@@ -495,9 +524,11 @@ impl PanelView {
             kind: Option<RowKind>, // None = project chip
             focused: bool,
             dim: bool,
+            bell: bool,
             div_before: bool,
             w: f32,
         }
+        let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let p = ui.painter_at(rect);
         let chip_h = 24.0;
         let pad = 10.0;
@@ -527,6 +558,7 @@ impl PanelView {
                 kind: None,
                 focused: proj.focused,
                 dim: proj.minimized,
+                bell: false, // the tab chips beside it carry the ring
                 div_before: pi > 0,
             });
             for (ti, t) in proj.tabs.iter().enumerate() {
@@ -539,6 +571,7 @@ impl PanelView {
                     kind: Some(t.kind),
                     focused: t.focused,
                     dim: t.minimized || !t.active_tab || t.exited,
+                    bell: bell_gate && t.bell,
                     div_before: false,
                 });
             }
@@ -624,6 +657,14 @@ impl PanelView {
                 cy - chip.galley.size().y / 2.0,
             );
             p.galley(tp, chip.galley, col);
+            // Pulsing bell dot on the ringing terminal's chip corner.
+            if chip.bell {
+                p.circle_filled(
+                    egui::pos2(chip_rect.max.x - 4.0, chip_rect.min.y + 4.0),
+                    3.0,
+                    bell_pulse(ui.input(|i| i.time)),
+                );
+            }
             if resp.clicked() {
                 self.click = Some(chip.path);
             }
@@ -649,6 +690,7 @@ impl PanelView {
             rect.min,
             egui::pos2(icons_max_x, rect.max.y),
         ));
+        let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let rails: Vec<_> = self
             .model
             .projects
@@ -661,6 +703,7 @@ impl PanelView {
                     proj.title.clone(),
                     proj.focused,
                     proj.minimized,
+                    proj.bell,
                 )
             })
             .collect();
@@ -668,7 +711,7 @@ impl PanelView {
         let max_scroll = (content_w - (icons_max_x - rect.min.x)).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
         let mut x = rect.min.x + 6.0 - self.scroll;
-        for (pi, path, title, focused, minimized) in rails {
+        for (pi, path, title, focused, minimized, bell) in rails {
             let cell = egui::Rect::from_center_size(
                 egui::pos2(x + 14.0, rect.center().y),
                 egui::vec2(28.0, 28.0),
@@ -711,6 +754,14 @@ impl PanelView {
                 crate::icons::IconKind::Folder,
                 tint,
             );
+            // Same pulsing-dot rule as the vertical rail.
+            if bell_gate && bell {
+                ip.circle_filled(
+                    egui::pos2(cell.max.x - 3.0, cell.min.y + 3.0),
+                    3.0,
+                    bell_pulse(ui.input(|i| i.time)),
+                );
+            }
             if resp.clicked() {
                 self.click = Some(path);
             }
@@ -824,6 +875,8 @@ impl PanelView {
         let text_x = row.min.x + 20.0;
         let reserve = if over {
             38.0 // min + close buttons
+        } else if rp.bell {
+            20.0 // pulsing bell dot
         } else if rp.minimized || rp.background_tab {
             26.0 // "min"/"tab" label
         } else {
@@ -886,6 +939,14 @@ impl PanelView {
                 self.hover_act = Some((rp.path, PanelBtn::Close));
                 btn_hit = true;
             }
+        } else if rp.bell {
+            // Latched Bell: pulsing amber dot in the right-edge slot — the
+            // attention cue outranks the "min"/"tab" state labels.
+            p.circle_filled(
+                egui::pos2(row.max.x - 12.0, row.center().y),
+                3.5,
+                bell_pulse(ui.input(|i| i.time)),
+            );
         } else if rp.minimized {
             p.text(
                 egui::pos2(row.max.x - 8.0, row.center().y),
@@ -918,6 +979,8 @@ struct RowPaintOwned {
     minimized: bool,
     background_tab: bool,
     exited: bool,
+    /// Latched Bell on this terminal row (already gated by the master switch).
+    bell: bool,
     project_row: bool,
 }
 

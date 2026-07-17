@@ -76,6 +76,14 @@ The state a Session reaches once it has answered the program's startup
 device-status query; injected input only lands after a Session is Ready.
 _Avoid_: started, alive, booted.
 
+**Bell**:
+A breathing amber pulse on a Session's chrome and its Sessions-panel row when
+the program rings BEL — attention routing to that Session, latched until the
+Session gains keyboard focus; not an OS notification. The latch belongs to that
+Session (not the Win); a single app-wide preference can silence all Bell
+attention (visual now; sound/push later).
+_Avoid_: alert, notification, toast (reserve those for later supervision push).
+
 ### Input & control
 
 **Leader**:

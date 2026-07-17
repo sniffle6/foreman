@@ -209,17 +209,6 @@ impl Shell {
     }
 }
 
-/// How long a Bell pulse lasts after the most recent ring. A new BEL while
-/// pulsing restarts this window — one continuous pulse, not a disco.
-pub const BELL_PULSE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// Focus-transition rule for Bell cancel (pure, unit-tested): the pulse dies
-/// when keyboard focus *lands* on the session. Holding focus never cancels —
-/// a BEL on an already-focused session still pulses. Hover is not focus.
-fn bell_cancelled_by_focus(was_active: bool, active: bool) -> bool {
-    active && !was_active
-}
-
 #[derive(Clone)]
 struct Listener {
     out: Arc<Mutex<Vec<u8>>>,
@@ -227,8 +216,9 @@ struct Listener {
     /// what's running in a *hand-launched* shell (e.g. `claude` typed at a prompt)
     /// so the tab icon can follow it. `None` = no title / reset to default.
     title: Arc<Mutex<Option<String>>>,
-    /// Visual Bell (`\a`) pulse deadline: `Some(t)` = pulse until `t`. Shared
-    /// with the Session, which paints it and cancels it on focus gain.
+    /// Visual Bell (`\a`): `Some(t)` = ringing since `t`, sticky until the
+    /// session gains keyboard focus. Shared with the Session, which paints
+    /// the pulse and clears it while attended.
     bell: Arc<Mutex<Option<std::time::Instant>>>,
 }
 impl EventListener for Listener {
@@ -257,12 +247,12 @@ impl EventListener for Listener {
                     b.extend_from_slice(reply.as_bytes());
                 }
             }
-            // BEL: record an attention-pulse deadline on the Session. Restart
-            // (not drop) on re-ring so spam reads as one continuous pulse.
+            // BEL: latch the attention pulse on the Session (sticky until the
+            // user focuses the pane; re-rings just refresh the timestamp).
             // Sibling of title/color handling — never the PtyWrite/Ready path.
             Event::Bell => {
                 if let Ok(mut b) = self.bell.lock() {
-                    *b = Some(std::time::Instant::now() + BELL_PULSE);
+                    *b = Some(std::time::Instant::now());
                 }
             }
             _ => {}
@@ -551,10 +541,8 @@ pub struct Session {
     resp: Arc<Mutex<Vec<u8>>>,
     /// Latest OSC title the running program set (shared with the `Listener`).
     osc_title: Arc<Mutex<Option<String>>>,
-    /// Visual Bell pulse deadline (shared with the `Listener`).
+    /// Visual Bell latch (shared with the `Listener`).
     bell: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Keyboard focus last frame — Bell cancels on the false→true transition.
-    was_active: bool,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -816,28 +804,24 @@ impl Session {
         }
     }
 
-    /// Whether the Bell pulse is live at `now` (deadline still in the future).
-    pub fn bell_active(&self, now: std::time::Instant) -> bool {
-        self.bell
-            .lock()
-            .ok()
-            .and_then(|b| *b)
-            .is_some_and(|d| d > now)
+    /// Whether the Bell is latched (ringing, unattended since the last BEL).
+    pub fn bell_active(&self) -> bool {
+        self.bell.lock().ok().is_some_and(|b| b.is_some())
     }
 
-    /// End the Bell pulse early (keyboard focus landed on this session).
+    /// End the Bell (keyboard focus is on this session — attention delivered).
     pub fn clear_bell(&self) {
         if let Ok(mut b) = self.bell.lock() {
             *b = None;
         }
     }
 
-    /// Test hook: force a pulse deadline without parsing a real BEL (wm paint
+    /// Test hook: latch the Bell without parsing a real BEL (wm paint
     /// helpers). Production rings only via the `Listener`.
     #[cfg(test)]
-    pub fn ring_bell_for_test(&self, deadline: std::time::Instant) {
+    pub fn ring_bell_for_test(&self) {
         if let Ok(mut b) = self.bell.lock() {
-            *b = Some(deadline);
+            *b = Some(std::time::Instant::now());
         }
     }
 
@@ -938,7 +922,6 @@ impl Session {
             resp,
             osc_title,
             bell,
-            was_active: false,
             writer,
             master: pair.master,
             child,
@@ -1700,8 +1683,6 @@ impl Session {
     pub fn keepalive(&mut self) {
         // Hidden/minimized tabs never run `show`, so cancel any stuck button here.
         self.cancel_all_mouse_captures();
-        // …and they can't hold keyboard focus, so a later focus counts as a gain.
-        self.was_active = false;
         self.pump();
     }
 
@@ -1717,10 +1698,6 @@ impl Session {
         active: bool,
         resp: &egui::Response,
     ) {
-        if bell_cancelled_by_focus(self.was_active, active) {
-            self.clear_bell();
-        }
-        self.was_active = active;
         let font_px = font_size(ui.ctx());
         // Metrics probe must use the same regular terminal face as painted glyphs.
         let font = crate::terminal_font::font_id(font_px, false, false);
@@ -1733,6 +1710,12 @@ impl Session {
         let rows = ((rect.height() / rh).floor() as usize).clamp(1, 300);
         self.resize(cols, rows);
         self.pump();
+        // A keyboard-focused session needs no attention routing — the Bell is
+        // suppressed while attended (after pump, so a BEL parsed this frame in
+        // the focused pane never flickers the chrome for one frame).
+        if active {
+            self.clear_bell();
+        }
         let metrics = crate::geom::CellMetrics::new(rect, cw, rh, cols, rows);
         let search_was_open = self.search.is_open();
         // Shared bar geometry for mouse hit-testing and paint (before paint).
@@ -3149,40 +3132,22 @@ mod tests {
     }
 
     #[test]
-    fn bell_cancels_only_on_gaining_focus() {
-        // unfocused → focused: the user found the pane; kill the pulse.
-        assert!(bell_cancelled_by_focus(false, true));
-        // already focused: a BEL must still do its short pulse.
-        assert!(!bell_cancelled_by_focus(true, true));
-        // staying (or going) unfocused never cancels.
-        assert!(!bell_cancelled_by_focus(false, false));
-        assert!(!bell_cancelled_by_focus(true, false));
-    }
-
-    #[test]
-    fn listener_bell_sets_and_restarts_the_pulse_deadline() {
+    fn listener_bell_latches_until_cleared() {
         let bell = Arc::new(Mutex::new(None));
         let l = Listener {
             out: Arc::new(Mutex::new(Vec::new())),
             title: Arc::new(Mutex::new(None)),
             bell: bell.clone(),
         };
-        let before = std::time::Instant::now();
+        assert!(bell.lock().unwrap().is_none(), "quiet until a BEL arrives");
         l.send_event(Event::Bell);
-        let first = bell.lock().unwrap().expect("BEL must set a pulse deadline");
-        assert!(first > before, "deadline must be in the future");
-        assert!(
-            first <= std::time::Instant::now() + BELL_PULSE,
-            "deadline must be ~now + BELL_PULSE, not unbounded"
-        );
-        // Spam restarts the window (one continuous pulse) — it never drops a ring.
+        let first = bell.lock().unwrap().expect("BEL must latch the bell");
+        // Re-rings refresh the timestamp; the latch never self-expires —
+        // only focus (clear_bell) ends it.
         std::thread::sleep(std::time::Duration::from_millis(5));
         l.send_event(Event::Bell);
-        let second = bell.lock().unwrap().expect("still pulsing");
-        assert!(
-            second >= first,
-            "a mid-pulse BEL must extend, never shorten"
-        );
+        let second = bell.lock().unwrap().expect("still latched");
+        assert!(second >= first, "a re-ring must refresh, never unlatch");
     }
 
     #[test]

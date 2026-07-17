@@ -57,8 +57,36 @@ pub const CARET: egui::Color32 = unmultiplied(231, 169, 63, 130);
 /// alpha is tuned for a block fill; a 1px border stroke needs full strength).
 /// Never the focus ladder: Bell is amber and temporary, focus is near-white.
 pub const BELL: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
+/// One full breathe of the Bell pulse, seconds.
+pub const BELL_PERIOD: f64 = 1.2;
+
+/// Bell pulse animation: breathe [`BELL`] between ~40% and full strength on a
+/// [`BELL_PERIOD`] cycle. Pure function of wall-clock seconds (egui
+/// `input.time`) so every pulsing surface breathes in sync.
+pub fn bell_pulse(t: f64) -> egui::Color32 {
+    let phase = 0.5 + 0.5 * (t * std::f64::consts::TAU / BELL_PERIOD).sin();
+    BELL.gamma_multiply(0.4 + 0.6 * phase as f32)
+}
 /// Scrollback indicator thumb at a pane's right edge.
 pub const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bell_pulse_breathes_within_the_bell_color() {
+        // Peak (sin=1 at t=P/4) is full BELL; trough (t=3P/4) is dimmer but
+        // never black — the pulse must stay visible at its low point.
+        let peak = bell_pulse(BELL_PERIOD / 4.0);
+        let trough = bell_pulse(3.0 * BELL_PERIOD / 4.0);
+        assert_eq!(peak, BELL, "peak of the breathe is the full bell color");
+        assert!(trough.r() < BELL.r(), "trough must dim");
+        assert!(trough.r() > 60, "trough must stay clearly visible");
+        // Same hue family throughout: warm, R > G > B.
+        assert!(trough.r() > trough.g() && trough.g() > trough.b());
+    }
+}
 
 // ---- scrollback search ----
 /// Ordinary match highlight (distinct from selection).
