@@ -535,6 +535,7 @@ impl eframe::App for App {
         }
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
+        terminal::set_bell_enabled(&ctx, self.settings.bell);
         // Landing when nothing is *visible* (closed or all minimized). Always
         // still run the desktop so the Sessions panel stays docked at its
         // remembered size and minimized PTYs keep pumping; the landing paints

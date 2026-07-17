@@ -187,6 +187,12 @@ impl Content {
             Content::TaskManager(_) => None,
         }
     }
+
+    /// Whether this content is a terminal with a live Bell pulse. Projects do
+    /// not bubble up (project/panel Bell chrome is explicitly out of v1 scope).
+    fn bell_active(&self, now: std::time::Instant) -> bool {
+        matches!(self, Content::Terminal(s) if s.bell_active(now))
+    }
 }
 
 /// One entry in a window's tab-stack: a title and the content it shows. The
@@ -251,6 +257,10 @@ impl Win {
     /// Is the active tab a project? (Drives titlebar styling + the +project key.)
     fn is_project(&self) -> bool {
         matches!(self.tabs[self.active].content, Content::Project(_))
+    }
+    /// Border pulse rule: the whole stack pulses while ANY of its tabs rings.
+    fn bell_active(&self, now: std::time::Instant) -> bool {
+        self.tabs.iter().any(|t| t.content.bell_active(now))
     }
     /// Task-manager panel window (any tab). Non-closable / non-minimizable /
     /// non-tabbable; excluded from `deserted` and `panel_model`.
@@ -3411,6 +3421,21 @@ impl WindowManager {
                 if child_interacted {
                     acts.push(Act::Focus(id));
                 }
+                // Bare sole pane has no border or chips — the Bell falls back
+                // to an inset ring on the content rect (the only surface that
+                // doesn't invent chrome).
+                if crate::terminal::bell_enabled(ui.ctx())
+                    && self.windows[i].bell_active(std::time::Instant::now())
+                {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(30));
+                    ui.painter_at(scr.intersect(area)).rect_stroke(
+                        scr.shrink(1.0),
+                        egui::CornerRadius::ZERO,
+                        egui::Stroke::new(2.0, BELL),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 continue;
             }
 
@@ -3741,6 +3766,8 @@ impl WindowManager {
                     // header_layout. Chips are registered after the window-drag
                     // rect so they win pointer priority; dragging a chip off
                     // the bar detaches it (untab).
+                    let bell_now = std::time::Instant::now();
+                    let bell_gate = crate::terminal::bell_enabled(ui.ctx());
                     for ch in chips {
                         let ti = ch.idx;
                         let chip = ch.rect;
@@ -3794,6 +3821,16 @@ impl WindowManager {
                                 egui::pos2(chip.max.x, chip.max.y),
                             );
                             p.rect_filled(open, egui::CornerRadius::ZERO, bg);
+                        }
+                        // Bell: only the ringing session's chip pulses (the
+                        // whole-stack border pulse is painted at the frame).
+                        if bell_gate && self.windows[i].tabs[ti].content.bell_active(bell_now) {
+                            p.rect_stroke(
+                                chip,
+                                radius,
+                                egui::Stroke::new(BORDER_W, BELL),
+                                egui::StrokeKind::Inside,
+                            );
                         }
                         let txt_col = if is_active_tab { TEXT } else { DIM };
                         // Leading icon: agent logo / shell glyph / project folder.
@@ -4163,7 +4200,18 @@ impl WindowManager {
             } // end header chrome
 
             // --- border + resize ---
-            let border_col = if is_focus {
+            // Bell: while ANY tab in this stack rings, the border flashes caret
+            // amber — temporary attention routing that outranks the focus color
+            // for the pulse (a focused session that rings still pulses). The
+            // repaint_after keeps the tail of the pulse from outliving its
+            // deadline on the idle 100ms cadence.
+            let bell_on = crate::terminal::bell_enabled(ui.ctx())
+                && self.windows[i].bell_active(std::time::Instant::now());
+            let border_col = if bell_on {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(30));
+                BELL
+            } else if is_focus {
                 if is_project {
                     PROJ_BORDER_FOCUS
                 } else {
@@ -5396,10 +5444,13 @@ mod tests {
             d.z += 1;
             d.windows.push(Win {
                 id,
-                tabs: vec![Tab::fixed("sessions", Content::TaskManager(crate::panel::PanelView::new(
+                tabs: vec![Tab::fixed(
+                    "sessions",
+                    Content::TaskManager(crate::panel::PanelView::new(
                         false,
                         crate::panel::PANEL_W,
-                    )))],
+                    )),
+                )],
                 active: 0,
                 rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(260.0, 800.0)),
                 z: d.z,
@@ -5461,7 +5512,10 @@ mod tests {
         m.z += 1;
         m.windows.push(Win {
             id,
-            tabs: vec![Tab::fixed("chat", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::clone(&m.chat))))],
+            tabs: vec![Tab::fixed(
+                "chat",
+                Content::Chat(crate::chat::ChatView::new(std::rc::Rc::clone(&m.chat))),
+            )],
             active: 0,
             rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
             z: m.z,
@@ -6188,12 +6242,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
         let id = wm
-            .add_terminal_cmd(
-                &["claude".into()],
-                None,
-                Some("agent · claude"),
-                &ctx,
-            )
+            .add_terminal_cmd(&["claude".into()], None, Some("agent · claude"), &ctx)
             .unwrap();
         // icon_kind is Claude from dispatch argv, but title stays the explicit one.
         wm.refresh_auto_titles();
@@ -6386,11 +6435,54 @@ mod tests {
         let (id, rect) = m.next_slot(egui::vec2(100.0, 100.0));
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{id}"));
-        m.push_win(id, Tab::fixed("proj", Content::Project(Box::new(child))), rect);
+        m.push_win(
+            id,
+            Tab::fixed("proj", Content::Project(Box::new(child))),
+            rect,
+        );
         if !id_focused {
             m.focused = None;
         }
         m
+    }
+
+    #[test]
+    fn bell_pulses_the_stack_until_expiry_or_clear() {
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        let env: Vec<(String, String)> = vec![];
+        let s1 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
+        let s2 = Session::spawn(Shell::Cmd, None, &env, ctx.clone()).unwrap();
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        m.push_win(1, Tab::fixed("front", Content::Terminal(s1)), r);
+        m.windows[0]
+            .tabs
+            .push(Tab::fixed("back", Content::Terminal(s2)));
+
+        let now = std::time::Instant::now();
+        assert!(
+            !m.windows[0].bell_active(now),
+            "fresh sessions must not pulse"
+        );
+
+        // Ring the background tab: the whole stack (border rule) pulses, but
+        // only that tab's content does (chip rule).
+        let Content::Terminal(s) = &m.windows[0].tabs[1].content else {
+            panic!("expected terminal");
+        };
+        s.ring_bell_for_test(now + std::time::Duration::from_millis(300));
+        assert!(m.windows[0].bell_active(now));
+        assert!(m.windows[0].tabs[1].content.bell_active(now));
+        assert!(!m.windows[0].tabs[0].content.bell_active(now));
+
+        // Past the deadline the pulse is over — no sticky badge.
+        let later = now + std::time::Duration::from_millis(301);
+        assert!(!m.windows[0].bell_active(later));
+
+        // Clearing (focus landed) kills it immediately.
+        s.ring_bell_for_test(now + std::time::Duration::from_millis(300));
+        s.clear_bell();
+        assert!(!m.windows[0].bell_active(now));
     }
 
     #[test]
@@ -7160,7 +7252,11 @@ mod tests {
             .unwrap();
         let mut d = WindowManager::new().as_desktop();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        d.push_win(1, Tab::fixed("proj", Content::Project(Box::new(child))), rect);
+        d.push_win(
+            1,
+            Tab::fixed("proj", Content::Project(Box::new(child))),
+            rect,
+        );
         (d, a, b)
     }
 
@@ -7484,7 +7580,11 @@ mod tests {
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        d.push_win(2, Tab::fixed("other", Content::Project(Box::new(child2))), rect);
+        d.push_win(
+            2,
+            Tab::fixed("other", Content::Project(Box::new(child2))),
+            rect,
+        );
 
         // --project p1 lists only p1's header + its two terminals
         let (msg, rrx) = status_msg(Some("p1"), std::time::Instant::now());
@@ -8555,9 +8655,12 @@ mod tests {
         let proj = push(&mut desk, "projA");
         let mut inner = WindowManager::new();
         let a = push(&mut inner, "termA");
-        inner.windows[0].tabs.push(Tab::fixed("termA2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed(
+            "termA2",
+            Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            )))));
+            ))),
+        ));
         let b = push(&mut inner, "termB");
         inner
             .windows
@@ -8616,9 +8719,12 @@ mod tests {
         let proj = push(&mut desk, "proj");
         let mut inner = WindowManager::new();
         let cw = push(&mut inner, "t1");
-        inner.windows[0].tabs.push(Tab::fixed("t2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed(
+            "t2",
+            Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            )))));
+            ))),
+        ));
         inner.windows[0].minimized = true;
         desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
             Content::Project(Box::new(inner));
@@ -9043,9 +9149,12 @@ mod tests {
         let proj = push(&mut desk, "proj");
         let mut inner = WindowManager::new();
         let cw = push(&mut inner, "t1");
-        inner.windows[0].tabs.push(Tab::fixed("t2", Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
+        inner.windows[0].tabs.push(Tab::fixed(
+            "t2",
+            Content::Chat(crate::chat::ChatView::new(std::rc::Rc::new(
                 std::cell::RefCell::new(crate::chat::ChatRoom::new()),
-            )))));
+            ))),
+        ));
         inner.windows[0].active = 0;
         desk.windows.iter_mut().find(|w| w.id == proj).unwrap().tabs[0].content =
             Content::Project(Box::new(inner));

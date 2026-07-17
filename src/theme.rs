@@ -53,6 +53,10 @@ pub const SELECTION_TEXT_BG: egui::Color32 = unmultiplied(231, 231, 231, 90);
 /// premultiplied color and blends as a near-white additive band.
 pub const SEL_BG: egui::Color32 = unmultiplied(231, 231, 231, 30);
 pub const CARET: egui::Color32 = unmultiplied(231, 169, 63, 130);
+/// Bell attention pulse — the caret amber family at full alpha (CARET's 130
+/// alpha is tuned for a block fill; a 1px border stroke needs full strength).
+/// Never the focus ladder: Bell is amber and temporary, focus is near-white.
+pub const BELL: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 /// Scrollback indicator thumb at a pane's right edge.
 pub const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
 

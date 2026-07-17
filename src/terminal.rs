@@ -665,6 +665,26 @@ pub fn set_font_size(ctx: &egui::Context, px: f32) {
     ctx.data_mut(|d| d.insert_temp(font_size_id(), FontSizeState(px)));
 }
 
+#[derive(Clone, Copy)]
+struct BellEnabledState(bool);
+
+fn bell_enabled_id() -> egui::Id {
+    egui::Id::new("foreman-bell-enabled")
+}
+
+/// Master Bell switch (settings.json `bell`), published per-frame by App.
+/// Unset (tests, headless) = on — matching the settings default.
+pub fn bell_enabled(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.get_temp::<BellEnabledState>(bell_enabled_id()))
+        .map(|s| s.0)
+        .unwrap_or(true)
+}
+
+/// Publish the persisted Bell switch as the live value paint paths read.
+pub fn set_bell_enabled(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(bell_enabled_id(), BellEnabledState(on)));
+}
+
 fn sel_viewport_range(
     range: SelectionRange,
     display_offset: usize,
