@@ -213,6 +213,13 @@ impl Shell {
 /// pulsing restarts this window — one continuous pulse, not a disco.
 pub const BELL_PULSE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Focus-transition rule for Bell cancel (pure, unit-tested): the pulse dies
+/// when keyboard focus *lands* on the session. Holding focus never cancels —
+/// a BEL on an already-focused session still pulses. Hover is not focus.
+fn bell_cancelled_by_focus(was_active: bool, active: bool) -> bool {
+    active && !was_active
+}
+
 #[derive(Clone)]
 struct Listener {
     out: Arc<Mutex<Vec<u8>>>,
@@ -546,6 +553,8 @@ pub struct Session {
     osc_title: Arc<Mutex<Option<String>>>,
     /// Visual Bell pulse deadline (shared with the `Listener`).
     bell: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Keyboard focus last frame — Bell cancels on the false→true transition.
+    was_active: bool,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -909,6 +918,7 @@ impl Session {
             resp,
             osc_title,
             bell,
+            was_active: false,
             writer,
             master: pair.master,
             child,
@@ -1670,6 +1680,8 @@ impl Session {
     pub fn keepalive(&mut self) {
         // Hidden/minimized tabs never run `show`, so cancel any stuck button here.
         self.cancel_all_mouse_captures();
+        // …and they can't hold keyboard focus, so a later focus counts as a gain.
+        self.was_active = false;
         self.pump();
     }
 
@@ -1685,6 +1697,10 @@ impl Session {
         active: bool,
         resp: &egui::Response,
     ) {
+        if bell_cancelled_by_focus(self.was_active, active) {
+            self.clear_bell();
+        }
+        self.was_active = active;
         let font_px = font_size(ui.ctx());
         // Metrics probe must use the same regular terminal face as painted glyphs.
         let font = crate::terminal_font::font_id(font_px, false, false);
@@ -3110,6 +3126,17 @@ mod tests {
         l.send_event(Event::ColorRequest(NamedColor::Background as usize, fmt));
         let got = String::from_utf8(out.lock().unwrap().clone()).unwrap();
         assert_eq!(got, format!("R{}G{}B{}", BG.r(), BG.g(), BG.b()));
+    }
+
+    #[test]
+    fn bell_cancels_only_on_gaining_focus() {
+        // unfocused → focused: the user found the pane; kill the pulse.
+        assert!(bell_cancelled_by_focus(false, true));
+        // already focused: a BEL must still do its short pulse.
+        assert!(!bell_cancelled_by_focus(true, true));
+        // staying (or going) unfocused never cancels.
+        assert!(!bell_cancelled_by_focus(false, false));
+        assert!(!bell_cancelled_by_focus(true, false));
     }
 
     #[test]
