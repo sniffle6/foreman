@@ -209,6 +209,10 @@ impl Shell {
     }
 }
 
+/// How long a Bell pulse lasts after the most recent ring. A new BEL while
+/// pulsing restarts this window — one continuous pulse, not a disco.
+pub const BELL_PULSE: std::time::Duration = std::time::Duration::from_millis(300);
+
 #[derive(Clone)]
 struct Listener {
     out: Arc<Mutex<Vec<u8>>>,
@@ -216,6 +220,9 @@ struct Listener {
     /// what's running in a *hand-launched* shell (e.g. `claude` typed at a prompt)
     /// so the tab icon can follow it. `None` = no title / reset to default.
     title: Arc<Mutex<Option<String>>>,
+    /// Visual Bell (`\a`) pulse deadline: `Some(t)` = pulse until `t`. Shared
+    /// with the Session, which paints it and cancels it on focus gain.
+    bell: Arc<Mutex<Option<std::time::Instant>>>,
 }
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
@@ -241,6 +248,14 @@ impl EventListener for Listener {
                 let reply = format(query_color(index));
                 if let Ok(mut b) = self.out.lock() {
                     b.extend_from_slice(reply.as_bytes());
+                }
+            }
+            // BEL: record an attention-pulse deadline on the Session. Restart
+            // (not drop) on re-ring so spam reads as one continuous pulse.
+            // Sibling of title/color handling — never the PtyWrite/Ready path.
+            Event::Bell => {
+                if let Ok(mut b) = self.bell.lock() {
+                    *b = Some(std::time::Instant::now() + BELL_PULSE);
                 }
             }
             _ => {}
@@ -529,6 +544,8 @@ pub struct Session {
     resp: Arc<Mutex<Vec<u8>>>,
     /// Latest OSC title the running program set (shared with the `Listener`).
     osc_title: Arc<Mutex<Option<String>>>,
+    /// Visual Bell pulse deadline (shared with the `Listener`).
+    bell: Arc<Mutex<Option<std::time::Instant>>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -770,6 +787,31 @@ impl Session {
         }
     }
 
+    /// Whether the Bell pulse is live at `now` (deadline still in the future).
+    pub fn bell_active(&self, now: std::time::Instant) -> bool {
+        self.bell
+            .lock()
+            .ok()
+            .and_then(|b| *b)
+            .is_some_and(|d| d > now)
+    }
+
+    /// End the Bell pulse early (keyboard focus landed on this session).
+    pub fn clear_bell(&self) {
+        if let Ok(mut b) = self.bell.lock() {
+            *b = None;
+        }
+    }
+
+    /// Test hook: force a pulse deadline without parsing a real BEL (wm paint
+    /// helpers). Production rings only via the `Listener`.
+    #[cfg(test)]
+    pub fn ring_bell_for_test(&self, deadline: std::time::Instant) {
+        if let Ok(mut b) = self.bell.lock() {
+            *b = Some(deadline);
+        }
+    }
+
     /// The icon for this terminal's tab, resolved in priority order:
     /// 1. the dispatched agent's argv (instant, `foreman open claude …`),
     /// 2. a hand-launched agent recognized from the program's OSC title (instant;
@@ -850,12 +892,14 @@ impl Session {
 
         let resp = Arc::new(Mutex::new(Vec::new()));
         let osc_title = Arc::new(Mutex::new(None));
+        let bell = Arc::new(Mutex::new(None));
         let term = Term::new(
             Config::default(),
             &Size { cols, rows },
             Listener {
                 out: resp.clone(),
                 title: osc_title.clone(),
+                bell: bell.clone(),
             },
         );
         Ok(Session {
@@ -864,6 +908,7 @@ impl Session {
             rx,
             resp,
             osc_title,
+            bell,
             writer,
             master: pair.master,
             child,
@@ -1851,9 +1896,7 @@ impl Session {
         // was retired). Unfocused panes show a hollow full-cell outline
         // (Alacritty/Kitty/Ghostty convention), so force Block for the rect.
         let mut cursor_draw = crate::caret::draw(cur_line, cur_col, cur_shape);
-        if !active
-            && let crate::caret::CursorDraw::At { shape, .. } = &mut cursor_draw
-        {
+        if !active && let crate::caret::CursorDraw::At { shape, .. } = &mut cursor_draw {
             *shape = alacritty_terminal::vte::ansi::CursorShape::Block;
         }
 
@@ -3059,6 +3102,7 @@ mod tests {
         let l = Listener {
             out: out.clone(),
             title: Arc::new(Mutex::new(None)),
+            bell: Arc::new(Mutex::new(None)),
         };
         // Stand-in for alacritty's formatter: echo the RGB it is handed.
         let fmt =
@@ -3066,6 +3110,32 @@ mod tests {
         l.send_event(Event::ColorRequest(NamedColor::Background as usize, fmt));
         let got = String::from_utf8(out.lock().unwrap().clone()).unwrap();
         assert_eq!(got, format!("R{}G{}B{}", BG.r(), BG.g(), BG.b()));
+    }
+
+    #[test]
+    fn listener_bell_sets_and_restarts_the_pulse_deadline() {
+        let bell = Arc::new(Mutex::new(None));
+        let l = Listener {
+            out: Arc::new(Mutex::new(Vec::new())),
+            title: Arc::new(Mutex::new(None)),
+            bell: bell.clone(),
+        };
+        let before = std::time::Instant::now();
+        l.send_event(Event::Bell);
+        let first = bell.lock().unwrap().expect("BEL must set a pulse deadline");
+        assert!(first > before, "deadline must be in the future");
+        assert!(
+            first <= std::time::Instant::now() + BELL_PULSE,
+            "deadline must be ~now + BELL_PULSE, not unbounded"
+        );
+        // Spam restarts the window (one continuous pulse) — it never drops a ring.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        l.send_event(Event::Bell);
+        let second = bell.lock().unwrap().expect("still pulsing");
+        assert!(
+            second >= first,
+            "a mid-pulse BEL must extend, never shorten"
+        );
     }
 
     #[test]
