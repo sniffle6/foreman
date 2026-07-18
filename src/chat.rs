@@ -15,13 +15,16 @@ pub enum ChatKind {
     Exited,
 }
 
-/// Crew-board staleness threshold: a live member unheard for this long
-/// renders its age in amber.
+/// Crew-board staleness threshold (default): a live member unheard for this
+/// long renders its age in amber. User-configurable via
+/// `Settings::crew_stale_secs`; this const only documents the default.
 pub const STALE_AFTER: Duration = Duration::from_secs(300);
 
-/// Relative age for the crew board: ("now"/"3m"/"2h", is_stale).
-pub fn age_label(d: Duration) -> (String, bool) {
-    let stale = d >= STALE_AFTER;
+/// Relative age for the crew board: ("now"/"3m"/"2h", is_stale). `stale_after`
+/// is the caller-supplied threshold (`Settings::crew_stale_secs`) — this
+/// helper stays pure and takes no config dependency of its own.
+pub fn age_label(d: Duration, stale_after: Duration) -> (String, bool) {
+    let stale = d >= stale_after;
     let s = d.as_secs();
     let label = if s < 60 {
         "now".to_string()
@@ -1143,29 +1146,39 @@ mod tests {
     #[test]
     fn age_label_boundaries() {
         assert_eq!(
-            age_label(Duration::from_secs(0)),
+            age_label(Duration::from_secs(0), STALE_AFTER),
             ("now".to_string(), false)
         );
         assert_eq!(
-            age_label(Duration::from_secs(59)),
+            age_label(Duration::from_secs(59), STALE_AFTER),
             ("now".to_string(), false)
         );
         assert_eq!(
-            age_label(Duration::from_secs(60)),
+            age_label(Duration::from_secs(60), STALE_AFTER),
             ("1m".to_string(), false)
         );
         assert_eq!(
-            age_label(Duration::from_secs(299)),
+            age_label(Duration::from_secs(299), STALE_AFTER),
             ("4m".to_string(), false)
         );
         assert_eq!(
-            age_label(Duration::from_secs(300)),
+            age_label(Duration::from_secs(300), STALE_AFTER),
             ("5m".to_string(), true)
         );
         assert_eq!(
-            age_label(Duration::from_secs(3600)),
+            age_label(Duration::from_secs(3600), STALE_AFTER),
             ("1h".to_string(), true)
         );
+    }
+
+    #[test]
+    fn age_label_honors_the_caller_supplied_stale_threshold() {
+        // The same 300s duration is stale at a 300s threshold but live at a
+        // 3600s threshold — proving `stale_after` (not the STALE_AFTER
+        // const) drives the judgment.
+        let d = Duration::from_secs(300);
+        assert!(age_label(d, Duration::from_secs(300)).1);
+        assert!(!age_label(d, Duration::from_secs(3600)).1);
     }
 
     #[test]

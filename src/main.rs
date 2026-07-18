@@ -874,7 +874,12 @@ fn main() -> eframe::Result {
         std::process::exit(control::client_main(&args[1..]));
     }
     install_panic_logger();
-    skills_install::install();
+    // Gate on `Settings::install_skills` — takes effect next launch (the menu
+    // row's desc already says "on launch"). Loaded once here, ahead of the
+    // App's own `Settings::load()`, since this runs before any frame exists.
+    if config::Settings::load().install_skills {
+        skills_install::install();
+    }
     conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut viewport = egui::ViewportBuilder::default()

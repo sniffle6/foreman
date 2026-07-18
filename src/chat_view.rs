@@ -85,6 +85,9 @@ impl ChatView {
             // Pull crew rows from the room; the borrow is dropped before the
             // paint loop (it borrows nothing else from the room).
             let crew = self.room.borrow().crew(std::time::Instant::now());
+            let stale_after = std::time::Duration::from_secs(
+                crate::config::live(ui.ctx()).crew_stale_secs as u64,
+            );
             for r in &crew {
                 let row = egui::Rect::from_min_size(
                     egui::pos2(board.min.x + 4.0, y),
@@ -111,7 +114,7 @@ impl ChatView {
                     ("exited".to_string(), false)
                 } else {
                     match r.last.and_then(|t| now.duration_since(t).ok()) {
-                        Some(d) => chat::age_label(d),
+                        Some(d) => chat::age_label(d, stale_after),
                         None => ("—".to_string(), false),
                     }
                 };

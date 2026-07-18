@@ -31,12 +31,13 @@ fn rect_from_snap(r: &crate::workspace::RectSnap) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h))
 }
 
-// Default quiescence window for `foreman send`: after writing input, wait this
-// long with no new PTY bytes before replying so a following snapshot reads
-// settled state. MAX_SETTLE_MS is a hard cap on the total wait; it stays under
-// control::REPLY_TIMEOUT (5s) so the pipe server's recv_timeout never fires
-// before a settle reply lands.
-const DEFAULT_SETTLE_MS: u64 = 120;
+// Quiescence window for `foreman send`: after writing input, wait this long
+// with no new PTY bytes before replying so a following snapshot reads settled
+// state. The default (absent an explicit `settle_ms` on the request) is
+// `Settings::send_settle_ms`. MAX_SETTLE_MS is a hard cap on the total wait —
+// defense in depth on top of `Settings::sanitize`'s 2000 clamp — and stays
+// under control::REPLY_TIMEOUT (5s) so the pipe server's recv_timeout never
+// fires before a settle reply lands.
 const MAX_SETTLE_MS: u64 = 4000;
 
 // One pending `foreman send` settle: the terminal to watch, the channel to
@@ -1087,7 +1088,9 @@ impl WindowManager {
                         let _ = reply.send(OpenReply::err(e));
                     }
                     Ok((pid, tid)) => {
-                        let settle = req.settle_ms.unwrap_or(DEFAULT_SETTLE_MS);
+                        let settle = req
+                            .settle_ms
+                            .unwrap_or(crate::config::live(ctx).send_settle_ms);
                         if settle == 0 {
                             // Fire-and-forget: reply immediately, no settle wait.
                             let _ = reply.send(OpenReply {
@@ -7985,8 +7988,8 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut d, a, _b) = chat_fixture(&ctx);
         let ta = format!("t{a}");
-        // Default settle (None → DEFAULT_SETTLE_MS): no immediate reply — the
-        // request is parked on the pending list.
+        // Default settle (None → Settings::send_settle_ms, 120 by default):
+        // no immediate reply — the request is parked on the pending list.
         let (msg, rrx) = send_msg(Some("p1"), &ta, "x", std::time::Instant::now(), None);
         d.handle_ctrl(msg, &ctx);
         assert!(
@@ -7999,6 +8002,36 @@ mod tests {
         let r = rrx
             .try_recv()
             .expect("settle must reply once the deadline passes");
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    #[test]
+    fn send_with_no_settle_ms_uses_the_configured_send_settle_default() {
+        let ctx = egui::Context::default();
+        let mut s = crate::config::Settings::default();
+        s.send_settle_ms = 500;
+        crate::config::seed_live(&ctx, &s);
+        let (mut d, a, _b) = chat_fixture(&ctx);
+        let ta = format!("t{a}");
+        let sent = std::time::Instant::now();
+        let (msg, rrx) = send_msg(Some("p1"), &ta, "x", sent, None);
+        d.handle_ctrl(msg, &ctx);
+        assert!(
+            rrx.try_recv().is_err(),
+            "settle send must NOT reply synchronously"
+        );
+        // Short of the configured 500ms default: still pending (proves the
+        // settle used is 500, not the old hardcoded 120ms default).
+        d.advance_settles(sent + std::time::Duration::from_millis(200));
+        assert!(
+            rrx.try_recv().is_err(),
+            "must not fire before the configured send_settle_ms elapses"
+        );
+        // Past 500ms (still well under MAX_SETTLE_MS): the settle fires.
+        d.advance_settles(sent + std::time::Duration::from_millis(600));
+        let r = rrx
+            .try_recv()
+            .expect("settle must reply once send_settle_ms elapses");
         assert!(r.ok, "{:?}", r.error);
     }
 
