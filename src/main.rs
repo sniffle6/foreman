@@ -500,7 +500,11 @@ impl eframe::App for App {
             );
             if !restored && !self.landing_enabled {
                 let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let nid = self.desktop.add_project(Shell::PowerShell, dir, &ctx);
+                // self.settings, not config::live: this startup block runs
+                // before the frame's seed_live, where live() is still default.
+                let nid =
+                    self.desktop
+                        .add_project(self.settings.default_shell.to_shell(), dir, &ctx);
                 self.desktop.tile_new(nid, None);
             }
             // Auto-project / restore must not pollute recents (spec).
@@ -588,7 +592,11 @@ impl eframe::App for App {
                 match act.kind.launch_command() {
                     // Terminal: a plain shell, as before.
                     None => {
-                        let nid = self.desktop.add_project(Shell::PowerShell, act.path, &ctx);
+                        let nid = self.desktop.add_project(
+                            self.settings.default_shell.to_shell(),
+                            act.path,
+                            &ctx,
+                        );
                         self.desktop.tile_new(nid, None);
                     }
                     // Agent (Claude/Codex/Grok), installed: a normal shell that runs it.
