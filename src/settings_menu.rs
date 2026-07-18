@@ -870,8 +870,21 @@ impl SettingsMenu {
                     // cancels. request_focus keeps the field hot until then.
                     if resp.lost_focus() {
                         if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            s.default_project_dir = self.editing.take().unwrap();
-                            bump(outcome, MenuOutcome::Changed);
+                            let committed = self.editing.take().unwrap();
+                            // Every Kind::Text field needs a commit arm here —
+                            // there is no generic string path through adjust().
+                            match spec.field {
+                                Field::DefaultProjectDir => {
+                                    s.default_project_dir = committed;
+                                    bump(outcome, MenuOutcome::Changed);
+                                }
+                                other => {
+                                    debug_assert!(
+                                        false,
+                                        "Kind::Text field {other:?} has no commit arm"
+                                    );
+                                }
+                            }
                         } else {
                             self.editing = None;
                         }
