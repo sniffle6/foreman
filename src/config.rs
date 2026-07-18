@@ -186,7 +186,7 @@ impl Default for Settings {
             zoom_step: FONT_ZOOM_STEP,
             copy_on_select: false,
             paste_warn_multiline: true,
-            bell_period: 1.2,
+            bell_period: crate::theme::BELL_PERIOD as f32,
             toast_secs: 6.0,
             new_windows_float: false,
             focus_follows_mouse: false,

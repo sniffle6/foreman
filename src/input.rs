@@ -14,7 +14,8 @@ use eframe::egui::{Event, Key, Modifiers, PointerButton};
 /// What one frame of input decided. The shell applies these side effects in order.
 #[derive(Default, Debug)]
 pub struct InputOutcome {
-    /// Encoded key + (mode-gated) paste bytes, in event order, ready to write.
+    /// Encoded key bytes, in event order, ready to write. Paste bytes are NOT
+    /// included here — see `paste_text`.
     pub pty_bytes: Vec<u8>,
     /// Copy the current selection to the clipboard.
     pub copy: bool,
@@ -27,6 +28,12 @@ pub struct InputOutcome {
     /// Ctrl+Shift+V — the pure pass can't read the clipboard, so it flags the
     /// request; the shell reads it and wraps through `paste_seq`.
     pub paste_clipboard: bool,
+    /// Raw text from an `Event::Paste` this frame (Ctrl+V / Shift+Insert),
+    /// unencoded. The shell gates it through the multi-line-paste confirm
+    /// before wrapping it with `paste_seq` and sending it — mode-gated
+    /// bracketing happens there, not here, so a warned paste can still be
+    /// cancelled before any bytes reach the PTY.
+    pub paste_text: Option<String>,
     /// Ctrl+0 — reset the global terminal font size to the default. The shell
     /// applies it to the shared zoom value; nothing is sent to the PTY.
     pub zoom_reset: bool,
@@ -129,7 +136,7 @@ pub fn process_input(
                 }
             }
             Event::Paste(s) if !s.is_empty() => {
-                out.pty_bytes.extend_from_slice(&paste_seq(mode, s));
+                out.paste_text = Some(s.clone());
                 saw_paste = true;
             }
             Event::Paste(_) => {} // empty paste (image-only clipboard) — fall through
@@ -1063,18 +1070,25 @@ mod tests {
             TermMode::empty(),
             false,
         );
-        assert_eq!(out.pty_bytes, b"x");
+        assert_eq!(out.paste_text.as_deref(), Some("x"));
+        assert!(out.pty_bytes.is_empty());
         assert!(!out.paste_clipboard);
     }
     #[test]
-    fn paste_event_is_bracketed_when_mode_set() {
+    fn paste_event_carries_raw_text_bracketing_deferred_to_shell() {
+        // process_input no longer brackets paste text itself: it hands the raw
+        // text back so the shell (Session::request_paste) can gate a multi-line
+        // paste through the confirm dialog BEFORE any encoding happens. Bracketing
+        // is exercised where it now lives — Session::feed_paste, see
+        // `paste_text_honors_bracketed_paste_and_strips_esc` in terminal.rs.
         let out = process_input(
             &[Event::Paste("x".into())],
             Modifiers::default(),
             TermMode::BRACKETED_PASTE,
             false,
         );
-        assert_eq!(out.pty_bytes, b"\x1b[200~x\x1b[201~");
+        assert_eq!(out.paste_text.as_deref(), Some("x"));
+        assert!(out.pty_bytes.is_empty());
     }
     #[test]
     fn shift_pageup_scrolls_instead_of_sending() {

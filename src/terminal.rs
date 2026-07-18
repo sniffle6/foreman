@@ -619,6 +619,10 @@ pub struct Session {
     /// Diagnostic trace (FOREMAN_RX_DUMP=<file>): raw PTY chunks plus resize and
     /// host-reply markers. None (zero-cost) when the variable is unset.
     rx_dump: Option<std::fs::File>,
+    /// A paste awaiting the multi-line confirm dialog (see `request_paste`).
+    /// Owned per-Session so it never leaks across terminals; drained by
+    /// `show` when the dialog resolves.
+    pending_paste: Option<String>,
 }
 
 fn read_clipboard() -> Option<String> {
@@ -627,6 +631,13 @@ fn read_clipboard() -> Option<String> {
 
 fn clipboard_has_image() -> bool {
     arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok())
+}
+
+/// Pure gate for the multi-line paste confirm: true when the setting is on
+/// and `text` spans more than one line (either newline style, since a raw
+/// clipboard may carry either).
+fn paste_needs_warning(text: &str, warn: bool) -> bool {
+    warn && text.contains(['\n', '\r'])
 }
 
 /// The live global terminal font size, parked in egui's per-context data so every
@@ -961,6 +972,7 @@ impl Session {
                     .open(p)
                     .ok()
             }),
+            pending_paste: None,
         })
     }
 
@@ -1292,17 +1304,74 @@ impl Session {
         let _ = self.writer.flush();
     }
 
-    /// Clipboard paste through the same mode-gated helper the keyboard paths
-    /// use (`Event::Paste` / Ctrl+Shift+V): honors bracketed-paste mode and
-    /// strips payload ESC. Right-click paste must not bypass this — raw
-    /// clipboard bytes submit multi-line pastes line by line and let a
-    /// malicious clipboard inject escape sequences.
-    fn paste_text(&mut self, txt: &str) {
+    /// The one paste-injection path: honors bracketed-paste mode and strips
+    /// payload ESC. Every paste entry point (`Event::Paste`, Ctrl+Shift+V,
+    /// right-click) reaches this only through `request_paste`'s gate — never
+    /// call it directly on live text, or a malicious/huge clipboard skips the
+    /// multi-line confirm.
+    fn feed_paste(&mut self, txt: &str) {
         if txt.is_empty() {
             return;
         }
         let seq = crate::input::paste_seq(*self.term.mode(), txt);
+        self.term.scroll_display(Scroll::Bottom);
         self.send_external_input(&seq);
+    }
+
+    /// The single gate every paste entry point funnels through. When
+    /// `paste_warn_multiline` is on and `text` spans more than one line, the
+    /// paste is held in `pending_paste` for the confirm dialog (rendered by
+    /// `show`) instead of being injected immediately.
+    fn request_paste(&mut self, text: String, ui: &egui::Ui) {
+        if text.is_empty() {
+            return;
+        }
+        let warn = crate::config::live(ui.ctx()).paste_warn_multiline;
+        if paste_needs_warning(&text, warn) {
+            self.pending_paste = Some(text);
+        } else {
+            self.feed_paste(&text);
+        }
+    }
+
+    /// Render the multi-line-paste confirm, scoped to this pane's own `rect`
+    /// (mirrors `wm.rs`'s close-confirm caller, at Session scope instead of
+    /// the window manager's). Resolves `pending_paste` on Cancel/Confirm.
+    fn show_paste_confirm(&mut self, ui: &mut egui::Ui, rect: egui::Rect, text: String) {
+        let lines = text.matches('\n').count() + 1;
+        let first_line = text.lines().next().unwrap_or("");
+        let body = if first_line.chars().count() > 60 {
+            let truncated: String = first_line.chars().take(60).collect();
+            format!("{truncated}\u{2026}")
+        } else {
+            first_line.to_string()
+        };
+        let mut view = crate::confirm::ConfirmClose::new(
+            format!("Paste {lines} lines?"),
+            body,
+            "Paste",
+            Vec::new(),
+        );
+        match view.show(ui, rect) {
+            crate::confirm::ConfirmOutcome::Pending => {}
+            crate::confirm::ConfirmOutcome::Cancelled => self.pending_paste = None,
+            crate::confirm::ConfirmOutcome::Confirmed => {
+                self.pending_paste = None;
+                self.feed_paste(&text);
+            }
+        }
+    }
+
+    /// Copy the current selection to the clipboard, if any. Shared by the
+    /// explicit copy path (Ctrl+C / `Event::Copy`) and copy-on-select.
+    /// Returns whether there was a selection to copy.
+    fn copy_selection(&mut self, ui: &egui::Ui) -> bool {
+        if let Some(txt) = self.term.selection_to_string() {
+            ui.ctx().copy_text(txt);
+            true
+        } else {
+            false
+        }
     }
 
     /// Pointer → buffer-coord selection point + cell side: the viewport cell
@@ -1355,23 +1424,29 @@ impl Session {
             set_font_size(ui.ctx(), crate::config::DEFAULT_FONT_SIZE);
         }
 
-        let mut bytes = std::mem::take(&mut outcome.pty_bytes);
+        let bytes = std::mem::take(&mut outcome.pty_bytes);
+        if !bytes.is_empty() {
+            self.term.scroll_display(Scroll::Bottom);
+            self.send(&bytes);
+        }
+
         // Ctrl+Shift+V: the pure pass can't read the clipboard, so it flags the
-        // request and we wrap the text here through the same mode-gated helper.
+        // request; the text (once read) goes through the same paste gate as
+        // Event::Paste below.
         if outcome.paste_clipboard {
             if let Some(txt) = read_clipboard().filter(|txt| !txt.is_empty()) {
-                bytes.extend_from_slice(&crate::input::paste_seq(mode, &txt));
+                self.request_paste(txt, ui);
             } else if clipboard_has_image() {
                 // Image-only clipboard: forward raw Ctrl+V so agents (Claude,
                 // Codex) run their native clipboard-image paste. Plain shells
                 // see readline quoted-insert — harmless. (spec WS2)
-                bytes.push(0x16);
+                self.term.scroll_display(Scroll::Bottom);
+                self.send(&[0x16]);
             }
         }
-
-        if !bytes.is_empty() {
-            self.term.scroll_display(Scroll::Bottom);
-            self.send(&bytes);
+        // Event::Paste (Ctrl+V / Shift+Insert) — routed through the same gate.
+        if let Some(txt) = outcome.paste_text.take() {
+            self.request_paste(txt, ui);
         }
 
         if outcome.open_search {
@@ -1382,11 +1457,9 @@ impl Session {
             return;
         }
         if outcome.copy {
-            if let Some(txt) = self.term.selection_to_string() {
-                ui.ctx().copy_text(txt);
-                if outcome.copy_clears {
-                    self.term.selection = None;
-                }
+            let copied = self.copy_selection(ui);
+            if copied && outcome.copy_clears {
+                self.term.selection = None;
             }
         } else if outcome.interrupt {
             self.send(&[0x03]); // Ctrl+C with no selection = interrupt
@@ -1745,7 +1818,10 @@ impl Session {
             // Surrender TextEdit focus while hidden; keep query/results.
         }
 
-        if active {
+        // A pending multi-line paste owns this pane's mouse/keyboard input —
+        // it must resolve (Paste/Cancel) before any of it reaches the shell.
+        let paste_pending = self.pending_paste.is_some();
+        if active && !paste_pending {
             // --- Mouse: raw events before selection (press must be immediate) ---
             let suppress_local = self.handle_mouse(
                 ui,
@@ -1811,14 +1887,23 @@ impl Session {
                         }
                     }
                 }
+                // Copy-on-select: mirror the explicit-copy path the instant a
+                // selection gesture finishes (mouse released, or the click that
+                // completes a double/triple-click selection), when enabled.
+                let selection_finished = resp.drag_stopped_by(egui::PointerButton::Primary)
+                    || resp.double_clicked_by(egui::PointerButton::Primary)
+                    || resp.triple_clicked_by(egui::PointerButton::Primary);
+                if selection_finished && crate::config::live(ui.ctx()).copy_on_select {
+                    self.copy_selection(ui);
+                }
                 // Secondary click over the search bar must not paste into the PTY.
                 if resp.secondary_clicked() {
                     let paste_ok = resp
                         .interact_pointer_pos()
                         .is_none_or(|p| search_bar.is_none_or(|b| !b.contains(p)));
                     if paste_ok {
-                        if let Some(txt) = read_clipboard() {
-                            self.paste_text(&txt);
+                        if let Some(txt) = read_clipboard().filter(|t| !t.is_empty()) {
+                            self.request_paste(txt, ui);
                         }
                     }
                 }
@@ -2232,6 +2317,15 @@ impl Session {
         // cannot steal keyboard input.
         if self.search.is_open() {
             self.paint_search_bar(ui, rect, active);
+        }
+
+        // Multi-line-paste confirm, last so it draws on top of everything else
+        // in this pane. Scoped to this Session's own `rect` — never leaks to
+        // another terminal's pane.
+        if active && paste_pending {
+            if let Some(text) = self.pending_paste.clone() {
+                self.show_paste_confirm(ui, rect, text);
+            }
         }
     }
 
@@ -3532,11 +3626,11 @@ mod tests {
         s.pump();
         // Empty paste / feed_text write nothing at all.
         let before_empty = writes.lock().unwrap().len();
-        s.paste_text("");
+        s.feed_paste("");
         s.feed_text("");
         assert_eq!(writes.lock().unwrap().len(), before_empty);
 
-        s.paste_text("a\x1b[201~b\nc");
+        s.feed_paste("a\x1b[201~b\nc");
         assert_eq!(
             writes.lock().unwrap().last().unwrap().0,
             b"\x1b[200~a[201~b\nc\x1b[201~"
@@ -3545,12 +3639,30 @@ mod tests {
         // App disables it → plain bytes, ESC still stripped.
         tx.send(b"\x1b[?2004l".to_vec()).unwrap();
         s.pump();
-        s.paste_text("a\x1b[201~b\nc");
+        s.feed_paste("a\x1b[201~b\nc");
         assert_eq!(writes.lock().unwrap().last().unwrap().0, b"a[201~b\nc");
 
         // Raw key/byte feed is written verbatim (no bracketed wrap).
         s.feed(b"x");
         assert_eq!(writes.lock().unwrap().last().unwrap().0, b"x");
+    }
+
+    // ---- paste_needs_warning (multi-line paste confirm gate) -----------------
+    #[test]
+    fn multiline_paste_needs_warning_when_enabled() {
+        assert!(paste_needs_warning("a\nb", true));
+    }
+    #[test]
+    fn single_line_paste_never_warns() {
+        assert!(!paste_needs_warning("ab", true));
+    }
+    #[test]
+    fn multiline_paste_does_not_warn_when_disabled() {
+        assert!(!paste_needs_warning("a\nb", false));
+    }
+    #[test]
+    fn bare_cr_also_counts_as_multiline() {
+        assert!(paste_needs_warning("a\rb", true));
     }
 
     #[test]
