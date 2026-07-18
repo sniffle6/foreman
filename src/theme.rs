@@ -53,6 +53,9 @@ pub const SELECTION_TEXT_BG: egui::Color32 = unmultiplied(231, 231, 231, 90);
 /// premultiplied color and blends as a near-white additive band.
 pub const SEL_BG: egui::Color32 = unmultiplied(231, 231, 231, 30);
 pub const CARET: egui::Color32 = unmultiplied(231, 169, 63, 130);
+/// Scrim painted over an unfocused pane's grid when `Settings::dim_unfocused`
+/// is on, so the focused pane reads clearly amid several visible siblings.
+pub const DIM_UNFOCUSED: egui::Color32 = egui::Color32::from_black_alpha(46);
 /// Bell attention pulse — the caret amber family at full alpha (CARET's 130
 /// alpha is tuned for a block fill; a 1px border stroke needs full strength).
 /// Never the focus ladder: Bell is amber and temporary, focus is near-white.

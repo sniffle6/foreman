@@ -2304,6 +2304,13 @@ impl Session {
             }
         }
 
+        // Dim unfocused panes: a soft scrim over the grid+caret so the
+        // focused pane reads clearly amid several visible siblings. Painted
+        // before the scrollback thumb/search bar so those stay full brightness.
+        if !active && crate::config::live(ui.ctx()).dim_unfocused {
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, DIM_UNFOCUSED);
+        }
+
         // scrollback indicator: thin right-edge thumb, shown only when there is
         // history and the user is scrolled back or hovering the pane.
         if let Some(r) = overlays.thumb

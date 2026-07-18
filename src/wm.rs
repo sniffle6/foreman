@@ -778,9 +778,11 @@ impl WindowManager {
         self.focused = Some(id);
     }
 
-    /// Spawn a terminal into this manager. Returns the new window's id, or `None`
+    /// Spawn a bare terminal window with no placement — the caller decides how
+    /// it enters (default placement via `tile_new`, a directional split via
+    /// `place_split`, or left floating). Returns the new window's id, or `None`
     /// if the PTY failed to spawn (the caller treats that as a no-op).
-    pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
+    fn spawn_terminal_win(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
         let env = self.term_env(self.next);
         let mut s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()).ok()?;
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
@@ -794,6 +796,22 @@ impl WindowManager {
             rect,
         );
         self.mark_workspace_dirty();
+        Some(id)
+    }
+
+    /// Spawn a terminal into this manager with default placement: tiles next
+    /// to the previously-focused window (`tile_new`), then — when
+    /// `Settings::new_windows_float` is on — pops it back out to floating
+    /// through the same path `Command::TermFloat` uses, so the float-rect
+    /// math lives in one place. Returns the new window's id, or `None` if the
+    /// PTY failed to spawn.
+    pub fn add_terminal(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
+        let anchor = self.focused;
+        let id = self.spawn_terminal_win(shell, ctx)?;
+        self.tile_new(id, anchor);
+        if crate::config::live(ctx).new_windows_float {
+            self.toggle_float_for(id);
+        }
         Some(id)
     }
 
@@ -851,7 +869,9 @@ impl WindowManager {
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{}", id));
         child.cwd = Some(cwd);
-        if let Some(tid) = child.add_terminal(shell, ctx) {
+        // Raw spawn, not `add_terminal`: a fresh project's sole terminal must
+        // always tile as the root — it's not subject to `new_windows_float`.
+        if let Some(tid) = child.spawn_terminal_win(shell, ctx) {
             child.tile_new(tid, None);
         }
         self.push_win(
@@ -889,8 +909,10 @@ impl WindowManager {
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{}", id));
         child.cwd = Some(cwd);
+        // Raw spawn, not `add_terminal`: a fresh project's sole terminal must
+        // always tile as the root — it's not subject to `new_windows_float`.
         if let Some(tid) =
-            child.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx)
+            child.spawn_terminal_win(crate::config::live(ctx).default_shell.to_shell(), ctx)
         {
             child.tile_new(tid, None);
             if let Some(w) = child.windows.iter_mut().find(|w| w.id == tid) {
@@ -2379,13 +2401,12 @@ impl WindowManager {
                         }
                         Command::Rename => child.begin_rename(),
                         Command::NewTerm => {
-                            let anchor = child.focused;
-                            if let Some(nid) = child.add_terminal(
+                            // `add_terminal` handles default placement (and
+                            // `new_windows_float`) itself.
+                            child.add_terminal(
                                 crate::config::live(&ctx).default_shell.to_shell(),
                                 &ctx,
-                            ) {
-                                child.tile_new(nid, anchor);
-                            }
+                            );
                         }
                         Command::LastTerm => child.toggle_last(),
                         Command::TabCycle => child.cycle_tab(true),
@@ -3057,8 +3078,10 @@ impl WindowManager {
     /// Split: create a new terminal next to the focused window in the tree.
     fn split_dir(&mut self, d: Dir, ctx: &egui::Context) {
         let src = self.focused;
+        // Raw spawn, not `add_terminal`: an explicit directional split always
+        // tiles in that direction — it's not subject to `new_windows_float`.
         let Some(new_id) =
-            self.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx)
+            self.spawn_terminal_win(crate::config::live(ctx).default_shell.to_shell(), ctx)
         else {
             return;
         };
@@ -3370,18 +3393,25 @@ impl WindowManager {
         // merge (tab) target; painted with a highlight to telegraph the drop.
         let mut merge_hint: Option<usize> = None;
 
+        // While the directory picker/renaming/keymap editor/menu is open, no
+        // window is "live" — this stops the focused terminal from consuming
+        // keystrokes meant for the overlay, and (below) stops a hover under
+        // the overlay from stealing focus either.
+        let no_modal = live
+            && self.picker.is_none()
+            && self.renaming.is_none()
+            && self.keymap_editor.is_none()
+            && self.menu.is_none();
+        // Focus-follows-mouse fires only on genuine pointer movement (not a
+        // still cursor under a pane that just re-laid-out) and never while a
+        // button is held (title drag, text selection, divider resize).
+        let follow_mouse = no_modal
+            && crate::config::live(ui.ctx()).focus_follows_mouse
+            && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO && !i.pointer.any_down());
+
         for &i in &order {
             let id = self.windows[i].id;
-            // While the directory picker is open, no window is active — this stops the
-            // focused terminal from also consuming the keystrokes meant for the picker.
-            // While renaming, no window is active so the typed title doesn't also
-            // leak into the focused terminal (which reads raw input events).
-            let is_focus = focused == Some(id)
-                && live
-                && self.picker.is_none()
-                && self.renaming.is_none()
-                && self.keymap_editor.is_none()
-                && self.menu.is_none();
+            let is_focus = focused == Some(id) && no_modal;
             let is_project = self.windows[i].is_project();
             let is_renaming = self.renaming == Some(id);
             // Keep backgrounded tabs (everything but the active tab) alive: their
@@ -3679,6 +3709,8 @@ impl WindowManager {
             };
             let cresp = ui.interact(content_rect, base.with((id, "content")), sense);
             if cresp.clicked() {
+                acts.push(Act::Focus(id));
+            } else if follow_mouse && cresp.hovered() && !is_focus {
                 acts.push(Act::Focus(id));
             }
             let child_interacted = self.windows[i].active_content().show(
@@ -4639,10 +4671,9 @@ impl WindowManager {
                 Act::AddTerm(id, shell) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                         if let Content::Project(wm) = w.active_content() {
-                            let anchor = wm.focused;
-                            if let Some(nid) = wm.add_terminal(shell, ctx) {
-                                wm.tile_new(nid, anchor);
-                            }
+                            // `add_terminal` handles default placement (and
+                            // `new_windows_float`) itself.
+                            wm.add_terminal(shell, ctx);
                         }
                     }
                     self.focus(id);
@@ -6453,6 +6484,25 @@ mod tests {
         assert!(wm.tree.contains(b), "floating b entered the tree");
         let leaves = wm.tree.leaves();
         assert_eq!(leaves, vec![b, a], "b is at the left edge, a to the right");
+    }
+
+    #[test]
+    fn new_terminal_tiles_by_default() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        assert!(wm.tree.contains(id), "must spawn tiled by default");
+    }
+
+    #[test]
+    fn new_terminal_floats_when_setting_says_so() {
+        let ctx = egui::Context::default();
+        let mut s = crate::config::Settings::default();
+        s.new_windows_float = true;
+        crate::config::seed_live(&ctx, &s);
+        let mut wm = WindowManager::new();
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        assert!(!wm.tree.contains(id), "must spawn floating");
     }
 
     #[test]
