@@ -84,6 +84,33 @@ pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
     Ok(())
 }
 
+/// What a bare "new terminal" runs. Custom command lines are a later phase
+/// (Shell is a Copy enum; a String variant ripples through every spawn site).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultShell {
+    PowerShell,
+    Cmd,
+    Sh,
+}
+
+impl DefaultShell {
+    pub fn to_shell(self) -> crate::terminal::Shell {
+        match self {
+            DefaultShell::PowerShell => crate::terminal::Shell::PowerShell,
+            DefaultShell::Cmd => crate::terminal::Shell::Cmd,
+            DefaultShell::Sh => crate::terminal::Shell::Bash,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DefaultShell::PowerShell => "PowerShell",
+            DefaultShell::Cmd => "CMD",
+            DefaultShell::Sh => "SH",
+        }
+    }
+}
+
 /// Persisted app settings (`%APPDATA%\foreman\settings.json`). Flat by design:
 /// `#[serde(default)]` means a missing file, a missing field, or extra fields
 /// written by a newer foreman all load cleanly — so adding a setting later never
@@ -104,6 +131,45 @@ pub struct Settings {
     /// push notification must honor the same key). File-only in v1 — no
     /// settings UI, no leader chord. Missing key = on.
     pub bell: bool,
+    // -- terminal --
+    /// What a bare new terminal spawns.
+    pub default_shell: DefaultShell,
+    /// History kept per pane, in lines.
+    pub scrollback_lines: u32,
+    /// Lines scrolled per wheel notch.
+    pub scroll_speed: f32,
+    /// Font points added/removed per Ctrl+Scroll notch.
+    pub zoom_step: f32,
+    /// Selection lands on the clipboard immediately.
+    pub copy_on_select: bool,
+    /// Confirm before pasting text containing newlines.
+    pub paste_warn_multiline: bool,
+    // -- bell & alerts --
+    /// Seconds for one full breathe of the amber bell pulse.
+    pub bell_period: f32,
+    /// How long a toast notification lingers, in seconds.
+    pub toast_secs: f32,
+    // -- window manager --
+    /// New terminals open floating instead of joining the tiling tree.
+    pub new_windows_float: bool,
+    /// Hovering a pane focuses it without a click.
+    pub focus_follows_mouse: bool,
+    /// Slight darkening on everything but the focused terminal.
+    pub dim_unfocused: bool,
+    // -- agents --
+    /// Write foreman-dispatch/foreman-chat skills into Claude & Codex dirs on launch.
+    pub install_skills: bool,
+    /// Seconds since last heard-from before a Crew member shows its age in amber.
+    pub crew_stale_secs: u32,
+    /// Default quiescence wait for `foreman send` when the caller omits one.
+    pub send_settle_ms: u64,
+    // -- startup --
+    /// Reopen last session's projects and layout on launch.
+    pub restore_workspace: bool,
+    /// Where the directory picker starts browsing (blank = home).
+    pub default_project_dir: String,
+    /// Check GitHub releases for updates in the background on launch.
+    pub update_check: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +180,23 @@ impl Default for Settings {
             panel_width: crate::panel::PANEL_W,
             panel_dock: crate::wm::Dir::Right,
             bell: true,
+            default_shell: DefaultShell::PowerShell,
+            scrollback_lines: 10_000,
+            scroll_speed: 3.0,
+            zoom_step: FONT_ZOOM_STEP,
+            copy_on_select: false,
+            paste_warn_multiline: true,
+            bell_period: 1.2,
+            toast_secs: 6.0,
+            new_windows_float: false,
+            focus_follows_mouse: false,
+            dim_unfocused: false,
+            install_skills: true,
+            crew_stale_secs: 300,
+            send_settle_ms: 120,
+            restore_workspace: true,
+            default_project_dir: String::new(),
+            update_check: true,
         }
     }
 }
@@ -121,13 +204,43 @@ impl Default for Settings {
 impl Settings {
     /// Load from `settings.json`, falling back to defaults on any problem.
     pub fn load() -> Self {
-        load_json(SETTINGS_FILE)
+        let mut s: Self = load_json(SETTINGS_FILE);
+        s.sanitize();
+        s
     }
 
     /// Persist atomically to `settings.json`.
     pub fn save(&self) -> Result<(), String> {
         save_json(SETTINGS_FILE, self)
     }
+
+    /// Clamp every numeric field to its legal range. Runs on load so a
+    /// hand-edited file can't violate invariants (notably: settle must stay
+    /// far below control.rs REPLY_TIMEOUT via wm.rs MAX_SETTLE_MS).
+    pub fn sanitize(&mut self) {
+        self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        self.scrollback_lines = self.scrollback_lines.clamp(100, 1_000_000);
+        self.scroll_speed = self.scroll_speed.clamp(1.0, 30.0);
+        self.zoom_step = self.zoom_step.clamp(0.25, 5.0);
+        self.bell_period = self.bell_period.clamp(0.4, 5.0);
+        self.toast_secs = self.toast_secs.clamp(1.0, 30.0);
+        self.crew_stale_secs = self.crew_stale_secs.clamp(30, 3600);
+        self.send_settle_ms = self.send_settle_ms.min(2000);
+    }
+}
+
+/// Seed the frame's settings into egui context data so deep consumers
+/// (terminal.rs, wm.rs, chat_view.rs) can read them without threading a
+/// parameter through every call. Same pattern as terminal::font_size.
+pub fn seed_live(ctx: &eframe::egui::Context, s: &Settings) {
+    let arc = std::sync::Arc::new(s.clone());
+    ctx.data_mut(|d| d.insert_temp(eframe::egui::Id::new("foreman::settings"), arc));
+}
+
+/// The settings seeded this frame (defaults before the app's first seed).
+pub fn live(ctx: &eframe::egui::Context) -> std::sync::Arc<Settings> {
+    ctx.data_mut(|d| d.get_temp(eframe::egui::Id::new("foreman::settings")))
+        .unwrap_or_else(|| std::sync::Arc::new(Settings::default()))
 }
 
 #[cfg(test)]
@@ -171,5 +284,69 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"font_size": 15.0, "future_setting": true}"#).unwrap();
         assert_eq!(s.font_size, 15.0);
+    }
+
+    #[test]
+    fn new_fields_default_when_missing_from_old_file() {
+        // An old settings.json (font_size only) must load with every new field
+        // at its default — the serde(default) contract.
+        let s: Settings = serde_json::from_str(r#"{ "font_size": 15.0 }"#).unwrap();
+        assert_eq!(s.default_shell, DefaultShell::PowerShell);
+        assert_eq!(s.scrollback_lines, 10_000);
+        assert_eq!(s.scroll_speed, 3.0);
+        assert_eq!(s.zoom_step, 1.0);
+        assert!(!s.copy_on_select);
+        assert!(s.paste_warn_multiline);
+        assert_eq!(s.bell_period, 1.2);
+        assert_eq!(s.toast_secs, 6.0);
+        assert!(!s.new_windows_float);
+        assert!(!s.focus_follows_mouse);
+        assert!(!s.dim_unfocused);
+        assert!(s.install_skills);
+        assert_eq!(s.crew_stale_secs, 300);
+        assert_eq!(s.send_settle_ms, 120);
+        assert!(s.restore_workspace);
+        assert_eq!(s.default_project_dir, "");
+        assert!(s.update_check);
+    }
+
+    #[test]
+    fn sanitize_clamps_hand_edited_values() {
+        let mut s = Settings::default();
+        s.send_settle_ms = 999_999; // must never approach MAX_SETTLE_MS (4000)
+        s.scrollback_lines = 7;
+        s.scroll_speed = 0.0;
+        s.zoom_step = 100.0;
+        s.bell_period = 0.0;
+        s.toast_secs = 0.0;
+        s.crew_stale_secs = 1;
+        s.sanitize();
+        assert_eq!(s.send_settle_ms, 2000);
+        assert_eq!(s.scrollback_lines, 100);
+        assert_eq!(s.scroll_speed, 1.0);
+        assert_eq!(s.zoom_step, 5.0);
+        assert_eq!(s.bell_period, 0.4);
+        assert_eq!(s.toast_secs, 1.0);
+        assert_eq!(s.crew_stale_secs, 30);
+    }
+
+    #[test]
+    fn default_shell_maps_to_terminal_shell() {
+        use crate::terminal::Shell;
+        assert_eq!(DefaultShell::PowerShell.to_shell(), Shell::PowerShell);
+        assert_eq!(DefaultShell::Cmd.to_shell(), Shell::Cmd);
+        assert_eq!(DefaultShell::Sh.to_shell(), Shell::Bash);
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_new_fields() {
+        let mut s = Settings::default();
+        s.default_shell = DefaultShell::Cmd;
+        s.copy_on_select = true;
+        s.default_project_dir = "H:\\claude code".into();
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.default_shell, DefaultShell::Cmd);
+        assert!(back.copy_on_select);
+        assert_eq!(back.default_project_dir, "H:\\claude code");
     }
 }
