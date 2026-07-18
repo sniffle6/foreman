@@ -182,7 +182,7 @@ impl Default for Settings {
             bell: true,
             default_shell: DefaultShell::PowerShell,
             scrollback_lines: 10_000,
-            scroll_speed: 3.0,
+            scroll_speed: crate::input::LINES_PER_NOTCH as f32,
             zoom_step: FONT_ZOOM_STEP,
             copy_on_select: false,
             paste_warn_multiline: true,

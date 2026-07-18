@@ -1872,7 +1872,8 @@ impl Session {
                     crate::input::wheel_steps(self.zoom_accum, dy, crate::input::WHEEL_NOTCH_PX);
                 self.zoom_accum = rem;
                 if steps != 0.0 {
-                    let next = crate::input::zoom_step(font_size(ui.ctx()), steps);
+                    let step_size = crate::config::live(ui.ctx()).zoom_step;
+                    let next = crate::input::zoom_step(font_size(ui.ctx()), steps, step_size);
                     set_font_size(ui.ctx(), next);
                 }
             } else if dy != 0.0 {
@@ -1882,10 +1883,11 @@ impl Session {
                     crate::input::wheel_steps(self.scroll_accum, dy, crate::input::WHEEL_NOTCH_PX);
                 self.scroll_accum = rem;
                 let notches = steps as i32;
+                let lines_per_notch = crate::config::live(ui.ctx()).scroll_speed;
                 if notches != 0 {
                     // Search open: wheel is always local history scroll.
                     if self.search.is_open() {
-                        let lines = notches.saturating_mul(crate::input::LINES_PER_NOTCH);
+                        let lines = (notches as f32 * lines_per_notch).round() as i32;
                         self.term
                             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
                     } else {
@@ -1895,7 +1897,8 @@ impl Session {
                             None => (1, 1),
                         };
                         let mode = *self.term.mode();
-                        let action = crate::input::wheel_input(notches, mode, col, row);
+                        let action =
+                            crate::input::wheel_input(notches, mode, col, row, lines_per_notch);
                         // Hover is the gate (we're inside `resp.hovered()`). Pty
                         // wheel is navigation under the pointer (SGR / arrows), not
                         // typed input — so it is not focus-gated (issue #7). Keyboard
