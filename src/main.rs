@@ -30,6 +30,7 @@ mod ready;
 mod recents;
 mod search;
 mod settings;
+mod settings_menu;
 mod skills_install;
 mod terminal;
 mod terminal_font;
