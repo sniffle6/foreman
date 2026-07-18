@@ -889,7 +889,9 @@ impl WindowManager {
         let mut child = WindowManager::new();
         child.tag = Some(format!("p{}", id));
         child.cwd = Some(cwd);
-        if let Some(tid) = child.add_terminal(Shell::PowerShell, ctx) {
+        if let Some(tid) =
+            child.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx)
+        {
             child.tile_new(tid, None);
             if let Some(w) = child.windows.iter_mut().find(|w| w.id == tid) {
                 if let Some(Content::Terminal(s)) = w.tabs.get_mut(w.active).map(|t| &mut t.content)
@@ -2378,7 +2380,10 @@ impl WindowManager {
                         Command::Rename => child.begin_rename(),
                         Command::NewTerm => {
                             let anchor = child.focused;
-                            if let Some(nid) = child.add_terminal(Shell::PowerShell, &ctx) {
+                            if let Some(nid) = child.add_terminal(
+                                crate::config::live(&ctx).default_shell.to_shell(),
+                                &ctx,
+                            ) {
                                 child.tile_new(nid, anchor);
                             }
                         }
@@ -3052,7 +3057,9 @@ impl WindowManager {
     /// Split: create a new terminal next to the focused window in the tree.
     fn split_dir(&mut self, d: Dir, ctx: &egui::Context) {
         let src = self.focused;
-        let Some(new_id) = self.add_terminal(Shell::PowerShell, ctx) else {
+        let Some(new_id) =
+            self.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx)
+        else {
             return;
         };
         self.place_split(src, new_id, d);
@@ -4686,7 +4693,11 @@ impl WindowManager {
                 Outcome::Cancelled => {}
                 Outcome::Accepted(path) => {
                     let anchor = self.focused;
-                    let nid = self.add_project(Shell::PowerShell, path, ctx);
+                    let nid = self.add_project(
+                        crate::config::live(ctx).default_shell.to_shell(),
+                        path,
+                        ctx,
+                    );
                     self.tile_new(nid, anchor);
                 }
             }

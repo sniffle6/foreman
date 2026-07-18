@@ -882,6 +882,8 @@ impl Session {
             .take_writer()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        let scrollback_lines = crate::config::live(&ctx).scrollback_lines as usize;
+
         let (tx, rx) = channel::<Vec<u8>>();
         std::thread::spawn(move || {
             // 64 KiB: read() returns whatever is already available (never waits
@@ -907,7 +909,10 @@ impl Session {
         let osc_title = Arc::new(Mutex::new(None));
         let bell = Arc::new(Mutex::new(None));
         let term = Term::new(
-            Config::default(),
+            Config {
+                scrolling_history: scrollback_lines,
+                ..Config::default()
+            },
             &Size { cols, rows },
             Listener {
                 out: resp.clone(),
