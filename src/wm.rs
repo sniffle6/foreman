@@ -448,6 +448,10 @@ pub struct WindowManager {
     update_chip: Option<String>,
     /// Latched when the user clicks the chip; App drains it each frame.
     update_clicked: bool,
+    /// Latched when the settings menu's "Check for updates now" is clicked;
+    /// App drains it each frame and fires the fetch through `update_fx` (the
+    /// menu has no path to that channel itself).
+    check_updates_requested: bool,
 }
 
 impl WindowManager {
@@ -483,6 +487,7 @@ impl WindowManager {
             workspace_dirty: false,
             update_chip: None,
             update_clicked: false,
+            check_updates_requested: false,
         }
     }
 
@@ -1825,6 +1830,12 @@ impl WindowManager {
         std::mem::take(&mut self.update_clicked)
     }
 
+    /// Latched when "Check for updates now" is clicked in the settings menu;
+    /// App drains it each frame.
+    pub fn take_check_updates_requested(&mut self) -> bool {
+        std::mem::take(&mut self.check_updates_requested)
+    }
+
     /// Desktop-only, idempotent: create the task-manager panel as a docked
     /// root split if none exists. `dock` is the edge the panel occupies
     /// (`Right` default; `Down` for the bottom strip).
@@ -2210,9 +2221,15 @@ impl WindowManager {
         self.chat.borrow().history(n)
     }
 
-    /// Where the picker opens: the focused project's cwd if there is one, else the
-    /// process working directory, else `.`.
-    fn picker_start(&self) -> PathBuf {
+    /// Where the picker opens: `settings.default_project_dir` when it's set and
+    /// still a real directory (a stale path silently falls back — no error UI);
+    /// else the focused project's cwd if there is one; else the process
+    /// working directory, else `.`.
+    fn picker_start(&self, ctx: &egui::Context) -> PathBuf {
+        let default_dir = crate::config::live(ctx).default_project_dir.clone();
+        if !default_dir.is_empty() && std::path::Path::new(&default_dir).is_dir() {
+            return PathBuf::from(default_dir);
+        }
         self.focused
             .and_then(|id| self.windows.iter().find(|w| w.id == id))
             .and_then(|w| match &w.tabs[w.active].content {
@@ -2378,7 +2395,7 @@ impl WindowManager {
             }
             Command::LastProject => self.toggle_last(),
             Command::NewProject => {
-                self.picker = Some(DirPicker::new(self.picker_start()));
+                self.picker = Some(DirPicker::new(self.picker_start(&ctx)));
             }
             Command::Help => self.show_help = true,
             Command::OpenSettings => self.open_settings(),
@@ -4682,7 +4699,7 @@ impl WindowManager {
                     self.focus(id);
                 }
                 Act::OpenProjectPicker => {
-                    self.picker = Some(DirPicker::new(self.picker_start()));
+                    self.picker = Some(DirPicker::new(self.picker_start(ctx)));
                 }
                 // The titlebar close control closes the *active tab* — which closes
                 // the whole window only when it was the last tab.
@@ -4767,6 +4784,10 @@ impl WindowManager {
                     }
                     MenuOutcome::Changed => {
                         crate::config::seed_live(ui.ctx(), &live_settings);
+                        self.menu = Some(menu);
+                    }
+                    MenuOutcome::CheckUpdatesNow => {
+                        self.check_updates_requested = true;
                         self.menu = Some(menu);
                     }
                     MenuOutcome::Pending => self.menu = Some(menu),
@@ -6663,9 +6684,45 @@ mod tests {
     fn an_open_picker_keeps_the_empty_desktop_alive() {
         let mut m = mgr_with_project(true);
         let id = m.windows[0].id;
-        m.picker = Some(DirPicker::new(m.picker_start()));
+        let ctx = egui::Context::default();
+        m.picker = Some(DirPicker::new(m.picker_start(&ctx)));
         m.close(id);
         assert!(!m.deserted(), "picker may still create a project; no quit");
+    }
+
+    #[test]
+    fn picker_start_prefers_a_valid_default_project_dir() {
+        let m = mgr_with_project(true);
+        let ctx = egui::Context::default();
+        let here = std::env::current_dir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.default_project_dir = here.to_string_lossy().into_owned();
+        crate::config::seed_live(&ctx, &s);
+        assert_eq!(m.picker_start(&ctx), here);
+    }
+
+    #[test]
+    fn picker_start_ignores_a_stale_default_project_dir() {
+        let m = mgr_with_project(true);
+        let ctx = egui::Context::default();
+        let mut s = crate::config::Settings::default();
+        s.default_project_dir = "H:\\this\\path\\does\\not\\exist\\at\\all".into();
+        crate::config::seed_live(&ctx, &s);
+        // Falls back to the focused project's cwd (set by mgr_with_project),
+        // not the stale setting — and never panics or shows an error.
+        assert_ne!(
+            m.picker_start(&ctx).to_string_lossy(),
+            s.default_project_dir
+        );
+    }
+
+    #[test]
+    fn check_updates_requested_latches_and_drains() {
+        let mut m = WindowManager::new();
+        assert!(!m.take_check_updates_requested());
+        m.check_updates_requested = true;
+        assert!(m.take_check_updates_requested());
+        assert!(!m.take_check_updates_requested(), "take drains");
     }
 
     #[test]

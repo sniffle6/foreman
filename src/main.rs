@@ -474,17 +474,21 @@ impl eframe::App for App {
                 o.input_options.zoom_modifier = egui::Modifiers::NONE;
             });
             // Restore prior layout when possible; otherwise auto-open cwd project
-            // unless the landing screen owns the empty desktop.
-            let snap = workspace::WorkspaceSnapshot::load();
+            // unless the landing screen owns the empty desktop. Gated on the
+            // Startup pane's "Restore workspace on launch" toggle — when it's
+            // off, `restored` stays false so the fallback below still runs.
             let mut restored = false;
-            if !snap.is_empty() {
-                let rep = self.desktop.apply_workspace(&snap, &ctx);
-                restored = rep.projects_restored > 0;
-                if rep.projects_skipped > 0 {
-                    eprintln!(
-                        "foreman: restored {} project(s), skipped {}",
-                        rep.projects_restored, rep.projects_skipped
-                    );
+            if self.settings.restore_workspace {
+                let snap = workspace::WorkspaceSnapshot::load();
+                if !snap.is_empty() {
+                    let rep = self.desktop.apply_workspace(&snap, &ctx);
+                    restored = rep.projects_restored > 0;
+                    if rep.projects_skipped > 0 {
+                        eprintln!(
+                            "foreman: restored {} project(s), skipped {}",
+                            rep.projects_restored, rep.projects_skipped
+                        );
+                    }
                 }
             }
             // Task-manager panel is always present (docked leaf); not in the
@@ -571,6 +575,12 @@ impl eframe::App for App {
             for fx in effects {
                 let _ = self.update_fx.send(fx);
             }
+        }
+        // "Check for updates now" (Startup pane): fires the same fetch the
+        // launch check and periodic re-check use, regardless of `update_check`
+        // or the state machine's current state.
+        if self.desktop.take_check_updates_requested() {
+            let _ = self.update_fx.send(update::Effect::FetchLatest);
         }
         if show_landing {
             let content = self.desktop.landing_content_rect(area);
@@ -874,10 +884,12 @@ fn main() -> eframe::Result {
         std::process::exit(control::client_main(&args[1..]));
     }
     install_panic_logger();
-    // Gate on `Settings::install_skills` — takes effect next launch (the menu
-    // row's desc already says "on launch"). Loaded once here, ahead of the
-    // App's own `Settings::load()`, since this runs before any frame exists.
-    if config::Settings::load().install_skills {
+    // Gate on `Settings::install_skills` / `Settings::update_check` — both take
+    // effect next launch (their menu rows already say "on launch"). Loaded once
+    // here, ahead of the App's own `Settings::load()`, since this runs before
+    // any frame exists.
+    let startup_settings = config::Settings::load();
+    if startup_settings.install_skills {
         skills_install::install();
     }
     conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
@@ -910,8 +922,15 @@ fn main() -> eframe::Result {
             let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
             let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
             // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch
-            // (spec section 3 gating). Debug builds never phone home.
-            if !cfg!(debug_assertions) && std::env::var_os("FOREMAN_NO_UPDATE").is_none() {
+            // (spec section 3 gating). Debug builds never phone home. The
+            // Startup pane's "Check for updates on launch" toggle gates the
+            // launch check itself — "Check now" in the menu bypasses this by
+            // sending an Effect straight to the App, which works even when the
+            // worker was never spawned (the send just no-ops).
+            if !cfg!(debug_assertions)
+                && std::env::var_os("FOREMAN_NO_UPDATE").is_none()
+                && startup_settings.update_check
+            {
                 update::spawn(cc.egui_ctx.clone(), upd_event_tx, upd_effect_rx);
             }
             Ok(Box::new(App::new(rx, upd_event_rx, upd_effect_tx)))

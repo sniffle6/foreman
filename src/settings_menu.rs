@@ -429,6 +429,9 @@ pub enum MenuOutcome {
     Changed,
     /// Open the keybindings editor on top of the menu.
     OpenKeybindings,
+    /// "Check for updates now" was clicked — caller fires the fetch through
+    /// `update_fx` (the menu has no path to that channel itself).
+    CheckUpdatesNow,
     /// Close the menu.
     Close,
 }
@@ -442,8 +445,9 @@ fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
         match o {
             MenuOutcome::Pending => 0,
             MenuOutcome::Changed => 1,
-            MenuOutcome::OpenKeybindings => 2,
-            MenuOutcome::Close => 3,
+            MenuOutcome::CheckUpdatesNow => 2,
+            MenuOutcome::OpenKeybindings => 3,
+            MenuOutcome::Close => 4,
         }
     }
     if rank(&new) > rank(cur) {
@@ -618,10 +622,11 @@ impl SettingsMenu {
         self.select_pane(Pane::ALL[i]);
     }
 
-    /// Run an `Action` row. `CheckUpdatesNow` is inert until a later task wires it.
+    /// Run an `Action` row.
     fn do_action(&self, field: Field) -> MenuOutcome {
         match field {
             Field::OpenKeybindings => MenuOutcome::OpenKeybindings,
+            Field::CheckUpdatesNow => MenuOutcome::CheckUpdatesNow,
             Field::OpenConfigFolder => {
                 if let Some(dir) = crate::config::config_dir() {
                     std::process::Command::new("explorer").arg(dir).spawn().ok();
@@ -727,6 +732,18 @@ impl SettingsMenu {
             let anchor_x = r.max.x - pad;
             let cy = r.center().y;
             self.draw_control(ui, spec, s, anchor_x, cy, r, selected, outcome, pane, i);
+        }
+        // Static version stamp, Startup pane only — not a RowSpec (nothing to
+        // navigate to or edit), so it's painted directly below the last row.
+        if pane == Pane::Startup {
+            let y = rect.min.y + specs.len() as f32 * row_h + 20.0;
+            ui.painter().text(
+                egui::pos2(rect.min.x + pad, y),
+                egui::Align2::LEFT_CENTER,
+                format!("Foreman v{}", env!("CARGO_PKG_VERSION")),
+                egui::FontId::proportional(11.0),
+                DIM,
+            );
         }
     }
 
@@ -922,7 +939,6 @@ impl SettingsMenu {
                 }
             }
             Kind::Action => {
-                let disabled = spec.field == Field::CheckUpdatesNow;
                 let caption = match spec.field {
                     Field::OpenKeybindings => "Open editor",
                     Field::OpenConfigFolder => "Open folder",
@@ -940,12 +956,10 @@ impl SettingsMenu {
                     egui::vec2(w, 24.0),
                 );
                 let resp = ui.interact(btn, id, egui::Sense::click());
-                if !disabled && resp.clicked() {
+                if resp.clicked() {
                     bump(outcome, self.do_action(spec.field));
                 }
-                let border = if disabled {
-                    BORDER
-                } else if selected || resp.hovered() {
+                let border = if selected || resp.hovered() {
                     BORDER_FOCUS
                 } else {
                     BORDER
@@ -961,7 +975,7 @@ impl SettingsMenu {
                     egui::Align2::CENTER_CENTER,
                     caption,
                     egui::FontId::proportional(12.5),
-                    if disabled { DIM } else { TEXT },
+                    TEXT,
                 );
             }
         }
@@ -1046,5 +1060,23 @@ mod tests {
         assert_eq!(display(Field::CrewStale, &s), "5 min");
         s.crew_stale_secs = 90;
         assert_eq!(display(Field::CrewStale, &s), "90 s");
+    }
+
+    #[test]
+    fn check_updates_now_action_requests_a_check() {
+        let m = SettingsMenu::new();
+        assert!(matches!(
+            m.do_action(Field::CheckUpdatesNow),
+            MenuOutcome::CheckUpdatesNow
+        ));
+    }
+
+    #[test]
+    fn check_updates_now_outranks_changed_but_not_close() {
+        let mut o = MenuOutcome::Changed;
+        bump(&mut o, MenuOutcome::CheckUpdatesNow);
+        assert!(matches!(o, MenuOutcome::CheckUpdatesNow));
+        bump(&mut o, MenuOutcome::Close);
+        assert!(matches!(o, MenuOutcome::Close));
     }
 }
