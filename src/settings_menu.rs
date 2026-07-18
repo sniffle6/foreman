@@ -473,6 +473,7 @@ impl SettingsMenu {
             .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
 
         egui::Window::new("settings_menu")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
