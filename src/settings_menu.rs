@@ -650,6 +650,7 @@ impl SettingsMenu {
             if resp.clicked() {
                 self.select_pane(*p);
                 self.in_rail = false;
+                self.editing = None; // abandon any inline text edit on pane change
             }
             if active {
                 ui.painter().rect_filled(r, 0.0, SEL_BG);
@@ -680,6 +681,15 @@ impl SettingsMenu {
         outcome: &mut MenuOutcome,
     ) {
         let specs = rows(self.pane);
+        // Safety net: an inline edit is only valid while its own Text row is the
+        // selection. If anything moved the selection away (e.g. a mouse click on
+        // the rail or another control) drop the edit — otherwise its TextEdit
+        // stops being drawn, never loses focus, and the keyboard stays frozen.
+        if self.editing.is_some()
+            && !(!self.in_rail && self.row < specs.len() && specs[self.row].kind == Kind::Text)
+        {
+            self.editing = None;
+        }
         let row_h = 46.0;
         let pad = 18.0;
         let pane = self.pane;
