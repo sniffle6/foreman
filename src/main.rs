@@ -40,7 +40,6 @@ mod wm;
 mod workspace;
 
 use eframe::egui;
-use terminal::Shell;
 use theme::*;
 use wm::WindowManager;
 
