@@ -111,7 +111,12 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   `Ctrl+B` by default (tmux-style).
 - `src/settings.rs` — in-app keybindings editor; a desktop-level modal overlay
   (mirrors the `dirpicker.rs` pattern), edits the live `Keymap` and signals the
-  wm when to persist.
+  wm when to persist. Opened from the settings menu's Keybindings pane.
+- `src/settings_menu.rs` — the settings menu (`Ctrl+B ,`): pure model (panes,
+  row specs, `adjust`/`display`) + egui modal view (rail + panes). Edits
+  `config::Settings` live via `config::seed_live`/`live` (per-frame
+  `Arc<Settings>` in egui ctx data); App saves on a debounce. Full doc:
+  `docs/settings-menu.md`.
 - `src/theme.rs` — every color token (surfaces, border/focus ladder, selection,
   app chrome, chat, ANSI palette) as consts, glob-imported by consumers. Static
   by design — no runtime theme system until a second theme exists.

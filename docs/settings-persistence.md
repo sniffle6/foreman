@@ -15,8 +15,15 @@ setting instead of hand-rolling file I/O again.
 - `save_json(file, &value)` → writes JSON **atomically** (write a `.tmp`, then
   rename over the real file). A crash mid-write leaves the old good file intact.
 - `Settings` → the actual app-settings struct, saved to
-  `%APPDATA%\foreman\settings.json`. Today it holds `font_size`,
-  `panel_collapsed`, `panel_width`, and `panel_dock`.
+  `%APPDATA%\foreman\settings.json`. Holds `font_size`, the panel prefs
+  (`panel_collapsed`/`panel_width`/`panel_dock`), `bell`, and the whole
+  settings-menu phase-1 set (shell, scrollback, zoom/scroll, clipboard, bell
+  timing, WM behaviors, agent knobs, startup gates — see
+  `docs/settings-menu.md` for the full list). `Settings::sanitize()` clamps
+  every numeric field on load so hand-edited files can't violate invariants.
+  `seed_live(ctx, &settings)` / `live(ctx)` park a per-frame `Arc<Settings>`
+  in egui context data so deep consumers (terminal, wm, chat) read settings
+  without parameter threading — same pattern as `terminal::font_size`.
 
 ## Why it exists
 
