@@ -3,6 +3,8 @@
 //! without a GUI. The egui view lives in the same file below (Task 3).
 
 use crate::config::{DefaultShell, Settings};
+use crate::theme::*;
+use eframe::egui;
 
 /// Left-rail categories, in display order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -361,6 +363,9 @@ pub struct SettingsMenu {
     pub pane: Pane,
     pub row: usize,
     pub in_rail: bool,
+    /// When `Some`, an inline text field is open for the selected `Text` row,
+    /// holding the in-progress edit buffer. `None` = browsing.
+    pub editing: Option<String>,
 }
 
 #[allow(dead_code)] // driven by the view (Task 3)
@@ -370,6 +375,7 @@ impl SettingsMenu {
             pane: Pane::Terminal,
             row: 0,
             in_rail: true,
+            editing: None,
         }
     }
 
@@ -399,6 +405,543 @@ impl SettingsMenu {
 impl Default for SettingsMenu {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// View (Task 3): an egui modal over the pure model above. Mirrors the
+// keybindings editor's overlay scaffolding (dim layer, centered panel, full
+// input capture) — see `src/settings.rs`.
+// ---------------------------------------------------------------------------
+
+/// Panel geometry (points). Fixed so the layout reads the same on every pane.
+const WIN_W: f32 = 660.0;
+const RAIL_W: f32 = 190.0;
+const TITLE_H: f32 = 38.0;
+const BODY_H: f32 = 300.0;
+const FOOTER_H: f32 = 30.0;
+
+/// What the settings menu wants the caller (wm) to do after a frame.
+pub enum MenuOutcome {
+    /// Stay open, nothing to persist.
+    Pending,
+    /// A setting changed this frame — caller publishes it + arms the save debounce.
+    Changed,
+    /// Open the keybindings editor on top of the menu.
+    OpenKeybindings,
+    /// Close the menu.
+    Close,
+}
+
+/// Merge a newly-produced outcome into the running one, keeping the
+/// highest-priority (Close > OpenKeybindings > Changed > Pending). Keyboard and
+/// mouse can both fire in one frame; this stops a stray mouse `Changed` from
+/// clobbering a keyboard `Close`.
+fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
+    fn rank(o: &MenuOutcome) -> u8 {
+        match o {
+            MenuOutcome::Pending => 0,
+            MenuOutcome::Changed => 1,
+            MenuOutcome::OpenKeybindings => 2,
+            MenuOutcome::Close => 3,
+        }
+    }
+    if rank(&new) > rank(cur) {
+        *cur = new;
+    }
+}
+
+impl SettingsMenu {
+    /// Render one frame of the settings menu and report what the caller should
+    /// do. `s` is the live settings, mutated in place; a `Changed` outcome means
+    /// the caller republishes it and arms the save debounce.
+    pub fn show(&mut self, ui: &mut egui::Ui, s: &mut Settings) -> MenuOutcome {
+        // Keyboard drives the menu, unless an inline text edit owns input.
+        let mut outcome = if self.editing.is_none() {
+            self.handle_keys(ui, s)
+        } else {
+            MenuOutcome::Pending
+        };
+
+        // Dim the desktop, then draw a centered panel.
+        let screen = ui.ctx().content_rect();
+        ui.painter()
+            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
+
+        egui::Window::new("settings_menu")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::NONE
+                    .fill(WIN_BG)
+                    .stroke(egui::Stroke::new(1.0, BORDER_FOCUS))
+                    .inner_margin(egui::Margin::same(0))
+                    .corner_radius(egui::CornerRadius::same(8)),
+            )
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(WIN_W);
+                ui.set_max_width(WIN_W);
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.visuals_mut().override_text_color = Some(TEXT);
+                // Fixed width (not available_width) so the manual row geometry is
+                // stable on the first frame before the Window has sized itself.
+                let w = WIN_W;
+
+                // --- title band ---
+                let (title, _) =
+                    ui.allocate_exact_size(egui::vec2(w, TITLE_H), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    title,
+                    egui::CornerRadius {
+                        nw: 8,
+                        ne: 8,
+                        sw: 0,
+                        se: 0,
+                    },
+                    TITLE_BG_FOCUS,
+                );
+                ui.painter().text(
+                    egui::pos2(title.min.x + 18.0, title.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("Settings — {}", self.pane.label()),
+                    egui::FontId::proportional(15.0),
+                    TEXT,
+                );
+
+                // --- body: rail | pane ---
+                let (body, _) = ui.allocate_exact_size(egui::vec2(w, BODY_H), egui::Sense::hover());
+                let rail = egui::Rect::from_min_size(body.min, egui::vec2(RAIL_W, BODY_H));
+                let pane =
+                    egui::Rect::from_min_max(egui::pos2(body.min.x + RAIL_W, body.min.y), body.max);
+                self.draw_rail(ui, rail);
+                self.draw_pane(ui, pane, s, &mut outcome);
+
+                // --- footer ---
+                let (footer, _) =
+                    ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
+                ui.painter().line_segment(
+                    [footer.left_top(), footer.right_top()],
+                    egui::Stroke::new(1.0, BORDER),
+                );
+                ui.painter().text(
+                    egui::pos2(footer.min.x + 18.0, footer.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close",
+                    egui::FontId::proportional(11.5),
+                    DIM,
+                );
+            });
+
+        outcome
+    }
+
+    /// Read this frame's navigation/adjust keys and apply them. Returns the
+    /// keyboard-driven outcome; mouse handling in the draw can only raise it.
+    fn handle_keys(&mut self, ui: &egui::Ui, s: &mut Settings) -> MenuOutcome {
+        let (up, down, tab, left, right, enter, esc) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Tab),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+
+        if esc {
+            return MenuOutcome::Close;
+        }
+        if tab {
+            self.nav_tab();
+        }
+
+        if self.in_rail {
+            if up {
+                self.prev_pane();
+            }
+            if down {
+                self.next_pane();
+            }
+            // Enter or → dives from the rail into the pane's rows.
+            if enter || right {
+                self.in_rail = false;
+            }
+            return MenuOutcome::Pending;
+        }
+
+        if up {
+            self.nav_up();
+        }
+        if down {
+            self.nav_down();
+        }
+
+        let spec = rows(self.pane)[self.row];
+        let mut changed = false;
+        if left {
+            changed |= adjust(spec.field, Adjust::Dec, s);
+        }
+        if right {
+            changed |= adjust(spec.field, Adjust::Inc, s);
+        }
+        if enter {
+            match spec.kind {
+                Kind::Toggle => changed |= adjust(spec.field, Adjust::Toggle, s),
+                Kind::Stepper | Kind::Choice => changed |= adjust(spec.field, Adjust::Inc, s),
+                Kind::Text => self.editing = Some(display(spec.field, s)),
+                Kind::Action => return self.do_action(spec.field),
+            }
+        }
+        if changed {
+            MenuOutcome::Changed
+        } else {
+            MenuOutcome::Pending
+        }
+    }
+
+    fn pane_index(&self) -> usize {
+        Pane::ALL.iter().position(|p| *p == self.pane).unwrap_or(0)
+    }
+
+    /// Move the rail selection up a pane (clamps; no wrap, matching row nav).
+    fn prev_pane(&mut self) {
+        let i = self.pane_index().saturating_sub(1);
+        self.select_pane(Pane::ALL[i]);
+    }
+
+    /// Move the rail selection down a pane (clamps at the last pane).
+    fn next_pane(&mut self) {
+        let i = (self.pane_index() + 1).min(Pane::ALL.len() - 1);
+        self.select_pane(Pane::ALL[i]);
+    }
+
+    /// Run an `Action` row. `CheckUpdatesNow` is inert until a later task wires it.
+    fn do_action(&self, field: Field) -> MenuOutcome {
+        match field {
+            Field::OpenKeybindings => MenuOutcome::OpenKeybindings,
+            Field::OpenConfigFolder => {
+                if let Some(dir) = crate::config::config_dir() {
+                    std::process::Command::new("explorer").arg(dir).spawn().ok();
+                }
+                MenuOutcome::Pending
+            }
+            _ => MenuOutcome::Pending,
+        }
+    }
+
+    /// Left rail: one clickable row per pane; the active pane gets a wash and a
+    /// bright left edge.
+    fn draw_rail(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        ui.painter().line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            egui::Stroke::new(1.0, BORDER),
+        );
+        let row_h = 40.0;
+        for (i, p) in Pane::ALL.iter().enumerate() {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x, rect.min.y + i as f32 * row_h),
+                egui::vec2(rect.width(), row_h),
+            );
+            let active = *p == self.pane;
+            let resp = ui.interact(r, egui::Id::new(("settings_rail", i)), egui::Sense::click());
+            if resp.clicked() {
+                self.select_pane(*p);
+                self.in_rail = false;
+            }
+            if active {
+                ui.painter().rect_filled(r, 0.0, SEL_BG);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(r.min, egui::vec2(2.0, row_h)),
+                    0.0,
+                    BORDER_FOCUS,
+                );
+            }
+            let color = if active || resp.hovered() { TEXT } else { DIM };
+            ui.painter().text(
+                egui::pos2(r.min.x + 16.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                p.label(),
+                egui::FontId::proportional(13.5),
+                color,
+            );
+        }
+    }
+
+    /// Right pane: one row per `RowSpec` — label + dim description on the left,
+    /// the kind-specific control on the right.
+    fn draw_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        s: &mut Settings,
+        outcome: &mut MenuOutcome,
+    ) {
+        let specs = rows(self.pane);
+        let row_h = 46.0;
+        let pad = 18.0;
+        let pane = self.pane;
+        let cur_row = self.row;
+        let in_rail = self.in_rail;
+        for (i, spec) in specs.iter().enumerate() {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x, rect.min.y + i as f32 * row_h),
+                egui::vec2(rect.width(), row_h),
+            );
+            let selected = !in_rail && i == cur_row;
+            if selected {
+                ui.painter().rect_filled(
+                    r.shrink2(egui::vec2(6.0, 3.0)),
+                    egui::CornerRadius::same(4),
+                    SEL_BG,
+                );
+            }
+            ui.painter().text(
+                egui::pos2(r.min.x + pad, r.min.y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                spec.label,
+                egui::FontId::proportional(13.0),
+                TEXT,
+            );
+            if !spec.desc.is_empty() {
+                ui.painter().text(
+                    egui::pos2(r.min.x + pad, r.min.y + 32.0),
+                    egui::Align2::LEFT_CENTER,
+                    spec.desc,
+                    egui::FontId::proportional(11.0),
+                    DIM,
+                );
+            }
+            let anchor_x = r.max.x - pad;
+            let cy = r.center().y;
+            self.draw_control(ui, spec, s, anchor_x, cy, r, selected, outcome, pane, i);
+        }
+    }
+
+    /// Draw the control for one row and route its mouse interaction.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        spec: &RowSpec,
+        s: &mut Settings,
+        anchor_x: f32,
+        cy: f32,
+        row_rect: egui::Rect,
+        selected: bool,
+        outcome: &mut MenuOutcome,
+        pane: Pane,
+        idx: usize,
+    ) {
+        let id = egui::Id::new(("settings_ctl", pane.label(), idx));
+        match spec.kind {
+            Kind::Toggle => {
+                let on = display(spec.field, s) == "true";
+                let (w, h) = (34.0, 18.0);
+                let bx = egui::Rect::from_min_size(
+                    egui::pos2(anchor_x - w, cy - h / 2.0),
+                    egui::vec2(w, h),
+                );
+                let resp = ui.interact(bx, id, egui::Sense::click());
+                if resp.clicked() && adjust(spec.field, Adjust::Toggle, s) {
+                    bump(outcome, MenuOutcome::Changed);
+                }
+                let col = if on { BELL } else { BORDER };
+                ui.painter().rect_stroke(
+                    bx,
+                    egui::CornerRadius::same(9),
+                    egui::Stroke::new(1.5, col),
+                    egui::StrokeKind::Inside,
+                );
+                let knob_r = 6.0;
+                let kx = if on {
+                    bx.max.x - knob_r - 2.0
+                } else {
+                    bx.min.x + knob_r + 2.0
+                };
+                ui.painter()
+                    .circle_filled(egui::pos2(kx, cy), knob_r, if on { BELL } else { DIM });
+            }
+            Kind::Stepper => {
+                let val = display(spec.field, s);
+                let plus = egui::Rect::from_min_size(
+                    egui::pos2(anchor_x - 20.0, cy - 10.0),
+                    egui::vec2(20.0, 20.0),
+                );
+                let vw = 88.0;
+                let value_rect = egui::Rect::from_min_size(
+                    egui::pos2(plus.min.x - vw, cy - 10.0),
+                    egui::vec2(vw, 20.0),
+                );
+                let minus = egui::Rect::from_min_size(
+                    egui::pos2(value_rect.min.x - 20.0, cy - 10.0),
+                    egui::vec2(20.0, 20.0),
+                );
+                let rp = ui.interact(plus, id.with("plus"), egui::Sense::click());
+                let rm = ui.interact(minus, id.with("minus"), egui::Sense::click());
+                if rp.clicked() && adjust(spec.field, Adjust::Inc, s) {
+                    bump(outcome, MenuOutcome::Changed);
+                }
+                if rm.clicked() && adjust(spec.field, Adjust::Dec, s) {
+                    bump(outcome, MenuOutcome::Changed);
+                }
+                let border = if selected { BORDER_FOCUS } else { BORDER };
+                for (rc, sym, hov) in [(minus, "−", rm.hovered()), (plus, "+", rp.hovered())] {
+                    ui.painter().rect_stroke(
+                        rc,
+                        egui::CornerRadius::same(4),
+                        egui::Stroke::new(1.0, border),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rc.center(),
+                        egui::Align2::CENTER_CENTER,
+                        sym,
+                        egui::FontId::proportional(14.0),
+                        if hov { TEXT } else { DIM },
+                    );
+                }
+                ui.painter().text(
+                    egui::pos2(value_rect.max.x - 4.0, cy),
+                    egui::Align2::RIGHT_CENTER,
+                    val,
+                    egui::FontId::proportional(12.5),
+                    TEXT,
+                );
+            }
+            Kind::Choice => {
+                let val = display(spec.field, s);
+                let galley = ui.painter().layout_no_wrap(
+                    val.clone(),
+                    egui::FontId::proportional(12.5),
+                    TEXT,
+                );
+                let w = galley.size().x + 24.0;
+                let chip = egui::Rect::from_min_size(
+                    egui::pos2(anchor_x - w, cy - 11.0),
+                    egui::vec2(w, 22.0),
+                );
+                let resp = ui.interact(chip, id, egui::Sense::click());
+                if resp.clicked() && adjust(spec.field, Adjust::Inc, s) {
+                    bump(outcome, MenuOutcome::Changed);
+                }
+                let border = if selected || resp.hovered() {
+                    BORDER_FOCUS
+                } else {
+                    BORDER
+                };
+                ui.painter().rect_stroke(
+                    chip,
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(1.0, border),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    val,
+                    egui::FontId::proportional(12.5),
+                    TEXT,
+                );
+            }
+            Kind::Text => {
+                if self.editing.is_some() && selected {
+                    let te_w = (row_rect.width() - 220.0).clamp(160.0, 300.0);
+                    let te_rect = egui::Rect::from_min_size(
+                        egui::pos2(anchor_x - te_w, cy - 12.0),
+                        egui::vec2(te_w, 24.0),
+                    );
+                    let buf = self.editing.as_mut().unwrap();
+                    let resp = ui.put(te_rect, egui::TextEdit::singleline(buf).desired_width(te_w));
+                    // Canonical egui commit/cancel: Enter loses focus AND is
+                    // pressed → commit; any other focus loss (Esc, click-away)
+                    // cancels. request_focus keeps the field hot until then.
+                    if resp.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            s.default_project_dir = self.editing.take().unwrap();
+                            bump(outcome, MenuOutcome::Changed);
+                        } else {
+                            self.editing = None;
+                        }
+                    } else {
+                        resp.request_focus();
+                    }
+                } else {
+                    let raw = display(spec.field, s);
+                    let shown = if raw.is_empty() {
+                        "(home)".to_string()
+                    } else {
+                        raw
+                    };
+                    let galley = ui.painter().layout_no_wrap(
+                        shown.clone(),
+                        egui::FontId::proportional(12.5),
+                        TEXT,
+                    );
+                    let w = (galley.size().x + 8.0).max(60.0);
+                    let hit = egui::Rect::from_min_size(
+                        egui::pos2(anchor_x - w, cy - 12.0),
+                        egui::vec2(w, 24.0),
+                    );
+                    let resp = ui.interact(hit, id, egui::Sense::click());
+                    if resp.clicked() {
+                        self.editing = Some(display(spec.field, s));
+                    }
+                    ui.painter().text(
+                        egui::pos2(anchor_x, cy),
+                        egui::Align2::RIGHT_CENTER,
+                        shown,
+                        egui::FontId::proportional(12.5),
+                        if resp.hovered() { TEXT } else { DIM },
+                    );
+                }
+            }
+            Kind::Action => {
+                let disabled = spec.field == Field::CheckUpdatesNow;
+                let caption = match spec.field {
+                    Field::OpenKeybindings => "Open editor",
+                    Field::OpenConfigFolder => "Open folder",
+                    Field::CheckUpdatesNow => "Check now",
+                    _ => "Open",
+                };
+                let galley = ui.painter().layout_no_wrap(
+                    caption.to_string(),
+                    egui::FontId::proportional(12.5),
+                    TEXT,
+                );
+                let w = galley.size().x + 24.0;
+                let btn = egui::Rect::from_min_size(
+                    egui::pos2(anchor_x - w, cy - 12.0),
+                    egui::vec2(w, 24.0),
+                );
+                let resp = ui.interact(btn, id, egui::Sense::click());
+                if !disabled && resp.clicked() {
+                    bump(outcome, self.do_action(spec.field));
+                }
+                let border = if disabled {
+                    BORDER
+                } else if selected || resp.hovered() {
+                    BORDER_FOCUS
+                } else {
+                    BORDER
+                };
+                ui.painter().rect_stroke(
+                    btn,
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(1.0, border),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    btn.center(),
+                    egui::Align2::CENTER_CENTER,
+                    caption,
+                    egui::FontId::proportional(12.5),
+                    if disabled { DIM } else { TEXT },
+                );
+            }
+        }
     }
 }
 

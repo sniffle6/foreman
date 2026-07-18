@@ -66,13 +66,13 @@ struct App {
     update_fx: std::sync::mpsc::Sender<update::Effect>,
     /// Current updater state; rendered by the panel chip (a later task).
     update_state: update::State,
-    /// Persisted app settings (terminal font size today). Seeded into egui's
-    /// per-context data each frame and read back to capture Ctrl+Scroll/Ctrl+0
-    /// zoom changes any pane made.
+    /// Persisted app settings. Seeded into egui's per-context data each frame and
+    /// read back to capture edits from any channel: Ctrl+Scroll/Ctrl+0 zoom, panel
+    /// collapse/dock, and the settings menu.
     settings: config::Settings,
-    /// Set when the live font size diverged from `settings`; the change is
-    /// written to disk only after a short debounce so a whole scroll gesture
-    /// persists once, not once per notch.
+    /// Set when the live settings diverged from `settings` (font zoom, panel prefs,
+    /// or a settings-menu edit); the change is written to disk only after a short
+    /// debounce so a whole scroll gesture or a burst of edits persists once.
     font_dirty_at: Option<std::time::Instant>,
     /// Set when the desktop workspace layout changed; written after debounce.
     workspace_dirty_at: Option<std::time::Instant>,
@@ -100,7 +100,8 @@ struct App {
     recents: recents::Recents,
 }
 
-/// Wait this long after the last zoom change before writing `settings.json`.
+/// Wait this long after the last settings change (zoom, panel prefs, or a menu
+/// edit) before writing `settings.json`.
 const FONT_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 /// Wait this long after the last structural workspace change before writing
 /// `workspace.json` (slightly longer than font — capture walks the full tree).
@@ -537,6 +538,9 @@ impl eframe::App for App {
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
         terminal::set_bell_enabled(&ctx, self.settings.bell);
+        // Publish the whole settings struct into ctx data so the settings menu
+        // (in wm) can read + edit it this frame; its edits come back via config::live.
+        config::seed_live(&ctx, &self.settings);
         // Landing when nothing is *visible* (closed or all minimized). Always
         // still run the desktop so the Sessions panel stays docked at its
         // remembered size and minimized PTYs keep pumping; the landing paints
@@ -616,8 +620,17 @@ impl eframe::App for App {
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
         // panel collapse/width, persist after a debounce so a scroll/drag
         // gesture writes the file once.
-        let live = terminal::font_size(&ctx);
         let mut settings_dirty = false;
+        // Adopt any settings-menu edits published this frame (config::seed_live in
+        // wm). Do this first, then let the font-zoom and panel channels override
+        // their own fields below — the menu never touches those, so live_cfg's
+        // copies of them equal this frame's seed and won't stomp a live zoom.
+        let live_cfg = config::live(&ctx);
+        if *live_cfg != self.settings {
+            self.settings = (*live_cfg).clone();
+            settings_dirty = true;
+        }
+        let live = terminal::font_size(&ctx);
         if live != self.settings.font_size {
             self.settings.font_size = live;
             settings_dirty = true;

@@ -115,7 +115,7 @@ impl DefaultShell {
 /// `#[serde(default)]` means a missing file, a missing field, or extra fields
 /// written by a newer foreman all load cleanly — so adding a setting later never
 /// breaks an existing file. Add new fields here as more settings become persisted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Global terminal text size, shared by every pane.

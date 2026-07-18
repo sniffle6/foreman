@@ -1,6 +1,7 @@
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::keymap::{Chord, Command, Keymap};
 use crate::settings::{Outcome as SettingsOutcome, SettingsView};
+use crate::settings_menu::{MenuOutcome, SettingsMenu};
 use crate::terminal::{Session, Shell};
 use crate::theme::*;
 use eframe::egui;
@@ -393,7 +394,11 @@ pub struct WindowManager {
     show_help: bool,
     /// When `Some`, the keybindings editor modal is open (desktop only). Like the
     /// picker, while it is up no terminal is active so its input is fully captured.
-    settings: Option<SettingsView>,
+    /// Opened from the settings menu's Keybindings pane; stacks on top of it.
+    keymap_editor: Option<SettingsView>,
+    /// When `Some`, the settings menu modal is open (desktop only). The primary
+    /// settings surface; the keybindings editor opens on top of it.
+    menu: Option<SettingsMenu>,
     /// Previously-focused window in this manager, for the `Tab` toggle. On the
     /// desktop this is the last project; inside a project, the last terminal.
     last_focused: Option<WinId>,
@@ -461,7 +466,8 @@ impl WindowManager {
             desktop: false,
             armed: false,
             show_help: false,
-            settings: None,
+            keymap_editor: None,
+            menu: None,
             last_focused: None,
             last_area: egui::vec2(0.0, 0.0),
             keymap: Keymap::default(),
@@ -2393,11 +2399,12 @@ impl WindowManager {
         }
     }
 
-    /// Open the keybindings editor modal (desktop only). Closes the read-only
-    /// help overlay if it was up, so the two modals never stack.
+    /// Open the settings menu modal (desktop only). Closes the read-only help
+    /// overlay if it was up, so the two modals never stack. The keybindings
+    /// editor is reached from within the menu's Keybindings pane.
     fn open_settings(&mut self) {
         self.show_help = false;
-        self.settings = Some(SettingsView::new());
+        self.menu = Some(SettingsMenu::new());
     }
 
     /// Mutable borrow of the focused window's child manager, if it is a project.
@@ -2528,7 +2535,8 @@ impl WindowManager {
     pub fn deserted(&self) -> bool {
         self.windows.iter().all(|w| w.is_panel())
             && self.picker.is_none()
-            && self.settings.is_none()
+            && self.keymap_editor.is_none()
+            && self.menu.is_none()
             && self.pending_close.is_none()
     }
 
@@ -2545,7 +2553,8 @@ impl WindowManager {
     pub fn should_show_landing(&self) -> bool {
         !self.has_visible_project()
             && self.picker.is_none()
-            && self.settings.is_none()
+            && self.keymap_editor.is_none()
+            && self.menu.is_none()
             && self.pending_close.is_none()
     }
 
@@ -2652,7 +2661,8 @@ impl WindowManager {
         self.app_modal
             || self.pending_close.is_some()
             || self.picker.is_some()
-            || self.settings.is_some()
+            || self.keymap_editor.is_some()
+            || self.menu.is_some()
             || self.renaming.is_some()
     }
 
@@ -3363,7 +3373,8 @@ impl WindowManager {
                 && live
                 && self.picker.is_none()
                 && self.renaming.is_none()
-                && self.settings.is_none();
+                && self.keymap_editor.is_none()
+                && self.menu.is_none();
             let is_project = self.windows[i].is_project();
             let is_renaming = self.renaming == Some(id);
             // Keep backgrounded tabs (everything but the active tab) alive: their
@@ -4525,7 +4536,8 @@ impl WindowManager {
             && active
             && self.picker.is_none()
             && self.renaming.is_none()
-            && self.settings.is_none()
+            && self.keymap_editor.is_none()
+            && self.menu.is_none()
             // Any focused text field (chat input, rename) owns the keyboard — leader stays dormant.
             && ui.ctx().memory(|m| m.focused().is_none())
         {
@@ -4592,7 +4604,11 @@ impl WindowManager {
         // wrong one), hide the dialog (minimize → app-wide keyboard freeze with no
         // visible modal), or stack a second overlay on top. These fields still hold
         // the pre-open state the frame a modal OPENS, so that opening act applies.
-        if self.app_modal || self.picker.is_some() || self.settings.is_some() {
+        if self.app_modal
+            || self.picker.is_some()
+            || self.keymap_editor.is_some()
+            || self.menu.is_some()
+        {
             return;
         }
         if acts.is_empty() {
@@ -4659,7 +4675,8 @@ impl WindowManager {
     }
 
     /// Desktop-level modal overlays drawn last, on top of everything: the dir
-    /// picker, the keybindings editor, and the leader cue / help cheat-sheet.
+    /// picker, the settings menu, the keybindings editor (stacked over the menu),
+    /// and the leader cue / help cheat-sheet.
     fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
             match picker.show_modal(ui) {
@@ -4675,21 +4692,47 @@ impl WindowManager {
             }
         }
 
-        // --- keybindings editor modal (desktop only) ---
+        // --- settings menu modal (desktop only) ---
+        // Suspended while the keybindings editor is stacked on top: that editor
+        // owns the keyboard and paints its own dim backdrop over the menu, so
+        // drawing the menu here would double-handle this frame's input. The menu
+        // edits a clone of the live settings and republishes it through ctx data
+        // (config::seed_live) so the App's read-back sees the change and debounces
+        // the save — the same channel the font-size zoom publishes through.
+        if self.keymap_editor.is_none() {
+            if let Some(mut menu) = self.menu.take() {
+                let mut live_settings = (*crate::config::live(ui.ctx())).clone();
+                match menu.show(ui, &mut live_settings) {
+                    MenuOutcome::Close => { /* drop it: closed */ }
+                    MenuOutcome::OpenKeybindings => {
+                        self.keymap_editor = Some(SettingsView::new());
+                        self.menu = Some(menu);
+                    }
+                    MenuOutcome::Changed => {
+                        crate::config::seed_live(ui.ctx(), &live_settings);
+                        self.menu = Some(menu);
+                    }
+                    MenuOutcome::Pending => self.menu = Some(menu),
+                }
+                self.swallow_input(ui);
+            }
+        }
+
+        // --- keybindings editor modal (desktop only), stacked over the menu ---
         // The editor reads input itself; afterwards we swallow every keyboard
         // event for the frame so nothing the editor didn't consume can leak to a
         // terminal — the same capture discipline as the picker / help overlay.
-        if let Some(mut settings) = self.settings.take() {
-            let outcome = settings.show(ui, &mut self.keymap);
+        if let Some(mut editor) = self.keymap_editor.take() {
+            let outcome = editor.show(ui, &mut self.keymap);
             match outcome {
                 SettingsOutcome::Close => { /* drop it: closed */ }
                 SettingsOutcome::Changed => {
                     if let Err(e) = self.keymap.save() {
-                        settings.set_save_error(e);
+                        editor.set_save_error(e);
                     }
-                    self.settings = Some(settings);
+                    self.keymap_editor = Some(editor);
                 }
-                SettingsOutcome::Pending => self.settings = Some(settings),
+                SettingsOutcome::Pending => self.keymap_editor = Some(editor),
             }
             self.swallow_input(ui);
         }
