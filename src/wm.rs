@@ -3450,7 +3450,13 @@ impl WindowManager {
                     ui.painter_at(scr.intersect(area)).rect_stroke(
                         scr.shrink(1.0),
                         egui::CornerRadius::ZERO,
-                        egui::Stroke::new(2.0, bell_pulse(ui.input(|inp| inp.time))),
+                        egui::Stroke::new(
+                            2.0,
+                            bell_pulse(
+                                ui.input(|inp| inp.time),
+                                crate::config::live(ui.ctx()).bell_period as f64,
+                            ),
+                        ),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -3785,7 +3791,10 @@ impl WindowManager {
                     // rect so they win pointer priority; dragging a chip off
                     // the bar detaches it (untab).
                     let bell_gate = crate::terminal::bell_enabled(ui.ctx());
-                    let bell_col = bell_pulse(ui.input(|inp| inp.time));
+                    let bell_col = bell_pulse(
+                        ui.input(|inp| inp.time),
+                        crate::config::live(ui.ctx()).bell_period as f64,
+                    );
                     for ch in chips {
                         let ti = ch.idx;
                         let chip = ch.rect;
@@ -4226,7 +4235,10 @@ impl WindowManager {
             let border_col = if bell_on {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(30));
-                bell_pulse(ui.input(|inp| inp.time))
+                bell_pulse(
+                    ui.input(|inp| inp.time),
+                    crate::config::live(ui.ctx()).bell_period as f64,
+                )
             } else if is_focus {
                 if is_project {
                     PROJ_BORDER_FOCUS

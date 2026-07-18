@@ -538,6 +538,8 @@ impl eframe::App for App {
         // Make the persisted font size the live value every pane reads this frame.
         terminal::set_font_size(&ctx, self.settings.font_size);
         terminal::set_bell_enabled(&ctx, self.settings.bell);
+        self.notify
+            .set_ttl(std::time::Duration::from_secs_f32(self.settings.toast_secs));
         // Publish the whole settings struct into ctx data so the settings menu
         // (in wm) can read + edit it this frame; its edits come back via config::live.
         config::seed_live(&ctx, &self.settings);

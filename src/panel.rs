@@ -404,7 +404,10 @@ impl PanelView {
                 p.circle_filled(
                     egui::pos2(cell.max.x - 3.0, cell.min.y + 3.0),
                     3.0,
-                    bell_pulse(ui.input(|i| i.time)),
+                    bell_pulse(
+                        ui.input(|i| i.time),
+                        crate::config::live(ui.ctx()).bell_period as f64,
+                    ),
                 );
             }
             if resp.clicked() {
@@ -665,7 +668,10 @@ impl PanelView {
                 p.circle_filled(
                     egui::pos2(chip_rect.max.x - 4.0, chip_rect.min.y + 4.0),
                     3.0,
-                    bell_pulse(ui.input(|i| i.time)),
+                    bell_pulse(
+                        ui.input(|i| i.time),
+                        crate::config::live(ui.ctx()).bell_period as f64,
+                    ),
                 );
             }
             if resp.clicked() {
@@ -762,7 +768,10 @@ impl PanelView {
                 ip.circle_filled(
                     egui::pos2(cell.max.x - 3.0, cell.min.y + 3.0),
                     3.0,
-                    bell_pulse(ui.input(|i| i.time)),
+                    bell_pulse(
+                        ui.input(|i| i.time),
+                        crate::config::live(ui.ctx()).bell_period as f64,
+                    ),
                 );
             }
             if resp.clicked() {
@@ -948,7 +957,10 @@ impl PanelView {
             p.circle_filled(
                 egui::pos2(row.max.x - 12.0, row.center().y),
                 3.5,
-                bell_pulse(ui.input(|i| i.time)),
+                bell_pulse(
+                    ui.input(|i| i.time),
+                    crate::config::live(ui.ctx()).bell_period as f64,
+                ),
             );
         } else if rp.minimized {
             p.text(

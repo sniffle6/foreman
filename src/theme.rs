@@ -61,10 +61,11 @@ pub const BELL: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
 pub const BELL_PERIOD: f64 = 1.2;
 
 /// Bell pulse animation: breathe [`BELL`] between ~40% and full strength on a
-/// [`BELL_PERIOD`] cycle. Pure function of wall-clock seconds (egui
+/// `period`-second cycle (settings `bell_period`; [`BELL_PERIOD`] is the
+/// documented default). Pure function of wall-clock seconds (egui
 /// `input.time`) so every pulsing surface breathes in sync.
-pub fn bell_pulse(t: f64) -> egui::Color32 {
-    let phase = 0.5 + 0.5 * (t * std::f64::consts::TAU / BELL_PERIOD).sin();
+pub fn bell_pulse(t: f64, period: f64) -> egui::Color32 {
+    let phase = 0.5 + 0.5 * (t * std::f64::consts::TAU / period).sin();
     BELL.gamma_multiply(0.4 + 0.6 * phase as f32)
 }
 /// Scrollback indicator thumb at a pane's right edge.
@@ -78,13 +79,19 @@ mod tests {
     fn bell_pulse_breathes_within_the_bell_color() {
         // Peak (sin=1 at t=P/4) is full BELL; trough (t=3P/4) is dimmer but
         // never black — the pulse must stay visible at its low point.
-        let peak = bell_pulse(BELL_PERIOD / 4.0);
-        let trough = bell_pulse(3.0 * BELL_PERIOD / 4.0);
+        let peak = bell_pulse(BELL_PERIOD / 4.0, BELL_PERIOD);
+        let trough = bell_pulse(3.0 * BELL_PERIOD / 4.0, BELL_PERIOD);
         assert_eq!(peak, BELL, "peak of the breathe is the full bell color");
         assert!(trough.r() < BELL.r(), "trough must dim");
         assert!(trough.r() > 60, "trough must stay clearly visible");
         // Same hue family throughout: warm, R > G > B.
         assert!(trough.r() > trough.g() && trough.g() > trough.b());
+    }
+
+    #[test]
+    fn custom_period_shifts_the_peak_by_the_same_phase() {
+        // Same phase (t/period) → same color, whatever the period.
+        assert_eq!(bell_pulse(0.5, 2.0), bell_pulse(0.25, 1.0));
     }
 }
 

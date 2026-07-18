@@ -45,11 +45,23 @@ struct Toast {
 /// The notification center. Owned by `App`; rendered on top of everything.
 pub struct Notifications {
     toasts: Vec<Toast>,
+    /// How long a toast lingers before it auto-dismisses (settings `toast_secs`);
+    /// `TTL` is the default until `App` seeds a live value.
+    ttl: Duration,
 }
 
 impl Notifications {
     pub fn new() -> Self {
-        Self { toasts: Vec::new() }
+        Self {
+            toasts: Vec::new(),
+            ttl: TTL,
+        }
+    }
+
+    /// Publish the live toast duration (settings `toast_secs`), seeded once per
+    /// frame before `show`.
+    pub fn set_ttl(&mut self, d: Duration) {
+        self.ttl = d;
     }
 
     /// Queue a toast. Deduped by (level, text) so a repeated error doesn't
@@ -73,7 +85,7 @@ impl Notifications {
     /// Drop toasts older than the TTL. Pure — the tested seam.
     fn prune(&mut self, now: Instant) {
         self.toasts
-            .retain(|t| now.saturating_duration_since(t.born) < TTL);
+            .retain(|t| now.saturating_duration_since(t.born) < self.ttl);
     }
 
     /// Prune expired toasts and paint the rest as a top-right overlay. Call once
@@ -137,6 +149,18 @@ mod tests {
         assert_eq!(n.toasts.len(), 1, "still live within the TTL");
         n.prune(t0 + TTL + Duration::from_secs(1));
         assert_eq!(n.toasts.len(), 0, "dropped past the TTL");
+    }
+
+    #[test]
+    fn set_ttl_prunes_at_the_custom_duration() {
+        let mut n = Notifications::new();
+        n.set_ttl(Duration::from_secs(1));
+        let t0 = Instant::now();
+        n.push(Level::Error, "boom", t0);
+        n.prune(t0 + Duration::from_millis(500));
+        assert_eq!(n.toasts.len(), 1, "still live within the custom TTL");
+        n.prune(t0 + Duration::from_secs(2));
+        assert_eq!(n.toasts.len(), 0, "dropped past the custom TTL");
     }
 
     #[test]
