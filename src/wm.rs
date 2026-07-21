@@ -1650,9 +1650,13 @@ impl WindowManager {
 
     /// Apply a settings-window lifecycle outcome recorded during the draw
     /// (content cannot mutate the WM mid-loop — same discipline as
-    /// `drain_chat_clicks`). Close removes the window; OpenKeybindings stacks
-    /// the modal editor; CheckUpdatesNow latches the update fetch.
-    fn drain_settings(&mut self) {
+    /// `drain_chat_clicks`). Close removes only the settings tab (per-tab, like
+    /// Chat, so a co-tabbed project survives); OpenKeybindings stacks the modal
+    /// editor; CheckUpdatesNow latches the update fetch. Returns true iff it
+    /// opened the keybindings editor this frame, so the caller can swallow the
+    /// triggering keystroke before the editor reads input (else a keyboard-opened
+    /// editor would instantly start leader capture).
+    fn drain_settings(&mut self) -> bool {
         let mut found = None;
         for w in &mut self.windows {
             for t in &mut w.tabs {
@@ -1663,12 +1667,23 @@ impl WindowManager {
                 }
             }
         }
-        let Some((id, outcome)) = found else { return };
+        let Some((id, outcome)) = found else {
+            return false;
+        };
         match outcome {
-            MenuOutcome::Close => self.close(id),
-            MenuOutcome::OpenKeybindings => self.keymap_editor = Some(SettingsView::new()),
-            MenuOutcome::CheckUpdatesNow => self.check_updates_requested = true,
-            _ => {}
+            MenuOutcome::Close => {
+                self.request_close_active_tab(id);
+                false
+            }
+            MenuOutcome::OpenKeybindings => {
+                self.keymap_editor = Some(SettingsView::new());
+                true
+            }
+            MenuOutcome::CheckUpdatesNow => {
+                self.check_updates_requested = true;
+                false
+            }
+            _ => false,
         }
     }
 
@@ -4547,7 +4562,9 @@ impl WindowManager {
         // the fixed order that lets the member, not the viewer, end up focused.
         self.drain_chat_clicks();
         self.drain_chat_posts();
-        self.drain_settings();
+        if self.drain_settings() {
+            self.swallow_input(ui);
+        }
         // Remember expanded panel extent + dock edge from the live tree.
         if self.desktop {
             self.sync_panel_width_from_layout();
@@ -7139,6 +7156,56 @@ mod tests {
         wm.open_settings();
         assert_eq!(count(&wm), 1);
         assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn settings_esc_close_spares_co_tabbed_project() {
+        let mut wm = WindowManager::new();
+        let id = push(&mut wm, "proj"); // Content::Project stub (tab 0)
+        let mut menu = SettingsMenu::new();
+        menu.pending = Some(MenuOutcome::Close);
+        let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+        w.tabs.push(Tab::fixed("Settings", Content::Settings(menu)));
+        w.active = w.tabs.len() - 1; // Settings tab is active/focused
+        wm.drain_settings();
+        let w = wm
+            .windows
+            .iter()
+            .find(|w| w.id == id)
+            .expect("the window must survive — only its Settings tab should close");
+        assert!(
+            !w.tabs
+                .iter()
+                .any(|t| matches!(t.content, Content::Settings(_))),
+            "the settings tab must be gone"
+        );
+        assert!(
+            w.tabs
+                .iter()
+                .any(|t| matches!(t.content, Content::Project(_))),
+            "the co-tabbed project must survive Esc on the settings tab"
+        );
+    }
+
+    #[test]
+    fn drain_settings_opens_keybindings_editor() {
+        let mut wm = WindowManager::new();
+        wm.open_settings();
+        let w = wm
+            .windows
+            .iter_mut()
+            .find(|w| {
+                w.tabs
+                    .iter()
+                    .any(|t| matches!(t.content, Content::Settings(_)))
+            })
+            .unwrap();
+        let Content::Settings(menu) = &mut w.tabs[w.active].content else {
+            panic!("expected the settings tab");
+        };
+        menu.pending = Some(MenuOutcome::OpenKeybindings);
+        assert!(wm.drain_settings(), "opening the editor must be reported");
+        assert!(wm.keymap_editor.is_some());
     }
 
     #[test]
