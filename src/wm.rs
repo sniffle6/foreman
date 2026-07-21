@@ -4783,7 +4783,9 @@ impl WindowManager {
         if self.keymap_editor.is_none() {
             if let Some(mut menu) = self.menu.take() {
                 let mut live_settings = (*crate::config::live(ui.ctx())).clone();
-                match menu.show(ui, &mut live_settings) {
+                let sz = SettingsMenu::size();
+                let rect = egui::Rect::from_center_size(area.center(), sz);
+                match menu.show(ui, rect, true, &mut live_settings) {
                     MenuOutcome::Close => { /* drop it: closed */ }
                     MenuOutcome::OpenKeybindings => {
                         self.keymap_editor = Some(SettingsView::new());

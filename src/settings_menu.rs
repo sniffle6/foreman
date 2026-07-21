@@ -471,84 +471,75 @@ impl SettingsMenu {
     /// Render one frame of the settings menu and report what the caller should
     /// do. `s` is the live settings, mutated in place; a `Changed` outcome means
     /// the caller republishes it and arms the save debounce.
-    pub fn show(&mut self, ui: &mut egui::Ui, s: &mut Settings) -> MenuOutcome {
-        // Keyboard drives the menu, unless an inline text edit owns input.
-        let mut outcome = if self.editing.is_none() {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        active: bool,
+        s: &mut Settings,
+    ) -> MenuOutcome {
+        // Keyboard drives the menu only when this window is focused and no
+        // inline text edit owns input.
+        let mut outcome = if active && self.editing.is_none() {
             self.handle_keys(ui, s)
         } else {
             MenuOutcome::Pending
         };
 
-        // Dim the desktop, then draw a centered panel.
-        let screen = ui.ctx().content_rect();
-        ui.painter()
-            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
+        // Fill the window body (the WM draws the header/border chrome around it).
+        ui.painter_at(rect).rect_filled(rect, 0.0, WIN_BG);
 
-        egui::Window::new("settings_menu")
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::NONE
-                    .fill(WIN_BG)
-                    .stroke(egui::Stroke::new(1.0, BORDER_FOCUS))
-                    .inner_margin(egui::Margin::same(0))
-                    .corner_radius(egui::CornerRadius::same(8)),
-            )
-            .show(ui.ctx(), |ui| {
-                ui.set_min_width(WIN_W);
-                ui.set_max_width(WIN_W);
-                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                ui.visuals_mut().override_text_color = Some(TEXT);
-                // Fixed width (not available_width) so the manual row geometry is
-                // stable on the first frame before the Window has sized itself.
-                let w = WIN_W;
+        // A scoped child UI bounded to `rect` so `override_text_color`/spacing
+        // mutations stay local and never leak to sibling windows drawn later in
+        // the same parent `ui` (idiom: landing.rs `ui.new_child`).
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let ui = &mut child;
+        ui.set_min_width(WIN_W);
+        ui.set_max_width(WIN_W);
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+        ui.visuals_mut().override_text_color = Some(TEXT);
+        let w = WIN_W;
 
-                // --- title band ---
-                let (title, _) =
-                    ui.allocate_exact_size(egui::vec2(w, TITLE_H), egui::Sense::hover());
-                ui.painter().rect_filled(
-                    title,
-                    egui::CornerRadius {
-                        nw: 8,
-                        ne: 8,
-                        sw: 0,
-                        se: 0,
-                    },
-                    TITLE_BG_FOCUS,
-                );
-                ui.painter().text(
-                    egui::pos2(title.min.x + 18.0, title.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    format!("Settings — {}", self.pane.label()),
-                    egui::FontId::proportional(15.0),
-                    TEXT,
-                );
+        // --- title band ---
+        let (title, _) = ui.allocate_exact_size(egui::vec2(w, TITLE_H), egui::Sense::hover());
+        ui.painter().rect_filled(
+            title,
+            egui::CornerRadius {
+                nw: 8,
+                ne: 8,
+                sw: 0,
+                se: 0,
+            },
+            TITLE_BG_FOCUS,
+        );
+        ui.painter().text(
+            egui::pos2(title.min.x + 18.0, title.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("Settings — {}", self.pane.label()),
+            egui::FontId::proportional(15.0),
+            TEXT,
+        );
 
-                // --- body: rail | pane ---
-                let (body, _) = ui.allocate_exact_size(egui::vec2(w, BODY_H), egui::Sense::hover());
-                let rail = egui::Rect::from_min_size(body.min, egui::vec2(RAIL_W, BODY_H));
-                let pane =
-                    egui::Rect::from_min_max(egui::pos2(body.min.x + RAIL_W, body.min.y), body.max);
-                self.draw_rail(ui, rail);
-                self.draw_pane(ui, pane, s, &mut outcome);
+        // --- body: rail | pane ---
+        let (body, _) = ui.allocate_exact_size(egui::vec2(w, BODY_H), egui::Sense::hover());
+        let rail = egui::Rect::from_min_size(body.min, egui::vec2(RAIL_W, BODY_H));
+        let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + RAIL_W, body.min.y), body.max);
+        self.draw_rail(ui, rail);
+        self.draw_pane(ui, pane, s, &mut outcome);
 
-                // --- footer ---
-                let (footer, _) =
-                    ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
-                ui.painter().line_segment(
-                    [footer.left_top(), footer.right_top()],
-                    egui::Stroke::new(1.0, BORDER),
-                );
-                ui.painter().text(
-                    egui::pos2(footer.min.x + 18.0, footer.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close",
-                    egui::FontId::proportional(11.5),
-                    DIM,
-                );
-            });
+        // --- footer ---
+        let (footer, _) = ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
+        ui.painter().line_segment(
+            [footer.left_top(), footer.right_top()],
+            egui::Stroke::new(1.0, BORDER),
+        );
+        ui.painter().text(
+            egui::pos2(footer.min.x + 18.0, footer.center().y),
+            egui::Align2::LEFT_CENTER,
+            "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close",
+            egui::FontId::proportional(11.5),
+            DIM,
+        );
 
         outcome
     }
