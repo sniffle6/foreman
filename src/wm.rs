@@ -125,6 +125,9 @@ pub enum Content {
     /// Desktop-level task-manager panel (project/tab list). At most one per
     /// desktop; non-closable / non-minimizable / non-tabbable.
     TaskManager(crate::panel::PanelView),
+    /// The settings menu as a desktop-level window (open-or-focus singleton).
+    /// Floating/closable/tabbable like Chat; not persisted (see capture_manager).
+    Settings(crate::settings_menu::SettingsMenu),
 }
 impl Content {
     /// Returns whether a window in this content was interacted with this frame.
@@ -163,6 +166,7 @@ impl Content {
                 view.show(ui, rect, base.with((win_id, "panel")));
                 false
             }
+            Content::Settings(_) => false,
         }
     }
 
@@ -175,7 +179,7 @@ impl Content {
             Content::Terminal(s) => s.keepalive(),
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
-            Content::TaskManager(_) => {}
+            Content::TaskManager(_) | Content::Settings(_) => {}
         }
     }
 
@@ -187,6 +191,7 @@ impl Content {
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
             Content::TaskManager(_) => None,
+            Content::Settings(_) => None,
         }
     }
 
@@ -526,7 +531,7 @@ impl WindowManager {
             let mut new_active = 0usize;
             let mut found_active = false;
             for (i, t) in w.tabs.iter().enumerate() {
-                if matches!(t.content, Content::TaskManager(_)) {
+                if matches!(t.content, Content::TaskManager(_) | Content::Settings(_)) {
                     continue;
                 }
                 if i == w.active {
@@ -541,7 +546,9 @@ impl WindowManager {
                     Content::Project(child) => ContentSnap::Project {
                         child: child.capture_manager(),
                     },
-                    Content::TaskManager(_) => unreachable!("filtered above"),
+                    Content::TaskManager(_) | Content::Settings(_) => {
+                        unreachable!("filtered above")
+                    }
                 };
                 tabs.push(TabSnap {
                     title: t.title.clone(),
@@ -1782,7 +1789,7 @@ impl WindowManager {
                             Content::Project(_) => {
                                 RowKind::Terminal(crate::icons::IconKind::Folder)
                             }
-                            Content::TaskManager(_) => continue,
+                            Content::TaskManager(_) | Content::Settings(_) => continue,
                         };
                         tabs.push(TabEntry {
                             path: TargetPath {
@@ -2183,7 +2190,7 @@ impl WindowManager {
                         ready: s.ready(),
                         exited: s.exited().is_some(),
                     }),
-                    Content::Chat(_) | Content::TaskManager(_) => {} // not members
+                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {} // not members
                 }
             }
         }
@@ -3284,7 +3291,7 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),
-                    Content::Chat(_) | Content::TaskManager(_) => {} // no process
+                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {} // no process
                 }
             }
         }
@@ -3307,7 +3314,7 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_auto_titles(),
-                    Content::Chat(_) | Content::TaskManager(_) => {}
+                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {}
                 }
             }
         }
@@ -5465,7 +5472,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
             }
         }
         Content::Project(wm) => wm.terminal_groups(),
-        Content::Chat(_) | Content::TaskManager(_) => Vec::new(),
+        Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => Vec::new(),
     }
 }
 
@@ -5663,6 +5670,32 @@ mod tests {
             crate::workspace::ContentSnap::Chat
         ));
         assert_eq!(snap.windows[0].id, id);
+    }
+
+    #[test]
+    fn capture_workspace_excludes_settings() {
+        let mut m = WindowManager::new();
+        let id = m.next;
+        m.next += 1;
+        m.z += 1;
+        m.windows.push(Win {
+            id,
+            tabs: vec![Tab::fixed(
+                "Settings",
+                Content::Settings(crate::settings_menu::SettingsMenu::new()),
+            )],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
+            z: m.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let snap = crate::workspace::capture_manager(&m);
+        assert!(
+            snap.windows.iter().all(|w| w.id != id),
+            "a settings window must be omitted from the workspace snapshot"
+        );
     }
 
     #[test]

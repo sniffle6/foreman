@@ -366,6 +366,10 @@ pub struct SettingsMenu {
     /// When `Some`, an inline text field is open for the selected `Text` row,
     /// holding the in-progress edit buffer. `None` = browsing.
     pub editing: Option<String>,
+    /// A window-lifecycle outcome (Close / OpenKeybindings / CheckUpdatesNow)
+    /// produced this frame, stashed for the WM's `drain_settings` to act on
+    /// after the render loop (content cannot mutate the WM mid-loop).
+    pub pending: Option<MenuOutcome>,
 }
 
 #[allow(dead_code)] // driven by the view (Task 3)
@@ -376,7 +380,14 @@ impl SettingsMenu {
             row: 0,
             in_rail: true,
             editing: None,
+            pending: None,
         }
+    }
+
+    /// The menu's intrinsic content size (title + body + footer bands), used to
+    /// size the floating window when it is first opened.
+    pub fn size() -> egui::Vec2 {
+        egui::vec2(WIN_W, TITLE_H + BODY_H + FOOTER_H)
     }
 
     /// Move up one row in the current pane; clamps at 0 (no wrap).
@@ -422,6 +433,7 @@ const BODY_H: f32 = 300.0;
 const FOOTER_H: f32 = 30.0;
 
 /// What the settings menu wants the caller (wm) to do after a frame.
+#[derive(Clone, Debug)]
 pub enum MenuOutcome {
     /// Stay open, nothing to persist.
     Pending,
