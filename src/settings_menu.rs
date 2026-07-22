@@ -530,7 +530,7 @@ impl SettingsMenu {
         ui.painter().text(
             egui::pos2(title.min.x + 18.0, title.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("Settings — {}", self.pane.label()),
+            self.pane.label(),
             egui::FontId::proportional(15.0),
             TEXT,
         );
