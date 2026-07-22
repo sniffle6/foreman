@@ -177,7 +177,12 @@ impl Content {
                     MenuOutcome::Pending => {}
                     other => menu.pending = Some(other),
                 }
-                false
+                // A control (toggle/stepper/rail) consumes its click before the
+                // window-level content Response sees it, so clicking a control in
+                // an *unfocused* settings window wouldn't raise focus and keyboard
+                // nav would stay dead. Report any click inside our rect as an
+                // interaction so the manager focuses this window (Act::Focus).
+                ui.rect_contains_pointer(rect) && ui.input(|i| i.pointer.any_click())
             }
         }
     }
