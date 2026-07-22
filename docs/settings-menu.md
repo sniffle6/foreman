@@ -14,9 +14,14 @@ doesn't block the terminals behind it — so live-apply is visible while you dra
 a value. Fully keyboard-driven when focused; mouse works everywhere.
 
 The layout is **reactive to the window size**: the bands span the window's
-width, the footer pins to the bottom, and the pane **scrolls** when the window
-is too short to show every row (keyboard nav auto-scrolls the selected row into
-view). The window opens at its natural size but can be freely resized/maximized.
+width, the footer pins to the bottom, and the pane **scrolls** — vertically
+when the window is too short to show every row (keyboard nav auto-scrolls the
+selected row into view), and horizontally when it's too narrow to fit a row's
+label and control (the rows hold a comfortable minimum width, `PANE_MIN_W`).
+A floating settings window also has a **larger resize floor** than other
+windows (`SettingsMenu::min_size()`, built on `PANE_MIN_W`) so dragging its edge
+can't cramp it; the horizontal scroll is mainly for the **tiled** case, where
+the layout tree can force a narrow column. The window opens at its natural size.
 
 `OpenSettings` is **open-or-focus**: it raises the existing settings window (and
 un-minimizes it) instead of opening a second one — the same singleton pattern as
