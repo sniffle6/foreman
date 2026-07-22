@@ -46,7 +46,7 @@ on purpose — a user slider on those creates support tickets, not value).
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
-| Keybindings | "Edit keybindings…" — opens the existing editor on top of the menu |
+| Keybindings | The keybindings editor, inline — leader, per-command chords, conflicts, reset-one / reset-all |
 | Agents | Install skills on launch (on); crew stale after (5 min); send settle default (120 ms) |
 | Startup & Updates | Restore workspace (on); default project directory (blank = old behavior); update check on launch (on); Check now; open settings folder; version |
 
@@ -76,10 +76,16 @@ on purpose — a user slider on those creates support tickets, not value).
 - **Esc / close on a tab-stacked settings window closes only the settings
   tab**, not a co-tabbed project — it routes through the normal per-tab close
   (`request_close_active_tab`), same as clicking the header close button.
-- **The keybindings editor is still a modal** stacked on top (chord capture
-  needs to steal all input); it opens from the Keybindings pane's "Edit
-  keybindings…" and the keystroke that opens it is swallowed so it doesn't
-  immediately start capturing.
+- **The keybindings editor IS the Keybindings pane** (no longer a modal). While
+  binding a key, chord capture briefly grabs all keyboard input — the leader is
+  suppressed (`settings_capturing()`) so any chord, including the leader itself,
+  is captured instead of dispatched. `Esc` cancels a capture / backs out to the
+  rail (it never closes the window while the editor is focused). Clicking a
+  window away *mid-capture* **freezes** the capture — it resumes when the
+  settings window is refocused — rather than cancelling it.
+- **The keybindings editor only reads input when the settings window is
+  focused** (like every other pane). An unfocused Keybindings pane is inert, so
+  typing in a terminal beside it can't drive the hidden editor.
 
 ## Key files
 
@@ -88,11 +94,15 @@ on purpose — a user slider on those creates support tickets, not value).
   window rect via a scoped child UI, rail, rows, text edit).
 - `src/wm.rs` — the window integration: `Content::Settings` variant,
   `open_settings` (open-or-focus singleton), the `Content::show` arm (reads
-  `config::live`, edits a clone, re-seeds on change), and `drain_settings`
-  (per-frame: close the tab / open the keybindings editor / check updates).
+  `config::live` + `keymap::live`, edits clones, re-seeds on change),
+  `drain_settings` (per-frame: close the tab / check updates), the keymap
+  read-back + save in `show`, and `settings_capturing()` gating the leader.
 - `src/config.rs` — the `Settings` struct, defaults, `sanitize()` clamps,
   `seed_live`/`live` (per-frame settings access for deep consumers).
-- `src/settings.rs` — the keybindings editor the menu opens for chords.
+- `src/keymap.rs` — the keymap + `seed_live`/`live` (the same ctx seam as
+  settings, carrying keymap edits from the inline editor back to the wm to save).
+- `src/settings.rs` — the keybindings editor, embedded in the Keybindings pane
+  (`SettingsMenu.keybindings`), drawn inline into the pane rect.
 - Consumers: `src/wm.rs` (shell default, float default, focus-follows-mouse,
   settle), `src/terminal.rs` (scrollback, zoom/scroll, copy-on-select, paste
   gate, dim), `src/theme.rs` (`bell_pulse` period, `DIM_UNFOCUSED`),

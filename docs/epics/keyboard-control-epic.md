@@ -183,11 +183,21 @@ Do not introduce them in Phase 1.
 
 ## Phase 3 — In-app rebinding editor  *(depends on Phase 2; build only if wanted)*
 
+> **STATUS (2026-07): SHIPPED, and no longer a modal.** The rebinding editor was
+> built in `src/settings.rs` (`SettingsView`) and, after the settings-menu window
+> conversion, folded into the settings window's **Keybindings pane** — it renders
+> inline, not as a desktop modal. Chord capture briefly grabs all input and the
+> leader is suppressed via `WindowManager::settings_capturing()`. The "modal
+> overlay" scope below is the original design and is superseded; see
+> `docs/settings-menu.md` and `docs/superpowers/specs/2026-07-21-keybindings-pane.md`.
+> The flow (leader row, grouped list, capture → conflict) is as described and still accurate.
+
 **Goal:** edit bindings inside Foreman. Earn this — the JSON file may be enough.
 
-**Scope:** a desktop-level **modal overlay** (settings are global, not project-confined
-— mirror `dirpicker.rs`, not a `Content` window). Opened via the `?` overlay's *Edit*
-affordance and/or an `OpenSettings` command.
+**Scope (original design — now inline, see status note above):** a desktop-level
+**modal overlay** (settings are global, not project-confined — mirror `dirpicker.rs`,
+not a `Content` window). Opened via the `?` overlay's *Edit* affordance and/or an
+`OpenSettings` command.
 - Top: editable **Leader** chord.
 - Grouped list (**Projects / Terminals / Actions**): each row = label · current chord
   (pretty `Ctrl+Shift+→`) · Rebind · reset-one.
