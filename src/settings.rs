@@ -84,6 +84,13 @@ impl SettingsView {
         self.message = Some(format!("Could not save: {msg}"));
     }
 
+    /// True while waiting for the user to press a chord to bind. The WM reads
+    /// this to suppress the leader so any chord (incl. the leader itself) is
+    /// captured instead of dispatched.
+    pub fn is_capturing(&self) -> bool {
+        matches!(self.mode, Mode::Capturing { .. })
+    }
+
     fn move_sel(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
@@ -160,7 +167,8 @@ impl SettingsView {
 
     /// Render one frame and report what the caller should do. `km` is the live
     /// keymap, mutated in place; a `Changed` outcome means the caller persists.
-    pub fn show(&mut self, ui: &mut egui::Ui, km: &mut Keymap) -> Outcome {
+    /// Draws into `rect` (the caller lays out the pane / modal panel).
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, km: &mut Keymap) -> Outcome {
         let mut changed = false;
         let mut close = false;
 
@@ -221,68 +229,44 @@ impl SettingsView {
             }
         }
 
-        // --- dim + panel ---------------------------------------------------
-        let screen = ui.ctx().content_rect();
-        ui.painter()
-            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
-
-        egui::Window::new("keybindings")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::NONE
-                    .fill(WIN_BG)
-                    .stroke(egui::Stroke::new(1.0, BORDER_FOCUS))
-                    .inner_margin(egui::Margin::same(16))
-                    .corner_radius(egui::CornerRadius::same(8)),
-            )
-            .show(ui.ctx(), |ui| {
-                ui.set_min_width(540.0);
-                ui.set_max_width(540.0);
-                ui.visuals_mut().override_text_color = Some(TEXT);
-
-                ui.label(
-                    egui::RichText::new("Keyboard bindings")
-                        .color(BORDER_FOCUS)
-                        .size(16.0)
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "j/k or ↑/↓ select · Enter rebind · Esc close / cancel capture",
-                    )
-                    .color(DIM)
-                    .size(11.5),
-                );
-                ui.add_space(8.0);
-
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.render_rows(ui, km, &mut changed);
-                    });
-
-                ui.add_space(6.0);
-                ui.separator();
-
-                // Footer: message line + actions.
-                if let Some(msg) = &self.message {
-                    ui.label(egui::RichText::new(msg).color(DIM).size(11.5));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Reset all to defaults").clicked() {
-                        km.reset_all();
-                        self.mode = Mode::Idle;
-                        self.message = Some("All bindings reset to defaults.".into());
-                        changed = true;
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
+        // --- draw into the pane rect (was a dim backdrop + centered egui::Window) ---
+        ui.painter_at(rect).rect_filled(rect, 0.0, WIN_BG);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let ui = &mut child;
+        ui.set_clip_rect(rect);
+        ui.visuals_mut().override_text_color = Some(TEXT);
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Keyboard bindings")
+                .color(BORDER_FOCUS)
+                .size(16.0)
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new("j/k or ↑/↓ select · Enter rebind · Esc back / cancel capture")
+                .color(DIM)
+                .size(11.5),
+        );
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("keybindings_pane")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.render_rows(ui, km, &mut changed);
             });
+        ui.add_space(6.0);
+        ui.separator();
+        if let Some(msg) = &self.message {
+            ui.label(egui::RichText::new(msg).color(DIM).size(11.5));
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Reset all to defaults").clicked() {
+                km.reset_all();
+                self.mode = Mode::Idle;
+                self.message = Some("All bindings reset to defaults.".into());
+                changed = true;
+            }
+        });
 
         if close {
             Outcome::Close

@@ -4861,7 +4861,14 @@ impl WindowManager {
         // event for the frame so nothing the editor didn't consume can leak to a
         // terminal — the same capture discipline as the picker / help overlay.
         if let Some(mut editor) = self.keymap_editor.take() {
-            let outcome = editor.show(ui, &mut self.keymap);
+            // The editor no longer paints its own dim backdrop (that moved to
+            // the pane-rect draw) — paint it here so the modal still reads as
+            // a modal until Task 3 deletes this block.
+            ui.painter()
+                .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
+            let sz = egui::vec2(540.0, 460.0);
+            let rect = egui::Rect::from_center_size(area.center(), sz);
+            let outcome = editor.show(ui, rect, &mut self.keymap);
             match outcome {
                 SettingsOutcome::Close => { /* drop it: closed */ }
                 SettingsOutcome::Changed => {
