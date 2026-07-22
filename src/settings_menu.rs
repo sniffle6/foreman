@@ -3,6 +3,8 @@
 //! without a GUI. The egui view lives in the same file below (Task 3).
 
 use crate::config::{DefaultShell, Settings};
+use crate::keymap::Keymap;
+use crate::settings::{Outcome as EditorOutcome, SettingsView};
 use crate::theme::*;
 use eframe::egui;
 
@@ -62,7 +64,6 @@ pub enum Field {
     RestoreWorkspace,
     DefaultProjectDir,
     UpdateCheck,
-    OpenKeybindings,
     CheckUpdatesNow,
     OpenConfigFolder,
 }
@@ -171,12 +172,10 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 kind: Kind::Toggle,
             },
         ],
-        Pane::Keybindings => &[RowSpec {
-            field: Field::OpenKeybindings,
-            label: "Edit keybindings…",
-            desc: "Leader, chords, conflicts — the full editor",
-            kind: Kind::Action,
-        }],
+        // The pane itself *is* the editor (draw_pane special-cases it before
+        // touching rows()); handle_keys also delegates to it before rows()
+        // could be indexed, so this is never read.
+        Pane::Keybindings => &[],
         Pane::Agents => &[
             RowSpec {
                 field: Field::InstallSkills,
@@ -319,7 +318,7 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::RestoreWorkspace => flip(&mut s.restore_workspace),
         Field::DefaultProjectDir => false,
         Field::UpdateCheck => flip(&mut s.update_check),
-        Field::OpenKeybindings | Field::CheckUpdatesNow | Field::OpenConfigFolder => false,
+        Field::CheckUpdatesNow | Field::OpenConfigFolder => false,
     }
 }
 
@@ -351,7 +350,7 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::RestoreWorkspace => s.restore_workspace.to_string(),
         Field::DefaultProjectDir => s.default_project_dir.clone(),
         Field::UpdateCheck => s.update_check.to_string(),
-        Field::OpenKeybindings | Field::CheckUpdatesNow | Field::OpenConfigFolder => String::new(),
+        Field::CheckUpdatesNow | Field::OpenConfigFolder => String::new(),
     }
 }
 
@@ -366,15 +365,18 @@ pub struct SettingsMenu {
     /// When `Some`, an inline text field is open for the selected `Text` row,
     /// holding the in-progress edit buffer. `None` = browsing.
     pub editing: Option<String>,
-    /// A window-lifecycle outcome (Close / OpenKeybindings / CheckUpdatesNow)
-    /// produced this frame, stashed for the WM's `drain_settings` to act on
-    /// after the render loop (content cannot mutate the WM mid-loop).
+    /// A window-lifecycle outcome (Close / CheckUpdatesNow) produced this
+    /// frame, stashed for the WM's `drain_settings` to act on after the
+    /// render loop (content cannot mutate the WM mid-loop).
     pub pending: Option<MenuOutcome>,
     /// Set when the keyboard moved the selection (row nav, pane switch, diving
     /// into the pane); consumed by `draw_pane` to scroll the selected row into
     /// view. Lets keyboard nav reach rows below the fold on a short window
     /// without fighting free mouse-wheel scrolling.
     pub scroll_to_selected: bool,
+    /// The keybindings editor, rendered inline when the Keybindings pane is
+    /// active (replaces the old stacked modal).
+    pub keybindings: SettingsView,
 }
 
 #[allow(dead_code)] // driven by the view (Task 3)
@@ -387,6 +389,7 @@ impl SettingsMenu {
             editing: None,
             pending: None,
             scroll_to_selected: false,
+            keybindings: SettingsView::new(),
         }
     }
 
@@ -465,8 +468,6 @@ pub enum MenuOutcome {
     Pending,
     /// A setting changed this frame — caller publishes it + arms the save debounce.
     Changed,
-    /// Open the keybindings editor on top of the menu.
-    OpenKeybindings,
     /// "Check for updates now" was clicked — caller fires the fetch through
     /// `update_fx` (the menu has no path to that channel itself).
     CheckUpdatesNow,
@@ -475,7 +476,7 @@ pub enum MenuOutcome {
 }
 
 /// Merge a newly-produced outcome into the running one, keeping the
-/// highest-priority (Close > OpenKeybindings > Changed > Pending). Keyboard and
+/// highest-priority (Close > CheckUpdatesNow > Changed > Pending). Keyboard and
 /// mouse can both fire in one frame; this stops a stray mouse `Changed` from
 /// clobbering a keyboard `Close`.
 fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
@@ -484,8 +485,7 @@ fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
             MenuOutcome::Pending => 0,
             MenuOutcome::Changed => 1,
             MenuOutcome::CheckUpdatesNow => 2,
-            MenuOutcome::OpenKeybindings => 3,
-            MenuOutcome::Close => 4,
+            MenuOutcome::Close => 3,
         }
     }
     if rank(&new) > rank(cur) {
@@ -496,13 +496,15 @@ fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
 impl SettingsMenu {
     /// Render one frame of the settings menu and report what the caller should
     /// do. `s` is the live settings, mutated in place; a `Changed` outcome means
-    /// the caller republishes it and arms the save debounce.
+    /// the caller republishes it and arms the save debounce. `km` is the live
+    /// keymap, threaded through to the inline Keybindings pane.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
         active: bool,
         s: &mut Settings,
+        km: &mut Keymap,
     ) -> MenuOutcome {
         // Keyboard drives the menu only when this window is focused and no
         // inline text edit owns input.
@@ -557,7 +559,7 @@ impl SettingsMenu {
         let rail = egui::Rect::from_min_size(body.min, egui::vec2(rail_w, body_h));
         let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + rail_w, body.min.y), body.max);
         self.draw_rail(ui, rail);
-        self.draw_pane(ui, pane, s, &mut outcome);
+        self.draw_pane(ui, pane, s, km, &mut outcome);
 
         // --- footer ---
         let (footer, _) = ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
@@ -576,6 +578,17 @@ impl SettingsMenu {
         outcome
     }
 
+    /// True while the embedded keybindings editor is mid chord-capture. The WM
+    /// reads this to suppress the leader while a settings window is focused.
+    pub fn is_capturing(&self) -> bool {
+        self.pane == Pane::Keybindings && self.keybindings.is_capturing()
+    }
+
+    #[cfg(test)]
+    pub fn begin_capture_for_test(&mut self) {
+        self.keybindings.begin_capture_for_test();
+    }
+
     /// Read this frame's navigation/adjust keys and apply them. Returns the
     /// keyboard-driven outcome; mouse handling in the draw can only raise it.
     fn handle_keys(&mut self, ui: &egui::Ui, s: &mut Settings) -> MenuOutcome {
@@ -590,6 +603,18 @@ impl SettingsMenu {
                 i.key_pressed(egui::Key::Escape),
             )
         });
+
+        // The Keybindings pane's editor reads its own input in draw_pane; don't
+        // double-handle its keys here. Tab still backs out to the rail. This must
+        // run before the Esc check below, so Esc inside the editor reaches
+        // `SettingsView` (cancel-capture / back-to-rail) instead of closing the
+        // window.
+        if self.pane == Pane::Keybindings && !self.in_rail {
+            if tab {
+                self.in_rail = true;
+            }
+            return MenuOutcome::Pending;
+        }
 
         if esc {
             return MenuOutcome::Close;
@@ -662,7 +687,6 @@ impl SettingsMenu {
     /// Run an `Action` row.
     fn do_action(&self, field: Field) -> MenuOutcome {
         match field {
-            Field::OpenKeybindings => MenuOutcome::OpenKeybindings,
             Field::CheckUpdatesNow => MenuOutcome::CheckUpdatesNow,
             Field::OpenConfigFolder => {
                 if let Some(dir) = crate::config::config_dir() {
@@ -720,8 +744,17 @@ impl SettingsMenu {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         s: &mut Settings,
+        km: &mut Keymap,
         outcome: &mut MenuOutcome,
     ) {
+        if self.pane == Pane::Keybindings {
+            match self.keybindings.show(ui, rect, km) {
+                EditorOutcome::Changed => bump(outcome, MenuOutcome::Changed),
+                EditorOutcome::Close => self.in_rail = true, // Esc/back-out returns to the rail
+                EditorOutcome::Pending => {}
+            }
+            return;
+        }
         let specs = rows(self.pane);
         // Safety net: an inline edit is only valid while its own Text row is the
         // selection. If anything moved the selection away (e.g. a mouse click on
@@ -1000,7 +1033,6 @@ impl SettingsMenu {
             }
             Kind::Action => {
                 let caption = match spec.field {
-                    Field::OpenKeybindings => "Open editor",
                     Field::OpenConfigFolder => "Open folder",
                     Field::CheckUpdatesNow => "Check now",
                     _ => "Open",
@@ -1051,7 +1083,11 @@ mod tests {
     fn every_pane_has_rows_and_labels() {
         for p in Pane::ALL {
             assert!(!p.label().is_empty());
-            assert!(!rows(p).is_empty(), "{:?} has no rows", p);
+            // Keybindings has no RowSpecs — draw_pane/handle_keys special-case
+            // it and delegate to the embedded SettingsView editor instead.
+            if p != Pane::Keybindings {
+                assert!(!rows(p).is_empty(), "{:?} has no rows", p);
+            }
         }
     }
 

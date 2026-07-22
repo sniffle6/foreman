@@ -91,6 +91,11 @@ impl SettingsView {
         matches!(self.mode, Mode::Capturing { .. })
     }
 
+    #[cfg(test)]
+    pub fn begin_capture_for_test(&mut self) {
+        self.start_capture();
+    }
+
     fn move_sel(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;

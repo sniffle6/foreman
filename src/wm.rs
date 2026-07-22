@@ -1,6 +1,5 @@
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::keymap::{Chord, Command, Keymap};
-use crate::settings::{Outcome as SettingsOutcome, SettingsView};
 use crate::settings_menu::{MenuOutcome, SettingsMenu};
 use crate::terminal::{Session, Shell};
 use crate::theme::*;
@@ -169,11 +168,18 @@ impl Content {
             Content::Settings(menu) => {
                 // Draw inside desktop.show, between main.rs's config::seed_live
                 // and its read-back: read live settings, edit a clone, and on a
-                // change republish via seed_live (same channel as font-zoom).
-                // Window-lifecycle outcomes are stashed for drain_settings.
+                // change republish via seed_live (same channel as font-zoom). The
+                // keymap mirrors this through keymap::seed_live/live — WM::show
+                // seeds it and reads it back (the keymap is WM-owned, not App-
+                // owned like settings). Window-lifecycle outcomes are stashed for
+                // drain_settings.
                 let mut live = (*crate::config::live(ui.ctx())).clone();
-                match menu.show(ui, rect, active, &mut live) {
-                    MenuOutcome::Changed => crate::config::seed_live(ui.ctx(), &live),
+                let mut km = (*crate::keymap::live(ui.ctx())).clone();
+                match menu.show(ui, rect, active, &mut live, &mut km) {
+                    MenuOutcome::Changed => {
+                        crate::config::seed_live(ui.ctx(), &live);
+                        crate::keymap::seed_live(ui.ctx(), &km);
+                    }
                     MenuOutcome::Pending => {}
                     other => menu.pending = Some(other),
                 }
@@ -415,10 +421,6 @@ pub struct WindowManager {
     armed: bool,
     /// Read-only bindings cheat sheet is open. Dismissed by any key.
     show_help: bool,
-    /// When `Some`, the keybindings editor modal is open (desktop only). Like the
-    /// picker, while it is up no terminal is active so its input is fully captured.
-    /// Opened from the settings menu's Keybindings pane; stacks on top of it.
-    keymap_editor: Option<SettingsView>,
     /// Previously-focused window in this manager, for the `Tab` toggle. On the
     /// desktop this is the last project; inside a project, the last terminal.
     last_focused: Option<WinId>,
@@ -490,7 +492,6 @@ impl WindowManager {
             desktop: false,
             armed: false,
             show_help: false,
-            keymap_editor: None,
             last_focused: None,
             last_area: egui::vec2(0.0, 0.0),
             keymap: Keymap::default(),
@@ -1656,11 +1657,8 @@ impl WindowManager {
     /// Apply a settings-window lifecycle outcome recorded during the draw
     /// (content cannot mutate the WM mid-loop — same discipline as
     /// `drain_chat_clicks`). Close removes only the settings tab (per-tab, like
-    /// Chat, so a co-tabbed project survives); OpenKeybindings stacks the modal
-    /// editor; CheckUpdatesNow latches the update fetch. Returns true iff it
-    /// opened the keybindings editor this frame, so the caller can swallow the
-    /// triggering keystroke before the editor reads input (else a keyboard-opened
-    /// editor would instantly start leader capture).
+    /// Chat, so a co-tabbed project survives); CheckUpdatesNow latches the
+    /// update fetch.
     fn drain_settings(&mut self) -> bool {
         let mut found = None;
         for w in &mut self.windows {
@@ -1680,15 +1678,25 @@ impl WindowManager {
                 self.request_close_active_tab(id);
                 false
             }
-            MenuOutcome::OpenKeybindings => {
-                self.keymap_editor = Some(SettingsView::new());
-                true
-            }
             MenuOutcome::CheckUpdatesNow => {
                 self.check_updates_requested = true;
                 false
             }
             _ => false,
+        }
+    }
+
+    /// Surface a keybindings-save failure in the footer of whichever settings
+    /// window's embedded editor is open. Called after `WindowManager::show`'s
+    /// keymap read-back when `Keymap::save` fails, so the pane stays open and
+    /// the user sees why their rebind did not stick on disk.
+    fn set_keybindings_save_error(&mut self, msg: String) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Settings(menu) = &mut t.content {
+                    menu.keybindings.set_save_error(msg.clone());
+                }
+            }
         }
     }
 
@@ -2662,7 +2670,6 @@ impl WindowManager {
     pub fn deserted(&self) -> bool {
         self.windows.iter().all(|w| w.is_panel())
             && self.picker.is_none()
-            && self.keymap_editor.is_none()
             && self.pending_close.is_none()
     }
 
@@ -2677,10 +2684,7 @@ impl WindowManager {
     /// the Sessions panel stays docked at its remembered size (including when
     /// every project is merely minimized).
     pub fn should_show_landing(&self) -> bool {
-        !self.has_visible_project()
-            && self.picker.is_none()
-            && self.keymap_editor.is_none()
-            && self.pending_close.is_none()
+        !self.has_visible_project() && self.picker.is_none() && self.pending_close.is_none()
     }
 
     /// Local-space strip for the panel when it is the sole tree leaf (no
@@ -2779,15 +2783,13 @@ impl WindowManager {
     }
 
     /// True while an overlay that owns the keyboard is up: an existing
-    /// close-confirm (app-wide via `app_modal`), the dir picker, the
-    /// keybindings editor, or an in-progress rename. A new close-confirm must
-    /// not open on top of one — otherwise two overlays render at once and
-    /// fight over one keypress.
+    /// close-confirm (app-wide via `app_modal`), the dir picker, or an
+    /// in-progress rename. A new close-confirm must not open on top of one —
+    /// otherwise two overlays render at once and fight over one keypress.
     fn overlay_blocks_close(&self) -> bool {
         self.app_modal
             || self.pending_close.is_some()
             || self.picker.is_some()
-            || self.keymap_editor.is_some()
             || self.renaming.is_some()
     }
 
@@ -3443,6 +3445,16 @@ impl WindowManager {
             }
         }
 
+        // Publish the keymap into ctx data before the render recursion so the
+        // settings window's Keybindings pane (drawn deep in the tree, with no
+        // access to the WM) can read + edit it this frame — mirrors main.rs's
+        // config::seed_live for settings. `pump_commands` below reads back
+        // whether the pane is capturing from *last* frame's render, since this
+        // frame's hasn't run yet.
+        if self.desktop {
+            crate::keymap::seed_live(ui.ctx(), &self.keymap);
+        }
+
         self.pump_commands(ui, live);
 
         ui.painter_at(area)
@@ -3492,14 +3504,11 @@ impl WindowManager {
         // merge (tab) target; painted with a highlight to telegraph the drop.
         let mut merge_hint: Option<usize> = None;
 
-        // While the directory picker/renaming/keymap editor is open, no
-        // window is "live" — this stops the focused terminal from consuming
-        // keystrokes meant for the overlay, and (below) stops a hover under
-        // the overlay from stealing focus either.
-        let no_modal = live
-            && self.picker.is_none()
-            && self.renaming.is_none()
-            && self.keymap_editor.is_none();
+        // While the directory picker/renaming is open, no window is "live" —
+        // this stops the focused terminal from consuming keystrokes meant for
+        // the overlay, and (below) stops a hover under the overlay from
+        // stealing focus either.
+        let no_modal = live && self.picker.is_none() && self.renaming.is_none();
         // Focus-follows-mouse fires only on genuine pointer movement (not a
         // still cursor under a pane that just re-laid-out) and never while a
         // button is held (title drag, text selection, divider resize).
@@ -4593,6 +4602,19 @@ impl WindowManager {
         }
         self.show_modals(ui, area, &ctx);
 
+        // Read back any keymap edit the Keybindings pane published this frame
+        // (keymap::seed_live/live — the keymap is WM-owned, so unlike settings
+        // this read-back lives here rather than in main.rs) and persist it.
+        if self.desktop {
+            let live_km = crate::keymap::live(&ctx);
+            if *live_km != self.keymap {
+                self.keymap = (*live_km).clone();
+                if let Err(e) = self.keymap.save() {
+                    self.set_keybindings_save_error(e);
+                }
+            }
+        }
+
         interacted
     }
 
@@ -4701,7 +4723,7 @@ impl WindowManager {
             && active
             && self.picker.is_none()
             && self.renaming.is_none()
-            && self.keymap_editor.is_none()
+            && !self.settings_capturing()
             // Any focused text field (chat input, rename) owns the keyboard — leader stays dormant.
             && ui.ctx().memory(|m| m.focused().is_none())
         {
@@ -4709,6 +4731,20 @@ impl WindowManager {
                 self.dispatch(cmd, ui);
             }
         }
+    }
+
+    /// True iff the focused settings window's Keybindings pane is mid chord-
+    /// capture — the WM suppresses the leader so the chord is captured, not
+    /// dispatched. Reads last frame's capture state (this runs before the
+    /// render recursion draws `Content::Settings` this frame).
+    fn settings_capturing(&self) -> bool {
+        let Some(fid) = self.focused else {
+            return false;
+        };
+        self.windows.iter().any(|w| {
+            w.id == fid
+                && matches!(&w.tabs[w.active].content, Content::Settings(menu) if menu.is_capturing())
+        })
     }
 
     /// Overlays painted above all windows while a title drag is in flight: the
@@ -4761,14 +4797,14 @@ impl WindowManager {
         base: egui::Id,
         ctx: &egui::Context,
     ) {
-        // A modal overlay (a close-confirm anywhere via `app_modal`, the dir
-        // picker, or the keybindings editor) is modal for the MOUSE too, not just
-        // the keyboard: drop every background window act while one is up. Otherwise
-        // the user could retarget the doomed tab (switch/merge → confirm kills the
-        // wrong one), hide the dialog (minimize → app-wide keyboard freeze with no
-        // visible modal), or stack a second overlay on top. These fields still hold
-        // the pre-open state the frame a modal OPENS, so that opening act applies.
-        if self.app_modal || self.picker.is_some() || self.keymap_editor.is_some() {
+        // A modal overlay (a close-confirm anywhere via `app_modal`, or the dir
+        // picker) is modal for the MOUSE too, not just the keyboard: drop every
+        // background window act while one is up. Otherwise the user could
+        // retarget the doomed tab (switch/merge → confirm kills the wrong one),
+        // hide the dialog (minimize → app-wide keyboard freeze with no visible
+        // modal), or stack a second overlay on top. These fields still hold the
+        // pre-open state the frame a modal OPENS, so that opening act applies.
+        if self.app_modal || self.picker.is_some() {
             return;
         }
         if acts.is_empty() {
@@ -4834,9 +4870,9 @@ impl WindowManager {
     }
 
     /// Desktop-level modal overlays drawn last, on top of everything: the dir
-    /// picker, the keybindings editor, and the leader cue / help cheat-sheet.
-    /// (The settings menu is no longer here — it draws as a `Content::Settings`
-    /// window in the normal render recursion.)
+    /// picker and the leader cue / help cheat-sheet. (The settings menu —
+    /// including its Keybindings pane — is no longer here; it draws as a
+    /// `Content::Settings` window in the normal render recursion.)
     fn show_modals(&mut self, ui: &mut egui::Ui, area: egui::Rect, ctx: &egui::Context) {
         if let Some(mut picker) = self.picker.take() {
             match picker.show_modal(ui) {
@@ -4854,32 +4890,6 @@ impl WindowManager {
                     self.tile_new(nid, anchor);
                 }
             }
-        }
-
-        // --- keybindings editor modal (desktop only) ---
-        // The editor reads input itself; afterwards we swallow every keyboard
-        // event for the frame so nothing the editor didn't consume can leak to a
-        // terminal — the same capture discipline as the picker / help overlay.
-        if let Some(mut editor) = self.keymap_editor.take() {
-            // The editor no longer paints its own dim backdrop (that moved to
-            // the pane-rect draw) — paint it here so the modal still reads as
-            // a modal until Task 3 deletes this block.
-            ui.painter()
-                .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
-            let sz = egui::vec2(540.0, 460.0);
-            let rect = egui::Rect::from_center_size(area.center(), sz);
-            let outcome = editor.show(ui, rect, &mut self.keymap);
-            match outcome {
-                SettingsOutcome::Close => { /* drop it: closed */ }
-                SettingsOutcome::Changed => {
-                    if let Err(e) = self.keymap.save() {
-                        editor.set_save_error(e);
-                    }
-                    self.keymap_editor = Some(editor);
-                }
-                SettingsOutcome::Pending => self.keymap_editor = Some(editor),
-            }
-            self.swallow_input(ui);
         }
 
         // --- close-confirm modal (runs at every level: a terminal close renders
@@ -7217,27 +7227,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_settings_opens_keybindings_editor() {
-        let mut wm = WindowManager::new();
-        wm.open_settings();
-        let w = wm
-            .windows
-            .iter_mut()
-            .find(|w| {
-                w.tabs
-                    .iter()
-                    .any(|t| matches!(t.content, Content::Settings(_)))
-            })
-            .unwrap();
-        let Content::Settings(menu) = &mut w.tabs[w.active].content else {
-            panic!("expected the settings tab");
-        };
-        menu.pending = Some(MenuOutcome::OpenKeybindings);
-        assert!(wm.drain_settings(), "opening the editor must be reported");
-        assert!(wm.keymap_editor.is_some());
-    }
-
-    #[test]
     fn open_chat_window_resurfaces_minimized_or_buried_viewer() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
@@ -7483,6 +7472,54 @@ mod tests {
             });
         });
         assert!(wm.armed, "without focus the leader must arm");
+    }
+
+    #[test]
+    fn leader_is_suppressed_while_the_keybindings_pane_captures() {
+        let mut wm = WindowManager::new();
+        wm.desktop = true; // not as_desktop(): avoids loading the user's keymap file
+        // A focused settings window whose Keybindings editor is capturing.
+        wm.open_settings();
+        let sid = wm.windows.last().unwrap().id;
+        wm.focused = Some(sid);
+        // Put the embedded editor into capture on the Keybindings pane.
+        {
+            let w = wm.windows.iter_mut().find(|w| w.id == sid).unwrap();
+            let Content::Settings(menu) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            menu.pane = crate::settings_menu::Pane::Keybindings;
+            menu.in_rail = false;
+            menu.begin_capture_for_test(); // helper added in Step 5
+        }
+        assert!(
+            wm.settings_capturing(),
+            "settings_capturing reflects Mode::Capturing"
+        );
+        let leader = wm.keymap.leader;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: leader.key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: leader.ctrl,
+                shift: leader.shift,
+                alt: leader.alt,
+                ..Default::default()
+            },
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                wm.pump_commands(ui, true);
+            });
+        });
+        assert!(
+            !wm.armed,
+            "the leader must stay dormant while the pane is capturing"
+        );
     }
 
     #[test]
