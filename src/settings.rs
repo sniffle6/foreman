@@ -25,13 +25,14 @@ pub enum Outcome {
 
 /// One selectable row in the editor. The leader row is special; command rows map
 /// to a `Command`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Row {
     Leader,
     Command(Command),
 }
 
 /// Capture sub-state of the editor.
+#[derive(Clone, Debug)]
 enum Mode {
     /// Browsing rows.
     Idle,
@@ -48,6 +49,7 @@ enum Mode {
 }
 
 /// The keybindings editor modal. Holds only UI state; the keymap lives in the wm.
+#[derive(Clone, Debug)]
 pub struct SettingsView {
     /// Flat, ordered list of rows (leader first, then commands grouped).
     rows: Vec<Row>,

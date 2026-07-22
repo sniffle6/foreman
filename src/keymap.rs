@@ -299,6 +299,7 @@ struct KeymapFile {
 }
 
 /// The active keymap: the leader chord plus a chord→command lookup table.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Keymap {
     pub leader: Chord,
     table: HashMap<Chord, Command>,
@@ -659,10 +660,33 @@ pub fn name_to_key(name: &str) -> Option<egui::Key> {
     egui::Key::from_name(name)
 }
 
+/// Per-frame publish of the live keymap into egui ctx data, so the settings
+/// window's Keybindings pane (drawn deep in the render loop, with no access to
+/// the WM) can read + edit it. Same seam as `config::seed_live`.
+pub fn seed_live(ctx: &eframe::egui::Context, k: &Keymap) {
+    let arc = std::sync::Arc::new(k.clone());
+    ctx.data_mut(|d| d.insert_temp(eframe::egui::Id::new("foreman::keymap"), arc));
+}
+
+/// The keymap seeded this frame (defaults before the first seed).
+pub fn live(ctx: &eframe::egui::Context) -> std::sync::Arc<Keymap> {
+    ctx.data_mut(|d| d.get_temp(eframe::egui::Id::new("foreman::keymap")))
+        .unwrap_or_else(|| std::sync::Arc::new(Keymap::default()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eframe::egui::Key as K;
+
+    #[test]
+    fn seed_live_round_trips_the_keymap() {
+        let ctx = egui::Context::default();
+        let mut km = Keymap::default();
+        km.set_leader(Chord::new(egui::Key::Y, false, false, false));
+        seed_live(&ctx, &km);
+        assert_eq!(*live(&ctx), km);
+    }
 
     #[test]
     fn default_leader_is_ctrl_b() {
