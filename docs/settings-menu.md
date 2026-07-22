@@ -1,18 +1,30 @@
 # Settings menu
 
-One modal, six panes, every phase-1 setting. Opened with the leader chord
-`Ctrl+B ,` (the `OpenSettings` command). Everything it edits lives in
-`%APPDATA%\foreman\settings.json` and applies live — no OK button, no restart
-(two exceptions below).
+One window, six panes, every phase-1 setting. Opened with the leader chord
+`Ctrl+B Ctrl+,` (the `OpenSettings` command; bare `,` is Rename). Everything it
+edits lives in `%APPDATA%\foreman\settings.json` and applies live — no OK
+button, no restart (two exceptions below).
 
 ## What it does
 
-A desktop-level modal overlay (same pattern as the dir picker and the old
-keybindings editor): a left rail of categories, a right pane of rows, a footer
-with the key hints. Fully keyboard-driven; mouse works everywhere.
+A desktop-level **`Content` window** (same family as chat and the task-manager
+panel), not a modal: a left rail of categories, a right pane of rows, a footer
+with the key hints. It **floats** by default, tiles/tabs like any window, and
+doesn't block the terminals behind it — so live-apply is visible while you drag
+a value. Fully keyboard-driven when focused; mouse works everywhere.
 
-Keys: `↑↓` navigate · `Tab` rail⇄pane · `←→` adjust a value · `Enter`
-toggle / run action / edit text · `Esc` close (or cancel a text edit).
+The layout is **reactive to the window size**: the bands span the window's
+width, the footer pins to the bottom, and the pane **scrolls** when the window
+is too short to show every row (keyboard nav auto-scrolls the selected row into
+view). The window opens at its natural size but can be freely resized/maximized.
+
+`OpenSettings` is **open-or-focus**: it raises the existing settings window (and
+un-minimizes it) instead of opening a second one — the same singleton pattern as
+the chat window (`open_chat_window`).
+
+Keys (only when the window is focused): `↑↓` navigate · `Tab` rail⇄pane · `←→`
+adjust a value · `Enter` toggle / run action / edit text · `Esc` close (or
+cancel a text edit).
 
 ## Why it exists
 
@@ -52,11 +64,27 @@ on purpose — a user slider on those creates support tickets, not value).
   float" on — the float default only applies to plain new-terminal commands.
 - Saves are debounced (~400 ms after the last change) and atomic; the file is
   written once per burst of changes, not per keystroke.
+- **The window keeps the app alive** like a project: if you close your last
+  project while settings is open, the app stays up (it's a non-panel window).
+- **Not persisted across restarts.** The settings window is excluded from
+  `workspace.json`, so it never reopens on relaunch (open it when you want it).
+- **Esc / close on a tab-stacked settings window closes only the settings
+  tab**, not a co-tabbed project — it routes through the normal per-tab close
+  (`request_close_active_tab`), same as clicking the header close button.
+- **The keybindings editor is still a modal** stacked on top (chord capture
+  needs to steal all input); it opens from the Keybindings pane's "Edit
+  keybindings…" and the keystroke that opens it is swallowed so it doesn't
+  immediately start capturing.
 
 ## Key files
 
 - `src/settings_menu.rs` — the menu: pure model (panes, row specs, `adjust`,
-  `display` — unit-tested) + egui view (modal, rail, rows, text edit).
+  `display` — unit-tested) + egui view (`show(ui, rect, active, s)` draws into a
+  window rect via a scoped child UI, rail, rows, text edit).
+- `src/wm.rs` — the window integration: `Content::Settings` variant,
+  `open_settings` (open-or-focus singleton), the `Content::show` arm (reads
+  `config::live`, edits a clone, re-seeds on change), and `drain_settings`
+  (per-frame: close the tab / open the keybindings editor / check updates).
 - `src/config.rs` — the `Settings` struct, defaults, `sanitize()` clamps,
   `seed_live`/`live` (per-frame settings access for deep consumers).
 - `src/settings.rs` — the keybindings editor the menu opens for chords.
