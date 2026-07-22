@@ -172,64 +172,77 @@ impl SettingsView {
 
     /// Render one frame and report what the caller should do. `km` is the live
     /// keymap, mutated in place; a `Changed` outcome means the caller persists.
-    /// Draws into `rect` (the caller lays out the pane / modal panel).
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, km: &mut Keymap) -> Outcome {
+    /// Draws into `rect` (the caller lays out the pane / modal panel). `active`
+    /// gates input: when `false` (the settings window isn't focused, or this
+    /// is the one frame the pane was just dived into) the editor draws its
+    /// current state but reads no keyboard input — otherwise a hidden or
+    /// just-entered editor would silently drive itself off keystrokes meant
+    /// for whatever else has focus.
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        active: bool,
+        km: &mut Keymap,
+    ) -> Outcome {
         let mut changed = false;
         let mut close = false;
 
         // --- input ---------------------------------------------------------
         // Capture mode reads the raw next chord; otherwise normal navigation.
-        match self.mode {
-            Mode::Capturing { row } => {
-                if let Some(captured) = capture_chord(ui) {
-                    // Esc cancels capture without binding.
-                    if captured.key == egui::Key::Escape
-                        && !captured.ctrl
-                        && !captured.shift
-                        && !captured.alt
-                    {
-                        self.mode = Mode::Idle;
-                    } else if self.apply(km, row, captured) {
-                        changed = true;
+        if active {
+            match self.mode {
+                Mode::Capturing { row } => {
+                    if let Some(captured) = capture_chord(ui) {
+                        // Esc cancels capture without binding.
+                        if captured.key == egui::Key::Escape
+                            && !captured.ctrl
+                            && !captured.shift
+                            && !captured.alt
+                        {
+                            self.mode = Mode::Idle;
+                        } else if self.apply(km, row, captured) {
+                            changed = true;
+                        }
                     }
                 }
-            }
-            Mode::Conflict { row, chord, .. } => {
-                ui.input(|i| {
-                    if i.key_pressed(egui::Key::Enter) {
-                        // Confirmed replace.
-                        km.rebind(
-                            match row {
-                                Row::Command(c) => c,
-                                Row::Leader => unreachable!("leader never enters conflict"),
-                            },
-                            chord,
-                        );
-                        changed = true;
-                        self.mode = Mode::Idle;
-                        self.message = Some(format!("{} reassigned.", chord.pretty()));
-                    } else if i.key_pressed(egui::Key::Escape) {
-                        self.mode = Mode::Idle;
+                Mode::Conflict { row, chord, .. } => {
+                    ui.input(|i| {
+                        if i.key_pressed(egui::Key::Enter) {
+                            // Confirmed replace.
+                            km.rebind(
+                                match row {
+                                    Row::Command(c) => c,
+                                    Row::Leader => unreachable!("leader never enters conflict"),
+                                },
+                                chord,
+                            );
+                            changed = true;
+                            self.mode = Mode::Idle;
+                            self.message = Some(format!("{} reassigned.", chord.pretty()));
+                        } else if i.key_pressed(egui::Key::Escape) {
+                            self.mode = Mode::Idle;
+                        }
+                    });
+                }
+                Mode::Idle => {
+                    ui.input(|i| {
+                        if i.key_pressed(egui::Key::Escape) {
+                            close = true;
+                        }
+                        if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J) {
+                            self.move_sel(1);
+                        }
+                        if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K) {
+                            self.move_sel(-1);
+                        }
+                    });
+                    // Enter starts a rebind on the selected row (separate borrow:
+                    // start_capture mutates self, can't be inside the input closure).
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter {
+                        self.start_capture();
                     }
-                });
-            }
-            Mode::Idle => {
-                ui.input(|i| {
-                    if i.key_pressed(egui::Key::Escape) {
-                        close = true;
-                    }
-                    if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J) {
-                        self.move_sel(1);
-                    }
-                    if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K) {
-                        self.move_sel(-1);
-                    }
-                });
-                // Enter starts a rebind on the selected row (separate borrow:
-                // start_capture mutates self, can't be inside the input closure).
-                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if enter {
-                    self.start_capture();
                 }
             }
         }
@@ -585,5 +598,55 @@ mod tests {
             }
             _ => panic!("expected Mode::Conflict, got a different mode"),
         }
+    }
+
+    #[test]
+    fn unfocused_editor_ignores_input() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.max_rect();
+                view.show(ui, r, false, &mut km);
+            });
+        });
+        assert!(
+            !view.is_capturing(),
+            "an unfocused editor must not read Enter into capture"
+        );
+    }
+
+    #[test]
+    fn focused_editor_reads_input() {
+        let mut view = SettingsView::new();
+        let mut km = Keymap::default();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.max_rect();
+                view.show(ui, r, true, &mut km);
+            });
+        });
+        assert!(
+            view.is_capturing(),
+            "a focused editor reads Enter and starts capture"
+        );
     }
 }

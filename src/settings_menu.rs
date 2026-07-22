@@ -377,6 +377,11 @@ pub struct SettingsMenu {
     /// The keybindings editor, rendered inline when the Keybindings pane is
     /// active (replaces the old stacked modal).
     pub keybindings: SettingsView,
+    /// Set for exactly one frame when the rail dives into the Keybindings pane
+    /// (Enter/→). `draw_pane` consumes it to skip that frame's editor input —
+    /// otherwise the same un-consumed Enter that dove in is read by the
+    /// editor's Idle branch as "start a rebind".
+    pub editor_just_entered: bool,
 }
 
 #[allow(dead_code)] // driven by the view (Task 3)
@@ -390,6 +395,7 @@ impl SettingsMenu {
             pending: None,
             scroll_to_selected: false,
             keybindings: SettingsView::new(),
+            editor_just_entered: false,
         }
     }
 
@@ -559,7 +565,7 @@ impl SettingsMenu {
         let rail = egui::Rect::from_min_size(body.min, egui::vec2(rail_w, body_h));
         let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + rail_w, body.min.y), body.max);
         self.draw_rail(ui, rail);
-        self.draw_pane(ui, pane, s, km, &mut outcome);
+        self.draw_pane(ui, pane, s, km, active, &mut outcome);
 
         // --- footer ---
         let (footer, _) = ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
@@ -634,6 +640,10 @@ impl SettingsMenu {
             if enter || right {
                 self.in_rail = false;
                 self.scroll_to_selected = true;
+                // Skip the Keybindings editor's input for the dive-in frame —
+                // otherwise this same Enter (never consumed above) is read by
+                // the editor's Idle branch as "start a rebind".
+                self.editor_just_entered = true;
             }
             return MenuOutcome::Pending;
         }
@@ -745,10 +755,16 @@ impl SettingsMenu {
         rect: egui::Rect,
         s: &mut Settings,
         km: &mut Keymap,
+        active: bool,
         outcome: &mut MenuOutcome,
     ) {
+        // Consumed every frame regardless of pane: the one-frame suppression
+        // only matters on the Keybindings pane, but the flag must not linger
+        // if the user dove in then immediately switched panes some other way.
+        let just_entered = std::mem::take(&mut self.editor_just_entered);
         if self.pane == Pane::Keybindings {
-            match self.keybindings.show(ui, rect, km) {
+            let reads_input = active && !self.in_rail && !just_entered;
+            match self.keybindings.show(ui, rect, reads_input, km) {
                 EditorOutcome::Changed => bump(outcome, MenuOutcome::Changed),
                 EditorOutcome::Close => self.in_rail = true, // Esc/back-out returns to the rail
                 EditorOutcome::Pending => {}
