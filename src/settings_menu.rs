@@ -396,6 +396,16 @@ impl SettingsMenu {
         egui::vec2(WIN_W, TITLE_H + BODY_H + FOOTER_H)
     }
 
+    /// The smallest usable content size, used as the settings window's resize
+    /// floor (larger than the global window minimum). Wide enough that a row's
+    /// label and its control don't collide (rail + a usable pane), and tall
+    /// enough to show the whole rail plus the title and footer. Below this the
+    /// layout would cramp horizontally, and there is no horizontal scroll.
+    pub fn min_size() -> egui::Vec2 {
+        let rail_h = Pane::ALL.len() as f32 * 40.0; // 40.0 = draw_rail row height
+        egui::vec2(RAIL_W + 300.0, rail_h + TITLE_H + FOOTER_H)
+    }
+
     /// Move up one row in the current pane; clamps at 0 (no wrap).
     pub fn nav_up(&mut self) {
         self.row = self.row.saturating_sub(1);

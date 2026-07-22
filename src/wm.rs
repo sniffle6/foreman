@@ -4541,7 +4541,20 @@ impl WindowManager {
                         }
                     }
                 } else {
-                    resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz);
+                    // The settings window has a larger resize floor than the
+                    // global minimum so its rows don't cramp horizontally
+                    // (there is no horizontal scroll).
+                    let min = if self.windows[i]
+                        .tabs
+                        .iter()
+                        .any(|t| matches!(t.content, Content::Settings(_)))
+                    {
+                        crate::settings_menu::SettingsMenu::min_size()
+                            + egui::vec2(2.0, TITLE_H + 1.0)
+                    } else {
+                        egui::vec2(MIN_W, MIN_H)
+                    };
+                    resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz, min);
                 }
                 self.mark_workspace_dirty();
             }
@@ -5023,19 +5036,20 @@ fn resize_floating(
     top: bool,
     bottom: bool,
     area: egui::Vec2,
+    min: egui::Vec2,
 ) {
     let mut nr = *rect;
     if left {
-        nr.min.x = (nr.min.x + d.x).max(0.0).min(nr.max.x - MIN_W);
+        nr.min.x = (nr.min.x + d.x).max(0.0).min(nr.max.x - min.x);
     }
     if right {
-        nr.max.x = (nr.max.x + d.x).min(area.x).max(nr.min.x + MIN_W);
+        nr.max.x = (nr.max.x + d.x).min(area.x).max(nr.min.x + min.x);
     }
     if top {
-        nr.min.y = (nr.min.y + d.y).max(0.0).min(nr.max.y - MIN_H);
+        nr.min.y = (nr.min.y + d.y).max(0.0).min(nr.max.y - min.y);
     }
     if bottom {
-        nr.max.y = (nr.max.y + d.y).min(area.y).max(nr.min.y + MIN_H);
+        nr.max.y = (nr.max.y + d.y).min(area.y).max(nr.min.y + min.y);
     }
     *rect = nr;
 }
