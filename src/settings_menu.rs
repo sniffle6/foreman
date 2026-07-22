@@ -370,6 +370,11 @@ pub struct SettingsMenu {
     /// produced this frame, stashed for the WM's `drain_settings` to act on
     /// after the render loop (content cannot mutate the WM mid-loop).
     pub pending: Option<MenuOutcome>,
+    /// Set when the keyboard moved the selection (row nav, pane switch, diving
+    /// into the pane); consumed by `draw_pane` to scroll the selected row into
+    /// view. Lets keyboard nav reach rows below the fold on a short window
+    /// without fighting free mouse-wheel scrolling.
+    pub scroll_to_selected: bool,
 }
 
 #[allow(dead_code)] // driven by the view (Task 3)
@@ -381,6 +386,7 @@ impl SettingsMenu {
             in_rail: true,
             editing: None,
             pending: None,
+            scroll_to_selected: false,
         }
     }
 
@@ -393,12 +399,14 @@ impl SettingsMenu {
     /// Move up one row in the current pane; clamps at 0 (no wrap).
     pub fn nav_up(&mut self) {
         self.row = self.row.saturating_sub(1);
+        self.scroll_to_selected = true;
     }
 
     /// Move down one row in the current pane; clamps at the last row.
     pub fn nav_down(&mut self) {
         let last = rows(self.pane).len().saturating_sub(1);
         self.row = (self.row + 1).min(last);
+        self.scroll_to_selected = true;
     }
 
     /// Flip focus between the pane rail and the row list.
@@ -410,6 +418,7 @@ impl SettingsMenu {
     pub fn select_pane(&mut self, p: Pane) {
         self.pane = p;
         self.row = 0;
+        self.scroll_to_selected = true;
     }
 }
 
@@ -494,11 +503,17 @@ impl SettingsMenu {
         // the same parent `ui` (idiom: landing.rs `ui.new_child`).
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         let ui = &mut child;
-        ui.set_min_width(WIN_W);
-        ui.set_max_width(WIN_W);
+        // Contain the fixed-size bands if the window is resized smaller than the
+        // menu's intrinsic size — clip to `rect` so nothing bleeds onto siblings.
+        ui.set_clip_rect(rect);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         ui.visuals_mut().override_text_color = Some(TEXT);
-        let w = WIN_W;
+        // Reactive layout: bands span the window's width and the body fills the
+        // height between the top title band and the bottom-pinned footer, so the
+        // panel grows and shrinks with the window instead of a fixed 660×368.
+        let w = rect.width();
+        let body_h = (rect.height() - TITLE_H - FOOTER_H).max(0.0);
+        let rail_w = RAIL_W.min(w);
 
         // --- title band ---
         let (title, _) = ui.allocate_exact_size(egui::vec2(w, TITLE_H), egui::Sense::hover());
@@ -521,9 +536,9 @@ impl SettingsMenu {
         );
 
         // --- body: rail | pane ---
-        let (body, _) = ui.allocate_exact_size(egui::vec2(w, BODY_H), egui::Sense::hover());
-        let rail = egui::Rect::from_min_size(body.min, egui::vec2(RAIL_W, BODY_H));
-        let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + RAIL_W, body.min.y), body.max);
+        let (body, _) = ui.allocate_exact_size(egui::vec2(w, body_h), egui::Sense::hover());
+        let rail = egui::Rect::from_min_size(body.min, egui::vec2(rail_w, body_h));
+        let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + rail_w, body.min.y), body.max);
         self.draw_rail(ui, rail);
         self.draw_pane(ui, pane, s, &mut outcome);
 
@@ -576,6 +591,7 @@ impl SettingsMenu {
             // Enter or → dives from the rail into the pane's rows.
             if enter || right {
                 self.in_rail = false;
+                self.scroll_to_selected = true;
             }
             return MenuOutcome::Pending;
         }
@@ -704,51 +720,68 @@ impl SettingsMenu {
         let pane = self.pane;
         let cur_row = self.row;
         let in_rail = self.in_rail;
-        for (i, spec) in specs.iter().enumerate() {
-            let r = egui::Rect::from_min_size(
-                egui::pos2(rect.min.x, rect.min.y + i as f32 * row_h),
-                egui::vec2(rect.width(), row_h),
-            );
-            let selected = !in_rail && i == cur_row;
-            if selected {
-                ui.painter().rect_filled(
-                    r.shrink2(egui::vec2(6.0, 3.0)),
-                    egui::CornerRadius::same(4),
-                    SEL_BG,
-                );
-            }
-            ui.painter().text(
-                egui::pos2(r.min.x + pad, r.min.y + 16.0),
-                egui::Align2::LEFT_CENTER,
-                spec.label,
-                egui::FontId::proportional(13.0),
-                TEXT,
-            );
-            if !spec.desc.is_empty() {
-                ui.painter().text(
-                    egui::pos2(r.min.x + pad, r.min.y + 32.0),
-                    egui::Align2::LEFT_CENTER,
-                    spec.desc,
-                    egui::FontId::proportional(11.0),
-                    DIM,
-                );
-            }
-            let anchor_x = r.max.x - pad;
-            let cy = r.center().y;
-            self.draw_control(ui, spec, s, anchor_x, cy, r, selected, outcome, pane, i);
-        }
-        // Static version stamp, Startup pane only — not a RowSpec (nothing to
-        // navigate to or edit), so it's painted directly below the last row.
-        if pane == Pane::Startup {
-            let y = rect.min.y + specs.len() as f32 * row_h + 20.0;
-            ui.painter().text(
-                egui::pos2(rect.min.x + pad, y),
-                egui::Align2::LEFT_CENTER,
-                format!("Foreman v{}", env!("CARGO_PKG_VERSION")),
-                egui::FontId::proportional(11.0),
-                DIM,
-            );
-        }
+        // Consumed once: scroll the selected row into view after a keyboard move,
+        // without snapping back while the user free-scrolls with the wheel.
+        let scroll_to = std::mem::take(&mut self.scroll_to_selected);
+
+        // Rows live in a vertical ScrollArea clipped to `rect`, so a window too
+        // short to show every row scrolls instead of clipping the lower rows.
+        let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        egui::ScrollArea::vertical()
+            .id_salt(("settings_pane", pane.label()))
+            .auto_shrink([false, false])
+            .show(&mut pane_ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.visuals_mut().override_text_color = Some(TEXT);
+                let width = ui.available_width();
+                for (i, spec) in specs.iter().enumerate() {
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+                    let selected = !in_rail && i == cur_row;
+                    if selected {
+                        ui.painter().rect_filled(
+                            r.shrink2(egui::vec2(6.0, 3.0)),
+                            egui::CornerRadius::same(4),
+                            SEL_BG,
+                        );
+                        if scroll_to {
+                            ui.scroll_to_rect(r, None);
+                        }
+                    }
+                    ui.painter().text(
+                        egui::pos2(r.min.x + pad, r.min.y + 16.0),
+                        egui::Align2::LEFT_CENTER,
+                        spec.label,
+                        egui::FontId::proportional(13.0),
+                        TEXT,
+                    );
+                    if !spec.desc.is_empty() {
+                        ui.painter().text(
+                            egui::pos2(r.min.x + pad, r.min.y + 32.0),
+                            egui::Align2::LEFT_CENTER,
+                            spec.desc,
+                            egui::FontId::proportional(11.0),
+                            DIM,
+                        );
+                    }
+                    let anchor_x = r.max.x - pad;
+                    let cy = r.center().y;
+                    self.draw_control(ui, spec, s, anchor_x, cy, r, selected, outcome, pane, i);
+                }
+                // Static version stamp, Startup pane only — allocated (not
+                // painted at an absolute y) so it scrolls with the rows.
+                if pane == Pane::Startup {
+                    let (vr, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover());
+                    ui.painter().text(
+                        egui::pos2(vr.min.x + pad, vr.min.y + 20.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("Foreman v{}", env!("CARGO_PKG_VERSION")),
+                        egui::FontId::proportional(11.0),
+                        DIM,
+                    );
+                }
+            });
     }
 
     /// Draw the control for one row and route its mouse interaction.

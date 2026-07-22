@@ -2517,7 +2517,10 @@ impl WindowManager {
             });
             return;
         }
-        let (id, rect) = self.next_slot(SettingsMenu::size());
+        // Add the window chrome the WM reserves (a TITLE_H header band + 1px
+        // border on the other three sides) so the content rect handed to the
+        // menu equals its intrinsic size — otherwise the footer overflows below.
+        let (id, rect) = self.next_slot(SettingsMenu::size() + egui::vec2(2.0, TITLE_H + 1.0));
         self.push_win(
             id,
             Tab::fixed("Settings", Content::Settings(SettingsMenu::new())),
