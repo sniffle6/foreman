@@ -403,7 +403,9 @@ impl SettingsMenu {
     /// layout would cramp horizontally, and there is no horizontal scroll.
     pub fn min_size() -> egui::Vec2 {
         let rail_h = Pane::ALL.len() as f32 * 40.0; // 40.0 = draw_rail row height
-        egui::vec2(RAIL_W + 300.0, rail_h + TITLE_H + FOOTER_H)
+        // + 20 leaves room for the vertical scrollbar so the floor itself never
+        // triggers the horizontal scroll.
+        egui::vec2(RAIL_W + PANE_MIN_W + 20.0, rail_h + TITLE_H + FOOTER_H)
     }
 
     /// Move up one row in the current pane; clamps at 0 (no wrap).
@@ -450,6 +452,11 @@ const RAIL_W: f32 = 190.0;
 const TITLE_H: f32 = 38.0;
 const BODY_H: f32 = 300.0;
 const FOOTER_H: f32 = 30.0;
+/// Width the pane rows are laid out at when the window is too narrow to fit them
+/// — a comfortable row width (label + control + gap). Below this the pane
+/// scrolls horizontally instead of cramping; it's also the floor the window's
+/// resize minimum is built on.
+const PANE_MIN_W: f32 = 360.0;
 
 /// What the settings menu wants the caller (wm) to do after a frame.
 #[derive(Clone, Debug)]
@@ -737,13 +744,19 @@ impl SettingsMenu {
         // Rows live in a vertical ScrollArea clipped to `rect`, so a window too
         // short to show every row scrolls instead of clipping the lower rows.
         let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt(("settings_pane", pane.label()))
             .auto_shrink([false, false])
             .show(&mut pane_ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
                 ui.visuals_mut().override_text_color = Some(TEXT);
-                let width = ui.available_width();
+                // Fill the viewport, but never draw rows narrower than PANE_MIN_W
+                // — below that the pane scrolls horizontally instead of cramping
+                // the label into its control. set_min_width makes the ScrollArea
+                // register the content as wider than the viewport so it shows a
+                // horizontal scrollbar.
+                let width = ui.available_width().max(PANE_MIN_W);
+                ui.set_min_width(width);
                 for (i, spec) in specs.iter().enumerate() {
                     let (r, _) =
                         ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
