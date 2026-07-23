@@ -1,6 +1,6 @@
 # Settings menu
 
-One window, six panes, every phase-1 setting. Opened with the leader chord
+One window, seven panes. Opened with the leader chord
 `Ctrl+B Ctrl+,` (the `OpenSettings` command; bare `,` is Rename). Everything it
 edits lives in `%APPDATA%\foreman\settings.json` and applies live — no OK
 button, no restart (two exceptions below).
@@ -43,6 +43,7 @@ on purpose — a user slider on those creates support tickets, not value).
 
 | Pane | Settings (default) |
 |---|---|
+| Appearance | The live theme editor (split preview; see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Built-in "Foreman Warm" is read-only until duplicated |
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
@@ -86,6 +87,13 @@ on purpose — a user slider on those creates support tickets, not value).
 - **The keybindings editor only reads input when the settings window is
   focused** (like every other pane). An unfocused Keybindings pane is inert, so
   typing in a terminal beside it can't drive the hidden editor.
+- **The Appearance pane is a custom-body pane** (like Keybindings) that edits the
+  *live* theme through the `theme::seed_live`/`live` seam — a color change
+  repaints every terminal instantly. The built-in is read-only (its pickers are
+  disabled); **Duplicate** forks it into an editable user theme saved under
+  `%APPDATA%\foreman\themes\`. Full write-up + the two known gaps (OSC
+  color-query answers and headless `--attrs` still report the *default* palette):
+  `docs/theme-system.md`.
 
 ## Key files
 
@@ -103,6 +111,10 @@ on purpose — a user slider on those creates support tickets, not value).
   settings, carrying keymap edits from the inline editor back to the wm to save).
 - `src/settings.rs` — the keybindings editor, embedded in the Keybindings pane
   (`SettingsMenu.keybindings`), drawn inline into the pane rect.
+- `src/appearance.rs` — the Appearance pane (`SettingsMenu.appearance`): the live
+  theme editor (split preview + color pickers). The `draw_pane` Appearance branch
+  threads the live `Theme` and handles Duplicate / preset-switch. See
+  `docs/theme-system.md`.
 - Consumers: `src/wm.rs` (shell default, float default, focus-follows-mouse,
   settle), `src/terminal.rs` (scrollback, zoom/scroll, copy-on-select, paste
   gate, dim), `src/theme.rs` (`bell_pulse` period, `DIM_UNFOCUSED`),

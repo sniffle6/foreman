@@ -1,10 +1,12 @@
-//! Every named color token in one place — the theme, statically.
+//! The theme: color tokens as a runtime [`Theme`] struct, published each frame
+//! through a ctx seam ([`seed_live`]/[`live`]) exactly like `config`/`keymap`.
 //!
-//! Deliberately NOT a runtime theme system: exactly one theme exists, so a
-//! switchable Theme struct would be interface with nothing behind it (same
-//! deferral reasoning as the chat-storage trait). When a second real theme
-//! lands, these consts become fields on a struct — a mechanical upgrade,
-//! because every consumer already goes through this module.
+//! The module consts below are no longer read directly by consumers — they only
+//! *define the built-in default* ([`Theme::foreman_warm`]), so a default theme
+//! renders byte-identically to the historical static palette. Every view reads
+//! `theme::live(ctx).<field>`; the terminal color pipeline (which runs partly off
+//! the egui thread) takes a `GridColors` value instead. User themes load and save
+//! under `%APPDATA%\foreman\themes\`. Full write-up: `docs/theme-system.md`.
 
 use eframe::egui;
 
