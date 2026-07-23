@@ -10,12 +10,12 @@ use eframe::egui;
 const CHAT_BOARD_W: f32 = 160.0;
 const CHAT_BOARD_MIN_W: f32 = 480.0; // window narrower than this hides the board
 
-fn chat_color(id: &str) -> egui::Color32 {
+fn chat_color(id: &str, colors: &[egui::Color32; 6]) -> egui::Color32 {
     if id == "you" {
-        return CHAT_COLORS[0];
+        return colors[0];
     }
     let n: u64 = id.trim_start_matches('t').parse().unwrap_or(0);
-    CHAT_COLORS[(n as usize) % CHAT_COLORS.len()]
+    colors[(n as usize) % colors.len()]
 }
 
 impl ChatView {
@@ -43,6 +43,7 @@ impl ChatView {
         resp: &egui::Response,
         id: egui::Id,
     ) {
+        let th = crate::theme::live(ui.ctx());
         // Reserve the input strip up front and shrink the working rect so the
         // board/log lay out above it. The painter keeps the FULL rect (it must
         // draw the strip chrome too).
@@ -50,7 +51,7 @@ impl ChatView {
         let input_rect =
             egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - INPUT_H), rect.max);
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, 0.0, WIN_BG);
+        p.rect_filled(rect, 0.0, th.win_bg);
         let rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, input_rect.min.y));
         let pad = 8.0;
         let meta_font = egui::FontId::proportional(11.0);
@@ -70,14 +71,14 @@ impl ChatView {
                     egui::pos2(board.max.x, rect.min.y),
                     egui::pos2(board.max.x, rect.max.y),
                 ],
-                egui::Stroke::new(1.0, BORDER),
+                egui::Stroke::new(1.0, th.border),
             );
             p.text(
                 egui::pos2(board.min.x + pad, board.min.y + pad),
                 egui::Align2::LEFT_TOP,
                 "CREW · BY LAST HEARD",
                 egui::FontId::proportional(9.5),
-                DIM,
+                th.dim,
             );
             let now = std::time::SystemTime::now();
             let row_h = 20.0;
@@ -95,14 +96,18 @@ impl ChatView {
                 );
                 let hovered = resp.hovered() && resp.hover_pos().is_some_and(|p| row.contains(p));
                 if hovered {
-                    p.rect_filled(row, 3.0, TITLE_BG);
+                    p.rect_filled(row, 3.0, th.title_bg);
                 }
                 if hovered && resp.clicked() {
                     self.click = Some(r.id.clone());
                 }
-                let dot = if r.exited { BORDER } else { CHAT_LIVE };
+                let dot = if r.exited { th.border } else { th.chat_live };
                 p.circle_filled(egui::pos2(row.min.x + 7.0, row.center().y), 3.0, dot);
-                let name_col = if r.exited { DIM } else { chat_color(&r.id) };
+                let name_col = if r.exited {
+                    th.dim
+                } else {
+                    chat_color(&r.id, &th.chat_colors)
+                };
                 // The pane identity has name == id ("you") — a bare label beats
                 // the silly-looking "you · you".
                 let label = if r.name == r.id {
@@ -126,7 +131,7 @@ impl ChatView {
                     egui::Align2::RIGHT_CENTER,
                     age,
                     egui::FontId::proportional(10.5),
-                    if stale { CHAT_STALE } else { DIM },
+                    if stale { th.chat_stale } else { th.dim },
                 );
                 let label_x = row.min.x + 16.0;
                 let mut job = egui::text::LayoutJob::simple_singleline(
@@ -176,7 +181,7 @@ impl ChatView {
         for b in &blocks {
             match b {
                 ChatBlock::Sys(s) => {
-                    let g = p.layout(s.clone(), meta_font.clone(), DIM, wrap);
+                    let g = p.layout(s.clone(), meta_font.clone(), th.dim, wrap);
                     total += g.size().y + 6.0;
                     items.push(Painted::Centered(g));
                     items.push(Painted::Gap(6.0));
@@ -185,7 +190,7 @@ impl ChatView {
                     let g = p.layout(
                         "NEW".into(),
                         egui::FontId::proportional(9.0),
-                        CHAT_STALE,
+                        th.chat_stale,
                         wrap,
                     );
                     total += 14.0;
@@ -195,9 +200,9 @@ impl ChatView {
                     let gn = p.layout_no_wrap(
                         name.clone(),
                         egui::FontId::proportional(12.0),
-                        chat_color(id),
+                        chat_color(id, &th.chat_colors),
                     );
-                    let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), DIM);
+                    let gm = p.layout_no_wrap(meta.clone(), meta_font.clone(), th.dim);
                     total += gn.size().y + 2.0 + 4.0; // header + breathing room above
                     items.push(Painted::Gap(4.0));
                     items.push(Painted::MetaPair(gn, gm));
@@ -210,9 +215,9 @@ impl ChatView {
                     for (i, word) in text.split(' ').enumerate() {
                         let lead = if i == 0 { "" } else { " " };
                         let (col, bg) = if word.starts_with('@') && word.len() > 1 {
-                            (CHAT_COLORS[0], CHAT_MENTION_BG)
+                            (th.chat_colors[0], th.chat_mention_bg)
                         } else {
-                            (TEXT, egui::Color32::TRANSPARENT)
+                            (th.text, egui::Color32::TRANSPARENT)
                         };
                         job.append(
                             &format!("{lead}{word}"),
@@ -229,7 +234,7 @@ impl ChatView {
                     total += g.size().y + 2.0;
                     items.push(Painted::Galley(
                         g,
-                        TEXT,
+                        th.text,
                         if to.is_empty() { 0.0 } else { 10.0 },
                         !to.is_empty(),
                     ));
@@ -257,7 +262,7 @@ impl ChatView {
                 Painted::Centered(g) => {
                     let h = g.size().y;
                     let x = log_rect.center().x - g.size().x / 2.0;
-                    p.galley(egui::pos2(x, y), g, DIM);
+                    p.galley(egui::pos2(x, y), g, th.dim);
                     y += h;
                 }
                 Painted::Rule(label) => {
@@ -269,7 +274,7 @@ impl ChatView {
                             egui::pos2(log_rect.min.x, mid),
                             egui::pos2(log_rect.max.x, mid),
                         ],
-                        egui::Stroke::new(1.0, CHAT_MENTION_BG),
+                        egui::Stroke::new(1.0, th.chat_mention_bg),
                     );
                     if let Some(g) = label {
                         let w = g.size().x;
@@ -280,17 +285,17 @@ impl ChatView {
                                 egui::vec2(w + 8.0, 14.0),
                             ),
                             0.0,
-                            WIN_BG,
+                            th.win_bg,
                         );
-                        p.galley(egui::pos2(lx, y + 1.0), g, CHAT_STALE);
+                        p.galley(egui::pos2(lx, y + 1.0), g, th.chat_stale);
                     }
                     y += 14.0;
                 }
                 Painted::MetaPair(gn, gm) => {
                     let h = gn.size().y;
                     let nw = gn.size().x;
-                    p.galley(egui::pos2(log_rect.min.x, y), gn, TEXT);
-                    p.galley(egui::pos2(log_rect.min.x + nw + 6.0, y + 1.5), gm, DIM);
+                    p.galley(egui::pos2(log_rect.min.x, y), gn, th.text);
+                    p.galley(egui::pos2(log_rect.min.x + nw + 6.0, y + 1.5), gm, th.dim);
                     y += h + 2.0;
                 }
                 Painted::Galley(g, col, indent, edge) => {
@@ -301,7 +306,7 @@ impl ChatView {
                                 egui::pos2(log_rect.min.x + 2.0, y),
                                 egui::pos2(log_rect.min.x + 2.0, y + h),
                             ],
-                            egui::Stroke::new(2.0, CHAT_EDGE),
+                            egui::Stroke::new(2.0, th.chat_edge),
                         );
                     }
                     p.galley(egui::pos2(log_rect.min.x + indent, y), g, col);
@@ -314,29 +319,29 @@ impl ChatView {
         // ---- input strip: the human posts from here ----
         // Repaint the strip ground first: the painter's clip spans the full
         // window, so a partially-scrolled log line can bleed under the strip.
-        p.rect_filled(input_rect, 0.0, WIN_BG);
+        p.rect_filled(input_rect, 0.0, th.win_bg);
         p.line_segment(
             [
                 input_rect.min,
                 egui::pos2(input_rect.max.x, input_rect.min.y),
             ],
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, th.border),
         );
         let te_rect = input_rect.shrink2(egui::vec2(8.0, 5.0));
-        p.rect_filled(te_rect, egui::CornerRadius::same(3), DESK_BG);
+        p.rect_filled(te_rect, egui::CornerRadius::same(3), th.desk_bg);
         p.rect_stroke(
             te_rect,
             egui::CornerRadius::same(3),
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, th.border),
             egui::StrokeKind::Inside,
         );
-        ui.visuals_mut().selection.bg_fill = SELECTION_TEXT_BG;
+        ui.visuals_mut().selection.bg_fill = th.selection_text_bg;
         let te = ui.put(
             te_rect,
             egui::TextEdit::singleline(&mut self.input)
                 .id(id)
                 .font(egui::FontId::proportional(12.5))
-                .text_color(TEXT)
+                .text_color(th.text)
                 .hint_text("Message…")
                 .vertical_align(egui::Align::Center)
                 .frame(egui::Frame::NONE)
