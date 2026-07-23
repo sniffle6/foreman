@@ -91,9 +91,11 @@ impl AppearanceView {
         self.working = self.saved.clone();
     }
 
-    /// Render the pane into `rect`. Task 14 draws the split layout + live
-    /// preview and Task 15 the color pickers; this placeholder keeps the pane
-    /// wired end-to-end (it appears in the rail and draws into its body).
+    /// Render the split-preview pane into `rect`: a control column on the left
+    /// and a sticky live preview (a fake terminal sample + the ANSI palette grid)
+    /// on the right, both drawn with the *working* theme so edits show live. The
+    /// color controls land in the next step; here we lay out the split, paint the
+    /// preview, and offer "Revert to saved" while dirty.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -101,15 +103,168 @@ impl AppearanceView {
         reads_input: bool,
         out_theme: &mut Theme,
     ) -> Outcome {
-        let _ = (reads_input, out_theme);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Appearance",
-            egui::FontId::proportional(14.0),
-            crate::theme::live(ui.ctx()).dim,
+        let t = self.working.clone();
+        let pad = 12.0;
+        let split_x = rect.left() + (rect.width() * 0.5).max(rect.width() - 340.0);
+        let left = egui::Rect::from_min_max(
+            rect.min + egui::vec2(pad, pad),
+            egui::pos2(split_x - pad, rect.bottom() - pad),
         );
-        Outcome::Pending
+        let right = egui::Rect::from_min_max(
+            egui::pos2(split_x + pad, rect.top() + pad),
+            rect.max - egui::vec2(pad, pad),
+        );
+
+        // Right: the sticky live preview (drawn with the working theme).
+        Self::paint_preview(ui, right, &t);
+
+        // Left: heading + (Revert while dirty). Controls arrive next step.
+        let p = ui.painter();
+        p.text(
+            left.min,
+            egui::Align2::LEFT_TOP,
+            &self.active_name,
+            egui::FontId::proportional(15.0),
+            t.text,
+        );
+        p.text(
+            left.min + egui::vec2(0.0, 24.0),
+            egui::Align2::LEFT_TOP,
+            if self.active_is_builtin() {
+                "Built-in theme — Duplicate to customize"
+            } else {
+                "User theme"
+            },
+            egui::FontId::proportional(12.0),
+            t.dim,
+        );
+
+        let mut outcome = Outcome::Pending;
+        if self.is_dirty() {
+            let btn = egui::Rect::from_min_size(
+                egui::pos2(left.left(), left.bottom() - 26.0),
+                egui::vec2(140.0, 24.0),
+            );
+            let resp = ui.interact(btn, ui.id().with("appearance_revert"), egui::Sense::click());
+            let fill = if resp.hovered() {
+                t.sel_bg
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let p = ui.painter();
+            p.rect_filled(btn, egui::CornerRadius::same(3), fill);
+            p.rect_stroke(
+                btn,
+                egui::CornerRadius::same(3),
+                egui::Stroke::new(1.0, t.border),
+                egui::StrokeKind::Inside,
+            );
+            p.text(
+                btn.center(),
+                egui::Align2::CENTER_CENTER,
+                "Revert to saved",
+                egui::FontId::proportional(12.0),
+                t.text,
+            );
+            if reads_input && resp.clicked() {
+                self.revert();
+                *out_theme = self.working.clone();
+                outcome = Outcome::Changed;
+            }
+        }
+        outcome
+    }
+
+    /// A self-contained mini-terminal sample rendered with `t` — NO PTY. Shows the
+    /// surface, foreground text, several palette colors, a selection wash, the
+    /// caret, and the full 16-swatch ANSI grid, so an edit is visible at a glance.
+    fn paint_preview(ui: &egui::Ui, rect: egui::Rect, t: &Theme) {
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, egui::CornerRadius::same(4), t.bg);
+        p.rect_stroke(
+            rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, t.border_focus),
+            egui::StrokeKind::Inside,
+        );
+        let mono = egui::FontId::monospace(13.0);
+        let x0 = rect.left() + 10.0;
+        let mut y = rect.top() + 10.0;
+        let lh = 18.0;
+        // Draw a left-to-right run of (text, color) segments on one line.
+        let mut line = |segs: &[(&str, egui::Color32)], y: f32| {
+            let mut x = x0;
+            for (s, c) in segs {
+                let r = p.text(
+                    egui::pos2(x, y),
+                    egui::Align2::LEFT_TOP,
+                    *s,
+                    mono.clone(),
+                    *c,
+                );
+                x = r.right();
+            }
+        };
+        line(
+            &[
+                ("andy", t.palette[2]),
+                (":", t.fg),
+                ("~/foreman", t.palette[4]),
+                ("$ ", t.fg),
+                ("git status", t.fg),
+            ],
+            y,
+        );
+        y += lh;
+        line(&[("On branch ", t.fg), ("main", t.palette[2])], y);
+        y += lh;
+        line(&[("  modified: ", t.palette[3]), ("src/theme.rs", t.fg)], y);
+        y += lh;
+        // Selected line: wash then text.
+        let sel_text = "  new file: src/appearance.rs";
+        let sel_w = p
+            .layout_no_wrap(sel_text.to_string(), mono.clone(), t.fg)
+            .rect
+            .width();
+        p.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(sel_w, lh)),
+            egui::CornerRadius::ZERO,
+            t.selection,
+        );
+        line(&[(sel_text, t.fg)], y);
+        y += lh;
+        // Prompt + caret block.
+        let after = p
+            .text(
+                egui::pos2(x0, y),
+                egui::Align2::LEFT_TOP,
+                "$ ",
+                mono.clone(),
+                t.fg,
+            )
+            .right();
+        p.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(after, y), egui::vec2(8.0, lh - 3.0)),
+            egui::CornerRadius::ZERO,
+            t.caret,
+        );
+
+        // ANSI 16-swatch grid, two rows of eight, along the bottom.
+        let cols = 8.0;
+        let gap = 3.0;
+        let sw = ((rect.width() - 20.0) - gap * (cols - 1.0)) / cols;
+        let sh = 14.0;
+        let gx = rect.left() + 10.0;
+        let gy = rect.bottom() - (sh * 2.0 + gap) - 10.0;
+        for i in 0..16 {
+            let r = i / 8;
+            let c = i % 8;
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(gx + c as f32 * (sw + gap), gy + r as f32 * (sh + gap)),
+                egui::vec2(sw, sh),
+            );
+            p.rect_filled(cell, egui::CornerRadius::same(2), t.palette[i as usize]);
+        }
     }
 }
 
