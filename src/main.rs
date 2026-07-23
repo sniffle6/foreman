@@ -75,6 +75,10 @@ struct App {
     font_dirty_at: Option<std::time::Instant>,
     /// Set when the desktop workspace layout changed; written after debounce.
     workspace_dirty_at: Option<std::time::Instant>,
+    /// The active color theme, resolved from `settings.theme` (the name) and
+    /// seeded into ctx data each frame like `settings`. The Appearance pane edits
+    /// it live through the ctx seam; the App reads the edit back here.
+    active_theme: std::sync::Arc<crate::theme::Theme>,
     /// Last time anything happened (input, PTY output, control msg). Drives the
     /// adaptive repaint cadence: fast while recently active, slow when idle.
     last_activity: Option<std::time::Instant>,
@@ -138,6 +142,7 @@ impl App {
             settings: config::Settings::load(),
             font_dirty_at: None,
             workspace_dirty_at: None,
+            active_theme: std::sync::Arc::new(crate::theme::Theme::foreman_warm()),
             last_activity: None,
             force_quit: false,
             landing: landing::Landing::new(
@@ -551,6 +556,7 @@ impl eframe::App for App {
         // Publish the whole settings struct into ctx data so the settings menu
         // (in wm) can read + edit it this frame; its edits come back via config::live.
         config::seed_live(&ctx, &self.settings);
+        crate::theme::seed_live(&ctx, &self.active_theme);
         // Landing when nothing is *visible* (closed or all minimized). Always
         // still run the desktop so the Sessions panel stays docked at its
         // remembered size and minimized PTYs keep pumping; the landing paints
@@ -676,6 +682,13 @@ impl eframe::App for App {
                 }
                 self.font_dirty_at = None;
             }
+        }
+        // Adopt any Appearance-pane theme edit published this frame (theme::seed_live
+        // in wm) so the preview and every real terminal repaint live. Debounced
+        // persistence to the user theme file lands with the theme-save wiring.
+        let live_th = crate::theme::live(&ctx);
+        if *live_th != *self.active_theme {
+            self.active_theme = live_th;
         }
         // Workspace layout: poll structural dirty, debounce write to workspace.json.
         if self.desktop.poll_workspace_dirty() {
