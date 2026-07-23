@@ -146,10 +146,10 @@ impl AppearanceView {
         let t = self.working.clone();
         let pad = 12.0;
         let inner = rect.shrink(pad);
-        // Responsive split: controls and preview each take ~half and BOTH grow
-        // with the window (the controls' swatches/name/palette fill their column,
-        // so the left side isn't dead space); the controls scroll if too tall.
-        let controls_w = (inner.width() * 0.5).clamp(240.0, (inner.width() - 200.0).max(240.0));
+        // Responsive split: the controls column grows with the window up to a
+        // sensible form width (its swatches/name/palette fill it, so it isn't dead
+        // space), then caps; the preview takes the rest. Controls scroll if tall.
+        let controls_w = (inner.width() * 0.44).clamp(250.0, 440.0);
         let controls_rect =
             egui::Rect::from_min_size(inner.min, egui::vec2(controls_w, inner.height()));
         let preview_rect = egui::Rect::from_min_max(
@@ -475,7 +475,8 @@ fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
     ui.horizontal(|ui| {
         color_row_label(ui, label);
         // Full-width swatch bar: fills the rest of the row (reactive + big target).
-        ui.spacing_mut().interact_size = egui::vec2(ui.available_width().max(24.0), 22.0);
+        ui.spacing_mut().interact_size =
+            egui::vec2(ui.available_width().min(220.0).max(24.0), 22.0);
         let mut rgb = [c.r(), c.g(), c.b()];
         let ch = ui.color_edit_button_srgb(&mut rgb).changed();
         if ch {
@@ -492,7 +493,8 @@ fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
 fn translucent_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
     ui.horizontal(|ui| {
         color_row_label(ui, label);
-        ui.spacing_mut().interact_size = egui::vec2(ui.available_width().max(24.0), 22.0);
+        ui.spacing_mut().interact_size =
+            egui::vec2(ui.available_width().min(220.0).max(24.0), 22.0);
         let mut a = c.to_srgba_unmultiplied();
         let ch = ui.color_edit_button_srgba_unmultiplied(&mut a).changed();
         if ch {
