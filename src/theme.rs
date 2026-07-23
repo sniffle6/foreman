@@ -443,7 +443,7 @@ impl Theme {
 /// non-alphanumeric characters collapsed to a single `-` (the caller appends
 /// `.json`). e.g. `"Foreman Warm copy"` -> `"foreman-warm-copy"`. `save`/`load`
 /// are symmetric on this, so a name round-trips regardless of trailing dashes.
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in name.chars() {

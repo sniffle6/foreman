@@ -801,10 +801,26 @@ impl SettingsMenu {
             return;
         }
         if self.pane == Pane::Appearance {
+            // Resync the pane to the active theme when its name changed (preset
+            // switch / Duplicate / external) — never mid-edit, since the name is
+            // stable while editing, so this can't clobber in-progress edits.
+            if s.theme.as_str() != self.appearance.active_name() {
+                self.appearance.set_active(&s.theme, theme.clone());
+            }
             let reads_input = active && !self.in_rail && !just_entered;
             match self.appearance.show(ui, rect, reads_input, theme) {
                 crate::appearance::Outcome::Changed => bump(outcome, MenuOutcome::Changed),
-                crate::appearance::Outcome::Duplicate(_name) => bump(outcome, MenuOutcome::Changed),
+                crate::appearance::Outcome::Duplicate(name) => {
+                    // Write the fork as a new user theme, then make it active; the
+                    // App reloads it (now editable) and the pane resyncs to it.
+                    let _ = self.appearance.working().save(&name);
+                    s.theme = name;
+                    bump(outcome, MenuOutcome::Changed);
+                }
+                crate::appearance::Outcome::SelectPreset(name) => {
+                    s.theme = name;
+                    bump(outcome, MenuOutcome::Changed);
+                }
                 crate::appearance::Outcome::Close => self.in_rail = true,
                 crate::appearance::Outcome::Pending => {}
             }

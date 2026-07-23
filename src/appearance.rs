@@ -20,6 +20,8 @@ pub enum Outcome {
     Changed,
     /// Fork the active theme into a new editable user theme with this name.
     Duplicate(String),
+    /// The user picked a different preset — the shell switches settings.theme.
+    SelectPreset(String),
     /// Back out to the rail (Esc/Tab).
     Close,
     /// Nothing happened this frame.
@@ -39,12 +41,14 @@ pub struct AppearanceView {
 
 impl AppearanceView {
     pub fn new() -> Self {
-        Self {
+        let mut v = Self {
             working: Theme::foreman_warm(),
             saved: Theme::foreman_warm(),
             active_name: BUILTIN.to_string(),
             presets: vec![BUILTIN.to_string()],
-        }
+        };
+        v.refresh_presets();
+        v
     }
 
     /// Switch the pane to a theme: it becomes both the working copy and the
@@ -53,6 +57,18 @@ impl AppearanceView {
         self.active_name = name.to_string();
         self.saved = theme.clone();
         self.working = theme;
+        self.refresh_presets();
+    }
+
+    /// Rebuild the preset list: the built-in first, then the user theme files.
+    fn refresh_presets(&mut self) {
+        let mut presets = vec![BUILTIN.to_string()];
+        for n in Theme::user_theme_names() {
+            if n != BUILTIN {
+                presets.push(n);
+            }
+        }
+        self.presets = presets;
     }
 
     /// The currently-active theme name (matches `Settings.theme`).
@@ -127,14 +143,23 @@ impl AppearanceView {
         let mut duplicate: Option<String> = None;
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(left));
         let lui = &mut child;
-        lui.label(
-            egui::RichText::new(&self.active_name)
-                .size(15.0)
-                .color(t.text),
-        );
+        // Preset selector: built-in + user themes. Choosing another asks the
+        // shell to change settings.theme; the App reloads and the pane resyncs.
+        let mut preset_switch: Option<String> = None;
+        let mut selected = self.active_name.clone();
+        egui::ComboBox::from_id_salt("appearance_preset")
+            .selected_text(&self.active_name)
+            .show_ui(lui, |ui| {
+                for p in &self.presets {
+                    ui.selectable_value(&mut selected, p.clone(), p.as_str());
+                }
+            });
+        if selected != self.active_name {
+            preset_switch = Some(selected);
+        }
         lui.label(
             egui::RichText::new(if self.active_is_builtin() {
-                "Built-in theme"
+                "Built-in — Duplicate to edit"
             } else {
                 "User theme"
             })
@@ -143,34 +168,39 @@ impl AppearanceView {
         );
         lui.add_space(8.0);
 
-        changed |= opaque_row(lui, "Background", &mut self.working.bg);
-        changed |= opaque_row(lui, "Foreground", &mut self.working.fg);
-        changed |= translucent_row(lui, "Selection", &mut self.working.selection);
-        changed |= opaque_row(lui, "Focus border", &mut self.working.border_focus);
-        changed |= translucent_row(lui, "Cursor", &mut self.working.caret);
+        // The color controls are read-only while the built-in is active — editing
+        // forks a user theme via Duplicate.
+        let editable = !self.active_is_builtin();
+        lui.add_enabled_ui(editable, |ui| {
+            changed |= opaque_row(ui, "Background", &mut self.working.bg);
+            changed |= opaque_row(ui, "Foreground", &mut self.working.fg);
+            changed |= translucent_row(ui, "Selection", &mut self.working.selection);
+            changed |= opaque_row(ui, "Focus border", &mut self.working.border_focus);
+            changed |= translucent_row(ui, "Cursor", &mut self.working.caret);
 
-        lui.add_space(6.0);
-        lui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
-        let mut palette = self.working.palette;
-        egui::Grid::new("appearance_palette")
-            .spacing([4.0, 4.0])
-            .show(lui, |ui| {
-                for i in 0..16usize {
-                    ui.push_id(i, |ui| {
-                        let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
+            let mut palette = self.working.palette;
+            egui::Grid::new("appearance_palette")
+                .spacing([4.0, 4.0])
+                .show(ui, |ui| {
+                    for i in 0..16usize {
+                        ui.push_id(i, |ui| {
+                            let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                            }
+                        });
+                        if i % 8 == 7 {
+                            ui.end_row();
                         }
-                    });
-                    if i % 8 == 7 {
-                        ui.end_row();
                     }
-                }
-            });
-        if palette != self.working.palette {
-            self.working.palette = palette;
-            changed = true;
-        }
+                });
+            if palette != self.working.palette {
+                self.working.palette = palette;
+                changed = true;
+            }
+        });
 
         lui.add_space(6.0);
         // Font size shares the Ctrl+Scroll zoom seam (a Settings field, not a theme
@@ -191,7 +221,7 @@ impl AppearanceView {
         lui.add_space(8.0);
         lui.horizontal(|ui| {
             if ui.button("Duplicate…").clicked() {
-                duplicate = Some(format!("{} copy", self.active_name));
+                duplicate = Some(crate::theme::slug(&format!("{} copy", self.active_name)));
             }
             if self.is_dirty() && ui.button("Revert to saved").clicked() {
                 self.revert();
@@ -201,6 +231,9 @@ impl AppearanceView {
 
         if let Some(name) = duplicate {
             return Outcome::Duplicate(name);
+        }
+        if let Some(name) = preset_switch {
+            return Outcome::SelectPreset(name);
         }
         if changed {
             *out_theme = self.working.clone();
