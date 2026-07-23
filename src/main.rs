@@ -3,6 +3,7 @@
 // eprintln/panic output lands somewhere during development.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appearance;
 mod caret;
 mod chat;
 mod chat_view;
