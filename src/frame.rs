@@ -23,7 +23,7 @@ use eframe::egui;
 
 use crate::caret::CursorDraw;
 use crate::geom::CellMetrics;
-use crate::terminal::{GlyphStyle, glyph_style};
+use crate::terminal::{GlyphStyle, GridColors, glyph_style};
 
 /// One logical glyph locked to a grid cell column (not pixel-x from galley).
 /// Spacer cells (`WIDE_CHAR_SPACER`) never produce a placement.
@@ -118,7 +118,7 @@ fn is_wide_spacer(flags: Flags) -> bool {
 ///
 /// Also records [`EmojiSite`]s for wide default-emoji-presentation scalars
 /// (stamp paint is a later phase — mono placement still always emitted).
-pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
+pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics, gc: &GridColors) -> PaintPlan {
     let off = grid.display_offset() as i32;
     let ncols = metrics.cols().min(grid.columns());
     let nrows = metrics.rows().min(grid.screen_lines());
@@ -149,7 +149,7 @@ pub fn plan_paint(grid: &Grid<Cell>, metrics: &CellMetrics) -> PaintPlan {
                 row,
                 col,
                 ch,
-                style: glyph_style(cell.flags, cell.fg, cell.bg),
+                style: glyph_style(cell.flags, cell.fg, cell.bg, gc),
                 width_cells,
             });
             // Stamp candidates: default emoji presentation (any width).
@@ -192,7 +192,7 @@ pub struct StyleRun {
 /// caches the galley built from it and only re-walks when content/scroll/dims/
 /// font change. Clamps to the grid's REAL size first (a stale index panics, and
 /// a panic across the winit callback aborts the process).
-pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>> {
+pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics, gc: &GridColors) -> Vec<Vec<StyleRun>> {
     let off = grid.display_offset() as i32;
     let ncols = metrics.cols().min(grid.columns());
     let nrows = metrics.rows().min(grid.screen_lines());
@@ -201,7 +201,7 @@ pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>>
         let mut runs: Vec<StyleRun> = Vec::new();
         let mut run = String::new();
         let mut run_style = GlyphStyle {
-            fg: crate::theme::FG,
+            fg: gc.fg,
             bg: None,
             underline: false,
             strikethrough: false,
@@ -210,7 +210,7 @@ pub fn text_rows(grid: &Grid<Cell>, metrics: &CellMetrics) -> Vec<Vec<StyleRun>>
         };
         for col in 0..ncols {
             let cell = &grid[Line(row as i32 - off)][Column(col)];
-            let style = glyph_style(cell.flags, cell.fg, cell.bg);
+            let style = glyph_style(cell.flags, cell.fg, cell.bg, gc);
             if style != run_style {
                 if !run.is_empty() {
                     runs.push(StyleRun {
@@ -362,6 +362,11 @@ mod tests {
         )
     }
 
+    /// Default grid colors for the pure paint tests (the built-in warm palette).
+    fn colors() -> GridColors {
+        GridColors::default_warm()
+    }
+
     // ---- clamp: the process-abort guard --------------------------------------
     #[test]
     fn plan_clamps_stale_metrics_to_grid_bounds() {
@@ -376,7 +381,7 @@ mod tests {
             10,
             10,
         );
-        let rows = text_rows(term.grid(), &m);
+        let rows = text_rows(term.grid(), &m, &colors());
         assert_eq!(rows.len(), 2, "must walk only the grid's 2 rows");
         for runs in &rows {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
@@ -393,7 +398,7 @@ mod tests {
         // paints exactly what the pane shows, no more.
         let term = term_with(b"", 10, 10);
         let m = metrics(4, 2);
-        let rows = text_rows(term.grid(), &m);
+        let rows = text_rows(term.grid(), &m, &colors());
         assert_eq!(rows.len(), 2);
         for runs in &rows {
             let text: String = runs.iter().map(|r| r.text.as_str()).collect();
@@ -427,7 +432,7 @@ mod tests {
         // "ab" is plain, "cd" is underlined (ESC[4m): one run per style, in order.
         let term = term_with(b"ab\x1b[4mcd", 4, 1);
         let m = metrics(4, 1);
-        let rows = text_rows(term.grid(), &m);
+        let rows = text_rows(term.grid(), &m, &colors());
         assert_eq!(rows.len(), 1);
         let runs = &rows[0];
         assert_eq!(runs.len(), 2, "a plain run then an underlined run");
@@ -442,7 +447,7 @@ mod tests {
         // A fresh row is blank cells; the walk emits spaces, never a raw '\0'.
         let term = term_with(b"", 4, 1);
         let m = metrics(4, 1);
-        let rows = text_rows(term.grid(), &m);
+        let rows = text_rows(term.grid(), &m, &colors());
         let text: String = rows[0].iter().map(|r| r.text.as_str()).collect();
         assert_eq!(text, "    ");
         assert!(!text.contains('\0'));
@@ -561,7 +566,7 @@ mod tests {
     fn plan_paint_places_ascii_on_columns() {
         let term = term_with(b"ab", 4, 1);
         let m = metrics(4, 1);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         let visible: Vec<_> = plan.glyphs.iter().filter(|g| g.ch != ' ').collect();
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].col, 0);
@@ -578,7 +583,7 @@ mod tests {
         // 你好: two width-2 CJK glyphs at cols 0 and 2; spacer cells emit nothing.
         let term = term_with("你好".as_bytes(), 8, 1);
         let m = metrics(8, 1);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
 
         // Invariant: no GlyphPlacement may sit on any wide spacer cell.
         for g in &plan.glyphs {
@@ -614,7 +619,7 @@ mod tests {
             // No WIDE_CHAR flag → width_cells 1 (orphan / broken pair).
         }
         let m = metrics(4, 1);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         let site = plan
             .emoji_sites
             .iter()
@@ -638,7 +643,7 @@ mod tests {
             cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
         }
         let m = metrics(4, 2);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         assert!(
             plan.glyphs.iter().all(|g| !(g.row == 1 && g.col == 0)),
             "LEADING_WIDE_CHAR_SPACER must not be painted: {:?}",
@@ -656,7 +661,7 @@ mod tests {
             10,
             10,
         );
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         assert!(plan.glyphs.iter().all(|g| g.row < 2 && g.col < 4));
     }
 
@@ -674,7 +679,7 @@ mod tests {
     fn plan_paint_emits_emoji_site_for_wide_emoji() {
         let term = term_with("🥒".as_bytes(), 8, 1);
         let m = metrics(8, 1);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         // Hard asserts: alacritty marks default-presentation emoji wide (like CJK).
         // If this fails, fix term_with / feed path — do not soften.
         let g = plan
@@ -696,7 +701,7 @@ mod tests {
         let bytes = b"\x1b[0ma\x1b[1mb\x1b[0;3mc\x1b[1;3md\x1b[0m";
         let term = term_with(bytes, 8, 1);
         let m = metrics(8, 1);
-        let plan = plan_paint(term.grid(), &m);
+        let plan = plan_paint(term.grid(), &m, &colors());
         let styles: Vec<_> = plan
             .glyphs
             .iter()

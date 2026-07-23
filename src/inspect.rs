@@ -141,6 +141,9 @@ pub fn snapshot_cells<L: EventListener>(
     let screen_rows = grid.screen_lines();
     let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
     let mut out = Vec::with_capacity(r1.saturating_sub(r0));
+    // Headless inspection has no egui ctx, so resolve against the built-in
+    // default palette. (Documented gap: `--attrs` reports the default theme.)
+    let gc = crate::terminal::GridColors::default_warm();
     for row in r0..r1 {
         let line = Line(row as i32 - off);
         let mut row_cells = Vec::new();
@@ -152,8 +155,8 @@ pub fn snapshot_cells<L: EventListener>(
                 col += 1;
                 continue;
             }
-            let fg = crate::terminal::resolve(cell.fg).unwrap_or(crate::theme::FG);
-            let bg = crate::terminal::resolve(cell.bg).map(|c| [c.r(), c.g(), c.b()]);
+            let fg = crate::terminal::resolve(cell.fg, &gc).unwrap_or(gc.fg);
+            let bg = crate::terminal::resolve(cell.bg, &gc).map(|c| [c.r(), c.g(), c.b()]);
             row_cells.push(CellData {
                 ch: if cell.c == '\0' { ' ' } else { cell.c },
                 fg: [fg.r(), fg.g(), fg.b()],

@@ -14,8 +14,6 @@ use alacritty_terminal::term::{Config, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-use crate::theme::*;
-
 /// Coarse "some terminal produced output recently" signal for the render loop's
 /// adaptive cadence. Private — poke it only through [`note_pty_output`] /
 /// [`take_pty_output`]. Drives frame scheduling, never correctness.
@@ -55,9 +53,31 @@ pub(crate) fn note_layout_call() {
     LAYOUT_CALLS.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-fn indexed_rgb(i: u8) -> egui::Color32 {
+/// The theme colors the grid resolver needs, as a plain value so the pure
+/// resolvers work off the egui thread (OSC answers) and headless (`--attrs`).
+/// Render paths build it from the live theme; ctx-less paths use the default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GridColors {
+    pub(crate) fg: egui::Color32,
+    pub(crate) bg: egui::Color32,
+    pub(crate) palette: [egui::Color32; 16],
+}
+impl GridColors {
+    pub(crate) fn from_theme(t: &crate::theme::Theme) -> Self {
+        Self {
+            fg: t.fg,
+            bg: t.bg,
+            palette: t.palette,
+        }
+    }
+    pub(crate) fn default_warm() -> Self {
+        Self::from_theme(&crate::theme::Theme::foreman_warm())
+    }
+}
+
+fn indexed_rgb(i: u8, gc: &GridColors) -> egui::Color32 {
     if (i as usize) < 16 {
-        return PALETTE[i as usize];
+        return gc.palette[i as usize];
     }
     if i >= 232 {
         let v = 8 + 10 * (i as u16 - 232);
@@ -74,31 +94,31 @@ fn indexed_rgb(i: u8) -> egui::Color32 {
     egui::Color32::from_rgb(comp(i / 36), comp((i / 6) % 6), comp(i % 6))
 }
 
-pub(crate) fn resolve(c: AnsiColor) -> Option<egui::Color32> {
+pub(crate) fn resolve(c: AnsiColor, gc: &GridColors) -> Option<egui::Color32> {
     match c {
         AnsiColor::Spec(rgb) => Some(egui::Color32::from_rgb(rgb.r, rgb.g, rgb.b)),
-        AnsiColor::Indexed(i) => Some(indexed_rgb(i)),
+        AnsiColor::Indexed(i) => Some(indexed_rgb(i, gc)),
         AnsiColor::Named(n) => match n {
-            NamedColor::Foreground | NamedColor::BrightForeground => Some(FG),
+            NamedColor::Foreground | NamedColor::BrightForeground => Some(gc.fg),
             NamedColor::Background => None,
-            NamedColor::Cursor => Some(FG),
-            NamedColor::Black => Some(PALETTE[0]),
-            NamedColor::Red => Some(PALETTE[1]),
-            NamedColor::Green => Some(PALETTE[2]),
-            NamedColor::Yellow => Some(PALETTE[3]),
-            NamedColor::Blue => Some(PALETTE[4]),
-            NamedColor::Magenta => Some(PALETTE[5]),
-            NamedColor::Cyan => Some(PALETTE[6]),
-            NamedColor::White => Some(PALETTE[7]),
-            NamedColor::BrightBlack => Some(PALETTE[8]),
-            NamedColor::BrightRed => Some(PALETTE[9]),
-            NamedColor::BrightGreen => Some(PALETTE[10]),
-            NamedColor::BrightYellow => Some(PALETTE[11]),
-            NamedColor::BrightBlue => Some(PALETTE[12]),
-            NamedColor::BrightMagenta => Some(PALETTE[13]),
-            NamedColor::BrightCyan => Some(PALETTE[14]),
-            NamedColor::BrightWhite => Some(PALETTE[15]),
-            _ => Some(FG),
+            NamedColor::Cursor => Some(gc.fg),
+            NamedColor::Black => Some(gc.palette[0]),
+            NamedColor::Red => Some(gc.palette[1]),
+            NamedColor::Green => Some(gc.palette[2]),
+            NamedColor::Yellow => Some(gc.palette[3]),
+            NamedColor::Blue => Some(gc.palette[4]),
+            NamedColor::Magenta => Some(gc.palette[5]),
+            NamedColor::Cyan => Some(gc.palette[6]),
+            NamedColor::White => Some(gc.palette[7]),
+            NamedColor::BrightBlack => Some(gc.palette[8]),
+            NamedColor::BrightRed => Some(gc.palette[9]),
+            NamedColor::BrightGreen => Some(gc.palette[10]),
+            NamedColor::BrightYellow => Some(gc.palette[11]),
+            NamedColor::BrightBlue => Some(gc.palette[12]),
+            NamedColor::BrightMagenta => Some(gc.palette[13]),
+            NamedColor::BrightCyan => Some(gc.palette[14]),
+            NamedColor::BrightWhite => Some(gc.palette[15]),
+            _ => Some(gc.fg),
         },
     }
 }
@@ -109,13 +129,18 @@ pub(crate) fn resolve(c: AnsiColor) -> Option<egui::Color32> {
 /// these (OSC 10/11/12, OSC 4;N) to detect a light/dark background and theme
 /// themselves — without an answer they fall back to a guess.
 fn query_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
+    // Off the egui thread (the Listener answers OSC queries from the reader),
+    // so there is no ctx to read the live theme — report the built-in default
+    // palette. (Documented phase-3b gap: OSC 10/11/12 & OSC 4;N answers do not
+    // follow a live theme edit.)
+    let gc = GridColors::default_warm();
     let c = if index < 256 {
-        indexed_rgb(index as u8)
+        indexed_rgb(index as u8, &gc)
     } else if index == NamedColor::Background as usize {
-        BG
+        gc.bg
     } else {
         // Foreground, Cursor, and the rarer named slots all use our foreground.
-        FG
+        gc.fg
     };
     alacritty_terminal::vte::ansi::Rgb {
         r: c.r(),
@@ -139,12 +164,17 @@ pub(crate) struct GlyphStyle {
     pub(crate) italic: bool,
 }
 
-pub(crate) fn glyph_style(flags: Flags, fg: AnsiColor, bg: AnsiColor) -> GlyphStyle {
-    let mut fg = resolve(fg).unwrap_or(FG);
-    let mut bg = resolve(bg);
+pub(crate) fn glyph_style(
+    flags: Flags,
+    fg: AnsiColor,
+    bg: AnsiColor,
+    gc: &GridColors,
+) -> GlyphStyle {
+    let mut fg = resolve(fg, gc).unwrap_or(gc.fg);
+    let mut bg = resolve(bg, gc);
     if flags.contains(Flags::INVERSE) {
         let old_fg = fg;
-        fg = bg.unwrap_or(BG);
+        fg = bg.unwrap_or(gc.bg);
         bg = Some(old_fg);
     }
     if flags.contains(Flags::DIM) {
@@ -374,6 +404,10 @@ struct MonoPaintKey {
     cols: usize,
     rows: usize,
     font_bits: u32,
+    /// Live palette/fg/bg. Keying on it busts the galley cache the instant a
+    /// theme edit changes colors, so cached terminal text repaints live rather
+    /// than waiting for the grid content to change.
+    colors: GridColors,
 }
 
 /// One grid-locked glyph ready to blit: grid identity + shared galley.
@@ -418,6 +452,7 @@ impl MonoPaintCache {
                 cols: 0,
                 rows: 0,
                 font_bits: 0,
+                colors: GridColors::default_warm(),
             },
             items: std::sync::Arc::new(Vec::new()),
             bgs: std::sync::Arc::new(Vec::new()),
@@ -1776,12 +1811,17 @@ impl Session {
         active: bool,
         resp: &egui::Response,
     ) {
+        // Live theme for this pane's own color refs (`th`) and the grid-resolver
+        // palette (`gc`). Owned values, so holding them across `ui`/`self`
+        // mutable borrows below is fine.
+        let th = crate::theme::live(ui.ctx());
+        let gc = GridColors::from_theme(&th);
         let font_px = font_size(ui.ctx());
         // Metrics probe must use the same regular terminal face as painted glyphs.
         let font = crate::terminal_font::font_id(font_px, false, false);
         let probe = ui
             .painter()
-            .layout_no_wrap("M".to_string(), font.clone(), FG);
+            .layout_no_wrap("M".to_string(), font.clone(), th.fg);
         let cw = probe.rect.width().max(1.0);
         let rh = probe.rect.height().max(1.0);
         let cols = ((rect.width() / cw).floor() as usize).clamp(2, 600);
@@ -2034,7 +2074,7 @@ impl Session {
         let overlays = crate::frame::overlays(self.term.grid(), &metrics, sel, cursor_draw);
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, egui::CornerRadius::ZERO, BG);
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, th.bg);
 
         // Grid-locked mono paint — Strategy P: one galley per non-blank placement,
         // blit pos from live cell_rect (not free-flow advances; not cached Pos2).
@@ -2048,6 +2088,7 @@ impl Session {
             cols: self.cols,
             rows: self.rows,
             font_bits: font_px.to_bits(),
+            colors: gc,
         };
         // Plan only on miss so cache hits stay free of plan_paint + layout_*.
         // Built before borrowing mono_paint mutably (self.term vs cache).
@@ -2055,7 +2096,7 @@ impl Session {
         // replan; atlas fill never changes this key (separate texture cache).
         let plan = match &self.mono_paint {
             Some(c) if c.key == key => None,
-            _ => Some(crate::frame::plan_paint(self.term.grid(), &metrics)),
+            _ => Some(crate::frame::plan_paint(self.term.grid(), &metrics, &gc)),
         };
         let (items, bgs, emoji_sites) = {
             let cache = self.mono_paint.get_or_insert_with(MonoPaintCache::empty);
@@ -2147,7 +2188,7 @@ impl Session {
             }
             // Unstamped EP emoji fall through here on purpose: mono tofu is
             // the fail-open when the color raster has no glyph.
-            painter.galley(metrics.cell_rect(g.row, g.col).min, g.galley.clone(), FG);
+            painter.galley(metrics.cell_rect(g.row, g.col).min, g.galley.clone(), th.fg);
         }
 
         if !stamp_ready.is_empty() {
@@ -2155,8 +2196,8 @@ impl Session {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             for (site, tex) in &stamp_ready {
                 let cell = &self.term.grid()[Line(site.row as i32 - off)][Column(site.col)];
-                let style = glyph_style(cell.flags, cell.fg, cell.bg);
-                let bg = style.bg.unwrap_or(BG);
+                let style = glyph_style(cell.flags, cell.fg, cell.bg, &gc);
+                let bg = style.bg.unwrap_or(th.bg);
                 let end_col = site.col + (site.width_cells as usize).saturating_sub(1);
                 let span = metrics.span_rect(site.row, site.col, end_col);
                 // Cell bg underlay (clears mono hole + transparent stamp corners).
@@ -2259,7 +2300,7 @@ impl Session {
                         painter.rect_filled(
                             metrics.span_rect(row, c0, c1),
                             egui::CornerRadius::ZERO,
-                            SEARCH_MATCH,
+                            th.search_match,
                         );
                     }
                 }
@@ -2276,7 +2317,7 @@ impl Session {
                         painter.rect_filled(
                             metrics.span_rect(row, c0, c1),
                             egui::CornerRadius::ZERO,
-                            SEARCH_CURRENT,
+                            th.search_current,
                         );
                     }
                 }
@@ -2284,7 +2325,7 @@ impl Session {
         }
 
         for r in &overlays.highlights {
-            painter.rect_filled(*r, egui::CornerRadius::ZERO, SELECTION);
+            painter.rect_filled(*r, egui::CornerRadius::ZERO, th.selection);
         }
 
         // caret — hidden while search owns input. Focused pane: filled rect;
@@ -2293,12 +2334,12 @@ impl Session {
             && let Some(r) = overlays.caret
         {
             if active {
-                painter.rect_filled(r, egui::CornerRadius::ZERO, CARET);
+                painter.rect_filled(r, egui::CornerRadius::ZERO, th.caret);
             } else {
                 painter.rect_stroke(
                     r,
                     egui::CornerRadius::ZERO,
-                    egui::Stroke::new(1.0, CARET),
+                    egui::Stroke::new(1.0, th.caret),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -2308,7 +2349,7 @@ impl Session {
         // focused pane reads clearly amid several visible siblings. Painted
         // before the scrollback thumb/search bar so those stay full brightness.
         if !active && crate::config::live(ui.ctx()).dim_unfocused {
-            painter.rect_filled(rect, egui::CornerRadius::ZERO, DIM_UNFOCUSED);
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, th.dim_unfocused);
         }
 
         // scrollback indicator: thin right-edge thumb, shown only when there is
@@ -2316,7 +2357,7 @@ impl Session {
         if let Some(r) = overlays.thumb
             && (overlays.scrolled_back || resp.hovered())
         {
-            painter.rect_filled(r, egui::CornerRadius::same(2), SCROLL_THUMB);
+            painter.rect_filled(r, egui::CornerRadius::same(2), th.scroll_thumb);
         }
 
         // Search bar last inside this pane's draw order (not a global layer).
@@ -2337,14 +2378,15 @@ impl Session {
     }
 
     fn paint_search_bar(&mut self, ui: &mut egui::Ui, content: egui::Rect, active: bool) {
+        let th = crate::theme::live(ui.ctx());
         let view = self.search.view();
         let bar = crate::search::search_bar_rect(content);
         let painter = ui.painter_at(content);
-        painter.rect_filled(bar, egui::CornerRadius::same(4), SEARCH_BAR_BG);
+        painter.rect_filled(bar, egui::CornerRadius::same(4), th.search_bar_bg);
         painter.rect_stroke(
             bar,
             egui::CornerRadius::same(4),
-            egui::Stroke::new(1.0, SEARCH_BAR_BORDER),
+            egui::Stroke::new(1.0, th.search_bar_border),
             egui::StrokeKind::Inside,
         );
 
@@ -2367,9 +2409,9 @@ impl Session {
             format!("{cur_s} / {total_s}")
         };
         let status_color = if view.invalid_regex {
-            SEARCH_ERROR
+            th.search_error
         } else {
-            DIM
+            th.dim
         };
 
         // Focused TextEdit owns keyboard (blocks WM leader via focused().is_some()).
@@ -2388,7 +2430,7 @@ impl Session {
             .id(edit_id)
             .desired_width(inner.width() * 0.55)
             .font(egui::TextStyle::Monospace)
-            .text_color(TEXT)
+            .text_color(th.text)
             .interactive(editing)
             .frame(egui::Frame::NONE);
         let te_resp = child.add(te);
@@ -2841,7 +2883,7 @@ mod tests {
 
     fn default_style() -> GlyphStyle {
         GlyphStyle {
-            fg: FG,
+            fg: GridColors::default_warm().fg,
             bg: None,
             underline: false,
             strikethrough: false,
@@ -3042,6 +3084,7 @@ mod tests {
             cols: 2,
             rows: 1,
             font_bits: 14.0f32.to_bits(),
+            colors: GridColors::default_warm(),
         };
         let mut cache = MonoPaintCache::empty();
         let mut layout = |_ch: char, _s: GlyphStyle| {
@@ -3082,6 +3125,7 @@ mod tests {
             cols: 1,
             rows: 1,
             font_bits: 14.0f32.to_bits(),
+            colors: GridColors::default_warm(),
         };
         let m_a = crate::geom::CellMetrics::new(
             egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(8.0, 16.0)),
@@ -3159,6 +3203,7 @@ mod tests {
             cols: 2,
             rows: 1,
             font_bits: 14.0f32.to_bits(),
+            colors: GridColors::default_warm(),
         };
         let mut cache = MonoPaintCache::empty();
         let mut layout = |_ch: char, _s: GlyphStyle| dummy_galley_for_tests('x');
@@ -3237,7 +3282,8 @@ mod tests {
             Arc::new(|c: alacritty_terminal::vte::ansi::Rgb| format!("R{}G{}B{}", c.r, c.g, c.b));
         l.send_event(Event::ColorRequest(NamedColor::Background as usize, fmt));
         let got = String::from_utf8(out.lock().unwrap().clone()).unwrap();
-        assert_eq!(got, format!("R{}G{}B{}", BG.r(), BG.g(), BG.b()));
+        let gc = GridColors::default_warm();
+        assert_eq!(got, format!("R{}G{}B{}", gc.bg.r(), gc.bg.g(), gc.bg.b()));
     }
 
     #[test]
@@ -3261,29 +3307,56 @@ mod tests {
 
     #[test]
     fn query_color_maps_palette_and_named_slots() {
+        let gc = GridColors::default_warm();
         // Palette entry 0 → our black; OSC 4;0 callers get it back.
         let p0 = query_color(0);
         assert_eq!(
             (p0.r, p0.g, p0.b),
-            (PALETTE[0].r(), PALETTE[0].g(), PALETTE[0].b())
+            (gc.palette[0].r(), gc.palette[0].g(), gc.palette[0].b())
         );
         // OSC 11 (background) → our BG; OSC 10 (foreground) / cursor → our FG.
         let bg = query_color(NamedColor::Background as usize);
-        assert_eq!((bg.r, bg.g, bg.b), (BG.r(), BG.g(), BG.b()));
+        assert_eq!((bg.r, bg.g, bg.b), (gc.bg.r(), gc.bg.g(), gc.bg.b()));
         let fg = query_color(NamedColor::Foreground as usize);
-        assert_eq!((fg.r, fg.g, fg.b), (FG.r(), FG.g(), FG.b()));
+        assert_eq!((fg.r, fg.g, fg.b), (gc.fg.r(), gc.fg.g(), gc.fg.b()));
         let cur = query_color(NamedColor::Cursor as usize);
-        assert_eq!((cur.r, cur.g, cur.b), (FG.r(), FG.g(), FG.b()));
+        assert_eq!((cur.r, cur.g, cur.b), (gc.fg.r(), gc.fg.g(), gc.fg.b()));
+    }
+
+    #[test]
+    fn resolve_uses_the_supplied_palette_not_a_const() {
+        // The pipeline reads colors from the passed GridColors, not a module
+        // const: recolor ANSI red (palette[1]) and the resolver returns the new
+        // color, proving the parameter is load-bearing.
+        let mut gc = GridColors::default_warm();
+        gc.palette[1] = egui::Color32::from_rgb(1, 2, 3);
+        assert_eq!(
+            resolve(AnsiColor::Indexed(1), &gc),
+            Some(egui::Color32::from_rgb(1, 2, 3))
+        );
+        // A default-fg cell still falls back to the supplied gc.fg.
+        assert_eq!(
+            glyph_style(
+                Flags::empty(),
+                named(NamedColor::Foreground),
+                named(NamedColor::Background),
+                &gc,
+            )
+            .fg,
+            gc.fg
+        );
     }
 
     #[test]
     fn glyph_style_plain_is_default_fg_no_bg() {
+        let gc = GridColors::default_warm();
         let s = glyph_style(
             Flags::empty(),
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
-        assert_eq!(s.fg, FG);
+        assert_eq!(s.fg, gc.fg);
         assert_eq!(s.bg, None);
         assert!(!s.underline && !s.strikethrough);
         assert!(!s.bold && !s.italic);
@@ -3291,10 +3364,12 @@ mod tests {
 
     #[test]
     fn glyph_style_reads_underline_and_strikeout_flags() {
+        let gc = GridColors::default_warm();
         let s = glyph_style(
             Flags::UNDERLINE | Flags::STRIKEOUT,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(s.underline, "UNDERLINE flag must set underline");
         assert!(s.strikethrough, "STRIKEOUT flag must set strikethrough");
@@ -3302,43 +3377,51 @@ mod tests {
 
     #[test]
     fn glyph_style_reads_bold_and_italic_flags() {
+        let gc = GridColors::default_warm();
         let bold = glyph_style(
             Flags::BOLD,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(bold.bold && !bold.italic);
         let italic = glyph_style(
             Flags::ITALIC,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(!italic.bold && italic.italic);
         let both = glyph_style(
             Flags::BOLD | Flags::ITALIC,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(both.bold && both.italic);
         let reset = glyph_style(
             Flags::empty(),
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(!reset.bold && !reset.italic);
     }
 
     #[test]
     fn glyph_style_dim_bold_darkens_color_keeps_weight() {
+        let gc = GridColors::default_warm();
         let plain_bold = glyph_style(
             Flags::BOLD,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         let dim_bold = glyph_style(
             Flags::DIM | Flags::BOLD,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert!(dim_bold.bold);
         assert_ne!(dim_bold.fg, plain_bold.fg);
@@ -3407,26 +3490,31 @@ mod tests {
     #[test]
     fn glyph_style_inverse_swaps_fg_and_bg() {
         // Default fg=FG, bg=None: inverse makes fg the background and bg the old fg.
+        let gc = GridColors::default_warm();
         let s = glyph_style(
             Flags::INVERSE,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
-        assert_eq!(s.fg, BG);
-        assert_eq!(s.bg, Some(FG));
+        assert_eq!(s.fg, gc.bg);
+        assert_eq!(s.bg, Some(gc.fg));
     }
 
     #[test]
     fn glyph_style_dim_darkens_the_foreground() {
+        let gc = GridColors::default_warm();
         let plain = glyph_style(
             Flags::empty(),
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         let dim = glyph_style(
             Flags::DIM,
             named(NamedColor::Foreground),
             named(NamedColor::Background),
+            &gc,
         );
         assert_ne!(dim.fg, plain.fg, "DIM must darken the foreground");
     }
