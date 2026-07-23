@@ -142,6 +142,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_tokens_default_from_the_builtin() {
+        // Forward-compat: a file missing newly-added tokens still loads — the
+        // container `serde(default)` fills every absent field from the built-in.
+        let t: Theme = serde_json::from_str("{}").unwrap();
+        assert_eq!(t, Theme::default());
+    }
+
+    #[test]
+    fn a_partial_file_keeps_present_tokens_and_defaults_the_rest() {
+        let t: Theme = serde_json::from_str(r##"{"bg":"#010203"}"##).unwrap();
+        assert_eq!(t.bg, egui::Color32::from_rgb(1, 2, 3));
+        assert_eq!(t.fg, Theme::default().fg);
+    }
+
+    #[test]
+    fn a_bad_token_is_rejected_so_the_loader_falls_back() {
+        // color_hex rejects malformed hex and a short palette array; the tolerant
+        // loader (load_json_from) turns that Err into Theme::default() — i.e. a
+        // corrupt theme file resolves to the built-in rather than bricking the UI.
+        assert!(serde_json::from_str::<Theme>(r##"{"bg":"#zzz"}"##).is_err());
+        assert!(serde_json::from_str::<Theme>(r##"{"palette":["#010203"]}"##).is_err());
+    }
+
+    #[test]
+    fn a_fully_edited_theme_round_trips_through_json() {
+        let mut t = Theme::foreman_warm();
+        t.bg = egui::Color32::from_rgb(9, 8, 7);
+        t.palette[5] = egui::Color32::from_rgb(1, 2, 3);
+        t.selection = unmultiplied(10, 20, 30, 44); // a translucent token
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Theme>(&json).unwrap(), t);
+    }
+
+    #[test]
     fn slug_is_filesystem_safe() {
         assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
         assert_eq!(slug("Test  Theme!!"), "test-theme-");
