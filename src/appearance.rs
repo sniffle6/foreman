@@ -206,39 +206,80 @@ impl AppearanceView {
                 }
                 ui.add_space(8.0);
 
-                // Color pickers — always editable. Editing the built-in
-                // transparently forks a user copy (handled at the end).
+                // Named UI/terminal colors — bigger swatches for easy clicking.
+                // Editing the built-in transparently forks a user copy (at the end).
+                let prev_named = ui.spacing().interact_size;
+                ui.spacing_mut().interact_size = egui::vec2(34.0, 20.0);
                 changed |= opaque_row(ui, "Background", &mut self.working.bg);
                 changed |= opaque_row(ui, "Foreground", &mut self.working.fg);
                 changed |= translucent_row(ui, "Selection", &mut self.working.selection);
                 changed |= opaque_row(ui, "Focus border", &mut self.working.border_focus);
                 changed |= translucent_row(ui, "Cursor", &mut self.working.caret);
+                ui.spacing_mut().interact_size = prev_named;
 
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
-                // Responsive swatches: 8 per row, sized to fill the column width.
-                let gap = 4.0;
-                let sw = ((ui.available_width() - gap * 7.0) / 8.0).clamp(14.0, 44.0);
-                let sh = (sw * 0.66).clamp(12.0, 24.0);
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Terminal palette")
+                        .size(12.0)
+                        .color(t.dim),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The 16 colors terminal programs use for colored output. \
+                         Hover a swatch to name it.",
+                    )
+                    .size(11.0)
+                    .color(t.dim),
+                );
+                ui.add_space(2.0);
+                const NAMES: [&str; 16] = [
+                    "Black",
+                    "Red",
+                    "Green",
+                    "Yellow",
+                    "Blue",
+                    "Magenta",
+                    "Cyan",
+                    "White",
+                    "Bright Black",
+                    "Bright Red",
+                    "Bright Green",
+                    "Bright Yellow",
+                    "Bright Blue",
+                    "Bright Magenta",
+                    "Bright Cyan",
+                    "Bright White",
+                ];
+                let gap = 5.0;
+                let label_w = 44.0;
+                let sw = ((ui.available_width() - label_w - gap * 8.0) / 8.0).clamp(16.0, 40.0);
+                let sh = (sw * 0.7).clamp(14.0, 26.0);
                 let mut palette = self.working.palette;
-                let prev_size = ui.spacing().interact_size;
+                let prev_pal = ui.spacing().interact_size;
                 ui.spacing_mut().interact_size = egui::vec2(sw, sh);
                 egui::Grid::new("appearance_palette")
                     .spacing([gap, gap])
                     .show(ui, |ui| {
-                        for i in 0..16usize {
-                            ui.push_id(i, |ui| {
-                                let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                                }
-                            });
-                            if i % 8 == 7 {
-                                ui.end_row();
+                        for (base, label) in [(0usize, "Base"), (8usize, "Bright")] {
+                            ui.label(egui::RichText::new(label).size(11.0).color(t.dim));
+                            for c in 0..8usize {
+                                let i = base + c;
+                                ui.push_id(i, |ui| {
+                                    let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
+                                    if ui
+                                        .color_edit_button_srgb(&mut rgb)
+                                        .on_hover_text(format!("{} · color {i}", NAMES[i]))
+                                        .changed()
+                                    {
+                                        palette[i] =
+                                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                    }
+                                });
                             }
+                            ui.end_row();
                         }
                     });
-                ui.spacing_mut().interact_size = prev_size;
+                ui.spacing_mut().interact_size = prev_pal;
                 if palette != self.working.palette {
                     self.working.palette = palette;
                     changed = true;
