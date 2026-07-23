@@ -33,14 +33,21 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Load a JSON config file from the foreman config dir. Tolerant by design:
-/// a missing file, an unreadable file, or invalid JSON all fall back to
-/// `T::default()` (with a stderr warning for the non-missing cases). Never panics
-/// — a bad config must not take the app down.
-pub fn load_json<T: DeserializeOwned + Default>(file: &str) -> T {
-    let Some(dir) = config_dir() else {
-        return T::default();
-    };
+/// Resolve (creating if needed) the per-name theme directory:
+/// `%APPDATA%\foreman\themes`. User themes are stored one JSON file per name
+/// here; the built-in is code-only and never written. Same `None`-on-failure
+/// contract as [`config_dir`] — callers fall back to in-code defaults.
+pub fn themes_dir() -> Option<PathBuf> {
+    let dir = config_dir()?.join("themes");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Load a JSON config file from `dir`. Tolerant by design: a missing file, an
+/// unreadable file, or invalid JSON all fall back to `T::default()` (with a
+/// stderr warning for the non-missing cases). Never panics — a bad config must
+/// not take the app down. [`load_json`] is the `config_dir()` flavor.
+pub fn load_json_from<T: DeserializeOwned + Default>(dir: &std::path::Path, file: &str) -> T {
     let path = dir.join(file);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -67,13 +74,15 @@ pub fn load_json<T: DeserializeOwned + Default>(file: &str) -> T {
     }
 }
 
-/// Write a JSON config file atomically: serialize, write a sibling `.tmp`, then
-/// rename it over the target. A crash mid-write leaves the previous good file
-/// intact (a bare `write` could truncate it). Errors are returned, never panicked,
-/// so the caller can surface them.
-pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
-    let dir = config_dir()
-        .ok_or_else(|| "APPDATA is not set; cannot locate the config directory".to_string())?;
+/// Write a JSON file atomically into `dir`: serialize, write a sibling `.tmp`,
+/// then rename it over the target. A crash mid-write leaves the previous good
+/// file intact (a bare `write` could truncate it). Errors are returned, never
+/// panicked. [`save_json`] is the `config_dir()` flavor.
+pub fn save_json_in<T: Serialize>(
+    dir: &std::path::Path,
+    file: &str,
+    value: &T,
+) -> Result<(), String> {
     let path = dir.join(file);
     let tmp = dir.join(format!("{file}.tmp"));
     let json = serde_json::to_string_pretty(value)
@@ -82,6 +91,24 @@ pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
     std::fs::rename(&tmp, &path)
         .map_err(|e| format!("could not commit {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Load a JSON config file from the foreman config dir. Tolerant by design:
+/// a missing file, an unreadable file, or invalid JSON all fall back to
+/// `T::default()`. Never panics — a bad config must not take the app down.
+pub fn load_json<T: DeserializeOwned + Default>(file: &str) -> T {
+    let Some(dir) = config_dir() else {
+        return T::default();
+    };
+    load_json_from(&dir, file)
+}
+
+/// Write a JSON config file atomically into the foreman config dir. Errors are
+/// returned, never panicked, so the caller can surface them.
+pub fn save_json<T: Serialize>(file: &str, value: &T) -> Result<(), String> {
+    let dir = config_dir()
+        .ok_or_else(|| "APPDATA is not set; cannot locate the config directory".to_string())?;
+    save_json_in(&dir, file, value)
 }
 
 /// What a bare "new terminal" runs. Custom command lines are a later phase
@@ -246,6 +273,33 @@ pub fn live(ctx: &eframe::egui::Context) -> std::sync::Arc<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_helpers_round_trip_in_an_arbitrary_dir() {
+        // The dir-parameterized helpers write and read from any directory (used
+        // for per-name theme files under themes_dir()), keeping the atomic
+        // tmp+rename + tolerant-load contract of the config_dir() flavor.
+        #[derive(Serialize, Deserialize, Default, PartialEq, Debug)]
+        struct Sample {
+            n: u32,
+            s: String,
+        }
+        // Fixed unique subdir name — no time/random in the test body.
+        let dir = std::env::temp_dir().join("foreman-test-json-helpers-16");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = "sample.json";
+        let v = Sample {
+            n: 42,
+            s: "hi".into(),
+        };
+        save_json_in(&dir, file, &v).unwrap();
+        let back: Sample = load_json_from(&dir, file);
+        assert_eq!(back, v);
+        // A missing file loads as the default (tolerant-load contract).
+        let missing: Sample = load_json_from(&dir, "does-not-exist.json");
+        assert_eq!(missing, Sample::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn missing_fields_fall_back_to_defaults() {
