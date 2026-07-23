@@ -3408,6 +3408,7 @@ impl WindowManager {
         // result flows back down so every level sees the app-wide state.
         app_modal: bool,
     ) -> bool {
+        let th = crate::theme::live(ui.ctx());
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
         let prev_area_w = self.last_area.x;
@@ -3592,6 +3593,7 @@ impl WindowManager {
                             bell_pulse(
                                 ui.input(|inp| inp.time),
                                 crate::config::live(ui.ctx()).bell_period as f64,
+                                th.bell,
                             ),
                         ),
                         egui::StrokeKind::Inside,
@@ -3933,6 +3935,7 @@ impl WindowManager {
                     let bell_col = bell_pulse(
                         ui.input(|inp| inp.time),
                         crate::config::live(ui.ctx()).bell_period as f64,
+                        th.bell,
                     );
                     for ch in chips {
                         let ti = ch.idx;
@@ -4377,6 +4380,7 @@ impl WindowManager {
                 bell_pulse(
                     ui.input(|inp| inp.time),
                     crate::config::live(ui.ctx()).bell_period as f64,
+                    th.bell,
                 )
             } else if is_focus {
                 if is_project {

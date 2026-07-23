@@ -341,6 +341,7 @@ impl PanelView {
     }
 
     fn paint_rail(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let th = crate::theme::live(ui.ctx());
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let p = ui.painter().with_clip_rect(rect);
         let rails: Vec<_> = self
@@ -407,6 +408,7 @@ impl PanelView {
                     bell_pulse(
                         ui.input(|i| i.time),
                         crate::config::live(ui.ctx()).bell_period as f64,
+                        th.bell,
                     ),
                 );
             }
@@ -523,6 +525,7 @@ impl PanelView {
     /// projects. Click = surface; no hover min/close here — management means
     /// expanding the panel first.
     fn paint_strip(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let th = crate::theme::live(ui.ctx());
         struct Chip {
             id: egui::Id,
             path: TargetPath,
@@ -671,6 +674,7 @@ impl PanelView {
                     bell_pulse(
                         ui.input(|i| i.time),
                         crate::config::live(ui.ctx()).bell_period as f64,
+                        th.bell,
                     ),
                 );
             }
@@ -686,6 +690,7 @@ impl PanelView {
     /// strip — the wm suppresses the header band entirely for a collapsed
     /// horizontal panel, so this toggle is the only mouse path back out.
     fn paint_rail_h(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let th = crate::theme::live(ui.ctx());
         // The expand glyph points along the grow axis: a bottom-docked panel
         // expands upward (⌃), a top-docked one downward (⌄). Same side test as
         // the expanded header's collapse glyph in wm.rs, mirrored.
@@ -771,6 +776,7 @@ impl PanelView {
                     bell_pulse(
                         ui.input(|i| i.time),
                         crate::config::live(ui.ctx()).bell_period as f64,
+                        th.bell,
                     ),
                 );
             }
@@ -820,6 +826,7 @@ impl PanelView {
         clip: egui::Rect,
         rp: RowPaintOwned,
     ) {
+        let th = crate::theme::live(ui.ctx());
         let p = ui.painter().with_clip_rect(clip);
         let resp = ui.interact(row, id, egui::Sense::click());
         // Geometric containment, not `hovered()`: the min/close buttons below
@@ -960,6 +967,7 @@ impl PanelView {
                 bell_pulse(
                     ui.input(|i| i.time),
                     crate::config::live(ui.ctx()).bell_period as f64,
+                    th.bell,
                 ),
             );
         } else if rp.minimized {
