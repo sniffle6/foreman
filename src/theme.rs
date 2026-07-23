@@ -96,6 +96,35 @@ mod tests {
         // Same phase (t/period) → same color, whatever the period.
         assert_eq!(bell_pulse(0.5, 2.0), bell_pulse(0.25, 1.0));
     }
+
+    #[test]
+    fn foreman_warm_equals_the_legacy_consts() {
+        // The runtime default is built FROM the consts, so it must render
+        // byte-identically to the historical static palette.
+        let t = Theme::foreman_warm();
+        assert_eq!(t.bg, BG);
+        assert_eq!(t.text, TEXT);
+        assert_eq!(t.fg, FG);
+        assert_eq!(t.selection, SELECTION);
+        assert_eq!(t.caret, CARET);
+        assert_eq!(t.palette, PALETTE);
+        assert_eq!(t.chat_colors, CHAT_COLORS);
+        assert_eq!(t.snap_fill, SNAP_FILL);
+        assert_eq!(t.app_border(), CHROME_BG); // APP_BORDER derivation preserved
+        assert_eq!(Theme::default(), Theme::foreman_warm());
+    }
+
+    #[test]
+    fn color_hex_round_trips_opaque_and_premultiplied() {
+        // Opaque → #rrggbb; premultiplied-with-alpha → #rrggbbaa; both exact,
+        // including the raw-premultiplied SNAP_FILL that has no straight-alpha form.
+        for c in [BG, PALETTE[3], SNAP_FILL, SELECTION, CARET] {
+            let s = color_hex::to_hex(c);
+            assert_eq!(color_hex::from_hex(&s).unwrap(), c, "round-trip {s}");
+        }
+        assert_eq!(color_hex::to_hex(BG), "#14120f");
+        assert!(color_hex::from_hex("#zzz").is_err());
+    }
 }
 
 // ---- scrollback search ----
@@ -158,3 +187,220 @@ pub const PALETTE: [egui::Color32; 16] = [
     egui::Color32::from_rgb(143, 199, 187),
     egui::Color32::from_rgb(236, 231, 218),
 ];
+
+use serde::{Deserialize, Serialize};
+
+/// Runtime theme: every color token as a field. [`Theme::foreman_warm`] is the
+/// built-in default, built from the module consts, so a default `Theme` renders
+/// byte-identically to the historical static palette. Published each frame into
+/// egui ctx data by `App` ([`seed_live`]); consumers read [`live`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)] // a missing token in a user file falls back to the built-in value
+pub struct Theme {
+    #[serde(with = "color_hex")]
+    pub bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub desk_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub win_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub title_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub title_bg_focus: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub text: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub dim: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub fg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub border: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub border_focus: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub proj_border_focus: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub selection: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub selection_text_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub sel_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub caret: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub dim_unfocused: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub bell: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub scroll_thumb: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub search_match: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub search_current: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub search_bar_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub search_bar_border: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub search_error: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chrome_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chrome_border: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chrome_btn_hover: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chrome_close_hover: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub danger: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub snap_fill: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub snap_stroke: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chat_stale: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chat_live: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chat_edge: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub chat_mention_bg: egui::Color32,
+    #[serde(with = "color_hex_array")]
+    pub chat_colors: [egui::Color32; 6],
+    #[serde(with = "color_hex_array")]
+    pub palette: [egui::Color32; 16],
+}
+
+impl Theme {
+    /// The built-in default, defined by the module consts (single source of
+    /// truth — no duplicated literals, so the default is byte-identical to the
+    /// historical static palette by construction).
+    pub fn foreman_warm() -> Self {
+        Self {
+            bg: BG,
+            desk_bg: DESK_BG,
+            win_bg: WIN_BG,
+            title_bg: TITLE_BG,
+            title_bg_focus: TITLE_BG_FOCUS,
+            text: TEXT,
+            dim: DIM,
+            fg: FG,
+            border: BORDER,
+            border_focus: BORDER_FOCUS,
+            proj_border_focus: PROJ_BORDER_FOCUS,
+            selection: SELECTION,
+            selection_text_bg: SELECTION_TEXT_BG,
+            sel_bg: SEL_BG,
+            caret: CARET,
+            dim_unfocused: DIM_UNFOCUSED,
+            bell: BELL,
+            scroll_thumb: SCROLL_THUMB,
+            search_match: SEARCH_MATCH,
+            search_current: SEARCH_CURRENT,
+            search_bar_bg: SEARCH_BAR_BG,
+            search_bar_border: SEARCH_BAR_BORDER,
+            search_error: SEARCH_ERROR,
+            chrome_bg: CHROME_BG,
+            chrome_border: CHROME_BORDER,
+            chrome_btn_hover: CHROME_BTN_HOVER,
+            chrome_close_hover: CHROME_CLOSE_HOVER,
+            danger: DANGER,
+            snap_fill: SNAP_FILL,
+            snap_stroke: SNAP_STROKE,
+            chat_stale: CHAT_STALE,
+            chat_live: CHAT_LIVE,
+            chat_edge: CHAT_EDGE,
+            chat_mention_bg: CHAT_MENTION_BG,
+            chat_colors: CHAT_COLORS,
+            palette: PALETTE,
+        }
+    }
+
+    /// The app frame matches the revealed OS bar — derived, never stored.
+    pub fn app_border(&self) -> egui::Color32 {
+        self.chrome_bg
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::foreman_warm()
+    }
+}
+
+/// Serde codec: `Color32` <-> `#rrggbb` (opaque) / `#rrggbbaa` (with alpha).
+/// Encodes the stored *premultiplied* bytes verbatim so every token — including
+/// the raw-premultiplied `SNAP_FILL`, which has no straight-alpha form —
+/// round-trips exactly. `from_hex` is tolerant (bad input is an error, so a
+/// corrupt file falls back to the built-in default via the tolerant loader).
+pub mod color_hex {
+    use super::egui::Color32;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn to_hex(c: Color32) -> String {
+        let [r, g, b, a] = c.to_array();
+        if a == 255 {
+            format!("#{r:02x}{g:02x}{b:02x}")
+        } else {
+            format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+        }
+    }
+
+    pub fn from_hex(s: &str) -> Result<Color32, String> {
+        let h = s
+            .strip_prefix('#')
+            .ok_or_else(|| format!("missing #: {s}"))?;
+        let byte = |i: usize| {
+            h.get(i..i + 2)
+                .ok_or_else(|| format!("short hex: {s}"))
+                .and_then(|p| u8::from_str_radix(p, 16).map_err(|e| e.to_string()))
+        };
+        match h.len() {
+            6 => Ok(Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?)),
+            8 => Ok(Color32::from_rgba_premultiplied(
+                byte(0)?,
+                byte(2)?,
+                byte(4)?,
+                byte(6)?,
+            )),
+            _ => Err(format!("bad hex len: {s}")),
+        }
+    }
+
+    pub fn serialize<S: Serializer>(c: &Color32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&to_hex(*c))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Color32, D::Error> {
+        let s = String::deserialize(d)?;
+        from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Array flavor of [`color_hex`] for the palette / chat-color arrays.
+pub mod color_hex_array {
+    use super::egui::Color32;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, const N: usize>(
+        a: &[Color32; N],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let v: Vec<String> = a.iter().map(|c| super::color_hex::to_hex(*c)).collect();
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[Color32; N], D::Error> {
+        let v = Vec::<String>::deserialize(d)?;
+        let mut out = [Color32::BLACK; N];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let s = v
+                .get(i)
+                .ok_or_else(|| serde::de::Error::custom("short color array"))?;
+            *slot = super::color_hex::from_hex(s).map_err(serde::de::Error::custom)?;
+        }
+        Ok(out)
+    }
+}
