@@ -186,6 +186,7 @@ impl App {
     /// coyote grace after leave so a brief miss doesn't retract it; re-hover
     /// mid-close reverses the slide smoothly with no extra dwell.
     fn show_os_chrome(&mut self, ctx: &egui::Context) {
+        let th = crate::theme::live(ctx);
         let screen = ctx.screen_rect();
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         if !maximized {
@@ -200,7 +201,7 @@ impl App {
             .rect_stroke(
                 screen,
                 0.0,
-                egui::Stroke::new(APP_BORDER_W, APP_BORDER),
+                egui::Stroke::new(APP_BORDER_W, th.app_border()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -309,17 +310,17 @@ impl App {
                 }
 
                 let p = ui.painter();
-                p.rect_filled(bar, 0.0, CHROME_BG);
+                p.rect_filled(bar, 0.0, th.chrome_bg);
                 p.line_segment(
                     [bar.left_bottom(), bar.right_bottom()],
-                    egui::Stroke::new(1.0, CHROME_BORDER),
+                    egui::Stroke::new(1.0, th.chrome_border),
                 );
                 p.text(
                     egui::pos2(bar.min.x + 12.0, bar.center().y),
                     egui::Align2::LEFT_CENTER,
                     "Foreman",
                     egui::FontId::proportional(13.0),
-                    DIM,
+                    th.dim,
                 );
 
                 for (resp, glyph) in [
@@ -328,16 +329,16 @@ impl App {
                     (&close, Glyph::Close),
                 ] {
                     let hovered = resp.hovered();
-                    let mut bg = CHROME_BG;
+                    let mut bg = th.chrome_bg;
                     if hovered {
                         bg = if glyph == Glyph::Close {
-                            CHROME_CLOSE_HOVER
+                            th.chrome_close_hover
                         } else {
-                            CHROME_BTN_HOVER
+                            th.chrome_btn_hover
                         };
                         p.rect_filled(resp.rect, 0.0, bg);
                     }
-                    let col = if hovered { TEXT } else { DIM };
+                    let col = if hovered { th.text } else { th.dim };
                     chrome_glyph(p, glyph, resp.rect.center(), maximized, col, bg);
                 }
             });
