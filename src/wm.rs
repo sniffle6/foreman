@@ -175,10 +175,12 @@ impl Content {
                 // drain_settings.
                 let mut live = (*crate::config::live(ui.ctx())).clone();
                 let mut km = (*crate::keymap::live(ui.ctx())).clone();
-                match menu.show(ui, rect, active, &mut live, &mut km) {
+                let mut th = (*crate::theme::live(ui.ctx())).clone();
+                match menu.show(ui, rect, active, &mut live, &mut km, &mut th) {
                     MenuOutcome::Changed => {
                         crate::config::seed_live(ui.ctx(), &live);
                         crate::keymap::seed_live(ui.ctx(), &km);
+                        crate::theme::seed_live(ui.ctx(), &th);
                     }
                     MenuOutcome::Pending => {}
                     other => menu.pending = Some(other),

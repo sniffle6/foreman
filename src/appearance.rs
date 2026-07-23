@@ -27,6 +27,7 @@ pub enum Outcome {
 }
 
 /// The Appearance pane's state.
+#[derive(Clone, Debug)]
 pub struct AppearanceView {
     working: Theme,
     saved: Theme,

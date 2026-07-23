@@ -11,6 +11,7 @@ use eframe::egui;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)] // constructed/matched by the view (Task 3)
 pub enum Pane {
+    Appearance,
     Terminal,
     Bell,
     WindowManager,
@@ -21,7 +22,8 @@ pub enum Pane {
 
 #[allow(dead_code)] // used by the view (Task 3)
 impl Pane {
-    pub const ALL: [Pane; 6] = [
+    pub const ALL: [Pane; 7] = [
+        Pane::Appearance,
         Pane::Terminal,
         Pane::Bell,
         Pane::WindowManager,
@@ -31,6 +33,7 @@ impl Pane {
     ];
     pub fn label(self) -> &'static str {
         match self {
+            Pane::Appearance => "Appearance",
             Pane::Terminal => "Terminal",
             Pane::Bell => "Bell & Alerts",
             Pane::WindowManager => "Window Manager",
@@ -93,6 +96,10 @@ pub struct RowSpec {
 #[allow(dead_code)] // called by the view (Task 3)
 pub fn rows(pane: Pane) -> &'static [RowSpec] {
     match pane {
+        // The pane itself *is* the editor (draw_pane special-cases it before
+        // touching rows()); handle_keys also delegates to it before rows()
+        // could be indexed, so this is never read.
+        Pane::Appearance => &[],
         Pane::Terminal => &[
             RowSpec {
                 field: Field::DefaultShellF,
@@ -376,6 +383,9 @@ pub struct SettingsMenu {
     /// The keybindings editor, rendered inline when the Keybindings pane is
     /// active (replaces the old stacked modal).
     pub keybindings: SettingsView,
+    /// The appearance/theme editor, rendered inline when the Appearance pane is
+    /// active (custom body, like Keybindings).
+    pub appearance: crate::appearance::AppearanceView,
     /// Set for exactly one frame when the rail dives into the Keybindings pane
     /// (Enter/→). `draw_pane` consumes it to skip that frame's editor input —
     /// otherwise the same un-consumed Enter that dove in is read by the
@@ -394,6 +404,7 @@ impl SettingsMenu {
             pending: None,
             scroll_to_selected: false,
             keybindings: SettingsView::new(),
+            appearance: crate::appearance::AppearanceView::new(),
             editor_just_entered: false,
         }
     }
@@ -510,6 +521,7 @@ impl SettingsMenu {
         active: bool,
         s: &mut Settings,
         km: &mut Keymap,
+        theme: &mut crate::theme::Theme,
     ) -> MenuOutcome {
         let th = crate::theme::live(ui.ctx());
         // Keyboard drives the menu only when this window is focused and no
@@ -565,7 +577,7 @@ impl SettingsMenu {
         let rail = egui::Rect::from_min_size(body.min, egui::vec2(rail_w, body_h));
         let pane = egui::Rect::from_min_max(egui::pos2(body.min.x + rail_w, body.min.y), body.max);
         self.draw_rail(ui, rail);
-        self.draw_pane(ui, pane, s, km, active, &mut outcome);
+        self.draw_pane(ui, pane, s, km, theme, active, &mut outcome);
 
         // --- footer ---
         let (footer, _) = ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
@@ -616,6 +628,16 @@ impl SettingsMenu {
         // `SettingsView` (cancel-capture / back-to-rail) instead of closing the
         // window.
         if self.pane == Pane::Keybindings && !self.in_rail {
+            if tab {
+                self.in_rail = true;
+            }
+            return MenuOutcome::Pending;
+        }
+
+        // The Appearance pane's editor reads its own input in draw_pane; don't
+        // double-handle here. Tab backs out to the rail. Runs before the Esc
+        // check so Esc reaches the pane (back-to-rail) rather than closing.
+        if self.pane == Pane::Appearance && !self.in_rail {
             if tab {
                 self.in_rail = true;
             }
@@ -760,6 +782,7 @@ impl SettingsMenu {
         rect: egui::Rect,
         s: &mut Settings,
         km: &mut Keymap,
+        theme: &mut crate::theme::Theme,
         active: bool,
         outcome: &mut MenuOutcome,
     ) {
@@ -774,6 +797,16 @@ impl SettingsMenu {
                 EditorOutcome::Changed => bump(outcome, MenuOutcome::Changed),
                 EditorOutcome::Close => self.in_rail = true, // Esc/back-out returns to the rail
                 EditorOutcome::Pending => {}
+            }
+            return;
+        }
+        if self.pane == Pane::Appearance {
+            let reads_input = active && !self.in_rail && !just_entered;
+            match self.appearance.show(ui, rect, reads_input, theme) {
+                crate::appearance::Outcome::Changed => bump(outcome, MenuOutcome::Changed),
+                crate::appearance::Outcome::Duplicate(_name) => bump(outcome, MenuOutcome::Changed),
+                crate::appearance::Outcome::Close => self.in_rail = true,
+                crate::appearance::Outcome::Pending => {}
             }
             return;
         }
@@ -1109,12 +1142,19 @@ mod tests {
     fn every_pane_has_rows_and_labels() {
         for p in Pane::ALL {
             assert!(!p.label().is_empty());
-            // Keybindings has no RowSpecs — draw_pane/handle_keys special-case
-            // it and delegate to the embedded SettingsView editor instead.
-            if p != Pane::Keybindings {
+            // Keybindings and Appearance have no RowSpecs — draw_pane/handle_keys
+            // special-case them and delegate to their embedded editors instead.
+            if p != Pane::Keybindings && p != Pane::Appearance {
                 assert!(!rows(p).is_empty(), "{:?} has no rows", p);
             }
         }
+    }
+
+    #[test]
+    fn appearance_is_a_custom_body_pane() {
+        assert!(Pane::ALL.contains(&Pane::Appearance));
+        assert!(rows(Pane::Appearance).is_empty());
+        assert_eq!(Pane::Appearance.label(), "Appearance");
     }
 
     #[test]
