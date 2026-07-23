@@ -140,6 +140,55 @@ mod tests {
         let ctx = egui::Context::default();
         assert_eq!(*live(&ctx), Theme::default());
     }
+
+    #[test]
+    fn slug_is_filesystem_safe() {
+        assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
+        assert_eq!(slug("Test  Theme!!"), "test-theme-");
+    }
+
+    #[test]
+    fn user_theme_save_load_round_trips_and_builtin_is_readonly() {
+        // The built-in is code-only: recognized, loads to foreman_warm, never written.
+        assert!(Theme::is_builtin(crate::appearance::BUILTIN));
+        assert_eq!(
+            Theme::load(crate::appearance::BUILTIN),
+            Theme::foreman_warm()
+        );
+        assert!(
+            Theme::foreman_warm()
+                .save(crate::appearance::BUILTIN)
+                .is_ok(),
+            "saving the built-in name is a no-op success"
+        );
+
+        // A uniquely-named user theme round-trips through the real themes_dir()
+        // (unique slug so a real user theme is never clobbered). Clean up after.
+        let name = "Zz Task18 Roundtrip";
+        let file = crate::config::themes_dir().map(|d| d.join(format!("{}.json", slug(name))));
+        if let Some(ref f) = file {
+            let _ = std::fs::remove_file(f);
+        }
+        let mut edited = Theme::foreman_warm();
+        edited.bg = egui::Color32::from_rgb(1, 2, 3);
+        edited.palette[1] = egui::Color32::from_rgb(9, 9, 9);
+        edited.save(name).unwrap();
+        assert_eq!(
+            Theme::load(name),
+            edited,
+            "saved user theme loads back exactly"
+        );
+
+        // A non-built-in name with no file falls back to the built-in default.
+        assert_eq!(
+            Theme::load("Zz No Such Theme Task18"),
+            Theme::foreman_warm()
+        );
+
+        if let Some(ref f) = file {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 }
 
 // ---- scrollback search ----
@@ -334,6 +383,79 @@ impl Theme {
     pub fn app_border(&self) -> egui::Color32 {
         self.chrome_bg
     }
+
+    /// The built-in theme is code-only (its name is [`crate::appearance::BUILTIN`]):
+    /// it never has a file, is never written, and always resolves to
+    /// [`foreman_warm`](Self::foreman_warm).
+    pub fn is_builtin(name: &str) -> bool {
+        name == crate::appearance::BUILTIN
+    }
+
+    /// Resolve a theme by name. The built-in returns [`foreman_warm`](Self::foreman_warm);
+    /// a user theme loads from `<slug>.json` under [`crate::config::themes_dir`],
+    /// tolerantly falling back to [`Theme::default`] (the built-in) on a missing
+    /// or corrupt file (via `serde(default)` + the tolerant loader).
+    pub fn load(name: &str) -> Theme {
+        if Self::is_builtin(name) {
+            return Self::foreman_warm();
+        }
+        match crate::config::themes_dir() {
+            Some(d) => crate::config::load_json_from(&d, &format!("{}.json", slug(name))),
+            None => Theme::default(),
+        }
+    }
+
+    /// Persist this theme under `name` as `<slug>.json` in [`crate::config::themes_dir`].
+    /// The built-in is never written (returns `Ok(())`) — duplicating it is how a
+    /// user theme is born.
+    pub fn save(&self, name: &str) -> Result<(), String> {
+        if Self::is_builtin(name) {
+            return Ok(());
+        }
+        crate::config::themes_dir()
+            .ok_or_else(|| "no themes dir".to_string())
+            .and_then(|d| crate::config::save_json_in(&d, &format!("{}.json", slug(name)), self))
+    }
+
+    /// The names (file stems) of every user theme file in [`crate::config::themes_dir`].
+    /// Best-effort: an empty vec when the dir is unavailable. Names are the slugs
+    /// for now (display can be the slug).
+    pub fn user_theme_names() -> Vec<String> {
+        let Some(dir) = crate::config::themes_dir() else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Filesystem-safe file stem for a theme name: lowercase, every run of
+/// non-alphanumeric characters collapsed to a single `-` (the caller appends
+/// `.json`). e.g. `"Foreman Warm copy"` -> `"foreman-warm-copy"`. `save`/`load`
+/// are symmetric on this, so a name round-trips regardless of trailing dashes.
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out
 }
 
 impl Default for Theme {

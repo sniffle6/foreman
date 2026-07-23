@@ -79,6 +79,14 @@ struct App {
     /// seeded into ctx data each frame like `settings`. The Appearance pane edits
     /// it live through the ctx seam; the App reads the edit back here.
     active_theme: std::sync::Arc<crate::theme::Theme>,
+    /// The name `active_theme` was resolved from. When `settings.theme` diverges
+    /// (a preset switch / Duplicate), the App reloads `active_theme` from the new
+    /// name — this tracks the last-loaded name so a reload fires exactly once.
+    active_theme_name: String,
+    /// Set when a live theme edit diverged from `active_theme`; the edit is
+    /// written to the user theme file only after a debounce (mirrors
+    /// `font_dirty_at`). The built-in is never written.
+    theme_dirty_at: Option<std::time::Instant>,
     /// Last time anything happened (input, PTY output, control msg). Drives the
     /// adaptive repaint cadence: fast while recently active, slow when idle.
     last_activity: Option<std::time::Instant>,
@@ -128,6 +136,11 @@ impl App {
             } else {
                 update::State::Idle
             };
+        // Resolve the active theme from the persisted setting up front (the name
+        // may reference a user theme file); both feed the struct literal below.
+        let settings = config::Settings::load();
+        let active_theme = std::sync::Arc::new(crate::theme::Theme::load(&settings.theme));
+        let active_theme_name = settings.theme.clone();
         Self {
             desktop: WindowManager::new().as_desktop(),
             started: false,
@@ -139,10 +152,12 @@ impl App {
             update_rx,
             update_fx,
             update_state,
-            settings: config::Settings::load(),
+            settings,
             font_dirty_at: None,
             workspace_dirty_at: None,
-            active_theme: std::sync::Arc::new(crate::theme::Theme::foreman_warm()),
+            active_theme,
+            active_theme_name,
+            theme_dirty_at: None,
             last_activity: None,
             force_quit: false,
             landing: landing::Landing::new(
@@ -683,12 +698,36 @@ impl eframe::App for App {
                 self.font_dirty_at = None;
             }
         }
+        // Reload the theme when the active name changes (a preset switch or
+        // Duplicate updated settings.theme). Do this before the live read-back and
+        // re-seed the ctx so the read-back sees the reloaded theme (equal → not
+        // marked dirty — a reload must not masquerade as an edit to persist).
+        if self.settings.theme != self.active_theme_name {
+            self.active_theme =
+                std::sync::Arc::new(crate::theme::Theme::load(&self.settings.theme));
+            self.active_theme_name = self.settings.theme.clone();
+            crate::theme::seed_live(&ctx, &self.active_theme);
+        }
         // Adopt any Appearance-pane theme edit published this frame (theme::seed_live
-        // in wm) so the preview and every real terminal repaint live. Debounced
-        // persistence to the user theme file lands with the theme-save wiring.
+        // in wm) so the preview and every real terminal repaint live, and mark it
+        // dirty for the debounced write below.
         let live_th = crate::theme::live(&ctx);
         if *live_th != *self.active_theme {
             self.active_theme = live_th;
+            self.theme_dirty_at = Some(std::time::Instant::now());
+        }
+        // Debounced persistence to the user theme file (mirrors the settings
+        // debounce). The built-in is never written — editing it live-applies but
+        // Duplicate is what creates a user theme.
+        if let Some(t) = self.theme_dirty_at {
+            if t.elapsed() >= FONT_SAVE_DEBOUNCE {
+                if !crate::theme::Theme::is_builtin(&self.settings.theme) {
+                    if let Err(e) = self.active_theme.save(&self.settings.theme) {
+                        eprintln!("foreman: could not save theme: {e}");
+                    }
+                }
+                self.theme_dirty_at = None;
+            }
         }
         // Workspace layout: poll structural dirty, debounce write to workspace.json.
         if self.desktop.poll_workspace_dirty() {
