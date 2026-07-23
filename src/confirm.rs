@@ -84,6 +84,7 @@ impl ConfirmClose {
             .rect_filled(area, 0.0, egui::Color32::from_black_alpha(150));
 
         let grouped = self.grouped();
+        let th = crate::theme::live(ui.ctx());
         // Center the panel on the OWNING manager's `area` (which the dim above
         // covers), not the whole viewport: a terminal-close over an off-center
         // project must pop over that project's rect, not the app center.
@@ -95,8 +96,8 @@ impl ConfirmClose {
             .fixed_pos(area.center())
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(360.0);
-                ui.label(egui::RichText::new(&self.title).strong().color(TEXT));
-                ui.label(egui::RichText::new(&self.lead).color(DIM));
+                ui.label(egui::RichText::new(&self.title).strong().color(th.text));
+                ui.label(egui::RichText::new(&self.lead).color(th.dim));
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -106,10 +107,10 @@ impl ConfirmClose {
                         for g in &self.groups {
                             if grouped {
                                 let mut header =
-                                    egui::RichText::new(&g.label).color(DIM).monospace();
+                                    egui::RichText::new(&g.label).color(th.dim).monospace();
                                 if let Some(scope) = &g.scope {
                                     header = egui::RichText::new(format!("{}   {scope}", g.label))
-                                        .color(DIM)
+                                        .color(th.dim)
                                         .monospace();
                                 }
                                 ui.label(header);
@@ -119,13 +120,15 @@ impl ConfirmClose {
                                     if grouped {
                                         ui.add_space(14.0);
                                     }
-                                    ui.label(egui::RichText::new(&p.name).color(TEXT).monospace());
+                                    ui.label(
+                                        egui::RichText::new(&p.name).color(th.text).monospace(),
+                                    );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.label(
                                                 egui::RichText::new(p.pid.to_string())
-                                                    .color(DIM)
+                                                    .color(th.dim)
                                                     .monospace(),
                                             );
                                             // Rollup of the child's own subtree,
@@ -137,7 +140,7 @@ impl ConfirmClose {
                                                         "+{}",
                                                         p.background
                                                     ))
-                                                    .color(DIM)
+                                                    .color(th.dim)
                                                     .monospace(),
                                                 );
                                             }
@@ -156,7 +159,7 @@ impl ConfirmClose {
                     if ui
                         .button(
                             egui::RichText::new(&self.confirm_label)
-                                .color(CARET)
+                                .color(th.caret)
                                 .strong(),
                         )
                         .clicked()

@@ -248,21 +248,22 @@ impl SettingsView {
         }
 
         // --- draw into the pane rect (was a dim backdrop + centered egui::Window) ---
-        ui.painter_at(rect).rect_filled(rect, 0.0, WIN_BG);
+        let th = crate::theme::live(ui.ctx());
+        ui.painter_at(rect).rect_filled(rect, 0.0, th.win_bg);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         let ui = &mut child;
         ui.set_clip_rect(rect);
-        ui.visuals_mut().override_text_color = Some(TEXT);
+        ui.visuals_mut().override_text_color = Some(th.text);
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new("Keyboard bindings")
-                .color(BORDER_FOCUS)
+                .color(th.border_focus)
                 .size(16.0)
                 .strong(),
         );
         ui.label(
             egui::RichText::new("j/k or ↑/↓ select · Enter rebind · Esc back / cancel capture")
-                .color(DIM)
+                .color(th.dim)
                 .size(11.5),
         );
         ui.add_space(8.0);
@@ -275,7 +276,7 @@ impl SettingsView {
         ui.add_space(6.0);
         ui.separator();
         if let Some(msg) = &self.message {
-            ui.label(egui::RichText::new(msg).color(DIM).size(11.5));
+            ui.label(egui::RichText::new(msg).color(th.dim).size(11.5));
         }
         ui.horizontal(|ui| {
             if ui.button("Reset all to defaults").clicked() {
@@ -297,6 +298,7 @@ impl SettingsView {
 
     /// Render the leader row and grouped command rows.
     fn render_rows(&mut self, ui: &mut egui::Ui, km: &mut Keymap, changed: &mut bool) {
+        let th = crate::theme::live(ui.ctx());
         // Track the running flat index to keep selection in sync.
         let mut idx = 0usize;
         let mut last_group: Option<Group> = None;
@@ -322,7 +324,7 @@ impl SettingsView {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(g.title())
-                            .color(BORDER_FOCUS)
+                            .color(th.border_focus)
                             .size(12.5)
                             .strong(),
                     );
@@ -351,7 +353,7 @@ impl SettingsView {
             }
             if is_sel {
                 ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(4), SEL_BG);
+                    .rect_filled(rect, egui::CornerRadius::same(4), th.sel_bg);
             }
 
             // Per-row capture / conflict inline state.
@@ -369,7 +371,7 @@ impl SettingsView {
                 egui::Align2::LEFT_CENTER,
                 &label,
                 egui::FontId::proportional(12.5),
-                if is_sel { TEXT } else { DIM },
+                if is_sel { th.text } else { th.dim },
             );
 
             // Chord / status (right region) + buttons drawn via a child UI.
@@ -402,17 +404,17 @@ impl SettingsView {
             // Status text (chord, or capture/conflict prompt).
             let status = if capturing {
                 egui::RichText::new("press keys…")
-                    .color(BORDER_FOCUS)
+                    .color(th.border_focus)
                     .strong()
             } else if let Some(existing) = conflict {
                 egui::RichText::new(format!(
                     "conflicts with \"{}\" — replace?",
                     existing.label()
                 ))
-                .color(DANGER)
+                .color(th.danger)
             } else {
                 egui::RichText::new(chord_str)
-                    .color(if is_sel { BORDER_FOCUS } else { TEXT })
+                    .color(if is_sel { th.border_focus } else { th.text })
                     .monospace()
             };
             child.label(status);

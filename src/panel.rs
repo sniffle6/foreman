@@ -150,6 +150,7 @@ impl PanelView {
     /// Paint the panel body (below the window title band). Records row
     /// interactions into `click` / `hover_act` / scroll; does not mutate the tree.
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let th = crate::theme::live(ui.ctx());
         // Bell: the panel may be the only visible surface for a ringing
         // session (minimized window, collapsed rail), so it drives its own
         // breathe repaint. Gated here like every other Bell paint site.
@@ -159,7 +160,7 @@ impl PanelView {
                 .request_repaint_after(std::time::Duration::from_millis(30));
         }
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, 0.0, BG);
+        p.rect_filled(rect, 0.0, th.bg);
 
         // Quiet update-available chip pinned to the bottom edge of every
         // expanded layout (rows, columns, strip); the collapsed rails get a
@@ -289,15 +290,20 @@ impl PanelView {
         base: egui::Id,
         ver: &str,
     ) {
+        let th = crate::theme::live(ui.ctx());
         let p = ui.painter();
         let chip = footer.shrink2(egui::vec2(6.0, 3.0));
         let id = base.with("update-chip");
         let resp = ui.interact(chip, id, egui::Sense::click());
         if resp.hovered() {
-            p.rect_filled(chip, egui::CornerRadius::same(5), SEL_BG);
+            p.rect_filled(chip, egui::CornerRadius::same(5), th.sel_bg);
         }
         let text = format!("↓ {ver} — click for release notes");
-        let col = if resp.hovered() { SNAP_STROKE } else { DIM };
+        let col = if resp.hovered() {
+            th.snap_stroke
+        } else {
+            th.dim
+        };
         let galley = p.layout_no_wrap(text, egui::FontId::proportional(12.0), col);
         let pos = egui::pos2(chip.min.x + 6.0, chip.center().y - galley.size().y / 2.0);
         p.galley(pos, galley, col);
@@ -317,15 +323,20 @@ impl PanelView {
         base: egui::Id,
         ver: &str,
     ) {
+        let th = crate::theme::live(ui.ctx());
         let p = ui.painter();
-        p.rect_filled(cell, egui::CornerRadius::same(5), BG);
+        p.rect_filled(cell, egui::CornerRadius::same(5), th.bg);
         let resp = ui
             .interact(cell, base.with("update-chip"), egui::Sense::click())
             .on_hover_text(format!("{ver} — click for release notes"));
         if resp.hovered() {
-            p.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
+            p.rect_filled(cell, egui::CornerRadius::same(5), th.sel_bg);
         }
-        let col = if resp.hovered() { TEXT } else { SNAP_STROKE };
+        let col = if resp.hovered() {
+            th.text
+        } else {
+            th.snap_stroke
+        };
         let galley = p.layout_no_wrap("↓".into(), egui::FontId::proportional(14.0), col);
         p.galley(
             egui::pos2(
@@ -374,7 +385,7 @@ impl PanelView {
                 )
                 .on_hover_text(&title);
             if focused || resp.hovered() {
-                p.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
+                p.rect_filled(cell, egui::CornerRadius::same(5), th.sel_bg);
             }
             if focused {
                 p.rect_filled(
@@ -383,11 +394,11 @@ impl PanelView {
                         egui::vec2(2.0, cell.height() - 12.0),
                     ),
                     0.0,
-                    BORDER_FOCUS,
+                    th.border_focus,
                 );
             }
             let tint = if minimized {
-                DIM
+                th.dim
             } else {
                 crate::icons::IconKind::Folder.tint()
             };
@@ -433,6 +444,7 @@ impl PanelView {
     /// comes from the group width. Scroll is horizontal only; rows past the
     /// group height are clipped.
     fn paint_columns(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+        let th = crate::theme::live(ui.ctx());
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let row_h = 22.0;
         let gap = 9.0; // pad + hairline + pad between groups
@@ -514,7 +526,7 @@ impl PanelView {
                     egui::pos2(dx, rect.min.y + 4.0),
                     egui::pos2(dx, rect.max.y - 4.0),
                 ],
-                egui::Stroke::new(1.0, BORDER.gamma_multiply(0.6)),
+                egui::Stroke::new(1.0, th.border.gamma_multiply(0.6)),
             );
         }
         self.hscroll(ui, rect, base, max_scroll);
@@ -601,7 +613,7 @@ impl PanelView {
                 x += 4.0;
                 p.line_segment(
                     [egui::pos2(x, cy - 8.0), egui::pos2(x, cy + 8.0)],
-                    egui::Stroke::new(1.0, BORDER.gamma_multiply(0.8)),
+                    egui::Stroke::new(1.0, th.border.gamma_multiply(0.8)),
                 );
                 x += 5.0;
             }
@@ -616,7 +628,7 @@ impl PanelView {
             let resp = ui.interact(chip_rect, chip.id, egui::Sense::click());
             let over = resp.hovered() || resp.contains_pointer();
             if chip.focused || over {
-                p.rect_filled(chip_rect, egui::CornerRadius::same(5), SEL_BG);
+                p.rect_filled(chip_rect, egui::CornerRadius::same(5), th.sel_bg);
             }
             if chip.focused {
                 p.rect_filled(
@@ -625,30 +637,30 @@ impl PanelView {
                         egui::vec2(2.0, chip_h - 8.0),
                     ),
                     0.0,
-                    BORDER_FOCUS,
+                    th.border_focus,
                 );
             }
             let col = if over || chip.focused {
-                TEXT
+                th.text
             } else if chip.dim {
-                DIM
+                th.dim
             } else if chip.kind.is_none() {
-                TEXT // project chips read brighter, like project rows
+                th.text // project chips read brighter, like project rows
             } else {
-                DIM
+                th.dim
             };
             let icon_c = egui::pos2(chip_rect.min.x + pad + icon_w / 2.0, cy);
             match chip.kind {
                 None => {
                     let tint = if chip.dim {
-                        DIM
+                        th.dim
                     } else {
                         crate::icons::IconKind::Folder.tint()
                     };
                     paint_icon(ui, &p, icon_c, 12.0, crate::icons::IconKind::Folder, tint);
                 }
                 Some(RowKind::Terminal(k)) => {
-                    let tint = if chip.dim { DIM } else { k.tint() };
+                    let tint = if chip.dim { th.dim } else { k.tint() };
                     paint_icon(ui, &p, icon_c, 12.0, k, tint);
                 }
                 Some(RowKind::Chat) => {
@@ -742,7 +754,7 @@ impl PanelView {
                 )
                 .on_hover_text(&title);
             if focused || resp.hovered() {
-                ip.rect_filled(cell, egui::CornerRadius::same(5), SEL_BG);
+                ip.rect_filled(cell, egui::CornerRadius::same(5), th.sel_bg);
             }
             if focused {
                 // Horizontal rail: the focus stripe is an underline.
@@ -752,11 +764,11 @@ impl PanelView {
                         egui::vec2(cell.width() - 8.0, 2.0),
                     ),
                     0.0,
-                    BORDER_FOCUS,
+                    th.border_focus,
                 );
             }
             let tint = if minimized {
-                DIM
+                th.dim
             } else {
                 crate::icons::IconKind::Folder.tint()
             };
@@ -790,9 +802,14 @@ impl PanelView {
         );
         let resp = ui.interact(br, base.with("rail-expand"), egui::Sense::click());
         if resp.hovered() {
-            p.rect_filled(br, egui::CornerRadius::same(4), SEL_BG);
+            p.rect_filled(br, egui::CornerRadius::same(4), th.sel_bg);
         }
-        paint_chevron(&p, br.center(), up, if resp.hovered() { TEXT } else { DIM });
+        paint_chevron(
+            &p,
+            br.center(),
+            up,
+            if resp.hovered() { th.text } else { th.dim },
+        );
         if resp.clicked() {
             self.toggle_collapse = true;
         }
@@ -836,7 +853,7 @@ impl PanelView {
         // row itself was topmost).
         let over = resp.hovered() || resp.contains_pointer();
         if rp.focused || over {
-            p.rect_filled(row, egui::CornerRadius::same(4), SEL_BG);
+            p.rect_filled(row, egui::CornerRadius::same(4), th.sel_bg);
         }
         if rp.focused {
             p.rect_filled(
@@ -845,18 +862,18 @@ impl PanelView {
                     egui::vec2(2.0, row.height() - 8.0),
                 ),
                 0.0,
-                BORDER_FOCUS,
+                th.border_focus,
             );
         }
 
         let col = if rp.exited {
-            DIM
+            th.dim
         } else if rp.focused {
-            TEXT
+            th.text
         } else if rp.minimized || rp.background_tab {
-            DIM
+            th.dim
         } else {
-            TEXT
+            th.text
         };
 
         // Icon
@@ -864,7 +881,7 @@ impl PanelView {
         match rp.kind {
             None => {
                 let tint = if rp.minimized {
-                    DIM
+                    th.dim
                 } else {
                     crate::icons::IconKind::Folder.tint()
                 };
@@ -872,7 +889,7 @@ impl PanelView {
             }
             Some(RowKind::Terminal(k)) => {
                 let tint = if rp.minimized || rp.background_tab || rp.exited {
-                    DIM
+                    th.dim
                 } else {
                     k.tint()
                 };
@@ -915,7 +932,7 @@ impl PanelView {
             let y = row.center().y;
             p.line_segment(
                 [egui::pos2(text_x, y), egui::pos2(text_x + text_size.x, y)],
-                egui::Stroke::new(1.0, DIM),
+                egui::Stroke::new(1.0, th.dim),
             );
         }
 
@@ -933,17 +950,21 @@ impl PanelView {
                 egui::Align2::CENTER_CENTER,
                 if rp.minimized { "□" } else { "–" },
                 egui::FontId::proportional(11.0),
-                if min_resp.hovered() { TEXT } else { DIM },
+                if min_resp.hovered() { th.text } else { th.dim },
             );
             if close_resp.hovered() {
-                p.rect_filled(close_r, egui::CornerRadius::same(3), DANGER);
+                p.rect_filled(close_r, egui::CornerRadius::same(3), th.danger);
             }
             p.text(
                 close_c,
                 egui::Align2::CENTER_CENTER,
                 "×",
                 egui::FontId::proportional(12.0),
-                if close_resp.hovered() { TEXT } else { DIM },
+                if close_resp.hovered() {
+                    th.text
+                } else {
+                    th.dim
+                },
             );
             if min_resp.clicked() {
                 if rp.minimized {
@@ -976,7 +997,7 @@ impl PanelView {
                 egui::Align2::RIGHT_CENTER,
                 "min",
                 egui::FontId::proportional(10.0),
-                DIM,
+                th.dim,
             );
         } else if rp.background_tab {
             p.text(
@@ -984,7 +1005,7 @@ impl PanelView {
                 egui::Align2::RIGHT_CENTER,
                 "tab",
                 egui::FontId::proportional(10.0),
-                DIM,
+                th.dim,
             );
         }
 
