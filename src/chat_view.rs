@@ -4,7 +4,6 @@
 //! the egui adapter for [`crate::chat::ChatView`].
 
 use crate::chat::{self, ChatBlock, ChatView};
-use crate::theme::*;
 use eframe::egui;
 
 const CHAT_BOARD_W: f32 = 160.0;

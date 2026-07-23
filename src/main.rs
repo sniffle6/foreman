@@ -40,7 +40,6 @@ mod wm;
 mod workspace;
 
 use eframe::egui;
-use theme::*;
 use wm::WindowManager;
 
 struct App {

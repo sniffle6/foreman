@@ -5,7 +5,6 @@
 use crate::config::{DefaultShell, Settings};
 use crate::keymap::Keymap;
 use crate::settings::{Outcome as EditorOutcome, SettingsView};
-use crate::theme::*;
 use eframe::egui;
 
 /// Left-rail categories, in display order.

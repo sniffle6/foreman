@@ -9,7 +9,6 @@
 //! touches disk itself; the wm owns the keymap and the persistence trigger.
 
 use crate::keymap::{Chord, Command, Group, Keymap};
-use crate::theme::*;
 use eframe::egui;
 
 // Palette — kept in step with wm.rs so the overlay reads as part of the app.

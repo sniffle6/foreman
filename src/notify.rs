@@ -12,8 +12,6 @@
 use eframe::egui;
 use std::time::{Duration, Instant};
 
-use crate::theme::{BORDER_FOCUS, DANGER, DIM, TEXT};
-
 /// How long a toast lingers before it auto-dismisses.
 const TTL: Duration = Duration::from_secs(6);
 
@@ -28,10 +26,10 @@ pub enum Level {
 }
 
 impl Level {
-    fn accent(self) -> egui::Color32 {
+    fn accent(self, th: &crate::theme::Theme) -> egui::Color32 {
         match self {
-            Level::Error | Level::Warning => DANGER,
-            Level::Info | Level::Success => BORDER_FOCUS,
+            Level::Error | Level::Warning => th.danger,
+            Level::Info | Level::Success => th.border_focus,
         }
     }
 }
@@ -100,6 +98,7 @@ impl Notifications {
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 40.0))
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
+                let th = crate::theme::live(ui.ctx());
                 ui.set_max_width(380.0);
                 for (i, t) in self.toasts.iter().enumerate() {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -109,14 +108,15 @@ impl Notifications {
                             ui.painter().rect_filled(
                                 bar,
                                 egui::CornerRadius::same(2),
-                                t.level.accent(),
+                                t.level.accent(&th),
                             );
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&t.text).color(TEXT)).wrap(),
+                                egui::Label::new(egui::RichText::new(&t.text).color(th.text))
+                                    .wrap(),
                             );
                             if ui
                                 .add(
-                                    egui::Button::new(egui::RichText::new("✕").color(DIM))
+                                    egui::Button::new(egui::RichText::new("✕").color(th.dim))
                                         .frame(false),
                                 )
                                 .clicked()

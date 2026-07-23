@@ -1,8 +1,6 @@
 use eframe::egui;
 use std::path::{Path, PathBuf};
 
-use crate::theme::{BORDER, BORDER_FOCUS, DANGER, DESK_BG, DIM, TEXT};
-
 fn is_sep(c: char) -> bool {
     c == '/' || c == '\\'
 }
@@ -327,6 +325,7 @@ impl DirPicker {
     /// `exit_down`: landing wants ↓ past the last row to close the popup
     /// (`PassedEnd`); the `+` project modal clamps on the last row instead.
     fn show_inner(&mut self, ui: &mut egui::Ui, exit_down: bool) -> Outcome {
+        let th = crate::theme::live(ui.ctx());
         let id = egui::Id::new("dirpicker-field");
 
         let mut outcome = Outcome::Pending;
@@ -413,14 +412,14 @@ impl DirPicker {
             egui::Rect::from_min_size(r.min, egui::vec2(r.width().min(520.0), field_h))
         };
         let border = if self.invalid {
-            DANGER
+            th.danger
         } else if self.open || self.armed {
-            BORDER_FOCUS
+            th.border_focus
         } else {
-            BORDER
+            th.border
         };
         ui.painter()
-            .rect_filled(field_rect, egui::CornerRadius::same(3), DESK_BG);
+            .rect_filled(field_rect, egui::CornerRadius::same(3), th.desk_bg);
         ui.painter().rect_stroke(
             field_rect,
             egui::CornerRadius::same(3),
@@ -432,7 +431,7 @@ impl DirPicker {
             egui::TextEdit::singleline(&mut self.path)
                 .id(id)
                 .font(font.clone())
-                .text_color(TEXT)
+                .text_color(th.text)
                 .frame(egui::Frame::NONE)
                 .vertical_align(egui::Align::Center)
                 .margin(egui::Margin::symmetric(6, 0))
@@ -482,7 +481,7 @@ impl DirPicker {
             if let Some(g) = self.ghost_text() {
                 let text_w = ui
                     .painter()
-                    .layout_no_wrap(self.path.clone(), font.clone(), TEXT)
+                    .layout_no_wrap(self.path.clone(), font.clone(), th.text)
                     .rect
                     .width();
                 let x = field_rect.min.x + 6.0 + text_w; // 6.0 == field margin
@@ -491,7 +490,7 @@ impl DirPicker {
                     egui::Align2::LEFT_CENTER,
                     g,
                     font.clone(),
-                    DIM,
+                    th.dim,
                 );
             }
 

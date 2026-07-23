@@ -3,7 +3,6 @@
 //! performed — the owner (wm.rs / main.rs) maps the outcome to an action.
 
 use crate::proc::ProcInfo;
-use crate::theme::*;
 use eframe::egui;
 
 pub enum ConfirmOutcome {

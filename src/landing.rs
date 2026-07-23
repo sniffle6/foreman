@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use crate::dirpicker::{DirPicker, Outcome};
 use crate::icons::{self, IconKind};
 use crate::recents::RecentEntry;
-use crate::theme::{BORDER_FOCUS, DIM, SEL_BG, TEXT, WIN_BG};
 
 /// Provisional, landing-local taxonomy (phase-2 replaces it with the dispatch model).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -297,6 +296,7 @@ fn shine_center(time: f32) -> f32 {
 /// Paint the block-art wordmark: forge gradient per glyph, an animated specular
 /// sweep, and a soft warm bloom behind. Centered in `rect`, top-aligned.
 fn paint_wordmark(ui: &egui::Ui, rect: egui::Rect, art: &str, font: egui::FontId, time: f32) {
+    let th = crate::theme::live(ui.ctx());
     let lines: Vec<&str> = art.lines().collect();
     let rows = lines.len().max(1);
     let cols = lines
@@ -369,7 +369,7 @@ fn paint_wordmark(ui: &egui::Ui, rect: egui::Rect, art: &str, font: egui::FontId
         ui.painter()
             .galley_with_override_text_color(pos + off, galley.clone(), glow);
     }
-    ui.painter().galley(pos, galley, TEXT);
+    ui.painter().galley(pos, galley, th.text);
 }
 
 impl SessionKind {
@@ -477,6 +477,7 @@ impl Landing {
         area: egui::Rect,
         recents: &[RecentEntry],
     ) -> Option<LandingAction> {
+        let th = crate::theme::live(ui.ctx());
         // Display-only filter: an entry whose dir is missing (unplugged drive) is
         // hidden, not deleted — it comes back when the drive does (spec). Cached
         // and refreshed on landing (re)appearance, NOT per frame: the landing
@@ -603,7 +604,7 @@ impl Landing {
             egui::Align2::CENTER_CENTER,
             "tmux for AI agents",
             egui::FontId::proportional(14.0),
-            DIM,
+            th.dim,
         );
 
         // Inline picker in the field rect.
@@ -631,16 +632,16 @@ impl Landing {
             let resp = ui.interact(*r, ui.id().with(("icon", idx)), egui::Sense::click());
             let selected = self.nav.zone == Zone::Buttons && idx == self.nav.btn;
             ui.painter()
-                .rect_filled(*r, egui::CornerRadius::same(4), WIN_BG);
+                .rect_filled(*r, egui::CornerRadius::same(4), th.win_bg);
             if selected || resp.hovered() {
                 ui.painter()
-                    .rect_filled(*r, egui::CornerRadius::same(4), SEL_BG);
+                    .rect_filled(*r, egui::CornerRadius::same(4), th.sel_bg);
             }
             if selected {
                 ui.painter().rect_stroke(
                     *r,
                     egui::CornerRadius::same(4),
-                    egui::Stroke::new(1.0, BORDER_FOCUS),
+                    egui::Stroke::new(1.0, th.border_focus),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -656,7 +657,7 @@ impl Landing {
                 egui::Align2::CENTER_TOP,
                 kind.label(),
                 egui::FontId::proportional(12.0),
-                TEXT,
+                th.text,
             );
             if resp.clicked() {
                 if let Some(path) = self.picker.current_dir() {
@@ -671,7 +672,7 @@ impl Landing {
                 egui::Align2::LEFT_CENTER,
                 "Recent",
                 egui::FontId::proportional(12.0),
-                DIM,
+                th.dim,
             );
             let row_font = egui::FontId::proportional(13.0);
             for (idx, (r, e)) in l.recents.iter().zip(visible.iter()).enumerate() {
@@ -679,7 +680,7 @@ impl Landing {
                 let selected = self.nav.zone == Zone::Recents && idx == self.nav.rec;
                 if selected || resp.hovered() {
                     ui.painter()
-                        .rect_filled(*r, egui::CornerRadius::same(3), SEL_BG);
+                        .rect_filled(*r, egui::CornerRadius::same(3), th.sel_bg);
                 }
                 if selected {
                     ui.painter().text(
@@ -687,7 +688,7 @@ impl Landing {
                         egui::Align2::LEFT_CENTER,
                         ">",
                         egui::FontId::monospace(13.0),
-                        TEXT,
+                        th.text,
                     );
                 }
                 let kind = SessionKind::from_kind_str(&e.kind);
@@ -710,7 +711,7 @@ impl Landing {
                 let name_x = r.min.x + 44.0;
                 let name_w = ui
                     .painter()
-                    .layout_no_wrap(name.clone(), row_font.clone(), TEXT)
+                    .layout_no_wrap(name.clone(), row_font.clone(), th.text)
                     .rect
                     .width();
                 ui.painter().text(
@@ -718,7 +719,7 @@ impl Landing {
                     egui::Align2::LEFT_CENTER,
                     name,
                     row_font.clone(),
-                    TEXT,
+                    th.text,
                 );
                 if let Some(parent) = e.path.parent() {
                     ui.painter().text(
@@ -726,7 +727,7 @@ impl Landing {
                         egui::Align2::LEFT_CENTER,
                         parent.display().to_string(),
                         row_font.clone(),
-                        DIM,
+                        th.dim,
                     );
                 }
                 if resp.clicked() {
