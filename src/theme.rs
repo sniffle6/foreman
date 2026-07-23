@@ -210,6 +210,19 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_the_user_theme_file_and_refuses_the_builtin() {
+        let dir = crate::config::themes_dir().unwrap();
+        let name = "zz-delete-me";
+        let path = dir.join(format!("{name}.json"));
+        Theme::foreman_warm().save(name).unwrap();
+        assert!(path.exists());
+        Theme::delete(name).unwrap();
+        assert!(!path.exists());
+        Theme::delete(name).unwrap(); // a missing file is Ok
+        assert!(Theme::delete(crate::appearance::BUILTIN).is_err());
+    }
+
+    #[test]
     fn slug_is_filesystem_safe() {
         assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
         assert_eq!(slug("Test  Theme!!"), "test-theme-");
@@ -530,6 +543,19 @@ impl Theme {
         self.save(&new_slug)?;
         let _ = std::fs::remove_file(dir.join(format!("{old_slug}.json")));
         Ok(new_slug)
+    }
+
+    /// Delete a user theme's file. Errors on the built-in; a missing file is Ok.
+    pub fn delete(name: &str) -> Result<(), String> {
+        if Self::is_builtin(name) {
+            return Err("cannot delete the built-in theme".into());
+        }
+        let dir = crate::config::themes_dir().ok_or_else(|| "no themes dir".to_string())?;
+        match std::fs::remove_file(dir.join(format!("{}.json", slug(name)))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 

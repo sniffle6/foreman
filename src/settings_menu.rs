@@ -842,6 +842,14 @@ impl SettingsMenu {
                         Err(e) => eprintln!("foreman: could not rename theme: {e}"),
                     }
                 }
+                crate::appearance::Outcome::Delete(name) => {
+                    // Remove the user theme file and fall back to the built-in.
+                    if let Err(e) = crate::theme::Theme::delete(&name) {
+                        eprintln!("foreman: could not delete theme: {e}");
+                    }
+                    s.theme = crate::appearance::BUILTIN.to_string();
+                    bump(outcome, MenuOutcome::Changed);
+                }
                 crate::appearance::Outcome::Pending => {}
             }
             return;

@@ -24,6 +24,8 @@ pub enum Outcome {
     SelectPreset(String),
     /// Rename the active user theme to this name.
     Rename(String),
+    /// Delete the active user theme (name given).
+    Delete(String),
     /// Nothing happened this frame.
     Pending,
 }
@@ -39,6 +41,8 @@ pub struct AppearanceView {
     name_edit: String,
     /// Selectable presets: built-in first, then user themes.
     presets: Vec<String>,
+    /// True while the delete-confirmation modal is open.
+    confirm_delete: bool,
 }
 
 impl AppearanceView {
@@ -49,6 +53,7 @@ impl AppearanceView {
             active_name: BUILTIN.to_string(),
             name_edit: BUILTIN.to_string(),
             presets: vec![BUILTIN.to_string()],
+            confirm_delete: false,
         };
         v.refresh_presets();
         v
@@ -144,18 +149,14 @@ impl AppearanceView {
         // Responsive split: the preview shrinks/grows with the window (clamped);
         // the control column fills the rest and scrolls if it's taller than the
         // pane, so nothing clips at small window sizes.
-        // Cap the content width so a wide window leaves a right margin instead of
-        // a dead gap; the preview is a fixed-height box beside the (scrolling)
-        // controls, both grouped at the left.
-        let content_w = inner.width().min(720.0);
-        let preview_w = (content_w * 0.42).clamp(200.0, 300.0);
-        let controls_w = (content_w - preview_w - pad).max(160.0);
-        let preview_h = inner.height().min(300.0);
+        // Controls take a reasonable column on the left; the preview fills the rest
+        // of the pane and grows with the window, so a wide/tall window isn't wasted.
+        let controls_w = (inner.width() * 0.42).clamp(240.0, 380.0);
         let controls_rect =
             egui::Rect::from_min_size(inner.min, egui::vec2(controls_w, inner.height()));
-        let preview_rect = egui::Rect::from_min_size(
+        let preview_rect = egui::Rect::from_min_max(
             egui::pos2(inner.left() + controls_w + pad, inner.top()),
-            egui::vec2(preview_w, preview_h),
+            inner.max,
         );
 
         Self::paint_preview(ui, preview_rect, &t);
@@ -164,6 +165,7 @@ impl AppearanceView {
         let mut duplicate: Option<String> = None;
         let mut preset_switch: Option<String> = None;
         let mut rename: Option<String> = None;
+        let mut delete: Option<String> = None;
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(controls_rect));
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -201,6 +203,9 @@ impl AppearanceView {
                             && crate::theme::slug(&self.name_edit) != self.active_name
                         {
                             rename = Some(self.name_edit.clone());
+                        }
+                        if ui.button("–").on_hover_text("Delete this theme").clicked() {
+                            self.confirm_delete = true;
                         }
                     });
                 }
@@ -312,6 +317,36 @@ impl AppearanceView {
                 });
             });
 
+        // Delete-confirmation modal (opened by the − button on a user theme).
+        if self.confirm_delete {
+            let m =
+                egui::Modal::new(egui::Id::new("appearance_delete_confirm")).show(ui.ctx(), |ui| {
+                    ui.set_width(280.0);
+                    ui.strong("Delete theme?");
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Permanently delete \u{201c}{}\u{201d}?",
+                        self.active_name
+                    ));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            delete = Some(self.active_name.clone());
+                            self.confirm_delete = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = false;
+                        }
+                    });
+                });
+            if m.should_close() {
+                self.confirm_delete = false;
+            }
+        }
+
+        if let Some(name) = delete {
+            return Outcome::Delete(name);
+        }
         // Editing the built-in transparently forks an editable user copy — the
         // built-in stays a pristine preset you can switch back to.
         if changed && self.active_is_builtin() {
