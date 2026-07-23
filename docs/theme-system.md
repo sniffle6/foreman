@@ -35,9 +35,11 @@ static palette.
 ## How to use it
 
 - Open settings (`Ctrl+B` then `Ctrl+,`), select **Appearance** (top of the rail).
-- The built-in **Foreman Warm** is read-only. Click **Duplicate** to fork it into
-  an editable user theme, then edit background / foreground / selection /
-  focus-border / cursor and the 16 ANSI swatches. Edits apply live and auto-save.
+- Just edit the colors — background / foreground / selection / focus-border /
+  cursor and the 16 ANSI swatches. Edits apply live and auto-save.
+- Editing the built-in **Foreman Warm** transparently **forks an editable copy**
+  (the built-in stays a pristine preset you can switch back to via the dropdown);
+  the preset name flips to the new copy. **Duplicate** makes an explicit copy.
 - **Revert to saved** undoes edits back to the baseline (the theme as it was when
   you opened/selected it). The preset dropdown switches themes.
 
@@ -61,8 +63,9 @@ static palette.
   thread — no egui ctx exists there) and the headless `foreman snapshot --attrs`
   inspector. The *visible* terminal grid DOES reflect the live theme; only these
   self-report paths lag.
-- **The built-in is never written to disk.** Editing it is disabled in the UI and
-  `Theme::save` refuses the built-in name; Duplicate is how a user theme is born.
+- **The built-in is never written to disk.** `Theme::save` refuses the built-in
+  name; editing the built-in forks a copy (and that copy is what's saved), so the
+  shipped colors are always recoverable by selecting "Foreman Warm" again.
 - **Font size** in the Appearance pane rides the `Ctrl+Scroll` zoom seam (a
   `Settings` field, not a theme token) — it persists in `settings.json`, not the
   theme file. Changing it resizes the grid (cols/rows change), with the same

@@ -43,7 +43,7 @@ on purpose — a user slider on those creates support tickets, not value).
 
 | Pane | Settings (default) |
 |---|---|
-| Appearance | The live theme editor (split preview; see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Built-in "Foreman Warm" is read-only until duplicated |
+| Appearance | The live theme editor (split preview; see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Editing the built-in "Foreman Warm" transparently forks an editable copy |
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
@@ -89,9 +89,10 @@ on purpose — a user slider on those creates support tickets, not value).
   typing in a terminal beside it can't drive the hidden editor.
 - **The Appearance pane is a custom-body pane** (like Keybindings) that edits the
   *live* theme through the `theme::seed_live`/`live` seam — a color change
-  repaints every terminal instantly. The built-in is read-only (its pickers are
-  disabled); **Duplicate** forks it into an editable user theme saved under
-  `%APPDATA%\foreman\themes\`. Full write-up + the two known gaps (OSC
+  repaints every terminal instantly. Editing the built-in transparently forks an
+  editable copy saved under `%APPDATA%\foreman\themes\` (the built-in stays a
+  pristine preset); **Duplicate** makes an explicit copy. Full write-up + the two
+  known gaps (OSC
   color-query answers and headless `--attrs` still report the *default* palette):
   `docs/theme-system.md`.
 

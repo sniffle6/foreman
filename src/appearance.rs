@@ -71,6 +71,21 @@ impl AppearanceView {
         self.presets = presets;
     }
 
+    /// A unique slug for a fork of the active theme, so an auto-fork (or an
+    /// explicit Duplicate) never clobbers an existing user theme file.
+    fn fork_name(&self) -> String {
+        let existing: std::collections::HashSet<String> =
+            Theme::user_theme_names().into_iter().collect();
+        let base = crate::theme::slug(&format!("{} copy", self.active_name));
+        if !existing.contains(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|c| !existing.contains(c))
+            .unwrap_or(base)
+    }
+
     /// The currently-active theme name (matches `Settings.theme`).
     pub fn active_name(&self) -> &str {
         &self.active_name
@@ -159,7 +174,7 @@ impl AppearanceView {
         }
         lui.label(
             egui::RichText::new(if self.active_is_builtin() {
-                "Built-in — Duplicate to edit"
+                "Built-in — edits save as a copy"
             } else {
                 "User theme"
             })
@@ -168,39 +183,36 @@ impl AppearanceView {
         );
         lui.add_space(8.0);
 
-        // The color controls are read-only while the built-in is active — editing
-        // forks a user theme via Duplicate.
-        let editable = !self.active_is_builtin();
-        lui.add_enabled_ui(editable, |ui| {
-            changed |= opaque_row(ui, "Background", &mut self.working.bg);
-            changed |= opaque_row(ui, "Foreground", &mut self.working.fg);
-            changed |= translucent_row(ui, "Selection", &mut self.working.selection);
-            changed |= opaque_row(ui, "Focus border", &mut self.working.border_focus);
-            changed |= translucent_row(ui, "Cursor", &mut self.working.caret);
+        // Color pickers — always editable. Editing the built-in transparently
+        // forks a user copy (handled at the end), so the built-in stays pristine.
+        changed |= opaque_row(lui, "Background", &mut self.working.bg);
+        changed |= opaque_row(lui, "Foreground", &mut self.working.fg);
+        changed |= translucent_row(lui, "Selection", &mut self.working.selection);
+        changed |= opaque_row(lui, "Focus border", &mut self.working.border_focus);
+        changed |= translucent_row(lui, "Cursor", &mut self.working.caret);
 
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
-            let mut palette = self.working.palette;
-            egui::Grid::new("appearance_palette")
-                .spacing([4.0, 4.0])
-                .show(ui, |ui| {
-                    for i in 0..16usize {
-                        ui.push_id(i, |ui| {
-                            let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
-                            if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                            }
-                        });
-                        if i % 8 == 7 {
-                            ui.end_row();
+        lui.add_space(6.0);
+        lui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
+        let mut palette = self.working.palette;
+        egui::Grid::new("appearance_palette")
+            .spacing([4.0, 4.0])
+            .show(lui, |ui| {
+                for i in 0..16usize {
+                    ui.push_id(i, |ui| {
+                        let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
                         }
+                    });
+                    if i % 8 == 7 {
+                        ui.end_row();
                     }
-                });
-            if palette != self.working.palette {
-                self.working.palette = palette;
-                changed = true;
-            }
-        });
+                }
+            });
+        if palette != self.working.palette {
+            self.working.palette = palette;
+            changed = true;
+        }
 
         lui.add_space(6.0);
         // Font size shares the Ctrl+Scroll zoom seam (a Settings field, not a theme
@@ -221,7 +233,7 @@ impl AppearanceView {
         lui.add_space(8.0);
         lui.horizontal(|ui| {
             if ui.button("Duplicate…").clicked() {
-                duplicate = Some(crate::theme::slug(&format!("{} copy", self.active_name)));
+                duplicate = Some(self.fork_name());
             }
             if self.is_dirty() && ui.button("Revert to saved").clicked() {
                 self.revert();
@@ -229,6 +241,12 @@ impl AppearanceView {
             }
         });
 
+        // Editing the built-in transparently forks an editable user copy — the
+        // built-in stays a pristine preset you can switch back to.
+        if changed && self.active_is_builtin() {
+            *out_theme = self.working.clone();
+            return Outcome::Duplicate(self.fork_name());
+        }
         if let Some(name) = duplicate {
             return Outcome::Duplicate(name);
         }
