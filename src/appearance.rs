@@ -103,6 +103,10 @@ impl AppearanceView {
         reads_input: bool,
         out_theme: &mut Theme,
     ) -> Outcome {
+        // Mouse-only pane: the color pickers are position-routed egui widgets, so
+        // (unlike the keyboard-capturing Keybindings editor) they need no
+        // reads_input gate; keyboard is handled by the settings shell.
+        let _ = reads_input;
         let t = self.working.clone();
         let pad = 12.0;
         let split_x = rect.left() + (rect.width() * 0.5).max(rect.width() - 340.0);
@@ -118,61 +122,91 @@ impl AppearanceView {
         // Right: the sticky live preview (drawn with the working theme).
         Self::paint_preview(ui, right, &t);
 
-        // Left: heading + (Revert while dirty). Controls arrive next step.
-        let p = ui.painter();
-        p.text(
-            left.min,
-            egui::Align2::LEFT_TOP,
-            &self.active_name,
-            egui::FontId::proportional(15.0),
-            t.text,
+        // Left: interactive control column.
+        let mut changed = false;
+        let mut duplicate: Option<String> = None;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(left));
+        let lui = &mut child;
+        lui.label(
+            egui::RichText::new(&self.active_name)
+                .size(15.0)
+                .color(t.text),
         );
-        p.text(
-            left.min + egui::vec2(0.0, 24.0),
-            egui::Align2::LEFT_TOP,
-            if self.active_is_builtin() {
-                "Built-in theme — Duplicate to customize"
+        lui.label(
+            egui::RichText::new(if self.active_is_builtin() {
+                "Built-in theme"
             } else {
                 "User theme"
-            },
-            egui::FontId::proportional(12.0),
-            t.dim,
+            })
+            .size(12.0)
+            .color(t.dim),
         );
+        lui.add_space(8.0);
 
-        let mut outcome = Outcome::Pending;
-        if self.is_dirty() {
-            let btn = egui::Rect::from_min_size(
-                egui::pos2(left.left(), left.bottom() - 26.0),
-                egui::vec2(140.0, 24.0),
-            );
-            let resp = ui.interact(btn, ui.id().with("appearance_revert"), egui::Sense::click());
-            let fill = if resp.hovered() {
-                t.sel_bg
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            let p = ui.painter();
-            p.rect_filled(btn, egui::CornerRadius::same(3), fill);
-            p.rect_stroke(
-                btn,
-                egui::CornerRadius::same(3),
-                egui::Stroke::new(1.0, t.border),
-                egui::StrokeKind::Inside,
-            );
-            p.text(
-                btn.center(),
-                egui::Align2::CENTER_CENTER,
-                "Revert to saved",
-                egui::FontId::proportional(12.0),
-                t.text,
-            );
-            if reads_input && resp.clicked() {
-                self.revert();
-                *out_theme = self.working.clone();
-                outcome = Outcome::Changed;
-            }
+        changed |= opaque_row(lui, "Background", &mut self.working.bg);
+        changed |= opaque_row(lui, "Foreground", &mut self.working.fg);
+        changed |= translucent_row(lui, "Selection", &mut self.working.selection);
+        changed |= opaque_row(lui, "Focus border", &mut self.working.border_focus);
+        changed |= translucent_row(lui, "Cursor", &mut self.working.caret);
+
+        lui.add_space(6.0);
+        lui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
+        let mut palette = self.working.palette;
+        egui::Grid::new("appearance_palette")
+            .spacing([4.0, 4.0])
+            .show(lui, |ui| {
+                for i in 0..16usize {
+                    ui.push_id(i, |ui| {
+                        let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                        }
+                    });
+                    if i % 8 == 7 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if palette != self.working.palette {
+            self.working.palette = palette;
+            changed = true;
         }
-        outcome
+
+        lui.add_space(6.0);
+        // Font size shares the Ctrl+Scroll zoom seam (a Settings field, not a theme
+        // token) — the App reads it back and persists it separately.
+        let mut fs = crate::terminal::font_size(lui.ctx());
+        lui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Font size").color(t.dim));
+            if ui.small_button("–").clicked() {
+                fs = (fs - 1.0).max(8.0);
+            }
+            ui.label(format!("{fs:.0}"));
+            if ui.small_button("+").clicked() {
+                fs = (fs + 1.0).min(40.0);
+            }
+        });
+        crate::terminal::set_font_size(lui.ctx(), fs);
+
+        lui.add_space(8.0);
+        lui.horizontal(|ui| {
+            if ui.button("Duplicate…").clicked() {
+                duplicate = Some(format!("{} copy", self.active_name));
+            }
+            if self.is_dirty() && ui.button("Revert to saved").clicked() {
+                self.revert();
+                changed = true;
+            }
+        });
+
+        if let Some(name) = duplicate {
+            return Outcome::Duplicate(name);
+        }
+        if changed {
+            *out_theme = self.working.clone();
+            return Outcome::Changed;
+        }
+        Outcome::Pending
     }
 
     /// A self-contained mini-terminal sample rendered with `t` — NO PTY. Shows the
@@ -266,6 +300,37 @@ impl AppearanceView {
             p.rect_filled(cell, egui::CornerRadius::same(2), t.palette[i as usize]);
         }
     }
+}
+
+/// One picker row for an OPAQUE token: a swatch button + label. Returns true if
+/// the color changed this frame.
+fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
+    ui.horizontal(|ui| {
+        let mut rgb = [c.r(), c.g(), c.b()];
+        let r = ui.color_edit_button_srgb(&mut rgb);
+        if r.changed() {
+            *c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+        }
+        ui.label(label);
+        r.changed()
+    })
+    .inner
+}
+
+/// One picker row for a TRANSLUCENT token, edited in STRAIGHT (un-premultiplied)
+/// alpha via `color_edit_button_srgba_unmultiplied` — the egui path that avoids
+/// the low-alpha premultiplied round-trip drift.
+fn translucent_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
+    ui.horizontal(|ui| {
+        let mut a = c.to_srgba_unmultiplied();
+        let r = ui.color_edit_button_srgba_unmultiplied(&mut a);
+        if r.changed() {
+            *c = egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
+        }
+        ui.label(label);
+        r.changed()
+    })
+    .inner
 }
 
 #[cfg(test)]
