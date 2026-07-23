@@ -3459,7 +3459,7 @@ impl WindowManager {
         self.pump_commands(ui, live);
 
         ui.painter_at(area)
-            .rect_filled(area, egui::CornerRadius::ZERO, DESK_BG);
+            .rect_filled(area, egui::CornerRadius::ZERO, th.desk_bg);
 
         let focused = self.focused;
         let asz = area.size();
@@ -3557,8 +3557,11 @@ impl WindowManager {
                 && !is_project
                 && !is_panel;
             if bare {
-                ui.painter_at(scr.intersect(area))
-                    .rect_filled(scr, egui::CornerRadius::ZERO, BG);
+                ui.painter_at(scr.intersect(area)).rect_filled(
+                    scr,
+                    egui::CornerRadius::ZERO,
+                    th.bg,
+                );
                 let cresp = ui.interact(
                     scr,
                     base.with((id, "content")),
@@ -3645,7 +3648,7 @@ impl WindowManager {
                     .layout_no_wrap(
                         self.windows[i].title().to_string(),
                         egui::FontId::proportional(12.5),
-                        TEXT,
+                        th.text,
                     )
                     .size()
                     .x;
@@ -3805,7 +3808,7 @@ impl WindowManager {
             // reserved (unfilled) title bands at both levels must blend into
             // the content below them, or they read as header bars even with
             // no fill.
-            p.rect_filled(scr, cr, BG);
+            p.rect_filled(scr, cr, th.bg);
 
             // --- content ---
             // Painted BEFORE the header so the hover-revealed header overlays
@@ -3855,7 +3858,7 @@ impl WindowManager {
                         .map(|t| TabMeasure {
                             label_w: ui
                                 .painter()
-                                .layout_no_wrap(t.title.clone(), tab_font.clone(), TEXT)
+                                .layout_no_wrap(t.title.clone(), tab_font.clone(), th.text)
                                 .size()
                                 .x,
                             has_icon: t.content.icon_kind().is_some(),
@@ -3869,7 +3872,7 @@ impl WindowManager {
                             .layout_no_wrap(
                                 self.windows[i].title().to_string(),
                                 title_font.clone(),
-                                TEXT,
+                                th.text,
                             )
                             .size()
                             .x,
@@ -3887,20 +3890,20 @@ impl WindowManager {
                     let te_rect = *field;
                     // Theme the field to the dark/amber titlebar instead of egui's
                     // default light TextEdit: dark inset fill + amber edit-mode border.
-                    p.rect_filled(te_rect, egui::CornerRadius::same(3), WIN_BG);
+                    p.rect_filled(te_rect, egui::CornerRadius::same(3), th.win_bg);
                     p.rect_stroke(
                         te_rect,
                         egui::CornerRadius::same(3),
-                        egui::Stroke::new(1.0, BORDER_FOCUS),
+                        egui::Stroke::new(1.0, th.border_focus),
                         egui::StrokeKind::Inside,
                     );
-                    ui.visuals_mut().selection.bg_fill = SELECTION_TEXT_BG;
+                    ui.visuals_mut().selection.bg_fill = th.selection_text_bg;
                     let resp = ui.put(
                         te_rect,
                         egui::TextEdit::singleline(&mut self.rename_buf)
                             .id(base.with((id, "rename")))
                             .font(egui::FontId::proportional(12.5))
-                            .text_color(TEXT)
+                            .text_color(th.text)
                             .vertical_align(egui::Align::Center)
                             .frame(egui::Frame::NONE)
                             .margin(egui::Margin::symmetric(6, 0))
@@ -3955,7 +3958,7 @@ impl WindowManager {
                         // the terminal). Inactive tabs sit lighter (hover lighter still)
                         // for an obvious active/inactive contrast.
                         let bg = if is_active_tab {
-                            BG
+                            th.bg
                         } else if chip_resp.hovered() {
                             egui::Color32::from_rgb(50, 45, 35)
                         } else {
@@ -3976,7 +3979,7 @@ impl WindowManager {
                         // into the content below it. Terminal tabs need no border; their
                         // bg-match into the content reads on its own.
                         if is_active_tab && is_project {
-                            let tab_border = if is_focus { BORDER_FOCUS } else { BORDER };
+                            let tab_border = if is_focus { th.border_focus } else { th.border };
                             p.rect_stroke(
                                 chip,
                                 radius,
@@ -4001,7 +4004,7 @@ impl WindowManager {
                                 egui::StrokeKind::Inside,
                             );
                         }
-                        let txt_col = if is_active_tab { TEXT } else { DIM };
+                        let txt_col = if is_active_tab { th.text } else { th.dim };
                         // Leading icon: agent logo / shell glyph / project folder.
                         if let (Some(kind), Some(icon_rect)) = (icon, ch.icon) {
                             let px = (icon_rect.width() * ui.ctx().pixels_per_point())
@@ -4140,7 +4143,7 @@ impl WindowManager {
                             egui::Align2::LEFT_CENTER,
                             self.windows[i].title(),
                             title_font.clone(),
-                            if is_focus { TEXT } else { DIM },
+                            if is_focus { th.text } else { th.dim },
                         );
                     }
                 }
@@ -4175,7 +4178,7 @@ impl WindowManager {
                     // points at the docked edge — `scr` vs the desktop area
                     // says whether that's the top or the bottom. Up/down are
                     // vector strokes: the default fonts have no U+2303/U+2304.
-                    let col = if is_focus { TEXT } else { DIM };
+                    let col = if is_focus { th.text } else { th.dim };
                     if !collapsed && scr.width() > scr.height() {
                         let up = scr.center().y < area.center().y;
                         crate::panel::paint_chevron(ui.painter(), br.center(), up, col);
@@ -4215,7 +4218,8 @@ impl WindowManager {
                         // share one optical center, size, and weight regardless of font.
                         let c = r.center();
                         let s = 4.0; // icon half-extent
-                        let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                        let stroke =
+                            egui::Stroke::new(1.4, if is_focus { th.text } else { th.dim });
                         let p = ui.painter();
                         match role {
                             CtlRole::Min => {
@@ -4282,7 +4286,7 @@ impl WindowManager {
                                     p.circle_filled(
                                         egui::pos2(c.x + dx, c.y),
                                         1.2,
-                                        if is_focus { TEXT } else { DIM },
+                                        if is_focus { th.text } else { th.dim },
                                     );
                                 }
                             }
@@ -4323,7 +4327,8 @@ impl WindowManager {
                             .rect_filled(pr, egui::CornerRadius::same(4), pbg);
                         let c = pr.center();
                         let s = 4.0;
-                        let stroke = egui::Stroke::new(1.4, if is_focus { TEXT } else { DIM });
+                        let stroke =
+                            egui::Stroke::new(1.4, if is_focus { th.text } else { th.dim });
                         let p = ui.painter();
                         p.line_segment(
                             [egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)],
@@ -4384,12 +4389,12 @@ impl WindowManager {
                 )
             } else if is_focus {
                 if is_project {
-                    PROJ_BORDER_FOCUS
+                    th.proj_border_focus
                 } else {
-                    BORDER_FOCUS
+                    th.border_focus
                 }
             } else {
-                BORDER
+                th.border
             };
             ui.painter_at(area).rect_stroke(
                 scr,
@@ -4761,15 +4766,16 @@ impl WindowManager {
         snap_overlay: Option<egui::Rect>,
         merge_hint: Option<usize>,
     ) {
+        let th = crate::theme::live(ui.ctx());
         // --- snap overlay (amber), painted above all windows while dragging ---
         if let Some(ov) = snap_overlay {
             let p = ui.painter_at(area);
             let r = ov.intersect(area);
-            p.rect_filled(r, egui::CornerRadius::same(8), SNAP_FILL);
+            p.rect_filled(r, egui::CornerRadius::same(8), th.snap_fill);
             p.rect_stroke(
                 r,
                 egui::CornerRadius::same(8),
-                egui::Stroke::new(1.5, SNAP_STROKE),
+                egui::Stroke::new(1.5, th.snap_stroke),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4781,11 +4787,11 @@ impl WindowManager {
                 .translate(area.min.to_vec2())
                 .intersect(area);
             let p = ui.painter_at(area);
-            p.rect_filled(r, egui::CornerRadius::same(8), SNAP_FILL);
+            p.rect_filled(r, egui::CornerRadius::same(8), th.snap_fill);
             p.rect_stroke(
                 r,
                 egui::CornerRadius::same(8),
-                egui::Stroke::new(2.0, SNAP_STROKE),
+                egui::Stroke::new(2.0, th.snap_stroke),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4920,6 +4926,7 @@ impl WindowManager {
     /// A small amber pill in the bottom-right while command mode is armed, so the
     /// leader press is visibly acknowledged.
     fn paint_armed_pill(&self, ui: &egui::Ui, area: egui::Rect) {
+        let th = crate::theme::live(ui.ctx());
         let text = format!("PREFIX  {}", self.keymap.leader.pretty());
         let text = text.as_str();
         let font = egui::FontId::monospace(11.5);
@@ -4929,7 +4936,7 @@ impl WindowManager {
         let size = galley.size() + pad * 2.0;
         let min = egui::pos2(area.max.x - size.x - 12.0, area.max.y - size.y - 12.0);
         let r = egui::Rect::from_min_size(min, size);
-        p.rect_filled(r, egui::CornerRadius::same(6), BORDER_FOCUS);
+        p.rect_filled(r, egui::CornerRadius::same(6), th.border_focus);
         p.text(
             r.center(),
             egui::Align2::CENTER_CENTER,
@@ -4944,6 +4951,7 @@ impl WindowManager {
     /// `pump_leader`). Rows are built from the **live** keymap so hand-edits and
     /// in-app rebinds are reflected here, not a stale hardcoded list.
     fn paint_help(&self, ui: &mut egui::Ui, area: egui::Rect) {
+        let th = crate::theme::live(ui.ctx());
         use crate::keymap::{Command, Group};
         ui.painter_at(area)
             .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
@@ -5002,11 +5010,11 @@ impl WindowManager {
         let panel = egui::Rect::from_center_size(center, egui::vec2(panel_w, panel_h));
 
         let p = ui.painter_at(area);
-        p.rect_filled(panel, egui::CornerRadius::same(8), WIN_BG);
+        p.rect_filled(panel, egui::CornerRadius::same(8), th.win_bg);
         p.rect_stroke(
             panel,
             egui::CornerRadius::same(8),
-            egui::Stroke::new(1.0, BORDER_FOCUS),
+            egui::Stroke::new(1.0, th.border_focus),
             egui::StrokeKind::Inside,
         );
 
@@ -5016,7 +5024,7 @@ impl WindowManager {
             egui::Align2::LEFT_TOP,
             "Keyboard bindings",
             title_font,
-            BORDER_FOCUS,
+            th.border_focus,
         );
         y += 30.0;
         for (k, v) in &rows {
@@ -5028,7 +5036,7 @@ impl WindowManager {
                         egui::Align2::LEFT_TOP,
                         k,
                         val_font.clone(),
-                        TEXT,
+                        th.text,
                     );
                 }
             } else {
@@ -5037,14 +5045,14 @@ impl WindowManager {
                     egui::Align2::LEFT_TOP,
                     k,
                     key_font.clone(),
-                    BORDER_FOCUS,
+                    th.border_focus,
                 );
                 p.text(
                     egui::pos2(panel.min.x + pad + key_col_w, y),
                     egui::Align2::LEFT_TOP,
                     v,
                     val_font.clone(),
-                    DIM,
+                    th.dim,
                 );
             }
             y += line_h;
@@ -5104,6 +5112,7 @@ fn hover_menu(
     items: &[(&str, Act)],
     align_right: bool,
 ) -> Option<Act> {
+    let th = crate::theme::live(ui.ctx());
     let open_id = menu_id.with("open");
     let was_open = ui
         .ctx()
@@ -5122,7 +5131,7 @@ fn hover_menu(
         .iter()
         .map(|(l, _)| {
             ui.painter()
-                .layout_no_wrap((*l).to_owned(), font.clone(), TEXT)
+                .layout_no_wrap((*l).to_owned(), font.clone(), th.text)
                 .size()
                 .x
         })
@@ -5148,11 +5157,11 @@ fn hover_menu(
         .fixed_pos(panel.min)
         .show(ui.ctx(), |mui| {
             let mp = mui.painter();
-            mp.rect_filled(panel, egui::CornerRadius::same(4), TITLE_BG);
+            mp.rect_filled(panel, egui::CornerRadius::same(4), th.title_bg);
             mp.rect_stroke(
                 panel,
                 egui::CornerRadius::same(4),
-                egui::Stroke::new(1.0, BORDER),
+                egui::Stroke::new(1.0, th.border),
                 egui::StrokeKind::Inside,
             );
             for (ri, (label, act)) in items.iter().enumerate() {
@@ -5162,14 +5171,14 @@ fn hover_menu(
                 );
                 let rresp = mui.interact(rr, menu_id.with(("item", ri)), egui::Sense::click());
                 if rresp.hovered() {
-                    mui.painter().rect_filled(rr, 0.0, TITLE_BG_FOCUS);
+                    mui.painter().rect_filled(rr, 0.0, th.title_bg_focus);
                 }
                 mui.painter().text(
                     egui::pos2(rr.min.x + pad, rr.center().y),
                     egui::Align2::LEFT_CENTER,
                     *label,
                     font.clone(),
-                    TEXT,
+                    th.text,
                 );
                 if rresp.clicked() {
                     clicked = Some(act.clone());
