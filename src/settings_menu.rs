@@ -512,6 +512,7 @@ impl SettingsMenu {
         s: &mut Settings,
         km: &mut Keymap,
     ) -> MenuOutcome {
+        let th = crate::theme::live(ui.ctx());
         // Keyboard drives the menu only when this window is focused and no
         // inline text edit owns input.
         let mut outcome = if active && self.editing.is_none() {
@@ -521,7 +522,7 @@ impl SettingsMenu {
         };
 
         // Fill the window body (the WM draws the header/border chrome around it).
-        ui.painter_at(rect).rect_filled(rect, 0.0, WIN_BG);
+        ui.painter_at(rect).rect_filled(rect, 0.0, th.win_bg);
 
         // A scoped child UI bounded to `rect` so `override_text_color`/spacing
         // mutations stay local and never leak to sibling windows drawn later in
@@ -532,7 +533,7 @@ impl SettingsMenu {
         // menu's intrinsic size — clip to `rect` so nothing bleeds onto siblings.
         ui.set_clip_rect(rect);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-        ui.visuals_mut().override_text_color = Some(TEXT);
+        ui.visuals_mut().override_text_color = Some(th.text);
         // Reactive layout: bands span the window's width and the body fills the
         // height between the top title band and the bottom-pinned footer, so the
         // panel grows and shrinks with the window instead of a fixed 660×368.
@@ -550,14 +551,14 @@ impl SettingsMenu {
                 sw: 0,
                 se: 0,
             },
-            TITLE_BG_FOCUS,
+            th.title_bg_focus,
         );
         ui.painter().text(
             egui::pos2(title.min.x + 18.0, title.center().y),
             egui::Align2::LEFT_CENTER,
             self.pane.label(),
             egui::FontId::proportional(15.0),
-            TEXT,
+            th.text,
         );
 
         // --- body: rail | pane ---
@@ -571,14 +572,14 @@ impl SettingsMenu {
         let (footer, _) = ui.allocate_exact_size(egui::vec2(w, FOOTER_H), egui::Sense::hover());
         ui.painter().line_segment(
             [footer.left_top(), footer.right_top()],
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, th.border),
         );
         ui.painter().text(
             egui::pos2(footer.min.x + 18.0, footer.center().y),
             egui::Align2::LEFT_CENTER,
             "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close",
             egui::FontId::proportional(11.5),
-            DIM,
+            th.dim,
         );
 
         outcome
@@ -711,9 +712,10 @@ impl SettingsMenu {
     /// Left rail: one clickable row per pane; the active pane gets a wash and a
     /// bright left edge.
     fn draw_rail(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let th = crate::theme::live(ui.ctx());
         ui.painter().line_segment(
             [rect.right_top(), rect.right_bottom()],
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, th.border),
         );
         let row_h = 40.0;
         for (i, p) in Pane::ALL.iter().enumerate() {
@@ -729,14 +731,18 @@ impl SettingsMenu {
                 self.editing = None; // abandon any inline text edit on pane change
             }
             if active {
-                ui.painter().rect_filled(r, 0.0, SEL_BG);
+                ui.painter().rect_filled(r, 0.0, th.sel_bg);
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(r.min, egui::vec2(2.0, row_h)),
                     0.0,
-                    BORDER_FOCUS,
+                    th.border_focus,
                 );
             }
-            let color = if active || resp.hovered() { TEXT } else { DIM };
+            let color = if active || resp.hovered() {
+                th.text
+            } else {
+                th.dim
+            };
             ui.painter().text(
                 egui::pos2(r.min.x + 16.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -758,6 +764,7 @@ impl SettingsMenu {
         active: bool,
         outcome: &mut MenuOutcome,
     ) {
+        let th = crate::theme::live(ui.ctx());
         // Consumed every frame regardless of pane: the one-frame suppression
         // only matters on the Keybindings pane, but the flag must not linger
         // if the user dove in then immediately switched panes some other way.
@@ -798,7 +805,7 @@ impl SettingsMenu {
             .auto_shrink([false, false])
             .show(&mut pane_ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                ui.visuals_mut().override_text_color = Some(TEXT);
+                ui.visuals_mut().override_text_color = Some(th.text);
                 // Fill the viewport, but never draw rows narrower than PANE_MIN_W
                 // — below that the pane scrolls horizontally instead of cramping
                 // the label into its control. set_min_width makes the ScrollArea
@@ -814,7 +821,7 @@ impl SettingsMenu {
                         ui.painter().rect_filled(
                             r.shrink2(egui::vec2(6.0, 3.0)),
                             egui::CornerRadius::same(4),
-                            SEL_BG,
+                            th.sel_bg,
                         );
                         if scroll_to {
                             ui.scroll_to_rect(r, None);
@@ -825,7 +832,7 @@ impl SettingsMenu {
                         egui::Align2::LEFT_CENTER,
                         spec.label,
                         egui::FontId::proportional(13.0),
-                        TEXT,
+                        th.text,
                     );
                     if !spec.desc.is_empty() {
                         ui.painter().text(
@@ -833,7 +840,7 @@ impl SettingsMenu {
                             egui::Align2::LEFT_CENTER,
                             spec.desc,
                             egui::FontId::proportional(11.0),
-                            DIM,
+                            th.dim,
                         );
                     }
                     let anchor_x = r.max.x - pad;
@@ -850,7 +857,7 @@ impl SettingsMenu {
                         egui::Align2::LEFT_CENTER,
                         format!("Foreman v{}", env!("CARGO_PKG_VERSION")),
                         egui::FontId::proportional(11.0),
-                        DIM,
+                        th.dim,
                     );
                 }
             });
@@ -871,6 +878,7 @@ impl SettingsMenu {
         pane: Pane,
         idx: usize,
     ) {
+        let th = crate::theme::live(ui.ctx());
         let id = egui::Id::new(("settings_ctl", pane.label(), idx));
         match spec.kind {
             Kind::Toggle => {
@@ -884,7 +892,7 @@ impl SettingsMenu {
                 if resp.clicked() && adjust(spec.field, Adjust::Toggle, s) {
                     bump(outcome, MenuOutcome::Changed);
                 }
-                let col = if on { BELL } else { BORDER };
+                let col = if on { th.bell } else { th.border };
                 ui.painter().rect_stroke(
                     bx,
                     egui::CornerRadius::same(9),
@@ -897,8 +905,11 @@ impl SettingsMenu {
                 } else {
                     bx.min.x + knob_r + 2.0
                 };
-                ui.painter()
-                    .circle_filled(egui::pos2(kx, cy), knob_r, if on { BELL } else { DIM });
+                ui.painter().circle_filled(
+                    egui::pos2(kx, cy),
+                    knob_r,
+                    if on { th.bell } else { th.dim },
+                );
             }
             Kind::Stepper => {
                 let val = display(spec.field, s);
@@ -923,7 +934,7 @@ impl SettingsMenu {
                 if rm.clicked() && adjust(spec.field, Adjust::Dec, s) {
                     bump(outcome, MenuOutcome::Changed);
                 }
-                let border = if selected { BORDER_FOCUS } else { BORDER };
+                let border = if selected { th.border_focus } else { th.border };
                 for (rc, sym, hov) in [(minus, "−", rm.hovered()), (plus, "+", rp.hovered())] {
                     ui.painter().rect_stroke(
                         rc,
@@ -936,7 +947,7 @@ impl SettingsMenu {
                         egui::Align2::CENTER_CENTER,
                         sym,
                         egui::FontId::proportional(14.0),
-                        if hov { TEXT } else { DIM },
+                        if hov { th.text } else { th.dim },
                     );
                 }
                 ui.painter().text(
@@ -944,7 +955,7 @@ impl SettingsMenu {
                     egui::Align2::RIGHT_CENTER,
                     val,
                     egui::FontId::proportional(12.5),
-                    TEXT,
+                    th.text,
                 );
             }
             Kind::Choice => {
@@ -952,7 +963,7 @@ impl SettingsMenu {
                 let galley = ui.painter().layout_no_wrap(
                     val.clone(),
                     egui::FontId::proportional(12.5),
-                    TEXT,
+                    th.text,
                 );
                 let w = galley.size().x + 24.0;
                 let chip = egui::Rect::from_min_size(
@@ -964,9 +975,9 @@ impl SettingsMenu {
                     bump(outcome, MenuOutcome::Changed);
                 }
                 let border = if selected || resp.hovered() {
-                    BORDER_FOCUS
+                    th.border_focus
                 } else {
-                    BORDER
+                    th.border
                 };
                 ui.painter().rect_stroke(
                     chip,
@@ -979,7 +990,7 @@ impl SettingsMenu {
                     egui::Align2::CENTER_CENTER,
                     val,
                     egui::FontId::proportional(12.5),
-                    TEXT,
+                    th.text,
                 );
             }
             Kind::Text => {
@@ -1027,7 +1038,7 @@ impl SettingsMenu {
                     let galley = ui.painter().layout_no_wrap(
                         shown.clone(),
                         egui::FontId::proportional(12.5),
-                        TEXT,
+                        th.text,
                     );
                     let w = (galley.size().x + 8.0).max(60.0);
                     let hit = egui::Rect::from_min_size(
@@ -1043,7 +1054,7 @@ impl SettingsMenu {
                         egui::Align2::RIGHT_CENTER,
                         shown,
                         egui::FontId::proportional(12.5),
-                        if resp.hovered() { TEXT } else { DIM },
+                        if resp.hovered() { th.text } else { th.dim },
                     );
                 }
             }
@@ -1056,7 +1067,7 @@ impl SettingsMenu {
                 let galley = ui.painter().layout_no_wrap(
                     caption.to_string(),
                     egui::FontId::proportional(12.5),
-                    TEXT,
+                    th.text,
                 );
                 let w = galley.size().x + 24.0;
                 let btn = egui::Rect::from_min_size(
@@ -1068,9 +1079,9 @@ impl SettingsMenu {
                     bump(outcome, self.do_action(spec.field));
                 }
                 let border = if selected || resp.hovered() {
-                    BORDER_FOCUS
+                    th.border_focus
                 } else {
-                    BORDER
+                    th.border
                 };
                 ui.painter().rect_stroke(
                     btn,
@@ -1083,7 +1094,7 @@ impl SettingsMenu {
                     egui::Align2::CENTER_CENTER,
                     caption,
                     egui::FontId::proportional(12.5),
-                    TEXT,
+                    th.text,
                 );
             }
         }
