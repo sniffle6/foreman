@@ -146,12 +146,10 @@ impl AppearanceView {
         let t = self.working.clone();
         let pad = 12.0;
         let inner = rect.shrink(pad);
-        // Responsive split: the preview shrinks/grows with the window (clamped);
-        // the control column fills the rest and scrolls if it's taller than the
-        // pane, so nothing clips at small window sizes.
-        // Controls take a reasonable column on the left; the preview fills the rest
-        // of the pane and grows with the window, so a wide/tall window isn't wasted.
-        let controls_w = (inner.width() * 0.42).clamp(240.0, 380.0);
+        // Responsive split: controls and preview each take ~half and BOTH grow
+        // with the window (the controls' swatches/name/palette fill their column,
+        // so the left side isn't dead space); the controls scroll if too tall.
+        let controls_w = (inner.width() * 0.5).clamp(240.0, (inner.width() - 200.0).max(240.0));
         let controls_rect =
             egui::Rect::from_min_size(inner.min, egui::vec2(controls_w, inner.height()));
         let preview_rect = egui::Rect::from_min_max(
@@ -196,7 +194,7 @@ impl AppearanceView {
                         ui.label(egui::RichText::new("Name").size(12.0).color(t.dim));
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.name_edit)
-                                .desired_width(ui.available_width().min(170.0)),
+                                .desired_width((ui.available_width() - 28.0).max(60.0)),
                         );
                         if resp.lost_focus()
                             && !self.name_edit.trim().is_empty()
@@ -211,16 +209,13 @@ impl AppearanceView {
                 }
                 ui.add_space(8.0);
 
-                // Named UI/terminal colors — bigger swatches for easy clicking.
-                // Editing the built-in transparently forks a user copy (at the end).
-                let prev_named = ui.spacing().interact_size;
-                ui.spacing_mut().interact_size = egui::vec2(34.0, 20.0);
+                // Named UI/terminal colors — each a full-width swatch bar (fills
+                // the column, big click target). Editing the built-in forks a copy.
                 changed |= opaque_row(ui, "Background", &mut self.working.bg);
                 changed |= opaque_row(ui, "Foreground", &mut self.working.fg);
                 changed |= translucent_row(ui, "Selection", &mut self.working.selection);
                 changed |= opaque_row(ui, "Focus border", &mut self.working.border_focus);
                 changed |= translucent_row(ui, "Cursor", &mut self.working.caret);
-                ui.spacing_mut().interact_size = prev_named;
 
                 ui.add_space(8.0);
                 ui.label(
@@ -257,8 +252,8 @@ impl AppearanceView {
                 ];
                 let gap = 5.0;
                 let label_w = 44.0;
-                let sw = ((ui.available_width() - label_w - gap * 8.0) / 8.0).clamp(16.0, 40.0);
-                let sh = (sw * 0.7).clamp(14.0, 26.0);
+                let sw = ((ui.available_width() - label_w - gap * 8.0) / 8.0).clamp(16.0, 64.0);
+                let sh = (sw * 0.6).clamp(14.0, 30.0);
                 let mut palette = self.working.palette;
                 let prev_pal = ui.spacing().interact_size;
                 ui.spacing_mut().interact_size = egui::vec2(sw, sh);
@@ -464,15 +459,29 @@ impl AppearanceView {
 
 /// One picker row for an OPAQUE token: a swatch button + label. Returns true if
 /// the color changed this frame.
+/// Fixed-width label so every swatch bar starts at the same x (aligned rows).
+fn color_row_label(ui: &mut egui::Ui, label: &str) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(90.0, 22.0), egui::Sense::hover());
+    ui.painter().text(
+        r.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        ui.visuals().text_color(),
+    );
+}
+
 fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
     ui.horizontal(|ui| {
+        color_row_label(ui, label);
+        // Full-width swatch bar: fills the rest of the row (reactive + big target).
+        ui.spacing_mut().interact_size = egui::vec2(ui.available_width().max(24.0), 22.0);
         let mut rgb = [c.r(), c.g(), c.b()];
-        let r = ui.color_edit_button_srgb(&mut rgb);
-        if r.changed() {
+        let ch = ui.color_edit_button_srgb(&mut rgb).changed();
+        if ch {
             *c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
         }
-        ui.label(label);
-        r.changed()
+        ch
     })
     .inner
 }
@@ -482,13 +491,14 @@ fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
 /// the low-alpha premultiplied round-trip drift.
 fn translucent_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32) -> bool {
     ui.horizontal(|ui| {
+        color_row_label(ui, label);
+        ui.spacing_mut().interact_size = egui::vec2(ui.available_width().max(24.0), 22.0);
         let mut a = c.to_srgba_unmultiplied();
-        let r = ui.color_edit_button_srgba_unmultiplied(&mut a);
-        if r.changed() {
+        let ch = ui.color_edit_button_srgba_unmultiplied(&mut a).changed();
+        if ch {
             *c = egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
         }
-        ui.label(label);
-        r.changed()
+        ch
     })
     .inner
 }
