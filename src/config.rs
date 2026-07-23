@@ -14,6 +14,10 @@ use std::path::PathBuf;
 /// Default terminal text size, in egui points. The size every pane starts at and
 /// what Ctrl+0 resets to.
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+/// The active theme a fresh install starts on. MUST equal `appearance::BUILTIN`
+/// (the built-in theme's name) so a default `Settings` resolves to the built-in,
+/// never a missing user-theme file.
+pub const DEFAULT_THEME: &str = "Foreman Warm";
 /// Clamp bounds for Ctrl+Scroll zoom — small enough to stay legible, large enough
 /// to be useful, and bounded so a wild scroll can't make a pane unusable.
 pub const MIN_FONT_SIZE: f32 = 6.0;
@@ -197,6 +201,11 @@ pub struct Settings {
     pub default_project_dir: String,
     /// Check GitHub releases for updates in the background on launch.
     pub update_check: bool,
+    // -- appearance --
+    /// Active color theme by name: the built-in `"Foreman Warm"` or a user
+    /// theme file stem under `themes_dir()`. The Appearance pane sets this; the
+    /// App resolves it to the live `Theme`.
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -224,6 +233,7 @@ impl Default for Settings {
             restore_workspace: true,
             default_project_dir: String::new(),
             update_check: true,
+            theme: DEFAULT_THEME.into(),
         }
     }
 }
@@ -253,6 +263,11 @@ impl Settings {
         self.toast_secs = self.toast_secs.clamp(1.0, 30.0);
         self.crew_stale_secs = self.crew_stale_secs.clamp(30, 3600);
         self.send_settle_ms = self.send_settle_ms.min(2000);
+        // Empty theme name self-heals to the built-in (full unknown-name
+        // validation against the theme list lands with the Duplicate wiring).
+        if self.theme.trim().is_empty() {
+            self.theme = DEFAULT_THEME.into();
+        }
     }
 }
 
@@ -362,6 +377,19 @@ mod tests {
         assert!(s.restore_workspace);
         assert_eq!(s.default_project_dir, "");
         assert!(s.update_check);
+        assert_eq!(s.theme, "Foreman Warm");
+    }
+
+    #[test]
+    fn theme_defaults_to_foreman_warm_and_sanitizes_empty() {
+        assert_eq!(Settings::default().theme, "Foreman Warm");
+        // The default name must match the built-in theme's name so a fresh
+        // Settings resolves to the built-in (never a missing user file).
+        assert_eq!(DEFAULT_THEME, crate::appearance::BUILTIN);
+        let mut s = Settings::default();
+        s.theme = String::new();
+        s.sanitize();
+        assert_eq!(s.theme, "Foreman Warm"); // empty self-heals
     }
 
     #[test]
