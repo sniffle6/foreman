@@ -22,6 +22,8 @@ pub enum Outcome {
     Duplicate(String),
     /// The user picked a different preset — the shell switches settings.theme.
     SelectPreset(String),
+    /// Rename the active user theme to this name.
+    Rename(String),
     /// Nothing happened this frame.
     Pending,
 }
@@ -32,8 +34,10 @@ pub struct AppearanceView {
     working: Theme,
     saved: Theme,
     active_name: String,
-    /// Selectable presets: built-in first, then user themes (populated in the
-    /// persistence phase).
+    /// Editable buffer for the active user theme's name (the rename field), synced
+    /// to `active_name` on `set_active`.
+    name_edit: String,
+    /// Selectable presets: built-in first, then user themes.
     presets: Vec<String>,
 }
 
@@ -43,6 +47,7 @@ impl AppearanceView {
             working: Theme::foreman_warm(),
             saved: Theme::foreman_warm(),
             active_name: BUILTIN.to_string(),
+            name_edit: BUILTIN.to_string(),
             presets: vec![BUILTIN.to_string()],
         };
         v.refresh_presets();
@@ -53,6 +58,7 @@ impl AppearanceView {
     /// clean baseline (so the pane opens non-dirty on the newly-active theme).
     pub fn set_active(&mut self, name: &str, theme: Theme) {
         self.active_name = name.to_string();
+        self.name_edit = name.to_string();
         self.saved = theme.clone();
         self.working = theme;
         self.refresh_presets();
@@ -130,111 +136,140 @@ impl AppearanceView {
         out_theme: &mut Theme,
     ) -> Outcome {
         // Mouse-only pane: the color pickers are position-routed egui widgets, so
-        // (unlike the keyboard-capturing Keybindings editor) they need no
-        // reads_input gate; keyboard is handled by the settings shell.
+        // they need no reads_input gate; keyboard is handled by the settings shell.
         let _ = reads_input;
         let t = self.working.clone();
         let pad = 12.0;
-        let split_x = rect.left() + (rect.width() * 0.5).max(rect.width() - 340.0);
-        let left = egui::Rect::from_min_max(
-            rect.min + egui::vec2(pad, pad),
-            egui::pos2(split_x - pad, rect.bottom() - pad),
-        );
-        let right = egui::Rect::from_min_max(
-            egui::pos2(split_x + pad, rect.top() + pad),
-            rect.max - egui::vec2(pad, pad),
+        let inner = rect.shrink(pad);
+        // Responsive split: the preview shrinks/grows with the window (clamped);
+        // the control column fills the rest and scrolls if it's taller than the
+        // pane, so nothing clips at small window sizes.
+        // Cap the content width so a wide window leaves a right margin instead of
+        // a dead gap; the preview is a fixed-height box beside the (scrolling)
+        // controls, both grouped at the left.
+        let content_w = inner.width().min(720.0);
+        let preview_w = (content_w * 0.42).clamp(200.0, 300.0);
+        let controls_w = (content_w - preview_w - pad).max(160.0);
+        let preview_h = inner.height().min(300.0);
+        let controls_rect =
+            egui::Rect::from_min_size(inner.min, egui::vec2(controls_w, inner.height()));
+        let preview_rect = egui::Rect::from_min_size(
+            egui::pos2(inner.left() + controls_w + pad, inner.top()),
+            egui::vec2(preview_w, preview_h),
         );
 
-        // Right: the sticky live preview (drawn with the working theme).
-        Self::paint_preview(ui, right, &t);
+        Self::paint_preview(ui, preview_rect, &t);
 
-        // Left: interactive control column.
         let mut changed = false;
         let mut duplicate: Option<String> = None;
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(left));
-        let lui = &mut child;
-        // Preset selector: built-in + user themes. Choosing another asks the
-        // shell to change settings.theme; the App reloads and the pane resyncs.
         let mut preset_switch: Option<String> = None;
-        let mut selected = self.active_name.clone();
-        egui::ComboBox::from_id_salt("appearance_preset")
-            .selected_text(&self.active_name)
-            .show_ui(lui, |ui| {
-                for p in &self.presets {
-                    ui.selectable_value(&mut selected, p.clone(), p.as_str());
-                }
-            });
-        if selected != self.active_name {
-            preset_switch = Some(selected);
-        }
-        lui.label(
-            egui::RichText::new(if self.active_is_builtin() {
-                "Built-in — edits save as a copy"
-            } else {
-                "User theme"
-            })
-            .size(12.0)
-            .color(t.dim),
-        );
-        lui.add_space(8.0);
-
-        // Color pickers — always editable. Editing the built-in transparently
-        // forks a user copy (handled at the end), so the built-in stays pristine.
-        changed |= opaque_row(lui, "Background", &mut self.working.bg);
-        changed |= opaque_row(lui, "Foreground", &mut self.working.fg);
-        changed |= translucent_row(lui, "Selection", &mut self.working.selection);
-        changed |= opaque_row(lui, "Focus border", &mut self.working.border_focus);
-        changed |= translucent_row(lui, "Cursor", &mut self.working.caret);
-
-        lui.add_space(6.0);
-        lui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
-        let mut palette = self.working.palette;
-        egui::Grid::new("appearance_palette")
-            .spacing([4.0, 4.0])
-            .show(lui, |ui| {
-                for i in 0..16usize {
-                    ui.push_id(i, |ui| {
-                        let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+        let mut rename: Option<String> = None;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(controls_rect));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                // Preset switcher — choosing another asks the shell to change
+                // settings.theme; the App reloads and the pane resyncs.
+                let mut selected = self.active_name.clone();
+                egui::ComboBox::from_id_salt("appearance_preset")
+                    .width(ui.available_width().min(220.0))
+                    .selected_text(&self.active_name)
+                    .show_ui(ui, |ui| {
+                        for p in &self.presets {
+                            ui.selectable_value(&mut selected, p.clone(), p.as_str());
                         }
                     });
-                    if i % 8 == 7 {
-                        ui.end_row();
-                    }
+                if selected != self.active_name {
+                    preset_switch = Some(selected);
                 }
+                if self.active_is_builtin() {
+                    ui.label(
+                        egui::RichText::new("Built-in — edits save as a copy")
+                            .size(12.0)
+                            .color(t.dim),
+                    );
+                } else {
+                    // Rename the active user theme: commit on Enter / focus-loss.
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Name").size(12.0).color(t.dim));
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.name_edit)
+                                .desired_width(ui.available_width().min(170.0)),
+                        );
+                        if resp.lost_focus()
+                            && !self.name_edit.trim().is_empty()
+                            && crate::theme::slug(&self.name_edit) != self.active_name
+                        {
+                            rename = Some(self.name_edit.clone());
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+
+                // Color pickers — always editable. Editing the built-in
+                // transparently forks a user copy (handled at the end).
+                changed |= opaque_row(ui, "Background", &mut self.working.bg);
+                changed |= opaque_row(ui, "Foreground", &mut self.working.fg);
+                changed |= translucent_row(ui, "Selection", &mut self.working.selection);
+                changed |= opaque_row(ui, "Focus border", &mut self.working.border_focus);
+                changed |= translucent_row(ui, "Cursor", &mut self.working.caret);
+
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("ANSI palette").size(12.0).color(t.dim));
+                // Responsive swatches: 8 per row, sized to fill the column width.
+                let gap = 4.0;
+                let sw = ((ui.available_width() - gap * 7.0) / 8.0).clamp(14.0, 44.0);
+                let sh = (sw * 0.66).clamp(12.0, 24.0);
+                let mut palette = self.working.palette;
+                let prev_size = ui.spacing().interact_size;
+                ui.spacing_mut().interact_size = egui::vec2(sw, sh);
+                egui::Grid::new("appearance_palette")
+                    .spacing([gap, gap])
+                    .show(ui, |ui| {
+                        for i in 0..16usize {
+                            ui.push_id(i, |ui| {
+                                let mut rgb = [palette[i].r(), palette[i].g(), palette[i].b()];
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    palette[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                                }
+                            });
+                            if i % 8 == 7 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                ui.spacing_mut().interact_size = prev_size;
+                if palette != self.working.palette {
+                    self.working.palette = palette;
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                // Font size shares the Ctrl+Scroll zoom seam (a Settings field).
+                let mut fs = crate::terminal::font_size(ui.ctx());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Font size").color(t.dim));
+                    if ui.small_button("–").clicked() {
+                        fs = (fs - 1.0).max(8.0);
+                    }
+                    ui.label(format!("{fs:.0}"));
+                    if ui.small_button("+").clicked() {
+                        fs = (fs + 1.0).min(40.0);
+                    }
+                });
+                crate::terminal::set_font_size(ui.ctx(), fs);
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Duplicate…").clicked() {
+                        duplicate = Some(self.fork_name());
+                    }
+                    if self.is_dirty() && ui.button("Revert").clicked() {
+                        self.revert();
+                        changed = true;
+                    }
+                });
             });
-        if palette != self.working.palette {
-            self.working.palette = palette;
-            changed = true;
-        }
-
-        lui.add_space(6.0);
-        // Font size shares the Ctrl+Scroll zoom seam (a Settings field, not a theme
-        // token) — the App reads it back and persists it separately.
-        let mut fs = crate::terminal::font_size(lui.ctx());
-        lui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Font size").color(t.dim));
-            if ui.small_button("–").clicked() {
-                fs = (fs - 1.0).max(8.0);
-            }
-            ui.label(format!("{fs:.0}"));
-            if ui.small_button("+").clicked() {
-                fs = (fs + 1.0).min(40.0);
-            }
-        });
-        crate::terminal::set_font_size(lui.ctx(), fs);
-
-        lui.add_space(8.0);
-        lui.horizontal(|ui| {
-            if ui.button("Duplicate…").clicked() {
-                duplicate = Some(self.fork_name());
-            }
-            if self.is_dirty() && ui.button("Revert to saved").clicked() {
-                self.revert();
-                changed = true;
-            }
-        });
 
         // Editing the built-in transparently forks an editable user copy — the
         // built-in stays a pristine preset you can switch back to.
@@ -247,6 +282,9 @@ impl AppearanceView {
         }
         if let Some(name) = preset_switch {
             return Outcome::SelectPreset(name);
+        }
+        if let Some(name) = rename {
+            return Outcome::Rename(name);
         }
         if changed {
             *out_theme = self.working.clone();

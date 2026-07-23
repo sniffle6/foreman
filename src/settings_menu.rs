@@ -823,8 +823,24 @@ impl SettingsMenu {
                     }
                 }
                 crate::appearance::Outcome::SelectPreset(name) => {
+                    // Persist any pending edit to the OUTGOING user theme before
+                    // switching, so a switch within the save-debounce never drops it.
+                    if !crate::theme::Theme::is_builtin(&s.theme) {
+                        let _ = self.appearance.working().save(&s.theme);
+                    }
                     s.theme = name;
                     bump(outcome, MenuOutcome::Changed);
+                }
+                crate::appearance::Outcome::Rename(name) => {
+                    // Write the current content under the new name + drop the old
+                    // file, then switch (the App reloads it and the pane resyncs).
+                    match self.appearance.working().rename(&s.theme, &name) {
+                        Ok(new_slug) => {
+                            s.theme = new_slug;
+                            bump(outcome, MenuOutcome::Changed);
+                        }
+                        Err(e) => eprintln!("foreman: could not rename theme: {e}"),
+                    }
                 }
                 crate::appearance::Outcome::Pending => {}
             }

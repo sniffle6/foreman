@@ -178,6 +178,38 @@ mod tests {
     }
 
     #[test]
+    fn rename_moves_current_content_to_the_new_name_and_drops_the_old() {
+        let dir = crate::config::themes_dir().unwrap();
+        let old = "zz-rename-src";
+        let new = "zz-rename-dst";
+        let _ = std::fs::remove_file(dir.join(format!("{old}.json")));
+        let _ = std::fs::remove_file(dir.join(format!("{new}.json")));
+
+        let mut th = Theme::foreman_warm();
+        th.bg = egui::Color32::from_rgb(1, 2, 3);
+        th.save(old).unwrap();
+        // Edit after the initial save, then rename — the CURRENT content moves.
+        th.caret = egui::Color32::from_rgb(9, 9, 9);
+        assert_eq!(th.rename(old, new).unwrap(), new);
+
+        assert_eq!(
+            Theme::load(old),
+            Theme::foreman_warm(),
+            "old file dropped → default"
+        );
+        let moved = Theme::load(new);
+        assert_eq!(moved.bg, egui::Color32::from_rgb(1, 2, 3));
+        assert_eq!(moved.caret, egui::Color32::from_rgb(9, 9, 9));
+        assert!(
+            Theme::foreman_warm()
+                .rename(crate::appearance::BUILTIN, "x")
+                .is_err(),
+            "the built-in cannot be renamed"
+        );
+        let _ = std::fs::remove_file(dir.join(format!("{new}.json")));
+    }
+
+    #[test]
     fn slug_is_filesystem_safe() {
         assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
         assert_eq!(slug("Test  Theme!!"), "test-theme-");
@@ -472,6 +504,32 @@ impl Theme {
             }
         }
         names
+    }
+
+    /// Rename a user theme file from `old` to `new`, returning the new slug. Errors
+    /// on the built-in, an empty name, or a collision with an existing theme (the
+    /// caller keeps the old name on error).
+    pub fn rename(&self, old: &str, new: &str) -> Result<String, String> {
+        if Self::is_builtin(old) {
+            return Err("cannot rename the built-in theme".into());
+        }
+        let new_slug = slug(new);
+        if new_slug.is_empty() {
+            return Err("empty theme name".into());
+        }
+        let old_slug = slug(old);
+        if new_slug == old_slug {
+            return self.save(&new_slug).map(|_| new_slug);
+        }
+        let dir = crate::config::themes_dir().ok_or_else(|| "no themes dir".to_string())?;
+        if dir.join(format!("{new_slug}.json")).exists() {
+            return Err(format!("a theme named '{new_slug}' already exists"));
+        }
+        // Write the current content under the new name, then drop the old file —
+        // so a pending edit moves with the rename and no orphan is left behind.
+        self.save(&new_slug)?;
+        let _ = std::fs::remove_file(dir.join(format!("{old_slug}.json")));
+        Ok(new_slug)
     }
 }
 
