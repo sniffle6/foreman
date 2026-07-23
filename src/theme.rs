@@ -125,6 +125,21 @@ mod tests {
         assert_eq!(color_hex::to_hex(BG), "#14120f");
         assert!(color_hex::from_hex("#zzz").is_err());
     }
+
+    #[test]
+    fn seed_live_round_trips_the_theme() {
+        let ctx = egui::Context::default();
+        let mut t = Theme::foreman_warm();
+        t.bg = egui::Color32::from_rgb(1, 2, 3);
+        seed_live(&ctx, &t);
+        assert_eq!(*live(&ctx), t);
+    }
+
+    #[test]
+    fn live_without_seed_is_the_default() {
+        let ctx = egui::Context::default();
+        assert_eq!(*live(&ctx), Theme::default());
+    }
 }
 
 // ---- scrollback search ----
@@ -326,6 +341,22 @@ impl Default for Theme {
     fn default() -> Self {
         Self::foreman_warm()
     }
+}
+
+/// Publish the active theme into egui ctx data for this frame — the same seam as
+/// [`crate::config::seed_live`]/[`crate::keymap::seed_live`]. `App` calls this
+/// each frame; every consuming fn reads it back via [`live`]. `insert_temp` is
+/// cleared each frame, so this must run every frame.
+pub fn seed_live(ctx: &egui::Context, t: &Theme) {
+    let arc = std::sync::Arc::new(t.clone());
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("foreman::theme"), arc));
+}
+
+/// Read the theme published this frame by [`seed_live`]. Before the first seed
+/// (or in a headless ctx) this returns the built-in default.
+pub fn live(ctx: &egui::Context) -> std::sync::Arc<Theme> {
+    ctx.data_mut(|d| d.get_temp(egui::Id::new("foreman::theme")))
+        .unwrap_or_else(|| std::sync::Arc::new(Theme::default()))
 }
 
 /// Serde codec: `Color32` <-> `#rrggbb` (opaque) / `#rrggbbaa` (with alpha).
