@@ -22,8 +22,6 @@ pub enum Outcome {
     Duplicate(String),
     /// The user picked a different preset — the shell switches settings.theme.
     SelectPreset(String),
-    /// Back out to the rail (Esc/Tab).
-    Close,
     /// Nothing happened this frame.
     Pending,
 }
@@ -60,14 +58,16 @@ impl AppearanceView {
         self.refresh_presets();
     }
 
-    /// Rebuild the preset list: the built-in first, then the user theme files.
+    /// Rebuild the preset list: the built-in first, then the user theme files
+    /// (sorted — `read_dir` order is unstable).
     fn refresh_presets(&mut self) {
+        let mut users: Vec<String> = Theme::user_theme_names()
+            .into_iter()
+            .filter(|n| n != BUILTIN)
+            .collect();
+        users.sort();
         let mut presets = vec![BUILTIN.to_string()];
-        for n in Theme::user_theme_names() {
-            if n != BUILTIN {
-                presets.push(n);
-            }
-        }
+        presets.extend(users);
         self.presets = presets;
     }
 
@@ -89,11 +89,6 @@ impl AppearanceView {
     /// The currently-active theme name (matches `Settings.theme`).
     pub fn active_name(&self) -> &str {
         &self.active_name
-    }
-
-    /// Replace the preset list (built-in + user theme names).
-    pub fn set_presets(&mut self, presets: Vec<String>) {
-        self.presets = presets;
     }
 
     /// True while the built-in theme is active — its controls are read-only, so
@@ -277,7 +272,7 @@ impl AppearanceView {
         let mut y = rect.top() + 10.0;
         let lh = 18.0;
         // Draw a left-to-right run of (text, color) segments on one line.
-        let mut line = |segs: &[(&str, egui::Color32)], y: f32| {
+        let line = |segs: &[(&str, egui::Color32)], y: f32| {
             let mut x = x0;
             for (s, c) in segs {
                 let r = p.text(

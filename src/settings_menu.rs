@@ -812,16 +812,20 @@ impl SettingsMenu {
                 crate::appearance::Outcome::Changed => bump(outcome, MenuOutcome::Changed),
                 crate::appearance::Outcome::Duplicate(name) => {
                     // Write the fork as a new user theme, then make it active; the
-                    // App reloads it (now editable) and the pane resyncs to it.
-                    let _ = self.appearance.working().save(&name);
-                    s.theme = name;
-                    bump(outcome, MenuOutcome::Changed);
+                    // App reloads it (now editable) and the pane resyncs to it. On a
+                    // write failure, don't advance to a phantom name with no file.
+                    match self.appearance.working().save(&name) {
+                        Ok(()) => {
+                            s.theme = name;
+                            bump(outcome, MenuOutcome::Changed);
+                        }
+                        Err(e) => eprintln!("foreman: could not create theme: {e}"),
+                    }
                 }
                 crate::appearance::Outcome::SelectPreset(name) => {
                     s.theme = name;
                     bump(outcome, MenuOutcome::Changed);
                 }
-                crate::appearance::Outcome::Close => self.in_rail = true,
                 crate::appearance::Outcome::Pending => {}
             }
             return;

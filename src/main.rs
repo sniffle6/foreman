@@ -703,6 +703,17 @@ impl eframe::App for App {
         // re-seed the ctx so the read-back sees the reloaded theme (equal → not
         // marked dirty — a reload must not masquerade as an edit to persist).
         if self.settings.theme != self.active_theme_name {
+            // Flush a pending edit to the OUTGOING theme first — otherwise a preset
+            // switch within the debounce window silently drops it (the reload below
+            // overwrites active_theme before the debounced write fires). Take() the
+            // flag so the debounce block doesn't then re-save under the NEW name.
+            if self.theme_dirty_at.take().is_some()
+                && !crate::theme::Theme::is_builtin(&self.active_theme_name)
+            {
+                if let Err(e) = self.active_theme.save(&self.active_theme_name) {
+                    eprintln!("foreman: could not save theme: {e}");
+                }
+            }
             self.active_theme =
                 std::sync::Arc::new(crate::theme::Theme::load(&self.settings.theme));
             self.active_theme_name = self.settings.theme.clone();
