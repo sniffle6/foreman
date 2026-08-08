@@ -1,5 +1,7 @@
 /target
 *.png
+# README screenshots are the exception to the *.png sweep.
+!assets/media/*.png
 *.log
 run-stderr.log
 
@@ -10,3 +12,4 @@ run-stderr.log
 
 docs/superpowers/specs/__pycache__/
 /rxdump*.bin
+.epic-manager/
