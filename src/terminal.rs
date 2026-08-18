@@ -518,9 +518,20 @@ fn emoji_stamp_fit_rect(span: egui::Rect, tex_w: f32, tex_h: f32) -> egui::Rect 
     egui::Rect::from_min_size(min, egui::vec2(w, h))
 }
 
+/// Entries the atlas may carry into a rebuild before it is dumped wholesale.
+///
+/// `GlyphStyle` holds *resolved* 24-bit fg/bg, so truecolor output (image cells,
+/// gradients, a theme switch) mints a near-unique key per cell and nothing but a
+/// zoom ever evicted. Normal use sits around 2k entries and never trips this.
+/// Dumping beats an LRU here: tracking recency would cost bookkeeping on every
+/// lookup in the exact hot path this atlas exists to speed up, and the worst case
+/// of a dump — reshape the visible screen once — is what this code did on *every*
+/// scroll before the atlas existed.
+const MAX_ATLAS_GALLEYS: usize = 8192;
+
 /// Session-lived `(char, GlyphStyle)` → galley map. Survives `display_offset`
 /// changes so scroll rebuilds hash-lookup instead of reshaping the same alphabet.
-/// `font_bits` is the eviction key — zoom clears the map.
+/// Evicted by `font_bits` (zoom) or by exceeding [`MAX_ATLAS_GALLEYS`].
 struct MonoGalleyAtlas {
     font_bits: u32,
     galleys: std::collections::HashMap<(char, GlyphStyle), std::sync::Arc<egui::Galley>>,
@@ -534,11 +545,25 @@ impl MonoGalleyAtlas {
         }
     }
 
+    /// Called once per rebuild, never mid-insert: a rebuild that needs more than
+    /// the cap must still finish with every galley it asked for, so residency
+    /// peaks at cap + one screen of cells (bounded) rather than thrashing the
+    /// map several times inside a single frame.
     fn prepare(&mut self, font_bits: u32) {
         if self.font_bits != font_bits {
-            self.galleys.clear();
+            self.dump();
             self.font_bits = font_bits;
+            return;
         }
+        if self.galleys.len() > MAX_ATLAS_GALLEYS {
+            self.dump();
+        }
+    }
+
+    /// Replace rather than `clear()` — `clear` keeps the spike's capacity
+    /// allocated, and handing that memory back is the point.
+    fn dump(&mut self) {
+        self.galleys = std::collections::HashMap::new();
     }
 
     fn get_or_insert(
@@ -3218,6 +3243,7 @@ mod tests {
             cols: 4,
             rows: 1,
             font_bits,
+            colors: GridColors::default_warm(),
         };
         let _ = cache.get_or_rebuild(key0, |atlas| {
             let (items, bgs) = mono_paint_items(&plan, atlas, font_bits, &mut layout);
@@ -3226,14 +3252,10 @@ mod tests {
         assert_eq!(layout_call_count(), 2);
 
         reset_layout_call_count();
-        let key1 = MonoPaintKey {
-            off: 12,
-            ..key0
-        };
+        let key1 = MonoPaintKey { off: 12, ..key0 };
         let plan_scrolled = two_letter_plan(0, 1);
         let _ = cache.get_or_rebuild(key1, |atlas| {
-            let (items, bgs) =
-                mono_paint_items(&plan_scrolled, atlas, font_bits, &mut layout);
+            let (items, bgs) = mono_paint_items(&plan_scrolled, atlas, font_bits, &mut layout);
             (items, bgs, plan_scrolled.emoji_sites.clone())
         });
         assert_eq!(
@@ -3300,6 +3322,89 @@ mod tests {
         };
         let _ = mono_paint_items(&plan_b, &mut atlas, font_bits, &mut layout);
         assert_eq!(layout_call_count(), 1, "only the unseen 'c' is laid out");
+    }
+
+    /// `n` placements of one char, each with a distinct 24-bit fg — the key
+    /// shape truecolor image cells and gradients produce.
+    fn truecolor_plan(n: usize) -> crate::frame::PaintPlan {
+        let glyphs = (0..n)
+            .map(|i| crate::frame::GlyphPlacement {
+                row: 0,
+                col: i,
+                ch: 'a',
+                style: GlyphStyle {
+                    fg: egui::Color32::from_rgb(
+                        (i & 0xFF) as u8,
+                        ((i >> 8) & 0xFF) as u8,
+                        ((i >> 16) & 0xFF) as u8,
+                    ),
+                    ..default_style()
+                },
+                width_cells: 1,
+            })
+            .collect();
+        crate::frame::PaintPlan {
+            glyphs,
+            emoji_sites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mono_paint_atlas_dumps_past_cap() {
+        // Truecolor cells mint a near-unique key each, and before the cap only a
+        // zoom evicted — so the map grew for the life of the Session.
+        // Production change that must fail this: dropping the MAX_ATLAS_GALLEYS
+        // branch from `prepare`.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let one = dummy_galley_for_tests('a');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+
+        let over = MAX_ATLAS_GALLEYS + 64;
+        let (items, _) =
+            mono_paint_items(&truecolor_plan(over), &mut atlas, font_bits, &mut layout);
+        assert_eq!(items.len(), over, "a rebuild is never cut short by the cap");
+        assert_eq!(
+            atlas.galleys.len(),
+            over,
+            "the dump lands between rebuilds, not mid-insert"
+        );
+
+        reset_layout_call_count();
+        let (items, _) =
+            mono_paint_items(&two_letter_plan(0, 1), &mut atlas, font_bits, &mut layout);
+        assert_eq!(
+            atlas.galleys.len(),
+            2,
+            "an over-cap atlas is dumped before the next rebuild"
+        );
+        assert_eq!(items.len(), 2, "paint still produces items after the dump");
+        assert_eq!(layout_call_count(), 2, "dumped glyphs reshape on demand");
+    }
+
+    #[test]
+    fn mono_paint_atlas_holds_at_the_cap() {
+        // The cap must not fire on ordinary use — sitting exactly at it still hits.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let one = dummy_galley_for_tests('a');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+
+        let plan = truecolor_plan(MAX_ATLAS_GALLEYS);
+        let _ = mono_paint_items(&plan, &mut atlas, font_bits, &mut layout);
+        assert_eq!(atlas.galleys.len(), MAX_ATLAS_GALLEYS);
+
+        reset_layout_call_count();
+        let _ = mono_paint_items(&plan, &mut atlas, font_bits, &mut layout);
+        assert_eq!(layout_call_count(), 0, "at the cap the atlas still hits");
     }
 
     #[test]
