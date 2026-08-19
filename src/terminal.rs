@@ -3407,6 +3407,88 @@ mod tests {
         assert_eq!(layout_call_count(), 0, "at the cap the atlas still hits");
     }
 
+    /// End-to-end scroll proof on a REAL grid: a real `Term` fed through the
+    /// real VT parser, walked by the real `plan_paint`, keyed exactly as `show`
+    /// keys it (`terminal.rs` — `off: grid().display_offset()`). The atlas tests
+    /// above drive synthetic plans; this one pins the claim the whole branch
+    /// exists for — a genuine wheel notch changes `display_offset`, which MUST
+    /// miss the item cache and MUST still reshape nothing.
+    ///
+    /// Every line carries the same alphabet, so "the scrolled viewport needs
+    /// only glyphs the first frame already shaped" is true by construction
+    /// rather than by luck of which line numbers happen to be on screen.
+    #[test]
+    fn real_grid_scroll_repaints_without_reshaping() {
+        let (cols, rows) = (40usize, 24usize);
+        let mut feed = String::new();
+        for i in 1..=60 {
+            feed.push_str(&format!("0123456789 abcdefghij line {i}\r\n"));
+        }
+        let mut term = term_with(feed.as_bytes(), cols, rows);
+        let metrics = crate::geom::CellMetrics::new(
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cols as f32 * 8.0, rows as f32 * 16.0),
+            ),
+            8.0,
+            16.0,
+            cols,
+            rows,
+        );
+        let gc = GridColors::default_warm();
+        let font_bits = 14.0f32.to_bits();
+        let one = dummy_galley_for_tests('x');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+        let mut cache = MonoPaintCache::empty();
+
+        // Frame 1 — pinned to the bottom, as a live session sits.
+        assert_eq!(term.grid().display_offset(), 0, "setup: pinned to bottom");
+        reset_layout_call_count();
+        let key0 = MonoPaintKey {
+            content_gen: 1,
+            off: term.grid().display_offset(),
+            cols,
+            rows,
+            font_bits,
+            colors: gc,
+        };
+        let plan0 = crate::frame::plan_paint(term.grid(), &metrics, &gc);
+        let (items0, _, _) = cache.get_or_rebuild(key0, |atlas| {
+            let (i, b) = mono_paint_items(&plan0, atlas, font_bits, &mut layout);
+            (i, b, plan0.emoji_sites.clone())
+        });
+        assert!(
+            !items0.is_empty(),
+            "setup: the first frame painted something"
+        );
+        assert!(layout_call_count() > 0, "first paint shapes the alphabet");
+
+        // The wheel notch itself — real scroll through alacritty, not a fake key.
+        term.scroll_display(Scroll::Delta(12));
+        let off = term.grid().display_offset();
+        assert_eq!(off, 12, "setup: the grid really scrolled into history");
+
+        // Frame 2 — the key MUST differ (that is the cache miss this branch is
+        // about), yet nothing may reshape.
+        reset_layout_call_count();
+        let key1 = MonoPaintKey { off, ..key0 };
+        assert!(key1 != key0, "scroll must miss the item cache");
+        let plan1 = crate::frame::plan_paint(term.grid(), &metrics, &gc);
+        let (items1, _, _) = cache.get_or_rebuild(key1, |atlas| {
+            let (i, b) = mono_paint_items(&plan1, atlas, font_bits, &mut layout);
+            (i, b, plan1.emoji_sites.clone())
+        });
+        assert!(!items1.is_empty(), "the scrolled frame still paints");
+        assert_eq!(
+            layout_call_count(),
+            0,
+            "scrolling a real grid must reshape nothing"
+        );
+    }
+
     #[test]
     fn mono_paint_cache_hit_tracks_pane_origin() {
         reset_layout_call_count();
