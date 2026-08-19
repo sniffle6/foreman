@@ -35,6 +35,21 @@ terminal in it, and your own session mid-command (incident 2026-07-09).
 chain from the calling shell and refuses to kill any process that turns out to
 be one of its own ancestors.
 
+**4. A shared target dir serves the wrong worktree's binary.** Point two
+worktrees at one `--target-dir` and cargo can run the *other* one's build. This
+is not theoretical — it happened while writing this script. Worktree A (a perf
+branch) was built and tested into the shared dir; then `cargo test` in worktree
+B, whose source contains no such code, reported `real_grid_scroll_…` passing and
+a test count belonging to A. A green suite was read as verification of B while
+describing A entirely.
+
+That failure is near-silent: no error, no warning, just a plausible pass. So the
+script keys the target dir per source dir (`target\agent\build\<leaf>-<hash>`)
+and pays the extra dependency build. If you invoke cargo by hand across
+worktrees, give each one its own `--target-dir`, and treat any test count that
+does not match the source in front of you as a stale binary until proven
+otherwise.
+
 ## Using it
 
 | Flag | What it does |
@@ -69,9 +84,10 @@ input, layout, settings — tests fine. Dispatch and headless snapshotting do no
 **The sandbox lives under `target\`,** so `cargo clean` deletes it. That is
 usually what you want, but don't park anything you care about in there.
 
-**Worktrees share one dep cache.** `-Path` changes what gets compiled, never
-where output lands — that is always the *repo's* `target\agent`. So building
-five worktrees costs one dependency build, not five.
+**Each source dir gets its own target dir,** under
+`target\agent\build\<leaf>-<hash>`. Sharing one target dir across worktrees is
+tempting — it would save a dependency build per worktree — but see hazard 4: it
+buys you a build cache and a way to read someone else's test results.
 
 **It does not check whether you are inside foreman.** It doesn't need to: it
 never kills by name, and the ancestor guard covers the case where the host

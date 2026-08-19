@@ -29,8 +29,10 @@ from a terminal still talk to THAT instance, not the dev one. GUI behaviour
 
 .PARAMETER Path
 Source dir to build — a git worktree, say. Defaults to the repo this script
-lives in. Build output always lands in the REPO's target\agent, so worktrees
-share one compiled dep cache instead of each paying a cold build.
+lives in. Output lands under the REPO's target\agent\build\<source-key>, one
+target dir per source dir. Sharing a single target dir across worktrees would
+save a dep build but lets cargo hand you the wrong worktree's binary, which is
+very hard to notice: you read a test result that came from other source.
 
 .PARAMETER Debug
 Build the debug profile. Default is release: debug Rust is slow enough to
@@ -84,11 +86,33 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot     = Split-Path $PSScriptRoot
 $SrcDir       = if ($Path) { (Resolve-Path $Path).Path } else { $RepoRoot }
 $BuildProfile = if ($Debug) { 'debug' } else { 'release' }
-$TargetDir    = Join-Path $RepoRoot 'target\agent'
+$DevRoot      = Join-Path $RepoRoot 'target\agent'
+
+# One target dir PER SOURCE DIR. Pointing several worktrees at a single shared
+# target dir looks like a free dep cache, but cargo can then hand you the OTHER
+# worktree's binary: build worktree A, run `cargo test` in worktree B against the
+# same --target-dir, and B's run can execute A's tests. Observed here - a test
+# that exists in no B source file reported a pass. Keyed by leaf name plus a hash
+# of the full path, so same-named dirs in different places stay distinct.
+#
+# MD5 of the path, NOT String.GetHashCode(): .NET randomizes string hashing per
+# process, so GetHashCode would hand out a different directory on every run —
+# a cold dependency build each time and a new leaked target dir each time.
+$md5          = [System.Security.Cryptography.MD5]::Create()
+$SrcHash      = [BitConverter]::ToString(
+                    $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($SrcDir.ToLowerInvariant()))
+                ).Replace('-', '').Substring(0, 8).ToLowerInvariant()
+$md5.Dispose()
+$SrcKey       = "{0}-{1}" -f (Split-Path $SrcDir -Leaf), $SrcHash
+$TargetDir    = Join-Path $DevRoot "build\$SrcKey"
 $Exe          = Join-Path $TargetDir "$BuildProfile\foreman.exe"
-$Sandbox   = Join-Path $TargetDir 'appdata'
-$ConfigDir = Join-Path $Sandbox 'foreman'
-$PidFile   = Join-Path $Sandbox 'dev-pids.txt'
+
+# Sandbox + pid file are deliberately shared across source dirs: one dev config
+# to carry settings between builds, and -Kill/-List match on $DevRoot so they
+# still see every dev instance regardless of which source built it.
+$Sandbox      = Join-Path $DevRoot 'appdata'
+$ConfigDir    = Join-Path $Sandbox 'foreman'
+$PidFile      = Join-Path $Sandbox 'dev-pids.txt'
 
 function Get-AncestorIds {
     # Walk up from this process so -Kill can never take out its own host.
@@ -106,7 +130,7 @@ function Get-AncestorIds {
 function Get-DevInstances {
     # Match on exe path, NEVER on name.
     Get-Process foreman -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and $_.Path -like "$TargetDir\*" }
+        Where-Object { $_.Path -and $_.Path -like "$DevRoot\*" }
 }
 
 function Stop-DevInstances {
@@ -127,7 +151,7 @@ function Stop-DevInstances {
 if ($List) {
     Get-Process foreman -ErrorAction SilentlyContinue |
         Select-Object Id, @{n = 'Kind'; e = {
-            if ($_.Path -like "$TargetDir\*") { 'dev (this script)' }
+            if ($_.Path -like "$DevRoot\*") { 'dev (this script)' }
             elseif ($_.Path -like "$RepoRoot\target\*") { 'repo target build' }
             else { 'installed / other' } } }, Path |
         Format-Table -AutoSize
