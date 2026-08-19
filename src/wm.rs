@@ -79,7 +79,7 @@ const TITLE_H: f32 = 26.0;
 // it lives in `Keymap::leader` (default `Ctrl+b`), loaded from
 // `%APPDATA%\foreman\keybindings.json` and overridable per user.
 
-const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
+pub(crate) const RESIZE_BAND: f32 = 6.0; // thickness of the invisible edge/corner resize hit-zones
 const MIN_W: f32 = 240.0; // smallest a floating window may be dragged to
 const MIN_H: f32 = 140.0;
 

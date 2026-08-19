@@ -95,17 +95,104 @@ impl CellMetrics {
     }
 }
 
+/// Painted width of the scrollback thumb at rest.
+const THUMB_W: f32 = 4.0;
+/// Painted width while the pointer is in the track band, or during a drag — so
+/// it reads as a control you can take hold of rather than a position readout.
+const THUMB_HOT_W: f32 = 8.0;
+/// How far the thumb keeps clear of the pane's right edge.
+///
+/// The window manager puts an invisible resize hit-zone [`crate::wm::RESIZE_BAND`]
+/// wide along every edge, and registers it with `ui.interact` AFTER the content,
+/// so it wins the hover. A thumb drawn flush to the edge therefore lives inside
+/// that zone: hovering it hovers the resize handle instead, the pane's own
+/// response stops reporting `hovered()`, and the thumb hides exactly when you
+/// reach for it. Deriving the inset from the band keeps the two from drifting.
+const THUMB_EDGE_INSET: f32 = crate::wm::RESIZE_BAND;
+/// Grab width. A 4px target is not hittable with a mouse, so the interactive
+/// zone reaches further left than the bar the user sees.
+const THUMB_HIT_W: f32 = 14.0;
+/// Floor on thumb height so a deep buffer still leaves something to grab.
+const THUMB_MIN_H: f32 = 16.0;
+
+/// Thumb height and the distance its top can travel down the track.
+///
+/// Travel is `track_h - thumb_h`, NOT the raw track height: once
+/// [`THUMB_MIN_H`] kicks in on a deep buffer the thumb is taller than its
+/// proportional share, so mapping over the full track would put the bottom of
+/// the range past the end of the track and leave the last stretch of history
+/// unreachable by dragging.
+fn thumb_metrics(track: egui::Rect, rows: usize, hist: usize) -> (f32, f32) {
+    let total = (rows + hist).max(1);
+    let track_h = track.height();
+    let thumb_h = (track_h * rows as f32 / total as f32)
+        .max(THUMB_MIN_H)
+        .min(track_h);
+    (thumb_h, (track_h - thumb_h).max(0.0))
+}
+
 /// Scrollback thumb geometry: where the right-edge thumb sits for a viewport
 /// of `rows` lines over `hist` lines of history, scrolled back `off` lines.
 /// Pure math only — whether to SHOW the thumb stays with the caller.
+///
+/// `off == hist` (fully scrolled back) puts the top of the thumb at the top of
+/// the track; `off == 0` (live prompt) puts its bottom at the bottom.
+/// [`offset_for_thumb_top`] is the exact inverse.
 pub(crate) fn thumb_rect(track: egui::Rect, rows: usize, hist: usize, off: i32) -> egui::Rect {
-    let total = rows + hist;
-    let track_h = track.height();
-    let thumb_h = (track_h * rows as f32 / total as f32).max(16.0);
-    let top_frac = (hist as i32 - off).max(0) as f32 / total as f32;
-    let thumb_y = (track.min.y + track_h * top_frac).min(track.max.y - thumb_h);
-    let w = 4.0;
-    egui::Rect::from_min_size(egui::pos2(track.max.x - w, thumb_y), egui::vec2(w, thumb_h))
+    let (thumb_h, travel) = thumb_metrics(track, rows, hist);
+    let back = (hist as i32 - off).clamp(0, hist as i32) as f32;
+    let frac = if hist == 0 { 0.0 } else { back / hist as f32 };
+    let thumb_y = track.min.y + travel * frac;
+    let right = track.max.x - THUMB_EDGE_INSET;
+    egui::Rect::from_min_size(
+        egui::pos2(right - THUMB_W, thumb_y),
+        egui::vec2(THUMB_W, thumb_h),
+    )
+}
+
+/// The bar as painted while hovered or dragged: same rows and same right edge,
+/// grown leftward. Pure so the widen is pinned without a GUI.
+pub(crate) fn thumb_hot_rect(bar: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HOT_W, bar.min.y), bar.max)
+}
+
+/// The thumb's grab zone: same rows as the painted bar, but wide enough to hit.
+pub(crate) fn thumb_hit_rect(track: egui::Rect, rows: usize, hist: usize, off: i32) -> egui::Rect {
+    let bar = thumb_rect(track, rows, hist, off);
+    egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HIT_W, bar.min.y), bar.max)
+}
+
+/// The full-height band on the right edge that counts as "the scrollbar" for
+/// hit-testing — same width as [`thumb_hit_rect`], spanning the whole track.
+/// A press in here but outside the thumb is a track click.
+pub(crate) fn thumb_track_rect(track: egui::Rect) -> egui::Rect {
+    let right = track.max.x - THUMB_EDGE_INSET;
+    egui::Rect::from_min_max(
+        egui::pos2(right - THUMB_HIT_W, track.min.y),
+        egui::pos2(right, track.max.y),
+    )
+}
+
+/// Inverse of [`thumb_rect`]: the `display_offset` that would place the thumb's
+/// top at `thumb_top_y`. Clamped to `0..=hist`, so dragging past either end of
+/// the track pins to the live bottom or the oldest scrollback rather than
+/// running off. Pure math — the caller decides whether a drag is in progress.
+pub(crate) fn offset_for_thumb_top(
+    track: egui::Rect,
+    rows: usize,
+    hist: usize,
+    thumb_top_y: f32,
+) -> i32 {
+    if hist == 0 {
+        return 0;
+    }
+    let (_, travel) = thumb_metrics(track, rows, hist);
+    if travel <= 0.0 {
+        return 0;
+    }
+    let frac = ((thumb_top_y - track.min.y) / travel).clamp(0.0, 1.0);
+    let back = (frac * hist as f32).round() as i32;
+    (hist as i32 - back).clamp(0, hist as i32)
 }
 
 /// The caret's pixel rect within its cell: Beam (insert mode) and Underline
@@ -194,7 +281,10 @@ mod tests {
         // 40 viewport rows over 40 history rows: thumb is half the track.
         let r = thumb_rect(track, 40, 40, 0);
         assert_eq!(r.height(), 200.0);
-        assert_eq!(r.max.x, 200.0);
+        // Right-aligned to the edge MINUS the resize band, not to the raw edge:
+        // flush against it the wm's resize hit-zone eats the hover. See
+        // thumb_and_its_hit_zone_clear_the_resize_band.
+        assert_eq!(r.max.x, 200.0 - crate::wm::RESIZE_BAND);
         assert_eq!(r.width(), 4.0);
         // off == 0 (live prompt) → thumb sits at the bottom.
         assert_eq!(r.max.y, 400.0);
@@ -214,6 +304,106 @@ mod tests {
         assert_eq!(r.height(), 16.0);
         // and the min-height thumb still clamps inside the track
         assert!(r.max.y <= 400.0);
+    }
+
+    #[test]
+    fn thumb_hit_rect_widens_the_grab_zone_only() {
+        // 4px is not grabbable with a mouse. The hit zone widens leftward; the
+        // painted bar (thumb_rect) is untouched, and both hug the same edge.
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        let bar = thumb_rect(track, 40, 40, 10);
+        let hit = thumb_hit_rect(track, 40, 40, 10);
+        assert_eq!((hit.min.y, hit.max.y), (bar.min.y, bar.max.y));
+        assert_eq!(hit.max.x, bar.max.x, "same edge");
+        assert!(hit.width() > bar.width(), "grab zone is wider than the bar");
+        assert!(
+            hit.contains(bar.center()),
+            "the bar sits inside its own hit zone"
+        );
+    }
+
+    #[test]
+    fn thumb_and_its_hit_zone_clear_the_resize_band() {
+        // The wm registers a RESIZE_BAND-wide edge hit-zone AFTER the content,
+        // so it wins the hover. Anything of ours inside it is unhoverable and
+        // ungrabbable: the thumb hid the instant you reached for it. Production
+        // change that must fail this: dropping THUMB_EDGE_INSET back to 0.
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        let safe = track.max.x - crate::wm::RESIZE_BAND;
+        for off in [0i32, 20, 40] {
+            let bar = thumb_rect(track, 40, 40, off);
+            let hit = thumb_hit_rect(track, 40, 40, off);
+            assert!(bar.max.x <= safe, "bar inside the resize band (off={off})");
+            assert!(
+                hit.max.x <= safe,
+                "grab zone inside the resize band (off={off})"
+            );
+            assert!(thumb_hot_rect(bar).max.x <= safe, "hot bar inside the band");
+        }
+        assert!(thumb_track_rect(track).max.x <= safe, "track band");
+    }
+
+    #[test]
+    fn thumb_hot_rect_grows_leftward_from_the_same_edge() {
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        let bar = thumb_rect(track, 40, 40, 10);
+        let hot = thumb_hot_rect(bar);
+        assert_eq!((hot.min.y, hot.max.y), (bar.min.y, bar.max.y), "same rows");
+        assert_eq!(hot.max.x, bar.max.x, "same right edge - it grows inward");
+        assert!(hot.width() > bar.width());
+    }
+
+    #[test]
+    fn thumb_track_band_covers_the_thumb_at_every_offset() {
+        // A track click is "in the band, outside the thumb", so the band must
+        // contain the thumb wherever it sits or the two tests disagree.
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        let band = thumb_track_rect(track);
+        assert_eq!((band.min.y, band.max.y), (track.min.y, track.max.y));
+        for off in [0i32, 20, 40] {
+            let hit = thumb_hit_rect(track, 40, 40, off);
+            assert!(band.contains(hit.center()), "off={off}");
+            assert_eq!(band.min.x, hit.min.x, "same width as the grab zone");
+        }
+    }
+
+    #[test]
+    fn thumb_offset_round_trips_through_thumb_rect() {
+        // Dragging the thumb to where it already is must not move the view.
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        for (rows, hist) in [(40usize, 40usize), (24, 500), (10, 10_000)] {
+            for off in [0i32, 1, hist as i32 / 3, hist as i32 - 1, hist as i32] {
+                let y = thumb_rect(track, rows, hist, off).min.y;
+                assert_eq!(
+                    offset_for_thumb_top(track, rows, hist, y),
+                    off,
+                    "rows={rows} hist={hist} off={off}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thumb_offset_clamps_outside_the_track() {
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        // Dragged above the track = fully scrolled back; below = live bottom.
+        assert_eq!(offset_for_thumb_top(track, 40, 40, -500.0), 40);
+        assert_eq!(offset_for_thumb_top(track, 40, 40, 9999.0), 0);
+    }
+
+    #[test]
+    fn thumb_drag_reaches_both_ends_with_a_min_height_thumb() {
+        // The 16px floor shortens the thumb's travel. Mapping the drag over the
+        // raw track height instead of the travel range leaves the last several
+        // hundred lines of a deep buffer unreachable by dragging.
+        let track = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 400.0));
+        let (rows, hist) = (10usize, 10_000usize);
+        let bottom = thumb_rect(track, rows, hist, 0).min.y;
+        assert_eq!(offset_for_thumb_top(track, rows, hist, bottom), 0);
+        assert_eq!(
+            offset_for_thumb_top(track, rows, hist, track.min.y),
+            hist as i32
+        );
     }
 
     #[test]

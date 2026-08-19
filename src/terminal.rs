@@ -687,6 +687,12 @@ pub struct Session {
     // Memoized grid-locked mono paint + the key it was built for. On a key hit
     // show() re-blits Arc clones (0 layout_*). Invalidated by any key change.
     mono_paint: Option<MonoPaintCache>,
+    /// Live scrollback-thumb drag: pixels from the pointer to the thumb's TOP at
+    /// grab time. Kept so grabbing the middle of the thumb doesn't snap the view
+    /// to put the thumb's top under the cursor. `None` when not dragging — which
+    /// is also what tells `show` to leave the thumb painted while the pointer
+    /// wanders off the pane mid-drag.
+    thumb_drag: Option<f32>,
     /// Color-emoji rasterizer (DirectWrite on Windows, null elsewhere). Fail-open:
     /// `None` from `color_glyph` leaves the mono glyph alone.
     emoji_raster: Box<dyn crate::emoji_raster::EmojiRaster>,
@@ -1056,6 +1062,7 @@ impl Session {
             output_gen: 0,
             content_gen: 0,
             mono_paint: None,
+            thumb_drag: None,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
             emoji_textures: std::collections::HashMap::new(),
             graphics: crate::graphics::Graphics::default(),
@@ -1943,7 +1950,57 @@ impl Session {
             let pointer_over_bar = search_bar.is_some_and(|b| {
                 ui.input(|i| i.pointer.interact_pos().is_some_and(|p| b.contains(p)))
             });
-            if !suppress_local && !pointer_over_bar {
+            // Scrollback thumb drag. Claimed BEFORE local selection, which
+            // otherwise swallows every primary drag on the pane. Gated on
+            // `!suppress_local` so an app that owns the mouse still wins — the
+            // same rule the rest of the pane follows, and alt-screen TUIs have
+            // no history so no thumb exists there anyway.
+            let hist = self.term.grid().history_size();
+            if !suppress_local && !pointer_over_bar && hist > 0 {
+                let track = metrics.rect();
+                let rows = metrics.rows();
+                let off = self.term.grid().display_offset() as i32;
+                let band = crate::geom::thumb_track_rect(track);
+
+                // Engage on the PRESS, not on `drag_started` — that only fires
+                // once the pointer has moved past a threshold, so a plain click
+                // on the track would sit there doing nothing until you jiggled.
+                if ui.input(|i| i.pointer.primary_pressed())
+                    && let Some(p) = resp.interact_pointer_pos()
+                    && band.contains(p)
+                {
+                    let hit = crate::geom::thumb_hit_rect(track, rows, hist, off);
+                    // On the thumb: keep the grab point. On bare track: centre
+                    // the thumb under the cursor, then behave as if grabbed
+                    // there, so click-then-drag is one continuous gesture.
+                    self.thumb_drag = Some(if hit.contains(p) {
+                        p.y - hit.min.y
+                    } else {
+                        hit.height() / 2.0
+                    });
+                }
+
+                if let Some(anchor) = self.thumb_drag
+                    && let Some(p) = resp.interact_pointer_pos()
+                {
+                    let want = crate::geom::offset_for_thumb_top(track, rows, hist, p.y - anchor);
+                    if want != off {
+                        self.term.scroll_display(Scroll::Delta(want - off));
+                    }
+                }
+            }
+            // Read BEFORE releasing the drag: the frame the button comes up is
+            // still the thumb's, or `selection_finished` below fires on it and
+            // ends a selection the user never started.
+            let thumb_dragging = self.thumb_drag.is_some();
+            // Release on the physical button, not on `is_pointer_button_down_on`
+            // — the pointer routinely leaves the pane mid-drag, and a thumb drag
+            // has to survive that.
+            if thumb_dragging && !ui.input(|i| i.pointer.primary_down()) {
+                self.thumb_drag = None;
+            }
+
+            if !suppress_local && !pointer_over_bar && !thumb_dragging {
                 // Local selection — primary button only (middle/right never start it).
                 let primary = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
                     || resp.dragged_by(egui::PointerButton::Primary)
@@ -2422,8 +2479,23 @@ impl Session {
         // scrollback indicator: thin right-edge thumb, shown only when there is
         // history and the user is scrolled back or hovering the pane.
         if let Some(r) = overlays.thumb
-            && (overlays.scrolled_back || resp.hovered())
+            && (overlays.scrolled_back || resp.hovered() || self.thumb_drag.is_some())
         {
+            // Widen while the pointer is in the track band (or mid-drag) so it
+            // reads as grabbable. Hover is tested against the band rather than
+            // the bar so the thumb fattens as you approach it, not only once
+            // you are dead on the 4px line.
+            let hot = self.thumb_drag.is_some()
+                || ui.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .is_some_and(|p| crate::geom::thumb_track_rect(metrics.rect()).contains(p))
+                });
+            let r = if hot {
+                crate::geom::thumb_hot_rect(r)
+            } else {
+                r
+            };
             painter.rect_filled(r, egui::CornerRadius::same(2), th.scroll_thumb);
         }
 
