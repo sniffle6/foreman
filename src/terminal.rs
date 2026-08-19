@@ -432,14 +432,17 @@ struct MonoBg {
 
 /// Memoized per-placement galleys + bg rects + emoji stamp sites for a pane.
 /// On key hit, show() re-blits only (0 layout_*). Rebuild skips blank galleys
-/// and dedupes by (char, style). Absolute pixel positions are never cached.
-/// `emoji_sites` ride the same mono key so cache hits still have stamp targets
-/// without re-running `plan_paint` or busting mono memo when the atlas fills.
+/// and dedupes via [`MonoGalleyAtlas`], which survives scroll (`off` in the
+/// key) so a miss only layouts unseen `(char, style)` pairs. Absolute pixel
+/// positions are never cached. `emoji_sites` ride the same mono key so cache
+/// hits still have stamp targets without re-running `plan_paint` or busting
+/// mono memo when the emoji atlas fills.
 struct MonoPaintCache {
     key: MonoPaintKey,
     items: std::sync::Arc<Vec<MonoGlyph>>,
     bgs: std::sync::Arc<Vec<MonoBg>>,
     emoji_sites: std::sync::Arc<Vec<crate::frame::EmojiSite>>,
+    atlas: MonoGalleyAtlas,
 }
 
 impl MonoPaintCache {
@@ -457,15 +460,19 @@ impl MonoPaintCache {
             items: std::sync::Arc::new(Vec::new()),
             bgs: std::sync::Arc::new(Vec::new()),
             emoji_sites: std::sync::Arc::new(Vec::new()),
+            atlas: MonoGalleyAtlas::new(),
         }
     }
 
     /// On key match: return cached items/bgs/sites (rebuild not called — 0 layouts).
-    /// On miss: call `rebuild`, store, return. Production and tests share this path.
+    /// On miss: call `rebuild` with the session-lived galley atlas, store, return.
+    /// Production and tests share this path.
     fn get_or_rebuild(
         &mut self,
         key: MonoPaintKey,
-        rebuild: impl FnOnce() -> (Vec<MonoGlyph>, Vec<MonoBg>, Vec<crate::frame::EmojiSite>),
+        rebuild: impl FnOnce(
+            &mut MonoGalleyAtlas,
+        ) -> (Vec<MonoGlyph>, Vec<MonoBg>, Vec<crate::frame::EmojiSite>),
     ) -> (
         std::sync::Arc<Vec<MonoGlyph>>,
         std::sync::Arc<Vec<MonoBg>>,
@@ -478,7 +485,7 @@ impl MonoPaintCache {
                 self.emoji_sites.clone(),
             );
         }
-        let (items, bgs, emoji_sites) = rebuild();
+        let (items, bgs, emoji_sites) = rebuild(&mut self.atlas);
         self.key = key;
         self.items = std::sync::Arc::new(items);
         self.bgs = std::sync::Arc::new(bgs);
@@ -511,20 +518,85 @@ fn emoji_stamp_fit_rect(span: egui::Rect, tex_w: f32, tex_h: f32) -> egui::Rect 
     egui::Rect::from_min_size(min, egui::vec2(w, h))
 }
 
+/// Entries the atlas may carry into a rebuild before it is dumped wholesale.
+///
+/// `GlyphStyle` holds *resolved* 24-bit fg/bg, so truecolor output (image cells,
+/// gradients, a theme switch) mints a near-unique key per cell and nothing but a
+/// zoom ever evicted. Normal use sits around 2k entries and never trips this.
+/// Dumping beats an LRU here: tracking recency would cost bookkeeping on every
+/// lookup in the exact hot path this atlas exists to speed up, and the worst case
+/// of a dump — reshape the visible screen once — is what this code did on *every*
+/// scroll before the atlas existed.
+const MAX_ATLAS_GALLEYS: usize = 8192;
+
+/// Session-lived `(char, GlyphStyle)` → galley map. Survives `display_offset`
+/// changes so scroll rebuilds hash-lookup instead of reshaping the same alphabet.
+/// Evicted by `font_bits` (zoom) or by exceeding [`MAX_ATLAS_GALLEYS`].
+struct MonoGalleyAtlas {
+    font_bits: u32,
+    galleys: std::collections::HashMap<(char, GlyphStyle), std::sync::Arc<egui::Galley>>,
+}
+
+impl MonoGalleyAtlas {
+    fn new() -> Self {
+        Self {
+            font_bits: 0,
+            galleys: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Called once per rebuild, never mid-insert: a rebuild that needs more than
+    /// the cap must still finish with every galley it asked for, so residency
+    /// peaks at cap + one screen of cells (bounded) rather than thrashing the
+    /// map several times inside a single frame.
+    fn prepare(&mut self, font_bits: u32) {
+        if self.font_bits != font_bits {
+            self.dump();
+            self.font_bits = font_bits;
+            return;
+        }
+        if self.galleys.len() > MAX_ATLAS_GALLEYS {
+            self.dump();
+        }
+    }
+
+    /// Replace rather than `clear()` — `clear` keeps the spike's capacity
+    /// allocated, and handing that memory back is the point.
+    fn dump(&mut self) {
+        self.galleys = std::collections::HashMap::new();
+    }
+
+    fn get_or_insert(
+        &mut self,
+        ch: char,
+        style: GlyphStyle,
+        layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
+    ) -> std::sync::Arc<egui::Galley> {
+        if let Some(g) = self.galleys.get(&(ch, style)) {
+            return g.clone();
+        }
+        let g = layout(ch, style);
+        self.galleys.insert((ch, style), g.clone());
+        g
+    }
+}
+
 /// Rebuild content-only mono galleys + SGR bg cells from a paint plan.
 ///
-/// Calls the injected `layout` once per **distinct** `(char, GlyphStyle)` —
-/// callers should invoke [`note_layout_call`] inside that closure when doing a
-/// real `layout_no_wrap` / `layout_job`. Skips space/`'\0'` for galleys (blank
-/// cells); non-default `style.bg` is collected for every cell including spaces
-/// so inverse/colored empties still paint. Positions are grid identity only —
-/// blit uses live metrics every frame (`cell_rect` for glyphs, `span_rect` for bgs).
+/// Calls the injected `layout` once per **distinct** `(char, GlyphStyle)`
+/// not already in `atlas` — callers should invoke [`note_layout_call`] inside
+/// that closure when doing a real `layout_no_wrap` / `layout_job`. Skips
+/// space/`'\0'` for galleys (blank cells); non-default `style.bg` is collected
+/// for every cell including spaces so inverse/colored empties still paint.
+/// Positions are grid identity only — blit uses live metrics every frame
+/// (`cell_rect` for glyphs, `span_rect` for bgs).
 fn mono_paint_items(
     plan: &crate::frame::PaintPlan,
+    atlas: &mut MonoGalleyAtlas,
+    font_bits: u32,
     layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
 ) -> (Vec<MonoGlyph>, Vec<MonoBg>) {
-    use std::collections::HashMap;
-    let mut dedupe: HashMap<(char, GlyphStyle), std::sync::Arc<egui::Galley>> = HashMap::new();
+    atlas.prepare(font_bits);
     let mut items = Vec::new();
     let mut bgs = Vec::new();
     for g in &plan.glyphs {
@@ -543,14 +615,7 @@ fn mono_paint_items(
         // suppresses their mono blit only when a color stamp actually resolved
         // (`stamped.contains`). Dropping them here painted NOTHING whenever the
         // raster failed (NullEmojiRaster) — tofu is the fail-open, not blank.
-        let galley = match dedupe.get(&(g.ch, g.style)) {
-            Some(arc) => arc.clone(),
-            None => {
-                let arc = layout(g.ch, g.style);
-                dedupe.insert((g.ch, g.style), arc.clone());
-                arc
-            }
-        };
+        let galley = atlas.get_or_insert(g.ch, g.style, layout);
         items.push(MonoGlyph {
             row: g.row,
             col: g.col,
@@ -566,7 +631,8 @@ fn mono_paint_items_for_test(
     plan: &crate::frame::PaintPlan,
     layout: &mut dyn FnMut(char, GlyphStyle) -> std::sync::Arc<egui::Galley>,
 ) -> (Vec<MonoGlyph>, Vec<MonoBg>) {
-    mono_paint_items(plan, layout)
+    let mut atlas = MonoGalleyAtlas::new();
+    mono_paint_items(plan, &mut atlas, 0, layout)
 }
 
 pub struct Session {
@@ -2078,9 +2144,10 @@ impl Session {
 
         // Grid-locked mono paint — Strategy P: one galley per non-blank placement,
         // blit pos from live cell_rect (not free-flow advances; not cached Pos2).
-        // Rebuilt only when the content/scroll/dims/font key changes; cache hit
-        // re-blits only (0 layout_*). Blank galleys skipped; non-default SGR bg
-        // rects cached for all cells incl. spaces. Galleys deduped by (char, style).
+        // Item list rebuilt when content/scroll/dims/font change; cache hit
+        // re-blits only (0 layout_*). Scroll misses reuse MonoGalleyAtlas
+        // (0 layout_* if the alphabet is already shaped). Blank galleys skipped;
+        // non-default SGR bg rects cached for all cells incl. spaces.
         // Selection + caret are overlays (below), so they never invalidate this.
         let key = MonoPaintKey {
             content_gen: self.content_gen,
@@ -2100,7 +2167,7 @@ impl Session {
         };
         let (items, bgs, emoji_sites) = {
             let cache = self.mono_paint.get_or_insert_with(MonoPaintCache::empty);
-            cache.get_or_rebuild(key, || {
+            cache.get_or_rebuild(key, |atlas| {
                 let plan = plan.expect("rebuild closure only runs on cache miss");
                 let mut layout = |ch: char, st: GlyphStyle| {
                     note_layout_call();
@@ -2131,7 +2198,7 @@ impl Session {
                     );
                     painter.layout_job(job)
                 };
-                let (items, bgs) = mono_paint_items(&plan, &mut layout);
+                let (items, bgs) = mono_paint_items(&plan, atlas, key.font_bits, &mut layout);
                 (items, bgs, plan.emoji_sites)
             })
         };
@@ -3091,18 +3158,335 @@ mod tests {
             note_layout_call();
             dummy_galley_for_tests('x')
         };
-        let _ = cache.get_or_rebuild(key, || {
-            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+        let _ = cache.get_or_rebuild(key, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan, atlas, key.font_bits, &mut layout);
             (items, bgs, plan.emoji_sites.clone())
         });
         let first = layout_call_count();
         assert!(first > 0);
         reset_layout_call_count();
-        let _ = cache.get_or_rebuild(key, || {
-            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+        let _ = cache.get_or_rebuild(key, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan, atlas, key.font_bits, &mut layout);
             (items, bgs, plan.emoji_sites.clone())
         });
         assert_eq!(layout_call_count(), 0, "cache hit must not layout");
+    }
+
+    fn two_letter_plan(col_a: usize, col_b: usize) -> crate::frame::PaintPlan {
+        let style = default_style();
+        crate::frame::PaintPlan {
+            glyphs: vec![
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: col_a,
+                    ch: 'a',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: col_b,
+                    ch: 'b',
+                    style,
+                    width_cells: 1,
+                },
+            ],
+            emoji_sites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mono_paint_scroll_offset_reuses_galleys() {
+        // Same charset, different cell identity (display_offset change).
+        // Production change that must fail this: throwing the (char, style)
+        // map away on every MonoPaintKey miss.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let mut layout = |ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let plan_a = two_letter_plan(0, 1);
+        let (items_a, _) = mono_paint_items(&plan_a, &mut atlas, font_bits, &mut layout);
+        assert_eq!(items_a.len(), 2);
+        assert_eq!(layout_call_count(), 2, "first view lays out a and b");
+
+        reset_layout_call_count();
+        let plan_b = two_letter_plan(2, 3);
+        let (items_b, _) = mono_paint_items(&plan_b, &mut atlas, font_bits, &mut layout);
+        assert_eq!(items_b.len(), 2);
+        assert_eq!((items_b[0].col, items_b[1].col), (2, 3));
+        assert_eq!(
+            layout_call_count(),
+            0,
+            "scroll with the same alphabet must not layout"
+        );
+    }
+
+    #[test]
+    fn mono_paint_cache_miss_on_scroll_reuses_atlas() {
+        // Production path: MonoPaintKey includes `off`, so every wheel notch
+        // misses the item cache. The atlas on the same MonoPaintCache must
+        // still suppress layout.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let plan = two_letter_plan(0, 1);
+        let mut cache = MonoPaintCache::empty();
+        let mut layout = |ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let key0 = MonoPaintKey {
+            content_gen: 1,
+            off: 0,
+            cols: 4,
+            rows: 1,
+            font_bits,
+            colors: GridColors::default_warm(),
+        };
+        let _ = cache.get_or_rebuild(key0, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan, atlas, font_bits, &mut layout);
+            (items, bgs, plan.emoji_sites.clone())
+        });
+        assert_eq!(layout_call_count(), 2);
+
+        reset_layout_call_count();
+        let key1 = MonoPaintKey { off: 12, ..key0 };
+        let plan_scrolled = two_letter_plan(0, 1);
+        let _ = cache.get_or_rebuild(key1, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan_scrolled, atlas, font_bits, &mut layout);
+            (items, bgs, plan_scrolled.emoji_sites.clone())
+        });
+        assert_eq!(
+            layout_call_count(),
+            0,
+            "item-cache miss from scroll must reuse the atlas"
+        );
+    }
+
+    #[test]
+    fn mono_paint_font_change_relayouts() {
+        reset_layout_call_count();
+        let mut atlas = MonoGalleyAtlas::new();
+        let mut layout = |ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let plan = two_letter_plan(0, 1);
+        let _ = mono_paint_items(&plan, &mut atlas, 14.0f32.to_bits(), &mut layout);
+        assert_eq!(layout_call_count(), 2);
+
+        reset_layout_call_count();
+        let _ = mono_paint_items(&plan, &mut atlas, 18.0f32.to_bits(), &mut layout);
+        assert_eq!(
+            layout_call_count(),
+            2,
+            "zoom must drop stale galleys and reshape"
+        );
+    }
+
+    #[test]
+    fn mono_paint_new_glyph_layouts_only_new() {
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let mut layout = |ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            dummy_galley_for_tests(ch)
+        };
+        let plan_a = two_letter_plan(0, 1); // a, b
+        let _ = mono_paint_items(&plan_a, &mut atlas, font_bits, &mut layout);
+        assert_eq!(layout_call_count(), 2);
+
+        reset_layout_call_count();
+        let style = default_style();
+        let plan_b = crate::frame::PaintPlan {
+            glyphs: vec![
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 0,
+                    ch: 'a',
+                    style,
+                    width_cells: 1,
+                },
+                crate::frame::GlyphPlacement {
+                    row: 0,
+                    col: 1,
+                    ch: 'c',
+                    style,
+                    width_cells: 1,
+                },
+            ],
+            emoji_sites: Vec::new(),
+        };
+        let _ = mono_paint_items(&plan_b, &mut atlas, font_bits, &mut layout);
+        assert_eq!(layout_call_count(), 1, "only the unseen 'c' is laid out");
+    }
+
+    /// `n` placements of one char, each with a distinct 24-bit fg — the key
+    /// shape truecolor image cells and gradients produce.
+    fn truecolor_plan(n: usize) -> crate::frame::PaintPlan {
+        let glyphs = (0..n)
+            .map(|i| crate::frame::GlyphPlacement {
+                row: 0,
+                col: i,
+                ch: 'a',
+                style: GlyphStyle {
+                    fg: egui::Color32::from_rgb(
+                        (i & 0xFF) as u8,
+                        ((i >> 8) & 0xFF) as u8,
+                        ((i >> 16) & 0xFF) as u8,
+                    ),
+                    ..default_style()
+                },
+                width_cells: 1,
+            })
+            .collect();
+        crate::frame::PaintPlan {
+            glyphs,
+            emoji_sites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mono_paint_atlas_dumps_past_cap() {
+        // Truecolor cells mint a near-unique key each, and before the cap only a
+        // zoom evicted — so the map grew for the life of the Session.
+        // Production change that must fail this: dropping the MAX_ATLAS_GALLEYS
+        // branch from `prepare`.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let one = dummy_galley_for_tests('a');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+
+        let over = MAX_ATLAS_GALLEYS + 64;
+        let (items, _) =
+            mono_paint_items(&truecolor_plan(over), &mut atlas, font_bits, &mut layout);
+        assert_eq!(items.len(), over, "a rebuild is never cut short by the cap");
+        assert_eq!(
+            atlas.galleys.len(),
+            over,
+            "the dump lands between rebuilds, not mid-insert"
+        );
+
+        reset_layout_call_count();
+        let (items, _) =
+            mono_paint_items(&two_letter_plan(0, 1), &mut atlas, font_bits, &mut layout);
+        assert_eq!(
+            atlas.galleys.len(),
+            2,
+            "an over-cap atlas is dumped before the next rebuild"
+        );
+        assert_eq!(items.len(), 2, "paint still produces items after the dump");
+        assert_eq!(layout_call_count(), 2, "dumped glyphs reshape on demand");
+    }
+
+    #[test]
+    fn mono_paint_atlas_holds_at_the_cap() {
+        // The cap must not fire on ordinary use — sitting exactly at it still hits.
+        reset_layout_call_count();
+        let font_bits = 14.0f32.to_bits();
+        let mut atlas = MonoGalleyAtlas::new();
+        let one = dummy_galley_for_tests('a');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+
+        let plan = truecolor_plan(MAX_ATLAS_GALLEYS);
+        let _ = mono_paint_items(&plan, &mut atlas, font_bits, &mut layout);
+        assert_eq!(atlas.galleys.len(), MAX_ATLAS_GALLEYS);
+
+        reset_layout_call_count();
+        let _ = mono_paint_items(&plan, &mut atlas, font_bits, &mut layout);
+        assert_eq!(layout_call_count(), 0, "at the cap the atlas still hits");
+    }
+
+    /// End-to-end scroll proof on a REAL grid: a real `Term` fed through the
+    /// real VT parser, walked by the real `plan_paint`, keyed exactly as `show`
+    /// keys it (`terminal.rs` — `off: grid().display_offset()`). The atlas tests
+    /// above drive synthetic plans; this one pins the claim the whole branch
+    /// exists for — a genuine wheel notch changes `display_offset`, which MUST
+    /// miss the item cache and MUST still reshape nothing.
+    ///
+    /// Every line carries the same alphabet, so "the scrolled viewport needs
+    /// only glyphs the first frame already shaped" is true by construction
+    /// rather than by luck of which line numbers happen to be on screen.
+    #[test]
+    fn real_grid_scroll_repaints_without_reshaping() {
+        let (cols, rows) = (40usize, 24usize);
+        let mut feed = String::new();
+        for i in 1..=60 {
+            feed.push_str(&format!("0123456789 abcdefghij line {i}\r\n"));
+        }
+        let mut term = term_with(feed.as_bytes(), cols, rows);
+        let metrics = crate::geom::CellMetrics::new(
+            egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cols as f32 * 8.0, rows as f32 * 16.0),
+            ),
+            8.0,
+            16.0,
+            cols,
+            rows,
+        );
+        let gc = GridColors::default_warm();
+        let font_bits = 14.0f32.to_bits();
+        let one = dummy_galley_for_tests('x');
+        let mut layout = |_ch: char, _s: GlyphStyle| {
+            note_layout_call();
+            one.clone()
+        };
+        let mut cache = MonoPaintCache::empty();
+
+        // Frame 1 — pinned to the bottom, as a live session sits.
+        assert_eq!(term.grid().display_offset(), 0, "setup: pinned to bottom");
+        reset_layout_call_count();
+        let key0 = MonoPaintKey {
+            content_gen: 1,
+            off: term.grid().display_offset(),
+            cols,
+            rows,
+            font_bits,
+            colors: gc,
+        };
+        let plan0 = crate::frame::plan_paint(term.grid(), &metrics, &gc);
+        let (items0, _, _) = cache.get_or_rebuild(key0, |atlas| {
+            let (i, b) = mono_paint_items(&plan0, atlas, font_bits, &mut layout);
+            (i, b, plan0.emoji_sites.clone())
+        });
+        assert!(
+            !items0.is_empty(),
+            "setup: the first frame painted something"
+        );
+        assert!(layout_call_count() > 0, "first paint shapes the alphabet");
+
+        // The wheel notch itself — real scroll through alacritty, not a fake key.
+        term.scroll_display(Scroll::Delta(12));
+        let off = term.grid().display_offset();
+        assert_eq!(off, 12, "setup: the grid really scrolled into history");
+
+        // Frame 2 — the key MUST differ (that is the cache miss this branch is
+        // about), yet nothing may reshape.
+        reset_layout_call_count();
+        let key1 = MonoPaintKey { off, ..key0 };
+        assert!(key1 != key0, "scroll must miss the item cache");
+        let plan1 = crate::frame::plan_paint(term.grid(), &metrics, &gc);
+        let (items1, _, _) = cache.get_or_rebuild(key1, |atlas| {
+            let (i, b) = mono_paint_items(&plan1, atlas, font_bits, &mut layout);
+            (i, b, plan1.emoji_sites.clone())
+        });
+        assert!(!items1.is_empty(), "the scrolled frame still paints");
+        assert_eq!(
+            layout_call_count(),
+            0,
+            "scrolling a real grid must reshape nothing"
+        );
     }
 
     #[test]
@@ -3146,8 +3530,8 @@ mod tests {
             note_layout_call();
             dummy_galley_for_tests('z')
         };
-        let (items_a, _, _) = cache.get_or_rebuild(key, || {
-            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+        let (items_a, _, _) = cache.get_or_rebuild(key, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan, atlas, key.font_bits, &mut layout);
             (items, bgs, plan.emoji_sites.clone())
         });
         assert!(layout_call_count() > 0);
@@ -3155,7 +3539,7 @@ mod tests {
         assert_eq!(pos_a, m_a.cell_rect(0, 0).min);
 
         reset_layout_call_count();
-        let (items_b, _, _) = cache.get_or_rebuild(key, || {
+        let (items_b, _, _) = cache.get_or_rebuild(key, |_atlas| {
             panic!("cache hit must not rebuild");
         });
         assert_eq!(layout_call_count(), 0, "origin change must not layout");
@@ -3207,12 +3591,12 @@ mod tests {
         };
         let mut cache = MonoPaintCache::empty();
         let mut layout = |_ch: char, _s: GlyphStyle| dummy_galley_for_tests('x');
-        let (_, _, got) = cache.get_or_rebuild(key, || {
-            let (items, bgs) = mono_paint_items(&plan, &mut layout);
+        let (_, _, got) = cache.get_or_rebuild(key, |atlas| {
+            let (items, bgs) = mono_paint_items(&plan, atlas, key.font_bits, &mut layout);
             (items, bgs, plan.emoji_sites.clone())
         });
         assert_eq!(*got, sites);
-        let (_, _, hit) = cache.get_or_rebuild(key, || {
+        let (_, _, hit) = cache.get_or_rebuild(key, |_atlas| {
             panic!("cache hit must not rebuild (sites still available)");
         });
         assert_eq!(*hit, sites);
@@ -3475,9 +3859,7 @@ mod tests {
         let (items, _) = mono_paint_items_for_test(&plan, &mut layout);
         assert_eq!(items.len(), 4);
         assert_eq!(layout_call_count(), 4, "four styles ⇒ four layouts");
-        // Second pass with same plan keys: layout count stays if we re-dedupe
-        // within one call — mono_paint_items always builds a fresh map, so
-        // exercise cache path separately via mono_paint_items on a MonoPaintKey.
+        // for_test builds a throwaway atlas, so a second call still layouts.
         reset_layout_call_count();
         let mut layout2 = |ch: char, _style: GlyphStyle| {
             note_layout_call();
