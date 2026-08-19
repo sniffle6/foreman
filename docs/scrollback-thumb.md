@@ -12,9 +12,23 @@ scrollback, and you can grab it.
 - Drag past either end of the track and it pins to the live bottom or the oldest
   line rather than running off.
 
-It appears when the pane has history *and* you're either scrolled back or
-hovering the pane — quiet chrome, same as before. It now also stays put while
-you drag, so it doesn't vanish when the pointer wanders off the pane mid-drag.
+It exists whenever the pane has history, and fades when you leave it alone. It
+stays solid while **held** — the pointer is in the track band, a drag is live,
+or the offset just moved — then after `THUMB_HOLD` (1s) eases out over
+`THUMB_FADE` (0.35s) to a floor that depends on where you are:
+
+- **scrolled back** → `THUMB_DIM_FLOOR` (30%), still faintly there, because at
+  rest it is the only sign you are not at the live prompt
+- **at the live prompt** → 0, fully gone; there is nothing to say
+
+It also stays put while you drag, so it doesn't vanish when the pointer wanders
+off the pane mid-drag.
+
+Note what is *not* a hold: hovering the middle of the pane. Before the fade, any
+pane hover revealed the thumb. Now only the band does, so at the bottom with the
+pointer in the middle of the terminal there is no thumb at all until you scroll
+or move toward the edge. That is a deliberate trade for quiet, and it is the
+first thing to revisit if the thumb feels hard to find.
 
 It is 4px at rest and grows to 8px while the pointer is in the track band or a
 drag is live, so it reads as something you can take hold of. The widen is tested
@@ -67,6 +81,15 @@ hardcoded 6 with a comment, and `thumb_and_its_hit_zone_clear_the_resize_band`
 fails if the inset goes back to zero. Widen the resize band and the thumb moves
 with it. Anything else you ever put on a pane edge has the same problem.
 
+**The fade must stop asking for frames.** foreman drops to a 100ms repaint
+cadence when quiet (`main.rs`), which would render the fade as about three
+visible steps — so while a fade is in flight the paint asks for 30ms frames, the
+same rate the bell pulse uses in `panel.rs`. `theme::thumb_settled` decides when
+to stop. It has to agree with `thumb_alpha`: too eager and the fade freezes
+part-way, too lazy and an idle foreman animates forever. A test pins the two
+together. This is the app's second animation after the bell — treat any new one
+the same way.
+
 **Travel, not track height.** The drag maps over `track_h - thumb_h`, not the
 raw track height. Once the 16px floor kicks in on a deep buffer the thumb is
 taller than its proportional share, so mapping over the full track would place
@@ -90,6 +113,8 @@ to be startable from the extreme right edge now scrolls instead.
 - `src/geom.rs` — `thumb_rect`, `offset_for_thumb_top`, `thumb_hit_rect`,
   `thumb_track_rect`, `thumb_hot_rect`, `thumb_metrics`, `THUMB_EDGE_INSET`,
   and their tests
+- `src/theme.rs` — `thumb_alpha`, `thumb_settled`, `THUMB_HOLD`/`THUMB_FADE`/
+  `THUMB_DIM_FLOOR`, and the curve's tests
 - `src/wm.rs` — `RESIZE_BAND`, the edge hit-zone the inset has to clear
 - `src/terminal.rs` — `Session::thumb_drag`, the claim in `show()`, the paint
 - `src/frame.rs` — `overlays()` emits `thumb: Option<Rect>` for the paint

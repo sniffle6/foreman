@@ -693,6 +693,13 @@ pub struct Session {
     /// is also what tells `show` to leave the thumb painted while the pointer
     /// wanders off the pane mid-drag.
     thumb_drag: Option<f32>,
+    /// When the thumb was last "held" (band hover, drag, or the offset moving).
+    /// `None` means never — an untouched pane starts already faded.
+    thumb_seen: Option<std::time::Instant>,
+    /// Previous frame's `display_offset`, only so "the user scrolled" can be
+    /// spotted as a change. Scrolling arrives by wheel, keys, search jumps and
+    /// the drag itself; watching the result catches all of them at one place.
+    thumb_last_off: i32,
     /// Color-emoji rasterizer (DirectWrite on Windows, null elsewhere). Fail-open:
     /// `None` from `color_glyph` leaves the mono glyph alone.
     emoji_raster: Box<dyn crate::emoji_raster::EmojiRaster>,
@@ -1063,6 +1070,8 @@ impl Session {
             content_gen: 0,
             mono_paint: None,
             thumb_drag: None,
+            thumb_seen: None,
+            thumb_last_off: 0,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
             emoji_textures: std::collections::HashMap::new(),
             graphics: crate::graphics::Graphics::default(),
@@ -2476,27 +2485,49 @@ impl Session {
             painter.rect_filled(rect, egui::CornerRadius::ZERO, th.dim_unfocused);
         }
 
-        // scrollback indicator: thin right-edge thumb, shown only when there is
-        // history and the user is scrolled back or hovering the pane.
-        if let Some(r) = overlays.thumb
-            && (overlays.scrolled_back || resp.hovered() || self.thumb_drag.is_some())
-        {
-            // Widen while the pointer is in the track band (or mid-drag) so it
-            // reads as grabbable. Hover is tested against the band rather than
-            // the bar so the thumb fattens as you approach it, not only once
-            // you are dead on the 4px line.
-            let hot = self.thumb_drag.is_some()
-                || ui.input(|i| {
-                    i.pointer
-                        .hover_pos()
-                        .is_some_and(|p| crate::geom::thumb_track_rect(metrics.rect()).contains(p))
-                });
-            let r = if hot {
-                crate::geom::thumb_hot_rect(r)
-            } else {
-                r
-            };
-            painter.rect_filled(r, egui::CornerRadius::same(2), th.scroll_thumb);
+        // Scrollback indicator: thin right-edge thumb, present only when the
+        // pane has history. Solid while "held" — pointer in the track band, a
+        // live drag, or the offset moved — then fading to a floor: dim while
+        // scrolled back (the only sign you are not at the live prompt), gone at
+        // the bottom, where there is nothing to say.
+        if let Some(r) = overlays.thumb {
+            let band = crate::geom::thumb_track_rect(metrics.rect());
+            let in_band = ui.input(|i| i.pointer.hover_pos().is_some_and(|p| band.contains(p)));
+            let off_now = self.term.grid().display_offset() as i32;
+            let scrolled = off_now != self.thumb_last_off;
+            self.thumb_last_off = off_now;
+            if in_band || self.thumb_drag.is_some() || scrolled {
+                self.thumb_seen = Some(std::time::Instant::now());
+            }
+
+            let idle = self
+                .thumb_seen
+                .map_or(f64::MAX, |t| t.elapsed().as_secs_f64());
+            let alpha = crate::theme::thumb_alpha(idle, overlays.scrolled_back);
+            if alpha > 0.0 {
+                // Widen while held so it reads as grabbable. Hover is tested
+                // against the band rather than the bar, so it fattens as you
+                // approach it, not only once you are dead on the 4px line.
+                let hot = self.thumb_drag.is_some() || in_band;
+                let r = if hot {
+                    crate::geom::thumb_hot_rect(r)
+                } else {
+                    r
+                };
+                painter.rect_filled(
+                    r,
+                    egui::CornerRadius::same(2),
+                    th.scroll_thumb.gamma_multiply(alpha),
+                );
+            }
+            // Animation frames ONLY while the fade is in flight. The idle
+            // cadence is 100ms (main.rs), which would render this as ~3 visible
+            // steps; 30ms matches the bell pulse in panel.rs. Once settled we
+            // stop asking, so an idle foreman costs exactly what it did before.
+            if !crate::theme::thumb_settled(idle) {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(30));
+            }
         }
 
         // Search bar last inside this pane's draw order (not a global layer).

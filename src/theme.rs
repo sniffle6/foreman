@@ -75,6 +75,37 @@ pub fn bell_pulse(t: f64, period: f64, bell: egui::Color32) -> egui::Color32 {
 }
 /// Scrollback indicator thumb at a pane's right edge.
 const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
+/// How long the thumb stays solid after the last hold (hover/drag/scroll).
+pub const THUMB_HOLD: f64 = 1.0;
+/// How long the fade itself takes, once the hold expires.
+pub const THUMB_FADE: f64 = 0.35;
+/// Where the fade lands while the pane is scrolled back. Not zero: at rest the
+/// thumb is the only sign you are not at the live prompt, so it dims rather
+/// than disappearing. At the bottom there is nothing to say, so it goes to 0.
+pub const THUMB_DIM_FLOOR: f32 = 0.30;
+
+/// Thumb alpha `idle` seconds after the last hold — 1.0 through [`THUMB_HOLD`],
+/// then eased over [`THUMB_FADE`] down to [`THUMB_DIM_FLOOR`] when scrolled back
+/// or 0.0 at the live bottom. Pure function of elapsed time, like
+/// [`bell_pulse`], so the curve is testable without a GUI. Monotonic by
+/// construction — an idle thumb must never shimmer.
+pub fn thumb_alpha(idle: f64, scrolled_back: bool) -> f32 {
+    let floor = if scrolled_back { THUMB_DIM_FLOOR } else { 0.0 };
+    if idle <= THUMB_HOLD {
+        return 1.0;
+    }
+    let t = ((idle - THUMB_HOLD) / THUMB_FADE).clamp(0.0, 1.0) as f32;
+    // Smoothstep: leaves 1.0 gently rather than stepping off a cliff.
+    let eased = t * t * (3.0 - 2.0 * t);
+    floor + (1.0 - floor) * (1.0 - eased)
+}
+
+/// Whether [`thumb_alpha`] has reached its resting value, so the paint loop can
+/// stop asking for animation frames. Must agree with the curve above: too eager
+/// and the fade freezes part-way, too lazy and the app animates forever at idle.
+pub fn thumb_settled(idle: f64) -> bool {
+    idle >= THUMB_HOLD + THUMB_FADE
+}
 
 #[cfg(test)]
 mod tests {
@@ -91,6 +122,46 @@ mod tests {
         assert!(trough.r() > 60, "trough must stay clearly visible");
         // Same hue family throughout: warm, R > G > B.
         assert!(trough.r() > trough.g() && trough.g() > trough.b());
+    }
+
+    #[test]
+    fn thumb_alpha_holds_then_eases_to_its_floor() {
+        // Solid through the hold, then eases. The floor depends on whether the
+        // pane is scrolled back: at the live prompt it goes fully away, scrolled
+        // back it settles dim so "you are not at the bottom" survives the fade.
+        assert_eq!(thumb_alpha(0.0, false), 1.0);
+        assert_eq!(thumb_alpha(THUMB_HOLD, false), 1.0, "hold is inclusive");
+        assert_eq!(thumb_alpha(THUMB_HOLD + THUMB_FADE, false), 0.0);
+        assert_eq!(thumb_alpha(THUMB_HOLD + THUMB_FADE, true), THUMB_DIM_FLOOR);
+        // Mid-fade sits strictly between, and scrolled-back never dips below.
+        let mid = THUMB_HOLD + THUMB_FADE / 2.0;
+        assert!(thumb_alpha(mid, false) > 0.0 && thumb_alpha(mid, false) < 1.0);
+        assert!(thumb_alpha(mid, true) > THUMB_DIM_FLOOR);
+    }
+
+    #[test]
+    fn thumb_alpha_never_climbs_back_and_clamps_past_the_end() {
+        // Monotonic: an idle thumb must not shimmer as time passes.
+        let mut prev = f32::INFINITY;
+        for i in 0..=40 {
+            let a = thumb_alpha(i as f64 * 0.1, false);
+            assert!(a <= prev, "alpha rose at idle={}", i as f64 * 0.1);
+            prev = a;
+        }
+        // Long past the fade it stays pinned, not negative or drifting.
+        assert_eq!(thumb_alpha(600.0, false), 0.0);
+        assert_eq!(thumb_alpha(600.0, true), THUMB_DIM_FLOOR);
+    }
+
+    #[test]
+    fn thumb_alpha_settled_predicate_matches_the_curve() {
+        // The paint loop asks for 30ms repaints only while unsettled; if this
+        // disagrees with the curve, the fade either freezes mid-way or the app
+        // animates forever at idle.
+        assert!(!thumb_settled(0.0));
+        assert!(!thumb_settled(THUMB_HOLD + THUMB_FADE / 2.0));
+        assert!(thumb_settled(THUMB_HOLD + THUMB_FADE));
+        assert!(thumb_settled(9999.0));
     }
 
     #[test]
