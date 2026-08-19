@@ -32,6 +32,27 @@ static palette.
   grid galley cache (`MonoPaintKey`) **includes** it, so a palette edit busts the
   cache and repaints already-drawn terminal text.
 
+## egui widget colors (the Visuals bridge)
+
+Almost everything in Foreman is **hand-painted** straight from `theme::live` —
+the terminal grid, window chrome, chat, panel, landing — so those already match
+whatever theme is active. But a few surfaces use **egui-native controls** that
+read their colors from egui's own `Visuals`, not the theme: the Appearance/
+settings widgets (`ComboBox`, `TextEdit`, `Button`, the `color_edit` swatches +
+their popups, the form scrollbar) and the close-confirm modal. Without a bridge
+these fall back to egui's stock cool-grey dark theme and clash with the warm app.
+
+`Theme::visuals(&self) -> egui::Visuals` is that bridge: it starts from
+`Visuals::dark()` and remaps the load-bearing slots — window/panel fills, the
+`TextEdit` well (`extreme_bg_color`), the five `widgets` states (idle/hover/
+active/open), selection, focus ring, caret, and semantic accents — onto the
+theme's tokens. `App` installs it **once per frame** via `ctx.set_visuals(...)`
+right after `theme::seed_live` (main.rs), sourced from `active_theme`. It's the
+same cost class as the other per-frame seeds and does not request a repaint.
+A startup `ctx.set_theme(ThemePreference::Dark)` pins dark so a system light-mode
+preference can't swap in unstyled light visuals. Editing a color recolors these
+controls too, one frame behind — the same lag every terminal repaint already has.
+
 ## How to use it
 
 - Open settings (`Ctrl+B` then `Ctrl+,`), select **Appearance** (top of the rail).
@@ -76,14 +97,15 @@ static palette.
 ## Key files
 
 - `src/theme.rs` — the `Theme` struct, `foreman_warm()` (built from the legacy
-  consts), the `seed_live`/`live` seam, hex serde (`color_hex`), and
-  `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
+  consts), the `seed_live`/`live` seam, `visuals()` (the egui `Visuals` bridge),
+  hex serde (`color_hex`), and `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
 - `src/appearance.rs` — the Appearance pane (`AppearanceView`): the pure model
   (working/saved/dirty/revert/presets), the split-preview view + live sample, and
   the color pickers.
 - `src/settings_menu.rs` — the custom-body `Pane::Appearance`, and the
   Duplicate / preset-switch / resync coordination in `draw_pane`.
-- `src/main.rs` — `App` owns/seeds/reads-back `active_theme` and debounce-saves.
+- `src/main.rs` — `App` owns/seeds/reads-back `active_theme`, installs the egui
+  `Visuals` bridge (`ctx.set_visuals`) each frame + pins dark, and debounce-saves.
 - `src/config.rs` — `themes_dir()`, the dir-parameterized JSON helpers
   (`load_json_from`/`save_json_in`), and the `Settings.theme` name field.
 - `src/terminal.rs` / `src/frame.rs` — `GridColors` parameterizes the color

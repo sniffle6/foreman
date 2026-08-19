@@ -117,6 +117,30 @@ mod tests {
     }
 
     #[test]
+    fn visuals_maps_theme_tokens_onto_egui_slots() {
+        // egui-native controls (settings menu) must read the theme, not egui's
+        // stock dark palette. Spot-check the load-bearing slots per widget state.
+        let t = Theme::foreman_warm();
+        let v = t.visuals();
+        assert_eq!(v.window_fill, t.win_bg); // popup / combo-list body
+        assert_eq!(v.panel_fill, t.win_bg);
+        assert_eq!(v.extreme_bg_color, t.bg); // TextEdit well
+        assert_eq!(v.widgets.inactive.bg_fill, t.title_bg); // idle button/combo
+        assert_eq!(v.widgets.hovered.bg_fill, t.title_bg_focus);
+        assert_eq!(v.widgets.active.bg_fill, t.title_bg_focus);
+        assert_eq!(v.widgets.hovered.bg_stroke.color, t.border_focus);
+        assert_eq!(v.selection.bg_fill, t.selection_text_bg);
+        assert_eq!(v.text_cursor.stroke.color, t.text);
+        assert_eq!(v.hyperlink_color, t.palette[4]);
+        assert_eq!(v.error_fg_color, t.danger);
+        // Default stroke widths survive — only the color is remapped.
+        assert_eq!(
+            v.widgets.inactive.bg_stroke.width,
+            egui::Visuals::dark().widgets.inactive.bg_stroke.width
+        );
+    }
+
+    #[test]
     fn color_hex_round_trips_opaque_and_premultiplied() {
         // Opaque → #rrggbb; premultiplied-with-alpha → #rrggbbaa; both exact,
         // including the raw-premultiplied SNAP_FILL that has no straight-alpha form.
@@ -463,6 +487,78 @@ impl Theme {
     /// The app frame matches the revealed OS bar — derived, never stored.
     pub fn app_border(&self) -> egui::Color32 {
         self.chrome_bg
+    }
+
+    /// Map this theme onto egui's built-in widget palette (`Visuals`).
+    ///
+    /// The terminal grid, window chrome, and chat are all hand-painted with these
+    /// tokens directly, so they already match. But the settings menu leans on
+    /// egui-native controls — `ComboBox`, `TextEdit`, `Button`, the `color_edit`
+    /// swatches and their popups, and the form's scrollbar — which read their
+    /// colors from `Visuals`. Without this the app never installs one, so those
+    /// controls fall back to egui's stock cool-grey dark theme and clash with the
+    /// warm rest of the app. `App` installs the result each frame from the active
+    /// theme (main.rs), so editing a color live-recolors the whole settings window.
+    pub fn visuals(&self) -> egui::Visuals {
+        let mut v = egui::Visuals::dark();
+
+        // Surfaces: popup/menu bodies (combo list, color picker), panels, and the
+        // recessed wells behind text inputs.
+        v.window_fill = self.win_bg;
+        v.panel_fill = self.win_bg;
+        v.window_stroke.color = self.border;
+        v.extreme_bg_color = self.bg; // TextEdit background
+        v.faint_bg_color = self.title_bg; // striped rows
+        v.code_bg_color = self.bg;
+
+        // Interactive chrome — buttons, combo boxes, checkboxes, scrollbar handle.
+        // Mutate the `.color` of each stroke so egui's default widths survive.
+        let paint = |w: &mut egui::style::WidgetVisuals,
+                     fill: egui::Color32,
+                     stroke: egui::Color32,
+                     fg: egui::Color32| {
+            w.bg_fill = fill;
+            w.weak_bg_fill = fill;
+            w.bg_stroke.color = stroke;
+            w.fg_stroke.color = fg;
+        };
+        paint(
+            &mut v.widgets.noninteractive,
+            self.win_bg,
+            self.border,
+            self.text,
+        );
+        paint(
+            &mut v.widgets.inactive,
+            self.title_bg,
+            self.border,
+            self.text,
+        );
+        paint(
+            &mut v.widgets.hovered,
+            self.title_bg_focus,
+            self.border_focus,
+            self.text,
+        );
+        paint(
+            &mut v.widgets.active,
+            self.title_bg_focus,
+            self.border_focus,
+            self.text,
+        );
+        paint(&mut v.widgets.open, self.title_bg, self.border, self.text);
+
+        // Text selection, focused-field ring, and the text caret.
+        v.selection.bg_fill = self.selection_text_bg;
+        v.selection.stroke.color = self.border_focus;
+        v.text_cursor.stroke.color = self.text;
+
+        // Links + semantic accents.
+        v.hyperlink_color = self.palette[4]; // ANSI blue
+        v.warn_fg_color = self.bell;
+        v.error_fg_color = self.danger;
+
+        v
     }
 
     /// The built-in theme is code-only (its name is [`crate::appearance::BUILTIN`]):

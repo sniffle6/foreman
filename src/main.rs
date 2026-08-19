@@ -572,6 +572,12 @@ impl eframe::App for App {
         // (in wm) can read + edit it this frame; its edits come back via config::live.
         config::seed_live(&ctx, &self.settings);
         crate::theme::seed_live(&ctx, &self.active_theme);
+        // Install the active theme as egui's widget palette so egui-native controls
+        // (the settings menu's combo/text/buttons/color pickers/scrollbar, the
+        // close-confirm modal) match the hand-painted rest of the app instead of
+        // egui's stock grey dark theme. Cheap per-frame; the chrome tracks a live
+        // color edit one frame behind, the same lag every terminal repaint already has.
+        ctx.set_visuals(self.active_theme.visuals());
         // Landing when nothing is *visible* (closed or all minimized). Always
         // still run the desktop so the Sessions panel stays docked at its
         // remembered size and minimized PTYs keep pumping; the landing paints
@@ -978,6 +984,10 @@ fn main() -> eframe::Result {
             // fonts; missing files leave defaults alone. Once per process.
             cc.egui_ctx
                 .set_fonts(terminal_font::load_font_definitions(&|p| std::fs::read(p)));
+            // The app is always the dark warm theme; pin it so a system light-mode
+            // preference can't swap in egui's unstyled light visuals. The per-frame
+            // `set_visuals` in `App::ui` then paints the active theme over it.
+            cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
 
             // Spawn the control server here (not before run_native) so it can hold
             // the egui Context and wake the render loop the instant a dispatch
