@@ -163,3 +163,23 @@ Session knowledge persists across conversations — check MEMORY.md in that dire
 
 **Active work:** Currently working on `feat/browser-style-tabs` branch. See `docs/epics/window-tabbing-split-epic.md`
 for the full epic context. This branch targets full tab-stack integration across projects and terminals.
+
+<!-- BEGIN EPIC MANAGER (managed — edits between these markers are overwritten by `epic-manager setup`) -->
+## Epic Manager
+
+This project uses Epic Manager as the durable mission board (MCP server `epic-manager`). Do not rely on chat history as the source of truth.
+
+Start of session:
+1. `session_register` (label, client_name, role), then `session_context` with the returned session_id.
+2. If no current task, `task_claim_next` (or `task_claim` for a named task).
+
+While working: heartbeat with `session_heartbeat`; `task_checkpoint` after investigation, before/after risky edits, and after tests; pass `expected_version` on status-changing writes.
+
+Finish: satisfy required criteria with `task_acceptance_update`, then `task_complete_for_review` (never mark your own task done). If stopping early, `task_release` with a handoff note.
+
+Errors return a compact envelope with a stable `blocked` code — branch on the code, don't parse the prose. See `docs/error-codes.md`.
+
+If a tool call fails with `-32000: Connection closed` or `blocked: daemon_unreachable`, the bridge dropped or the daemon is mid-restart — it is transient and auto-reconnects. Just retry the same call; do NOT sleep, poll, or abandon the task.
+
+Full Codex workflow guide: `epic-manager instructions --agent codex`.
+<!-- END EPIC MANAGER -->
