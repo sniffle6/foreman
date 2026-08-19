@@ -17,18 +17,21 @@ stays solid while **held** — the pointer is in the track band, a drag is live,
 or the offset just moved — then after `THUMB_HOLD` (1s) eases out over
 `THUMB_FADE` (0.35s) to a floor that depends on where you are:
 
-- **scrolled back** → `THUMB_DIM_FLOOR` (30%), still faintly there, because at
-  rest it is the only sign you are not at the live prompt
-- **at the live prompt** → 0, fully gone; there is nothing to say
+- **scrolled back**, or **the pointer is anywhere in this pane** →
+  `THUMB_DIM_FLOOR` (30%), faint but present
+- **neither** → 0, fully gone
 
 It also stays put while you drag, so it doesn't vanish when the pointer wanders
 off the pane mid-drag.
 
-Note what is *not* a hold: hovering the middle of the pane. Before the fade, any
-pane hover revealed the thumb. Now only the band does, so at the bottom with the
-pointer in the middle of the terminal there is no thumb at all until you scroll
-or move toward the edge. That is a deliberate trade for quiet, and it is the
-first thing to revisit if the thumb feels hard to find.
+The pointer-in-pane floor is what keeps the thumb findable. The fade originally
+counted only the track band as a hold, which meant hovering a terminal showed
+*nothing* until you happened to reach for the edge — you cannot grab a control
+you have no reason to believe exists. Holding it fully solid on pane hover is the
+other extreme: you are hovering a terminal nearly all the time, so it would never
+fade and the feature would do nothing. Faint-on-hover, solid-on-approach is the
+middle, and `thumb_alpha` takes the floor as a parameter precisely so this stays
+the caller's decision.
 
 It is 4px at rest and grows to 8px while the pointer is in the track band or a
 drag is live, so it reads as something you can take hold of. The widen is tested

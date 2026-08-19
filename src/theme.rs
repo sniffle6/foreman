@@ -79,18 +79,21 @@ const SCROLL_THUMB: egui::Color32 = unmultiplied(231, 231, 231, 150);
 pub const THUMB_HOLD: f64 = 1.0;
 /// How long the fade itself takes, once the hold expires.
 pub const THUMB_FADE: f64 = 0.35;
-/// Where the fade lands while the pane is scrolled back. Not zero: at rest the
-/// thumb is the only sign you are not at the live prompt, so it dims rather
-/// than disappearing. At the bottom there is nothing to say, so it goes to 0.
+/// The resting alpha a faded thumb keeps when it still has something to say —
+/// the pane is scrolled back, or the pointer is simply somewhere in the pane.
+/// Not zero in those cases: a thumb you can never see is a thumb nobody finds.
 pub const THUMB_DIM_FLOOR: f32 = 0.30;
 
-/// Thumb alpha `idle` seconds after the last hold — 1.0 through [`THUMB_HOLD`],
-/// then eased over [`THUMB_FADE`] down to [`THUMB_DIM_FLOOR`] when scrolled back
-/// or 0.0 at the live bottom. Pure function of elapsed time, like
-/// [`bell_pulse`], so the curve is testable without a GUI. Monotonic by
-/// construction — an idle thumb must never shimmer.
-pub fn thumb_alpha(idle: f64, scrolled_back: bool) -> f32 {
-    let floor = if scrolled_back { THUMB_DIM_FLOOR } else { 0.0 };
+/// Thumb alpha `idle` seconds after the last hold: 1.0 through [`THUMB_HOLD`],
+/// then eased over [`THUMB_FADE`] down to `floor`.
+///
+/// The floor is the caller's decision, not this function's — scrolled back and
+/// pointer-in-pane both want a faint thumb, and the curve has no business
+/// knowing which. Pure function of elapsed time, like [`bell_pulse`], so it is
+/// testable without a GUI. Monotonic by construction: an idle thumb must never
+/// shimmer, which reads as flicker without looking obviously wrong.
+pub fn thumb_alpha(idle: f64, floor: f32) -> f32 {
+    let floor = floor.clamp(0.0, 1.0);
     if idle <= THUMB_HOLD {
         return 1.0;
     }
@@ -129,14 +132,31 @@ mod tests {
         // Solid through the hold, then eases. The floor depends on whether the
         // pane is scrolled back: at the live prompt it goes fully away, scrolled
         // back it settles dim so "you are not at the bottom" survives the fade.
-        assert_eq!(thumb_alpha(0.0, false), 1.0);
-        assert_eq!(thumb_alpha(THUMB_HOLD, false), 1.0, "hold is inclusive");
-        assert_eq!(thumb_alpha(THUMB_HOLD + THUMB_FADE, false), 0.0);
-        assert_eq!(thumb_alpha(THUMB_HOLD + THUMB_FADE, true), THUMB_DIM_FLOOR);
-        // Mid-fade sits strictly between, and scrolled-back never dips below.
+        assert_eq!(thumb_alpha(0.0, 0.0), 1.0);
+        assert_eq!(thumb_alpha(THUMB_HOLD, 0.0), 1.0, "hold is inclusive");
+        assert_eq!(thumb_alpha(THUMB_HOLD + THUMB_FADE, 0.0), 0.0);
+        assert_eq!(
+            thumb_alpha(THUMB_HOLD + THUMB_FADE, THUMB_DIM_FLOOR),
+            THUMB_DIM_FLOOR
+        );
+        // Mid-fade sits strictly between, and a floored fade never dips below.
         let mid = THUMB_HOLD + THUMB_FADE / 2.0;
-        assert!(thumb_alpha(mid, false) > 0.0 && thumb_alpha(mid, false) < 1.0);
-        assert!(thumb_alpha(mid, true) > THUMB_DIM_FLOOR);
+        assert!(thumb_alpha(mid, 0.0) > 0.0 && thumb_alpha(mid, 0.0) < 1.0);
+        assert!(thumb_alpha(mid, THUMB_DIM_FLOOR) > THUMB_DIM_FLOOR);
+    }
+
+    #[test]
+    fn thumb_alpha_rests_on_whatever_floor_it_is_given() {
+        // The floor is the caller's call — scrolled back OR the pointer merely
+        // being in the pane both hold it faintly visible, and the curve should
+        // not know or care which. Any floor, not just the two we happen to use.
+        for floor in [0.0f32, 0.15, THUMB_DIM_FLOOR, 0.5, 1.0] {
+            assert_eq!(thumb_alpha(600.0, floor), floor, "floor={floor}");
+            assert_eq!(thumb_alpha(0.0, floor), 1.0, "held beats the floor");
+        }
+        // Nonsense floors are clamped rather than producing alpha out of range.
+        assert_eq!(thumb_alpha(600.0, 4.0), 1.0);
+        assert_eq!(thumb_alpha(600.0, -2.0), 0.0);
     }
 
     #[test]
@@ -144,13 +164,13 @@ mod tests {
         // Monotonic: an idle thumb must not shimmer as time passes.
         let mut prev = f32::INFINITY;
         for i in 0..=40 {
-            let a = thumb_alpha(i as f64 * 0.1, false);
+            let a = thumb_alpha(i as f64 * 0.1, 0.0);
             assert!(a <= prev, "alpha rose at idle={}", i as f64 * 0.1);
             prev = a;
         }
         // Long past the fade it stays pinned, not negative or drifting.
-        assert_eq!(thumb_alpha(600.0, false), 0.0);
-        assert_eq!(thumb_alpha(600.0, true), THUMB_DIM_FLOOR);
+        assert_eq!(thumb_alpha(600.0, 0.0), 0.0);
+        assert_eq!(thumb_alpha(600.0, THUMB_DIM_FLOOR), THUMB_DIM_FLOOR);
     }
 
     #[test]

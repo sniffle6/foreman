@@ -2503,7 +2503,16 @@ impl Session {
             let idle = self
                 .thumb_seen
                 .map_or(f64::MAX, |t| t.elapsed().as_secs_f64());
-            let alpha = crate::theme::thumb_alpha(idle, overlays.scrolled_back);
+            // Faint-but-present whenever there's something to say: you're not at
+            // the live prompt, OR the pointer is in this pane at all. The latter
+            // is what keeps the thumb discoverable — without it, hovering a
+            // terminal shows nothing until you happen to reach for the edge.
+            let floor = if overlays.scrolled_back || resp.hovered() {
+                crate::theme::THUMB_DIM_FLOOR
+            } else {
+                0.0
+            };
+            let alpha = crate::theme::thumb_alpha(idle, floor);
             if alpha > 0.0 {
                 // Widen while held so it reads as grabbable. Hover is tested
                 // against the band rather than the bar, so it fattens as you
