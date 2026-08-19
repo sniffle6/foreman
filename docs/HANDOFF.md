@@ -134,6 +134,12 @@ you (incident: 2026-07-09, an agent reviewing this repo from a foreman terminal
 took the whole app down). Ask the user to close foreman, or build to a separate
 target dir that doesn't lock the running exe: `cargo build --target-dir target/agent`.
 
+**To run a dev build next to a foreman you already have open**, use
+`.\scripts\run-dev.ps1` rather than launching the exe yourself — it builds to
+`target\agent`, sandboxes `APPDATA` so the dev instance can't overwrite your real
+`workspace.json`, and kills by exe path with an ancestor guard. See
+`docs/dev-launcher.md`.
+
 **Run + screenshot the window** (you can't see the GUI otherwise — capture it and
 `Read` the PNG):
 ```powershell
