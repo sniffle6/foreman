@@ -26,8 +26,17 @@ version exists. Spec with the full decision history:
   glyph instead. Clicking opens the releases page in the browser. Nothing
   downloads, nothing installs.
 
-- **One-click apply (Phase 4)**: not built yet. The state machine already has
-  the states/effects for it; `CAN_APPLY` in `src/update.rs` is the switch.
+- **One-click apply (Phase 4, current)**: clicking the chip on an applicable
+  release downloads the zip and checksums, verifies the SHA-256, and swaps the
+  running exe for the new one (`foreman.exe` → `.old`, `.new` → `foreman.exe`).
+  The chip then reads "Restart to update"; a first click arms it ("Restart? N
+  sessions close"), a second click within 5 s actually restarts (spawns the
+  new exe, which waits out the old process, then the old one exits), and
+  letting the 5 s pass disarms it back to a plain restart prompt. It's fine to
+  stage a swap and never restart — the new exe just sits there until you do.
+  Failures split in two: a bad hash or a failed download are retryable
+  (clicking the chip re-downloads); a failed swap is not (clicking opens the
+  releases page so you can grab the zip by hand).
 
 ## Why it exists this way
 
@@ -57,8 +66,27 @@ instead of publishing.
 - Prereleases, drafts, and non-`X.Y.Z` tags are silently ignored by the
   updater (`parse_version` returns None → no chip).
 - Debug builds never check for updates. `FOREMAN_NO_UPDATE=1` disables the
-  check in release builds. `FOREMAN_UPDATE_TEST=1` (debug only) fakes an
-  available update so the chip can be screenshotted.
+  check in release builds. `FOREMAN_UPDATE_TEST` (debug only) fakes an update
+  and picks which chip state to preview: unset/empty = no chip, `apply` =
+  offer, `down` = downloading, `ready`/`armed` = restart prompt (unarmed/
+  armed), `err`/`errswap` = retryable/non-retryable failure; any other
+  non-empty value (including the old `=1`) falls back to a plain notify chip.
+  The fake offer's assets point at an unroutable URL, so clicking `apply` in a
+  debug build kicks off a real download that fails fast into `err` — useful
+  for screenshotting the error chip, but don't expect it to actually swap
+  anything.
+- `FOREMAN_WAIT_PID` is set internally by the restart handshake (the old
+  instance passes its own pid to the freshly-spawned new one so it can wait
+  the old process out) — never set this by hand.
+- The collapsed-rail glyph (`↓`/`↻`/`!`) is steady, not pulsing — a deliberate
+  simplification from the original spec's animated cell.
+- The swap only replaces the exe (two-rename dance: `foreman.exe` → `.old`,
+  `.new` → `foreman.exe`, staged in `%TEMP%\foreman-update`). It does not
+  touch licenses, the Start-menu shortcut, or PATH — those are install.ps1's
+  job, untouched by an in-place update. Only the GUI process cleans up a
+  leftover `.old` at startup, never the CLI verbs (`foreman open`/`status`/...),
+  so a leftover can't race a concurrent update download from a dispatching
+  agent.
 - The updater uses rustls + webpki-roots, not the Windows cert store —
   corporate MITM proxies make the check fail, which is a silent skip by
   design (stderr gets one line).
@@ -79,8 +107,12 @@ instead of publishing.
   names; tag==Cargo.toml check.
 - `install.ps1` — the one-liner install: download, verify, extract, PATH.
 - `src/update.rs` — pure state machine (`step`/`parse_version`/
-  `select_asset`), worker thread (`spawn`), all gating constants.
+  `select_asset`), the full download/verify/swap worker (`spawn`), the
+  two-rename swap and startup `cleanup_leftovers`, all gating constants.
 - `src/panel.rs` — `paint_update_chip` (expanded footer) and
-  `paint_rail_update_glyph` (collapsed rails).
+  `paint_rail_update_glyph` (collapsed rails, steady glyph).
 - `src/main.rs` — App wiring: event drain, chip state hand-off, release-only
-  spawn gating.
+  spawn gating, the restart handshake (`FOREMAN_WAIT_PID`, `restart_for_update`).
+- `src/control.rs` — pipe-creation retry (`listen_retry`) so a restarted
+  instance wins `\\.\pipe\foreman` even if the old one lingers a beat past
+  the restart handshake's wait.
