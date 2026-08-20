@@ -31,7 +31,7 @@ pub enum State {
     Idle,
     UpdateAvailable { offer: Offer, can_apply: bool },
     Downloading { offer: Offer, progress: f32 },
-    ReadyToRestart { armed: bool },
+    ReadyToRestart { armed: bool, version: String },
     Error { offer: Offer, retryable: bool },
 }
 
@@ -198,17 +198,52 @@ pub fn step(state: State, ev: Event, current: &str) -> (State, Vec<Effect>) {
             },
             vec![],
         ),
-        (S::Downloading { .. }, E::SwapOk) => (S::ReadyToRestart { armed: false }, vec![]),
-        (S::ReadyToRestart { armed: false }, E::ClickChip) => {
-            (S::ReadyToRestart { armed: true }, vec![])
-        }
-        (S::ReadyToRestart { armed: true }, E::ClickChip) => (
-            S::ReadyToRestart { armed: true },
+        (S::Downloading { offer, .. }, E::SwapOk) => (
+            S::ReadyToRestart {
+                armed: false,
+                version: offer.version,
+            },
+            vec![],
+        ),
+        (
+            S::ReadyToRestart {
+                armed: false,
+                version,
+            },
+            E::ClickChip,
+        ) => (
+            S::ReadyToRestart {
+                armed: true,
+                version,
+            },
+            vec![],
+        ),
+        (
+            S::ReadyToRestart {
+                armed: true,
+                version,
+            },
+            E::ClickChip,
+        ) => (
+            S::ReadyToRestart {
+                armed: true,
+                version,
+            },
             vec![X::SaveWorkspaceAndRestart],
         ),
-        (S::ReadyToRestart { armed: true }, E::ArmTimeout) => {
-            (S::ReadyToRestart { armed: false }, vec![])
-        }
+        (
+            S::ReadyToRestart {
+                armed: true,
+                version,
+            },
+            E::ArmTimeout,
+        ) => (
+            S::ReadyToRestart {
+                armed: false,
+                version,
+            },
+            vec![],
+        ),
         (
             S::Error {
                 offer,
@@ -895,7 +930,13 @@ mod tests {
         let (s, fx) = step(s, Event::DownloadDone, "0.2.10");
         assert_eq!(fx, vec![Effect::VerifyAndSwap]);
         let (s, fx) = step(s, Event::SwapOk, "0.2.10");
-        assert_eq!(s, State::ReadyToRestart { armed: false });
+        assert_eq!(
+            s,
+            State::ReadyToRestart {
+                armed: false,
+                version: "v0.3.0".into(),
+            }
+        );
         assert!(fx.is_empty());
     }
 
@@ -941,14 +982,29 @@ mod tests {
     #[test]
     fn restart_requires_arm_then_confirm_and_timeout_disarms() {
         let (s, fx) = step(
-            State::ReadyToRestart { armed: false },
+            State::ReadyToRestart {
+                armed: false,
+                version: "v0.3.0".into(),
+            },
             Event::ClickChip,
             "0.2.10",
         );
-        assert_eq!(s, State::ReadyToRestart { armed: true });
+        assert_eq!(
+            s,
+            State::ReadyToRestart {
+                armed: true,
+                version: "v0.3.0".into(),
+            }
+        );
         assert!(fx.is_empty());
         let (s2, fx) = step(s.clone(), Event::ArmTimeout, "0.2.10");
-        assert_eq!(s2, State::ReadyToRestart { armed: false });
+        assert_eq!(
+            s2,
+            State::ReadyToRestart {
+                armed: false,
+                version: "v0.3.0".into(),
+            }
+        );
         assert!(fx.is_empty());
         let (_, fx) = step(s, Event::ClickChip, "0.2.10");
         assert_eq!(fx, vec![Effect::SaveWorkspaceAndRestart]);
@@ -965,7 +1021,10 @@ mod tests {
                 offer: offer(true, true),
                 progress: 0.5,
             },
-            State::ReadyToRestart { armed: false },
+            State::ReadyToRestart {
+                armed: false,
+                version: "v0.3.0".into(),
+            },
         ] {
             let (s2, fx) = step(
                 s.clone(),

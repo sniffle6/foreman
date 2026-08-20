@@ -163,8 +163,14 @@ impl App {
                     offer: fake_offer(),
                     progress: 0.43,
                 },
-                Some("ready") => update::State::ReadyToRestart { armed: false },
-                Some("armed") => update::State::ReadyToRestart { armed: true },
+                Some("ready") => update::State::ReadyToRestart {
+                    armed: false,
+                    version: "v9.9.9".into(),
+                },
+                Some("armed") => update::State::ReadyToRestart {
+                    armed: true,
+                    version: "v9.9.9".into(),
+                },
                 Some("err") => update::State::Error {
                     offer: fake_offer(),
                     retryable: true,
@@ -641,18 +647,18 @@ impl eframe::App for App {
         // Auto-disarm the restart chip 5s after it's first armed, so a stray
         // click doesn't leave a live restart primed indefinitely.
         match (&self.update_state, self.arm_deadline) {
-            (update::State::ReadyToRestart { armed: true }, None) => {
+            (update::State::ReadyToRestart { armed: true, .. }, None) => {
                 let d = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 self.arm_deadline = Some(d);
                 ctx.request_repaint_after(std::time::Duration::from_secs(5));
             }
-            (update::State::ReadyToRestart { armed: true }, Some(d))
+            (update::State::ReadyToRestart { armed: true, .. }, Some(d))
                 if std::time::Instant::now() >= d =>
             {
                 self.arm_deadline = None;
                 self.drive_update(update::Event::ArmTimeout, &ctx);
             }
-            (update::State::ReadyToRestart { armed: true }, Some(_)) => {}
+            (update::State::ReadyToRestart { armed: true, .. }, Some(_)) => {}
             _ => self.arm_deadline = None,
         }
 
@@ -675,9 +681,10 @@ impl eframe::App for App {
                     progress: *progress,
                 })
             }
-            update::State::ReadyToRestart { armed } => {
-                Some(panel::UpdateChip::Restart { armed: *armed })
-            }
+            update::State::ReadyToRestart { armed, version } => Some(panel::UpdateChip::Restart {
+                armed: *armed,
+                version: version.clone(),
+            }),
             update::State::Error { retryable, .. } => Some(panel::UpdateChip::Failed {
                 retryable: *retryable,
             }),

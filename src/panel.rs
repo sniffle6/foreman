@@ -105,7 +105,7 @@ pub enum UpdateChip {
     /// In-flight download; `progress` is 0..=1.
     Downloading { version: String, progress: f32 },
     /// Swap complete; `armed` is the arm-then-confirm gate on restart.
-    Restart { armed: bool },
+    Restart { armed: bool, version: String },
     /// Download/verify/swap failed; `retryable` picks retry vs. release notes.
     Failed { retryable: bool },
 }
@@ -120,10 +120,17 @@ fn chip_text(chip: &UpdateChip, sessions: usize) -> (String, bool) {
             let pct = (progress * 100.0) as u32;
             (format!("↓ {version} — {pct}%"), false)
         }
-        UpdateChip::Restart { armed: false } => ("↻ Restart to update".to_string(), false),
-        UpdateChip::Restart { armed: true } => {
-            let noun = if sessions == 1 { "session" } else { "sessions" };
-            (format!("Restart? {sessions} {noun} close"), true)
+        UpdateChip::Restart {
+            armed: false,
+            version,
+        } => (format!("↻ Restart to update → {version}"), false),
+        UpdateChip::Restart { armed: true, .. } => {
+            let clause = if sessions == 1 {
+                "1 session closes"
+            } else {
+                &format!("{sessions} sessions close")
+            };
+            (format!("Restart? {clause}"), true)
         }
         UpdateChip::Failed { retryable: true } => ("Update failed — retry".to_string(), true),
         UpdateChip::Failed { retryable: false } => {
@@ -1144,4 +1151,39 @@ fn paint_icon(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         tint,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chip_text_names_the_staged_version_and_flags_danger_right() {
+        let (t, danger) = chip_text(
+            &UpdateChip::Restart {
+                armed: false,
+                version: "v0.3.1".into(),
+            },
+            4,
+        );
+        assert_eq!(t, "↻ Restart to update → v0.3.1");
+        assert!(!danger);
+        let (t, danger) = chip_text(
+            &UpdateChip::Restart {
+                armed: true,
+                version: "v0.3.1".into(),
+            },
+            4,
+        );
+        assert_eq!(t, "Restart? 4 sessions close");
+        assert!(danger);
+        let (t, _) = chip_text(
+            &UpdateChip::Restart {
+                armed: true,
+                version: "v0.3.1".into(),
+            },
+            1,
+        );
+        assert_eq!(t, "Restart? 1 session closes");
+    }
 }
