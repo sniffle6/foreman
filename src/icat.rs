@@ -63,6 +63,61 @@ pub fn fit(img: (u32, u32), pane_cols: u16, pane_rows: u16) -> (u16, u16) {
     )
 }
 
+/// Downscale headroom for hi-DPI panes: the renderer may paint a cell at up
+/// to ~2x the assumed 8px width, so only shrink sources larger than 2x the
+/// displayed estimate — linear filtering handles minification below 2:1
+/// without shimmer; past it, pre-shrinking is what keeps screenshots crisp.
+const DPI_HEADROOM: u32 = 2;
+
+/// Area-average (box) resize of tight RGBA pixels. Unweighted over the
+/// covering source rect — exact for integer ratios, visually fine for the
+/// large minifications this is used for.
+pub fn downscale_rgba(rgba: &[u8], w: u32, h: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (w, h, dw, dh) = (w as usize, h as usize, dw as usize, dh as usize);
+    let mut out = Vec::with_capacity(dw * dh * 4);
+    for y in 0..dh {
+        let y0 = y * h / dh;
+        let y1 = ((y + 1) * h / dh).max(y0 + 1);
+        for x in 0..dw {
+            let x0 = x * w / dw;
+            let x1 = ((x + 1) * w / dw).max(x0 + 1);
+            let mut acc = [0u64; 4];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let p = (sy * w + sx) * 4;
+                    for (a, &v) in acc.iter_mut().zip(&rgba[p..p + 4]) {
+                        *a += u64::from(v);
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u64;
+            out.extend(acc.iter().map(|&a| (a / n) as u8));
+        }
+    }
+    out
+}
+
+/// Shrink a PNG to at most `max_w` pixels wide (aspect kept), re-encoded as
+/// RGBA8. `None` = already small enough, transmit the original bytes.
+pub fn shrink_to_fit(png: &[u8], max_w: u32) -> Result<Option<Vec<u8>>, String> {
+    let (w, h, rgba) = crate::graphics::decode_png(png).map_err(str::to_owned)?;
+    if w <= max_w.max(1) {
+        return Ok(None);
+    }
+    let dw = max_w.max(1);
+    let dh = (u64::from(h) * u64::from(dw) / u64::from(w)).max(1) as u32;
+    let small = downscale_rgba(&rgba, w, h, dw, dh);
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, dw, dh);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+        writer.write_image_data(&small).map_err(|e| e.to_string())?;
+    }
+    Ok(Some(out))
+}
+
 /// PNG signature + IHDR dimensions, without decoding pixel data.
 pub fn png_dims(bytes: &[u8]) -> Result<(u32, u32), String> {
     const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
@@ -133,6 +188,16 @@ pub fn icat_main(args: &[String]) -> i32 {
         // Explicit --cols keeps aspect but skips the width heuristics.
         Some(n) => fit(dims, n.saturating_add(2), pane_rows),
         None => fit(dims, pane_cols, pane_rows),
+    };
+    // Pre-shrink sources much larger than the displayed estimate so big
+    // screenshots stay crisp (and cheap to transmit) under linear filtering.
+    let bytes = match shrink_to_fit(&bytes, u32::from(c) * CELL_W * DPI_HEADROOM) {
+        Ok(Some(smaller)) => smaller,
+        Ok(None) => bytes,
+        Err(e) => {
+            eprintln!("foreman icat: {path}: {e}");
+            return 2;
+        }
     };
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();
@@ -256,6 +321,50 @@ mod tests {
         assert_eq!(fit((16, 16), 120, 40), (2, 1));
         // Very tall image is height-capped with width re-derived from aspect.
         assert_eq!(fit((100, 2000), 80, 24), (2, 21));
+    }
+
+    #[test]
+    fn downscale_averages_covered_source_pixels() {
+        // 2x1 black+white -> 1x1 mid-gray (127 by integer division).
+        let bw = [0, 0, 0, 255, 255, 255, 255, 255];
+        assert_eq!(downscale_rgba(&bw, 2, 1, 1, 1), vec![127, 127, 127, 255]);
+        // 4x4 of four solid 2x2 quadrants -> 2x2 of exactly those colors.
+        let q = |c: [u8; 4]| c;
+        let (red, grn, blu, wht) = (
+            q([255, 0, 0, 255]),
+            q([0, 255, 0, 255]),
+            q([0, 0, 255, 255]),
+            q([255, 255, 255, 255]),
+        );
+        let mut src = Vec::new();
+        for row in [
+            [red, red, grn, grn],
+            [red, red, grn, grn],
+            [blu, blu, wht, wht],
+            [blu, blu, wht, wht],
+        ] {
+            for px in row {
+                src.extend_from_slice(&px);
+            }
+        }
+        let out = downscale_rgba(&src, 4, 4, 2, 2);
+        assert_eq!(out[0..4], red);
+        assert_eq!(out[4..8], grn);
+        assert_eq!(out[8..12], blu);
+        assert_eq!(out[12..16], wht);
+    }
+
+    #[test]
+    fn shrink_to_fit_halves_a_large_png_and_leaves_small_ones_alone() {
+        let big = png_of(100, 60, |_| [10, 200, 30, 255]);
+        let shrunk = shrink_to_fit(&big, 50).unwrap().expect("must shrink");
+        assert_eq!(png_dims(&shrunk), Ok((50, 30)));
+        // Solid color must survive the round-trip exactly.
+        let (_, _, rgba) = crate::graphics::decode_png(&shrunk).unwrap();
+        assert!(rgba.chunks_exact(4).all(|p| p == [10, 200, 30, 255]));
+        // Already small enough: untouched.
+        assert!(shrink_to_fit(&big, 100).unwrap().is_none());
+        assert!(shrink_to_fit(&big, 500).unwrap().is_none());
     }
 
     #[test]

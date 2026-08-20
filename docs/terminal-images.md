@@ -22,6 +22,10 @@ screenshot and runs `foreman icat shot.png` so the human sees it in the pane.
   capped below the viewport because a placement that scrolls off the top is
   deleted (placement semantics above).
 - PNG only in v1 (the image store only decodes PNG).
+- Sources wider than 2x the displayed estimate (2x = hi-DPI headroom) are
+  pre-shrunk with an area-average filter and re-encoded before transmit —
+  linear filtering shimmers past 2:1 minification, so this is what keeps a
+  4K screenshot crisp (and small on the wire). Smaller images go untouched.
 - icat prints `rows` newlines after the image so the prompt lands below it
   (the renderer deliberately doesn't advance the cursor — v1 limit).
 - The image behaves like ordinary output: scrolls with the buffer, gone once

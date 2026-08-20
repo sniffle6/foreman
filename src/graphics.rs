@@ -580,7 +580,8 @@ fn decode_image(h: &Header, b64: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static 
     }
 }
 
-fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
+// pub(crate): icat's downscale path reuses this exact normalization.
+pub(crate) fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>), &'static str> {
     let mut dec = png::Decoder::new(data);
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().map_err(|_| "EBADPNG")?;
