@@ -1,4 +1,4 @@
-# Terminal Images (kitty graphics, image paste, alt-key routing)
+# Terminal Images (kitty graphics, icat, image paste, alt-key routing)
 
 ## What / why
 
@@ -7,6 +7,29 @@ display at cursor → delete by id, chunked transmission), delivers image-paste
 keystrokes to agents (Alt+V, Ctrl+V, Ctrl+Alt+V), and no longer double-sends
 Alt+letter. Spec with all decisions:
 docs/superpowers/specs/2026-07-02-terminal-image-support-design.md
+
+## foreman icat — show an image in your pane
+
+`foreman icat <file.png> [--cols N]` prints an image into the current
+terminal by emitting the same kitty APC bytes on stdout (Codex chunk format:
+full header + `m=1`, bare continuations, `m=0` final). No pipe, no GUI code —
+stdout IS the PTY, so the running foreman's scanner renders it like any other
+client, and it also works in kitty/WezTerm. The main use: an agent finishes a
+screenshot and runs `foreman icat shot.png` so the human sees it in the pane.
+
+- Sized to the console width (minus a margin), aspect kept via a ~1:2 cell
+  ratio; small images are never stretched past their natural span; height is
+  capped below the viewport because a placement that scrolls off the top is
+  deleted (placement semantics above).
+- PNG only in v1 (the image store only decodes PNG).
+- icat prints `rows` newlines after the image so the prompt lands below it
+  (the renderer deliberately doesn't advance the cursor — v1 limit).
+- The image behaves like ordinary output: scrolls with the buffer, gone once
+  it scrolls off the top.
+- Image id = the icat process id, so repeated icats never collide.
+- Pure seams (`encode`, `fit`, `png_dims`) are unit-tested round-trip through
+  `graphics::Graphics::feed`/`apply`/`visible` — the tests drive the real
+  renderer, not a mock.
 
 ## How it works
 
@@ -105,6 +128,8 @@ than the parse it rides alongside.
 ## Key files
 
 - src/graphics.rs — scanner, kitty parser, image store, placements (pure)
+- src/icat.rs — `foreman icat`: kitty APC encoder + fit math + console-size
+  probe (CLI-side; dispatched from control.rs's client_main)
 - src/terminal.rs — advance_scanned/term_view, pump segmenting, texture cache,
   overlay painting, clipboard_has_image, conpty canary + perf bench tests
 - src/input.rs — alt/ctrl+alt routing, empty-paste fallback

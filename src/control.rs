@@ -719,6 +719,7 @@ USAGE
   foreman close [tN ...] [--project P]      close terminals (no ids: your own pane)
   foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
   foreman snapshot [--project P] [--terminal T]       read the rendered viewport
+  foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help)
@@ -823,6 +824,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("close") => close_main(&args[1..]),
         Some("send") => send_main(&args[1..]),
         Some("snapshot") => snapshot_main(&args[1..]),
+        Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -837,6 +839,7 @@ pub fn client_main(args: &[String]) -> i32 {
                 "       foreman send [--project P] [--terminal T] --text TXT [--keys \"K\"] [--settle-ms N]"
             );
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
+            eprintln!("       foreman icat <file.png> [--cols N]");
             eprintln!("       foreman help");
             2
         }

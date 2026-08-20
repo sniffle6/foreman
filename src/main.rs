@@ -16,6 +16,7 @@ mod emoji_raster;
 mod frame;
 mod geom;
 mod graphics;
+mod icat;
 mod icons;
 mod input;
 mod inspect;
