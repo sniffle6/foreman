@@ -1,7 +1,8 @@
 # One-Click Update (Phase 4) — Design
 
 Date: 2026-08-19
-Status: implemented (v0.3.x pilot pending); extends
+Status: implemented; live pilot PASSED 2026-08-20 (v0.3.0 one-clicked to v0.3.1,
+installed exe hash-verified against the release asset, leftovers cleaned). Extends
 `2026-07-14-install-and-update-design.md` (section 3 "Apply (Phase 4)"),
 which stays authoritative for everything not restated here.
 
