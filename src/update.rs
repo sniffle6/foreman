@@ -391,6 +391,119 @@ pub fn cleanup_leftovers() {
     let _ = std::fs::remove_dir_all(staging_dir());
 }
 
+struct Staged {
+    zip_path: std::path::PathBuf,
+    sums_path: std::path::PathBuf,
+    zip_name: String,
+}
+
+// Byte-download sibling of fetch_url: same agent/UA shape but streams the
+// body to a file instead of parsing JSON. `progress` is None for the tiny
+// sums file; for the zip it carries the channel to report whole-percent
+// Progress events on. Missing Content-Length means no progress events at
+// all -- the chip just shows the downloading label (spec: best effort).
+fn download_to_file(
+    url: &str,
+    dest: &std::path::Path,
+    progress: Option<(&std::sync::mpsc::Sender<Event>, &eframe::egui::Context)>,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let ua = concat!(
+        "foreman/",
+        env!("CARGO_PKG_VERSION"),
+        " (+https://github.com/sniffle6/foreman)"
+    );
+    // A 15 MB zip on a slow link can take a while; the 10s global timeout
+    // fetch_url uses for the tiny release-info call would kill it.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(300)))
+        .build()
+        .into();
+    let mut resp = agent
+        .get(url)
+        .header("User-Agent", ua)
+        .call()
+        .map_err(|e| e.to_string())?;
+    let total = resp.body().content_length();
+    let mut file = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut reader = resp.body_mut().as_reader();
+    let mut buf = [0u8; 65536];
+    let mut done: u64 = 0;
+    let mut last_pct: u64 = u64::MAX;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        done += n as u64;
+        if let (Some((event_tx, ctx)), Some(total)) = (progress, total) {
+            if total > 0 {
+                let pct = done * 100 / total;
+                if pct != last_pct {
+                    last_pct = pct;
+                    let _ = event_tx.send(Event::Progress(done as f32 / total as f32));
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn download_release(
+    zip: &Asset,
+    sums: &Asset,
+    event_tx: &std::sync::mpsc::Sender<Event>,
+    ctx: &eframe::egui::Context,
+) -> Result<Staged, String> {
+    let dir = staging_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let sums_path = dir.join("SHA256SUMS.txt");
+    download_to_file(&sums.browser_download_url, &sums_path, None)?;
+    let zip_path = dir.join(&zip.name);
+    download_to_file(&zip.browser_download_url, &zip_path, Some((event_tx, ctx)))?;
+    Ok(Staged {
+        zip_path,
+        sums_path,
+        zip_name: zip.name.clone(),
+    })
+}
+
+fn verify_and_swap(st: &Staged) -> Event {
+    let sums_text = match std::fs::read_to_string(&st.sums_path) {
+        Ok(t) => t,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(staging_dir());
+            return Event::HashBad;
+        }
+    };
+    let expected = expected_hash(&sums_text, &st.zip_name);
+    let actual = sha256_hex(&st.zip_path).ok();
+    if expected.is_none() || expected != actual {
+        let _ = std::fs::remove_dir_all(staging_dir());
+        return Event::HashBad;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return Event::SwapFailed,
+    };
+    if let Err(e) = extract_exe(&st.zip_path, &sibling(&exe, ".new")) {
+        eprintln!("update: extract failed: {e}");
+        return Event::SwapFailed;
+    }
+    match swap_exe(&exe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(staging_dir());
+            Event::SwapOk
+        }
+        Err(e) => {
+            eprintln!("update: swap failed: {e}");
+            Event::SwapFailed
+        }
+    }
+}
+
 /// Worker thread: executes Effects, reports Events (channel + repaint --
 /// the same seam shape as Session's PTY reader thread, terminal.rs:824).
 /// Self-schedules the periodic check; Phase-4 effects are accepted and
@@ -402,6 +515,7 @@ pub fn spawn(
 ) {
     std::thread::spawn(move || {
         let mut next_check = std::time::Instant::now() + FIRST_CHECK;
+        let mut staged: Option<Staged> = None;
         loop {
             let wait = next_check.saturating_duration_since(std::time::Instant::now());
             match effect_rx.recv_timeout(wait) {
@@ -411,15 +525,48 @@ pub fn spawn(
                     ctx.request_repaint();
                     continue;
                 }
-                Ok(_) => continue, // Phase-4 effects: not executed yet
+                Ok(Effect::Download { zip, sums }) => {
+                    let ev = match download_release(&zip, &sums, &event_tx, &ctx) {
+                        Ok(st) => {
+                            staged = Some(st);
+                            Event::DownloadDone
+                        }
+                        Err(e) => {
+                            eprintln!("update: download failed: {e}");
+                            Event::FetchFailed
+                        }
+                    };
+                    if event_tx.send(ev).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                    continue;
+                }
+                Ok(Effect::VerifyAndSwap) => {
+                    let ev = match staged.take() {
+                        Some(st) => verify_and_swap(&st),
+                        None => Event::SwapFailed, // effect without a download: defensive
+                    };
+                    if event_tx.send(ev).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                    continue;
+                }
+                // App intercepts the click before it ever reaches the worker
+                // (it saves the workspace and restarts the process itself).
+                Ok(Effect::SaveWorkspaceAndRestart) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
             let ev = match fetch_latest() {
-                Ok(r) => Event::ReleaseFetched {
-                    info: r,
-                    writable: false,
-                },
+                Ok(r) => {
+                    let writable = std::env::current_exe()
+                        .ok()
+                        .and_then(|e| e.parent().map(probe_writable))
+                        .unwrap_or(false);
+                    Event::ReleaseFetched { info: r, writable }
+                }
                 Err(e) => {
                     eprintln!("update: check failed (will retry): {e}");
                     Event::FetchFailed
