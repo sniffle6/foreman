@@ -65,6 +65,10 @@ struct App {
     update_fx: std::sync::mpsc::Sender<update::Effect>,
     /// Current updater state; rendered by the panel chip (a later task).
     update_state: update::State,
+    /// Deadline for the armed restart chip to auto-disarm (5s after the first
+    /// click), or `None` when not armed. Cleared on any state other than
+    /// `ReadyToRestart { armed: true }`.
+    arm_deadline: Option<std::time::Instant>,
     /// Persisted app settings. Seeded into egui's per-context data each frame and
     /// read back to capture edits from any channel: Ctrl+Scroll/Ctrl+0 zoom, panel
     /// collapse/dock, and the settings menu.
@@ -190,6 +194,7 @@ impl App {
             update_rx,
             update_fx,
             update_state,
+            arm_deadline: None,
             settings,
             font_dirty_at: None,
             workspace_dirty_at: None,
@@ -216,6 +221,49 @@ impl App {
             eprintln!("foreman: could not save workspace: {e}");
         }
         self.workspace_dirty_at = None;
+    }
+
+    /// Feed one event through the state machine and dispatch its effects.
+    /// SaveWorkspaceAndRestart is App's own (needs the live tree + viewport);
+    /// everything else goes to the worker.
+    fn drive_update(&mut self, ev: update::Event, ctx: &egui::Context) {
+        let state = std::mem::replace(&mut self.update_state, update::State::Idle);
+        let (state, effects) = update::step(state, ev, env!("CARGO_PKG_VERSION"));
+        self.update_state = state;
+        for fx in effects {
+            match fx {
+                update::Effect::SaveWorkspaceAndRestart => self.restart_for_update(ctx),
+                other => {
+                    let _ = self.update_fx.send(other);
+                }
+            }
+        }
+    }
+
+    /// Flush the workspace, spawn the freshly-swapped exe with our pid so it
+    /// can wait us out, then close. Spawn failure leaves the app running —
+    /// the swap already happened, so a manual restart still updates.
+    fn restart_for_update(&mut self, ctx: &egui::Context) {
+        self.flush_workspace();
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        match std::process::Command::new(&exe)
+            .env("FOREMAN_WAIT_PID", std::process::id().to_string())
+            .spawn()
+        {
+            Ok(_) => {
+                self.force_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.notify.push(
+                    notify::Level::Error,
+                    format!("update restart failed: {e}"),
+                    std::time::Instant::now(),
+                );
+            }
+        }
     }
 }
 
@@ -581,12 +629,25 @@ impl eframe::App for App {
         }
 
         while let Ok(ev) = self.update_rx.try_recv() {
-            let state = std::mem::replace(&mut self.update_state, update::State::Idle);
-            let (state, effects) = update::step(state, ev, env!("CARGO_PKG_VERSION"));
-            self.update_state = state;
-            for fx in effects {
-                let _ = self.update_fx.send(fx);
+            self.drive_update(ev, &ctx);
+        }
+
+        // Auto-disarm the restart chip 5s after it's first armed, so a stray
+        // click doesn't leave a live restart primed indefinitely.
+        match (&self.update_state, self.arm_deadline) {
+            (update::State::ReadyToRestart { armed: true }, None) => {
+                let d = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                self.arm_deadline = Some(d);
+                ctx.request_repaint_after(std::time::Duration::from_secs(5));
             }
+            (update::State::ReadyToRestart { armed: true }, Some(d))
+                if std::time::Instant::now() >= d =>
+            {
+                self.arm_deadline = None;
+                self.drive_update(update::Event::ArmTimeout, &ctx);
+            }
+            (update::State::ReadyToRestart { armed: true }, Some(_)) => {}
+            _ => self.arm_deadline = None,
         }
 
         self.desktop.set_update_chip(match &self.update_state {
@@ -660,13 +721,7 @@ impl eframe::App for App {
                 .show(ui, area, true, egui::Id::new("desktop"), false);
         }
         if self.desktop.take_update_click() {
-            let state = std::mem::replace(&mut self.update_state, update::State::Idle);
-            let (state, effects) =
-                update::step(state, update::Event::ClickChip, env!("CARGO_PKG_VERSION"));
-            self.update_state = state;
-            for fx in effects {
-                let _ = self.update_fx.send(fx);
-            }
+            self.drive_update(update::Event::ClickChip, &ctx);
         }
         // "Check for updates now" (Startup pane): fires the same fetch the
         // launch check and periodic re-check use, regardless of `update_check`
@@ -1008,7 +1063,35 @@ fn attach_parent_console() {
     }
 }
 
+/// Block until `pid` exits or `timeout` passes. Best effort: open failure
+/// (already gone, or access denied) returns immediately.
+fn wait_for_exit(pid: u32, timeout: std::time::Duration) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return;
+        }
+        WaitForSingleObject(h, timeout.as_millis() as u32);
+        CloseHandle(h);
+    }
+}
+
 fn main() -> eframe::Result {
+    // Update-restart handshake: the old instance spawned us with its pid.
+    // Wait (bounded) for it to fully exit so we don't race its control pipe
+    // or paint two desktops at once, then keep the var out of terminals' env.
+    if let Some(pid) = std::env::var("FOREMAN_WAIT_PID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        unsafe { std::env::remove_var("FOREMAN_WAIT_PID") };
+        wait_for_exit(pid, std::time::Duration::from_secs(10));
+    }
+    update::cleanup_leftovers();
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
