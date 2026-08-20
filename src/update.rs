@@ -39,6 +39,7 @@ pub enum State {
 pub enum Event {
     ReleaseFetched { info: ReleaseInfo, writable: bool },
     FetchFailed,
+    DownloadFailed,
     ClickChip,
     Progress(f32),
     DownloadDone,
@@ -164,13 +165,18 @@ pub fn step(state: State, ev: Event, current: &str) -> (State, Vec<Effect>) {
         (S::Downloading { offer, .. }, E::Progress(p)) => {
             (S::Downloading { offer, progress: p }, vec![])
         }
-        (S::Downloading { offer, .. }, E::FetchFailed) => (
+        (S::Downloading { offer, .. }, E::DownloadFailed) => (
             S::Error {
                 offer,
                 retryable: true,
             },
             vec![],
         ),
+        // A background release-check failure that lands mid-download (e.g. a
+        // queued "Check now") must not clobber an in-flight download or a
+        // download that already finished and is awaiting verify — silent skip,
+        // same as everywhere else FetchFailed is ignored.
+        (s @ S::Downloading { .. }, E::FetchFailed) => (s, vec![]),
         (S::Downloading { offer, .. }, E::DownloadDone) => (
             S::Downloading {
                 offer,
@@ -340,15 +346,18 @@ pub fn expected_hash(sums_text: &str, file_name: &str) -> Option<String> {
     None
 }
 
-// Release zips store foreman.exe at the root; match by suffix in case a
-// future release nests it (spec doesn't guarantee root, just presence).
+// Release zips store foreman.exe at the root; match by final path component
+// in case a future release nests it (spec doesn't guarantee root, just
+// presence) -- NOT by suffix, which would also match "not-foreman.exe".
 pub fn extract_exe(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     let f = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
     let mut idx = None;
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        if entry.name().ends_with("foreman.exe") {
+        if std::path::Path::new(entry.name()).file_name()
+            == Some(std::ffi::OsStr::new("foreman.exe"))
+        {
             idx = Some(i);
             break;
         }
@@ -387,6 +396,7 @@ pub fn swap_exe(exe: &std::path::Path) -> Result<(), String> {
 pub fn cleanup_leftovers() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(sibling(&exe, ".old"));
+        let _ = std::fs::remove_file(sibling(&exe, ".new"));
     }
     let _ = std::fs::remove_dir_all(staging_dir());
 }
@@ -402,7 +412,22 @@ struct Staged {
 // sums file; for the zip it carries the channel to report whole-percent
 // Progress events on. Missing Content-Length means no progress events at
 // all -- the chip just shows the downloading label (spec: best effort).
+// Best-effort cleanup wrapper: on any failure, the partially-written file (if
+// it got as far as being created) is removed rather than left behind in
+// staging_dir() for the next check/attempt to trip over.
 fn download_to_file(
+    url: &str,
+    dest: &std::path::Path,
+    progress: Option<(&std::sync::mpsc::Sender<Event>, &eframe::egui::Context)>,
+) -> Result<(), String> {
+    let result = download_to_file_inner(url, dest, progress);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+fn download_to_file_inner(
     url: &str,
     dest: &std::path::Path,
     progress: Option<(&std::sync::mpsc::Sender<Event>, &eframe::egui::Context)>,
@@ -461,7 +486,9 @@ fn download_release(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let sums_path = dir.join("SHA256SUMS.txt");
     download_to_file(&sums.browser_download_url, &sums_path, None)?;
-    let zip_path = dir.join(&zip.name);
+    // Fixed name, never the API-supplied asset name -- zip.name is kept only
+    // as the SHA256SUMS.txt lookup key (Staged.zip_name), not joined into a path.
+    let zip_path = dir.join("update.zip");
     download_to_file(&zip.browser_download_url, &zip_path, Some((event_tx, ctx)))?;
     Ok(Staged {
         zip_path,
@@ -533,13 +560,16 @@ pub fn spawn(
                         }
                         Err(e) => {
                             eprintln!("update: download failed: {e}");
-                            Event::FetchFailed
+                            Event::DownloadFailed
                         }
                     };
                     if event_tx.send(ev).is_err() {
                         break;
                     }
                     ctx.request_repaint();
+                    // A verify that follows must never be delayed behind a
+                    // blocking periodic release fetch.
+                    next_check = std::time::Instant::now() + CHECK_EVERY;
                     continue;
                 }
                 Ok(Effect::VerifyAndSwap) => {
@@ -551,6 +581,7 @@ pub fn spawn(
                         break;
                     }
                     ctx.request_repaint();
+                    next_check = std::time::Instant::now() + CHECK_EVERY;
                     continue;
                 }
                 // App intercepts the click before it ever reaches the worker
@@ -796,6 +827,22 @@ mod tests {
         assert!(fx.is_empty());
     }
 
+    #[test]
+    fn background_fetch_failure_during_download_is_silent_skip() {
+        // A queued "Check now" landing mid-download (or right after one
+        // finishes, awaiting verify) must not clobber the download in
+        // progress -- only a DownloadFailed event does that.
+        for progress in [0.0, 0.5, 1.0] {
+            let s = State::Downloading {
+                offer: offer(true, true),
+                progress,
+            };
+            let (s2, fx) = step(s.clone(), Event::FetchFailed, "0.2.10");
+            assert_eq!(s2, s);
+            assert!(fx.is_empty());
+        }
+    }
+
     // step: chip click
     #[test]
     fn click_without_can_apply_opens_releases_page() {
@@ -856,7 +903,7 @@ mod tests {
     fn hash_bad_and_download_failure_are_retryable_swap_failure_is_not() {
         for (ev, retryable) in [
             (Event::HashBad, true),
-            (Event::FetchFailed, true),
+            (Event::DownloadFailed, true),
             (Event::SwapFailed, false),
         ] {
             let s = State::Downloading {
@@ -1049,6 +1096,11 @@ mod tests {
         let mut w = zip::ZipWriter::new(f);
         let opts = zip::write::SimpleFileOptions::default();
         use std::io::Write as _;
+        // Decoy first: a suffix match ("...foreman.exe") would wrongly grab
+        // this one, so it appears before the real entry to prove the exact
+        // final-path-component match wins.
+        w.start_file("xforeman.exe", opts).unwrap();
+        w.write_all(b"DECOY-BYTES").unwrap();
         w.start_file("foreman.exe", opts).unwrap();
         w.write_all(b"NEW-EXE-BYTES").unwrap();
         w.start_file("LICENSE", opts).unwrap();
@@ -1091,6 +1143,26 @@ mod tests {
         assert!(!probe_writable(std::path::Path::new(
             r"C:\nonexistent-foreman-probe-dir"
         )));
+    }
+
+    #[test]
+    fn cleanup_leftovers_removes_orphaned_old_and_new_and_staging_dir() {
+        // current_exe() in a test binary isn't foreman.exe, but cleanup_leftovers
+        // only ever derives sibling paths from it -- exercising it against the
+        // real test exe still proves both siblings get removed.
+        let exe = std::env::current_exe().unwrap();
+        let old = sibling(&exe, ".old");
+        let new = sibling(&exe, ".new");
+        std::fs::write(&old, b"leftover-old").unwrap();
+        std::fs::write(&new, b"leftover-new").unwrap();
+        std::fs::create_dir_all(staging_dir()).unwrap();
+        std::fs::write(staging_dir().join("stale.zip"), b"x").unwrap();
+
+        cleanup_leftovers();
+
+        assert!(!old.exists());
+        assert!(!new.exists());
+        assert!(!staging_dir().exists());
     }
 
     #[test]

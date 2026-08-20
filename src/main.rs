@@ -136,9 +136,11 @@ impl App {
             update::Offer {
                 version: "v9.9.9".into(),
                 html_url: update::RELEASES_URL.into(),
-                // Real assets (not None) so the `apply`/`err` stages exercise the
-                // actual click -> download path; the URL is unroutable so it fails
-                // fast into a retryable Error, itself a useful visual test.
+                // Real assets (not None) so the offer looks realistic. The URL is
+                // unroutable, but that's moot in debug: the update worker is never
+                // spawned here (see the `cfg!(debug_assertions)` gate below), so
+                // clicking `apply` just stalls in `Downloading — 0%` rather than
+                // actually hitting the network.
                 zip: Some(update::Asset {
                     name: "foreman-v9.9.9-x86_64-windows.zip".into(),
                     browser_download_url: "http://127.0.0.1:9/x".into(),
@@ -244,6 +246,9 @@ impl App {
     /// can wait us out, then close. Spawn failure leaves the app running —
     /// the swap already happened, so a manual restart still updates.
     fn restart_for_update(&mut self, ctx: &egui::Context) {
+        if self.force_quit {
+            return;
+        }
         self.flush_workspace();
         let Ok(exe) = std::env::current_exe() else {
             return;

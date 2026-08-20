@@ -71,10 +71,11 @@ instead of publishing.
   offer, `down` = downloading, `ready`/`armed` = restart prompt (unarmed/
   armed), `err`/`errswap` = retryable/non-retryable failure; any other
   non-empty value (including the old `=1`) falls back to a plain notify chip.
-  The fake offer's assets point at an unroutable URL, so clicking `apply` in a
-  debug build kicks off a real download that fails fast into `err` — useful
-  for screenshotting the error chip, but don't expect it to actually swap
-  anything.
+  The update worker is never spawned in debug builds, so the fake offer's
+  assets (pointed at an unroutable URL) are never actually fetched: clicking
+  `apply` just transitions to `Downloading — 0%` and stalls there forever.
+  To preview `err`/`errswap`, set `FOREMAN_UPDATE_TEST` to those values
+  directly rather than clicking through from `apply`.
 - `FOREMAN_WAIT_PID` is set internally by the restart handshake (the old
   instance passes its own pid to the freshly-spawned new one so it can wait
   the old process out) — never set this by hand.
