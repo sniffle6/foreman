@@ -124,22 +124,56 @@ impl App {
         update_rx: std::sync::mpsc::Receiver<update::Event>,
         update_fx: std::sync::mpsc::Sender<update::Effect>,
     ) -> Self {
-        // Debug-only preview: FOREMAN_UPDATE_TEST=1 fakes an available update
-        // so the chip can be seen/screenshotted without a real newer release.
-        let update_state =
-            if cfg!(debug_assertions) && std::env::var_os("FOREMAN_UPDATE_TEST").is_some() {
-                update::State::UpdateAvailable {
-                    offer: update::Offer {
-                        version: "v9.9.9".into(),
-                        html_url: update::RELEASES_URL.into(),
-                        zip: None,
-                        sums: None,
-                    },
+        // Debug-only preview: FOREMAN_UPDATE_TEST picks an initial update::State
+        // so every chip variant can be seen/screenshotted without a real newer
+        // release. Unknown non-empty values fall back to the plain Notify look
+        // (backward compatible with the old `=1` toggle).
+        fn fake_offer() -> update::Offer {
+            update::Offer {
+                version: "v9.9.9".into(),
+                html_url: update::RELEASES_URL.into(),
+                // Real assets (not None) so the `apply`/`err` stages exercise the
+                // actual click -> download path; the URL is unroutable so it fails
+                // fast into a retryable Error, itself a useful visual test.
+                zip: Some(update::Asset {
+                    name: "foreman-v9.9.9-x86_64-windows.zip".into(),
+                    browser_download_url: "http://127.0.0.1:9/x".into(),
+                }),
+                sums: Some(update::Asset {
+                    name: "SHA256SUMS.txt".into(),
+                    browser_download_url: "http://127.0.0.1:9/x".into(),
+                }),
+            }
+        }
+        let update_state = if cfg!(debug_assertions) {
+            match std::env::var("FOREMAN_UPDATE_TEST").ok().as_deref() {
+                None | Some("") => update::State::Idle,
+                Some("apply") => update::State::UpdateAvailable {
+                    offer: fake_offer(),
+                    can_apply: true,
+                },
+                Some("down") => update::State::Downloading {
+                    offer: fake_offer(),
+                    progress: 0.43,
+                },
+                Some("ready") => update::State::ReadyToRestart { armed: false },
+                Some("armed") => update::State::ReadyToRestart { armed: true },
+                Some("err") => update::State::Error {
+                    offer: fake_offer(),
+                    retryable: true,
+                },
+                Some("errswap") => update::State::Error {
+                    offer: fake_offer(),
+                    retryable: false,
+                },
+                Some(_) => update::State::UpdateAvailable {
+                    offer: fake_offer(),
                     can_apply: false,
-                }
-            } else {
-                update::State::Idle
-            };
+                },
+            }
+        } else {
+            update::State::Idle
+        };
         // Resolve the active theme from the persisted setting up front (the name
         // may reference a user theme file); both feed the struct literal below.
         let settings = config::Settings::load();
@@ -556,8 +590,31 @@ impl eframe::App for App {
         }
 
         self.desktop.set_update_chip(match &self.update_state {
-            update::State::UpdateAvailable { offer, .. } => Some(offer.version.clone()),
-            _ => None,
+            update::State::UpdateAvailable {
+                offer,
+                can_apply: false,
+            } => Some(panel::UpdateChip::Notify {
+                version: offer.version.clone(),
+            }),
+            update::State::UpdateAvailable {
+                offer,
+                can_apply: true,
+            } => Some(panel::UpdateChip::Apply {
+                version: offer.version.clone(),
+            }),
+            update::State::Downloading { offer, progress } => {
+                Some(panel::UpdateChip::Downloading {
+                    version: offer.version.clone(),
+                    progress: *progress,
+                })
+            }
+            update::State::ReadyToRestart { armed } => {
+                Some(panel::UpdateChip::Restart { armed: *armed })
+            }
+            update::State::Error { retryable, .. } => Some(panel::UpdateChip::Failed {
+                retryable: *retryable,
+            }),
+            update::State::Idle => None,
         });
 
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));

@@ -467,8 +467,8 @@ pub struct WindowManager {
     /// Structural workspace change since last poll (layout/open/close/focus/…).
     /// Desktop `poll_workspace_dirty` ORs this with nested project children.
     workspace_dirty: bool,
-    /// Version string to show as the panel's update chip (None = hidden).
-    update_chip: Option<String>,
+    /// Chip to show in the panel (None = hidden, i.e. `update::State::Idle`).
+    update_chip: Option<crate::panel::UpdateChip>,
     /// Latched when the user clicks the chip; App drains it each frame.
     update_clicked: bool,
     /// Latched when the settings menu's "Check for updates now" is clicked;
@@ -1889,8 +1889,8 @@ impl WindowManager {
         }
     }
 
-    /// Version string to show as the panel's update chip (None = hidden).
-    pub fn set_update_chip(&mut self, v: Option<String>) {
+    /// Chip to show in the panel (None = hidden, i.e. `update::State::Idle`).
+    pub fn set_update_chip(&mut self, v: Option<crate::panel::UpdateChip>) {
         self.update_chip = v;
     }
 

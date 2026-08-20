@@ -94,11 +94,62 @@ pub struct ProjectEntry {
     pub tabs: Vec<TabEntry>,
 }
 
+/// Display variant for the update chip; one per Phase-4 `update::State` case
+/// (`Idle` maps to `None` in `PanelModel.update`, not a variant here).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateChip {
+    /// Phase 3 look: not writable, click opens the release notes page.
+    Notify { version: String },
+    /// Writable and both assets present: click starts the download.
+    Apply { version: String },
+    /// In-flight download; `progress` is 0..=1.
+    Downloading { version: String, progress: f32 },
+    /// Swap complete; `armed` is the arm-then-confirm gate on restart.
+    Restart { armed: bool },
+    /// Download/verify/swap failed; `retryable` picks retry vs. release notes.
+    Failed { retryable: bool },
+}
+
+/// Chip label + danger flag for a given chip state. `sessions` is only read
+/// by `Restart { armed: true }` (every open tab that a restart would close).
+fn chip_text(chip: &UpdateChip, sessions: usize) -> (String, bool) {
+    match chip {
+        UpdateChip::Notify { version } => (format!("↓ {version} — click for release notes"), false),
+        UpdateChip::Apply { version } => (format!("↓ {version} — click to update"), false),
+        UpdateChip::Downloading { version, progress } => {
+            let pct = (progress * 100.0) as u32;
+            (format!("↓ {version} — {pct}%"), false)
+        }
+        UpdateChip::Restart { armed: false } => ("↻ Restart to update".to_string(), false),
+        UpdateChip::Restart { armed: true } => {
+            let noun = if sessions == 1 { "session" } else { "sessions" };
+            (format!("Restart? {sessions} {noun} close"), true)
+        }
+        UpdateChip::Failed { retryable: true } => ("Update failed — retry".to_string(), true),
+        UpdateChip::Failed { retryable: false } => {
+            ("Update failed — release notes".to_string(), true)
+        }
+    }
+}
+
+/// Rail-glyph counterpart of `chip_text`'s color grouping: `↓` while a
+/// release is only known/downloading, `↻` once a restart would apply it,
+/// `!` on failure.
+fn chip_glyph(chip: &UpdateChip) -> &'static str {
+    match chip {
+        UpdateChip::Notify { .. } | UpdateChip::Apply { .. } | UpdateChip::Downloading { .. } => {
+            "↓"
+        }
+        UpdateChip::Restart { .. } => "↻",
+        UpdateChip::Failed { .. } => "!",
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PanelModel {
     pub projects: Vec<ProjectEntry>,
-    /// Version string to show as the panel's update chip (None = hidden).
-    pub update: Option<String>,
+    /// Update chip to show in the panel (None = hidden, i.e. `update::State::Idle`).
+    pub update: Option<UpdateChip>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,8 +226,8 @@ impl PanelView {
                 rect.max,
             );
             body.max.y -= UPDATE_CHIP_H;
-            let ver = self.model.update.clone().unwrap();
-            self.paint_update_chip(ui, footer, base, &ver);
+            let chip = self.model.update.clone().unwrap();
+            self.paint_update_chip(ui, footer, base, &chip);
         }
 
         // Flow follows the rect the leaf was given this frame: wider than tall
@@ -281,63 +332,90 @@ impl PanelView {
         }
     }
 
-    /// Quiet update-available chip pinned to the panel's bottom edge.
-    /// Click is recorded (deferred-Act, like `self.click`) and drained by wm.
+    /// Quiet update chip pinned to the panel's bottom edge. Label and color
+    /// vary by `chip` variant (see `chip_text`); click is recorded
+    /// (deferred-Act, like `self.click`) and drained by wm regardless of
+    /// variant — the state machine decides what a click means.
     fn paint_update_chip(
         &mut self,
         ui: &mut egui::Ui,
         footer: egui::Rect,
         base: egui::Id,
-        ver: &str,
+        chip: &UpdateChip,
     ) {
         let th = crate::theme::live(ui.ctx());
         let p = ui.painter();
-        let chip = footer.shrink2(egui::vec2(6.0, 3.0));
+        let rect = footer.shrink2(egui::vec2(6.0, 3.0));
         let id = base.with("update-chip");
-        let resp = ui.interact(chip, id, egui::Sense::click());
+        let resp = ui.interact(rect, id, egui::Sense::click());
         if resp.hovered() {
-            p.rect_filled(chip, egui::CornerRadius::same(5), th.sel_bg);
+            p.rect_filled(rect, egui::CornerRadius::same(5), th.sel_bg);
         }
-        let text = format!("↓ {ver} — click for release notes");
-        let col = if resp.hovered() {
+        let sessions = self
+            .model
+            .projects
+            .iter()
+            .map(|pr| pr.tabs.len())
+            .sum::<usize>();
+        let (text, danger) = chip_text(chip, sessions);
+        let col = if danger {
+            th.danger
+        } else if resp.hovered() {
             th.snap_stroke
         } else {
             th.dim
         };
         let galley = p.layout_no_wrap(text, egui::FontId::proportional(12.0), col);
-        let pos = egui::pos2(chip.min.x + 6.0, chip.center().y - galley.size().y / 2.0);
+        let pos = egui::pos2(rect.min.x + 6.0, rect.center().y - galley.size().y / 2.0);
         p.galley(pos, galley, col);
         if resp.clicked() {
             self.update_click = true;
         }
     }
 
-    /// Collapsed-rail counterpart of the footer chip: a lone ↓ glyph carrying
-    /// the same id, tooltip, and `update_click` latch, so an update is
-    /// noticeable without expanding the panel. Fills BG behind itself because
-    /// the vertical rail has no scroll clamp and icons can flow underneath.
+    /// Collapsed-rail counterpart of the footer chip: a lone glyph (see
+    /// `chip_glyph`) carrying the same id, tooltip text as the expanded chip,
+    /// and `update_click` latch, so an update is noticeable without expanding
+    /// the panel. No pulse animation for `Restart`/`Failed` — Progress events
+    /// already repaint per percent, and a rail user gets the tooltip; a
+    /// steady glyph avoids a per-frame animation loop for a rarely-visible
+    /// state. Fills BG behind itself because the vertical rail has no scroll
+    /// clamp and icons can flow underneath.
     fn paint_rail_update_glyph(
         &mut self,
         ui: &mut egui::Ui,
         cell: egui::Rect,
         base: egui::Id,
-        ver: &str,
+        chip: &UpdateChip,
     ) {
         let th = crate::theme::live(ui.ctx());
         let p = ui.painter();
         p.rect_filled(cell, egui::CornerRadius::same(5), th.bg);
+        let sessions = self
+            .model
+            .projects
+            .iter()
+            .map(|pr| pr.tabs.len())
+            .sum::<usize>();
+        let (text, danger) = chip_text(chip, sessions);
         let resp = ui
             .interact(cell, base.with("update-chip"), egui::Sense::click())
-            .on_hover_text(format!("{ver} — click for release notes"));
+            .on_hover_text(text);
         if resp.hovered() {
             p.rect_filled(cell, egui::CornerRadius::same(5), th.sel_bg);
         }
-        let col = if resp.hovered() {
+        let col = if danger {
+            th.danger
+        } else if resp.hovered() {
             th.text
         } else {
             th.snap_stroke
         };
-        let galley = p.layout_no_wrap("↓".into(), egui::FontId::proportional(14.0), col);
+        let galley = p.layout_no_wrap(
+            chip_glyph(chip).into(),
+            egui::FontId::proportional(14.0),
+            col,
+        );
         p.galley(
             egui::pos2(
                 cell.center().x - galley.size().x / 2.0,
@@ -428,12 +506,12 @@ impl PanelView {
             }
             y += 32.0;
         }
-        if let Some(ver) = self.model.update.clone() {
+        if let Some(chip) = self.model.update.clone() {
             let cell = egui::Rect::from_center_size(
                 egui::pos2(rect.center().x, rect.max.y - 16.0),
                 egui::vec2(22.0, 22.0),
             );
-            self.paint_rail_update_glyph(ui, cell, base, &ver);
+            self.paint_rail_update_glyph(ui, cell, base, &chip);
         }
     }
 
@@ -710,8 +788,8 @@ impl PanelView {
         let p = ui.painter_at(rect);
         // Icons clip against the reserved expand-toggle zone at the right end
         // (widened when the update glyph rides beside it).
-        let update_ver = self.model.update.clone();
-        let icons_max_x = rect.max.x - 28.0 - if update_ver.is_some() { 26.0 } else { 0.0 };
+        let update_chip = self.model.update.clone();
+        let icons_max_x = rect.max.x - 28.0 - if update_chip.is_some() { 26.0 } else { 0.0 };
         let ip = ui.painter_at(egui::Rect::from_min_max(
             rect.min,
             egui::pos2(icons_max_x, rect.max.y),
@@ -813,12 +891,12 @@ impl PanelView {
         if resp.clicked() {
             self.toggle_collapse = true;
         }
-        if let Some(ver) = update_ver {
+        if let Some(chip) = update_chip {
             let cell = egui::Rect::from_center_size(
                 egui::pos2(rect.max.x - 40.0, rect.center().y),
                 egui::vec2(22.0, 22.0),
             );
-            self.paint_rail_update_glyph(ui, cell, base, &ver);
+            self.paint_rail_update_glyph(ui, cell, base, &chip);
         }
         self.hscroll(ui, rect, base, max_scroll);
     }
