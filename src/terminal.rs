@@ -1360,6 +1360,9 @@ impl Session {
             let (oldc, oldr) = (self.cols, self.rows);
             self.cols = cols;
             self.rows = rows;
+            // Reflow invalidates placement anchors; drop images rather than
+            // let them drift (graphics.rs::on_resize).
+            self.graphics.on_resize();
             let pulled = resize_anchored(&mut self.term, Size { cols, rows });
             // Reflow under a preserved scroll offset points the viewport at stale
             // content; snap back to the live prompt like a normal terminal.

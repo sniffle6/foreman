@@ -81,8 +81,13 @@ spawn gate listed there.
 - KITTY_WINDOW_ID=1 is injected; TERM stays xterm-256color on purpose.
 - Graphics replies bypass `resp` — a successful resp flush latches `ready`
   (DSR contract).
-- A `clear`/RIS doesn't delete placements; scrolling or `a=d` does. Pets
-  deletes its own frames constantly, so this only shows with rogue clients.
+- `clear` (ED2/ED3) deletes the active screen's placements; RIS deletes both
+  screens'. Deliberately over-broad for 2J: history placements go too — one
+  clear = a visually clean pane. Scrolling off the top and `a=d` still delete
+  as before. Image *data* stays in the store so id-only re-display works.
+- Resize drops every placement: reflow invalidates the (col, line, history)
+  anchors and a vanished image beats one lying about its position. TUIs
+  repaint and re-place on resize anyway; re-run `foreman icat` to reshow.
 - Alt text suppression is `alt && !ctrl` — AltGr (= Ctrl+Alt on Windows) must
   keep typing on intl layouts. Don't "simplify" it to plain `alt`. Same story
   for the Ctrl+Alt encoder: it's scoped to V only (Codex's binding) because an

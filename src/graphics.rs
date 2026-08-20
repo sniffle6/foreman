@@ -86,11 +86,15 @@ enum Scan {
     Esc,
     Apc,
     ApcEsc,
+    Csi,
 }
 
 #[derive(Default)]
 pub struct Graphics {
     scan: Scan,
+    /// CSI parameter bytes while `scan == Csi` (only `2J`/`3J` matter; capped
+    /// so a hostile param stream can't grow it).
+    csi: Vec<u8>,
     /// Current APC body (starting at its 'G'), buffered only for graphics APCs.
     apc: Vec<u8>,
     seen_first: bool,
@@ -140,6 +144,12 @@ enum Cmd {
     },
     Nop {
         reply: Option<Vec<u8>>,
+    },
+    /// ED2/ED3 or RIS seen in the stream: a cleared screen keeps no images.
+    /// `all` (RIS) wipes both screens; otherwise only the screen that was
+    /// active at the command's stream position (sampled via `view`).
+    Clear {
+        all: bool,
     },
 }
 
@@ -241,8 +251,42 @@ impl Graphics {
                             self.overflow = false;
                             self.scan = Scan::Apc;
                         }
+                        b'[' => {
+                            self.csi.clear();
+                            self.scan = Scan::Csi;
+                        }
+                        // RIS: full reset wipes both screens' placements.
+                        b'c' => {
+                            self.pending.push_back(Cmd::Clear { all: true });
+                            cuts.push(Cut { offset: i + 1 });
+                            self.scan = Scan::Ground;
+                        }
                         0x1b => {} // ESC ESC — stay in Esc for the next byte
                         _ => self.scan = Scan::Ground,
+                    }
+                    i += 1;
+                }
+                // Only to catch ED2/ED3 (`clear`): images must not survive a
+                // cleared screen. Every other CSI is walked to its final byte
+                // and ignored; alacritty parses it for real.
+                Scan::Csi => {
+                    match chunk[i] {
+                        f @ 0x40..=0x7e => {
+                            if f == b'J' && matches!(self.csi.as_slice(), b"2" | b"3") {
+                                self.pending.push_back(Cmd::Clear { all: false });
+                                cuts.push(Cut { offset: i + 1 });
+                            }
+                            self.scan = Scan::Ground;
+                        }
+                        0x1b => self.scan = Scan::Esc,
+                        b => {
+                            if self.csi.len() < 8 {
+                                self.csi.push(b);
+                            } else {
+                                self.csi.clear();
+                                self.csi.push(0xff); // over-long: can never match
+                            }
+                        }
                     }
                     i += 1;
                 }
@@ -454,6 +498,13 @@ impl Graphics {
                 }
                 _ => self.placements.clear(), // bare a=d / d=a: clear visible
             },
+            Cmd::Clear { all } => {
+                if all {
+                    self.placements.clear();
+                } else {
+                    self.placements.retain(|p| p.alt != view.alt_screen);
+                }
+            }
             Cmd::Query { header, payload } => {
                 let ok = header.medium == b'd'
                     && matches!(header.format, 24 | 32 | 100)
@@ -517,6 +568,15 @@ impl Graphics {
     }
 
     /// Paint guard: `show` skips all image work when this is false.
+    /// Resize: text reflows but placement anchors (col, line, history) do
+    /// not, so images drift relative to the text around them. Honest v1
+    /// semantic: drop every placement — a vanished image beats a lying one;
+    /// TUIs repaint (and re-place) on resize anyway, icat is re-run. Image
+    /// data stays in the store so id-only re-display keeps working.
+    pub fn on_resize(&mut self) {
+        self.placements.clear();
+    }
+
     pub fn active(&self) -> bool {
         !self.placements.is_empty()
     }
@@ -785,6 +845,98 @@ mod tests {
         display_offset: 0,
         screen_lines: 40,
     };
+
+    #[test]
+    fn clear_2j_deletes_current_screen_placements_but_keeps_images() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(5));
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(g.feed(b"[2J").len(), 1, "ED2 must cut");
+        g.apply(view(0, 0), &mut out);
+        assert!(g.visible(&VP).is_empty());
+        assert!(g.has_image(5), "image data survives for id re-display");
+        // ED3 (scrollback clear) behaves the same.
+        g.feed(&red_transmit(6));
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(g.feed(b"[3J").len(), 1);
+        g.apply(view(0, 0), &mut out);
+        assert!(g.visible(&VP).is_empty());
+    }
+
+    #[test]
+    fn partial_erase_and_decsed_do_not_clear() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(7));
+        g.apply(view(0, 0), &mut out);
+        for seq in [b"[J".as_slice(), b"[0J", b"[1J", b"[?2J", b"[22J"] {
+            assert!(g.feed(seq).is_empty(), "{seq:?} must not cut");
+        }
+        assert_eq!(g.visible(&VP).len(), 1);
+    }
+
+    #[test]
+    fn clear_split_across_chunks_still_clears() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(8));
+        g.apply(view(0, 0), &mut out);
+        assert!(g.feed(b"[").is_empty());
+        assert!(g.feed(b"2").is_empty());
+        assert_eq!(g.feed(b"J").len(), 1);
+        g.apply(view(0, 0), &mut out);
+        assert!(g.visible(&VP).is_empty());
+    }
+
+    #[test]
+    fn clear_only_wipes_the_active_screen_ris_wipes_both() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        // One placement on the primary screen, one on the alt screen.
+        g.feed(&red_transmit(10));
+        g.apply(view(0, 0), &mut out);
+        g.feed(&red_transmit(11));
+        g.apply(
+            TermView {
+                cursor_col: 0,
+                cursor_line: 0,
+                alt_screen: true,
+                history_size: 0,
+            },
+            &mut out,
+        );
+        // Clear while the ALT screen is active: primary survives.
+        g.feed(b"[2J");
+        g.apply(
+            TermView {
+                cursor_col: 0,
+                cursor_line: 0,
+                alt_screen: true,
+                history_size: 0,
+            },
+            &mut out,
+        );
+        assert_eq!(g.visible(&VP).len(), 1, "primary placement must survive");
+        // RIS wipes everything.
+        g.feed(&red_transmit(12));
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(g.feed(b"c").len(), 1);
+        g.apply(view(0, 0), &mut out);
+        assert!(g.visible(&VP).is_empty());
+    }
+
+    #[test]
+    fn resize_purges_placements_but_keeps_image_data() {
+        let mut g = Graphics::default();
+        let mut out = Vec::new();
+        g.feed(&red_transmit(9));
+        g.apply(view(0, 0), &mut out);
+        assert_eq!(g.visible(&VP).len(), 1);
+        g.on_resize();
+        assert!(g.visible(&VP).is_empty());
+        assert!(g.has_image(9));
+    }
 
     #[test]
     fn transmit_places_at_the_sampled_cursor() {
