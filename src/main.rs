@@ -1091,13 +1091,17 @@ fn main() -> eframe::Result {
         unsafe { std::env::remove_var("FOREMAN_WAIT_PID") };
         wait_for_exit(pid, std::time::Duration::from_secs(10));
     }
-    update::cleanup_leftovers();
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         attach_parent_console();
         std::process::exit(control::client_main(&args[1..]));
     }
+    // Only the GUI process cleans up swap leftovers — every `foreman open/chat/
+    // status/...` CLI invocation above exits before this line, so a `.old`/
+    // staging-dir delete here can't race a concurrent update download (agents
+    // dispatch these constantly from inside terminals while the app updates).
+    update::cleanup_leftovers();
     install_panic_logger();
     // Gate on `Settings::install_skills` / `Settings::update_check` — both take
     // effect next launch (their menu rows already say "on launch"). Loaded once
