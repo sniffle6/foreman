@@ -129,8 +129,12 @@ impl App {
         let update_state =
             if cfg!(debug_assertions) && std::env::var_os("FOREMAN_UPDATE_TEST").is_some() {
                 update::State::UpdateAvailable {
-                    version: "v9.9.9".into(),
-                    html_url: update::RELEASES_URL.into(),
+                    offer: update::Offer {
+                        version: "v9.9.9".into(),
+                        html_url: update::RELEASES_URL.into(),
+                        zip: None,
+                        sums: None,
+                    },
                     can_apply: false,
                 }
             } else {
@@ -552,7 +556,7 @@ impl eframe::App for App {
         }
 
         self.desktop.set_update_chip(match &self.update_state {
-            update::State::UpdateAvailable { version, .. } => Some(version.clone()),
+            update::State::UpdateAvailable { offer, .. } => Some(offer.version.clone()),
             _ => None,
         });
 

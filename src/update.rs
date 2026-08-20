@@ -19,46 +19,43 @@ pub struct ReleaseInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Offer {
+    pub version: String,
+    pub html_url: String,
+    pub zip: Option<Asset>,
+    pub sums: Option<Asset>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum State {
     Idle,
-    UpdateAvailable {
-        version: String,
-        html_url: String,
-        can_apply: bool,
-    },
-    Downloading {
-        progress: f32,
-    },
-    ReadyToRestart,
-    Error {
-        retryable: bool,
-    },
+    UpdateAvailable { offer: Offer, can_apply: bool },
+    Downloading { offer: Offer, progress: f32 },
+    ReadyToRestart { armed: bool },
+    Error { offer: Offer, retryable: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    ReleaseFetched(ReleaseInfo),
+    ReleaseFetched { info: ReleaseInfo, writable: bool },
     FetchFailed,
     ClickChip,
     Progress(f32),
-    HashOk,
+    DownloadDone,
     HashBad,
     SwapOk,
     SwapFailed,
-    ClickRestart,
+    ArmTimeout,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     FetchLatest,
     OpenReleasesPage(String),
-    Download(Asset),
+    Download { zip: Asset, sums: Asset },
     VerifyAndSwap,
     SaveWorkspaceAndRestart,
 }
-
-// Phase 3 is notify-only; Phase 4 flips this to a real writability probe.
-const CAN_APPLY: bool = false;
 
 // Strict X.Y.Z (optional leading v). Anything else - prereleases,
 // two-part versions - is None, which the caller treats as "no update"
@@ -81,38 +78,168 @@ pub fn select_asset(assets: &[Asset]) -> Option<&Asset> {
     assets.iter().find(|a| a.name.ends_with(ZIP_SUFFIX))
 }
 
+// SHA256SUMS.txt sits beside the zip in every release; the name is fixed by
+// the release-build script, never derived from the version (spec section 1).
+pub fn select_sums(assets: &[Asset]) -> Option<&Asset> {
+    assets.iter().find(|a| a.name == "SHA256SUMS.txt")
+}
+
 pub fn step(state: State, ev: Event, current: &str) -> (State, Vec<Effect>) {
     use Effect as X;
     use Event as E;
     use State as S;
     match (state, ev) {
-        (S::Idle, E::ReleaseFetched(r)) | (S::UpdateAvailable { .. }, E::ReleaseFetched(r)) => {
-            match (parse_version(current), parse_version(&r.tag_name)) {
-                (Some(cur), Some(new)) if new > cur => (
-                    S::UpdateAvailable {
-                        version: r.tag_name,
-                        html_url: r.html_url,
-                        can_apply: CAN_APPLY && select_asset(&r.assets).is_some(),
-                    },
-                    vec![],
-                ),
+        (S::Idle, E::ReleaseFetched { info, writable })
+        | (S::UpdateAvailable { .. }, E::ReleaseFetched { info, writable })
+        | (S::Error { .. }, E::ReleaseFetched { info, writable }) => {
+            match (parse_version(current), parse_version(&info.tag_name)) {
+                (Some(cur), Some(new)) if new > cur => {
+                    let zip = select_asset(&info.assets).cloned();
+                    let sums = select_sums(&info.assets).cloned();
+                    let can_apply = writable && zip.is_some() && sums.is_some();
+                    (
+                        S::UpdateAvailable {
+                            offer: Offer {
+                                version: info.tag_name,
+                                html_url: info.html_url,
+                                zip,
+                                sums,
+                            },
+                            can_apply,
+                        },
+                        vec![],
+                    )
+                }
                 _ => (S::Idle, vec![]),
             }
         }
+        // Busy states ignore a fresh fetch outright (spec: don't yank the rug
+        // out from under an in-flight download or an armed restart).
+        (s @ (S::Downloading { .. } | S::ReadyToRestart { .. }), E::ReleaseFetched { .. }) => {
+            (s, vec![])
+        }
         (
             S::UpdateAvailable {
-                version,
-                html_url,
+                offer,
                 can_apply: false,
             },
             E::ClickChip,
         ) => {
-            let url = html_url.clone();
+            let url = offer.html_url.clone();
             (
                 S::UpdateAvailable {
-                    version,
-                    html_url,
+                    offer,
                     can_apply: false,
+                },
+                vec![X::OpenReleasesPage(url)],
+            )
+        }
+        (
+            S::UpdateAvailable {
+                offer,
+                can_apply: true,
+            },
+            E::ClickChip,
+        ) => match (offer.zip.clone(), offer.sums.clone()) {
+            (Some(zip), Some(sums)) => (
+                S::Downloading {
+                    offer,
+                    progress: 0.0,
+                },
+                vec![X::Download { zip, sums }],
+            ),
+            // can_apply promises both assets; anything else is defensive —
+            // never unwrap here, fall back to the manual-download page.
+            _ => {
+                let url = offer.html_url.clone();
+                (
+                    S::UpdateAvailable {
+                        offer,
+                        can_apply: true,
+                    },
+                    vec![X::OpenReleasesPage(url)],
+                )
+            }
+        },
+        (S::Downloading { offer, .. }, E::Progress(p)) => {
+            (S::Downloading { offer, progress: p }, vec![])
+        }
+        (S::Downloading { offer, .. }, E::FetchFailed) => (
+            S::Error {
+                offer,
+                retryable: true,
+            },
+            vec![],
+        ),
+        (S::Downloading { offer, .. }, E::DownloadDone) => (
+            S::Downloading {
+                offer,
+                progress: 1.0,
+            },
+            vec![X::VerifyAndSwap],
+        ),
+        (S::Downloading { offer, .. }, E::HashBad) => (
+            S::Error {
+                offer,
+                retryable: true,
+            },
+            vec![],
+        ),
+        (S::Downloading { offer, .. }, E::SwapFailed) => (
+            S::Error {
+                offer,
+                retryable: false,
+            },
+            vec![],
+        ),
+        (S::Downloading { .. }, E::SwapOk) => (S::ReadyToRestart { armed: false }, vec![]),
+        (S::ReadyToRestart { armed: false }, E::ClickChip) => {
+            (S::ReadyToRestart { armed: true }, vec![])
+        }
+        (S::ReadyToRestart { armed: true }, E::ClickChip) => (
+            S::ReadyToRestart { armed: true },
+            vec![X::SaveWorkspaceAndRestart],
+        ),
+        (S::ReadyToRestart { armed: true }, E::ArmTimeout) => {
+            (S::ReadyToRestart { armed: false }, vec![])
+        }
+        (
+            S::Error {
+                offer,
+                retryable: true,
+            },
+            E::ClickChip,
+        ) => match (offer.zip.clone(), offer.sums.clone()) {
+            (Some(zip), Some(sums)) => (
+                S::Downloading {
+                    offer,
+                    progress: 0.0,
+                },
+                vec![X::Download { zip, sums }],
+            ),
+            _ => {
+                let url = offer.html_url.clone();
+                (
+                    S::Error {
+                        offer,
+                        retryable: true,
+                    },
+                    vec![X::OpenReleasesPage(url)],
+                )
+            }
+        },
+        (
+            S::Error {
+                offer,
+                retryable: false,
+            },
+            E::ClickChip,
+        ) => {
+            let url = offer.html_url.clone();
+            (
+                S::Error {
+                    offer,
+                    retryable: false,
                 },
                 vec![X::OpenReleasesPage(url)],
             )
@@ -178,7 +305,10 @@ pub fn spawn(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
             let ev = match fetch_latest() {
-                Ok(r) => Event::ReleaseFetched(r),
+                Ok(r) => Event::ReleaseFetched {
+                    info: r,
+                    writable: false,
+                },
                 Err(e) => {
                     eprintln!("update: check failed (will retry): {e}");
                     Event::FetchFailed
@@ -245,19 +375,41 @@ mod tests {
         assert!(select_asset(&none.assets).is_none());
     }
 
+    fn offer(zip: bool, sums: bool) -> Offer {
+        Offer {
+            version: "v0.3.0".into(),
+            html_url: "https://gh/rel".into(),
+            zip: zip.then(|| Asset {
+                name: "foreman-v0.3.0-x86_64-windows.zip".into(),
+                browser_download_url: "https://x/z".into(),
+            }),
+            sums: sums.then(|| Asset {
+                name: "SHA256SUMS.txt".into(),
+                browser_download_url: "https://x/s".into(),
+            }),
+        }
+    }
+
     // step: fetch outcomes
     #[test]
     fn newer_release_shows_chip_with_can_apply_false() {
         let (s, fx) = step(
             State::Idle,
-            Event::ReleaseFetched(rel("v0.2.1", &[])),
+            Event::ReleaseFetched {
+                info: rel("v0.2.1", &[]),
+                writable: false,
+            },
             "0.2.0",
         );
         assert_eq!(
             s,
             State::UpdateAvailable {
-                version: "v0.2.1".into(),
-                html_url: "https://github.com/sniffle6/foreman/releases/tag/TEST".into(),
+                offer: Offer {
+                    version: "v0.2.1".into(),
+                    html_url: "https://github.com/sniffle6/foreman/releases/tag/TEST".into(),
+                    zip: None,
+                    sums: None,
+                },
                 can_apply: false,
             }
         );
@@ -265,9 +417,78 @@ mod tests {
     }
 
     #[test]
+    fn writable_fetch_with_both_assets_offers_apply() {
+        let info = rel(
+            "v0.3.0",
+            &["SHA256SUMS.txt", "foreman-v0.3.0-x86_64-windows.zip"],
+        );
+        let (s, _) = step(
+            State::Idle,
+            Event::ReleaseFetched {
+                info,
+                writable: true,
+            },
+            "0.2.10",
+        );
+        assert!(matches!(
+            s,
+            State::UpdateAvailable {
+                can_apply: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unwritable_or_missing_assets_fall_back_to_notify() {
+        let full = rel(
+            "v0.3.0",
+            &["SHA256SUMS.txt", "foreman-v0.3.0-x86_64-windows.zip"],
+        );
+        let (s, _) = step(
+            State::Idle,
+            Event::ReleaseFetched {
+                info: full.clone(),
+                writable: false,
+            },
+            "0.2.10",
+        );
+        assert!(matches!(
+            s,
+            State::UpdateAvailable {
+                can_apply: false,
+                ..
+            }
+        ));
+        let no_sums = rel("v0.3.0", &["foreman-v0.3.0-x86_64-windows.zip"]);
+        let (s, _) = step(
+            State::Idle,
+            Event::ReleaseFetched {
+                info: no_sums,
+                writable: true,
+            },
+            "0.2.10",
+        );
+        assert!(matches!(
+            s,
+            State::UpdateAvailable {
+                can_apply: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn equal_older_or_unparseable_release_stays_idle() {
         for tag in ["v0.2.0", "v0.1.9", "v0.2.0-rc1", "junk"] {
-            let (s, fx) = step(State::Idle, Event::ReleaseFetched(rel(tag, &[])), "0.2.0");
+            let (s, fx) = step(
+                State::Idle,
+                Event::ReleaseFetched {
+                    info: rel(tag, &[]),
+                    writable: true,
+                },
+                "0.2.0",
+            );
             assert_eq!(s, State::Idle, "tag {tag} must not offer an update");
             assert!(fx.is_empty());
         }
@@ -276,13 +497,24 @@ mod tests {
     #[test]
     fn refetch_replaces_an_existing_offer() {
         let showing = State::UpdateAvailable {
-            version: "v0.2.1".into(),
-            html_url: "u".into(),
+            offer: Offer {
+                version: "v0.2.1".into(),
+                html_url: "u".into(),
+                zip: None,
+                sums: None,
+            },
             can_apply: false,
         };
-        let (s, _) = step(showing, Event::ReleaseFetched(rel("v0.3.0", &[])), "0.2.0");
+        let (s, _) = step(
+            showing,
+            Event::ReleaseFetched {
+                info: rel("v0.3.0", &[]),
+                writable: true,
+            },
+            "0.2.0",
+        );
         match s {
-            State::UpdateAvailable { version, .. } => assert_eq!(version, "v0.3.0"),
+            State::UpdateAvailable { offer, .. } => assert_eq!(offer.version, "v0.3.0"),
             other => panic!("expected UpdateAvailable, got {other:?}"),
         }
     }
@@ -290,8 +522,12 @@ mod tests {
     #[test]
     fn fetch_failure_is_silent_skip_in_any_state() {
         let showing = State::UpdateAvailable {
-            version: "v0.2.1".into(),
-            html_url: "u".into(),
+            offer: Offer {
+                version: "v0.2.1".into(),
+                html_url: "u".into(),
+                zip: None,
+                sums: None,
+            },
             can_apply: false,
         };
         let (s, fx) = step(showing.clone(), Event::FetchFailed, "0.2.0");
@@ -302,17 +538,173 @@ mod tests {
         assert!(fx.is_empty());
     }
 
-    // step: chip click (Phase 3 = notify-only)
+    // step: chip click
     #[test]
     fn click_without_can_apply_opens_releases_page() {
         let showing = State::UpdateAvailable {
-            version: "v0.2.1".into(),
-            html_url: "https://gh/rel".into(),
+            offer: Offer {
+                version: "v0.2.1".into(),
+                html_url: "https://gh/rel".into(),
+                zip: None,
+                sums: None,
+            },
             can_apply: false,
         };
         let (s, fx) = step(showing.clone(), Event::ClickChip, "0.2.0");
         assert_eq!(s, showing);
         assert_eq!(fx, vec![Effect::OpenReleasesPage("https://gh/rel".into())]);
+    }
+
+    #[test]
+    fn apply_click_starts_download() {
+        let s = State::UpdateAvailable {
+            offer: offer(true, true),
+            can_apply: true,
+        };
+        let (s, fx) = step(s, Event::ClickChip, "0.2.10");
+        assert!(matches!(s, State::Downloading { progress, .. } if progress == 0.0));
+        assert!(matches!(fx.as_slice(), [Effect::Download { .. }]));
+    }
+
+    #[test]
+    fn can_apply_true_with_missing_asset_defensively_opens_releases_page() {
+        // can_apply is supposed to guarantee both assets; if it's ever wrong,
+        // step must never unwrap -- it falls back to the manual page instead.
+        let s = State::UpdateAvailable {
+            offer: offer(false, true),
+            can_apply: true,
+        };
+        let (s2, fx) = step(s.clone(), Event::ClickChip, "0.2.10");
+        assert_eq!(s2, s);
+        assert_eq!(fx, vec![Effect::OpenReleasesPage("https://gh/rel".into())]);
+    }
+
+    #[test]
+    fn download_completes_then_verifies_then_restart_offer() {
+        let s = State::Downloading {
+            offer: offer(true, true),
+            progress: 0.0,
+        };
+        let (s, _) = step(s, Event::Progress(0.43), "0.2.10");
+        assert!(matches!(s, State::Downloading { progress, .. } if (progress - 0.43).abs() < 1e-6));
+        let (s, fx) = step(s, Event::DownloadDone, "0.2.10");
+        assert_eq!(fx, vec![Effect::VerifyAndSwap]);
+        let (s, fx) = step(s, Event::SwapOk, "0.2.10");
+        assert_eq!(s, State::ReadyToRestart { armed: false });
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn hash_bad_and_download_failure_are_retryable_swap_failure_is_not() {
+        for (ev, retryable) in [
+            (Event::HashBad, true),
+            (Event::FetchFailed, true),
+            (Event::SwapFailed, false),
+        ] {
+            let s = State::Downloading {
+                offer: offer(true, true),
+                progress: 0.5,
+            };
+            let (s, _) = step(s, ev, "0.2.10");
+            assert_eq!(
+                s,
+                State::Error {
+                    offer: offer(true, true),
+                    retryable
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_error_click_redownloads_nonretryable_opens_page() {
+        let s = State::Error {
+            offer: offer(true, true),
+            retryable: true,
+        };
+        let (s, fx) = step(s, Event::ClickChip, "0.2.10");
+        assert!(matches!(s, State::Downloading { .. }));
+        assert!(matches!(fx.as_slice(), [Effect::Download { .. }]));
+        let s = State::Error {
+            offer: offer(true, true),
+            retryable: false,
+        };
+        let (_, fx) = step(s, Event::ClickChip, "0.2.10");
+        assert_eq!(fx, vec![Effect::OpenReleasesPage("https://gh/rel".into())]);
+    }
+
+    #[test]
+    fn restart_requires_arm_then_confirm_and_timeout_disarms() {
+        let (s, fx) = step(
+            State::ReadyToRestart { armed: false },
+            Event::ClickChip,
+            "0.2.10",
+        );
+        assert_eq!(s, State::ReadyToRestart { armed: true });
+        assert!(fx.is_empty());
+        let (s2, fx) = step(s.clone(), Event::ArmTimeout, "0.2.10");
+        assert_eq!(s2, State::ReadyToRestart { armed: false });
+        assert!(fx.is_empty());
+        let (_, fx) = step(s, Event::ClickChip, "0.2.10");
+        assert_eq!(fx, vec![Effect::SaveWorkspaceAndRestart]);
+    }
+
+    #[test]
+    fn newer_release_while_busy_is_ignored() {
+        let info = rel(
+            "v9.9.9",
+            &["SHA256SUMS.txt", "foreman-v9.9.9-x86_64-windows.zip"],
+        );
+        for s in [
+            State::Downloading {
+                offer: offer(true, true),
+                progress: 0.5,
+            },
+            State::ReadyToRestart { armed: false },
+        ] {
+            let (s2, fx) = step(
+                s.clone(),
+                Event::ReleaseFetched {
+                    info: info.clone(),
+                    writable: true,
+                },
+                "0.2.10",
+            );
+            assert_eq!(s2, s);
+            assert!(fx.is_empty());
+        }
+    }
+
+    #[test]
+    fn error_state_accepts_a_fresh_offer() {
+        let info = rel(
+            "v0.4.0",
+            &["SHA256SUMS.txt", "foreman-v0.4.0-x86_64-windows.zip"],
+        );
+        let s = State::Error {
+            offer: offer(true, true),
+            retryable: true,
+        };
+        let (s, _) = step(
+            s,
+            Event::ReleaseFetched {
+                info,
+                writable: true,
+            },
+            "0.2.10",
+        );
+        assert!(matches!(s, State::UpdateAvailable { offer, .. } if offer.version == "v0.4.0"));
+    }
+
+    #[test]
+    fn selects_sums_by_exact_name() {
+        let r = rel(
+            "v0.3.0",
+            &["SHA256SUMS.txt", "foreman-v0.3.0-x86_64-windows.zip"],
+        );
+        assert_eq!(select_sums(&r.assets).unwrap().name, "SHA256SUMS.txt");
+        let r = rel("v0.3.0", &["foreman-v0.3.0-x86_64-windows.zip"]);
+        assert!(select_sums(&r.assets).is_none());
     }
 
     #[test]
