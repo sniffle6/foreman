@@ -22,8 +22,9 @@ The image renders inside your own pane, where the human can see it. Use it
 whenever you produce visual evidence — a window screenshot after a UI change,
 a rendered chart, a before/after capture — instead of only mentioning the
 file path. The image behaves like ordinary terminal output: it scrolls with
-the buffer and is gone once it scrolls off the top, so re-run the command if
-the human asks to see it again.
+the buffer and is gone once it scrolls off the top — and also disappears on
+`clear` or a pane resize — so re-run the command if the human asks to see
+it again.
 
 ## Facts
 
