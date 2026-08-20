@@ -280,6 +280,117 @@ fn fetch_latest() -> Result<ReleaseInfo, String> {
     fetch_url(API_URL)
 }
 
+// %TEMP%\foreman-update -- scratch space for the downloaded zip + sums,
+// wiped after a successful swap and best-effort on startup (cleanup_leftovers).
+pub fn staging_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("foreman-update")
+}
+
+// "foreman.exe" + ".old" -> "foreman.exe.old"; appends to the full filename,
+// not the extension, so it survives paths without one.
+pub fn sibling(p: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    s.into()
+}
+
+// Cheap write+delete probe -- the only reliable way to know if the install
+// dir is writable without an update-and-see (spec: Program Files needs UAC,
+// a per-user install doesn't).
+pub fn probe_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".foreman-probe-{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"x").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+pub fn sha256_hex(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+// Parses "<hex>  <name>" lines (SHA256SUMS.txt: sha256sum's two-space format,
+// but tolerate one space and CRLF). Name is the last token so paths with
+// spaces in the hex slot never happen -- the hex is always token 0.
+pub fn expected_hash(sums_text: &str, file_name: &str) -> Option<String> {
+    for line in sums_text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        if tokens[tokens.len() - 1] == file_name {
+            return Some(tokens[0].to_lowercase());
+        }
+    }
+    None
+}
+
+// Release zips store foreman.exe at the root; match by suffix in case a
+// future release nests it (spec doesn't guarantee root, just presence).
+pub fn extract_exe(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let f = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+    let mut idx = None;
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        if entry.name().ends_with("foreman.exe") {
+            idx = Some(i);
+            break;
+        }
+    }
+    let idx = idx.ok_or_else(|| "foreman.exe not found in release zip".to_string())?;
+    let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
+    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+    out.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Two-rename dance: exe -> exe.old, then exe.new -> exe. A running exe can be
+// renamed on Windows (just not deleted/overwritten in place), so this swap
+// works even while the old binary is still executing this code. On the
+// second rename's failure, best-effort roll the first one back so the app
+// is never left without an exe at its expected path.
+pub fn swap_exe(exe: &std::path::Path) -> Result<(), String> {
+    let old = sibling(exe, ".old");
+    let new = sibling(exe, ".new");
+    std::fs::rename(exe, &old)
+        .map_err(|e| format!("rename {} -> {}: {e}", exe.display(), old.display()))?;
+    if let Err(e) = std::fs::rename(&new, exe) {
+        let _ = std::fs::rename(&old, exe);
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            new.display(),
+            exe.display()
+        ));
+    }
+    Ok(())
+}
+
+// Startup best-effort: a prior run's leftover .old (never cleaned because the
+// process using it had already restarted) and any abandoned staging dir.
+pub fn cleanup_leftovers() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(sibling(&exe, ".old"));
+    }
+    let _ = std::fs::remove_dir_all(staging_dir());
+}
+
 /// Worker thread: executes Effects, reports Events (channel + repaint --
 /// the same seam shape as Session's PTY reader thread, terminal.rs:824).
 /// Self-schedules the periodic check; Phase-4 effects are accepted and
@@ -744,5 +855,102 @@ mod tests {
         // worker maps to Event::FetchFailed (never a panic).
         let err = fetch_url("http://127.0.0.1:9/releases/latest");
         assert!(err.is_err());
+    }
+
+    // verify/swap helpers — each test gets a fresh temp_dir()/foreman-test-<label>-<pid>,
+    // mirroring control.rs's unique-per-test pipe names.
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("foreman-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        let dir = test_dir("sha");
+        let f = dir.join("abc.txt");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            sha256_hex(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn expected_hash_finds_the_matching_line() {
+        let sums = "aaaa  other.zip\nbbbb  foreman-v0.3.0-x86_64-windows.zip\n";
+        assert_eq!(
+            expected_hash(sums, "foreman-v0.3.0-x86_64-windows.zip"),
+            Some("bbbb".into())
+        );
+        assert_eq!(expected_hash(sums, "missing.zip"), None);
+        // tolerate single-space and CRLF variants
+        assert_eq!(
+            expected_hash("cccc foreman.zip\r\n", "foreman.zip"),
+            Some("cccc".into())
+        );
+    }
+
+    #[test]
+    fn extract_exe_pulls_the_exe_out_of_a_zip() {
+        let dir = test_dir("zip");
+        let zip_path = dir.join("rel.zip");
+        // build a zip containing foreman.exe + a license, with the zip crate itself
+        let f = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        use std::io::Write as _;
+        w.start_file("foreman.exe", opts).unwrap();
+        w.write_all(b"NEW-EXE-BYTES").unwrap();
+        w.start_file("LICENSE", opts).unwrap();
+        w.write_all(b"license").unwrap();
+        w.finish().unwrap();
+        let dest = dir.join("foreman.exe.new");
+        extract_exe(&zip_path, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"NEW-EXE-BYTES");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn swap_replaces_exe_and_keeps_old() {
+        let dir = test_dir("swap");
+        let exe = dir.join("foreman.exe");
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(sibling(&exe, ".new"), b"NEW").unwrap();
+        swap_exe(&exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(sibling(&exe, ".old")).unwrap(), b"OLD");
+        assert!(!sibling(&exe, ".new").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn swap_rolls_back_when_new_is_missing() {
+        // rename 1 succeeds, rename 2 fails (no .new) -> .old must be renamed back
+        let dir = test_dir("rollback");
+        let exe = dir.join("foreman.exe");
+        std::fs::write(&exe, b"OLD").unwrap();
+        assert!(swap_exe(&exe).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD", "exe must be restored");
+        assert!(!sibling(&exe, ".old").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn probe_writable_true_in_temp_false_in_missing_dir() {
+        assert!(probe_writable(&std::env::temp_dir()));
+        assert!(!probe_writable(std::path::Path::new(
+            r"C:\nonexistent-foreman-probe-dir"
+        )));
+    }
+
+    #[test]
+    fn sibling_appends_to_the_full_filename() {
+        assert_eq!(
+            sibling(std::path::Path::new(r"C:\x\foreman.exe"), ".old"),
+            std::path::PathBuf::from(r"C:\x\foreman.exe.old")
+        );
     }
 }
