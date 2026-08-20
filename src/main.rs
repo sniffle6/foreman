@@ -18,6 +18,7 @@ mod geom;
 mod graphics;
 mod icat;
 mod icons;
+mod imageview;
 mod input;
 mod inspect;
 mod job;
