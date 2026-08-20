@@ -15,6 +15,7 @@ All commands are PowerShell 7+. Baseline: commit `7fda1c2` (2026-07-01).
 |---|---|---|
 | Did the Session receive my input? What's on its screen? | `foreman send` → `foreman snapshot` (headless loop, below) | Grid text (a Snapshot) |
 | Does the UI *look* right (layout, colors, icons, chrome)? | build-screenshot skill | Pixels (`win.png`) |
+| Show the human an image/screenshot in-pane (FOREMAN=1) | `foreman icat <file.png>` (foreman-icat skill) | Rendered in your pane |
 | What Sessions exist and are they alive? | `foreman status` | Line-per-Session listing |
 | What did the agents say / who went quiet? | `foreman chat --history N`, Crew board | Room log tail, presence ages |
 | Is rendering slow? | Throwaway frame harness (below) | ms/frame numbers |

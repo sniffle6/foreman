@@ -119,6 +119,9 @@ const CODEX_DISPATCH_OPENAI: &str =
     include_str!("../.codex/skills/foreman-dispatch/agents/openai.yaml");
 const CODEX_CHAT_SKILL: &str = include_str!("../.codex/skills/foreman-chat/SKILL.md");
 const CODEX_CHAT_OPENAI: &str = include_str!("../.codex/skills/foreman-chat/agents/openai.yaml");
+const ICAT_SKILL: &str = include_str!("../.claude/skills/foreman-icat/SKILL.md");
+const CODEX_ICAT_SKILL: &str = include_str!("../.codex/skills/foreman-icat/SKILL.md");
+const CODEX_ICAT_OPENAI: &str = include_str!("../.codex/skills/foreman-icat/agents/openai.yaml");
 
 #[derive(Clone, Copy)]
 struct SkillBundle {
@@ -140,6 +143,11 @@ const CLAUDE_SKILLS: &[SkillBundle] = &[
         skill_md: CHAT_SKILL,
         openai_yaml: None,
     },
+    SkillBundle {
+        name: "foreman-icat",
+        skill_md: ICAT_SKILL,
+        openai_yaml: None,
+    },
 ];
 
 /// Codex installs also include UI metadata under `agents/openai.yaml`.
@@ -153,6 +161,11 @@ const CODEX_SKILLS: &[SkillBundle] = &[
         name: "foreman-chat",
         skill_md: CODEX_CHAT_SKILL,
         openai_yaml: Some(CODEX_CHAT_OPENAI),
+    },
+    SkillBundle {
+        name: "foreman-icat",
+        skill_md: CODEX_ICAT_SKILL,
+        openai_yaml: Some(CODEX_ICAT_OPENAI),
     },
 ];
 
@@ -373,9 +386,13 @@ mod tests {
     fn install_into_writes_claude_both_then_is_idempotent() {
         let dir = temp("install-into");
         let first = install_into(&dir, CLAUDE_SKILLS, OBSOLETE_SKILLS).unwrap();
-        assert_eq!(first.written, vec!["foreman-dispatch", "foreman-chat"]);
+        assert_eq!(
+            first.written,
+            vec!["foreman-dispatch", "foreman-chat", "foreman-icat"]
+        );
         assert!(dir.join("foreman-dispatch").join("SKILL.md").exists());
         assert!(dir.join("foreman-chat").join("SKILL.md").exists());
+        assert!(dir.join("foreman-icat").join("SKILL.md").exists());
         // second run: nothing changes
         let second = install_into(&dir, CLAUDE_SKILLS, OBSOLETE_SKILLS).unwrap();
         assert!(
@@ -389,7 +406,10 @@ mod tests {
     fn install_into_writes_codex_openai_yaml_then_is_idempotent() {
         let dir = temp("install-codex");
         let first = install_into(&dir, CODEX_SKILLS, OBSOLETE_SKILLS).unwrap();
-        assert_eq!(first.written, vec!["foreman-dispatch", "foreman-chat"]);
+        assert_eq!(
+            first.written,
+            vec!["foreman-dispatch", "foreman-chat", "foreman-icat"]
+        );
         let yaml = dir
             .join("foreman-dispatch")
             .join("agents")

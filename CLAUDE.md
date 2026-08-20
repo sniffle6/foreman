@@ -121,7 +121,7 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   app chrome, chat, ANSI palette) as consts, glob-imported by consumers. Static
   by design — no runtime theme system until a second theme exists.
 - `src/skills_install.rs` — on startup, embeds (`include_str!`) and installs the
-  `foreman-dispatch`/`foreman-chat` skills into Claude and Codex global skill
+  `foreman-dispatch`/`foreman-chat`/`foreman-icat` skills into Claude and Codex global skill
   dirs so agents in any project (incl. external repos) can discover them. Source
   skill copies live in `.claude/skills/` and `.codex/skills/`; keep them in sync
   when behavior changes, then rebuild to propagate. Best-effort — failures are
