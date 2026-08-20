@@ -229,6 +229,29 @@ pub enum CtrlMsg {
     Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
+/// Create the pipe listener, retrying briefly: after an update-restart the
+/// old instance can hold the pipe a beat past its window closing, and two
+/// instances launched fast race it. First success wins; None = give up
+/// (dispatch disabled), same behavior as the old one-shot failure.
+fn listen_retry(
+    name: interprocess::local_socket::Name<'_>,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> Option<interprocess::local_socket::Listener> {
+    for i in 0..attempts {
+        match ListenerOptions::new().name(name.clone()).create_sync() {
+            Ok(l) => return Some(l),
+            Err(e) if i + 1 == attempts => {
+                eprintln!(
+                    "control: pipe unavailable after {attempts} attempts ({e}); agent dispatch disabled"
+                );
+            }
+            Err(_) => std::thread::sleep(delay),
+        }
+    }
+    None
+}
+
 /// Pipe server. Runs on a background thread for the GUI's whole lifetime; the
 /// GUI drains `tx`'s receiver each frame. One JSON line in, one JSON line out,
 /// per connection.
@@ -236,14 +259,8 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
     let Ok(name) = pipe.to_ns_name::<GenericNamespaced>() else {
         return;
     };
-    let listener = match ListenerOptions::new().name(name).create_sync() {
-        Ok(l) => l,
-        // Another foreman owns the pipe (or it's blocked): GUI still works,
-        // dispatch is just unavailable in this instance.
-        Err(e) => {
-            eprintln!("control: pipe unavailable ({e}); agent dispatch disabled");
-            return;
-        }
+    let Some(listener) = listen_retry(name, 8, std::time::Duration::from_millis(250)) else {
+        return;
     };
     // Each connection is handled on its own short-lived thread: read the request,
     // hand it to the GUI, wait for the reply, write it back. A client that
@@ -1133,6 +1150,33 @@ mod tests {
         let reply = reply.expect("no reply");
         assert!(reply.ok);
         assert_eq!(reply.project.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn listen_retry_wins_the_pipe_after_the_holder_exits() {
+        let pipe = format!("foreman-test-retry-{}", std::process::id());
+        let name = pipe.clone().to_ns_name::<GenericNamespaced>().unwrap();
+        let holder = ListenerOptions::new().name(name).create_sync().unwrap();
+        let p2 = pipe.clone();
+        let t = std::thread::spawn(move || {
+            let name = p2.to_ns_name::<GenericNamespaced>().unwrap();
+            listen_retry(name, 20, std::time::Duration::from_millis(50)).is_some()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(holder);
+        assert!(
+            t.join().unwrap(),
+            "retry must acquire the pipe once the holder is gone"
+        );
+    }
+
+    #[test]
+    fn listen_retry_gives_up_when_the_pipe_stays_held() {
+        let pipe = format!("foreman-test-retry-held-{}", std::process::id());
+        let name = pipe.clone().to_ns_name::<GenericNamespaced>().unwrap();
+        let _holder = ListenerOptions::new().name(name).create_sync().unwrap();
+        let name2 = pipe.to_ns_name::<GenericNamespaced>().unwrap();
+        assert!(listen_retry(name2, 3, std::time::Duration::from_millis(20)).is_none());
     }
 
     #[test]
