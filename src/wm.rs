@@ -1932,11 +1932,12 @@ impl WindowManager {
                             Content::Project(_) => {
                                 RowKind::Terminal(crate::icons::IconKind::Folder)
                             }
-                            // Image windows don't appear in the sessions panel today —
-                            // same opt-out as TaskManager/Settings (not agent sessions).
-                            Content::Image(_) | Content::TaskManager(_) | Content::Settings(_) => {
-                                continue;
-                            }
+                            // A minimized window can ONLY be restored via a panel
+                            // click (chip taskbars are gone) — an Image window opted
+                            // out here would be permanently unreachable once
+                            // minimized. Content window, same as Chat: it gets a row.
+                            Content::Image(_) => RowKind::Image,
+                            Content::TaskManager(_) | Content::Settings(_) => continue,
                         };
                         tabs.push(TabEntry {
                             path: TargetPath {
@@ -9227,6 +9228,51 @@ mod tests {
         assert!(!p.tabs[1].active_tab);
         let bt = p.tabs.iter().find(|t| t.path.window == Some(b)).unwrap();
         assert!(bt.minimized);
+    }
+
+    #[test]
+    fn minimized_image_window_gets_a_panel_row_and_restores_via_it() {
+        // Regression: a minimized Image window used to be opted out of the
+        // panel model entirely (same as TaskManager/Settings) — with chip
+        // taskbars gone, minimize is the ONLY way in, so that stranded the
+        // window with no path back. It must behave like Chat: a real row,
+        // and `surface_target` (the panel-click path) restores it.
+        let mut desk = WindowManager::new();
+        let proj = push(&mut desk, "projA");
+        let mut inner = WindowManager::new();
+        let img = push(&mut inner, "armed.png");
+        inner.windows[0].tabs[0].content = Content::Image(crate::imageview::ImageView::error(
+            std::path::PathBuf::from("armed.png"),
+            "stub",
+        ));
+        inner.windows[0].minimized = true;
+        desk.windows[0].tabs[0].content = Content::Project(Box::new(inner));
+        desk.focus(proj);
+
+        let m = desk.panel_model();
+        let row = m.projects[0]
+            .tabs
+            .iter()
+            .find(|t| t.path.window == Some(img))
+            .expect("image window must appear in the panel model");
+        assert!(
+            matches!(row.kind, crate::panel::RowKind::Image),
+            "expected RowKind::Image, got {:?}",
+            row.kind
+        );
+        assert!(row.minimized);
+        let path = row.path;
+
+        desk.surface_target(path);
+
+        let Content::Project(inner) =
+            &desk.windows.iter().find(|w| w.id == proj).unwrap().tabs[0].content
+        else {
+            panic!("expected project");
+        };
+        let iw = inner.windows.iter().find(|w| w.id == img).unwrap();
+        assert!(!iw.minimized, "panel click must restore the image window");
+        assert_eq!(inner.focused, Some(img));
     }
 
     #[test]

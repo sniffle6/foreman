@@ -63,6 +63,7 @@ pub struct TargetPath {
 pub enum RowKind {
     Terminal(crate::icons::IconKind),
     Chat,
+    Image,
 }
 
 #[derive(Clone, Debug)]
@@ -757,6 +758,7 @@ impl PanelView {
                         col,
                     );
                 }
+                Some(RowKind::Image) => paint_image_glyph(&p, icon_c, col),
             }
             let tp = egui::pos2(
                 chip_rect.min.x + pad + icon_w + text_gap,
@@ -989,6 +991,7 @@ impl PanelView {
                     col,
                 );
             }
+            Some(RowKind::Image) => paint_image_glyph(&p, icon_c, col),
         }
 
         // Title, truncated with … to the space left of the buttons/labels.
@@ -1128,6 +1131,32 @@ pub(crate) fn paint_chevron(p: &egui::Painter, c: egui::Pos2, up: bool, color: e
         [egui::pos2(c.x, c.y - dy), egui::pos2(c.x + hw, c.y + dy)],
         stroke,
     );
+}
+
+/// A tiny framed-mountain glyph for `RowKind::Image` rows. Same tofu-avoidance
+/// policy as `paint_chevron`: no confidence a picture-ish symbol codepoint is
+/// covered by every fallback font, so it's drawn as vector strokes instead of
+/// a text glyph (Chat's `§` is Latin-1 and known-safe; this isn't).
+pub(crate) fn paint_image_glyph(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    let half = 4.4;
+    let frame = egui::Rect::from_center_size(c, egui::vec2(half * 2.0, half * 2.0));
+    let stroke = egui::Stroke::new(1.1, color);
+    p.rect_stroke(
+        frame,
+        egui::CornerRadius::same(1),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    p.circle_filled(egui::pos2(frame.min.x + 2.2, frame.min.y + 2.2), 1.0, color);
+    let ridge = [
+        egui::pos2(frame.min.x + 1.0, frame.max.y - 1.2),
+        egui::pos2(c.x - 0.6, c.y + 0.6),
+        egui::pos2(c.x + 1.4, c.y - 1.2),
+        egui::pos2(frame.max.x - 1.0, frame.max.y - 1.2),
+    ];
+    p.line_segment([ridge[0], ridge[1]], stroke);
+    p.line_segment([ridge[1], ridge[2]], stroke);
+    p.line_segment([ridge[2], ridge[3]], stroke);
 }
 
 fn row_visible(row: egui::Rect, clip: egui::Rect) -> bool {
