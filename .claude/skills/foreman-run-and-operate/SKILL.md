@@ -76,7 +76,7 @@ General rules:
 | status | `foreman status [--project P]` | **Deliberately no env default**: bare `status` lists ALL projects (`src/control.rs:103-105`); it is an overview verb. `--project pN` filters; unknown pN is an error. Any stray positional is an error. |
 | close | `foreman close [tN ...] [--project P]` | Ids must match `t<digits>`. With ids: closes those in P (default `FOREMAN_PROJECT_ID`, else focused). Validation is **all-or-nothing**: any unknown/non-terminal id fails the whole request, nothing closes. With **no** ids = self-close: requires BOTH `FOREMAN_TERMINAL_ID` and `FOREMAN_PROJECT_ID`, and **refuses** an explicit `--project` (`src/control.rs:513-529`). |
 | send | `foreman send [--project P] [--terminal T] [--text TXT] [--keys "K K..."]... [--settle-ms N]` | At least one of `--text`/`--keys`. `--text` is raw UTF-8 written verbatim (last one wins if repeated); `--keys` splits its value on whitespace and is repeatable (appends). Write order: text first, then keys. No `--terminal` = self-target: requires BOTH env vars and **refuses** an explicit `--project` (a `tN` is only unique within its project — pass `--terminal` to cross projects). Key names validated against the Session's live terminal mode BEFORE any byte is written — errors have no side effects (`src/wm.rs:1346-1354`). |
-| snapshot | `foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor]` | `--attrs`/`--cursor` are valueless opt-ins. No `--terminal`: **refuses** an explicit `--project` (same rule as send); self-targets only when `FOREMAN_TERMINAL_ID` is set (then `FOREMAN_PROJECT_ID` is required); otherwise errors `--terminal is required`. |
+| snapshot | `foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor] [--tail N]` | `--attrs`/`--cursor` are valueless opt-ins. `--tail N` (positive integer) is the last N buffer lines including scrollback, not the displayed viewport; larger than the buffer returns the whole buffer. No `--terminal`: **refuses** an explicit `--project` (same rule as send); self-targets only when `FOREMAN_TERMINAL_ID` is set (then `FOREMAN_PROJECT_ID` is required); otherwise errors `--terminal is required`. |
 
 ### send key-name grammar (`src/inspect.rs:207-283`, encoding in `src/input.rs:257-342`)
 
@@ -150,7 +150,8 @@ Reply printing:
   `send` → `{"ok":true}` after the settle.
 - Plain `snapshot` rows are the rendered viewport as currently displayed
   (scrollback-scroll included), trailing spaces trimmed, wide-char spacer cells
-  skipped (`src/inspect.rs:56-92`).
+  skipped (`src/inspect.rs`). `--tail N` instead returns the last N lines of
+  the buffer (history + live screen) and ignores display offset.
 
 **`open`'s `ok:true` means "a terminal opened", never "the command succeeded".**
 A Worker that spawned and instantly died still returned ok; `status` shows it as

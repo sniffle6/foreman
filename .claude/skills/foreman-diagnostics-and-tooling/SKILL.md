@@ -49,6 +49,7 @@ foreman snapshot --project p1 --terminal t3
 # Structured reads (reply becomes ONE JSON line instead of text rows):
 foreman snapshot --project p1 --terminal t3 --cursor   # {row, col, shape}
 foreman snapshot --project p1 --terminal t3 --attrs    # per-cell fg/bg RGB + style flags
+foreman snapshot --project p1 --terminal t3 --tail 80  # last 80 buffer lines, not the viewport
 ```
 
 Self-targeting reads `FOREMAN_TERMINAL_ID` + `FOREMAN_PROJECT_ID`, injected
@@ -98,8 +99,10 @@ blocks. Interpretation:
 
 ### Reading a Snapshot
 
-- Default reply: one line per visible grid row, **trailing spaces trimmed**,
-  blank rows are empty strings (src/inspect.rs:89) — remember this when diffing.
+- Default reply: one line per **visible** grid row, **trailing spaces trimmed**,
+  blank rows are empty strings — remember this when diffing. Long output that
+  scrolled off the pane is not in a default snapshot; use `--tail N` for the
+  last N buffer lines (scrollback + live screen, ignores current scroll).
 - `--cursor` reports the **raw model cursor** from the grid
   (`term.renderable_content().cursor`, src/inspect.rs:95). Since the Caret
   gate's retirement (2026-07-15) the painted caret is the same cell — any

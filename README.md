@@ -59,8 +59,9 @@ foreman snapshot --terminal t4
 - **Chat rooms** — each project has a chat room; posts are *typed into* member
   agents' terminals (push, not poll), so a team of agents can divide work in
   one room. A read-only viewer pane shows the log.
-- **Screens are readable** — `snapshot` returns any terminal's rendered
-  viewport, so an agent can check on a worker without touching it.
+- **Screens are readable** — `snapshot` returns any terminal's grid (viewport,
+  or `--tail N` of scrollback), so an agent can check on a worker without
+  touching it.
 - **Skills auto-installed** — on first launch foreman installs
   `foreman-dispatch` / `foreman-chat` skills into Claude Code and Codex, so
   agents discover all of this on their own.

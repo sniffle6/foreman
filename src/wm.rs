@@ -1564,7 +1564,7 @@ impl WindowManager {
         let session = self.session_mut(pid, tid)?;
         // One pump for the whole reply — chaining snapshot_text/cells/cursor_info
         // would pump per field and can stitch gens under active output.
-        Ok(session.snapshot_all(req.attrs, req.cursor))
+        Ok(session.snapshot_all(req.attrs, req.cursor, req.tail))
     }
 
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
@@ -8329,6 +8329,7 @@ mod tests {
             terminal: Some(terminal.to_string()),
             attrs: false,
             cursor: false,
+            tail: None,
         };
         (crate::control::CtrlMsg::Snapshot(req, rtx, sent), rrx)
     }
@@ -8471,6 +8472,7 @@ mod tests {
                 terminal: Some(ta.clone()),
                 attrs,
                 cursor,
+                tail: None,
             };
             (
                 crate::control::CtrlMsg::Snapshot(req, rtx, std::time::Instant::now()),

@@ -118,8 +118,9 @@ terminal headlessly, without the window or the user's keyboard.
 _Avoid_: scraping, probing, automation.
 
 **Snapshot**:
-A Session's rendered screen captured as data — the grid as text by default, or
-per-cell attributes and cursor on request. A read, never a side effect.
+A Session's grid captured as data — the displayed viewport as text by default,
+or the last N buffer lines with `--tail N`; per-cell attributes and cursor on
+request. A read, never a side effect.
 _Avoid_: dump, capture, screenshot (a screenshot is pixels; a Snapshot is the grid).
 
 **Chat room**:

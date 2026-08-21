@@ -8,8 +8,10 @@
 //! thin adapters over these functions.
 //!
 //! Reads come in two flavours: plain text (`snapshot_text`) for the default
-//! path, and per-cell attributes (`snapshot_cells`) for the `--attrs` opt-in.
-//! Plus cursor, substring-match, and key encoding.
+//! viewport path, and per-cell attributes (`snapshot_cells`) for the `--attrs`
+//! opt-in. `--tail N` uses [`snapshot_tail`] / [`snapshot_cells_tail`] to walk
+//! scrollback, not the displayed viewport. Plus cursor, substring-match, and
+//! key encoding.
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -73,17 +75,33 @@ fn clamp_region(
     }
 }
 
-/// The rendered viewport as plain text — one string per row, trailing spaces
-/// trimmed, wide-char spacer cells skipped. `region` clamps to the grid.
-pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -> Vec<String> {
+/// Last `n` lines of the buffer (scrollback + live screen), ignoring the
+/// current `display_offset`. Clamps to whatever the grid actually holds.
+/// `Line(0)` is the top of the live viewport; history is negative.
+fn tail_span<L: EventListener>(term: &Term<L>, n: usize) -> (i32, usize) {
     let grid = term.grid();
-    let off = grid.display_offset() as i32;
-    let cols = grid.columns();
-    let screen_rows = grid.screen_lines();
-    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
-    let mut out = Vec::with_capacity(r1.saturating_sub(r0));
-    for row in r0..r1 {
-        let line = Line(row as i32 - off);
+    let hist = grid.history_size();
+    let screen = grid.screen_lines();
+    let available = hist.saturating_add(screen);
+    let count = n.min(available);
+    let start = screen as i32 - count as i32;
+    (start, count)
+}
+
+/// Walk `n_rows` starting at alacritty `Line(start)` as plain text. Column
+/// range is inclusive-exclusive `[c0, c1)`. Wide-char spacers skipped,
+/// trailing spaces trimmed — same rules as the viewport snapshot.
+fn snapshot_text_span<L: EventListener>(
+    term: &Term<L>,
+    start: i32,
+    n_rows: usize,
+    c0: usize,
+    c1: usize,
+) -> Vec<String> {
+    let grid = term.grid();
+    let mut out = Vec::with_capacity(n_rows);
+    for i in 0..n_rows {
+        let line = Line(start + i as i32);
         let mut text = String::new();
         let mut col = c0;
         while col < c1 {
@@ -100,6 +118,26 @@ pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -
         out.push(text.trim_end().to_string());
     }
     out
+}
+
+/// The rendered viewport as plain text — one string per row, trailing spaces
+/// trimmed, wide-char spacer cells skipped. `region` clamps to the grid.
+pub fn snapshot_text<L: EventListener>(term: &Term<L>, region: Option<Region>) -> Vec<String> {
+    let grid = term.grid();
+    let off = grid.display_offset() as i32;
+    let cols = grid.columns();
+    let screen_rows = grid.screen_lines();
+    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
+    snapshot_text_span(term, r0 as i32 - off, r1.saturating_sub(r0), c0, c1)
+}
+
+/// Last `n` lines of the buffer as plain text — scrollback plus the live
+/// screen bottom, not the currently displayed viewport. `n` larger than the
+/// buffer returns the whole buffer.
+pub fn snapshot_tail<L: EventListener>(term: &Term<L>, n: usize) -> Vec<String> {
+    let (start, count) = tail_span(term, n);
+    let cols = term.grid().columns();
+    snapshot_text_span(term, start, count, 0, cols)
 }
 
 /// The cursor's row/col and shape.
@@ -126,26 +164,20 @@ pub fn grid_contains<L: EventListener>(term: &Term<L>, pattern: &str) -> bool {
         .any(|l| l.contains(pattern))
 }
 
-/// Per-cell attribute snapshot for the `--attrs` opt-in. Walks the grid exactly
-/// like [`snapshot_text`] (same region clamp, same `display_offset` row mapping,
-/// same wide-char spacer skip) but emits one [`CellData`] per kept cell instead
-/// of a flattened string. Colors resolve through the GUI palette
-/// ([`crate::terminal::resolve`]) so attrs reads match what's painted.
-pub fn snapshot_cells<L: EventListener>(
+fn snapshot_cells_span<L: EventListener>(
     term: &Term<L>,
-    region: Option<Region>,
+    start: i32,
+    n_rows: usize,
+    c0: usize,
+    c1: usize,
 ) -> Vec<Vec<CellData>> {
     let grid = term.grid();
-    let off = grid.display_offset() as i32;
-    let cols = grid.columns();
-    let screen_rows = grid.screen_lines();
-    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
-    let mut out = Vec::with_capacity(r1.saturating_sub(r0));
+    let mut out = Vec::with_capacity(n_rows);
     // Headless inspection has no egui ctx, so resolve against the built-in
     // default palette. (Documented gap: `--attrs` reports the default theme.)
     let gc = crate::terminal::GridColors::default_warm();
-    for row in r0..r1 {
-        let line = Line(row as i32 - off);
+    for i in 0..n_rows {
+        let line = Line(start + i as i32);
         let mut row_cells = Vec::new();
         let mut col = c0;
         while col < c1 {
@@ -174,6 +206,30 @@ pub fn snapshot_cells<L: EventListener>(
         out.push(row_cells);
     }
     out
+}
+
+/// Per-cell attribute snapshot for the `--attrs` opt-in. Walks the grid exactly
+/// like [`snapshot_text`] (same region clamp, same `display_offset` row mapping,
+/// same wide-char spacer skip) but emits one [`CellData`] per kept cell instead
+/// of a flattened string. Colors resolve through the GUI palette
+/// ([`crate::terminal::resolve`]) so attrs reads match what's painted.
+pub fn snapshot_cells<L: EventListener>(
+    term: &Term<L>,
+    region: Option<Region>,
+) -> Vec<Vec<CellData>> {
+    let grid = term.grid();
+    let off = grid.display_offset() as i32;
+    let cols = grid.columns();
+    let screen_rows = grid.screen_lines();
+    let (r0, r1, c0, c1) = clamp_region(region, screen_rows, cols);
+    snapshot_cells_span(term, r0 as i32 - off, r1.saturating_sub(r0), c0, c1)
+}
+
+/// Per-cell attributes for [`snapshot_tail`] — same line span as the text tail.
+pub fn snapshot_cells_tail<L: EventListener>(term: &Term<L>, n: usize) -> Vec<Vec<CellData>> {
+    let (start, count) = tail_span(term, n);
+    let cols = term.grid().columns();
+    snapshot_cells_span(term, start, count, 0, cols)
 }
 
 /// Map a single letter to its egui `Key` (case-insensitive).
@@ -313,6 +369,23 @@ mod tests {
         }
     }
 
+    /// Viewport `screen` rows with room for scrollback (matches live Sessions).
+    struct HistDims {
+        cols: usize,
+        screen: usize,
+    }
+    impl Dimensions for HistDims {
+        fn total_lines(&self) -> usize {
+            self.screen + 10_000
+        }
+        fn screen_lines(&self) -> usize {
+            self.screen
+        }
+        fn columns(&self) -> usize {
+            self.cols
+        }
+    }
+
     fn term_with(bytes: &[u8], cols: usize, rows: usize) -> Term<VoidListener> {
         let mut term = Term::new(Config::default(), &Dims { cols, rows }, VoidListener);
         let mut parser: Processor = Processor::new();
@@ -357,6 +430,113 @@ mod tests {
         );
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], "row0");
+    }
+
+    // ---- snapshot_tail -------------------------------------------------------
+
+    /// Screen `rows` high with history allowed. Writes MARK0..MARK{n-1}.
+    fn term_scrolled(cols: usize, rows: usize, n_marks: usize) -> Term<VoidListener> {
+        let body = (0..n_marks)
+            .map(|i| format!("MARK{i}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let mut term = Term::new(
+            Config {
+                scrolling_history: 10_000,
+                ..Config::default()
+            },
+            &HistDims { cols, screen: rows },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, body.as_bytes());
+        term
+    }
+
+    fn has_mark(rows: &[String], i: usize) -> bool {
+        let needle = format!("MARK{i}");
+        rows.iter().any(|r| r.contains(&needle))
+    }
+
+    #[test]
+    fn snapshot_tail_includes_scrollback_the_viewport_dropped() {
+        // 3-row screen, 8 marks: MARK0 has scrolled off; MARK7 is live.
+        let term = term_scrolled(20, 3, 8);
+        let view = snapshot_text(&term, None);
+        assert_eq!(view.len(), 3);
+        assert!(
+            !has_mark(&view, 0),
+            "oldest line must be off the viewport: {view:?}"
+        );
+        assert!(has_mark(&view, 7), "newest line stays on screen: {view:?}");
+
+        let tail = snapshot_tail(&term, 6);
+        assert_eq!(tail.len(), 6, "{tail:?}");
+        assert!(
+            has_mark(&tail, 0) || has_mark(&tail, 1) || has_mark(&tail, 2),
+            "tail must reach into scrollback: {tail:?}"
+        );
+        assert!(has_mark(&tail, 7), "tail ends at the live bottom: {tail:?}");
+        assert!(!has_mark(&view, 0));
+    }
+
+    #[test]
+    fn snapshot_tail_clamps_to_available_buffer() {
+        let term = term_scrolled(20, 3, 8);
+        let tail = snapshot_tail(&term, 10_000);
+        assert!(
+            has_mark(&tail, 0),
+            "full tail must include oldest: {tail:?}"
+        );
+        assert!(
+            has_mark(&tail, 7),
+            "full tail must include newest: {tail:?}"
+        );
+        assert!(
+            tail.len() <= 8 + 3,
+            "must not invent rows past the buffer: {}",
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_cells_tail_matches_text_tail_span() {
+        let term = term_scrolled(20, 3, 8);
+        let text = snapshot_tail(&term, 5);
+        let cells = snapshot_cells_tail(&term, 5);
+        assert_eq!(cells.len(), text.len());
+        let last_text = text.last().expect("tail");
+        let last_cells: String = cells
+            .last()
+            .expect("cells")
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert_eq!(last_cells, *last_text);
+    }
+
+    #[test]
+    fn snapshot_tail_ignores_display_offset() {
+        let mut term = term_scrolled(20, 3, 8);
+        let live = snapshot_tail(&term, 4);
+        term.scroll_display(alacritty_terminal::grid::Scroll::Delta(20));
+        let view = snapshot_text(&term, None);
+        assert!(
+            has_mark(&view, 0),
+            "scrolled viewport should show old lines: {view:?}"
+        );
+        let tail = snapshot_tail(&term, 4);
+        assert_eq!(
+            tail, live,
+            "tail is the live buffer bottom, not the scrolled viewport"
+        );
+        assert!(has_mark(&tail, 7), "{tail:?}");
+        assert!(
+            !has_mark(&tail, 0),
+            "4-line tail should not reach MARK0: {tail:?}"
+        );
     }
 
     // ---- snapshot_cells ------------------------------------------------------

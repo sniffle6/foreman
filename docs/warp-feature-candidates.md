@@ -38,7 +38,7 @@ Fig completion specs (MIT).
 **Do next (ranked — not equal):**
 
 1. **Font fallback** — **shipped** (`docs/font-fallback.md`). CJK/emoji glyphs via YaHei + Segoe fallbacks.
-2. **snapshot `--tail N`** — agents only see the viewport today; long builds fall off.
+2. **snapshot `--tail N`** — **shipped.** Last N buffer lines, not the viewport.
 3. **READY_GRACE** (agent-state campaign Phase 0) — inject/chat can stick forever if DSR never latches. Foundation for state later.
 4. **`keyboard_owner()`** — ~20-line cleanup when touching keymap/wm. Lowest product value.
 5. **Composer** — optional human multi-line draft. Not the fleet problem. Soft adopt only.

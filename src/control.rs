@@ -163,8 +163,9 @@ pub struct ViewRequest {
     pub path: String,
 }
 
-/// Read the rendered viewport of a terminal. Plain text by default; `attrs` and
-/// `cursor` are opt-ins that attach structured fields to the reply.
+/// Read a terminal's grid as text. Default is the currently displayed viewport;
+/// `tail` of Some(N) is the last N buffer lines (scrollback included). `attrs`
+/// and `cursor` are opt-ins that attach structured fields to the reply.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRequest {
     pub cmd: String, // always "snapshot"
@@ -178,6 +179,11 @@ pub struct SnapshotRequest {
     /// `--cursor`: include cursor position + shape (`cursor`) in the reply.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor: bool,
+    /// `--tail N`: last N lines of the buffer (scrollback + live screen), not
+    /// the currently displayed viewport. Omitted on the wire when None so v1
+    /// requests stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<usize>,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -657,11 +663,12 @@ pub fn parse_send_args(
 }
 
 /// Parse `foreman snapshot` args: `[--project P] [--terminal T] [--attrs]
-/// [--cursor]`. When `--terminal` is absent, fills from `self_terminal`
+/// [--cursor] [--tail N]`. When `--terminal` is absent, fills from `self_terminal`
 /// (FOREMAN_TERMINAL_ID) and requires FOREMAN_PROJECT_ID (`default_project`);
 /// an explicit `--project` then errors (terminal ids are only unique within
 /// a project, so it would be a cross-project guess).
-/// `--attrs`/`--cursor` are valueless boolean opt-ins.
+/// `--attrs`/`--cursor` are valueless boolean opt-ins. `--tail N` is the last
+/// N lines of the buffer (scrollback included), not the displayed viewport.
 pub fn parse_snapshot_args(
     args: &[String],
     default_project: Option<String>,
@@ -672,6 +679,7 @@ pub fn parse_snapshot_args(
     let mut terminal: Option<String> = None;
     let mut attrs = false;
     let mut cursor = false;
+    let mut tail: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -691,6 +699,17 @@ pub fn parse_snapshot_args(
             "--cursor" => {
                 cursor = true;
                 i += 1;
+            }
+            "--tail" => {
+                let raw = args.get(i + 1).ok_or("--tail needs a positive integer")?;
+                let n: usize = raw
+                    .parse()
+                    .map_err(|_| "--tail needs a positive integer".to_string())?;
+                if n == 0 {
+                    return Err("--tail needs a positive integer".into());
+                }
+                tail = Some(n);
+                i += 2;
             }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => return Err(format!("unexpected argument: {other}")),
@@ -722,6 +741,7 @@ pub fn parse_snapshot_args(
         terminal: Some(terminal),
         attrs,
         cursor,
+        tail,
     })
 }
 
@@ -786,7 +806,7 @@ USAGE
   foreman status [--project P]              list projects + terminals (running/exited)
   foreman close [tN ...] [--project P]      close terminals (no ids: your own pane)
   foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
-  foreman snapshot [--project P] [--terminal T]       read the rendered viewport
+  foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman help | --help | -h                this text (also: open --help, chat --help,
@@ -872,14 +892,17 @@ prefixes combinable. Unknown name exits 2.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_SNAPSHOT: &str = "\
-foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor]
+foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor] [--tail N]
 
-Read terminal T's rendered viewport (default: your own).
-Default: plain text rows in the history field, one per visible row, trailing
-spaces trimmed, printed line per line — a settled terminal (after foreman send)
-gives you the current screen state. Opt-in structured fields:
+Read terminal T (default: your own).
+Default: the currently displayed viewport as plain text rows in the history
+field, one per visible row, trailing spaces trimmed, printed line per line.
+--tail N reads the last N lines of the buffer (scrollback + live screen)
+instead — viewport-only inspect silently drops long-build output.
+N must be a positive integer; larger than the buffer returns the whole buffer.
+Opt-in structured fields:
   --attrs   cells: per-cell fg/bg (RGB) + bold/italic/underline/strikethrough/
-            inverse/dim/wide flags.
+            inverse/dim/wide flags (same row span as the text).
   --cursor  cursor: {row, col, shape}.
 With --attrs or --cursor the whole reply is printed as one JSON line instead.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
@@ -1830,12 +1853,14 @@ mod tests {
             terminal: Some("t3".into()),
             attrs: false,
             cursor: false,
+            tail: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("\"project\""), "{json}");
         // false opt-in flags must serialize away (v1 byte-compat)
         assert!(!json.contains("\"attrs\""), "{json}");
         assert!(!json.contains("\"cursor\""), "{json}");
+        assert!(!json.contains("\"tail\""), "{json}");
         let back: SnapshotRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, req);
     }
@@ -2101,6 +2126,52 @@ mod tests {
         .unwrap();
         assert!(req.cursor, "expected cursor=true");
         assert!(!req.attrs, "attrs defaults false");
+        assert_eq!(req.tail, None);
+    }
+
+    #[test]
+    fn parse_snapshot_args_tail_flag() {
+        let req = parse_snapshot_args(
+            &s(&["--terminal", "t2", "--tail", "80"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.tail, Some(80));
+        assert!(!req.attrs);
+        assert!(!req.cursor);
+    }
+
+    #[test]
+    fn parse_snapshot_args_rejects_tail_zero_and_missing() {
+        let e = parse_snapshot_args(
+            &s(&["--terminal", "t2", "--tail", "0"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("positive integer"), "{e}");
+        let e = parse_snapshot_args(&s(&["--terminal", "t2", "--tail"]), Some("p1".into()), None)
+            .unwrap_err();
+        assert!(e.contains("positive integer"), "{e}");
+        let e = parse_snapshot_args(
+            &s(&["--terminal", "t2", "--tail", "nope"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("positive integer"), "{e}");
+    }
+
+    #[test]
+    fn snapshot_request_without_tail_is_wire_compat_with_v1() {
+        // A v1 payload (no tail key) must still parse; a new request with
+        // tail=None must omit the key so old GUIs never see it.
+        let v1 = r#"{"cmd":"snapshot","terminal":"t3"}"#;
+        let req: SnapshotRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.tail, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"tail\""), "{json}");
     }
 
     #[test]
@@ -2187,6 +2258,7 @@ mod tests {
             terminal: Some("t3".into()),
             attrs: false,
             cursor: false,
+            tail: None,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -2245,6 +2317,7 @@ mod tests {
             terminal: Some("t3".into()),
             attrs: true,
             cursor: false,
+            tail: None,
         };
         let mut reply = None;
         for _ in 0..100 {

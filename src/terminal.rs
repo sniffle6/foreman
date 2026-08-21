@@ -1246,18 +1246,28 @@ impl Session {
     /// Prefer this over chaining [`snapshot_text`] / [`snapshot_cells`] /
     /// [`cursor_info`] when more than one field is needed — each of those
     /// pumps independently, so concurrent PTY output can tear the reply.
+    ///
+    /// `tail` of `Some(n)` reads the last n buffer lines (scrollback included)
+    /// instead of the currently displayed viewport.
     pub fn snapshot_all(
         &mut self,
         attrs: bool,
         cursor: bool,
+        tail: Option<usize>,
     ) -> (
         Vec<String>,
         Option<Vec<Vec<crate::inspect::CellData>>>,
         Option<crate::inspect::CursorInfo>,
     ) {
         self.pump();
-        let text = crate::inspect::snapshot_text(&self.term, None);
-        let cells = attrs.then(|| crate::inspect::snapshot_cells(&self.term, None));
+        let text = match tail {
+            Some(n) => crate::inspect::snapshot_tail(&self.term, n),
+            None => crate::inspect::snapshot_text(&self.term, None),
+        };
+        let cells = attrs.then(|| match tail {
+            Some(n) => crate::inspect::snapshot_cells_tail(&self.term, n),
+            None => crate::inspect::snapshot_cells(&self.term, None),
+        });
         let cursor = cursor.then(|| crate::inspect::cursor_info(&self.term));
         (text, cells, cursor)
     }

@@ -7,10 +7,13 @@ without touching the GUI. Phase 1 (`src/inspect.rs` pure functions) and Phase 2
 ## What it does
 
 - `foreman send` — write raw UTF-8 text and/or named key presses into a terminal's PTY.
-- `foreman snapshot` — read the terminal's rendered viewport as plain text rows.
+- `foreman snapshot` — read the terminal's grid as plain text rows. Default is
+  the currently displayed viewport; `--tail N` is the last N lines of the
+  buffer (scrollback + live screen).
 
 Together they close the feedback loop: an agent can `send` a command and then
-`snapshot` to see the result.
+`snapshot` to see the result — including output that has already scrolled off
+the pane.
 
 ## How to use
 
@@ -22,6 +25,9 @@ foreman snapshot
 # Targeting another terminal explicitly:
 foreman send --project p1 --terminal t3 --text "ls\r"
 foreman snapshot --project p1 --terminal t3
+
+# Last N buffer lines (scrollback), not just the visible pane:
+foreman snapshot --project p1 --terminal t3 --tail 80
 
 # Named key presses (same encoding as the GUI keyboard):
 foreman send --project p1 --terminal t3 --keys "F5"
@@ -44,11 +50,26 @@ foreman send --keys "Escape F1" --keys "Enter"
 # equivalent to: Escape, F1, Enter
 ```
 
-## `--settle-ms` (next phase)
+## `--tail N`
 
-`--settle-ms N` is accepted and parsed but not yet honored. Phase 3 will add
-quiescence-based settle so a `send` blocks until the terminal goes quiet before
-replying. For now, chain a `snapshot` after a `send` to read settled state.
+Default snapshot is the **displayed viewport** — if the pane is 30 rows, you
+get 30 rows, even when thousands of lines sit in scrollback. A long
+`cargo test` failure that scrolled off the top is invisible.
+
+`--tail N` walks the last N lines of the buffer (history + live screen) and
+ignores the current scroll position. N larger than the buffer returns
+everything. N must be a positive integer (exit 2 otherwise). `--attrs` uses
+the same row span.
+
+On the alternate screen (vim, lazygit, agent TUIs) there is no scrollback;
+`--tail` then returns at most one screen of that buffer.
+
+## `--settle-ms`
+
+`--settle-ms N` is honored: after `send` writes, the reply waits until the
+Session has produced no new output for N ms (default 120, cap 4000) so a
+following snapshot is settled, not mid-update. `--settle-ms 0` replies
+immediately.
 
 ## Self-target
 
@@ -66,7 +87,7 @@ terminal from your env would silently target another project's pane.
 
 ## Key files
 
-- `src/inspect.rs` — pure grid-walk: `snapshot_text`, `parse_keys`, `cursor_info`, `grid_contains`
+- `src/inspect.rs` — pure grid-walk: `snapshot_text`, `snapshot_tail`, `parse_keys`, `cursor_info`, `grid_contains`
 - `src/terminal.rs` — `Session::feed`, `Session::term_mode`, `Session::snapshot_text`
 - `src/control.rs` — `SendRequest`, `SnapshotRequest`, `CtrlMsg::Send/Snapshot`, `parse_send_args`, `parse_snapshot_args`, `send_main`, `snapshot_main`
 - `src/wm.rs` — `resolve_terminal`, `session_mut`, `send_dispatch`, `snapshot_dispatch`, `handle_ctrl` arms
