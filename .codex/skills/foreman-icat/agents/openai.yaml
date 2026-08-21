@@ -1,4 +1,4 @@
 interface:
   display_name: "Foreman Icat"
-  short_description: "Show an image in your Foreman pane"
-  default_prompt: "Use $foreman-icat to display a PNG (screenshot, chart, capture) in the terminal pane."
+  short_description: "Show an image in your Foreman pane or a viewer window"
+  default_prompt: "Use $foreman-icat to display a PNG (screenshot, chart, capture) inline in the terminal pane or in a persistent viewer window."
