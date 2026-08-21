@@ -105,6 +105,8 @@ out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
   not poll); dispatched terminals auto-join, others join on first post.
   Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
 - `src/dirpicker.rs` — keyboard-driven project directory picker.
+- `src/imageview.rs` — `Content::Image`: `foreman view <path.png>` opens a
+  persistent PNG viewer window (fit/zoom/pan, no PTY). Doc: `docs/image-viewer.md`.
 - `src/keymap.rs` — data-driven leader-key bindings. Defaults live in
   `Keymap::default` (in code); a user file at `%APPDATA%\foreman\keybindings.json`
   is merged *over* them, so new commands always get a default chord. Leader is

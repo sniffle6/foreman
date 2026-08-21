@@ -34,6 +34,10 @@ screenshot and runs `foreman icat shot.png` so the human sees it in the pane.
 - Pure seams (`encode`, `fit`, `png_dims`) are unit-tested round-trip through
   `graphics::Graphics::feed`/`apply`/`visible` — the tests drive the real
   renderer, not a mock.
+- Inline and ephemeral: it scrolls away with the pane's buffer and doesn't
+  survive a restart. For a persistent window you can tile/float/close like
+  any other pane and that comes back after restart, use `foreman view
+  <file.png>` instead — see `docs/image-viewer.md`.
 
 ## How it works
 
