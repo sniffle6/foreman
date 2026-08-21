@@ -154,14 +154,13 @@ impl ImageView {
 
         match &mut self.img {
             ImgState::Err(msg) => {
+                // Long paths/messages must wrap, not overhang the pane edge —
+                // `painter.text` has no wrap width, so lay out a galley first.
                 let text = format!("{}\n{msg}", self.path.display());
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    text,
-                    egui::FontId::proportional(13.0),
-                    th.dim,
-                );
+                let wrap = (rect.width() - 24.0).max(40.0);
+                let galley = painter.layout(text, egui::FontId::proportional(13.0), th.dim, wrap);
+                let pos = rect.center() - galley.size() / 2.0;
+                painter.galley(pos, galley, th.dim);
             }
             ImgState::Ok {
                 w,
