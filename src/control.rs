@@ -149,6 +149,20 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Open a persistent `Content::Image` window showing a PNG. `path` is always
+/// an absolute, canonicalized path — resolved CLIENT-side (see
+/// `parse_view_args`) so the GUI (which may have a different cwd) never
+/// guesses. The GUI still decodes defensively: a path that goes stale between
+/// client-side validation and the GUI opening it lands in the viewer's
+/// placeholder state, never a dropped request.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ViewRequest {
+    pub cmd: String, // always "view" in v1
+    #[serde(default)]
+    pub project: Option<String>, // "p3"; None = focused project
+    pub path: String,
+}
+
 /// Read the rendered viewport of a terminal. Plain text by default; `attrs` and
 /// `cursor` are opt-ins that attach structured fields to the reply.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -227,6 +241,7 @@ pub enum CtrlMsg {
     Close(CloseRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Send(SendRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Create the pipe listener, retrying briefly: after an update-restart the
@@ -316,6 +331,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
                             .map_err(|e| format!("bad request: {e}")),
                         "snapshot" => serde_json::from_str::<SnapshotRequest>(&line)
                             .map(|r| CtrlMsg::Snapshot(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "view" => serde_json::from_str::<ViewRequest>(&line)
+                            .map(|r| CtrlMsg::View(r, rtx, now))
                             .map_err(|e| format!("bad request: {e}")),
                         other => Err(format!("unknown cmd: {other}")),
                     },
@@ -707,6 +725,56 @@ pub fn parse_snapshot_args(
     })
 }
 
+/// Parse `foreman view` args: `[--project P] <path.png>`. Resolves the path to
+/// an absolute, canonicalized form CLIENT-side (the GUI may run with a
+/// different cwd) and strips Windows' `\\?\` verbatim prefix so the stored/
+/// displayed path stays a normal one. Cheap validation happens here too — a
+/// nonexistent file or non-`.png` extension exits 2 before touching the pipe;
+/// the GUI still degrades gracefully on any later decode failure regardless.
+pub fn parse_view_args(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<ViewRequest, String> {
+    let mut project = default_project;
+    let mut path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if path.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                path = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let raw = path.ok_or("missing <path.png>")?;
+    let is_png = std::path::Path::new(&raw)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return Err(format!("not a .png file: {raw}"));
+    }
+    let abs = std::fs::canonicalize(&raw).map_err(|e| format!("cannot find {raw}: {e}"))?;
+    let display = abs.display().to_string();
+    let display = display
+        .strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(display);
+    Ok(ViewRequest {
+        cmd: "view".into(),
+        project,
+        path: display,
+    })
+}
+
 const HELP: &str = "\
 foreman — a desktop for running fleets of AI-agent terminals
 
@@ -720,9 +788,10 @@ USAGE
   foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
   foreman snapshot [--project P] [--terminal T]       read the rendered viewport
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
+  foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
-                                            snapshot --help)
+                                            snapshot --help, view --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -815,6 +884,20 @@ gives you the current screen state. Opt-in structured fields:
 With --attrs or --cursor the whole reply is printed as one JSON line instead.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
+const HELP_VIEW: &str = "\
+foreman view <file.png> [--project P]
+
+Open a persistent Content::Image window in project P (default: your
+FOREMAN_PROJECT_ID, else the focused project) showing <file.png>. Unlike
+icat (inline, ephemeral, scrolls away with the pane) this is a normal
+window: tile/float/tab/close/minimize all work like any other pane, and it
+restores across restarts (path only — zoom/pan reset).
+PNG only in v1. The path is resolved to an absolute path before the request
+is sent — a relative path is relative to THIS process's cwd, not the GUI's.
+Reply: {\"ok\":true,\"terminal\":\"tN\",\"project\":\"pN\"}.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments (nonexistent file or
+non-.png extension fail here, before touching the pipe).";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
@@ -825,6 +908,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("send") => send_main(&args[1..]),
         Some("snapshot") => snapshot_main(&args[1..]),
         Some("icat") => crate::icat::icat_main(&args[1..]),
+        Some("view") => view_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -840,6 +924,7 @@ pub fn client_main(args: &[String]) -> i32 {
             );
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman icat <file.png> [--cols N]");
+            eprintln!("       foreman view <file.png> [--project P]");
             eprintln!("       foreman help");
             2
         }
@@ -953,6 +1038,21 @@ fn snapshot_main(args: &[String]) -> i32 {
         }
     };
     report("foreman snapshot", request(PIPE, &req))
+}
+
+fn view_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_VIEW}");
+        return 0;
+    }
+    let req = match parse_view_args(args, std::env::var("FOREMAN_PROJECT_ID").ok()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman view: {e}");
+            return 2;
+        }
+    };
+    report("foreman view", request(PIPE, &req))
 }
 
 /// Print the pipe reply (or the connection failure) the way all subcommands do.
@@ -2161,5 +2261,110 @@ mod tests {
         let cells = r.cells.expect("cells present");
         assert_eq!(cells[0][0].ch, 'X');
         assert!(cells[0][0].underline);
+    }
+
+    // ---- view ------------------------------------------------------------
+
+    #[test]
+    fn parse_view_args_rejects_non_png_extension() {
+        let e = parse_view_args(&s(&["photo.jpg"]), None).unwrap_err();
+        assert!(e.contains("not a .png file"), "{e}");
+    }
+
+    #[test]
+    fn parse_view_args_rejects_missing_file() {
+        let e = parse_view_args(&s(&["definitely_missing_9f8c.png"]), None).unwrap_err();
+        assert!(e.contains("cannot find"), "{e}");
+    }
+
+    #[test]
+    fn parse_view_args_resolves_absolute_path_and_project() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("foreman-view-test-{}.png", std::process::id()));
+        std::fs::write(&path, b"not a real png, just a real file").unwrap();
+        let req = parse_view_args(
+            &s(&["--project", "p2", path.to_str().unwrap()]),
+            Some("p1".into()),
+        )
+        .unwrap();
+        assert_eq!(req.cmd, "view");
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        assert!(!req.path.starts_with(r"\\?\"), "{}", req.path);
+        assert!(std::path::Path::new(&req.path).is_absolute());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_view_args_defaults_project_from_env() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("foreman-view-test-def-{}.png", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let req = parse_view_args(&s(&[path.to_str().unwrap()]), Some("p9".into())).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p9"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_view_args_rejects_unknown_flag() {
+        let e = parse_view_args(&s(&["--bogus", "a.png"]), None).unwrap_err();
+        assert!(e.contains("--bogus"), "{e}");
+    }
+
+    #[test]
+    fn parse_view_args_rejects_two_positionals() {
+        let e = parse_view_args(&s(&["a.png", "b.png"]), None).unwrap_err();
+        assert!(e.contains("unexpected argument"), "{e}");
+    }
+
+    #[test]
+    fn view_request_wire_roundtrips() {
+        let req = ViewRequest {
+            cmd: "view".into(),
+            project: Some("p1".into()),
+            path: r"C:\images\armed.png".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ViewRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn view_pipe_roundtrip() {
+        let pipe = format!("foreman-test-view-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::View(req, reply, _) => {
+                    assert_eq!(req.path, r"C:\images\armed.png");
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        terminal: Some("t4".into()),
+                        project: Some("p1".into()),
+                        ..Default::default()
+                    });
+                }
+                _ => panic!("expected CtrlMsg::View"),
+            }
+        });
+        let req = ViewRequest {
+            cmd: "view".into(),
+            project: None,
+            path: r"C:\images\armed.png".into(),
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let r = reply.expect("no reply");
+        assert!(r.ok);
+        assert_eq!(r.terminal.as_deref(), Some("t4"));
     }
 }

@@ -121,6 +121,10 @@ pub enum Content {
     /// view state; shares the log via Rc — a viewer, not a member: never
     /// injected into (spec §4).
     Chat(crate::chat::ChatView),
+    /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
+    /// Floating/closable/tabbable/tileable like any normal window; restored
+    /// across restarts by path only (see `ContentSnap::Image`).
+    Image(crate::imageview::ImageView),
     /// Desktop-level task-manager panel (project/tab list). At most one per
     /// desktop; non-closable / non-minimizable / non-tabbable.
     TaskManager(crate::panel::PanelView),
@@ -159,6 +163,10 @@ impl Content {
                 // Paint lives in chat_view.rs; click/pending_post drained after
                 // apply_acts (see ChatView::show docs).
                 view.show(ui, rect, active, resp, base.with((win_id, "chat-input")));
+                false
+            }
+            Content::Image(view) => {
+                view.show(ui, rect, active, resp);
                 false
             }
             Content::TaskManager(view) => {
@@ -204,6 +212,7 @@ impl Content {
             Content::Terminal(s) => s.keepalive(),
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
+            Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
         }
     }
@@ -215,6 +224,7 @@ impl Content {
             Content::Terminal(s) => Some(s.icon_kind()),
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
+            Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
         }
@@ -559,6 +569,9 @@ impl WindowManager {
                         shell: shell_to_str(s.shell).into(),
                     },
                     Content::Chat(_) => ContentSnap::Chat,
+                    Content::Image(view) => ContentSnap::Image {
+                        path: view.path.clone(),
+                    },
                     Content::Project(child) => ContentSnap::Project {
                         child: child.capture_manager(),
                     },
@@ -712,6 +725,9 @@ impl WindowManager {
                     }
                     ContentSnap::Chat => {
                         Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat)))
+                    }
+                    ContentSnap::Image { path } => {
+                        Content::Image(crate::imageview::ImageView::load(path.clone()))
                     }
                     ContentSnap::Project { child } => {
                         if child.cwd.as_ref().is_none_or(|p| !p.is_dir()) {
@@ -1162,6 +1178,12 @@ impl WindowManager {
                     Err(e) => OpenReply::err(e),
                 });
             }
+            CtrlMsg::View(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(Self::open_reply(self.view_dispatch(&req)));
+            }
         }
     }
 
@@ -1198,6 +1220,20 @@ impl WindowManager {
             )
             .map(|tid| (pid, tid))
             .map_err(|e| format!("spawn failed: {e}"))
+    }
+
+    /// Resolve + open a persistent `Content::Image` window for `foreman view`.
+    /// Same project-targeting rule as `open_dispatch`. Unlike a spawned
+    /// terminal, an orphaned window (reply channel died) costs nothing to
+    /// leave behind — no undo needed, unlike `open`'s spawn-undo.
+    fn view_dispatch(
+        &mut self,
+        req: &crate::control::ViewRequest,
+    ) -> Result<(WinId, WinId), String> {
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let child = self.project_child_mut(pid)?;
+        let tid = child.add_image(std::path::PathBuf::from(&req.path));
+        Ok((pid, tid))
     }
 
     /// Resolve + execute the room-side half of a chat request: history reads
@@ -1583,6 +1619,51 @@ impl WindowManager {
         Ok(id)
     }
 
+    /// Debug-only test hook for `FOREMAN_VIEW_TEST` (main.rs): this debug
+    /// instance can't reach its own control pipe when the user's real foreman
+    /// already holds `\\.\pipe\foreman`, so the happy-path GUI check opens an
+    /// image window directly instead of round-tripping `foreman view`. Reuses
+    /// (or creates, at `cwd`) a desktop project window, same as a live `view`
+    /// dispatch would resolve to via `resolve_project(None)`.
+    #[cfg(debug_assertions)]
+    pub fn debug_open_image(
+        &mut self,
+        path: PathBuf,
+        cwd: PathBuf,
+        shell: crate::terminal::Shell,
+        ctx: &egui::Context,
+    ) {
+        let pid = self
+            .windows
+            .iter()
+            .find(|w| matches!(w.tabs[w.active].content, Content::Project(_)))
+            .map(|w| w.id)
+            .unwrap_or_else(|| self.add_project(shell, cwd, ctx));
+        if let Ok(child) = self.project_child_mut(pid) {
+            child.add_image(path);
+        }
+    }
+
+    /// Open a `Content::Image` window showing `path` (decode happens inside
+    /// `ImageView::load`; a missing/bad file lands in its placeholder state,
+    /// never a failed dispatch). Tiled like a dispatched terminal — a static
+    /// viewer is meant to be looked at, so focus stays where it was.
+    fn add_image(&mut self, path: PathBuf) -> WinId {
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let view = crate::imageview::ImageView::load(path);
+        let (id, rect) = self.next_slot(egui::vec2(480.0, 360.0));
+        let prev_focus = self.focused;
+        self.push_win(id, Tab::fixed(title, Content::Image(view)), rect);
+        self.tile_new(id, prev_focus);
+        self.focused = prev_focus;
+        self.mark_workspace_dirty();
+        id
+    }
+
     /// Open (or focus) this project's chat viewer — singleton per project
     /// (spec §4). Closing it later doesn't touch the log; the room is the log.
     fn open_chat_window(&mut self) {
@@ -1851,7 +1932,11 @@ impl WindowManager {
                             Content::Project(_) => {
                                 RowKind::Terminal(crate::icons::IconKind::Folder)
                             }
-                            Content::TaskManager(_) | Content::Settings(_) => continue,
+                            // Image windows don't appear in the sessions panel today —
+                            // same opt-out as TaskManager/Settings (not agent sessions).
+                            Content::Image(_) | Content::TaskManager(_) | Content::Settings(_) => {
+                                continue;
+                            }
                         };
                         tabs.push(TabEntry {
                             path: TargetPath {
@@ -2252,7 +2337,10 @@ impl WindowManager {
                         ready: s.ready(),
                         exited: s.exited().is_some(),
                     }),
-                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {} // not members
+                    Content::Chat(_)
+                    | Content::Image(_)
+                    | Content::TaskManager(_)
+                    | Content::Settings(_) => {} // not members
                 }
             }
         }
@@ -3367,7 +3455,10 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),
-                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {} // no process
+                    Content::Chat(_)
+                    | Content::Image(_)
+                    | Content::TaskManager(_)
+                    | Content::Settings(_) => {} // no process
                 }
             }
         }
@@ -3390,7 +3481,10 @@ impl WindowManager {
                         }
                     }
                     Content::Project(wm) => wm.refresh_auto_titles(),
-                    Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => {}
+                    Content::Chat(_)
+                    | Content::Image(_)
+                    | Content::TaskManager(_)
+                    | Content::Settings(_) => {}
                 }
             }
         }
@@ -5558,7 +5652,9 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
             }
         }
         Content::Project(wm) => wm.terminal_groups(),
-        Content::Chat(_) | Content::TaskManager(_) | Content::Settings(_) => Vec::new(),
+        Content::Chat(_) | Content::Image(_) | Content::TaskManager(_) | Content::Settings(_) => {
+            Vec::new()
+        }
     }
 }
 

@@ -631,6 +631,22 @@ impl eframe::App for App {
             // Do not leave restore-induced dirty true on first frame.
             let _ = self.desktop.poll_workspace_dirty();
             self.started = true;
+
+            // Debug-only preview: FOREMAN_VIEW_TEST=<path.png> opens an image
+            // window at startup, so `foreman view`'s happy-path GUI behavior
+            // can be screenshotted without reaching this instance's own
+            // control pipe (unreachable from outside when the user's real
+            // foreman already holds \\.\pipe\foreman — see docs/image-viewer.md).
+            #[cfg(debug_assertions)]
+            if let Ok(path) = std::env::var("FOREMAN_VIEW_TEST") {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                self.desktop.debug_open_image(
+                    std::path::PathBuf::from(path),
+                    cwd,
+                    self.settings.default_shell.to_shell(),
+                    &ctx,
+                );
+            }
         }
 
         let mut ctrl_activity = false;

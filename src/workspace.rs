@@ -92,9 +92,20 @@ impl Default for TabSnap {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ContentSnap {
-    Terminal { shell: String },
+    Terminal {
+        shell: String,
+    },
     Chat,
-    Project { child: ManagerSnap },
+    Project {
+        child: ManagerSnap,
+    },
+    /// `foreman view` window. Path only, v1 — zoom/pan are not persisted; a
+    /// restored viewer always opens fit-to-window. A path that no longer
+    /// resolves (or no longer decodes) restores into the placeholder state,
+    /// same as a live `foreman view` of a bad path.
+    Image {
+        path: PathBuf,
+    },
 }
 
 /// Layout tree node. `dir` is `"H"` or `"V"` for splits.
@@ -395,6 +406,23 @@ mod tests {
             &child.windows[0].tabs[0].content,
             ContentSnap::Terminal { shell } if shell == "powershell"
         ));
+    }
+
+    #[test]
+    fn image_content_round_trips() {
+        let snap = TabSnap {
+            title: "armed.png".into(),
+            content: ContentSnap::Image {
+                path: PathBuf::from(r"C:\shots\armed.png"),
+            },
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains(r#""kind":"Image""#), "{json}");
+        let back: TabSnap = serde_json::from_str(&json).unwrap();
+        match back.content {
+            ContentSnap::Image { path } => assert_eq!(path, PathBuf::from(r"C:\shots\armed.png")),
+            _ => panic!("expected Image"),
+        }
     }
 
     #[test]
