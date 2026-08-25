@@ -15,45 +15,35 @@ Lightweight repo-local issue tracker. Rules:
 
 ### #4 — Feature: rename terminals from the sessions panel by double-clicking the name
 
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement
+**Status:** open · **Filed:** 2026-07-10 · **Rescoped:** 2026-08-25 · **Severity:** enhancement (small)
 
-**Request.** In the task-manager/sessions panel (`src/panel.rs`, the desktop
-right-edge list of projects and their terminals), double-clicking a terminal
-row's name should turn it into an inline text edit; committing (Enter or focus
-loss) sets a user-chosen name for that terminal, Escape cancels. The custom
-name should stick — i.e. override the automatic title the terminal would
-otherwise display.
+**Request.** Double-clicking a terminal row's name in the sessions panel
+(`src/panel.rs`) should start an inline rename, the same way double-clicking a
+window's titlebar name already does.
 
-**Current behavior.** Terminal names in the panel are display-only. Rows are
-painted from `WindowManager::panel_model()` and only handle single click
-(`self.click = Some(path)` to surface/focus) plus hover min/close buttons;
-there is no `double_clicked()` handling and no rename affordance anywhere.
-Titles come from the terminal itself (OSC title set by the shell/agent, with
-process-tree fallback via `src/proc.rs` — see `src/terminal.rs` ~356–569),
-so they change as the session runs.
+**What already exists** (this issue was filed before any of it, and its
+original text claiming "no rename affordance anywhere" is obsolete):
 
-**Sketch.**
-1. Add a user-override name field on the window/terminal (likely on `Win` in
-   `src/wm.rs` or on the terminal session): `custom_name: Option<String>`.
-   Display logic everywhere a title is shown (panel row, window header, tab
-   label) prefers `custom_name` over the live OSC/process title.
-2. Panel edit state: the panel model gets `renaming: Option<TargetPath>` plus
-   an edit buffer. `resp.double_clicked()` on a terminal row enters rename
-   mode; the row paints a `TextEdit` instead of the label while active. Enter
-   commits (wm drains e.g. `rename: Option<(TargetPath, String)>`), Escape or
-   clicking elsewhere cancels.
-3. Interaction with issue #2 (click = focus/minimize toggle): egui fires
-   `clicked()` before `double_clicked()` on the same row, so entering rename
-   mode will also have surfaced/toggled the window. Acceptable; if it feels
-   bad, suppress the minimize half when a double-click lands.
-4. Persistence: decide whether the name survives restart. Terminals themselves
-   are not persisted across app runs today, so session-lifetime-only is fine;
-   note it in the doc (`docs/task-manager-panel.md`).
+- Inline rename on the window titlebar — double-click the name rect,
+  `src/wm.rs:3757`; state is `renaming`/`rename_buf`/`rename_focus` (~422).
+- A `begin_rename()` command for the focused window (`wm.rs:2648`).
+- Custom names already beat auto-titles: `Tab::fixed` vs `Tab::shell_default`,
+  arbitrated by `title_is_auto_managed` (`wm.rs:5536`), so an agent being
+  detected in a pane will not clobber a name the user chose.
+- Custom names already survive restart: `TabSnap.title` is persisted, and
+  restore re-applies the fixed/auto distinction (`wm.rs:756-759`).
 
-**Scope note.** The request is terminals only, but the same mechanism applies
-to project rows for free if wanted later. Keyboard focus while editing must
-not leak to the focused terminal (the panel edit must swallow keys — see the
-focus-cascade rules in `src/wm.rs`).
+**So the remaining work is only the panel affordance.** Panel rows sense
+`click` and paint from `WindowManager::panel_model()`; they need
+`double_clicked()` handling, a `TextEdit` in place of the label while editing,
+and a way to hand the committed string back to the wm's existing rename path —
+reuse it rather than adding a second one.
+
+**Gotchas.** Keyboard focus while editing must not leak to the focused
+terminal (focus-cascade rules in `src/wm.rs`). And egui fires `clicked()`
+before `double_clicked()`, so entering rename will also have run the row's
+single-click focus/minimize toggle; suppress the minimize half if that feels
+wrong in practice.
 
 ---
 
@@ -100,29 +90,6 @@ project's terminal list by that key.
 (issue #4) — the drag threshold is what keeps these from colliding. The panel
 also scrolls vertically; dragging near the panel edge should auto-scroll or at
 minimum not break the clamped-scroll behavior from commit 24729ef.
-
----
-
-### #10 — Route idle/join/exit chat notifications to the human only, never into agent PTYs
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (trivial, high value) · **Depends on:** nothing
-
-**Symptom.** Idle notifications (and join/exit housekeeping noise) are
-delivered into agent members' terminals as typed input. For an agent this is
-pure noise — a fake user message forcing a context switch; only the human
-watching the chat window needs it.
-
-**Request.** Deliver idle/join/exit notifications to the human's chat viewer
-(`Content::Chat`) only — visible in the log/transcript, never injected into
-member PTYs.
-
-**Notes.** `src/chat.rs` already has an entry class that is "never injected
-into PTYs and never appears in `--history`" (chat.rs ~9, ~237 — system
-entries are excluded from `deliver_after`). Implementation is likely: post
-idle notifications as that class (or a variant that shows in the viewer and
-`--history` but is excluded from delivery) rather than as ordinary member
-posts. Verify with a two-member room: trigger an idle notification, confirm
-the human viewer shows it and neither agent PTY receives bytes.
 
 ---
 
