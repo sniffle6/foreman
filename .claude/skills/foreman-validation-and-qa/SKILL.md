@@ -98,7 +98,8 @@ acid-test app (epic line ~454).
 | config.rs / icons.rs | 3 each | Serde compat; icon mapping |
 
 Re-derive: see Provenance. Run per-module for speed: `cargo test wm::`,
-`cargo test --lib layout` (CLAUDE.md's documented loop).
+`cargo test layout::`. **Not** `--lib` — `foreman` is bin-only and that form
+errors; see **foreman-build-and-env**.
 
 ## Test conventions (copy these precedents)
 

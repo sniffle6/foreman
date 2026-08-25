@@ -39,7 +39,7 @@ style nits (a PostToolUse hook already runs `cargo fmt`).
    kill it yourself — by exe path, never by name (`Get-Process foreman |
    Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force`), or
    linking fails with os error 5).
-   Scoped tests: `cargo test --lib <module>`.
+   Scoped tests: `cargo test <module>::` (not `--lib` — bin-only crate).
 5. Report findings as **must-fix** (bug / regression / invariant violation) vs
    **consider** (risk / nit). Cite `path:line` from the current tree. If you
    find nothing real, say so plainly — no padding.

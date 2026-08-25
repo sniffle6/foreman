@@ -126,8 +126,8 @@ pub struct CloseRequest {
 
 /// Drive raw input into a terminal. `text` is written verbatim (UTF-8);
 /// `keys` are named key presses encoded through `inspect::parse_keys` with
-/// the session's live `TermMode`. Text first, then keys. `settle_ms` is
-/// parsed and stored but not yet honored (settle is the next phase).
+/// the session's live `TermMode`. Text first, then keys. `settle_ms` defers
+/// the reply until the screen goes quiet for that long (see `wm::PendingSettle`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SendRequest {
     pub cmd: String, // always "send"
@@ -588,7 +588,7 @@ pub fn parse_close_args(
 /// an explicit `--project` then errors (terminal ids are only unique within
 /// a project, so it would be a cross-project guess).
 /// Requires at least one of `--text` or `--keys`.
-/// NOTE: `settle_ms` is parsed but not yet honored (settle is the next phase).
+/// `settle_ms` defers the reply until the screen quiets; see `wm::advance_settles`.
 pub fn parse_send_args(
     args: &[String],
     default_project: Option<String>,
@@ -884,8 +884,8 @@ foreman send [--project P] [--terminal T] [--text TXT] [--keys \"K K …\"] [--s
 Write input to terminal T (default: your own). --text is raw UTF-8 written
 verbatim (\\r = Enter). --keys is a space-separated sequence of named key
 presses encoded with the session's live TermMode. --text and --keys are
-additive: text first, then keys. --settle-ms N (not yet honored; settle is
-the next phase). Reply: {\"ok\":true} or {\"ok\":false,\"error\":\"...\"}.
+additive: text first, then keys. --settle-ms N waits for the screen to stay
+quiet that long before replying. Reply: {\"ok\":true} or {\"ok\":false,\"error\":\"...\"}.
 Key names: F1..F12, Up Down Left Right, Home End PageUp PageDown Insert
 Delete, Enter Tab Esc Backspace Space, single letters; Ctrl+/Alt+/Shift+
 prefixes combinable. Unknown name exits 2.

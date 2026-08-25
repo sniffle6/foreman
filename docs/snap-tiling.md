@@ -1,5 +1,10 @@
 # Snap tiling (edges + corners)
 
+> **SUPERSEDED (2026-08-24):** the 9-zone snap system described below
+> (`compose_zone`, `snap_or_tab`, `zone_rect`, `Zone`) was deleted. Tiling is now
+> a recursive layout tree. See `docs/tiling-tree.md`. Kept for decision history
+> only — do not implement from this file.
+
 ## What it does
 
 Snapping tiles a window to half or quarter of its manager's area. You snap with

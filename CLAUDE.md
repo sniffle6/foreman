@@ -3,185 +3,92 @@
 Fast, native desktop for running many AI-agent terminal sessions ("tmux built
 for AI"). Rust + egui, real PTYs (`portable-pty`/ConPTY), full terminal emulation
 (`alacritty_terminal`). **Hard requirement: it must be fast** — native, not
-Electron/Tauri.
+Electron/Tauri. That constraint has already decided several arguments; see
+**foreman-failure-archaeology** before reopening one.
 
-**Authoritative deep doc:** `docs/HANDOFF.md` — read it top-to-bottom before
-substantial work (vision, full architecture, next phases, working agreement).
-This file is the quick-load summary; HANDOFF.md wins on any conflict.
+This file is deliberately thin. The knowledge lives in project skills and
+`docs/` — see the routing table below. `docs/HANDOFF.md` is the authoritative
+deep doc (vision, architecture, module map, next phases) and wins on any
+conflict.
 
-## Build / verify loop (Windows, PowerShell, GNU toolchain — no MSVC)
+## Read this before you touch anything
 
-Kill the running app first or the link fails with `Access is denied (os error 5)`.
-**Kill by exe path, never by name** — only a `target\`-built instance holds the
-lock; `Stop-Process -Name foreman` also kills the user's *installed* foreman
-(`%LOCALAPPDATA%\Programs\foreman`), which looks like a crash (incident:
-2026-07-15). From the repo root:
+Three ways to destroy work that no amount of care downstream will undo:
 
-```powershell
-Get-Process foreman -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$PWD\target\*" } | Stop-Process -Force; Start-Sleep -Milliseconds 500
-cargo build 2>&1 | Select-Object -Last 20
-cargo run            # debug
-cargo run --release  # the "is it fast" build
-cargo test           # unit tests (layout tree, wm, chat — no GUI needed)
-```
+- **⚠ `$env:FOREMAN` = `1` means you are running INSIDE the foreman app.** Do
+  NOT `Stop-Process foreman` — you kill your own host, every other terminal in
+  it, and yourself mid-command. Build without touching the running exe:
+  `cargo build --target-dir target/agent`.
+- **Kill by exe path, never by name.** `Stop-Process -Name foreman` also kills
+  the user's *installed* foreman (`%LOCALAPPDATA%\Programs\foreman`), which
+  looks like a crash to them (incident: 2026-07-15). Only a `target\`-built
+  instance holds the link lock.
+- **Never use `VoidListener`** in a `Session`. Shells send `ESC [ 6 n` (DSR) at
+  startup and hang until the terminal replies; `Listener` captures
+  `Event::PtyWrite` and `pump()` writes it back. Skipping it = black pane that
+  never prompts.
 
-**⚠ If `$env:FOREMAN` is `1`, you are running INSIDE the foreman app.** Do NOT
-`Stop-Process foreman` — you will kill your own host, every other terminal in
-it, and yourself mid-command (this has happened). Instead ask the user to close
-foreman, or build without touching the running exe:
-`cargo build --target-dir target/agent`.
+Everything else that has cost hours is in **foreman-debugging-playbook** and
+**foreman-failure-archaeology**. Check them before diagnosing from scratch.
 
-The GUI can't be seen from the terminal — to verify visually, run the exe and
-screenshot the window, then `Read` the PNG. Full screenshot script is in
-`docs/HANDOFF.md` § 3.
+## Invariants that outlive any single file
 
- Executables are built to `target/debug/foreman.exe` (debug) or `target/release/foreman.exe` (release).
-Unit tests cover layout tree, window manager, and chat model (integration tests need the GUI). Run
-`cargo test` or test individual modules with `cargo test --lib layout` / `::wm` / `::chat`.
+- **Recursive compositor.** One `WindowManager` engine runs at the desktop level
+  and again *inside* each project (`Content::Project(Box<WindowManager>)`).
+  Focus cascades so exactly one terminal reads the keyboard.
+- **Window rects are LOCAL** to their manager's `area`. Screen rect =
+  `rect.translate(area.min)`. Mixing the two is the #1 "painted in the wrong
+  place" bug.
+- **Two window states, never three.** Every window is either tiled (a leaf in
+  the `LayoutTree` of H/V splits) or floating. Zoom is an overlay — the tree is
+  untouched.
+- **Tabs are level-restricted.** Any window can tab onto any other in the *same*
+  `WindowManager`: projects with projects, terminals with terminals.
+- **App vanished after the laptop woke from sleep = a wgpu device loss**, not a
+  foreman bug in the usual sense. Handled by an ordered *restart*, never by
+  recovery: `vendor/egui-wgpu` is a 3-hunk local fork that deletes egui-wgpu's
+  unconditional `panic!` in `update_buffers`, and `App::logic` then saves the
+  workspace and respawns. Never try to recreate the wgpu device
+  (gfx-rs/wgpu#9277 — even a fill-the-screen app could not do it reliably).
+  Crash evidence is `%APPDATA%\foreman\foreman_panic.log` (absolute and
+  timestamped since v0.3.5). Full story: `docs/gpu-device-loss.md`; the flags,
+  crash-loop guard and respawn primitive live in `src/gpu.rs`.
 
-## Gotchas (these already cost hours — do not rediscover)
+Details, seam map, threading model, and the borrow rules: **foreman-architecture-contract**.
 
-- **GNU toolchain, not MSVC:** `rustup default stable-gnu`.
-- **Linker = w64devkit** at `C:\w64devkit\bin` (on PATH; provides `dlltool`/`gcc`/`ld`).
-- **`cannot find -lgcc_eh`:** w64devkit GCC 16 folded EH into `libgcc`. Fix is an
-  empty stub: `ar crs C:\w64devkit\lib\gcc\x86_64-w64-mingw32\16.1.0\libgcc_eh.a`.
-  Recreate if you reinstall w64devkit.
-- **Black pane / shell never prompts = the DSR trap.** Shells send `ESC [ 6 n` on
-  startup and hang until the terminal replies. `Session`'s `Listener` captures
-  `Event::PtyWrite` and `pump()` writes it back. **Never use `VoidListener`.**
-- **`Access is denied (os error 5)`** on build = app still running; kill it first.
-- **egui 0.34:** `App::ui(&mut Ui, ...)` (not `update`); go through the painter
-  (`ui.painter().layout_no_wrap`) since `ui.fonts(|f|…)` needs `&mut`. Ctrl+C/V may
-  arrive as `Event::Copy`/`Paste` — handle those AND key events.
-- **Resize reflow still diverges; cursor sync is bundled.** ConPTY 1.25 now asks
-  Foreman for the post-resize cursor before later screen-buffer queries (#19535),
-  but it cannot reconstruct dropped rows or clear stale PSReadLine text. This is
-  NOT a double reflow in `Session::resize`; the four "ConPTY owns redraw" variants
-  still fail. `Ctrl+L` heals residuals. Evidence: `docs/conpty-resize-reflow.md`.
+## Where to look
 
-## Architecture
+| When you are… | Use |
+|---|---|
+| Building, testing, or fighting the toolchain | **foreman-build-and-env** |
+| Something is broken and you want the known cause | **foreman-debugging-playbook** |
+| Deciding where code belongs / touching wm, layout, control, chat | **foreman-architecture-contract** |
+| In `terminal.rs`, `input.rs`, `caret.rs`, `frame.rs`, or decoding VT/ConPTY | **terminal-emulation-reference** |
+| Writing egui and it's behaving oddly | **egui-immediate-mode-reference** |
+| Running the app or driving the `foreman` CLI / control plane | **foreman-run-and-operate** |
+| Proving behavior with evidence (`foreman send`/`snapshot`, perf, panics) | **foreman-diagnostics-and-tooling** |
+| Deciding whether a change is *done* / adding tests | **foreman-validation-and-qa** |
+| Adding a dep, deleting code, touching wire format, committing | **foreman-change-control** |
+| Touching settings, keybindings, env vars, persisted config | **foreman-config-and-flags** |
+| Writing a doc, epic, spec, or commit message | **foreman-docs-and-writing** |
+| Tempted to retry a settled battle (resize reflow, vsync, snap zones) | **foreman-failure-archaeology** |
+| Forming a theory or designing an experiment | **foreman-research-methodology** |
 
-A **recursive compositor**: one `WindowManager` engine runs at the desktop level
-and nested inside each project. Each project window's content is another
-`WindowManager` (`Content::Project(Box<WindowManager>)`) of terminals. Sub-windows
-are confined to their project. Focus cascades so exactly one terminal reads the
-keyboard. Window rects are **local** (relative to each manager's `area`).
+Vocabulary is `CONTEXT.md` (ubiquitous language). Decisions are `docs/adr/`.
+Feature docs are one-per-subsystem in `docs/` — check for an existing one before
+adding a new file.
 
-**Two window states**: every window is either **tiled** (a leaf in the manager's
-`LayoutTree` of recursive H/V splits — `src/layout.rs`) or **floating**. Drag a
-header to tear a tile out; drop hints (leaf edge = split, leaf center = tab,
-area edge = root split) re-insert it. Leader `WASD` moves in the tree,
-`Alt+WASD` splits a new terminal in, `F`/`Ctrl+F` toggles float, `Z` zooms
-(overlay — the tree is untouched). New windows tile by default. Full doc:
-`docs/tiling-tree.md`.
+## Agent surfaces
 
-**Tabs** are a generic `Win` property restricted by *level*: any window can tab
-onto any other in the **same** `WindowManager` (so projects tab with projects,
-terminals with terminals). A one-tab stack is a normal window; dragging a tab
-out untabs it. A multi-tab tree leaf is a tabbed container in the layout.
-
-- `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
-  Closing the last project quits the app (`WindowManager::deserted`), like a
-  terminal emulator exiting with its last tab; an open picker/settings modal
-  holds it alive.
-- `src/wm.rs` — the reusable window engine: drag/focus/z-order/min/max/resize/
-  close, `Win` (tab stack), `Content`, tree integration, per-frame re-fit.
-  Headers at both levels are always-on quiet chrome — surface-colored
-  (`terminal::BG`) on a reserved band, no fill — except a lone tiled pane
-  (bare); projects add hover-opened `+`/`⋯` menus (`docs/window-chrome.md`).
-  Minimize restores via the task-manager panel (chip taskbars removed).
-- `src/panel.rs` — task-manager panel model + shallow view (`Content::TaskManager`);
-  desktop right-edge list of projects/tabs. See `docs/task-manager-panel.md`.
-- `src/layout.rs` — the tiling tree (pure, unit-tested): insert/remove/layout/
-  drop targets/divider resize.
-- `src/terminal.rs` — `Session` (PTY + alacritty + reader thread), color resolver,
-  selection/clipboard, key routing, grid render.
-- `src/control.rs` — the `foreman` CLI + IPC control plane: `foreman
-  open/chat/status/close` run from inside any foreman terminal talk to the GUI.
-  Terminals get `FOREMAN=1`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`,
-  `FOREMAN_TERMINAL_ID` injected so agents can dispatch and self-target.
-- `src/chat.rs` — per-project chat room model (append-only log, pure data).
-  Posts are injected into every member terminal's PTY as typed input (push,
-  not poll); dispatched terminals auto-join, others join on first post.
-  Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
-- `src/dirpicker.rs` — keyboard-driven project directory picker.
-- `src/imageview.rs` — `Content::Image`: `foreman view <path.png>` opens a
-  persistent PNG viewer window (fit/zoom/pan, no PTY). Doc: `docs/image-viewer.md`.
-- `src/keymap.rs` — data-driven leader-key bindings. Defaults live in
-  `Keymap::default` (in code); a user file at `%APPDATA%\foreman\keybindings.json`
-  is merged *over* them, so new commands always get a default chord. Leader is
-  `Ctrl+B` by default (tmux-style).
-- `src/settings.rs` — in-app keybindings editor; a desktop-level modal overlay
-  (mirrors the `dirpicker.rs` pattern), edits the live `Keymap` and signals the
-  wm when to persist. Opened from the settings menu's Keybindings pane.
-- `src/settings_menu.rs` — the settings menu (`Ctrl+B ,`): pure model (panes,
-  row specs, `adjust`/`display`) + egui modal view (rail + panes). Edits
-  `config::Settings` live via `config::seed_live`/`live` (per-frame
-  `Arc<Settings>` in egui ctx data); App saves on a debounce. Full doc:
-  `docs/settings-menu.md`.
-- `src/theme.rs` — every color token (surfaces, border/focus ladder, selection,
-  app chrome, chat, ANSI palette) as consts, glob-imported by consumers. Static
-  by design — no runtime theme system until a second theme exists.
-- `src/skills_install.rs` — on startup, embeds (`include_str!`) and installs the
-  `foreman-dispatch`/`foreman-chat`/`foreman-icat` skills into Claude and Codex global skill
-  dirs so agents in any project (incl. external repos) can discover them. Source
-  skill copies live in `.claude/skills/` and `.codex/skills/`; keep them in sync
-  when behavior changes, then rebuild to propagate. Best-effort — failures are
-  logged, never block launch.
-
-Subsystem docs: `docs/tiling-tree.md` (two-state windows + layout tree),
-`docs/project-directories.md`,
-`docs/epics/agent-dispatch-epic.md` (control CLI + chat room; known gaps in
-`docs/chat-missing-features.md`),
-`docs/epics/keyboard-control-epic.md` (leader/keymap/settings),
-`docs/epics/window-tabbing-split-epic.md` (tab-stacks; zone parts superseded).
-(`docs/foreman.md` is older narrative notes — prefer HANDOFF.md on any conflict.)
-
-## Agent skills
-
-### Issue tracker
-
-GitHub Issues on `sniffle6/foreman` via `gh`; external PRs are **not** a triage surface. See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+- **Issues:** GitHub Issues on `sniffle6/foreman` via `gh`. External PRs are not
+  a triage surface. See `docs/agents/issue-tracker.md`.
+- **Triage labels:** `needs-triage`, `needs-info`, `ready-for-agent`,
+  `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
 
 ## Working agreement
 
 - Quality- and speed-obsessed user; no flattery, push back on bad ideas.
-- Verify by building + screenshotting — don't claim it works without evidence.
-- Don't needlessly hijack the user's mouse/keyboard to test.
-- Commit only when asked.
-
-## Session Context
-
-**Memory system:** This project uses persistent memory at `C:\Users\sniff\.claude\projects\H--claude-code-foreman\memory\`.
-Session knowledge persists across conversations — check MEMORY.md in that directory to see what's been recorded.
-
-**Active work:** Currently working on `feat/browser-style-tabs` branch. See `docs/epics/window-tabbing-split-epic.md`
-for the full epic context. This branch targets full tab-stack integration across projects and terminals.
-
-<!-- BEGIN EPIC MANAGER (managed — edits between these markers are overwritten by `epic-manager setup`) -->
-## Epic Manager
-
-This project uses Epic Manager as the durable mission board (MCP server `epic-manager`). Do not rely on chat history as the source of truth.
-
-Start of session:
-1. `session_register` (label, client_name, role), then `session_context` with the returned session_id.
-2. If no current task, `task_claim_next` (or `task_claim` for a named task).
-
-While working: heartbeat with `session_heartbeat`; `task_checkpoint` after investigation, before/after risky edits, and after tests; pass `expected_version` on status-changing writes.
-
-Finish: satisfy required criteria with `task_acceptance_update`, then `task_complete_for_review` (never mark your own task done). If stopping early, `task_release` with a handoff note.
-
-Errors return a compact envelope with a stable `blocked` code — branch on the code, don't parse the prose. See `docs/error-codes.md`.
-
-If a tool call fails with `-32000: Connection closed` or `blocked: daemon_unreachable`, the bridge dropped or the daemon is mid-restart — it is transient and auto-reconnects. Just retry the same call; do NOT sleep, poll, or abandon the task.
-
-Full Codex workflow guide: `epic-manager instructions --agent codex`.
-<!-- END EPIC MANAGER -->
+- Verify by building + screenshotting — never claim it works without evidence.
+  The GUI cannot be seen from the terminal.
+- Don't hijack the user's mouse/keyboard to test.
+- Commit only when asked — but subagents commit their own work.

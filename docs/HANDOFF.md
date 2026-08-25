@@ -78,6 +78,19 @@ as distinct.
 Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fine.
 
 ### Architecture / files
+- `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
+  Closing the last project quits (`WindowManager::deserted`); an open
+  picker/settings modal holds the app alive.
+- `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
+  zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
+  z, minimized, prev }`, `Content::{Terminal, Project, Chat, TaskManager, Image}`.
+  `show(ui, area, active, base)` is the whole thing. Headers at both levels are
+  always-on quiet chrome (`docs/window-chrome.md`).
+- `src/layout.rs` — the tiling tree (pure data + math, unit-tested): insert /
+  remove / rect layout / drop targets / divider resize. See
+  `docs/tiling-tree.md`.
+- `src/panel.rs` — task-manager panel model + shallow view; desktop right-edge
+  list of projects/tabs. See `docs/task-manager-panel.md`.
 - `src/terminal.rs` — `Session` (PTY + alacritty + reader thread + writer +
   `resp` reply buffer), color resolver, selection, mouse capture, search
   adapter, `read_input` (keys + clipboard), `show(ui, rect, active, resp)`
@@ -86,19 +99,30 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
 - `src/terminal_font.rs` — four Hack faces + system fallbacks; `font_id`.
 - `src/input.rs` — pure key/paste/wheel/mouse encoding + Ctrl+F open-search.
 - `src/search.rs` — bounded scrollback-search model.
-- `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
-  zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
-  z, minimized, prev }`, `Content::{Terminal, Project, Chat}`.
-  `show(ui, area, active, base)` is the whole thing.
-- `src/layout.rs` — the tiling tree (pure data + math, unit-tested): insert /
-  remove / rect layout / drop targets / divider resize. See
-  `docs/tiling-tree.md`.
-- `src/main.rs` — eframe `App`: toolbar (`+ project`, `+ terminal in project`) +
-  the desktop `WindowManager`.
+- `src/control.rs` — the `foreman` CLI + IPC control plane over the named pipe
+  `\.\pipe\foreman`. Injects `FOREMAN`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`,
+  `FOREMAN_TERMINAL_ID` into every terminal so agents can dispatch and
+  self-target.
+- `src/chat.rs` — per-project chat room model (append-only log, pure data).
+  Posts are injected into member terminals' PTYs as typed input (push, not
+  poll). Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
+- `src/dirpicker.rs` — keyboard-driven project directory picker.
+- `src/imageview.rs` — `Content::Image`: `foreman view <path.png>` opens a
+  persistent PNG viewer (fit/zoom/pan, no PTY). See `docs/image-viewer.md`.
+- `src/keymap.rs` — data-driven leader-key bindings. Defaults in
+  `Keymap::default`; `%APPDATA%\foreman\keybindings.json` merges *over* them so
+  new commands always get a default chord. Leader is `Ctrl+B`.
+- `src/settings.rs` — in-app keybindings editor (desktop-level modal, mirrors
+  `dirpicker.rs`); edits the live `Keymap`, signals the wm to persist.
+- `src/settings_menu.rs` — the settings menu (`Ctrl+B ,`): pure model + egui
+  modal view. Edits `config::Settings` live via `config::seed_live`/`live`.
+  See `docs/settings-menu.md`.
+- `src/theme.rs` — every color token as consts, glob-imported by consumers.
 - `src/skills_install.rs` — embeds and best-effort installs the
-  `foreman-dispatch`/`foreman-chat` skills into Claude and Codex global skill
-  dirs at GUI startup. Claude sources live in `.claude/skills/`; Codex sources
-  live in `.codex/skills/`. Keep the paired skill copies semantically synced.
+  `foreman-dispatch`/`foreman-chat`/`foreman-icat` skills into Claude and Codex
+  global skill dirs at GUI startup. Claude sources live in `.claude/skills/`;
+  Codex sources live in `.codex/skills/`. Keep the paired copies semantically
+  synced, then rebuild to propagate.
 
 ### Coordinate model (matters for new work)
 Each `WindowManager` works in its own `area: Rect`. Window rects are **local**
@@ -201,32 +225,48 @@ MOUSE/FOCUS, so do it sparingly and tell them.
 
 ## 5. Next phases (pick up here)
 
-The window-manager skeleton + terminal are done. What's left is the "built for AI"
-substance:
+**Verified against `src/` on 2026-08-24.** Most of what this section listed as
+future in 2026-06 has since shipped. Re-verify before believing any roadmap,
+including this one.
 
-1. **Status lines** — project titlebar: repo + branch (+ git status). Per-terminal:
-   model · token usage · state. (Reference: the old web mockup had these; ask the
-   user if you want the visual.)
-2. **AI-agent integration** (the differentiator) — run claude/codex CLIs in the
-   terminals; detect "needs input" / done / idle and surface it (badge on the
-   terminal/project titlebar, a "jump to next needs-you", etc.).
-3. **`Content::Browser`** — new enum variant + `Content::show` arm; the rest of the
-   engine is reused.
-4. **Daemon/client split** — move PTYs into a headless core so sessions persist
-   across UI restarts (true tmux-style). Native launch is already instant, so this
-   is about live process survival, not open-speed. **Cold layout restore**
-   (fresh shells at saved project cwds) already ships via `workspace.json` —
-   see `docs/workspace-persistence.md`; that is not this item.
+Shipped since the original list: the Control plane, Chat room and Dispatch
+(`src/control.rs`, `src/chat.rs`); terminal inspection (`foreman send` /
+`snapshot`); scrollback, wheel scrolling and scrollback search; word and line
+selection via double/triple click (terminal.rs:2031-2047); tab stacks and
+tab-merge by drag; the leader keymap and settings menu; workspace persistence;
+the image viewer; and shell selection, which retired the old `Session.shell`
+dead-code warning by giving the field a job. The `TOP_HOLD`/`GROW_LEAD`
+constants the old backlog wanted tuned no longer exist.
 
-Smaller polish backlog: scrollback + scroll-wheel, word/line select (double/triple
-click), tab-merge windows (drop one window onto another), keyboard tiling
-shortcuts, tune `TOP_HOLD`/`GROW_LEAD` to feel, remove the `Session.shell`
-dead-code warning (or use it).
+Genuinely still open:
+
+1. **Status lines** — project titlebar: repo + branch (+ git status).
+   Per-terminal: model, token usage, state. Nothing renders these today; the
+   only `branch` string in `src/` is preview text at `appearance.rs:473`.
+   (Reference: the old web mockup had these; ask the user if you want the
+   visual.)
+2. **Agent-state detection** — the unbuilt half of "AI-agent integration".
+   Running the claude/codex CLIs in terminals works, and `proc.rs::agent_for`
+   already identifies which agent owns a Session (it drives the tab icons). What
+   is missing is needs-input / working / done / idle state and surfacing it: a
+   badge on the terminal or project titlebar, "jump to next needs-you". Design
+   notes: `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
+3. **`Content::Browser`** — a new enum variant plus a `Content::show` arm; the
+   rest of the engine is reused. `Content` today is Terminal / Project / Chat /
+   Image / TaskManager (wm.rs:116).
+4. **Daemon/client split** — move PTYs into a headless core so sessions survive
+   UI restarts (true tmux-style). Native launch is already instant, so this is
+   about live process survival, not open-speed. **Cold layout restore** (fresh
+   shells at saved project cwds) already ships via `workspace.json`; see
+   `docs/workspace-persistence.md`. That is not this item.
 
 ---
 
 ## 6. Working agreement
-- The user is quality- and speed-obsessed; no flattery, push back on bad ideas.
-- Verify by building + screenshotting; don't claim it works without evidence.
-- Don't needlessly hijack the user's mouse/keyboard to test.
-- After a feature, update `docs/foreman.md`. Commit only when asked.
+The working agreement lives in `CLAUDE.md` (Claude) and `AGENTS.md` (Codex) and
+is deliberately not duplicated here.
+
+One correction to what this section used to say: **"after a feature, update
+`docs/foreman.md`" is dead practice.** That file is superseded narrative notes.
+Write one doc per feature in `docs/` instead — house style and the supersession
+rules are in `.claude/skills/foreman-docs-and-writing/SKILL.md`.

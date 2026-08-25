@@ -166,10 +166,11 @@ inventory lives in **foreman-config-and-flags**.
   cargo test wm::        # src/wm.rs tests
   cargo test chat::      # src/chat.rs tests
   ```
-- **DOC DRIFT (flagged):** `CLAUDE.md` says `cargo test --lib layout`. That
-  fails — verified by running it: ``error: no library targets found in package
-  `foreman` `` (exit 101), because no library target exists. Use the filter
-  form above. Also stale: `docs/followups-latency-and-control.md:91` says
+- **`--lib` never works here** — `foreman` is bin-only, so `cargo test --lib
+  layout` fails with ``error: no library targets found in package `foreman` ``
+  (exit 101). Use the filter form above, or `cargo test --bin foreman <filter>`.
+  CLAUDE.md carried this bad form until 2026-08-24 and seeded copies of it
+  across the repo; fixed at the same time. Also stale: `docs/followups-latency-and-control.md:91` says
   "181 tests" — the count is 353 fns now.
 
 ## Warning baseline (as of 2026-07-01, HEAD `7fda1c2`)
@@ -211,7 +212,7 @@ Runtime symptoms (black Session, dead input, etc.) belong to
 | `Access is denied (os error 5)`                        | Linking over a running `foreman.exe`         | The `Stop-Process` kill line, then rebuild              |
 | `link.exe not found` / Visual Studio component errors  | rustup reverted to MSVC default              | `rustup default stable-gnu`                             |
 | `dlltool` / `gcc` not found                            | `C:\w64devkit\bin` not on PATH               | Checklist step 4                                        |
-| ``error: no library targets found in package `foreman` `` | `cargo test --lib …` (stale CLAUDE.md form) | `cargo test <module>::` filter                       |
+| ``error: no library targets found in package `foreman` `` | `cargo test --lib …` — bin-only crate           | `cargo test <module>::` filter                       |
 
 ## Toolchain and pinned versions (as of 2026-07-01)
 

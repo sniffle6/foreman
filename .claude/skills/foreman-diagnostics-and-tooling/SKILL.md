@@ -43,7 +43,7 @@ foreman send --text "pwd" --keys "Enter"
 foreman snapshot
 
 # Target any Session explicitly (works from any local process):
-foreman send --project p1 --terminal t3 --text "cargo test --lib layout" --keys "Enter"
+foreman send --project p1 --terminal t3 --text "cargo test layout::" --keys "Enter"
 foreman snapshot --project p1 --terminal t3
 
 # Structured reads (reply becomes ONE JSON line instead of text rows):

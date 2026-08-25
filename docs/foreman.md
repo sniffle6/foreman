@@ -1,5 +1,11 @@
 # Foreman (native)
 
+> **PARTIALLY SUPERSEDED (2026-08-24):** the snap-zone sections below
+> (`detect_zone`, `zone_rect`) and the `foreman/index.html` mockup describe
+> deleted code. Only the "Tiling tree + floating" section near the end is
+> current. Prefer `docs/HANDOFF.md` and the per-feature docs in `docs/`; kept
+> for decision history.
+
 A fast, native desktop for running many AI-agent terminal sessions. Rust + egui,
 with real PTYs and a full terminal emulator. This is the "real" build that
 replaces the HTML mockups in `foreman/`.

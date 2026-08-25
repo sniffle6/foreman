@@ -228,7 +228,7 @@ and constants drift; re-verify from `H:/claude code/foreman` (PowerShell 7+):
 | Crate versions 0.26.0 / 0.9.0 | `git grep -n -A1 'name = "alacritty_terminal"' Cargo.lock; git grep -n -A1 'name = "portable-pty"' Cargo.lock` |
 | Listener match arms (PtyWrite/Title/ResetTitle/ColorRequest) | `git grep -n "Event::" src/terminal.rs` |
 | Ready latch + pending_inject flush | `git grep -n "ready = true" src/terminal.rs` and the tests `session_latches_ready_after_dsr_is_answered`, `inject_before_ready_is_queued_then_flushed` |
-| Key/mouse encodings byte-for-byte | `cargo test --lib input` (byte-equality tests; mind the shared target/ lock) |
+| Key/mouse encodings byte-for-byte | `cargo test input::` (byte-equality tests; mind the shared target/ lock) |
 | Env advertisement | `git grep -n "COLORTERM" src/wm.rs` |
 | Selection wiring (alacritty Selection in use since Phase 4) | `git grep -n "term.selection" src/terminal.rs ; cargo test selection` |
 | Caret gate retired (pure `draw` mapping only) | `git grep -n "CaretGate\|CURSOR_SETTLE" src/` — any hit means the gate came back |

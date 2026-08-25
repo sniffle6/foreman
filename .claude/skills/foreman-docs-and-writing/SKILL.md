@@ -17,9 +17,9 @@ docs' own headers. **A doc's own status header is evidence, not truth.**
 
 | Doc | Role | Trust (2026-07-01) |
 |---|---|---|
-| `CLAUDE.md` | Quick-load summary for Claude agents | **Most current summary.** Architecture list covers the major modules but not all 18 `src/*.rs` files. One stale spot: the "Session Context" section names `feat/browser-style-tabs` as active though that work is merged to `main` (commits `d4da700`, `31a3db4`) and the current branch is `main`. (Its "Memory system" pointer was also dead until 2026-07-02, when MEMORY.md was first written to that directory.) |
-| `AGENTS.md` | Codex mirror of CLAUDE.md | Current; same content adapted for Codex. Has no Session Context section, so it lacks CLAUDE.md's stale spots. |
-| `docs/HANDOFF.md` | DECLARED authoritative deep doc (HANDOFF.md:8-9; CLAUDE.md says "HANDOFF.md wins on any conflict") | **Drifted — trust section-by-section.** Current: §3 build/verify loop, §4 gotchas, §2 coordinate model. Stale: §2 "Architecture / files" names only 5 of 18 src modules (omits `control.rs`, `chat.rs`, `inspect.rs`, `caret.rs`, `keymap.rs`, `input.rs`, `settings.rs`, `dirpicker.rs`, …); §5 roadmap lists "AI-agent integration" as future though the Control plane, Chat room, and Inspection layer shipped; §6 says "After a feature, update `docs/foreman.md`" — dead practice, see house style. |
+| `CLAUDE.md` | **Router, not a library** (thinned 2026-08-24) | Current and deliberately minimal: identity, the three destructive gotchas, four structural invariants, a skill routing table, working agreement. It no longer carries a build loop, a gotcha dictionary, a module map, or a "Session Context" section — those moved to skills and `docs/HANDOFF.md`. Rationale + the don't-re-fatten rule: `docs/agents/context-layout.md`. |
+| `AGENTS.md` | Codex counterpart, same router shape (thinned 2026-08-24) | Current. Mirrors CLAUDE.md's structure but routes by **file path** into `.claude/skills/`, since Codex does not get skill descriptions auto-injected. Carries two Codex-only sections with no other home: why `.claude/skills/` is readable by Codex, and the paired `foreman-dispatch`/`chat`/`icat` copy rules. Adding a project skill means adding a row to **both** tables. |
+| `docs/HANDOFF.md` | Authoritative deep doc (HANDOFF.md:8-9; CLAUDE.md says "HANDOFF.md wins on any conflict") | **Trust section-by-section.** Current: §3 build/verify loop, §4 gotchas, §2 coordinate model, and §2 "Architecture / files" — which as of 2026-08-24 is the **single complete module map** (absorbed from CLAUDE.md; it previously named only 5 of 18 src modules). Still stale: §5 roadmap lists "AI-agent integration" as future though the Control plane, Chat room, and Inspection layer shipped; §6 says "After a feature, update `docs/foreman.md`" — dead practice, see house style. |
 | `CONTEXT.md` | **Glossary of record** (ubiquitous language) | Current and growing — the "Frame plan" entry landed at HEAD `7fda1c2`. Glossary ONLY, by its own charter (CONTEXT.md:4-6). |
 | `docs/tiling-tree.md`, `docs/chat-delivery.md`, `docs/cursor-rendering.md`, `docs/os-chrome.md`, `docs/settings-persistence.md`, `docs/terminal-zoom.md`, `docs/tab-icons.md`, `docs/terminal-selection.md`, `docs/project-directories.md`, `docs/conpty-resize-reflow.md` | Subsystem feature docs | Current (spot-verified: named symbols and key files exist in `src/`). |
 | `docs/terminal-inspection.md` | Feature doc for `send`/`snapshot` | Mostly current, **one stale section**: it says `--settle-ms` is "accepted and parsed but not yet honored" — false; `src/wm.rs` honors it (`DEFAULT_SETTLE_MS`, `PendingSettle`, `advance_settles`, wm.rs:938 as of 2026-07-01). `src/control.rs`'s own doc comments repeat the same stale claim (control.rs:129-130, 548, 763) — even code comments drift. |
@@ -47,9 +47,10 @@ this verified order instead**:
 
 1. **Code** (`src/`) — always wins.
 2. **Subsystem feature doc** (`docs/<feature>.md`) — freshest prose.
-3. **CLAUDE.md / AGENTS.md** — current summary, minus its Session Context section.
-4. **HANDOFF.md** — trust §3/§4 (build loop, gotchas); distrust §2 architecture
-   list, §5 roadmap, §6 "update foreman.md".
+3. **HANDOFF.md** — trust §2 (architecture/files, coordinate model), §3 (build
+   loop) and §4 (gotchas); distrust §5 roadmap and §6 "update foreman.md".
+4. **CLAUDE.md / AGENTS.md** — routing and invariants only; they no longer
+   attempt to describe modules.
 5. **Epics / contracts** — decision history yes; status headers only after
    checking the tracker or code.
 
@@ -89,8 +90,12 @@ Get-ChildItem src/*.rs | Select-String -Pattern "compose_zone|snap_or_tab" | Sel
 - [ ] Any doc the change supersedes gets a **banner** (next section).
 - [ ] Epic status header updated if the epic's phase state changed.
 - [ ] New named seam? Add a CONTEXT.md glossary entry (below).
-- [ ] CLAUDE.md **and** AGENTS.md architecture lines updated if a module was
-      added/renamed (keep the pair in sync — they are Claude/Codex mirrors).
+- [ ] Project skill added/renamed? Add a row to the routing table in **both**
+      `CLAUDE.md` (by skill name) and `AGENTS.md` (by `SKILL.md` path).
+- [ ] Module added/renamed? Update the `docs/HANDOFF.md` §2 "Architecture /
+      files" list — **not** CLAUDE.md. CLAUDE.md carries no module map by
+      design (`docs/agents/context-layout.md`); adding one line "just this once"
+      is exactly how it grew to 187 lines before.
 - [ ] Touched `.claude/skills/foreman-dispatch|foreman-chat`? Sync the
       `.codex/skills` twin and note that a rebuild is required (skills section).
 
@@ -213,8 +218,8 @@ Re-verify drift-prone claims before trusting this table — all commands run fro
 | `--settle-ms` honored but docs/comments say otherwise | `Select-String -Path src/wm.rs -Pattern "DEFAULT_SETTLE_MS"` vs `Select-String -Path docs/terminal-inspection.md,src/control.rs -Pattern "not yet honored"` |
 | Epic status headers lag | `Get-Content docs/epics/keyboard-control-epic.md -TotalCount 4` vs `Test-Path src/keymap.rs` |
 | `--attrs`/`--cursor` built; `--wait-for`/`--since-seq`/`--region` not | `Select-String -Path src/control.rs -Pattern "--attrs\|--cursor\|--wait-for\|--since-seq\|--region"` |
-| HANDOFF architecture list names 5 modules; src has 18 | `(Get-ChildItem src/*.rs).Count` vs `Select-String -Path docs/HANDOFF.md -Pattern "src/\w+\.rs"` |
-| CLAUDE.md Session Context stale (branch, memory dir) | `git branch --show-current` and `Get-Content CLAUDE.md \| Select-Object -Last 10` |
+| HANDOFF architecture list covers every `src/*.rs` | `(Get-ChildItem src/*.rs).Count` vs `Select-String -Path docs/HANDOFF.md -Pattern "src/\w+\.rs"` |
+| CLAUDE.md has not been re-fattened (routing only) | `(Get-Content CLAUDE.md).Count` — over ~110 lines means something belongs in a skill |
 | Contract tracker wins over contract header | `Get-Content docs/contracts/chat-handshake-remaining-work.md -TotalCount 12` |
 | Commit format + trailer | `git log -10 --format='%h %s%n  %(trailers:key=Co-Authored-By)'` |
 | The "@" incident | `git show 37687b5 --no-patch --format=%B` |

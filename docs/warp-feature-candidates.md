@@ -156,9 +156,10 @@ an addressable log of structured command results.
 
 **Verified findings:**
 - **Snapshot is viewport-only today** (`snapshot_text` walks
-  `0..screen_lines`); no flag reaches scrollback. (Doc drift found: the
-  control.rs:130 comment saying `--settle-ms` is "not yet honored" is stale —
-  wm.rs does honor it.)
+  `0..screen_lines`); no flag reaches scrollback. (Doc drift found here was fixed
+  2026-08-24: the control.rs comments claiming `--settle-ms` is "not yet
+  honored" now say it defers the reply until the screen quiets, which is what
+  wm.rs actually does.)
 - **Scrollback is sliceable:** default 10k-line history; `graphics.rs:476-496`
   already tracks content anchors across scroll via `history_size` deltas —
   precedent for buffer-stable "total line" coordinates.
