@@ -1,4 +1,8 @@
 /target
+# The vendored egui-wgpu fork is its own workspace root (so its clippy lint
+# baseline stays out of foreman's build), which means it builds into its own
+# target dir when its tests are run directly.
+/vendor/*/target
 *.png
 # README screenshots are the exception to the *.png sweep.
 !assets/media/*.png

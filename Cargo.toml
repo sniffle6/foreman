@@ -5,6 +5,19 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sniffle6/foreman"
 description = "Fast native desktop for running many AI-agent terminal sessions"
+# The vendored egui-wgpu fork below is a build input, not part of the package.
+exclude = ["vendor/*"]
+
+# Deletes the two unconditional panic!s in egui-wgpu's Renderer::update_buffers
+# that kill foreman on a wgpu device loss (resume from sleep). Delete this whole
+# section and the vendor/ tree the day emilk/egui#8452 (or its successor) ships.
+# See docs/gpu-device-loss.md.
+#
+# This stays a ONE-crate patch: published egui-wgpu 0.34.3 depends on
+# egui/epaint/wgpu/winit by concrete crates.io versions, so eframe, egui and
+# epaint keep resolving from the registry — no duplicate-type explosion.
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
 
 [dependencies]
 alacritty_terminal = "0.26.0"

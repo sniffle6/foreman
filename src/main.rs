@@ -15,6 +15,7 @@ mod dirpicker;
 mod emoji_raster;
 mod frame;
 mod geom;
+mod gpu;
 mod graphics;
 mod icat;
 mod icons;
@@ -115,6 +116,13 @@ struct App {
     notify: notify::Notifications,
     /// Recent-project MRU (recents.json), fed by the desktop's open drain.
     recents: recents::Recents,
+    /// First frame seen by the debug GPU fault-injection hooks; their countdown
+    /// is measured from here. `None` until the first `logic` call.
+    #[cfg(debug_assertions)]
+    debug_gpu_t0: Option<std::time::Instant>,
+    /// Set once a debug GPU fault has been injected, so it fires exactly once.
+    #[cfg(debug_assertions)]
+    debug_gpu_fired: bool,
 }
 
 /// Wait this long after the last settings change (zoom, panel prefs, or a menu
@@ -220,6 +228,62 @@ impl App {
             landing_shown: false,
             notify: notify::Notifications::new(),
             recents: recents::Recents::load(),
+            #[cfg(debug_assertions)]
+            debug_gpu_t0: None,
+            #[cfg(debug_assertions)]
+            debug_gpu_fired: false,
+        }
+    }
+
+    /// Debug-only GPU fault injection, driven from `App::logic`. Release builds
+    /// compile this away entirely (same convention as `FOREMAN_UPDATE_TEST` and
+    /// `FOREMAN_VIEW_TEST`). Three hooks, cheapest first:
+    ///
+    /// * `FOREMAN_GPU_LOST_TEST=<secs>` — flip the device-lost hint by hand.
+    ///   Exercises the ordered handoff, the crash-loop guard, the toast and the
+    ///   restart end to end with NO GPU fault at all.
+    /// * `FOREMAN_GPU_DESTROY_TEST=<secs>` — `device.destroy()`. THE primary
+    ///   acceptance hook: a bit-for-bit reproduction of the production failure
+    ///   (valid=false -> check_is_valid -> DeviceError::Lost -> `None` from
+    ///   `write_buffer_with`). Crucially `device_destroy` does NOT invoke the
+    ///   device-lost closure, so this drives the FORK's flag — the load-bearing
+    ///   detector — and not the optimistic callback path.
+    /// * `FOREMAN_FAKE_PANIC=staging` — panic with the exact upstream message,
+    ///   to exercise the panic hook's string fallback in isolation.
+    ///
+    /// WARNING: a second foreman instance contends for the hard-coded
+    /// `\\.\pipe\foreman` and can steal `foreman open`/`send`/`snapshot` calls
+    /// from the user's live session. Run these only when no agents are
+    /// dispatching, and prefer `cargo build --target-dir target/agent`.
+    #[cfg(debug_assertions)]
+    fn debug_gpu_test_hooks(&mut self, frame: &mut eframe::Frame) {
+        if self.debug_gpu_fired {
+            return;
+        }
+        let t0 = *self
+            .debug_gpu_t0
+            .get_or_insert_with(std::time::Instant::now);
+        let after = |var: &str| -> bool {
+            std::env::var(var)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .is_some_and(|secs| t0.elapsed().as_secs_f64() >= secs)
+        };
+        if after("FOREMAN_GPU_LOST_TEST") {
+            self.debug_gpu_fired = true;
+            eprintln!("foreman: FOREMAN_GPU_LOST_TEST — faking a device-lost hint");
+            gpu::mark_lost_hint();
+        } else if after("FOREMAN_GPU_DESTROY_TEST") {
+            self.debug_gpu_fired = true;
+            eprintln!("foreman: FOREMAN_GPU_DESTROY_TEST — destroying the wgpu device");
+            if let Some(rs) = frame.wgpu_render_state() {
+                rs.device.destroy();
+            } else {
+                eprintln!("foreman: no wgpu render state (glow backend?); nothing to destroy");
+            }
+        } else if std::env::var("FOREMAN_FAKE_PANIC").as_deref() == Ok("staging") {
+            self.debug_gpu_fired = true;
+            panic!("Failed to create staging buffer for index data. Index count: 25200.");
         }
     }
 
@@ -266,6 +330,9 @@ impl App {
             .spawn()
         {
             Ok(_) => {
+                // Deliberate quit: a panic during shutdown must not fork a
+                // second successor beside the one we just spawned.
+                gpu::disarm_handoff();
                 self.force_quit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -580,6 +647,46 @@ fn chrome_glyph(
 }
 
 impl eframe::App for App {
+    /// The ordered device-loss handoff, and the new per-frame preemption point.
+    ///
+    /// `logic` and not `ui` on purpose: eframe calls `app.logic(...)`
+    /// unconditionally inside `run_ui`, while `app.ui` is behind `if is_visible`
+    /// (epi_integration.rs:277-305). A device loss while the window is minimized
+    /// is therefore still caught, and the hot `App::ui` is untouched.
+    ///
+    /// Detection latency is one frame by design: with the vendored egui-wgpu
+    /// fork the frame that would have panicked instead completes (fallback
+    /// write, then SkipFrame) and sets the flag, so the NEXT `logic` catches it.
+    /// That next frame is guaranteed by the device-lost callback's
+    /// `request_repaint()` when it fires, and by the 100 ms idle repaint
+    /// backstop below when it does not.
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(debug_assertions)]
+        self.debug_gpu_test_hooks(_frame);
+
+        // Fast path: one atomic load per frame (a single `mov` on x86).
+        if !gpu::lost() || self.force_quit {
+            return;
+        }
+        self.force_quit = true; // re-entrancy guard
+        gpu::disarm_handoff(); // the ordered path owns the handoff now
+        gpu::log_line("gpu: device lost — ordered handoff (saving workspace, respawning)");
+        // LOAD-BEARING GUARD: on frame 0 the desktop is still empty (restore
+        // runs inside the `!self.started` block in `App::ui`). An unguarded
+        // flush here would overwrite workspace.json with an empty snapshot and
+        // destroy the user's layout permanently.
+        if self.started {
+            self.flush_workspace();
+        }
+        let _ = gpu::respawn("device-lost");
+        // Exit even if the spawn was refused (crash-loop guard) or failed: the
+        // layout is on disk, and staying alive means repainting a dead device
+        // forever. NOT `ViewportCommand::Close` — viewport commands are applied
+        // in eframe's handle_viewport_output AFTER this frame's paint, so Close
+        // would still paint the doomed frame.
+        std::process::exit(0);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.started {
@@ -617,6 +724,17 @@ impl eframe::App for App {
                 self.settings.panel_width,
                 self.settings.panel_dock,
             );
+            // Explain ourselves after a device-loss restart. Without this the
+            // user sees the app blink and their agents vanish with no reason
+            // given, which reads as a worse bug than the crash it replaced.
+            if gpu::FROM_GPU_RESTART.load(std::sync::atomic::Ordering::Acquire) {
+                self.notify.push(
+                    notify::Level::Warning,
+                    "Restarted after a graphics device reset (usually waking from sleep). \
+                     Layout restored — running terminal processes did not survive.",
+                    std::time::Instant::now(),
+                );
+            }
             if !restored && !self.landing_enabled {
                 let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 // self.settings, not config::live: this startup block runs
@@ -647,6 +765,11 @@ impl eframe::App for App {
                     &ctx,
                 );
             }
+
+            // The desktop now exists and workspace.json reflects it, so a
+            // device-loss panic from here on may safely fork a successor.
+            // Every deliberate quit path disarms this again.
+            gpu::arm_handoff();
         }
 
         let mut ctrl_activity = false;
@@ -799,6 +922,7 @@ impl eframe::App for App {
         }
         if self.desktop.take_quit_confirmed() {
             self.flush_workspace();
+            gpu::disarm_handoff(); // deliberate quit; never fork a successor
             self.force_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -808,6 +932,7 @@ impl eframe::App for App {
         // settings modal is up, so a project being created mid-modal survives.
         if self.started && !self.landing_enabled && self.desktop.deserted() {
             self.flush_workspace();
+            gpu::disarm_handoff(); // deliberate quit; never fork a successor
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
@@ -941,60 +1066,47 @@ impl eframe::App for App {
     }
 }
 
-/// File name of the crash log, kept in the same `%APPDATA%\foreman` directory
-/// that holds `settings.json`.
-const PANIC_LOG_FILE: &str = "foreman_panic.log";
-
-/// Absolute path to the crash log. Falls back to a CWD-relative file when
-/// `APPDATA` cannot be resolved — a log in an awkward place beats no log.
-fn crash_log_path() -> std::path::PathBuf {
-    crash_log_path_in(config::config_dir())
-}
-
-/// Pure seam for [`crash_log_path`], so the fallback is testable without
-/// mutating the process environment (`set_var` is `unsafe` in edition 2024 and
-/// races every other test in the binary).
-fn crash_log_path_in(dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
-    dir.map(|d| d.join(PANIC_LOG_FILE))
-        .unwrap_or_else(|| std::path::PathBuf::from(PANIC_LOG_FILE))
-}
-
 /// Log any panic (message + location + backtrace) to
-/// `%APPDATA%\foreman\foreman_panic.log` before the default hook runs. A panic
-/// inside the egui/winit callback unwinds across the platform event loop and
-/// aborts the process with an opaque exit code, so without this the cause is
-/// invisible. Safe to keep; it only writes on a panic.
+/// `%APPDATA%\foreman\foreman_panic.log` before the default hook runs (falling
+/// back to a CWD-relative file only when `APPDATA` is unset). A panic inside the
+/// egui/winit callback unwinds across the platform event loop and aborts the
+/// process with an opaque exit code, so without this the cause is invisible.
+/// Safe to keep; it only writes on a panic.
 ///
-/// Two properties this file is useless without, both learned while diagnosing a
-/// GPU device-loss crash (GH #2, #3):
-///
-/// - **Absolute path.** Opening a bare relative name puts the log in whatever
-///   CWD the process inherited, so it lands somewhere different depending on
-///   whether foreman started from the Start Menu, a shell, or an installer
-///   shim — and a bug report saying "the log is at X" is then true only for the
-///   reporter.
-/// - **A timestamp per entry.** The file is append-only, so without one you can
-///   date exactly one panic (the last, via file mtime) however many it holds.
-///   Correlating panics against Windows Kernel-Power sleep/resume events is what
-///   identified GH #2, and 8 of its 10 recorded panics were undateable.
+/// The absolute path and the ISO-8601 local timestamp are load-bearing (GH #3):
+/// a CWD-relative, undated log from an installed exe is unfindable, and without
+/// a timestamp a crash can't be correlated against Kernel-Power sleep/resume
+/// events — which is the only way we ever dated the device-loss crashes.
 fn install_panic_logger() {
     let default = std::panic::take_hook();
-    // Resolve ONCE, out here: `config_dir` does a `create_dir_all`, which must
-    // not run on an already-unwinding thread.
-    let path = crash_log_path();
+    // Resolve ONCE, outside the hook: config_dir() does create_dir_all, which
+    // must not run on an unwinding thread.
+    let path = crate::gpu::crash_log_path();
     std::panic::set_hook(Box::new(move |info| {
-        // Local time, matching how Kernel-Power events read in Event Viewer.
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
         let bt = std::backtrace::Backtrace::force_capture();
         let line = format!("=== foreman panic {ts} ===\n{info}\nbacktrace:\n{bt}\n\n");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
+        crate::gpu::append_log(&path, &line);
+        // Belt-and-braces for the same-frame device-loss race: if the FIRST
+        // failing hal call is the staging-buffer allocation itself, `Device::lose`
+        // runs inside `create_staging_buffer` (wgpu-core resource.rs:1129 ->
+        // :702-711 -> :5209) and the panic follows two lines later — so
+        // `gpu::lost()` is already true here. With the vendored fork in place
+        // this branch should be UNREACHABLE; if it ever fires, the fork regressed.
+        //
+        // The FLAG is primary and the message string is a documented heuristic
+        // fallback only: egui already reworded and relocated that string on
+        // main, so it will silently stop matching at the next bump.
+        if crate::gpu::handoff_armed()
+            && (crate::gpu::lost()
+                || std::panic::PanicHookInfo::payload_as_str(info)
+                    .is_some_and(|p| p.contains("Failed to create staging buffer")))
         {
-            use std::io::Write;
-            let _ = f.write_all(line.as_bytes());
-            let _ = f.flush();
+            // Command::spawn + file I/O on an unwinding thread: a panic here
+            // would abort the process, so contain it.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::gpu::respawn("device-lost-panic")
+            }));
         }
         default(info);
     }));
@@ -1158,6 +1270,14 @@ fn main() -> eframe::Result {
         unsafe { std::env::remove_var("FOREMAN_WAIT_PID") };
         wait_for_exit(pid, std::time::Duration::from_secs(10));
     }
+    // A device-loss restart tells the successor to explain itself. Remove the
+    // var for the same reason FOREMAN_WAIT_PID is removed above: foreman
+    // injects its own process env into every terminal it spawns, so leaving it
+    // set would leak into every agent's environment.
+    if std::env::var_os("FOREMAN_GPU_RESTART").is_some() {
+        unsafe { std::env::remove_var("FOREMAN_GPU_RESTART") };
+        gpu::FROM_GPU_RESTART.store(true, std::sync::atomic::Ordering::Release);
+    }
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
@@ -1204,6 +1324,42 @@ fn main() -> eframe::Result {
             // `set_visuals` in `App::ui` then paints the active theme over it.
             cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
 
+            // Device-loss tripwire + one-time GPU identification.
+            // `cc.wgpu_render_state` exists because foreman uses eframe's
+            // default features (which include wgpu); see
+            // docs/gpu-device-loss.md if the glow backend is ever adopted.
+            //
+            // The callback is only an EARLY HINT — wgpu-core documents that it
+            // "might never be called", and `device.destroy()` never fires it —
+            // so the authoritative detector stays the fork's own flag. What it
+            // buys us is one saved dead frame plus wgpu's own message in the
+            // log, and it is the only path exercised by a REAL DXGI removal.
+            if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                let info = rs.adapter.get_info(); // cached struct, no driver call
+                gpu::log_line(&format!(
+                    "gpu: backend={:?} adapter={:?} name={:?} driver={:?} {:?}",
+                    info.backend, info.device_type, info.name, info.driver, info.driver_info
+                ));
+                let ctx = cc.egui_ctx.clone();
+                rs.device.set_device_lost_callback(move |reason, msg| {
+                    // Runs on whichever thread hit the hal error, with wgpu-core
+                    // holding the closure mutex — MUST NOT call back into wgpu
+                    // (deadlock). A file append, an atomic store and an egui
+                    // repaint touch no wgpu state, so all three are safe.
+                    //
+                    // Log BEFORE the store so that if the process dies
+                    // immediately after, the file still explains why. And do NOT
+                    // filter `DeviceLostReason::Destroyed`: `Device::lose`
+                    // hardcodes `Unknown`, so the filter would be dead in
+                    // production, and FOREMAN_GPU_DESTROY_TEST deliberately
+                    // wants a Destroyed-reason loss treated as a loss.
+                    // Clean-shutdown safety comes from `gpu::disarm_handoff`.
+                    gpu::log_line(&format!("gpu: device lost ({reason:?}): {msg}"));
+                    gpu::mark_lost_hint();
+                    ctx.request_repaint();
+                });
+            }
+
             // Spawn the control server here (not before run_native) so it can hold
             // the egui Context and wake the render loop the instant a dispatch
             // arrives, rather than waiting on the idle repaint tick.
@@ -1226,30 +1382,6 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(rx, upd_event_rx, upd_effect_tx)))
         }),
     )
-}
-
-#[cfg(test)]
-mod crash_log_tests {
-    use super::*;
-
-    #[test]
-    fn crash_log_lands_next_to_settings_when_appdata_resolves() {
-        let dir = std::path::PathBuf::from(r"C:\Users\someone\AppData\Roaming\foreman");
-        assert_eq!(
-            crash_log_path_in(Some(dir.clone())),
-            dir.join("foreman_panic.log")
-        );
-    }
-
-    #[test]
-    fn crash_log_falls_back_to_a_bare_name_when_appdata_is_unresolvable() {
-        // Not a silent no-op: losing the record entirely is strictly worse than
-        // writing it to the CWD, which is what every build did before GH #3.
-        assert_eq!(
-            crash_log_path_in(None),
-            std::path::PathBuf::from("foreman_panic.log")
-        );
-    }
 }
 
 #[cfg(test)]
