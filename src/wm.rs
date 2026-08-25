@@ -700,9 +700,21 @@ impl WindowManager {
         let mut snap_id_to_win: HashMap<SnapId, WinId> = HashMap::new();
 
         for win_snap in &snap.windows {
-            // Provisional id used for term env / project tags; only consumed
-            // if at least one tab materializes.
-            let provisional_id = self.next;
+            // Id for this window (term env / project tags). Consumed up front:
+            // a window whose tabs all fail to materialize burns it, which is
+            // harmless — ids are monotonic and never reused, and are only used
+            // for identity plus env injection.
+            let win_id = self.next;
+            self.next += 1;
+            // Every terminal tab needs its OWN id: FOREMAN_TERMINAL_ID and the
+            // chat member id are derived from it, so sharing one across a
+            // restored tab stack makes `foreman send`/`snapshot` target the
+            // wrong pane and collapses several chat members into one. The live
+            // spawn path already consumes a fresh `self.next` per pane; restore
+            // used to hoist a single id across the whole loop. The first
+            // terminal tab reuses the window id (matching pre-fix ids for the
+            // common single-terminal window); every later one gets its own.
+            let mut win_id_taken = false;
             let mut tabs: Vec<Tab> = Vec::new();
             let mut new_active = 0usize;
             let mut found_active = false;
@@ -711,10 +723,18 @@ impl WindowManager {
                 let content = match &tab_snap.content {
                     ContentSnap::Terminal { shell } => {
                         let shell = shell_from_str(shell);
-                        let env = self.term_env(provisional_id);
+                        let tid = if win_id_taken {
+                            let t = self.next;
+                            self.next += 1;
+                            t
+                        } else {
+                            win_id_taken = true;
+                            win_id
+                        };
+                        let env = self.term_env(tid);
                         match Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()) {
                             Ok(mut s) => {
-                                s.set_term_id(provisional_id);
+                                s.set_term_id(tid);
                                 Content::Terminal(s)
                             }
                             Err(e) => {
@@ -737,8 +757,9 @@ impl WindowManager {
                         let mut nested = WindowManager::new();
                         nested.cwd = child.cwd.clone();
                         // Tag before nested apply so child terminals get
-                        // FOREMAN_PROJECT_ID (id == provisional, finalized below).
-                        nested.tag = Some(format!("p{provisional_id}"));
+                        // FOREMAN_PROJECT_ID. Keyed to the WINDOW id, not a
+                        // per-terminal one — a project is one window.
+                        nested.tag = Some(format!("p{win_id}"));
                         let nested_rep = nested.apply_manager(child, ctx);
                         report.merge(nested_rep);
                         report.projects_restored += 1;
@@ -771,14 +792,11 @@ impl WindowManager {
                 new_active = tabs.len() - 1;
             }
 
-            let id = self.next;
-            self.next += 1;
             self.z += 1;
-            debug_assert_eq!(id, provisional_id);
-            snap_id_to_win.insert(win_snap.id, id);
+            snap_id_to_win.insert(win_snap.id, win_id);
 
             self.windows.push(Win {
-                id,
+                id: win_id,
                 tabs,
                 active: new_active,
                 rect: rect_from_snap(&win_snap.rect),
@@ -7086,6 +7104,51 @@ mod tests {
         let desktop = WindowManager::new();
         let env = desktop.term_env(1);
         assert!(env.iter().all(|(n, _)| n != "FOREMAN_PROJECT_ID"));
+    }
+
+    #[test]
+    fn restored_tab_stack_gets_unique_term_ids() {
+        // Restore used to hoist ONE provisional id across a window's whole tab
+        // loop, so every terminal in a restored multi-tab stack shared a
+        // FOREMAN_TERMINAL_ID (and one chat member id) — `foreman send`/
+        // `snapshot` would then target whichever pane matched first. Auto-restart
+        // after a GPU device loss makes restore routine, so this must hold.
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap};
+        let ctx = egui::Context::default();
+        let tab = || TabSnap {
+            title: "cmd".into(),
+            content: ContentSnap::Terminal {
+                shell: "cmd".into(),
+            },
+        };
+        let snap = ManagerSnap {
+            windows: vec![WinSnap {
+                id: 1,
+                active: 0,
+                tabs: vec![tab(), tab(), tab()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".into());
+        wm.apply_manager(&snap, &ctx);
+
+        let win = wm.windows.first().expect("one restored window");
+        let ids: Vec<u64> = win
+            .tabs
+            .iter()
+            .map(|t| match &t.content {
+                Content::Terminal(s) => s.term_id(),
+                _ => panic!("expected a terminal tab"),
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 3, "term ids must be distinct, got {ids:?}");
+        // The first tab keeps the window id, so single-terminal windows restore
+        // with exactly the ids they had before this fix.
+        assert_eq!(ids[0], win.id);
     }
 
     // --- group chat: membership, post, broadcast, history ---
