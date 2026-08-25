@@ -1,6 +1,6 @@
 ---
 name: foreman-debugging-playbook
-description: Use when foreman misbehaves and you need the known-failure dictionary — a Session comes up black and never prompts, "rx 4 bytes", "Access is denied (os error 5)" on build, "cannot find -lgcc_eh", resize + Up-arrow prompt corruption, caret strobing in TUIs, dead unclickable UI regions, Ctrl+Scroll/Ctrl+0 zoom doing nothing, chat posts never arriving, "foreman did not respond", dispatch failures, washed-out TUI colors, the app vanishing (foreman_panic.log), flaky PTY tests.
+description: Use when foreman misbehaves and you need the known-failure dictionary — a Session comes up black and never prompts, "rx 4 bytes", "Access is denied (os error 5)" on build, "cannot find -lgcc_eh", resize + Up-arrow prompt corruption, caret strobing in TUIs, dead unclickable UI regions, Ctrl+Scroll/Ctrl+0 zoom doing nothing, chat posts never arriving, "foreman did not respond", dispatch failures, washed-out TUI colors, the app vanishing (foreman_panic.log) — including after sleep or a display power transition (GPU device loss) — flaky PTY tests.
 ---
 
 # Foreman Debugging Playbook
@@ -22,7 +22,9 @@ escape query `ESC[6n` a program sends to ask "terminal, where is your cursor?"
 — the program **blocks** until the terminal replies. egui terms (Area, hit
 test, immediate mode) live in **egui-immediate-mode-reference**.
 
-All `path:line` citations are as of 2026-07-01, HEAD `7fda1c2`.
+Citations are `file` + symbol, never `file:line` — line numbers rot in weeks,
+symbol names have survived every refactor so far. `rg -n "fn <symbol>" src/`
+lands you on it.
 
 ## Quick triage table
 
@@ -40,6 +42,7 @@ All `path:line` citations are as of 2026-07-01, HEAD `7fda1c2`.
 | TUI colors flat/washed out (grey boxes) | Capability env vars or OSC color replies missing | §10 |
 | Whole app vanishes, opaque exit code | Panic aborted across the winit callback — read `foreman_panic.log` | §11 |
 | A PTY test fails in the full suite, passes alone | Pre-Ready injection swallowed under load — re-send pattern | §12 |
+| App vanished after sleep, resume, or a display power transition | GPU device loss. Under wgpu that is an unconditional `panic!` + abort — SETTLED: foreman renders on glow | §13 |
 
 ---
 
@@ -56,8 +59,8 @@ the child and it hangs forever.
 
 **Fix / fence.** The wiring already exists and must not be undone:
 `Session`'s `Listener` captures `Event::PtyWrite` into a shared buffer
-(src/terminal.rs:187) and `Session::pump()` flushes that buffer back into the
-PTY after the RX chunk that completed the query. A successful first reply plus
+(src/terminal.rs `struct Listener`) and `Session::pump()` flushes that buffer
+back into the PTY after the RX chunk that completed the query. A successful first reply plus
 the child's first visible paint latch the Session **Ready**; a failed write must
 not. Minimized windows still call the headless keepalive path so this handshake
 does not time out. **Never give a live Session a
@@ -66,8 +69,9 @@ does not time out. **Never give a live Session a
 **Nuance — VoidListener is legitimate in one place:** driven `Term` fixtures
 in tests. `src/inspect.rs` is generic over `EventListener` precisely so the
 same code runs on a live `Term<Listener>` and a test `Term<VoidListener>` fed
-fixed bytes with no PTY at all (src/inspect.rs:1-8; used in
-src/inspect.rs:309-310 and src/frame.rs:182-183). A `VoidListener` on a
+fixed bytes with no PTY at all (src/inspect.rs — every fn is
+`<L: EventListener>`; used in the test mods of inspect.rs and frame.rs).
+A `VoidListener` on a
 **live** Session is a bug; on a byte-driven fixture it's the design.
 
 **Story.** Early sessions came up black and the cause was invisible until the
@@ -171,7 +175,7 @@ gate.
 
 **Discriminator.** Is the *model cursor* or the *painted caret* wrong? Run
 `foreman snapshot --cursor` (returns the grid model's cursor,
-src/inspect.rs:95) and compare with what's painted. Model cursor wrong =
+src/inspect.rs `cursor_info`) and compare with what's painted. Model cursor wrong =
 emulation problem (**terminal-emulation-reference**); model right but paint
 wrong = paint problem (`frame::overlays` / `show()`).
 
@@ -194,13 +198,13 @@ while the rest works.
    under it went input-dead.
 
 **Fix / fence.** Chrome Areas set `.movable(false)`, `.constrain(false)`, and
-`.default_size(...)` (src/main.rs:252-257; rationale docs/os-chrome.md). Each
+`.default_size(...)` (src/main.rs `show_os_chrome`; rationale docs/os-chrome.md). Each
 resize-rim strip is its **own** Area — one Area for all four strips has a
 full-screen bounding rect and eats every click in the app.
 
 **Debugging tip (verbatim from the incident):** if chrome interaction dies
 regionally again, dump `ctx.memory(|m| m.area_rect(id))` for the chrome Areas
-**first** (docs/os-chrome.md:64-65). General egui trap taxonomy:
+**first** (docs/os-chrome.md §Gotchas). General egui trap taxonomy:
 **egui-immediate-mode-reference**.
 
 ## §7 Ctrl+Scroll / Ctrl+0 zoom dead
@@ -212,7 +216,8 @@ regionally again, dump `ctx.memory(|m| m.area_rect(id))` for the chrome Areas
 Ctrl+wheel into a whole-UI zoom (zeroing `smooth_scroll_delta`, so foreman's
 handler sees nothing) and consumes Ctrl+0/Ctrl+± for chrome scaling.
 
-**Fix / fence.** Startup must disable both (src/main.rs:347-350):
+**Fix / fence.** Startup must disable both (src/main.rs, in `App::ui`'s
+one-shot startup block):
 
 ```rust
 ctx.options_mut(|o| {
@@ -234,10 +239,10 @@ Four distinct mechanisms; discriminate in this order:
 
 | Check | Mechanism |
 |---|---|
-| Is the Session Ready yet? | Bytes injected pre-Ready are eaten by the startup DSR scan. `Session::inject_input` therefore **queues** posts until Ready and `pump()` flushes them on the frame Readiness latches (src/terminal.rs:663-665, 727-731). Delivery is at-most-late, not lost — *if* the Session ever becomes Ready. |
-| Does the member ever latch Ready? | Ready latches only when the program's startup DSR is answered (src/terminal.rs:566, 722-724). A worker that never emits a DSR never latches, and queued posts sit forever. Headless print-mode workers (`claude -p`) additionally don't read stdin at all — injected posts hit a dead buffer even when delivered. Receive-capability detection is an **open gap** (docs/chat-missing-features.md, Layer 1 item 3, as of 2026-07-01). |
-| Was the submit folded? | The trailing Enter is a **deferred** `\r` sent `SUBMIT_DELAY` (150ms, src/terminal.rs:300) after the text, fired by `pump()` — because Claude's paste handling folds an immediate CR into the paste (incident dated 2026-06-10 in the comment at src/terminal.rs:650-656: message sat unsubmitted in the input box). |
-| Is the tick seeing the whole room? | `WindowManager::chat_tick` collects **every** live member, then the room's `tick` (the **Outbox** step) reconciles presence and delivers only to Ready, non-exited members, advancing per-member delivery cursors (src/wm.rs:1576, src/chat.rs:598-665). **Invariant: pass the full live set** — a member absent from the `live` slice is reconciled as *gone* and gets an Exited line. A partial set silently evicts members. |
+| Is the Session Ready yet? | Bytes injected pre-Ready are eaten by the startup DSR scan. `ReadyGate::try_inject` (src/ready.rs) therefore **queues** posts until Ready and `ReadyGate::poll`, called from `Session::pump()`, flushes them on the frame Readiness latches. Delivery is at-most-late, not lost — *if* the Session ever becomes Ready. |
+| Does the member ever latch Ready? | Ready is **two** halves ANDed, both in `ReadyGate` (src/ready.rs): `on_dsr_reply_flushed` (the startup device-status reply actually made it back to the child) and `on_rx_chunk` seeing the first visible glyph (`InkScan`). A worker that never emits a DSR never latches, and queued posts sit forever. Headless print-mode workers (`claude -p`) additionally don't read stdin at all — injected posts hit a dead buffer even when delivered. Receive-capability detection is an **open gap** (docs/chat-missing-features.md, Layer 1). |
+| Was the submit folded? | The trailing Enter is a **deferred** `\r` armed `SUBMIT_DELAY` after the text (src/ready.rs — the const's doc comment carries the incident: Claude Code's TUI folds input arriving inside the same burst *into* the paste, so a back-to-back `\r` became a literal newline and the message sat unsubmitted in the input box). |
+| Is the tick seeing the whole room? | `WindowManager::chat_tick` (src/wm.rs) collects **every** live member, then `ChatRoom::tick` (src/chat.rs — the **Outbox** step) reconciles presence and delivers only to Ready, non-exited members, advancing per-member delivery cursors. **Invariant: pass the full live set** — a member absent from the `live` slice is reconciled as *gone* and gets an Exited line. A partial set silently evicts members. |
 
 Delivery-order and framing details: docs/chat-delivery.md. Operational chat
 usage (as an agent inside foreman): the **foreman-chat** skill.
@@ -249,11 +254,11 @@ Symptoms and their contracts (transport ground truth lives in
 
 | Symptom | Contract |
 |---|---|
-| Dispatch dead in one instance; GUI otherwise fine | A second foreman instance can't own the pipe. The server logs `control: pipe unavailable (...); agent dispatch disabled` to stderr and returns — GUI still works, dispatch doesn't (src/control.rs:241-245). Check for another running foreman.exe. |
-| Client prints `foreman did not respond` | The pipe server waited `REPLY_TIMEOUT` (5s, src/control.rs:10) for the GUI. **A timed-out request NEVER executes**: the GUI drops any request older than `REPLY_TIMEOUT` unexecuted (src/wm.rs:841-843), and an `open` whose reply channel died has its spawn undone (src/wm.rs:846-850). So a retry cannot create a duplicate Session. (One asymmetry: a chat post whose reply channel died **stays in the log** — append-only; only the injection is skipped — so a retried post can duplicate a history line, src/wm.rs:867-870.) |
-| `... runs via a cmd-shim ... cannot carry newlines or " in arguments` | Deliberate refusal. Anything routed through `cmd.exe` re-parses the command line: a newline ends the command, an embedded `"` flips quote state. Argv containing `\n`, `\r`, or `"` (`unsafe_for_cmd`, src/terminal.rs:401) is refused for `.cmd`/`.bat` targets and for the bare-name `cmd /c` fallback. Flatten the prompt to one quote-free line or install the tool as a native exe. |
-| `{"ok":true,...}` but the worker did nothing | **`ok:true` means "a Session opened", not "your command exists."** A bare name that isn't directly spawnable falls back to `cmd.exe /c <argv>` (src/terminal.rs:419-426) — cmd spawns fine even when the inner command doesn't exist. The help text says it outright: "The reply is NOT the command's output or result" (src/control.rs, HELP_OPEN). Verify with `foreman status` — an instantly-dead worker shows `exited(code)` because status asks the live process, not the tab title. |
-| `control pipe stayed busy for 10s` | Client-side `CONNECT_TIMEOUT` (10s, src/control.rs:17) turned a wedged server into an error. Retry, or find the wedged dispatch. |
+| Dispatch dead in one instance; GUI otherwise fine | A second foreman instance can't own the pipe. The server logs `control: pipe unavailable after N attempts (...); agent dispatch disabled` to stderr and returns — GUI still works, dispatch doesn't (src/control.rs `listen_retry`). Check for another running foreman.exe. |
+| Client prints `foreman did not respond` | The pipe server waited `REPLY_TIMEOUT` (5s, src/control.rs) for the GUI. **A timed-out request NEVER executes**: every arm of `WindowManager::handle_ctrl` (src/wm.rs) drops a request older than `REPLY_TIMEOUT` unexecuted, and an `open` whose reply channel died has its spawn undone via `close_terminal`. So a retry cannot create a duplicate Session. (One asymmetry: a chat post whose reply channel died **stays in the log** — append-only; only the injection is skipped — so a retried post can duplicate a history line.) |
+| `... runs via a cmd-shim ... cannot carry newlines or " in arguments` | Deliberate refusal. Anything routed through `cmd.exe` re-parses the command line: a newline ends the command, an embedded `"` flips quote state. Argv containing `\n`, `\r`, or `"` (`unsafe_for_cmd` inside `Session::spawn_argv`, src/terminal.rs) is refused for `.cmd`/`.bat` targets and for the bare-name `cmd /c` fallback. Flatten the prompt to one quote-free line or install the tool as a native exe. |
+| `{"ok":true,...}` but the worker did nothing | **`ok:true` means "a Session opened", not "your command exists."** A bare name that isn't directly spawnable falls back to `cmd.exe /c <argv>` (`Session::spawn_argv`, src/terminal.rs) — cmd spawns fine even when the inner command doesn't exist. The help text says it outright: "The reply is NOT the command's output or result" (src/control.rs, `HELP_OPEN`). Verify with `foreman status` — an instantly-dead worker shows `exited(code)` because status asks the live process, not the tab title. |
+| `control pipe stayed busy for 10s` | Client-side `CONNECT_TIMEOUT` (10s, src/control.rs) turned a wedged server into an error. Retry, or find the wedged dispatch. |
 
 ## §10 Wrong / washed-out colors in TUIs
 
@@ -262,13 +267,15 @@ box incident) instead of its real theme.
 
 **Immediate cause.** Two capability channels, both required:
 1. **Env advertisement:** every foreman-spawned Session gets
-   `COLORTERM=truecolor` and `TERM=xterm-256color` injected (src/wm.rs:792-794)
+   `COLORTERM=truecolor` and `TERM=xterm-256color` injected
+   (`WindowManager::term_env`, src/wm.rs)
    so TUIs enable 24-bit color. Codex keys its truecolor path off `COLORTERM`
    (docs/epics/terminal-completeness-epic.md §truecolor).
 2. **OSC color queries:** apps ask the terminal for its palette
    (OSC 10/11/12 for fg/bg/cursor, OSC 4;N for palette entries) to detect
    light/dark and theme themselves. `Listener` answers `Event::ColorRequest`
-   with the RGB foreman actually paints (src/terminal.rs:102-121, 204-208).
+   with the RGB foreman actually paints (src/terminal.rs — the
+   `Event::ColorRequest` arm of `impl EventListener for Listener`).
    Without an answer, apps guess.
 
 **Discriminator.** `foreman snapshot --attrs` returns per-cell resolved RGB
@@ -283,22 +290,25 @@ actually resolve", independent of the paint path.
 across the platform event loop and **aborts the process**; the cause is
 invisible without a hook.
 
-**Fix / fence.** `install_panic_logger` (src/main.rs:427-443) appends message,
-location, and backtrace to **`foreman_panic.log` in the process working
-directory** before the default hook runs. Read that file first:
+**Fix / fence.** `install_panic_logger` (src/main.rs) appends a timestamped
+`=== foreman panic {ts} ===` entry — message, location, backtrace — to
+**`%APPDATA%\foreman\foreman_panic.log`** before the default hook runs
+(`crash_log_path` → `crash_log_path_in(config::config_dir())`). Read that file
+first:
 
 ```powershell
-Get-Content "H:/claude code/foreman/foreman_panic.log" -Tail 40
+Get-Content "$env:APPDATA\foreman\foreman_panic.log" -Tail 40
 ```
 
-(If foreman was launched from another directory, the log is in *that*
-directory.)
+A bare `foreman_panic.log` in some working directory is the pre-966379b
+fallback shape — `crash_log_path_in(None)` only when `APPDATA` is unresolvable.
+If you find one at the repo root it is almost certainly a fossil, not evidence:
+check the entry timestamps before believing it.
 
-**Status (as of 2026-07-01).** No per-Session isolation exists — one Session's
-paint panic kills every Session in the app. Open item. The Frame plan seam
-(HEAD `7fda1c2`) removes one whole class of these: grid walks are clamped to
-the grid's real bounds before painting, so a stale index can't panic the
-process (CONTEXT.md §Frame plan).
+**Status.** No per-Session isolation exists — one Session's paint panic kills
+every Session in the app. Open item. The Frame plan seam removes one whole
+class of these: grid walks are clamped to the grid's real bounds before
+painting, so a stale index can't panic the process (CONTEXT.md §Frame plan).
 
 ## §12 Flaky PTY tests — pre-Ready swallow under suite load
 
@@ -323,6 +333,26 @@ re-sends.
 latency under the timing window; the race remains (same doc, §Diagnosis).
 Test evidence standards: **foreman-validation-and-qa**.
 
+## §13 App vanished after sleep / display power transition — GPU device loss
+
+**Symptom.** Foreman is gone after the machine slept, resumed, changed
+displays, or the display driver reset. Nothing on screen said so.
+
+**Immediate cause.** Windows drops the GPU device on those transitions.
+`egui-wgpu` does not handle that: `Renderer::update_buffers` calls
+`write_buffer_with`, gets `None` from a device in an error state, and hits an
+unconditional `panic!` — which per §11 aborts the whole process, every Session
+with it. `egui_glow` only logs on `GL_CONTEXT_LOST`.
+
+**Fix / fence — SETTLED (`ba803ef`).** foreman renders on **glow**, and
+`default-features = false` on the `eframe` line in `Cargo.toml` is load-bearing:
+eframe prefers wgpu when both backends are enabled. Do not "modernize" that
+line back to wgpu — the upgrade path was ruled out too (newer egui-wgpu keeps
+the same panic). The side-by-side A/B through one real device-loss event, and
+the crash evidence from `%APPDATA%\foreman\foreman_panic.log`, are in
+`docs/gpu-device-loss.md`. Session persistence (PTYs outliving the GUI process)
+is still the only thing that would make a GUI death *survivable*; it is open.
+
 ---
 
 ## Discriminating experiments
@@ -334,30 +364,16 @@ Session or pass `--project/--terminal` explicitly):
 
 | Question | Experiment |
 |---|---|
-| "What is actually on the Session's screen?" (headless ground truth, no pixels) | `foreman send --terminal tN --text "..."` then `foreman snapshot --terminal tN`. `send` waits a Quiescence settle by default — replies after 120ms of PTY silence, hard cap 4000ms (src/wm.rs:17-18) — so the following Snapshot reads a settled screen. `--settle-ms 0` = fire-and-forget. **Drift flag:** the CLI help and `SendRequest` doc-comments still say `--settle-ms` is "not yet honored" (src/control.rs:129-130, 763) — stale; src/wm.rs:938-960 honors it (verified, as of 2026-07-01). |
+| "What is actually on the Session's screen?" (headless ground truth, no pixels) | `foreman send --terminal tN --text "..."` then `foreman snapshot --terminal tN`. `send` waits a Quiescence settle by default — the quiet window is `Settings::send_settle_ms` (src/config.rs, ships at 120ms, user-editable, clamped to 2000 by `sanitize`), and `MAX_SETTLE_MS` (4000, src/wm.rs) is the hard cap on total wait. `--settle-ms 0` = fire-and-forget; `WindowManager::advance_settles` drains parked settles per frame. |
 | "Is the emulation wrong or the paint wrong?" | `foreman snapshot --cursor` (model cursor) vs what's painted (same cell since the gate retired) — see §5. `--attrs` does the same for colors — see §10. |
 | "What's the fleet state?" | `foreman status` — running/exited(code) for every Session, chat membership, asked of the live process. |
 | "Is the chrome wrong?" (pixels, not grid) | Build + screenshot via the **build-screenshot** skill. A Snapshot can't see egui chrome; a screenshot can't see cell attributes. Pick by layer. |
 
 ## When NOT to use this skill
 
-- **Recreating the build environment / toolchain traps in depth** — use
-  **foreman-build-and-env** (this playbook only triages the two build-breaking
-  error strings).
-- **How the control CLI works when it's *not* failing** (verbs, flags,
-  transport) — **foreman-run-and-operate**.
-- **Building measurement harnesses** (latency, screenshot loops, archaeology
-  tooling) — **foreman-diagnostics-and-tooling**.
-- **The full history of an investigation** (who tried what, when, and every
-  dead end) — **foreman-failure-archaeology**; this playbook keeps only the
-  actionable verdicts.
-- **Understanding *why* the architecture is shaped this way** (invariants,
-  seams, threading) — **foreman-architecture-contract**.
-- **Domain background** on PTY/ConPTY/VT or egui itself —
-  **terminal-emulation-reference** / **egui-immediate-mode-reference**.
-- **Operating foreman as an agent running inside it** (dispatching workers,
-  posting chat) — the user-facing **foreman-dispatch** and **foreman-chat**
-  skills; do not read source for their operational mechanics.
+- **The full history of an investigation** (who tried what, and every dead end)
+  — **foreman-failure-archaeology**; this playbook keeps only the actionable
+  verdicts.
 - **A brand-new symptom not in the table** — that's a fresh investigation:
   `superpowers:systematic-debugging` discipline, evidence per
   **foreman-research-methodology**, and add the entry here once settled (via
@@ -365,26 +381,14 @@ Session or pass `--project/--terminal` explicitly):
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against HEAD `7fda1c2` (all file:line citations date from
-then). Re-verification one-liners for the drift-prone claims (PowerShell, repo
-root `H:/claude code/foreman`):
+Re-verification one-liners for the load-bearing, drift-prone claims — the ones
+where being wrong sends someone down a dead path:
 
 | Claim | Re-verify with |
 |---|---|
-| DSR reply path: `PtyWrite` captured, `pump()` flushes, Ready latch | `rg -n "PtyWrite\|fn pump\|ready = true" src/terminal.rs` |
-| VoidListener only in test fixtures | `rg -n "VoidListener" src/` (expect hits only in `#[cfg(test)]`/test mods of inspect.rs, frame.rs) |
-| Kill hook matcher is Bash-only | `Get-Content .claude/settings.json` |
+| The VoidListener fence: it appears only in test fixtures, never on a live Session | `rg -n "VoidListener" src/` — hits must all be inside `#[cfg(test)]` mods |
+| Panic log really lands in `%APPDATA%\foreman\` | `rg -n -e crash_log_path -e PANIC_LOG_FILE src/main.rs` — must resolve through `config::config_dir()`, not the CWD |
+| Renderer is still glow, not wgpu | `rg -n -A6 '^eframe = ' Cargo.toml` — `default-features = false` plus the `glow` feature; a bare `eframe` line means wgpu is back and §13 is live again |
 | ConPTY mitigation/residual status | `Get-Content docs/conpty-resize-reflow.md -TotalCount 8`; check bundled pair + #18725/#19535 status |
-| Caret gate retired (caret.rs is a pure draw mapping) | `rg -n "CaretGate\|CURSOR_SETTLE" src/` — any hit means the gate came back; update §5 |
-| Area landmine fixes (`constrain(false)`) | `rg -n "constrain\(false\)" src/main.rs` and docs/os-chrome.md §Gotchas |
-| egui zoom opt-out still present | `rg -n "zoom_with_keyboard\|zoom_modifier" src/main.rs` |
-| SUBMIT_DELAY 150ms; pre-Ready queueing | `rg -n "SUBMIT_DELAY\|pending_inject" src/terminal.rs` |
-| REPLY_TIMEOUT 5s / CONNECT_TIMEOUT 10s / stale-drop + spawn-undo | `rg -n "REPLY_TIMEOUT\|CONNECT_TIMEOUT" src/control.rs src/wm.rs` |
-| cmd-shim refusal chars `\n \r "` | `rg -n "unsafe_for_cmd" src/terminal.rs` |
-| COLORTERM/TERM injection + ColorRequest replies | `rg -n "COLORTERM" src/wm.rs; rg -n "ColorRequest" src/terminal.rs` |
-| Panic log name/location | `rg -n "foreman_panic.log" src/main.rs` |
-| Settle constants 120ms/4000ms; help-text drift ("not yet honored") | `rg -n "DEFAULT_SETTLE_MS\|MAX_SETTLE_MS" src/wm.rs; rg -n "not yet honored" src/control.rs` — if the help text was fixed, delete the drift flag in §Discriminating experiments |
-| `claude -p` receive gap still open | `rg -n "write-only" docs/chat-missing-features.md` |
 
-If any command's output contradicts an entry, the code wins — update the entry
-and its date stamp.
+If any command's output contradicts an entry, the code wins — update the entry.

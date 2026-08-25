@@ -6,7 +6,7 @@ for AI"). Rust + egui, real PTYs (`portable-pty`/ConPTY), full terminal emulatio
 Electron/Tauri. That constraint has already settled several arguments; check
 `.claude/skills/foreman-failure-archaeology/SKILL.md` before reopening one.
 
-This file is deliberately thin. The knowledge lives in a 20-file reference
+This file is deliberately thin. The knowledge lives in the reference
 library under `.claude/skills/` and in `docs/` - see the routing table below.
 `docs/HANDOFF.md` is the authoritative deep doc (vision, architecture, complete
 module map, next phases) and wins on any conflict.
@@ -97,7 +97,8 @@ them and installs them into the Claude and Codex global skill dirs at startup so
 agents in any repo can find them. When you change dispatch or chat behavior:
 edit both copies, keep them semantically identical, adapt only the command
 examples (`claude` / `claude -p` versus `codex` / `codex exec`), then rebuild to
-propagate. `build-screenshot` is repo-local and Codex-only.
+propagate. `build-screenshot` is twinned in both dirs, embedded in neither; the
+Claude copy carries `disable-model-invocation: true`, the Codex copy does not.
 
 ## Working Agreement
 

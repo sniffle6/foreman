@@ -5,14 +5,13 @@ description: Use when a foreman investigation needs proof instead of eyeballing 
 
 # Foreman Proof & Analysis Toolkit
 
-Nine first-principles analysis recipes, each proven in this repo's history.
+First-principles analysis recipes, each proven in this repo's history.
 House rule: **prove it, don't just observe it.** An observation ("it looks
 fixed") is not a result; a result names a mechanism and shows the evidence that
 mechanism predicts. The general evidence bar and result lifecycle live in
 **foreman-research-methodology** — this skill is the recipe box.
 
-Baseline: committed HEAD `7fda1c2`, working tree clean (as of 2026-07-01).
-All line numbers are date-stamped to that commit.
+Code is cited by file and symbol, never by line number.
 
 ## Picking a recipe
 
@@ -38,8 +37,8 @@ All line numbers are date-stamped to that commit.
   exchange. Details: **terminal-emulation-reference**.
 - **DSR** — Device Status Report, `ESC[6n`: the child asks "where is the
   cursor?" and hangs until the terminal answers. A Session is **Ready** once
-  its startup DSR has been answered (CONTEXT.md "Ready"; latch at
-  `src/terminal.rs:722-724`).
+  its startup DSR has been answered (CONTEXT.md "Ready"; the latch is in
+  `Session::pump`, `src/terminal.rs`).
 - **Grid / viewport / `display_offset`** — `alacritty_terminal` (the crate
   foreman uses as parser + screen model) keeps the visible screen plus
   scrollback history in one grid. `display_offset` is how many lines the user
@@ -54,12 +53,12 @@ missing text) and you are about to theorize. `foreman snapshot` shows the
 *parsed* grid — downstream of the parser. Before blaming foreman's resize
 logic, ConPTY, or the shell, read the actual bytes.
 
-**Where the bytes flow** (as of 2026-07-01):
+**Where the bytes flow** (all in `src/terminal.rs`):
 
 | Direction | Path |
 |---|---|
-| ConPTY → foreman | reader thread `src/terminal.rs:495-509` (8 KiB reads → mpsc channel) → `pump()` drains + feeds parser `src/terminal.rs:713-717` |
-| foreman → ConPTY | `Session::send` `src/terminal.rs:793-796`; plus `pump()` flushing emulator replies (DSR answers) `src/terminal.rs:718-721` |
+| ConPTY → foreman | the reader thread spawned by `Session::spawn` (chunked reads → mpsc channel) → `Session::pump` drains and feeds the parser |
+| foreman → ConPTY | `Session::send`; plus `pump()` flushing emulator replies (DSR answers) back to the child |
 
 **Steps:**
 
@@ -153,7 +152,7 @@ state and applies side effects.
    the entangled code.
 2. **Define its inputs and outputs as plain data.** Time enters as an
    `Instant` parameter — the pure code *never reads the clock*
-   (`src/caret.rs:53-54` states this contract explicitly).
+   (`settle_tick` in `src/wm.rs` takes `now` as a parameter).
 3. **Extract** into a pure fn/struct with unit tests (value/byte equality, no
    sleeps, no GUI, no Session).
 4. **Thin the shell**: `show()`/`pump()` supply live state, call the seam,
@@ -162,20 +161,21 @@ state and applies side effects.
    deliberate seams (house style: **foreman-docs-and-writing**; the full seam
    map: **foreman-architecture-contract**).
 
-**Worked examples (all live at HEAD `7fda1c2`, as of 2026-07-01):**
+**Worked examples (all live):**
 
 | Seam (CONTEXT.md name) | Pure code | Signature shape |
 |---|---|---|
-| Input-encoding seam | `src/input.rs:37` `process_input` | egui events + term mode + has-selection → `InputOutcome` (bytes + side-effect flags) |
+| Input-encoding seam | `src/input.rs` `process_input` | egui events + term mode + has-selection → `InputOutcome` (bytes + side-effect flags) |
 | Caret (gate retired 2026-07-15) | `src/caret.rs` `draw` | model cursor (line, col, shape) → what to paint |
-| Outbox | `src/chat.rs:598` `ChatRoom::tick` | project tag + live Member presence → `Vec<Delivery>` |
-| Quiescence settle | `src/wm.rs:34-49` `settle_tick` | (gen, quiet_since, deadline, window, now) → (gen, since, done) |
+| Outbox | `src/chat.rs` `ChatRoom::tick` | project tag + live Member presence → `Vec<Delivery>` |
+| Quiescence settle | `src/wm.rs` `settle_tick` | (gen, quiet_since, deadline, window, now) → (gen, since, done) |
 | Cell metrics | `src/geom.rs` `CellMetrics` | pane rect + cell size → all pixel↔cell conversions |
-| Frame plan | `src/frame.rs:59` `plan` | grid + Cell metrics + selection + caret draw → paint plan |
+| Paint plan | `src/frame.rs` `plan_paint` (with `text_rows`, `overlays`) | grid + Cell metrics + colors → paint plan |
+| Ready gate | `src/ready.rs` `ReadyGate` | injected bytes + Ready state + clock → queue or flush |
 
-Cell metrics and Frame plan landed in `7fda1c2` (2026-07-01) — the briefing
-era's "in-flight TDD" state is over; that commit reports 343 → 353 tests, all
-passing.
+The pattern's payoff is visible in the test census: `rg -c '#\[test\]' src/ |
+sort -t: -k2 -rn` — the pure modules carry the tests, and they run without a
+window or a PTY.
 
 **Done when:** the decision has GUI-free, Session-free, sleep-free unit tests,
 and the shell contains no branching logic of its own beyond visibility/paint
@@ -245,46 +245,55 @@ deadline makes the outer layer lie to its caller.
    on?
 4. Document the ripple for the *next* timer someone adds.
 
-**Ground truth (as of 2026-07-01):**
+**Ground truth:**
 
-| Constant | Value | Where | Role |
+| Timer | Value | Where | Role |
 |---|---|---|---|
-| `DEFAULT_SETTLE_MS` | 120 ms | `src/wm.rs:17` | default Quiescence settle window for `foreman send` |
-| `MAX_SETTLE_MS` | 4000 ms | `src/wm.rs:18` | hard cap on the total settle wait |
-| `REPLY_TIMEOUT` | 5 s | `src/control.rs:10` | pipe server waits this long for the GUI; the GUI drops any queued request older than this (`src/wm.rs:841` et seq.) so it never executes work the client was already told failed |
-| `CONNECT_TIMEOUT` | 10 s | `src/control.rs:17` | client-side deadline for connecting to a busy pipe |
+| `Settings::send_settle_ms` | 120 ms default, **user-editable**, clamped ≤ 2000 by `Settings::sanitize` | `src/config.rs` | default Quiescence settle window for `foreman send` when the caller omits `--settle-ms` |
+| `MAX_SETTLE_MS` | 4000 ms | `src/wm.rs` | hard cap on the total settle wait, applied whatever the caller or the setting asked for |
+| `REPLY_TIMEOUT` | 5 s | `src/control.rs` | pipe server waits this long for the GUI; the GUI drops any queued request older than this (`WindowManager::handle_ctrl`) so it never executes work the client was already told failed |
+| `CONNECT_TIMEOUT` | 10 s | `src/control.rs` | client-side deadline for connecting to a busy pipe |
 
-**The invariant:** `MAX_SETTLE_MS (4 s) < REPLY_TIMEOUT (5 s) <
-CONNECT_TIMEOUT (10 s)`. The first link is documented at `src/wm.rs:14-16`:
-the settle cap stays under `REPLY_TIMEOUT` so the pipe server's
-`recv_timeout` never fires before a settle reply lands. The second: a client
-waiting to connect must outwait a server that may spend up to `REPLY_TIMEOUT`
-on the request ahead of it.
+**The invariant:** `send_settle_ms (≤ 2000) < MAX_SETTLE_MS (4000) <
+REPLY_TIMEOUT (5 s) < CONNECT_TIMEOUT (10 s)`.
+
+Link by link: the clamp keeps a hand-edited setting from reaching the cap; the
+cap stays under `REPLY_TIMEOUT` so the pipe server's `recv_timeout` never fires
+before a settle reply lands; and a client waiting to connect must outwait a
+server that may spend up to `REPLY_TIMEOUT` on the request ahead of it.
+
+**Read the first row again — that is this recipe's own worked example.** The
+settle default used to be a compile-time `DEFAULT_SETTLE_MS`. It became a
+persisted, user-editable field, which is exactly the "next timer someone adds"
+this recipe exists to catch, and the thing that makes it safe is not the
+default value but `Settings::sanitize`'s clamp: without it a user typing
+`"send_settle_ms": 9999999` into settings.json would push an inner wait past
+three outer deadlines. **A knob that a human can type into is a timer.** When
+you promote a constant to a setting, the clamp is not polish, it is the proof.
 
 **The documented ripple (open — designed, not built):** Phase 4's
 `snapshot --wait-for PATTERN --timeout-ms N` is deliberately deferred across
 frames and carries its own deadline, so it **must be exempted from the
 `REPLY_TIMEOUT` stale-drop** (and `serve()` must `recv_timeout` on the
-inspection's own ceiling) — otherwise every wait longer than 5 s silently
-vanishes (`docs/epics/terminal-inspection-epic.md:190-195`). Anyone building
+inspection's own ceiling) — otherwise every wait longer than `REPLY_TIMEOUT`
+silently vanishes (`docs/epics/terminal-inspection-epic.md`). Anyone building
 `--wait-for` re-runs this recipe first.
 
-**Drift flag (verified 2026-07-01):** the comment at `src/control.rs:12-13`
-("the server handles one connection at a time") was written 2026-06-10 and
-predates the thread-per-connection rewrite (`15f675f`, 2026-06-18): `serve()`
-now spawns a thread per connection with a `MAX_INFLIGHT = 64` cap
-(`src/control.rs:248-272`). The epic's "Serial-pipe blocking" constraint
-(`docs/epics/terminal-inspection-epic.md:203`) predates it too.
-`CONNECT_TIMEOUT`'s rationale (bounded wait when the server is wedged) still
-holds.
+**Legacy-doc warning:** anything describing the pipe server as handling "one
+connection at a time" predates the thread-per-connection rewrite (`15f675f`,
+2026-06-18): `serve()` now spawns a thread per connection with a `MAX_INFLIGHT`
+cap. The terminal-inspection epic's "Serial-pipe blocking" constraint predates
+it too. `CONNECT_TIMEOUT`'s rationale (bounded wait when the server is wedged)
+still holds.
 
-**Done when:** the inequality chain is written down with each constant's
-`file:line` and one sentence per link proving why inner < outer.
+**Done when:** the inequality chain is written down with each timer's file +
+symbol and one sentence per link proving why inner < outer.
 
-**Evidence bar:** the chain plus a test per boundary where practical (e.g.
-`src/wm.rs:5379-5382` proves the settle fires at the `MAX_SETTLE_MS`
-deadline; the stale-drop tests at `src/wm.rs:3816-3826` prove abandoned
-requests are never executed).
+**Evidence bar:** the chain plus a test per boundary where practical — the
+settle tests in `src/wm.rs` prove it fires at the `MAX_SETTLE_MS` deadline and
+not before the configured `send_settle_ms`; the stale-drop tests prove
+abandoned requests are never executed; `sanitize_clamps_hand_edited_values`
+(`src/config.rs`) proves the outermost user-facing link.
 
 ---
 
@@ -298,19 +307,19 @@ output: origin, 0- or 1-based, axis order, and the clamp story.
 
 | Space | Convention | Where defined |
 |---|---|---|
-| Viewport cells | 0-based `(row, col)`, row 0 = top of visible area | `CellMetrics::cell_at`, `src/geom.rs:50` |
-| Mouse protocol | **1-based `(col, row)` — column first** (SGR/X10 wire order) | `CellMetrics::mouse_cell`, `src/geom.rs:61` |
-| Grid/buffer | `Line` goes negative into scrollback; viewport row → grid line is `Line(row - display_offset)` | `src/frame.rs:84`, `src/terminal.rs:617` |
+| Viewport cells | 0-based `(row, col)`, row 0 = top of visible area | `CellMetrics::cell_at`, `src/geom.rs` |
+| Mouse protocol | **1-based `(col, row)` — column first** (SGR/X10 wire order) | `CellMetrics::mouse_cell`, `src/geom.rs` |
+| Grid/buffer | `Line` goes negative into scrollback; viewport row → grid line is `Line(row - display_offset)` | `src/frame.rs`, `src/terminal.rs` |
 
 **Steps:**
 
 1. Name each function's input/output space in its doc comment.
 2. Write the clamp story: what happens out of bounds. In this repo the clamp
    is load-bearing twice over — `CellMetrics` clamps pointer positions into
-   the grid so a drag leaving the pane still resolves (`src/geom.rs:50-67`),
-   and `frame::plan` clamps its grid walk to the grid's *real* dims because a
+   the grid so a drag leaving the pane still resolves (`src/geom.rs`), and
+   `frame::plan_paint` clamps its grid walk to the grid's *real* dims because a
    stale `grid[Line][Column]` index panics, and a panic across the winit
-   callback aborts the whole process (`src/frame.rs:11-17`).
+   callback aborts the whole process (`src/frame.rs` module docs).
 3. If two functions read the same pointer, add a **cross-agreement test** so
    the two readings can never drift apart.
 
@@ -318,8 +327,8 @@ output: origin, 0- or 1-based, axis order, and the clamp story.
 convert pointer → cell, but `mouse_cell` is 1-based and column-first because
 the mouse *protocols* speak that order — the asymmetry is protocol-driven,
 not accidental. The cross-agreement test
-`mouse_cell_is_cell_at_plus_one_in_col_row_order` (`src/geom.rs:153-169`)
-pins them together, clamps included.
+`mouse_cell_is_cell_at_plus_one_in_col_row_order` (`src/geom.rs`) pins them
+together, clamps included.
 
 **Worked example B — the selection-v1 failure (resolved 2026-07-02).**
 `docs/terminal-selection.md` recounts v1's failure mode: selection endpoints
@@ -333,9 +342,9 @@ described was fiction for three weeks (no committed revision had it) until
 `to_range`), `sel_anchor`/`sel_head`/`selection_text` are deleted, and the
 seam boundary demonstrates the recipe — `sel_point` converts
 viewport→buffer on the way in, `sel_viewport_range` converts buffer→viewport
-on the way out, so `frame.rs`'s `SelRange` stays deliberately viewport-space
-(`src/frame.rs:28-33`) while storage is buffer-space. Every crossing names
-its space; that is the "state the space first" rule, enforced at a seam.
+on the way out, so `frame::SelRange` stays deliberately viewport-space while
+storage is buffer-space. Every crossing names its space; that is the "state the
+space first" rule, enforced at a seam.
 
 **Done when:** every function involved names its space in its doc comment,
 the clamp behavior is unit-tested, and paired readers have a cross-agreement
@@ -343,7 +352,7 @@ test.
 
 **Evidence bar:** the space table written before the math; tests at the
 boundaries (first pixel of a cell, last cell, both out-of-range corners — see
-`src/geom.rs:134-148`).
+`src/geom.rs`'s test module).
 
 ---
 
@@ -379,12 +388,11 @@ theory can't explain why it ever passed, it's not the mechanism.
 - **Fix at the mechanism, in layers:** (a) the test re-sends until the
   member's stdin has seen it (the 2026-06-11 plan); (b) the product fix —
   `inject_input` queues bytes until Ready latches, `pump()` flushes
-  (commit `6ad7f64`, `src/terminal.rs:663-665, 722-728`); (c) the Outbox's
-  per-Member delivery cursors only advance on delivery to a Ready Session,
-  after which the test needs no re-send at all — today it just pumps and
-  `chat_tick()`s until both members exit (`src/wm.rs:4553-4583`), and a
-  sibling test notes "the cursor + ready-gating make a re-send unnecessary"
-  (`src/wm.rs:4827`).
+  (commit `6ad7f64`, `src/terminal.rs`; the gate now lives in `src/ready.rs`);
+  (c) the Outbox's per-Member delivery cursors only advance on delivery to a
+  Ready Session, after which the test needs no re-send at all — it just pumps
+  and `chat_tick()`s until both members exit, and a sibling test in `src/wm.rs`
+  notes "the cursor + ready-gating make a re-send unnecessary".
 - **Explicitly rejected:** serializing the suite — it would merely keep DSR
   latency under the 150 ms timer, hiding the race, and the same swallow
   existed in production (a chat post to a just-Dispatched Member).
@@ -392,7 +400,7 @@ theory can't explain why it ever passed, it's not the mechanism.
 **Done when:** you can write "fails under X because M; passes under Y because
 M" with the same M, and the fix changes M's behavior, not the schedule.
 
-**Evidence bar:** the mechanism cited to `file:line`; pre-fix failure
+**Evidence bar:** the mechanism cited to file + symbol; pre-fix failure
 reproduced; post-fix consecutive full-suite green runs recorded as the flake
 evidence. Flaky-test policy: **foreman-validation-and-qa**.
 
@@ -417,18 +425,20 @@ serde `default` — so old JSON still parses.
 2. Parse a *literal* v1 JSON string (no new key); assert the default.
 3. Round-trip the set form.
 
-**Worked examples (all in `src/control.rs` tests, as of 2026-07-01):**
+**Worked examples (all in `src/control.rs` tests;
+`rg -n "wire_compat|omits_none" src/control.rs` lists the current set):**
 
-| Test | Line | Guards |
-|---|---|---|
-| `chat_request_to_is_wire_compatible_with_v1` | 1538 | `--to` targets field |
-| `chat_request_re_is_wire_compatible` | 1587 | `--re` handshake back-pointer |
-| `chat_history_request_is_wire_compatible_without_from` | 1454 | optional `from` on history reads |
-| `send_request_omits_none_and_empty_fields` | 1627 | send verb's optional fields |
-| `snapshot_reply_without_attrs_cursor_is_wire_compat` | 1905 | reply stays a v1 `OpenReply` without opt-ins |
+| Test | Guards |
+|---|---|
+| `chat_request_to_is_wire_compatible_with_v1` | `--to` targets field |
+| `chat_request_re_is_wire_compatible` | `--re` handshake back-pointer |
+| `chat_history_request_is_wire_compatible_without_from` | optional `from` on history reads |
+| `send_request_omits_none_and_empty_fields` | send verb's optional fields |
+| `snapshot_request_without_tail_is_wire_compat_with_v1` | `--tail N` added without moving the v1 request |
+| `snapshot_reply_without_attrs_cursor_is_wire_compat` | reply stays a v1 `OpenReply` without opt-ins |
 
-The field-level doc comments carry the same rule ("skipped on the wire when
-None so v1 replies stay byte-identical" — `src/control.rs:48-54`).
+The field-level doc comments in `src/control.rs` carry the same rule ("skipped
+on the wire when None so v1 replies stay byte-identical").
 
 **Done when:** all three asserts exist for every new field, with the v1 form
 as a literal string in the test (not re-serialized by current code — that
@@ -458,21 +468,20 @@ names its cell.
 
 **Worked example — historical: `compose_zone`.** The keyboard edge/corner
 snap machine (a horizontal pin × vertical pin per axis) was tested by
-`compose_zone_matches_full_transition_table`: 10 states × 4 directions = 40
-asserted cells mirroring the design table
-(`git show e438a83:src/wm.rs`, test at line 2146 of that revision). The code
+`compose_zone_matches_full_transition_table`, whose asserted cells mirrored the
+design table cell for cell — every state × every direction, none omitted
+(`git show e438a83:src/wm.rs`). The code
 and test were deleted in `f3c76f0` (2026-06-11) when zone snapping was
 replaced by the Layout tree — **the code died; the method survives.**
 
 **Worked example — retired but exemplary: the Caret gate** (deleted
 2026-07-15 when the caret moved to direct model-cursor tracking; see
-docs/cursor-rendering.md). At `7fda1c2`, `cursor_to_draw` (src/caret.rs:130
-of that revision) was the pure policy table with each row asserted directly,
-timeline tests driving the time-derived half through injected `Instant`s, and
-boundary tests pinning `CURSOR_SETTLE`/`INPUT_GRACE` at their exact
-thresholds — **the code died; the method survives** (like compose_zone
-above). `settle_tick`'s tests (`src/wm.rs:5505-5580`) enumerate cases the
-same way and are still live.
+docs/cursor-rendering.md). Its `cursor_to_draw` was a pure policy table with
+each row asserted directly, timeline tests driving the time-derived half
+through injected `Instant`s, and boundary tests pinning its settle/grace
+constants at their exact thresholds — **the code died; the method survives**
+(like compose_zone above). `settle_tick`'s tests in `src/wm.rs` enumerate cases
+the same way and are still live.
 
 **Done when:** asserted cells = |states| × |inputs| (or exclusions are
 explicit), and every assert message names its cell.
@@ -484,39 +493,40 @@ or module comment — a reviewer can diff them by eye.
 
 ## When NOT to use this skill
 
-- **A known symptom needs triage now** → **foreman-debugging-playbook** (the
-  symptom → known-failure dictionary; come back here when the dictionary
-  misses).
-- **You want the history of an investigation** → **foreman-failure-archaeology**.
-- **You need instrumentation, harnesses, screenshots, headless
-  send/Snapshot verification** → **foreman-diagnostics-and-tooling** (this
-  skill is the reasoning method; that one is the toolbox).
-- **You're deciding whether a result is *accepted*, or how to record a
-  refutation** → **foreman-research-methodology**.
-- **You're defining shipping/acceptance evidence** → **foreman-validation-and-qa**.
-- **You need domain background** (VT/ConPTY internals, egui traps) →
-  **terminal-emulation-reference**, **egui-immediate-mode-reference**.
+- **A known symptom needs triage now** → **foreman-debugging-playbook** (this
+  skill is how you prove a *new* mechanism; that one is the dictionary of
+  mechanisms already proven).
 - **Any fix a recipe motivates** still goes through **foreman-change-control**
   — these recipes produce evidence, never authorization.
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against HEAD `7fda1c2` (clean working tree). Line numbers
-and constants below drift; re-verify before trusting. Run from the repo root
-`H:/claude code/foreman` (all read-only):
+The recipes are method and do not rot. The facts they lean on do. Re-check
+these before repeating them:
 
 | Claim | Re-verify with |
 |---|---|
-| Timeout constants + nesting comment | `git grep -n "MAX_SETTLE_MS\|REPLY_TIMEOUT\|CONNECT_TIMEOUT" -- src/wm.rs src/control.rs` |
-| Stale-drop guards in the GUI drain | `git grep -n "sent.elapsed() >= REPLY_TIMEOUT" -- src/wm.rs` |
-| Thread-per-connection + `MAX_INFLIGHT` | `git grep -n "MAX_INFLIGHT" -- src/control.rs`; `git log -1 --format="%h %ad %s" 15f675f` |
-| `--wait-for` REPLY_TIMEOUT-exemption ripple (still open?) | `git grep -n "wait-for\|wait_for" -- src/control.rs docs/epics/terminal-inspection-epic.md` (no src hits = still unbuilt) |
-| Caret gate retired (caret.rs = pure `draw`) | `git grep -n "CaretGate\|CURSOR_SETTLE" -- src/` — any hit means it came back |
-| Ready gate + inject queue | `git grep -n "pending_inject\|ready = true" -- src/terminal.rs` |
-| Wire-compat test inventory | `git grep -n "wire_compat\|wire_compatible\|omits_none" -- src/control.rs` |
-| Selection buffer-space since `b581240` | `git log --all --oneline -S "Selection::new" -- src/` → `b581240`; `git grep -n "sel_anchor" -- src/terminal.rs` (expect empty) |
-| `compose_zone` historical table | `git show e438a83:src/wm.rs \| Select-String compose_zone` |
-| Reader-thread / send() tee points | `git grep -n "try_clone_reader\|fn send(&mut self" -- src/terminal.rs` |
-| Test count (353 at `7fda1c2`) | `git show -s 7fda1c2` (commit message); recount with `cargo test` only when the build lock is free |
-| Measured latency numbers (2026-06-18) | read `docs/followups-latency-and-control.md` |
-| ConPTY investigation facts | read `docs/conpty-resize-reflow.md` |
+| The timeout chain (Recipe 5), including the settle clamp | the timeout-chain runs in the block below |
+| Stale-drop guard still drops abandoned requests | `rg -n "sent.elapsed" src/wm.rs` |
+| `--wait-for` ripple still open (unbuilt) | the `wait_for` run below — any hit means it shipped and this section is stale |
+| Wire-compat test inventory (Recipe 8) | the `wire_compat` / `omits_none` runs below |
+| Measured latency numbers (2026-06-18) and ConPTY facts | read `docs/followups-latency-and-control.md`, `docs/conpty-resize-reflow.md` |
+
+Run these as written. **`rg` uses Rust regex, not BRE — an alternation is a
+bare `|`.** Writing `\|` (as `git grep` needs) makes `rg` match a *literal*
+pipe, which matches nothing and reports a silent false pass:
+
+```
+# timeout chain
+rg -n "send_settle_ms" src/config.rs src/wm.rs
+rg -n "MAX_SETTLE_MS" src/wm.rs
+rg -n "REPLY_TIMEOUT" src/control.rs
+rg -n "CONNECT_TIMEOUT" src/control.rs
+
+# --wait-for ripple: no output = still unbuilt
+rg -n "wait_for|wait-for" src/control.rs
+
+# wire-compat test inventory
+rg -n "wire_compat" src/control.rs
+rg -n "omits_none" src/control.rs
+```

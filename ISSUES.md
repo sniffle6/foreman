@@ -24,14 +24,16 @@ window's titlebar name already does.
 **What already exists** (this issue was filed before any of it, and its
 original text claiming "no rename affordance anywhere" is obsolete):
 
-- Inline rename on the window titlebar — double-click the name rect,
-  `src/wm.rs:3757`; state is `renaming`/`rename_buf`/`rename_focus` (~422).
-- A `begin_rename()` command for the focused window (`wm.rs:2648`).
+- Inline rename on the window titlebar — double-click the name rect, in
+  `WindowManager::show` (`src/wm.rs`); state is
+  `renaming`/`rename_buf`/`rename_focus` on the manager.
+- A `begin_rename()` command for the focused window (`src/wm.rs`).
 - Custom names already beat auto-titles: `Tab::fixed` vs `Tab::shell_default`,
-  arbitrated by `title_is_auto_managed` (`wm.rs:5536`), so an agent being
+  arbitrated by `title_is_auto_managed` (`src/wm.rs`), so an agent being
   detected in a pane will not clobber a name the user chose.
 - Custom names already survive restart: `TabSnap.title` is persisted, and
-  restore re-applies the fixed/auto distinction (`wm.rs:756-759`).
+  `apply_manager` re-applies the fixed/auto distinction on restore
+  (`src/wm.rs`).
 
 **So the remaining work is only the panel affordance.** Panel rows sense
 `click` and paint from `WindowManager::panel_model()`; they need
@@ -191,7 +193,8 @@ error: process didn't exit successfully: `target\release\foreman.exe` (exit code
 ```
 
 **Evidence.** `foreman_panic.log` (written by `install_panic_logger`,
-src/main.rs) has captured at least two separate occurrences at the same
+src/main.rs — the log lived in the process CWD until `966379b` moved it to
+`%APPDATA%\foreman\`) captured separate occurrences at the same
 location (`egui-wgpu-0.34.3/src/renderer.rs:971`), with different index counts
 (31968 and 26184). Backtrace: `egui_wgpu::renderer::Renderer::update_buffers`
 → `Painter::paint_and_update_textures` → eframe/winit frame callback. This is
@@ -227,8 +230,8 @@ playbook §11 the panic aborts the whole process — every session dies.
 
 **Repro.** Not deterministic. Leave foreman running, put the machine through
 sleep/resume or heavy GPU load in another app, return and interact. Confirm a
-crash by reading `foreman_panic.log` in the directory foreman was launched
-from.
+crash by reading `%APPDATA%\foreman\foreman_panic.log` (entries are timestamped
+— check the timestamp before treating one as current).
 
 ### #3 — Feature: Grok as a first-class agent — landing-page button + Grok icon on sessions
 

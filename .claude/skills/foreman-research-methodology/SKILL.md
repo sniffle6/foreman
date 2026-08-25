@@ -33,9 +33,8 @@ A root-cause claim is accepted here only when it clears ALL of these:
 ### Worked example: the ConPTY resize/recall corruption
 
 Source: `docs/conpty-resize-reflow.md` (all observations reproduced);
-committed as `5332757`; code comment at `Session::resize` in `src/terminal.rs`
-(near line 742 as of 2026-07-01) ends "See docs/conpty-resize-reflow.md before
-touching this."
+committed as `5332757`; the code comment on `Session::resize` in
+`src/terminal.rs` ends "See docs/conpty-resize-reflow.md before touching this."
 
 | Observation | Theory A: "double reflow in `Session::resize`" | Theory B: upstream divergence (microsoft/terminal #18725) |
 |---|---|---|
@@ -65,8 +64,9 @@ measure. Two verified instances:
    path ~0.2 ms, one max-rate flood ~0.8 ms, 12 simultaneous floods ~8 ms avg
    (`docs/followups-latency-and-control.md`). The rival mechanism (vsync) was
    killed by A/B — see negatives below.
-2. **The chat-room A/B experiment (designed 2026-06-15, NOT run as of
-   2026-07-01).** `docs/superpowers/specs/2026-06-15-chat-room-ab-experiment-design.md`
+2. **The chat-room A/B experiment (designed 2026-06-15, still never run —
+   check with `ls docs/chat-ab-results.md`).**
+   `docs/superpowers/specs/2026-06-15-chat-room-ab-experiment-design.md`
    pre-registers the headline metrics (**tokens-per-requirement-met**,
    **bugs-per-1k-tokens**), fixes ≥3 runs per arm × 3 arms = 9 builds, blinds
    the grader, interleaves runs against cache bias — and gates all of it behind
@@ -148,8 +148,11 @@ surface stops earning its keep:
    (accepted on the wire, did nothing), not as "bad code".
 
 A designed-but-unbuilt idea parks the same way: `docs/chat-persistence.md` is
-labeled **"designed, not built"** and stays true — verified 2026-07-01 that
-`ChatLog::open`/`next_seq` do not exist in `src/chat.rs` at HEAD.
+labeled **"designed, not built"** and stays true. Check it with
+`rg -n "std::fs|next_seq" src/chat.rs` — note that grepping for `ChatLog`
+alone would **pass falsely**, because an in-memory `ChatLog` exists; only the
+file I/O and the sequence numbering are the unbuilt part. A re-verification
+command that can pass for the wrong reason is worse than none.
 
 ## Don't-re-litigate discipline
 
@@ -171,18 +174,24 @@ Two asymmetries keep this honest:
    2026-06-11 into today's Layout tree + two-state model (`docs/tiling-tree.md`,
    commits `daeda90`…`31a9120`). A model re-opening a settled decision needs new
    evidence; the user needs only the decision.
-2. **Supersession must reach every doc.** Verified drift (2026-07-01):
-   `docs/snap-tiling.md` still describes the deleted 9-zone snap system with no
-   superseded banner — commit `b42e92e` ("supersede zone-snap docs") updated
-   HANDOFF/CLAUDE.md/the epic/foreman.md but not that file. Trust
-   `docs/tiling-tree.md`; the doc trust map is **foreman-docs-and-writing**.
+2. **Supersession must reach every doc, and a "supersede the docs" commit is
+   not proof that it did.** `docs/snap-tiling.md` describes the deleted 9-zone
+   snap system. Commit `b42e92e` was literally titled "supersede zone-snap
+   docs" — it updated HANDOFF, CLAUDE.md, the epic and foreman.md, and missed
+   the one file named after the superseded feature. The banner did not land
+   until `5ad4ee9` (2026-08-24), months later, and only because an audit went
+   looking. The lesson is the failure mode, not the fix: **a supersession
+   commit's own title is the weakest possible evidence that supersession
+   happened.** Enumerate the files that mention the dead thing
+   (`rg -l <dead-symbol> docs/`) and check them off; do not trust the commit
+   message. The doc trust map is **foreman-docs-and-writing**.
 
 ## Where good ideas came from (observed, not theorized)
 
 | Source | Verified episode |
 |---|---|
 | **Dogfooding** — foreman coordinating the agents that build foreman | The mentions-v2 spec "was produced *by* the feature it extends" — two Dispatched agents debating in the p1 Chat room; the persistence four-lens debate and the missing-features panel also ran in the room. |
-| **Live failures converted to design** | Paste-burst lost submit → the deferred `\r` (`SUBMIT_DELAY`, 150 ms, `src/terminal.rs`, commit `45f4725`). The 5m34s/23.5k-token re-derivation spiral → the stop-sign skill pattern ("This skill is complete. Do NOT read foreman source or docs…" — top of both shipped agent skills). A wedged client blocking all Dispatch → thread-per-connection Control plane (`15f675f`). |
+| **Live failures converted to design** | Paste-burst lost submit → the deferred `\r` (`SUBMIT_DELAY`, now in `src/ready.rs`, commit `45f4725`). The 5m34s/23.5k-token re-derivation spiral → the stop-sign skill pattern ("This skill is complete. Do NOT read foreman source or docs…" — top of the shipped agent skills). A wedged client blocking all Dispatch → thread-per-connection Control plane (`15f675f`). |
 | **User reversals of settled decisions** | zone snapping → Layout tree (above). |
 | **Upstream bug reports as design input** | microsoft/terminal #18725 and PR #4741 set the fix/no-fix economics for the resize corruption — the "real fix" was costed from what Windows Terminal actually does, then deliberately not pursued. |
 
@@ -190,46 +199,27 @@ Two asymmetries keep this honest:
 
 An accepted result = the evidence bar above **plus** a measurable gate with
 evidence per **foreman-validation-and-qa** **plus** classification/review per
-**foreman-change-control**. Nothing in this skill routes around either. Test
-counts in the episode docs are dated facts (181 on 2026-06-18, 274 on
-2026-06-27 per their docs); never quote them as current — re-run `cargo test`.
+**foreman-change-control**. Nothing in this skill routes around either.
+
+Test counts quoted in episode docs are dated facts about the day they were
+written; never quote one as current. Derive it:
+`rg -c '#\[test\]' src/ | sort -t: -k2 -rn`.
 
 ## When NOT to use this skill
 
-| You actually need | Go to |
-|---|---|
-| Triage a known symptom right now | **foreman-debugging-playbook** |
-| The full history of an investigation or revert | **foreman-failure-archaeology** |
-| How to measure (harnesses, Snapshots, screenshots) | **foreman-diagnostics-and-tooling** |
-| Worked first-principles analysis recipes | **foreman-proof-and-analysis-toolkit** |
-| What evidence a change needs to merge | **foreman-validation-and-qa** |
-| The settled-decision registry / change gates | **foreman-change-control** |
-| Open problems and external claim standards | **foreman-research-frontier** |
-| Operating chat/dispatch as an agent *inside* foreman | **foreman-chat** / **foreman-dispatch** (user-facing; they forbid reading source) |
+- Triaging a known symptom right now → **foreman-debugging-playbook** (this
+  skill is for forming a *new* theory; that one is theories already settled).
+- The worked analysis recipes themselves → **foreman-proof-and-analysis-toolkit**.
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against committed HEAD (`7fda1c2` on `main`; `src/frame.rs`
-/`src/geom.rs` carry in-flight TDD in the working tree, not documented here).
-Re-verify drift-prone claims:
+The discipline does not rot; the episodes it cites can. Re-check these before
+repeating them:
 
-```powershell
-# ConPTY episode: doc + code comment still paired
-Select-String -Path "H:/claude code/foreman/src/terminal.rs" -Pattern "conpty-resize-reflow"
-# vsync negative still recorded
-Select-String -Path "H:/claude code/foreman/docs/followups-latency-and-control.md" -Pattern "vsync"
-# --await-ack retirement: recovery commit + removal commit still exist
-git -C "H:/claude code/foreman" show -s --format=%s 4607001 9bb3a35
-# Chat persistence still designed-not-built (no hits = not built)
-Select-String -Path "H:/claude code/foreman/src/chat.rs" -Pattern "next_seq|fn open"
-# A/B experiment still not run (both should fail/return nothing)
-Test-Path "H:/claude code/foreman/scripts/ab"; Test-Path "H:/claude code/foreman/docs/chat-ab-results.md"
-# Standing consensus caveat still in the mentions spec
-Select-String -Path "H:/claude code/foreman/docs/superpowers/specs/2026-06-10-chat-mentions-design.md" -Pattern "not a human-approved"
-# snap-tiling.md banner drift: no output = still unbannered
-Select-String -Path "H:/claude code/foreman/docs/snap-tiling.md" -Pattern "supersed" -CaseSensitive:$false
-# SUBMIT_DELAY constant still 150 ms
-Select-String -Path "H:/claude code/foreman/src/terminal.rs" -Pattern "SUBMIT_DELAY: "
-# Stop-sign pattern still opens the agent skills
-Select-String -Path "H:/claude code/foreman/.claude/skills/foreman-*/SKILL.md" -Pattern "This skill is complete"
-```
+| Claim | Re-verify with |
+|---|---|
+| ConPTY episode: doc and code comment still paired | `rg -n "conpty-resize-reflow" src/terminal.rs docs/` |
+| `--await-ack` retirement: both commits still reachable | `git show -s --format=%s 4607001 9bb3a35` |
+| Chat persistence still designed-not-built | `rg -n "std::fs" src/chat.rs; rg -n "next_seq" src/chat.rs` — no output from either means still unbuilt; grepping `ChatLog` instead would false-pass |
+| The chat A/B experiment still has not been run | `ls docs/chat-ab-results.md scripts/ab` — both absent means still un-run |
+| The standing "consensus is not approval" caveat still in the mentions spec | `rg -n "not a human-approved" docs/superpowers/specs/2026-06-10-chat-mentions-design.md` |

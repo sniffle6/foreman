@@ -26,7 +26,8 @@ Three ways to destroy work that no amount of care downstream will undo:
 - **Never use `VoidListener`** in a `Session`. Shells send `ESC [ 6 n` (DSR) at
   startup and hang until the terminal replies; `Listener` captures
   `Event::PtyWrite` and `pump()` writes it back. Skipping it = black pane that
-  never prompts.
+  never prompts. (Driven `Term<VoidListener>` test fixtures are fine — that is
+  the sanctioned pure-parse pattern.)
 
 Everything else that has cost hours is in **foreman-debugging-playbook** and
 **foreman-failure-archaeology**. Check them before diagnosing from scratch.
@@ -44,14 +45,9 @@ Everything else that has cost hours is in **foreman-debugging-playbook** and
   untouched.
 - **Tabs are level-restricted.** Any window can tab onto any other in the *same*
   `WindowManager`: projects with projects, terminals with terminals.
-- **foreman renders on glow (OpenGL), not wgpu.** That is a deliberate,
-  measured choice, not a leftover: Windows loses the GPU device on sleep and
-  display power transitions, and `egui-wgpu` responds with an unconditional
-  `panic!` in `update_buffers` that aborts the process. `egui_glow` only logs.
-  Do not "modernize" the `eframe` line in `Cargo.toml` back to wgpu — read
-  `docs/gpu-device-loss.md` first; it records the side-by-side test that
-  settled it. Crash evidence is `%APPDATA%\foreman\foreman_panic.log`
-  (absolute and timestamped).
+- **Renders on glow, not wgpu** — a measured choice, not a leftover. Do not
+  touch the `eframe` line in `Cargo.toml` (which carries the same warning
+  inline). Why: `docs/gpu-device-loss.md`.
 
 Details, seam map, threading model, and the borrow rules: **foreman-architecture-contract**.
 
@@ -65,7 +61,8 @@ Details, seam map, threading model, and the borrow rules: **foreman-architecture
 | In `terminal.rs`, `input.rs`, `caret.rs`, `frame.rs`, or decoding VT/ConPTY | **terminal-emulation-reference** |
 | Writing egui and it's behaving oddly | **egui-immediate-mode-reference** |
 | Running the app or driving the `foreman` CLI / control plane | **foreman-run-and-operate** |
-| Proving behavior with evidence (`foreman send`/`snapshot`, perf, panics) | **foreman-diagnostics-and-tooling** |
+| Verifying a GUI change with a screenshot | **build-screenshot** (user-only — ask the user to run it) |
+| Proving behavior with evidence instead of eyeballing (`foreman send`/`snapshot`, perf, panics) | **foreman-diagnostics-and-tooling** |
 | Deciding whether a change is *done* / adding tests | **foreman-validation-and-qa** |
 | Adding a dep, deleting code, touching wire format, committing | **foreman-change-control** |
 | Touching settings, keybindings, env vars, persisted config | **foreman-config-and-flags** |
@@ -81,8 +78,7 @@ adding a new file.
 
 - **Issues:** GitHub Issues on `sniffle6/foreman` via `gh`. External PRs are not
   a triage surface. See `docs/agents/issue-tracker.md`.
-- **Triage labels:** `needs-triage`, `needs-info`, `ready-for-agent`,
-  `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+- **Triage labels:** `docs/agents/triage-labels.md`.
 
 ## Working agreement
 

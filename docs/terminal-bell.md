@@ -39,9 +39,10 @@ this feature.
 | **Sessions panel — collapsed rail** | Pulsing amber dot on the project icon when any child rings (the rail is the only surface for its rows) |
 | **Minimized window** | No window chrome, but its panel row/rail dot still pulses |
 
-- **Color:** caret amber family (`theme::BELL`, RGB `231, 169, 63`), breathing
-  between ~40% and full strength on a `theme::BELL_PERIOD` (1.2 s) cycle via
-  `theme::bell_pulse(t)` — every surface breathes in sync from egui wall time.
+- **Color:** caret amber family (`theme::BELL`), breathing between ~40% and
+  full strength via `theme::bell_pulse(t, period, color)` — every surface
+  breathes in sync because they all pass the same egui wall time. The period
+  comes from `Settings::bell_period`, defaulting to `theme::BELL_PERIOD`.
 - **Duration:** **sticky** — the latch holds until the ringing Session becomes
   the keyboard-focused terminal. There is no timeout.
 - **Spam:** more BELs while latched just refresh the ring timestamp (no
@@ -145,7 +146,7 @@ interactive user verification.
 - [x] Panel: ringing terminal's row dot pulses; project rail icon dot pulses;
       minimized windows still surface through the panel
 - [x] `"bell": false` mutes chrome and panel; default / missing key → on
-- [x] Existing Ready / DSR / title / color-request paths still green (671 tests)
+- [x] Existing Ready / DSR / title / color-request paths still green (full `cargo test`)
 
 ## Key files
 
@@ -155,8 +156,8 @@ interactive user verification.
 | `src/wm.rs` | `Win::bell_active` (border rule) + `Content::bell_active` (chip/row rule); border/chip/bare-ring paint; `panel_model()` bell flags; 30 ms repaint |
 | `src/panel.rs` | `TabEntry.bell` / `ProjectEntry.bell`; pulsing dots on rows, rails, strip chips; panel-driven repaint |
 | `src/main.rs` | publishes `settings.bell` into the egui ctx each frame (beside `set_font_size`) |
-| `src/config.rs` | `Settings.bell: bool` (default `true`) |
-| `src/theme.rs` | `BELL`, `BELL_PERIOD`, `bell_pulse(t)` — the shared breathe animation |
+| `src/config.rs` | `Settings.bell: bool` (default `true`), `Settings.bell_period` |
+| `src/theme.rs` | `BELL`, `BELL_PERIOD`, `bell_pulse` — the shared breathe animation |
 
 ## Related
 

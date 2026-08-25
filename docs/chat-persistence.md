@@ -71,9 +71,9 @@ of the way there — it has the deep module, it just doesn't write to disk:
 
 | Debate name            | Real code today (`src/chat.rs`)                         |
 |------------------------|---------------------------------------------------------|
-| `append(post) → Seq`   | `ChatLog::push` / `ChatLog::post_re` (returns `seq`)    |
+| `append(post) → Seq`   | `ChatLog::push` / `ChatLog::post_re` (return the appended `&ChatMsg`; `ChatRoom::post` hands the caller its `seq`) |
 | `replay(from_seq)`     | **`ChatLog::deliver_after(member_id, after)`** — exists |
-| delivery cursor        | `MemberState.cursor` in `ChatRoom` (in-memory)          |
+| delivery cursor        | `MemberState.cursor`, owned by `ChatRoom` (in-memory)  |
 | `load(path) → Self`    | **does not exist yet — this is the work**               |
 
 `replay()` is already built: `deliver_after` scans the whole Vec from `after`, so
@@ -82,10 +82,11 @@ it already has the no-silent-truncation property the design demands. Good.
 Two structural facts that make this cheap and safe:
 
 - **Persist-then-echo is already true for free.** A `foreman chat` post is applied
-  on the egui UI thread via `WindowManager::chat_post` (`src/wm.rs:1529`) →
-  `ChatRoom::post`, which returns the seq synchronously. The echo/injection happens
-  on a *later* frame in `ChatRoom::tick` (`src/wm.rs:1574`). So adding the
-  synchronous `write()` inside `push` — before it returns the seq — guarantees
+  on the egui UI thread via `WindowManager::chat_post` (`src/wm.rs`) →
+  `ChatRoom::post` (`src/chat.rs`), which returns the seq synchronously. The
+  echo/injection happens on a *later* frame in `ChatRoom::tick` (`src/chat.rs`),
+  driven per-frame by `WindowManager::chat_tick` (`src/wm.rs`). So adding the
+  synchronous `write()` inside `push` — before the seq escapes to `ChatRoom::post` — guarantees
   "durable before echoed" with **zero new threading**. `tick` only *reads* the log
   to build inject lines; keep it that way (never write/fsync in `tick`, it runs
   every frame).
@@ -125,17 +126,19 @@ covered by the existing tests once the `len` assumption is removed.
    1`; then open the file in append mode and **keep the handle** on the struct. One
    op = load + recover + ready-to-append.
 4. **Write on append.** In `push`, after building the `ChatMsg`, `write_all` its
-   JSON line + `\n` to the open handle **before returning the seq**. No `fsync`.
+   JSON line + `\n` to the open handle **before `push` returns**. No `fsync`.
 5. **Wire it through `ChatRoom` / `WindowManager`.** Resolve a per-project path and
    pass it to `ChatRoom::new(path)` → `ChatLog::open(path)`. The room is constructed
-   at `src/wm.rs:662` and a project's `cwd` is set in `add_project`
-   (`src/wm.rs:756`). Plumb the path in there.
+   in `WindowManager::new` (the `chat:` field initializer, `src/wm.rs`) and a
+   project's `cwd` is set in `WindowManager::add_project` /
+   `add_project_with_command` (`src/wm.rs`). Plumb the path in there.
 6. **(Optional polish) periodic off-path `fsync`.** Flush on an idle / few-second
    cadence, never on the per-frame `tick` and never on the post path.
 
 ## Open decisions (settle before coding)
 
-- **Where the file lives.** A project has a stable `cwd` (`src/wm.rs:599`); the
+- **Where the file lives.** A project has a stable `cwd` (the `WindowManager::cwd`
+  field, `src/wm.rs` — `None` at desktop level, `Some` on a project); the
   project id `pN` is **session-assigned and NOT stable across restart**, so it
   cannot key the file. Two options:
   - (a) `<cwd>/.foreman/chat.jsonl` — literally "beside the project", but it
@@ -162,14 +165,16 @@ covered by the existing tests once the `len` assumption is removed.
 - `src/chat.rs` — the module. `ChatLog` (add `next_seq`, the handle, `open`, the
   write-on-`push`), `ChatMsg` (the serde record), `deliver_after` (already
   `replay`). All persistence logic lives here.
-- `src/wm.rs` — `WindowManager` owns `chat: Rc<RefCell<ChatRoom>>` (`:607`/`:662`);
-  `chat_post` (`:1529`) is the write trigger, `tick` (`:1574`) the read-only
-  per-frame echo. Path resolution hooks into `add_project` (`:756`). **Do not add a
-  disk touch to `tick`.**
+- `src/wm.rs` — `WindowManager` owns `chat: Rc<RefCell<ChatRoom>>` (field + its
+  initializer in `WindowManager::new`); `chat_post` is the write trigger,
+  `chat_tick` the read-only per-frame echo (it calls `ChatRoom::tick` in
+  `src/chat.rs`). Path resolution hooks into `add_project`. **Do not add a disk
+  touch to the tick path.**
 - `src/control.rs` — the `foreman chat` CLI/IPC client; no change needed (it posts
   through the same server path).
 - `docs/chat-missing-features.md` — § Layer-1 #2 is the parent item this builds.
-- `docs/chat-delivery.md` — the in-memory delivery-cursor mechanism being made
-  durable.
+- `docs/chat-delivery.md` — the authoritative account of the shipped delivery path
+  (`ChatLog::deliver_after` + `ChatRoom::tick` + `WindowManager::chat_tick`); this
+  is the in-memory cursor mechanism being made durable. Read it first.
 - `docs/contracts/chat-handshake-contract.md` — the cursor/`#N`/dedup contract the
   at-least-once delivery semantic must keep honoring.

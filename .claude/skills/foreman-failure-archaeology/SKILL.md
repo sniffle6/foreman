@@ -1,6 +1,6 @@
 ---
 name: foreman-failure-archaeology
-description: Use when tempted to re-diagnose or re-try a settled foreman battle, or when digging in this repo's git history - resize + Up-arrow prompt corruption, "double reflow", vsync-off latency theories, --await-ack, the 9-zone snap system / compose_zone, docs/snap-tiling.md or docs/terminal-selection.md disagreeing with code, the flaky human_post_appends chat test, blame pointing at daeda90 or 31a3db4, dangling stashes, the "@" commit subject, or the never-run chat A/B experiment.
+description: Use when tempted to re-diagnose or re-try a settled foreman battle, or when digging in this repo's git history - resize + Up-arrow prompt corruption, "double reflow", vsync-off latency theories, wgpu vs glow / GPU device loss, --await-ack, the 9-zone snap system / compose_zone, docs/snap-tiling.md describing a deleted zone system, the flaky human_post_appends chat test, blame pointing at daeda90 or 31a3db4, dangling stashes, the "@" commit subject, or the never-run chat A/B experiment.
 ---
 
 # Foreman failure archaeology
@@ -10,8 +10,8 @@ stall in this repo — each as symptom → wrong turns → root cause → eviden
 status — so nobody re-fights a settled battle. Plus: how to do git archaeology
 in this specific repo without being misled by its history hazards.
 
-Baseline: committed HEAD `7fda1c2` on `main`, 2026-07-01. Every line-number
-citation below is against that commit and is date-stamped. All commands run
+Entries are cited by commit hash and symbol name, never by line number: the
+hashes are immutable and the reasoning is what survives. All commands run
 from the repo root `H:/claude code/foreman` in PowerShell 7+.
 
 **Rule: before proposing a root cause or a fix for anything in the index
@@ -32,6 +32,7 @@ behind those triage rows. Settled verdicts are enforced by
 | 6 | Input latency | 16 ms metronome, NOT vsync | 2026-06-18 |
 | 7 | Chat-room A/B experiment | Planned in full, never executed | abandoned |
 | 8 | Eaten chat posts under the passthrough ConPTY host | `ready` redefined: DSR answered AND first child paint | 2026-07-03 |
+| 9 | GPU device loss aborting the whole app | Renderer switched wgpu → glow; wgpu FENCED | 2026-08-25 |
 
 ---
 
@@ -87,8 +88,8 @@ translates its screen into VT escape bytes that foreman's emulator
   73-line doc, a 6-line pointer comment at `Session::resize`, a 5-line
   CLAUDE.md gotcha. The four experiments were **never committed anywhere**:
   `git log --all -S "PSEUDOCONSOLE_RESIZE_QUIRK"` matches only `5332757` (the
-  doc text), and `Cargo.toml:12` pins crates.io `portable-pty = "0.9.0"` with
-  no `[patch]`/vendored path (as of 2026-07-01).
+  doc text), and `Cargo.toml` pins crates.io `portable-pty` with
+  no `[patch]`/vendored path (`rg -n portable-pty Cargo.toml`).
 
 ## 2. The 9-zone snap system — replaced in one evening (2026-06-11)
 
@@ -109,10 +110,13 @@ Foreman's first window model: a `Zone` enum with 9 variants
 - **Status:** settled. The two-state (tiled/floating) Layout-tree model is the
   law; the zone system lived seven days. Do not re-propose zone snapping —
   **foreman-change-control**.
-- **Trap:** the supersession sweep `b42e92e` touched 5 files but **missed
-  `docs/snap-tiling.md`**, which still describes zone snapping in the present
-  tense with **no supersession banner** (as of 2026-07-01). It is a trap doc —
-  see the meta-failures table below.
+- **Trap, since defused:** the supersession sweep `b42e92e` **missed
+  `docs/snap-tiling.md`**, which went on describing zone snapping in the
+  present tense for over two months. `5ad4ee9` (2026-08-24) finally added the
+  SUPERSEDED banner. The doc is still zone-era content — read it as decision
+  history, never as a spec — but it now says so itself. The lesson survives the
+  fix: a supersession sweep that updates *some* docs leaves the missed ones
+  looking authoritative, and nothing in the repo notices.
 - The reversal is recorded in the banner of
   `docs/epics/window-tabbing-split-epic.md` and referenced from
   `docs/tiling-tree.md` ("earlier floating-only decision recorded in the
@@ -137,16 +141,16 @@ plane would confirm a Member acknowledged a post.
   `Session.ready` latch.
 - **Restart point** (if unattended fleets ever need self-healing handoffs):
   `docs/contracts/chat-handshake-remaining-work.md`. The recovery commit
-  `4607001` is recorded twice — in that contract doc and at
-  `docs/chat-missing-features.md:60` (as of 2026-07-01).
+  `4607001` is recorded twice — in that contract doc and in
+  `docs/chat-missing-features.md`.
 - **Sequel:** Part 1 of the remaining work (delivery cursor + catch-up replay)
   was built for real on 2026-06-27 (`9aeb72b`; `docs/chat-delivery.md`) — see
-  battle 5. Part 2 (ack registry, timeout notice, Crew board badge) remains
-  deferred (as of 2026-07-01).
+  battle 5. Part 2 (ack registry, timeout notice, Crew board badge) was still
+  deferred as of 2026-07-01; check the contract doc before assuming that holds.
 - **Lesson:** an accepted-but-ignored flag is worse than no flag. Current CLI
   ground truth lives in **foreman-run-and-operate**.
 
-## 4. Selection — the rewrite that exists only in its doc (open drift)
+## 4. Selection — the rewrite that existed only in its doc (resolved 2026-07-02)
 
 - **v1 (initial commit `87464e4`):** hand-rolled selection storing two
   `(row, col)` tuples in screen/viewport coordinates. Recorded failure mode:
@@ -161,7 +165,7 @@ plane would confirm a Member acknowledged a post.
   existed **on no branch**. `git log --all -S "Selection::new"` matched only
   the doc commit itself. The tree plan records why: the doc was "untracked
   pending the selection-rewrite recovery"
-  (`docs/superpowers/plans/2026-06-11-tree-floating-windows.md:27`) — the
+  (`docs/superpowers/plans/2026-06-11-tree-floating-windows.md`) — the
   rewrite lived in a working tree that was lost; only the doc was recovered.
   Throughout the window the real code stayed hand-rolled
   `sel_anchor`/`sel_head: Option<(usize, usize)>` viewport cells, copied by a
@@ -200,8 +204,8 @@ child's device-status scan. Details: **terminal-emulation-reference**.
 - **Fix, stage 3 (structural):** the 2026-06-27 delivery-cursor sweep
   (`9aeb72b`; `docs/chat-delivery.md`) — per-Member delivery cursors +
   catch-up replay, gated on `Session::ready()`. It **deleted** the production
-  `chat_broadcast`/`chat_broadcast_in` push entirely (only test fns named
-  `chat_broadcast_*` remain in `src/wm.rs`, as of 2026-07-01). This per-frame
+  `chat_broadcast`/`chat_broadcast_in` push entirely (`rg -n 'fn chat_broadcast'
+  src/wm.rs` should still find test fns only). This per-frame
   delivery decision is today's Outbox seam.
 - **Status:** settled. If a chat delivery test flakes now, suspect a new bug,
   not this one. Flaky policy: **foreman-validation-and-qa**.
@@ -233,14 +237,15 @@ child's device-status scan. Details: **terminal-emulation-reference**.
 
 ## 7. Never executed: the chat-room A/B experiment (abandoned without marker)
 
-- A complete 1393-line implementation plan
+- A complete implementation plan
   (`docs/superpowers/plans/2026-06-15-chat-room-ab-experiment.md`) plus a
-  187-line design spec for a 3-arm experiment (solo / team-no-chat /
+  design spec for a 3-arm experiment (solo / team-no-chat /
   team+chat) measuring whether the Chat room improves result quality and
   token efficiency.
-- **Verified as of 2026-07-01: no part was ever built.** The prerequisites do
-  not exist — no `ChatMsg::to_jsonl`, no `persist_chat_msg` anywhere in
-  `src/`, no `scripts/` directory at the repo root.
+- **No part was ever built.** The prerequisites do not exist —
+  `rg -e to_jsonl -e persist_chat_msg src/` finds nothing, and there is no
+  `docs/chat-ab-results.md`. (Do not use "no `scripts/` dir" as the tell any
+  more: `scripts/` exists now, for unrelated reasons.)
 - Both files are dated 2026-06-15 (inside a commit-activity gap) but were only
   committed 2026-06-29 inside the consolidation commit `31a3db4` — the plan
   carries **no status marker** saying it was abandoned.
@@ -250,7 +255,7 @@ child's device-status scan. Details: **terminal-emulation-reference**.
 
 ## 8. Eaten chat posts under the passthrough ConPTY host (settled 2026-07-03)
 
-- **Symptom:** 5 wm chat tests red, consistently (not flaky):
+- **Symptom:** the wm chat tests red, consistently (not flaky):
   `chat_broadcast_hits_members_only_excluding_sender`,
   `chat_broadcast_reaches_background_member_tab_not_foreground_shell`,
   `chat_post_replies_ok_then_broadcasts`,
@@ -283,8 +288,9 @@ child's device-status scan. Details: **terminal-emulation-reference**.
   only the post until both children painted → the identical delivery path
   went green in 3.1s.
 - **Fix:** `ready` = DSR answered AND first visible glyph in the PTY output.
-  The glyph detector is `InkScan` (src/terminal.rs), a pure cross-chunk
-  scanner that skips escape/control sequences. Grid-sniffing was rejected:
+  The glyph detector is `InkScan` (now in src/ready.rs alongside `ReadyGate`),
+  a pure cross-chunk scanner that skips escape/control sequences.
+  Grid-sniffing was rejected:
   `inject_note` paints the dispatch banner into the grid without any child
   output, so "grid non-empty" false-latches in the real app. Regression
   contract test: `ready_waits_for_the_childs_first_paint`.
@@ -295,29 +301,91 @@ child's device-status scan. Details: **terminal-emulation-reference**.
   posts queue instead of being eaten (READY_GRACE remains the designed
   remedy — **foreman-agent-state-campaign** Phase 0).
 
+## 9. GPU device loss killed the app — the renderer, not the geometry (2026-08-25)
+
+- **Symptom:** foreman vanished with no window, no dialog, repeatedly, mostly
+  after sleep or a display power transition. `%APPDATA%\foreman\foreman_panic.log`
+  held the evidence (GH #2). Triage row: **foreman-debugging-playbook**.
+- **Wrong first diagnosis (do not re-derive):** "too much terminal geometry per
+  frame" — the panic message quotes an index-buffer size, so it reads like a
+  capacity problem. The 11th recorded panic killed that theory outright: a
+  **173 KB** allocation failed against a **1.9 MB** buffer with 11× headroom, on
+  a frame carrying a *quarter* of the geometry of the smallest previous crash.
+  Size was never the variable. (foreman only meshes the viewport anyway —
+  `frame.rs::plan_paint` bounds rows to the screen — so scrollback depth cannot
+  move the index count.)
+- **Root cause:** `egui-wgpu`'s `update_buffers` responds to device loss with an
+  unconditional `panic!`. `Queue::write_buffer_with` returns `None` *only* on
+  device loss (every other error class goes to wgpu's own error handler), so the
+  `None` is unambiguous — and the panic unwinds across the winit callback and
+  aborts the process, taking every PTY with it. `egui_glow`'s entire reaction to
+  a lost context, `GL_CONTEXT_LOST` included, is a `log::error!`.
+- **Ruled out:** upgrading is not a fix — the same panic is present in
+  `egui-wgpu` 0.36.1, the current release. "Just restart on device loss" was
+  rejected too: one recorded crash had no Power-Troubleshooter or Kernel-Power
+  event at all, so brief GPU power transitions would fire the restart at
+  unpredictable moments during normal use.
+- **Disproof method — a concurrent side-by-side A/B.** Both builds were launched
+  **at the same time on the same laptop** and put through one device-loss event:
+  the wgpu build took its 11th panic, the glow build kept rendering terminals
+  correctly. Concurrency is what makes it a result rather than an anecdote — the
+  crash only fires on roughly two thirds of transitions, so a lone glow survival
+  would have been indistinguishable from luck. The wgpu process is its own
+  positive control.
+- **Fix (`ba803ef`):** one dependency line. `eframe` with
+  `default-features = false` plus the `glow` feature. `default-features = false`
+  is load-bearing, not cosmetic — eframe prefers wgpu whenever both backends are
+  enabled. foreman is renderer-agnostic (every texture goes through
+  `egui::ColorImage` + `ctx.load_texture`), so the only source change was
+  `App::on_exit`, whose signature eframe `cfg`s on the renderer feature.
+- **The road not taken:** branch `wip/wgpu-device-loss-fix` holds a working
+  alternative — a `[patch.crates-io]` fork of `egui-wgpu` swapping the panic for
+  a sticky flag, plus `src/gpu.rs` with a crash-loop guard and an ordered
+  save-and-respawn. Rejected because **it never saved the agents**: every
+  `Session` owns a `KILL_ON_JOB_CLOSE` job (`src/job.rs`), so PTY children die
+  with the process whether it exits cleanly or panics — an ordered restart is
+  still a restart. It also pinned a vendored fork to one `egui-wgpu` version,
+  taxing every future egui bump. Kept in case glow ever proves worse.
+- **Status:** settled; the fence is in CLAUDE.md ("do not *modernize* the
+  `eframe` line back to wgpu"). Reopening requires re-running the concurrent
+  side-by-side, not an argument. Note glow is panic-*rarer*, not panic-free:
+  eframe's `change_gl_context` unwraps `make_current()` every frame on Windows,
+  and eframe requests a non-robust GL context so a reset raises no
+  `GL_CONTEXT_LOST` at all — if foreman ever wakes up visibly *corrupt* rather
+  than crashed, start there. `NativeOptions::vsync` also changes meaning: a
+  no-op under wgpu, live under glow (see battle 6 before re-testing it).
+- **Evidence trail:** `docs/gpu-device-loss.md` (full record incl. the A/B and
+  the rejected branch), commit `ba803ef`, GH #2.
+
 ---
 
 ## Meta-failures: the docs-drift chronicle
 
-Every entry below is a *verified* instance (2026-07-01, HEAD `7fda1c2`) where
-a repo artifact asserted something the code contradicted. The single lesson of
-this section: **verify against code, not docs.** The living trust map and the
-fix conventions belong to **foreman-docs-and-writing**; this table is the
-incident record.
+**The lesson: verify against code, not docs.** Authority labels do not track
+freshness — HANDOFF.md is *authoritative by declaration* (CLAUDE.md says it wins
+conflicts) and has still drifted in places, while on selection it was the doc
+that was right and HANDOFF that was stale. Only code is current.
 
-| Artifact | What it says | Verified truth | Evidence |
-|----------|--------------|----------------|----------|
-| `docs/snap-tiling.md` | Zone snapping, present tense, no banner | Zones deleted `31a9120` (2026-06-11); the supersession sweep `b42e92e` updated 5 files and missed this one | `git show --stat b42e92e` |
-| `docs/terminal-selection.md` § How to use | alacritty `Selection` API in use | Was fiction for 3 weeks (no commit had it); TRUE since `b581240` (2026-07-02) — HANDOFF's module map is now the stale one on selection | battle 4 |
-| `src/control.rs:130,548,763` + `foreman send --help` | "`--settle-ms` ... not yet honored (settle is the next phase)" | Honored: `DEFAULT_SETTLE_MS = 120`, `MAX_SETTLE_MS = 4000` (`src/wm.rs:17-18`), consumed at `src/wm.rs:938`, driven by `advance_settles` — the Quiescence settle works | `rg settle src/wm.rs` |
-| `docs/HANDOFF.md` § Coordinate model | "Snap/dwell use `ui.ctx().pointer_latest_pos()`..." | No `dwell`/`snap_or_tab` anywhere in `src/wm.rs` | `rg -e dwell -e snap_or_tab src/wm.rs` |
-| `docs/epics/window-tabbing-split-epic.md` | "**Status:** designed, not started" | Phase 1 tab-stacks shipped (its own 2026-06-11 banner admits it); browser-style tabs shipped `d4da700`/`31a3db4` | header vs git log |
-| `CLAUDE.md` § Session Context | "Currently working on `feat/browser-style-tabs`"; "check MEMORY.md in that directory" | Checkout is on `main`; that branch's tip `31a3db4` is an ancestor of `main`. The memory directory was missing until 2026-07-02, when MEMORY.md was first written there — the branch claim is still stale | `git merge-base --is-ancestor`; `Test-Path` |
-| `.claude/agents/foreman-reviewer.md` (pre-2026-07-02) | "Split (`Alt+WASD`) snaps a new terminal to a zone" | Zones deleted 2026-06-11; the reviewer agent taught a dead system for 3 weeks until its 2026-07-02 rework | `rg 'snaps a new terminal to a zone' .claude/agents/` (now empty) |
+A tabulated inventory of *which* artifacts were drifted used to live here. It
+was deleted on purpose: a drift table rots faster than the drift it records, and
+a stale entry pointing at a doc that has since been fixed sends people to argue
+with a corrected file. Date the drift yourself (`git log --oneline -- <path>`)
+and check the code. The living trust map and the fix conventions belong to
+**foreman-docs-and-writing**.
 
-Meta-lesson: HANDOFF.md is *authoritative by declaration* (CLAUDE.md says it
-wins conflicts) yet has drifted in places itself — while on selection it is
-the doc that's *right*. Authority labels don't track freshness; only code does.
+One row is kept because it is the incident that taught the lesson:
+
+- **`--settle-ms` "parsed but not yet honored" (drift window ~2026-06-26 →
+  2026-07-xx; resolved).** `src/control.rs`'s doc comments and `foreman send
+  --help` announced the flag as inert while `src/wm.rs` was already consuming
+  it — a settle path driven by `advance_settles`/`settle_tick` off a
+  `PendingSettle`, under a `MAX_SETTLE_MS` hard cap, with the per-send default
+  now coming from `Settings::send_settle_ms` in `src/config.rs`. Both the code
+  comments and `docs/terminal-inspection.md` have since been corrected. The bite
+  was not the wrong doc; it was that a *self-deprecating* doc is trusted harder
+  than a boastful one — nobody re-checks a feature the docs say isn't finished.
+  The frozen constant names in the original entry (`DEFAULT_SETTLE_MS`, since
+  deleted) are exactly the kind of citation this skill no longer writes.
 
 ## History hazards: blame and bisect traps
 
@@ -326,20 +394,20 @@ the doc that's *right*. Authority labels don't track freshness; only code does.
 | `daeda90` squash | Exact squash of a discarded 5-commit worktree chain (`9e9418c`→`902ae38`→`6f24d0d`→`47d0d75`→`37a01dc`, now dangling). Proof: `git rev-parse daeda90^{tree} 37a01dc^{tree}` → both `e8aa459...` | `git blame` on the first 683 lines of `src/layout.rs` points at one squash; the real step-by-step authorship exists only in the dangling chain |
 | `31a3db4` consolidation | 12 files, +2080/−164 across caret/chat/config/control/icons/input/inspect/proc/terminal/wm **plus** two 06-15-dated docs, under a `feat(tabs)` subject; body admits "Also consolidates in-progress work across ... modules" | ~2 weeks of multi-module WIP under one tabs-flavored subject — blame or bisect landing here tells you almost nothing about intent |
 | `37687b5` | First message line is literally `@` (PowerShell here-string leak); the real subject is line 2: "feat(wm): new terminals and projects tile by default" | Subject greps and changelog tools misread it. Commit-message conventions: **foreman-docs-and-writing** |
-| Only 2 merge commits | `970e8c9`, `3588634` (as of 2026-07-01) | History is otherwise linear; `git log --first-parent main` ≈ full mainline |
-| Zero file deletions | `git log --diff-filter=D --oneline --all` returns **nothing** (as of 2026-07-01) | Every file ever added still exists; dead code dies by in-file edits — hunt lifetimes with `-S`, not `--follow` on deleted paths |
+| Few merge commits | Run `git log --oneline --merges` first — the count grows, but history stays overwhelmingly linear | `git log --first-parent main` ≈ the full mainline; first-parent reading rarely hides anything |
+| Zero file deletions | `git log --diff-filter=D --oneline --all` returns **nothing** — still true; re-run it, it is a one-line check | Every file ever added still exists; dead code dies by in-file edits — hunt lifetimes with `-S`, not `--follow` on deleted paths |
 | Commit-activity gaps | No commits (any ref) 06-06..06-08, 06-13..06-17, 06-19..06-25 | Gaps ≠ idle: the A/B plan is dated 06-15, mid-gap, committed 06-29. Look for later consolidation commits and dangling objects |
 | Plan dates ≠ commit dates | `docs/superpowers/plans/*` filenames carry authoring dates; several were committed much later | Date a decision by the plan filename *and* `git log -- <path>` |
 
-**Dangling-object inventory** (`git fsck --no-reflogs`, as of 2026-07-01 — 4
-dangling commits):
+**Notable dangling objects.** Enumerate the current set yourself —
+`git fsck --no-reflogs 2>$null | Select-String "dangling commit"` — the list
+grows with every discarded worktree and dropped stash. Two carry a judgment
+worth not re-deriving:
 
 | Hash | What it is | Status |
 |------|-----------|--------|
-| `37a01dc` | Tip of the discarded layout-tree worktree chain | Fully recovered by the `daeda90` squash (tree-identical) |
-| `ad12875` | Orphan twin of plan commit `4bbc55a` (same subject + author timestamp 2026-06-11 21:46:52) | Superseded duplicate |
-| `880fc35` | Stash-form "WIP on feature/tiling-tree" (2026-06-11, `src/wm.rs`) | Dropped stash; likely superseded same evening |
-| `30346e9` | Stash-form "On feat/terminal-input-and-inspection: chat-cursor-wip" (2026-06-27 15:53; chat.rs/main.rs/wm.rs, +141/−103) | Dropped stash; the ChatRoom/delivery work landed 17:45 the same day (`9aeb72b`), but **whether the stash was fully superseded is unverified — possibly lost work** |
+| `37a01dc` | Tip of the discarded layout-tree worktree chain | Fully recovered by the `daeda90` squash — **proven** tree-identical (`git rev-parse daeda90^{tree} 37a01dc^{tree}` → same hash), so blame is recoverable there |
+| `30346e9` | Stash-form "On feat/terminal-input-and-inspection: chat-cursor-wip" (2026-06-27 15:53; chat.rs/main.rs/wm.rs) | Dropped stash; the ChatRoom/delivery work landed 17:45 the same day (`9aeb72b`), but **whether the stash was fully superseded is unverified — possibly lost work** |
 
 Dangling objects are unreachable and get pruned by `git gc` eventually; if you
 need one, inspect it soon (`git show --stat <hash>`) or tag it.
@@ -356,10 +424,11 @@ git log --all -S "compose_zone" --format="%h %ad %s" --date=short
 #  f3c76f0 2026-06-11  code death (tree commands replace it)
 #  b42e92e 2026-06-11  doc-text mention
 
-# When did a doc last change (drift dating):
+# When did a doc last change (drift dating). Worked example: this is how you
+# find that snap-tiling.md's SUPERSEDED banner arrived long after the code did.
 git log --oneline -- docs/snap-tiling.md
 
-# Deleted files (returns NOTHING in this repo as of 2026-07-01 — that's the finding):
+# Deleted files (returns NOTHING in this repo — that's the finding):
 git log --diff-filter=D --oneline --all
 
 # Dangling commits (discarded chains, dropped stashes):
@@ -371,7 +440,7 @@ git show <hash>:src/chat.rs            # read a file as it was in the lost commi
 # Prove/refute "commit A is a squash of chain tip B":
 git rev-parse <A>^{tree} <B>^{tree}    # identical hashes = identical content
 
-# Mainline reading (only 2 merges exist):
+# Mainline reading (history is near-linear; check with `git log --oneline --merges`):
 git log --first-parent --oneline main
 
 # Line-range history when blame dead-ends at daeda90/31a3db4:
@@ -391,35 +460,33 @@ makes the verdict enforceable by **foreman-change-control**.
 ## When NOT to use this skill
 
 - **You have a live symptom to triage now** → **foreman-debugging-playbook**
-  (symptom → discriminating experiment tables).
-- **You're deciding which doc to trust or fixing drift** →
-  **foreman-docs-and-writing** (trust map, house style); this skill only
-  records the incidents.
+  (symptom → discriminating experiment tables). This skill is the history
+  behind those rows, not the triage itself.
 - **You want to change or re-litigate a settled decision** →
   **foreman-change-control** (the gate; this skill is its evidence annex).
-- **You want to revive the A/B experiment or open new research** →
-  **foreman-research-frontier** / **foreman-research-methodology**.
-- **You're measuring performance or driving the app headlessly** →
-  **foreman-diagnostics-and-tooling**.
-- **You're an agent running inside foreman needing dispatch/chat usage** →
-  the user-facing **foreman-dispatch** / **foreman-chat** skills.
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against HEAD `7fda1c2` (`main`). Re-verify drift-prone
-claims before trusting them:
+Verdicts and commit hashes here are permanent. What perishes is the "still
+true today" half of an entry, so re-check only those:
 
 | Claim | Re-verify with |
 |-------|----------------|
-| Experiments never committed (battle 1) | `git log --all -S "PSEUDOCONSOLE_RESIZE_QUIRK"` → only `5332757`; `rg portable-pty Cargo.toml` |
-| `origin/fix/terminal-reflow-on-resize` tips at `5332757` | `git log --oneline origin/fix/terminal-reflow-on-resize -1` |
-| `docs/snap-tiling.md` still bannerless | `Get-Content docs/snap-tiling.md -TotalCount 5` |
-| Selection rewrite landed (battle 4 resolved) | `git log --all -S "Selection::new"` → `64a80b9` (doc) + `b581240` (code); `rg "sel_anchor" src/terminal.rs` (expect empty) |
-| `--settle-ms` honored but help still lies | `rg "not yet honored" src/control.rs`; `rg "DEFAULT_SETTLE_MS" src/wm.rs` |
-| Production `chat_broadcast` still deleted | `rg "fn chat_broadcast" src/wm.rs` → test fns only |
-| A/B prerequisites still unbuilt | `rg -e to_jsonl -e persist_chat_msg src/`; `Test-Path scripts` |
-| Dangling inventory (gc may prune) | `git fsck --no-reflogs 2>$null` — look for "dangling commit" lines |
-| Zero deletions / 2 merges / date gaps | `git log --diff-filter=D --oneline --all`; `git log --merges --oneline`; `git log --format=%ad --date=short --all` |
-| Epic/CLAUDE.md/HANDOFF drift rows | commands in the meta-failures table |
-| Latency numbers (idle ~0.13 ms/frame etc.) | dated 2026-06-18; re-measure via **foreman-diagnostics-and-tooling** |
-| Line numbers cited (`control.rs:130,548,763`, `wm.rs:17-18,938`, `terminal.rs:260`) | `rg -n` the quoted strings; treat numbers as 2026-07-01 snapshots |
+| Battle 1: the four ConPTY experiments were never committed anywhere | `git log --all -S "PSEUDOCONSOLE_RESIZE_QUIRK"` → only `5332757`; `rg -n portable-pty Cargo.toml` (crates.io pin, no `[patch]`) |
+| Battle 9: the renderer is still glow | `rg -n -A6 '^eframe = ' Cargo.toml` → `default-features = false` **and** the `glow` feature. Losing either silently restores the aborting wgpu path |
+| Dangling objects (gc prunes them; `30346e9` may be real lost work) | the `git fsck` command below the table |
+| Latency numbers (idle ~0.13 ms/frame etc.) | dated 2026-06-18; re-measure via **foreman-diagnostics-and-tooling** before quoting |
+
+Dangling-object sweep (the pipe cannot live in a table cell — copy it from
+here; PowerShell):
+
+```powershell
+git fsck --no-reflogs 2>$null | Select-String "dangling commit"
+```
+
+**A note on this table's own history.** It used to be three times this long, and
+several of its rows had rotted into *false passes* — greps for symbols that had
+since been deleted, which therefore "confirmed" a claim by matching nothing, or
+`Test-Path` probes whose premise the repo had already outgrown. A self-check
+that cannot fail is worse than no self-check. If you add a row, make sure a
+change in the code can actually make it report red.

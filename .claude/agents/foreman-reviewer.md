@@ -19,8 +19,8 @@ style nits (a PostToolUse hook already runs `cargo fmt`).
 - **WM/layout edit.** A diff touches src/wm.rs, layout.rs, or main.rs: review
   against the Window-manager landmines.
 - **Wire edit.** A diff touches src/control.rs or chat.rs, or any
-  foreman-dispatch/foreman-chat SKILL.md: review against the Control-plane
-  landmines — these are the easiest to break silently.
+  foreman-dispatch/foreman-chat/foreman-icat SKILL.md: review against the
+  Control-plane landmines — these are the easiest to break silently.
 - **Pre-commit sweep.** Before a commit/PR spanning several files: run every
   section the diff touches.
 
@@ -63,9 +63,9 @@ Deep doc: `terminal-emulation-reference`; failure dictionary: `foreman-debugging
   corrupts selection, mouse, and caret math. `WIDE_CHAR_SPACER` cells must be
   skipped or mapped to spaces wherever cells are walked.
 - **The pure seams stay pure.** geom.rs (cell metrics), input.rs (key/mouse
-  encoding), frame.rs (frame plan), caret.rs (caret gate) contain no egui or PTY
-  types by design — that is why they are unit-testable. A diff that threads GUI
-  or PTY state into them is a must-fix.
+  encoding), frame.rs (frame plan), caret.rs (caret draw decision) contain no
+  egui or PTY types by design — that is why they are unit-testable. A diff that
+  threads GUI or PTY state into them is a must-fix.
 - **ConPTY resize corruption is settled.** Narrow-past-a-wrapped-prompt +
   Up-arrow corruption is ConPTY's upstream bug (microsoft/terminal #18725), not
   ours. Reject diffs that "fix" `Session::resize` for it — four redraw-ownership
@@ -98,13 +98,14 @@ Deep doc: `foreman-architecture-contract`; tiling model: `docs/tiling-tree.md`.
 - **Per-frame re-fit.** Windows re-fit to their area every frame (confinement +
   reflow on OS resize). Changes to `show`/layout must preserve this.
 
-### Control plane / chat (control.rs, chat.rs, and dispatch/chat SKILL.md files)
+### Control plane / chat (control.rs, chat.rs, and the embedded SKILL.md files)
 Deep docs: `foreman-change-control` (gates), `foreman-architecture-contract` (why).
 
 - **Wire compat v1 is byte-identical.** Every field added after v1 is
   `Option`/`Vec` with `#[serde(default, skip_serializing_if = ...)]` AND has a
-  wire-compat test (four exist in control.rs's test module as models: assert the
-  unset field serializes away, and a v1 JSON without the key still parses). A
+  wire-compat test (models live in control.rs's test module — list them with
+  `rg -n 'fn .*wire_compat' src/control.rs`; each asserts the unset field
+  serializes away, and that a v1 JSON without the key still parses). A
   JSON shape change without both is **must-fix** — the CLI and GUI can be
   different builds, and globally installed agent skills speak this protocol.
 - **Ordering invariants.** Reply-before-inject: a chat ack goes on the reply
@@ -114,10 +115,14 @@ Deep docs: `foreman-change-control` (gates), `foreman-architecture-contract` (wh
   (`sent.elapsed() >= REPLY_TIMEOUT`) before acting; new verbs must too.
 - **Layer purity.** chat.rs is pure data — no `std::fs`, no GUI types.
   control.rs is transport-only — no `use crate::` into wm/terminal.
-- **Three-way skill sync.** Editing `.claude/skills/foreman-dispatch` or
-  `foreman-chat` SKILL.md requires the `.codex/skills` twin updated AND a
-  rebuild — `include_str!` embeds them in the exe at compile time. Flag any
-  lone edit.
+- **Three-way skill sync.** Three skills are embedded in the exe:
+  `foreman-dispatch`, `foreman-chat`, and `foreman-icat`. Editing any of their
+  `.claude/skills/<name>/SKILL.md` sources requires the `.codex/skills` twin
+  updated (plus that twin's `agents/openai.yaml` if the description moved) AND a
+  rebuild — `include_str!` embeds them at compile time, so an unrebuilt edit
+  leaves the globally installed copy serving the old text. Flag any lone edit.
+  Confirm the current embed list with
+  `rg -n 'include_str!' src/skills_install.rs`.
 
 ### egui 0.34 / input (main.rs, wm.rs and terminal.rs paint/input paths)
 Deep doc: `egui-immediate-mode-reference`.

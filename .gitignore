@@ -4,6 +4,11 @@
 !assets/media/*.png
 *.log
 run-stderr.log
+# The panic log lives in %APPDATA%\foreman; a copy here means APPDATA was
+# unresolvable and the hook fell back to the CWD. Never commit one — a stale
+# copy at the repo root reads as current evidence and has cost hours.
+foreman_panic.log
+grep.exe.stackdump
 
 # IDE / tooling caches
 /.idea/

@@ -27,18 +27,23 @@ loop on demand.
 ## Remaining work (prioritized)
 
 ### 1. Per-pane panic isolation — HIGH (queued for the WM branch)
-One terminal can abort the whole process: `src/terminal.rs:~727` notes that a
-stale alacritty grid index panics, and a panic across the winit callback aborts
-the entire app. `install_panic_logger` in `src/main.rs` exists precisely because
-of this. For "tmux for AI" running many sessions, one bad pane must not kill the
-others.
+One terminal can abort the whole process: indexing alacritty's grid with a
+stale `Line`/`Column` panics (`src/terminal.rs`, on the selection path where
+alacritty's `Selection::to_range` clamps the coords and `sel_viewport_range`
+culls them onto the viewport), and a panic across the winit callback aborts the
+entire app.
+`install_panic_logger` in `src/main.rs` exists precisely because of this. For
+"tmux for AI" running many sessions, one bad pane must not kill the others.
 
 - **Approach:** wrap each terminal's `show()`/`pump()` in
   `std::panic::catch_unwind(std::panic::AssertUnwindSafe(...))` in `src/wm.rs`
   (where per-terminal `show()` is called); on panic, degrade that pane to an error
   tile instead of re-rendering.
-- **Note:** this is belt-and-suspenders — `terminal.rs:~727` already *guards* the
-  known index panic defensively; this is about surviving the unknown ones.
+- **Note:** this is belt-and-suspenders — that path already *guards* the known
+  index panic defensively (alacritty's `Selection::to_range` clamps, then
+  `sel_viewport_range` in `src/terminal.rs` culls onto the viewport; see the
+  `..._are_clamped_not_panicking` tests there); this is about surviving the
+  unknown ones.
 - **Blocked on:** `wm.rs`/`layout.rs` have uncommitted WIP; do this after that
   branch lands so the change doesn't tangle with it.
 
@@ -76,19 +81,19 @@ items:
   ever target 20–30 continuously-noisy agents, the lever is **bounded per-frame
   parsing** (cap bytes fed to the parser per terminal per frame, defer the rest) —
   not worth its complexity/risk before then.
-- **The `dead_code` warnings are false positives.** `ready` (getter), `post`,
-  `chat_post`, `leaves`, `cwd`/`query`/`selected` are all used only by the test
-  suite — they warn because they're `pub` in a *binary* crate and their only
-  callers are behind `#[cfg(test)]`. They are NOT dead; don't delete. If a
-  zero-warning build is wanted, `#[cfg(test)]` only the two pure test wrappers
-  (`post`, `chat_post`) and leave the real component accessors.
-- **`shell` field** (`src/terminal.rs`) is write-only (set, never read). Kept by
-  decision — reasonable session state to have around; remove only if it stays
-  unused (removal threads through `spawn_with`'s signature + 3 call sites).
+- **Some `dead_code` warnings are false positives, and the set changes.** A
+  `pub` fn in a *binary* crate whose only callers sit behind `#[cfg(test)]`
+  warns even though it is a real component accessor the test suite depends on.
+  Those are NOT dead; don't delete them. Which symbols are currently in that
+  set is not written down here on purpose — membership churns silently in both
+  directions (a fn gains a production caller, or gets `#[cfg(test)]`-gated),
+  and a stale "these are false positives" list is how a genuine dead-code
+  warning gets waved through. Check the caller set yourself; the standing
+  baseline lives in **foreman-build-and-env**.
 
 ## How to verify
 
-- `cargo test` (181 tests, no GUI needed).
+- `cargo test` (no GUI needed).
 - For frame-latency work, the throwaway harness pattern: temp-instrument
   `App::ui` in `src/main.rs` to log inter-frame gap + `desktop.show()` duration,
   run the release exe with stderr redirected to a file, type/flood, read the log.

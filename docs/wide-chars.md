@@ -223,6 +223,14 @@ and `…-results.md`. The code they describe no longer exists.
 - ConPTY line redraws leave `�` residue mid-line and below the prompt after
   corruption. Same family as `docs/conpty-resize-reflow.md`.
 
-Key files: `src/input.rs` (`CellWide` classifier + key encoding),
-`src/frame.rs` (paint spacer skip), `src/inspect.rs` (snapshot spacer skip),
-`src/terminal.rs` (emoji raster/paint).
+## Key files
+
+- `src/psreadline.rs` — the whole shipped fix: `WIDE_EDIT_FIX`, the pwsh
+  Set-PSReadLineKeyHandler bindings, and the tests that pin RightArrow as
+  deliberately unbound.
+- `src/input.rs` — `CellWide::classify` / `CellWide::is_wide_spacer`, the one
+  home for width classification; key encoding.
+- `src/frame.rs` — paint spacer skip (`plan_paint`, `overlays`) and the
+  wide-caret span.
+- `src/inspect.rs` — snapshot spacer skip (`snapshot_text`, `snapshot_cells`).
+- `src/terminal.rs`, `src/emoji_raster.rs` — emoji raster/stamp paint.

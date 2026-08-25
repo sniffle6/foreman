@@ -1,6 +1,6 @@
 ---
 name: foreman-research-frontier
-description: Use when asking whether foreman work is novel or state-of-the-art, planning research-grade efforts (agent-state detection, headless agent self-verification, the chat-room A/B experiment, session persistence / daemon-client split, per-Session panic isolation, READY_GRACE), preparing any external claim, benchmark, blog post, or release, asked about the missing LICENSE or CI, or when someone proposes reopening ConPTY resize reflow. Everything here is open or candidate — none of it is built.
+description: Use when asking whether foreman work is novel or state-of-the-art, planning research-grade efforts (agent-state detection, headless agent self-verification, the chat-room A/B experiment, session persistence / daemon-client split, per-Session panic isolation, READY_GRACE), preparing any external claim, benchmark, blog post, or release, or when someone proposes reopening ConPTY resize reflow. Everything here is open or candidate — none of it is built.
 ---
 
 # Foreman research frontier
@@ -8,27 +8,27 @@ description: Use when asking whether foreman work is novel or state-of-the-art, 
 Open problems where foreman could advance the state of the art, plus the
 standards for claiming anything externally. **Status discipline: every item in
 this skill is `open`, `candidate`, or `designed-not-built`. Nothing here is
-shipped.** Baseline for all claims: committed HEAD `7fda1c2` (2026-07-01). Any
-work spawned from this skill still goes through **foreman-change-control** —
-this document authorizes nothing.
+shipped.** Verify every "still absent" claim against `src/` before you act on
+it — the absences are what rot. Any work spawned from this skill still goes
+through **foreman-change-control** — this document authorizes nothing.
 
 Vocabulary is CONTEXT.md's (repo root): a **Session** is one running terminal
 (shell or agent CLI plus its emulated screen); a **Snapshot** is its rendered
 grid read as data; **Ready** is the latch a Session sets once it has answered
 its program's startup device-status query; the **Control plane** is the local
 request channel (`foreman open/chat/status/close/send/snapshot`,
-src/control.rs:786 ff.) an in-terminal agent uses to drive foreman;
+src/control.rs `HELP` / `serve`) an in-terminal agent uses to drive foreman;
 **Quiescence settle** is waiting for output silence before reading. A PTY is
 the OS object that makes a program believe it's talking to a terminal; ConPTY
 is Windows' implementation — see **terminal-emulation-reference** for the
 domain pack.
 
-## Frontier map (as of 2026-07-01)
+## Frontier map
 
 | # | Frontier | Status | Full detail lives in |
 |---|----------|--------|----------------------|
 | 1 | Agent-state detection | open (PRIMARY) | **foreman-agent-state-campaign** |
-| 2 | Headless agent self-verification | candidate; inspection layer built, 2 gaps | this skill |
+| 2 | Headless agent self-verification | candidate; inspection layer built, gaps below | this skill |
 | 3 | Multi-agent coordination measurement (A/B) | designed-not-built, never executed | this skill |
 | 4 | Session persistence (daemon/client split) | open, listed in HANDOFF | this skill |
 | 5 | Fleet reliability floor | designed 2026-06-18, unbuilt | this skill |
@@ -50,13 +50,13 @@ direction" (docs/superpowers/specs/2026-06-10-chat-mentions-design.md, the
 quiescence-gating warning — that spec's row 5 is design-settled with an
 unsolved mechanism at its center).
 
-**Foreman's asset (verified at HEAD).** Foreman IS the terminal, so it sees
+**Foreman's asset.** Foreman IS the terminal, so it sees
 every byte with emulator-level structure, and it already has:
-- the **Ready** latch (`Session.ready`, latched when the startup DSR reply is
-  flushed — src/terminal.rs:271–275, 716–728 as of 2026-07-01),
-- a cheap output-freshness signal (`Session::output_gen`, src/terminal.rs:687),
+- the **Ready** latch (`Session::ready`, driven by the pure `ReadyGate` in
+  src/ready.rs — DSR reply flushed AND the child's first painted glyph),
+- a cheap output-freshness signal (`Session::output_gen`, src/terminal.rs),
 - Quiescence settle machinery (`PendingSettle`/`advance_settles`/`settle_tick`,
-  src/wm.rs:20–49, 1275),
+  src/wm.rs),
 - structured Snapshots (`snapshot --attrs --cursor`, commit `ec0af05`),
 - the Control plane + per-Session env identity for labeling real sessions.
 
@@ -81,24 +81,21 @@ cli send-text`/`get-text` are real prior art for the primitives, but neither
 couples send to a settled read (Quiescence settle as the reply gate), gates
 injection on Ready, or gives the agent an env-injected self-target.
 
-**Foreman's asset — the inspection layer is BUILT (HEAD `7fda1c2`):**
+**Foreman's asset — the inspection layer is BUILT:**
 
 | Piece | Evidence |
 |-------|----------|
-| `foreman send --text/--keys/--settle-ms` | src/control.rs (SendRequest), src/wm.rs:938–953 settle path |
-| Settle honored, non-blocking for the GUI | `PendingSettle` + `advance_settles` (src/wm.rs:657–659, 1275); `DEFAULT_SETTLE_MS=120`, `MAX_SETTLE_MS=4000` (src/wm.rs:17–18) |
-| `foreman snapshot` text / `--attrs` / `--cursor` | commit `ec0af05`; src/inspect.rs |
-| Zero-flag self-target | `FOREMAN`, `FOREMAN_TERMINAL_ID`, `FOREMAN_PROJECT_ID` injected at spawn (src/wm.rs:789–797) |
+| `foreman send --text/--keys/--settle-ms/--terminal` | src/control.rs `SendRequest`; the settle path in src/wm.rs |
+| Settle honored, non-blocking for the GUI | `PendingSettle` + `settle_tick` + `advance_settles` (src/wm.rs); the per-send default is `Settings::send_settle_ms` (src/config.rs, user-editable, sanitize-clamped) under the hard `MAX_SETTLE_MS` cap in src/wm.rs |
+| `foreman snapshot` text / `--attrs` / `--cursor` / `--tail N` | commit `ec0af05`; `--tail` shipped `43e86d3`; src/inspect.rs |
+| Zero-flag self-target | `FOREMAN`, `FOREMAN_TERMINAL_ID`, `FOREMAN_PROJECT_ID` injected at spawn (src/wm.rs `fn term_env`) |
 
-⚠ **Doc drift, flagged (as of 2026-07-01):** docs/terminal-inspection.md
-§ "`--settle-ms` (next phase)" and the doc comments in src/control.rs
-(lines ~129–130, ~548, ~763) still say settle is "parsed but not yet honored."
-That is stale — settle IS honored in src/wm.rs:938–953. Trust the code.
-
-**What's missing (verified absent from src/):** `--wait-for`/`--timeout-ms`,
-`--since-seq`, `--region`, `--rows`, and the **`REPLY_TIMEOUT` exemption** —
-the GUI drops any control message older than `REPLY_TIMEOUT` (5 s,
-src/control.rs:10), so a long `--wait-for` would be dropped by design unless
+**What's missing (re-verify with `rg -n 'wait_for|since_seq|"--region"|"--rows"' src/`
+before building — the read side keeps growing, `--tail N` closed the
+last-N-lines gap in `43e86d3`):** `--wait-for`/`--timeout-ms`, `--since-seq`,
+`--region`, `--rows`, and the **`REPLY_TIMEOUT` exemption** — the GUI drops any
+control message older than `REPLY_TIMEOUT` (src/control.rs), so a long
+`--wait-for` would be dropped by design unless
 inspections are exempted and honored up to their own deadline. This is the
 documented ripple warning in docs/epics/terminal-inspection-epic.md ("the
 `REPLY_TIMEOUT` stale-drop must exempt inspections") — read its landmines
@@ -110,8 +107,8 @@ section before building.
 2. Build `--wait-for` + the `REPLY_TIMEOUT` exemption using the epic's
    pending-inspections pattern — the hardest step; it touches the pipe server's
    `recv_timeout` too.
-3. Fix the stale settle docs/comments, then dogfood: pick one real terminal
-   feature and require its verification evidence to be send/snapshot only.
+3. Dogfood: pick one real terminal feature and require its verification
+   evidence to be send/snapshot only.
 
 **You have a result when:** an agent lands a terminal feature end-to-end with
 **zero screenshots** — every verification step in its evidence chain is a
@@ -134,16 +131,18 @@ hidden acceptance suite, headline metrics **tokens-per-requirement-met** and
 **Foreman's asset.** The experiment is fully designed and planned —
 docs/superpowers/specs/2026-06-15-chat-room-ab-experiment-design.md and
 docs/superpowers/plans/2026-06-15-chat-room-ab-experiment.md — a complete,
-ready, never-executed asset: as of 2026-07-01 there is no `scripts/` dir and no
-docs/chat-ab-results.md (verified).
+ready, never-executed asset. The tell that it never ran: no
+docs/chat-ab-results.md (`Test-Path docs/chat-ab-results.md`). Do not use
+"there is no `scripts/` dir" as the tell — `scripts/` exists now for unrelated
+reasons.
 
 **Prerequisite: chat persistence — designed-not-built.**
-docs/chat-persistence.md is the build plan, with **six settled decisions**
+docs/chat-persistence.md is the build plan, with its settled decisions
 (JSONL with trailing-newline commit marker; one narrow module, no trait;
 synchronous write on the post path; periodic off-path fsync; one-pass reload;
 at-least-once delivery + dedup-by-seq) and **the seq/len landmine**:
-`ChatLog::push` assigns `seq = self.msgs.len() as u64 + 1` and `last_seq()`
-returns `msgs.len()` (src/chat.rs:187, 205–207 at HEAD) — decouple seq from Vec
+`ChatLog::push` assigns `seq` from `self.msgs.len() as u64 + 1` and `last_seq()`
+returns `msgs.len()` (src/chat.rs) — decouple seq from Vec
 length (`next_seq`) FIRST or seqs collide/rewind across restart. Those
 decisions are do-not-re-litigate per **foreman-change-control**.
 
@@ -163,9 +162,19 @@ data-ranked reordering of docs/chat-missing-features.md.
 ## 4. Session persistence (daemon/client split)
 
 **Problem.** True tmux-style survival: a Session's process and screen outlive a
-GUI restart. Listed as next-phase work in docs/HANDOFF.md § 5 item 4
+GUI restart. Listed as next-phase work in docs/HANDOFF.md § 5
 ("Daemon/client split — move PTYs into a headless core so sessions persist
 across UI restarts").
+
+**What already ships is NOT this.** `workspace.json` (src/workspace.rs) restores
+the **layout tree**, not the processes: `capture_workspace` writes a
+`WorkspaceSnapshot` (built from per-level `ManagerSnap`s) of window rects, tabs
+and `ContentSnap` — and
+`ContentSnap::Terminal` carries only a `shell` string. On restart foreman
+rebuilds the same tiling and spawns a *fresh* shell in each leaf. No child
+process, scrollback, or agent conversation survives. Do not read the presence of
+workspace.json as this frontier being half-done; it makes the frontier's
+prerequisite *more* visible, not less (see the id-stability blocker below).
 
 **Why it's hard here.** Sessions are owned by the GUI thread: a `Win`'s
 `Content::Terminal` holds the `Session` (PTY + reader thread) inside the
@@ -179,8 +188,8 @@ composition: tmux-style persistence for **ConPTY-backed Sessions on Windows**
 under a recursive GUI compositor, reusing an existing agent Control plane as
 the client protocol. Label: candidate until a prior-art sweep says otherwise.
 
-**Foreman's asset.** The Control plane is already message-passing (six verbs
-over a local socket, serviced as `CtrlMsg` on the UI thread — operational
+**Foreman's asset.** The Control plane is already message-passing (every CLI
+verb over a local named pipe, serviced as `CtrlMsg` on the UI thread — operational
 ground truth in **foreman-run-and-operate**), and the persistence designs
 already anticipate restart: chat-persistence.md's seq-monotonic-across-restart
 constraint, and its explicitly named blocker — **terminal/project ids (`tN`,
@@ -207,11 +216,13 @@ screenshot required.
 
 **Problem.** One Session's panic aborts the whole process (a panic unwinding
 across the winit callback kills the app — that's why `install_panic_logger`
-exists, src/main.rs:427 at HEAD). A fleet product cannot lose 19 Sessions to
+exists, src/main.rs). A fleet product cannot lose a whole desktop of Sessions to
 one bad one. Every other frontier's demo dies on this.
 
-**Designed 2026-06-18, unbuilt (verified: `git grep catch_unwind READY_GRACE`
-finds nothing in src/ as of 2026-07-01)** — both in
+**Designed 2026-06-18, unbuilt (probe: `rg -n 'catch_unwind' src/` — expect
+nothing; do NOT probe for `READY_GRACE`, that string now appears in src/ready.rs
+as a comment saying the constant is deliberately absent, so the grep passes
+while the feature is missing)** — both designs are in
 docs/followups-latency-and-control.md:
 - **Per-Session panic isolation:** wrap each Session's `show()`/`pump()` in
   `std::panic::catch_unwind(AssertUnwindSafe(..))` in src/wm.rs; on panic,
@@ -219,12 +230,17 @@ docs/followups-latency-and-control.md:
 - **READY_GRACE:** a Session whose program never answers the startup
   device-status query never latches Ready, so injected posts queue forever.
   Fallback: latch Ready by a generous timeout (~1.5–2 s), injectable so the
-  path is deterministically testable.
+  path is deterministically testable. **Placement is already ruled:**
+  src/ready.rs's module doc says READY_GRACE is intentionally *not* in the pure
+  gate — the gate never reads the clock (all time is injected, same pattern as
+  the Caret gate), and a grace timer needs one. It belongs in the caller that
+  owns the clock, feeding the gate an injected `now`.
 
-**Partial progress at HEAD:** the *known* grid-index panic is now clamped in
-the Frame plan seam (src/frame.rs module doc, "the process-abort guard",
-commit `7fda1c2`). `catch_unwind` remains the belt-and-suspenders against
-*unknown* panics.
+**Partial progress:** the *known* grid-index panic is now clamped in
+the Frame plan seam (src/frame.rs, "the process-abort guard" — its module doc
+carries the rationale). `catch_unwind` remains the belt-and-suspenders against
+*unknown* panics. The other realized fleet-wide abort was the renderer, not a
+Session: see the glow-over-wgpu battle in **foreman-failure-archaeology**.
 
 **First three steps in this repo:** (1) the `catch_unwind` wrap per the
 followups doc's approach; (2) an error-tile degraded state for a panicked Win;
@@ -287,15 +303,20 @@ result in docs/. A novelty claim without that document is not permitted.
   has ratified them. (Internal do-not-re-litigate status is
   **foreman-change-control**'s domain.)
 
-### Release blockers (verified 2026-07-01)
+### Release readiness
 
-| Blocker | State | Consequence |
-|---------|-------|-------------|
-| No `LICENSE` file; no `license` field in Cargo.toml | absent | No external release, no source citation in publications, no crates.io |
-| No CI (no `.github/`, no other CI config in repo) | absent | No "tests pass" claim is externally checkable |
+Licensing is settled and shipped: dual MIT / Apache-2.0, `LICENSE-MIT` +
+`LICENSE-APACHE` at the repo root, `license = "MIT OR Apache-2.0"` in
+Cargo.toml, badge and License section in the README. This is no longer a
+blocker; do not talk anyone out of shipping over it.
 
-Both must exist before ANY external release or claim; adding them is a change —
-route through **foreman-change-control**. Evidence-bar and result-lifecycle
+One caveat still bites external "tests pass" claims: `.github/workflows/release.yml`
+runs `cargo test` on **tag pushes** (and on PRs that touch the workflow or
+install.ps1), gated on the tag matching the Cargo.toml version — there is no
+test gate on ordinary commits or ordinary PRs. So "CI is green" is a statement
+about the last release tag, not about `main`. Quote it that way, or run the
+suite yourself and say when. Adding a push/PR gate is a change — route through
+**foreman-change-control**. Evidence-bar and result-lifecycle
 discipline for research work is **foreman-research-methodology**; this skill
 only says *what* is worth researching and *what* may be claimed.
 
@@ -303,31 +324,19 @@ only says *what* is worth researching and *what* may be claimed.
 
 - Executing agent-state detection work → **foreman-agent-state-campaign** (the
   step-by-step campaign; this skill only frames the frontier).
-- How to run `foreman send`/`snapshot`/`chat` operationally →
-  **foreman-run-and-operate** (developer-facing) or the user-facing
-  `foreman-dispatch`/`foreman-chat` skills for agents inside foreman.
-- Turning a hunch into an accepted result (evidence bar, lifecycle,
-  refutation) → **foreman-research-methodology**.
-- What counts as evidence / acceptance gates → **foreman-validation-and-qa**.
-- Why the ConPTY investigation concluded as it did / other dead ends →
-  **foreman-failure-archaeology**.
-- Gating, review, or settled-decision questions → **foreman-change-control**.
+- Turning a hunch into an accepted result, or recording a negative one →
+  **foreman-research-methodology**.
+- Why a dead end died → **foreman-failure-archaeology**.
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against committed HEAD `7fda1c2` (working tree clean at
-verification time). Re-verify drift-prone claims from the repo root:
+Every "still absent" claim in this skill is the perishable kind — a frontier
+closes when someone builds it, and nothing here notices. Re-verify before
+acting:
 
 | Claim | Re-verify |
 |-------|-----------|
-| HEAD baseline | `git log -1 --oneline` |
-| Settle honored; wait-for/since-seq absent | `Select-String -Path src/wm.rs -Pattern 'advance_settles'` and `Select-String -Path src/control.rs -Pattern 'wait_for|since_seq'` (expect no product hits) |
-| Stale "not yet honored" settle comments/docs | `Select-String -Path src/control.rs,docs/terminal-inspection.md -Pattern 'not yet honored'` |
-| `REPLY_TIMEOUT` = 5 s | `Select-String -Path src/control.rs -Pattern 'REPLY_TIMEOUT'` |
-| seq/len landmine still present | `Select-String -Path src/chat.rs -Pattern 'msgs.len\(\) as u64 \+ 1'` |
-| Chat persistence unbuilt | `Select-String -Path src/chat.rs -Pattern 'std::fs|File'` (expect nothing) |
-| A/B never executed | `Test-Path docs/chat-ab-results.md; Test-Path scripts` (expect False, False) |
-| Reliability floor unbuilt | `git grep -n "catch_unwind\|READY_GRACE" -- src/` (expect nothing) |
-| LICENSE/CI absent | `Test-Path LICENSE; Test-Path .github; Select-String -Path Cargo.toml -Pattern 'license'` (expect False, False, nothing) |
-| Frame-plan clamp at HEAD | `Select-String -Path src/frame.rs -Pattern 'process-abort guard'` |
-| Line-number citations (volatile) | re-grep the named symbol before trusting any `path:line` here |
+| Inspection gaps still open | `rg -n -e '"--wait-for"' -e '"--since-seq"' -e '"--region"' -e '"--rows"' src/control.rs` (expect nothing) |
+| seq/len landmine still present | `rg -n 'msgs.len\(\) as u64 \+ 1' src/chat.rs` |
+| Chat persistence unbuilt | `rg -n -e 'std::fs' -e 'File::' src/chat.rs` (expect nothing) |
+| Reliability floor unbuilt | `rg -n 'catch_unwind' src/` (expect nothing — `READY_GRACE` is a FALSE probe, it matches a comment in src/ready.rs) |

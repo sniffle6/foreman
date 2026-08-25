@@ -43,9 +43,15 @@ bash: `"$FOREMAN_EXE" icat "/c/path/to/image.png"` (same for `view`).
 - view takes `--project P` to open in another project (default: your own,
   from `FOREMAN_PROJECT_ID`). Success prints
   `{"ok":true,"terminal":"tN","project":"pN"}`; close the window with its ✕
-  or `foreman close --terminal tN`.
-- Exit codes: 0 shown/opened, 2 bad arguments or unreadable/non-PNG file
-  (view validates the file client-side before touching the GUI).
+  or `foreman close tN` (`close` takes bare `tN` ids — it has no
+  `--terminal` flag, and any unknown `--` flag exits 2).
+- Exit codes: 0 shown/opened; 2 bad arguments or unreadable/non-PNG file
+  (view validates the file client-side before touching the GUI). Exit 1
+  means different things per verb: for `view`, foreman was unreachable or
+  refused the request; for `icat` — which never touches the control pipe,
+  it just writes kitty-graphics bytes to stdout — it means **stdout could
+  not be written**, i.e. the harness-capture / redirect failure above, not
+  a dead GUI.
 - The release foreman.exe is a GUI-subsystem binary: cmd/PowerShell don't
   wait for it or surface its stderr unless output is redirected/piped. A
   silent no-window `view` means the args were bad — rerun with stderr

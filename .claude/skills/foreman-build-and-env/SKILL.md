@@ -1,14 +1,14 @@
 ---
 name: foreman-build-and-env
-description: Use when setting up a fresh Windows machine to build foreman, or when a build/test fails with "cannot find -lgcc_eh", "Access is denied (os error 5)", "error: no library targets found in package `foreman`", or link.exe/MSVC errors; when touching rustup/stable-gnu, w64devkit, libgcc_eh.a, PATH, the kill-foreman.ps1 or cargo-fmt.ps1 hooks; or when asked about the cargo build/run/test loop, per-module test filters, the test census, or the expected-warning baseline.
+description: Use when setting up a fresh Windows machine to build foreman, or when a build/test fails with "cannot find -lgcc_eh", "Access is denied (os error 5)", "error: no library targets found in package `foreman`", or link.exe/MSVC errors; when touching rustup/stable-gnu, w64devkit, libgcc_eh.a, PATH, the kill-foreman.ps1 or cargo-fmt.ps1 hooks; or when asked about the cargo build/run/test loop, per-module test filters, what CI does and does not gate, or the expected-warning baseline.
 ---
 
 # foreman-build-and-env
 
 How to recreate the build environment from nothing, run the build/test loop
 without breaking a live fleet, and tell an expected warning from a new one.
-Baseline: committed HEAD `7fda1c2` (as of 2026-07-01). Repo root:
-`H:\claude code\foreman` — the path contains a space; **always quote it**.
+Repo root: `H:\claude code\foreman` — the path contains a space; **always
+quote it**.
 
 Two terms used below, defined once:
 
@@ -23,7 +23,7 @@ Two terms used below, defined once:
 
 1. **Install rustup** from `https://rustup.rs` (run `rustup-init.exe`, accept
    defaults). Observed working toolchain: rustc/cargo **1.96.0** (as of
-   2026-07-01). The crate is `edition = "2024"` (`Cargo.toml:4`), so anything
+   2026-07-01). The crate is `edition = "2024"` (`Cargo.toml`), so anything
    ≥ 1.85 compiles it, but stay current.
 
 2. **Switch the default toolchain to GNU:**
@@ -44,7 +44,7 @@ Two terms used below, defined once:
    2026-07-01).
 
 4. **Put `C:\w64devkit\bin` on PATH** (persist it, and set it for the current
-   session — the per-session line matches `docs/HANDOFF.md:107`):
+   session — the per-session line matches the one in `docs/HANDOFF.md`):
    ```powershell
    [Environment]::SetEnvironmentVariable('Path', "C:\w64devkit\bin;" + [Environment]::GetEnvironmentVariable('Path','User'), 'User')
    $env:Path = "C:\w64devkit\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
@@ -71,7 +71,8 @@ Two terms used below, defined once:
    ```
 
 7. **Optional — WSL for bash Sessions.** A Session set to bash spawns
-   `wsl.exe` (`src/terminal.rs:164`), i.e. Windows Subsystem for Linux. On a
+   `wsl.exe` (`src/terminal.rs`, the `Shell::Bash` arm), i.e. Windows
+   Subsystem for Linux. On a
    fresh machine run `wsl --install` (needs the Virtual Machine Platform
    Windows feature and virtualization enabled in BIOS/UEFI), then reboot. A
    bash Session failing on a machine without WSL2 is machine setup, not an app
@@ -151,15 +152,16 @@ inventory lives in **foreman-config-and-flags**.
 - All tests are in-crate `#[cfg(test)]` modules; there is **no `tests/`
   directory** (verified) and this is a **bin-only crate** — the sole cargo
   target is `bin foreman` at `src/main.rs` (no `src/lib.rs`, no `[lib]`).
-- Census (as of 2026-07-01, HEAD `7fda1c2`): **353 `#[test]` fns across 16
-  files in `src/`**. Re-derive, don't trust:
-  ```powershell
-  (Select-String -Path "H:\claude code\foreman\src\*.rs" -Pattern '#\[test\]').Count
+- **A census is a query, not a fact — never write one down.** Test totals and
+  per-module counts rot within weeks, and a stale count read as current is
+  worse than no count at all. Derive it when you need it:
   ```
-- Pass state: not re-run while writing this skill (shared `target\` lock).
-  Earlier the same day, pre-commit, the census was 344 green + 9 intentionally
-  red `src/frame.rs` TDD tests; `7fda1c2` then landed the frame-plan
-  implementation, so expect all-green at HEAD — confirm with `cargo test`.
+  rg -c '#\[test\]' src/ | sort -t: -k2 -rn
+  ```
+  The same rule applies to every enumeration in this repo's docs: field lists,
+  "N verbs", "N modules". Write the command, or write nothing.
+- Expect all-green unless a commit message declares red WIP — confirm with
+  `cargo test`, and see **foreman-validation-and-qa** for the flaky-test policy.
 - Per-module runs use a **name filter on the bin target**:
   ```powershell
   cargo test layout::    # src/layout.rs tests
@@ -170,36 +172,37 @@ inventory lives in **foreman-config-and-flags**.
   layout` fails with ``error: no library targets found in package `foreman` ``
   (exit 101). Use the filter form above, or `cargo test --bin foreman <filter>`.
   CLAUDE.md carried this bad form until 2026-08-24 and seeded copies of it
-  across the repo; fixed at the same time. Also stale: `docs/followups-latency-and-control.md:91` says
-  "181 tests" — the count is 353 fns now.
+  across the repo; fixed at the same time.
 
-## Warning baseline (as of 2026-07-01, HEAD `7fda1c2`)
+## Warning baseline
 
-Expected warnings — anything NOT in this table is yours to fix:
-
-| Warning                          | Where                          | Why it's expected                                                                 |
-| -------------------------------- | ------------------------------ | --------------------------------------------------------------------------------- |
-| deprecated `Context::screen_rect` | `src/main.rs:87`              | egui 0.34.3 deprecates it ("split into viewport_rect() and content_rect()"). Fix candidate: `content_rect()`; don't drive-by fix — see foreman-change-control. |
-| dead_code `cwd`/`query`/`selected` | `src/dirpicker.rs:40,44,48`  | False positive — see below                                                         |
-| dead_code `grid_contains`        | `src/inspect.rs:112`           | False positive — see below                                                         |
-| dead_code `is_empty` / `leaves`  | `src/layout.rs:54,69`          | False positive — see below                                                         |
-
-**Why the dead_code ones are false positives:** they are `pub` fns in a
-*binary* crate whose only callers are `#[cfg(test)]` — real component
-accessors used by the test suite. `docs/followups-latency-and-control.md:79-84`
-records the decision: **do not delete them.**
-
-**DOC DRIFT (flagged):** that same doc's list names `ready`, `post`, and
-`chat_post` as warners and `shell` as a write-only field. All four have since
-gone live or been gated: `ready()` has a production caller (`src/wm.rs:1588`),
-`ChatLog::post` is now `#[cfg(test)]` (`src/chat.rs:143`), `chat_post` has a
-production caller (`src/wm.rs:1048`), and `shell` is read at
-`src/terminal.rs:461`. The table above is the verified current set (derived by
-caller inspection; re-verify with a build):
+Derive the current set — do not trust a written list:
 
 ```powershell
 cargo build 2>&1 | Select-String -Pattern 'warning'
 ```
+
+These families are expected; anything else is yours to fix.
+
+**Deprecated `Context::screen_rect`** (`src/main.rs`, in `show_os_chrome`).
+egui 0.34.3 deprecates it ("split into
+viewport_rect() and content_rect()"). Fix candidate: `content_rect()`; don't
+drive-by fix — see **foreman-change-control**.
+
+**`dead_code` on `pub` fns whose only callers are `#[cfg(test)]`.** In a
+*binary* crate rustc does not count a test-only caller as a use, so real
+component accessors used by the test suite warn. **Do not delete them** —
+`docs/followups-latency-and-control.md` records that decision. Examples that
+have held: `LayoutTree::is_empty` (`src/layout.rs`) and `inspect::grid_contains`
+(`src/inspect.rs`).
+
+**Do not treat that membership as a list.** It churns silently in both
+directions: a fn gains a production caller and stops warning (`LayoutTree::leaves`
+now has one in `src/wm.rs`; so do `Session::ready` and `chat_post`), or it gets
+`#[cfg(test)]`-gated and stops warning (`ChatLog::post`, the `dirpicker`
+accessors). A stale "these are false positives" list is exactly how a REAL
+dead-code warning gets waved through — before calling any specific warning
+expected, check that symbol's caller set with `rg` yourself.
 
 ## Build-time error → fix
 
@@ -227,43 +230,40 @@ rustc --version; rustup show active-toolchain; gcc --version | Select-Object -Fi
 Select-String -Path "H:\claude code\foreman\Cargo.lock" -Pattern '^name = "(eframe|egui|alacritty_terminal|portable-pty|interprocess|arboard|resvg|sysinfo|winit)"' -Context 0,1 | ForEach-Object { $_.Line + ' ' + $_.Context.PostContext[0] }
 ```
 
-## There is no CI
+## What CI gates (and what it does not)
 
-No `.github/workflows`, no CI config of any kind is tracked (verified at
-HEAD). Local `cargo test`, the two hooks above, and review are the entire
-pipeline. Nothing will catch what you don't run yourself.
+CI is release-gated only — `.github/workflows/release.yml` runs `cargo test` +
+`cargo build --release` on a `v*` tag push (it also installs the GNU toolchain
+to match local builds, and refuses to release if the tag and the `Cargo.toml`
+version disagree). It is the repo's **only** workflow, and its other two
+triggers do not widen that: `pull_request` is `paths`-restricted to
+`.github/workflows/release.yml` and `install.ps1`, plus manual
+`workflow_dispatch`. So **ordinary commits and ordinary PRs are entirely
+ungated** — nothing runs on them — and local `cargo test` remains the real
+correctness gate. But a knowingly-red WIP commit on main WILL fail the next
+release tag. Do not park a broken test on main and assume nothing will notice.
+
+Re-derive the trigger set rather than trusting this paragraph:
+
+```powershell
+Get-Content .github/workflows/release.yml -TotalCount 12
+```
 
 ## When NOT to use this skill
 
-- **Visually verifying a change** (build + screenshot + Read the PNG) →
-  **build-screenshot** skill.
-- **Running the app or driving the Control plane CLI** (verbs, flags,
-  transport, timeouts) → **foreman-run-and-operate**.
-- **Measuring behavior** (headless send/Snapshot, latency harness) →
-  **foreman-diagnostics-and-tooling**.
 - **Runtime failures** (black Session, resize corruption, dead input) →
-  **foreman-debugging-playbook**; terminal-domain concepts (PTY, ConPTY, VT) →
-  **terminal-emulation-reference**.
-- **Evidence/acceptance standards and test conventions** →
-  **foreman-validation-and-qa**.
-- **Config files, env vars, tunables** → **foreman-config-and-flags**.
-- **Fixing baseline warnings or pinning the toolchain per-repo** — classify
-  through **foreman-change-control** first.
+  **foreman-debugging-playbook**. This skill is build-environment only.
+- **Test conventions and what counts as evidence** (as opposed to how to run
+  the build) → **foreman-validation-and-qa**.
 
 ## Provenance and maintenance
 
-Written 2026-07-01 against HEAD `7fda1c2`; every command and path above was
-run or file-verified on the working machine that day. Drift-prone claims and
-their re-verification one-liners:
+Machine-specific claims that are both load-bearing and volatile, with the
+command that settles each:
 
 | Claim                                   | Re-verify with                                                                 |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
 | Toolchain 1.96.0 / stable-gnu default   | `rustc --version; rustup show active-toolchain`                                |
-| No `rust-toolchain.toml`                | `Test-Path "H:\claude code\foreman\rust-toolchain.toml"` (expect False)        |
-| GCC version dir `16.1.0` + 8-byte stub  | `Get-ChildItem C:\w64devkit\lib\gcc\x86_64-w64-mingw32; (Get-Item C:\w64devkit\lib\gcc\x86_64-w64-mingw32\*\libgcc_eh.a).Length` |
+| GCC version dir + 8-byte `libgcc_eh` stub | `Get-ChildItem C:\w64devkit\lib\gcc\x86_64-w64-mingw32; (Get-Item C:\w64devkit\lib\gcc\x86_64-w64-mingw32\*\libgcc_eh.a).Length` |
 | Hook behavior (matchers, regex, exit 0) | Read `.claude/settings.json`, `.claude/hooks/kill-foreman.ps1`, `.claude/hooks/cargo-fmt.ps1` |
-| Test census 353 / bin-only crate        | census one-liner above; `cargo metadata --no-deps --format-version 1 \| ConvertFrom-Json \| % { $_.packages[0].targets.kind }` |
-| Warning baseline (4 rows)               | `cargo build 2>&1 \| Select-String warning`                                    |
 | Pinned dep versions                     | Cargo.lock one-liner above                                                     |
-| `Shell::Bash` → `wsl.exe`               | `Select-String -Path "H:\claude code\foreman\src\terminal.rs" -Pattern 'wsl.exe'` |
-| No CI                                   | `git -C "H:\claude code\foreman" ls-files \| Select-String 'workflows'` (expect nothing) |

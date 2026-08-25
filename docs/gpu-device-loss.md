@@ -106,7 +106,7 @@ crash-loop guard and an ordered save-and-respawn. It works, and it is kept in
 case glow ever proves worse.
 
 It was rejected because it never saved the agents. Every `Session` owns a
-`KILL_ON_JOB_CLOSE` job (`src/job.rs:37`), so the PTY children die with the
+`KILL_ON_JOB_CLOSE` job (`src/job.rs`), so the PTY children die with the
 process whether it exits cleanly or panics — an ordered restart is still a
 restart. It also carried a vendored fork pinned to one `egui-wgpu` version,
 taxing every future egui upgrade until [emilk/egui#8452] lands.
