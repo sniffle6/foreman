@@ -103,54 +103,9 @@ minimum not break the clamped-scroll behavior from commit 24729ef.
 
 ---
 
-### #9 — Chat injection gating + delivery ACK/retry, composed from EXISTING quiescence signals (fixes stuck-input)
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** high (messages silently lost in real use) · **Priority:** 1 of the chat-reliability series (#9–#15) · **Depends on:** nothing
-
-**Background (shared by #9–#15).** The project chat room delivers posts by
-injecting them into each member terminal's PTY as typed input (push model —
-`ChatRoom::tick` in `src/chat.rs` ~598 produces per-member `Delivery`
-batches; the wm writes them into the `Session`). The
-chat-mentions design doc (`docs/superpowers/specs/2026-06-10-chat-mentions-design.md`)
-already flags quiescence-gating of this injection as a known unsolved gap.
-The state model across this series is deliberately **minimal**: passive
-safe-to-inject (this issue) + self-reported turn-boundary state (#12).
-Richer semantics ("reviewing", "blocked on X") belong in chat messages, not
-the state system.
-
-**Symptom.** Chat posts injected into a recipient CLI sometimes sit in its
-input field and never submit — the synthetic keystrokes (and the Enter) race
-the TUI's rendering and get swallowed mid-repaint. Delivery is
-fire-and-forget; nobody notices the loss. Worst observed chat bug.
-
-**Request — delivery-safety, NOT agent-state.** Three parts:
-1. **Gate: do NOT build new detection.** Compose the quiescence signals that
-   already exist in-process into a per-terminal "safe-to-inject" gate:
-   `Session::ready` + `output_gen` (src/terminal.rs), the output-settle
-   machinery (`advance_settles`, `DEFAULT_SETTLE_MS=120`, src/wm.rs), and the
-   cursor-rest gate (src/caret.rs, `CURSOR_SETTLE=50ms`). Hold keystroke
-   injection for a member until the gate opens.
-2. **ACK:** after injecting, verify the frame was consumed — injected text
-   echoed back / input buffer cleared — rather than assuming.
-3. **Retry:** if swallowed, re-inject with backoff (bounded attempts);
-   sender gets per-recipient **delivered/pending** status (`foreman chat`
-   reply path in `src/control.rs`).
-
-**Notes.** The delivery cursor (`Tab::last_delivered_seq`, chat.rs ~436)
-currently advances at hand-off; with ACK it should advance only on confirmed
-delivery so a swallowed message is re-delivered, not skipped. Echo detection
-must tolerate TUIs that render input boxes (transformed echo) — match the
-message body substring in recent output; treat no-echo-within-timeout as
-swallowed. Keep the gate/ACK seams pure and unit-testable (synthetic output
-streams), per the PTY-test conventions. This issue gates *when it is safe to
-type*; it does not claim to know the agent is done — that ambiguity is #12's
-domain.
-
----
-
 ### #10 — Route idle/join/exit chat notifications to the human only, never into agent PTYs
 
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (trivial, high value) · **Priority:** 2 of the chat-reliability series · **Depends on:** nothing
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement (trivial, high value) · **Depends on:** nothing
 
 **Symptom.** Idle notifications (and join/exit housekeeping noise) are
 delivered into agent members' terminals as typed input. For an agent this is
@@ -171,34 +126,9 @@ the human viewer shows it and neither agent PTY receives bytes.
 
 ---
 
-### #11 — Chat seen-seq dedupe: live injection and `--history` share one delivered marker
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** bug (duplicate delivery) · **Priority:** 3 of the chat-reliability series · **Depends on:** nothing
-
-**Symptom.** A member can receive the same message twice — once via live PTY
-injection and once by reading `foreman chat --history` — because the two
-paths don't share a seen-seq marker. Messages carry seq numbers, so dedupe
-is cheap; the marker just isn't shared.
-
-**Request.** One per-member delivered-seq marker consulted by both paths:
-live injection already advances `Tab::last_delivered_seq` (chat.rs ~436,
-consumed by `deliver_after` ~240); `--history` (served in `src/control.rs`)
-should default to a "since my cursor" view so a catching-up agent doesn't
-re-read what was already injected. Full history stays available behind a
-flag (`--all`) — agents legitimately re-read context.
-
-**Design note.** Decide the semantics deliberately: does reading history
-*consume* (advance the cursor, so live injection skips those seqs), or is
-the cursor advanced only by injection with history default-filtered by it?
-The latter is safer (no risk of a history read suppressing live delivery the
-recipient never saw). Interacts with #9: once ACK exists the cursor means
-"confirmed delivered" — a history read must not fake an ACK.
-
----
-
 ### #12 — `foreman state` cooperative verb + CLI hook adapters (turn-boundary signal; campaign-gated)
 
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 4 of the chat-reliability series · **Depends on:** nothing hard; **must route through the agent-state campaign** (`.claude/skills/foreman-agent-state-campaign/SKILL.md`)
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Depends on:** nothing hard; **must route through the agent-state campaign** (`.claude/skills/foreman-agent-state-campaign/SKILL.md`)
 
 **Request.** Implement the campaign's pre-planned cooperative verb —
 `foreman state working|blocked|done|idle` — and ship adapters that auto-wire
@@ -223,7 +153,7 @@ agent session files).
    best-effort, never blocks launch).
 3. **Codex adapter:** same via Codex's `notify` config.
 4. **Degradation:** unadapted/unknown CLIs simply have no turn-boundary
-   state; consumers (e.g. #13) fall back to #9's safe-to-inject gate only.
+   state; consumers (e.g. #13) get nothing and must deliver immediately.
 
 **Notes.** Agent identity for choosing an adapter already exists
 (process-tree scan in `src/proc.rs` + OSC-title fallback). Staleness: a
@@ -236,81 +166,34 @@ signal, not a security boundary.
 
 ### #13 — Turn-boundary chat queueing: hold routine posts until the recipient's turn ends; `--urgent` bypass
 
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 5 of the chat-reliability series · **Depends on:** #9, #12
+**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Depends on:** #12
 
 **Symptom.** Chat posts land mid-task as fake user input while the recipient
 agent is mid-turn, forcing a context switch. There is no way to hold routine
 messages until the agent finishes its turn.
 
 **Request.** Default chat delivery waits for the recipient's **turn
-boundary** — #12's self-reported state (`done`/`idle`) when available,
-falling back to #9's passive safe-to-inject gate for CLIs with no adapter.
-Add an `--urgent`/`--interrupt` flag to `foreman chat` preserving today's
-immediate-inject behavior; urgent should be human-only or role-gated
-(see #14) so agents can't stampede each other.
+boundary** — #12's self-reported state (`done`/`idle`). A member whose CLI has
+no adapter reports no state and is delivered to immediately, exactly as today.
+Add an `--urgent`/`--interrupt` flag to `foreman chat` preserving immediate
+injection for adapted members too.
 
-**Notes.** Two layers compose, and stay distinct: turn-boundary decides
-*when a message becomes eligible*; #9's gate + ACK decide *when the
-keystrokes are physically safe and whether they landed*. The per-member
-delivery cursor already provides ordering — a held member accumulates and
-then receives the batch in seq order (existing `deliver_after` semantics).
-Beware starvation: an agent that never reports `idle`/`done` must not hold
-messages forever — #12's staleness fallback plus the sender-visible
-`pending` state from #9 (so a human can escalate with `--urgent`) cover it.
+**Notes.** This decides *when a message becomes eligible* — it says nothing
+about whether the keystrokes physically landed, which remains unsolved (see
+the delivery-reliability note below). The per-member delivery cursor already
+provides ordering: a held member accumulates and then receives the batch in
+seq order (existing `deliver_after` semantics). Beware starvation — an agent
+that never reports `idle`/`done` must not hold messages forever, so #12's
+staleness fallback has to force delivery rather than queue indefinitely.
 
----
-
-### #14 — Chat member roles: `--role` on open/dispatch, role in roster and message frames
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Priority:** 6 of the chat-reliability series · **Depends on:** nothing
-
-**Symptom.** Chat members don't know each other's function: agents burn chat
-posts announcing what they are, and self-assign work outside their intended
-scope.
-
-**Request.**
-1. `--role <string>` on `foreman open`/dispatch (`src/control.rs`) and on
-   first join for members that joined by posting; stored on the member
-   (`src/chat.rs` member records, join-order roster ~464).
-2. Role rendered in the roster and in **every** chat frame — injection
-   framing and history lines share one format (chat.rs ~85–115:
-   `[chat p1 #14] t2: text` becomes `[chat p1 #7] t1(reviewer): ...`).
-3. Roster-with-roles injected into each member's context at join and on any
-   membership change, so every agent always knows who's who without asking.
-
-**Notes.** Role is a free-form string label, not an enforcement mechanism —
-scope discipline still comes from prompts; the role line just gives agents
-the information. Changing the frame format touches the transcript/wire
-format agents parse — **ask-first per foreman-change-control** (OpenReply /
-wire-compat rules), and keep untargeted frames byte-identical where existing
-chat.rs frame tests assert on them. `--role` also pairs with #13's "urgent
-is role-gated".
-
----
-
-### #15 — (Optional, parallel) OSC 133 spike — verify ConPTY passthrough of semantic prompt marks, detect-only
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** spike (1 day, timeboxed) · **Priority:** 7 of the chat-reliability series — optional, parallel; **nothing above depends on it**
-
-**Request.** Run the spike exactly as scoped in
-`docs/warp-feature-candidates.md` §1 (verdict there: SPIKE-FIRST):
-1. Verify the vendored-OpenConsole ConPTY actually passes `ESC]133;D;N`
-   (command-finished-with-exit-code) marks through to foreman — passthrough
-   is currently **unverified**; if ConPTY eats them, the whole feature is
-   dead and the spike ends there.
-2. **Detect-only** — interception seam is `advance_scanned`
-   (src/terminal.rs:242), no alacritty fork needed. No shell-profile
-   injection in this spike.
-3. Check empirically whether Claude Code/Codex emit 133 marks around
-   embedded tool executions (expectation from the analysis: marks stop
-   flowing while a TUI agent runs, so this signal helps **plain-shell panes
-   only**).
-
-**Outcome.** A written verdict feeding the agent-state campaign
-(`.claude/skills/foreman-agent-state-campaign/SKILL.md`) as a candidate
-passive signal for plain-shell panes — it does not change the campaign's
-position that self-reporting (#12) is the primary turn-boundary mechanism
-for agent TUIs.
+**Known unsolved, adjacent.** Chat injection is fire-and-forget: posts typed
+into a recipient CLI sometimes sit in its input field and never submit,
+because the synthetic keystrokes race the TUI's repaint and get swallowed.
+Nobody notices the loss. This issue makes that *less* likely by delivering at
+a quiet moment, but does not detect or retry a swallowed message. Recorded
+here so the gap is not forgotten: a previous entry specced an echo-detection
+ACK plus bounded retry for it, and was dropped on 2026-08-25 as over-built —
+the symptom is still real, the cure was worse.
 
 ---
 
