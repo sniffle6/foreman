@@ -11,7 +11,19 @@ alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-eframe = "0.34.3"
+# glow (OpenGL/WGL), NOT the default wgpu backend. egui-wgpu `panic!`s outright
+# when a staging-buffer allocation fails, which is what a GPU device loss looks
+# like — and Windows loses the device on every sleep/display power transition.
+# egui_glow only logs on GL_CONTEXT_LOST. See docs/gpu-device-loss.md before
+# touching this line; `default-features = false` is required because eframe
+# prefers wgpu whenever both backends are enabled.
+eframe = { version = "0.34.3", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 interprocess = "2"
 png = "0.17"
 portable-pty = "0.9.0"

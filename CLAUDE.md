@@ -44,15 +44,14 @@ Everything else that has cost hours is in **foreman-debugging-playbook** and
   untouched.
 - **Tabs are level-restricted.** Any window can tab onto any other in the *same*
   `WindowManager`: projects with projects, terminals with terminals.
-- **App vanished after the laptop woke from sleep = a wgpu device loss**, not a
-  foreman bug in the usual sense. Handled by an ordered *restart*, never by
-  recovery: `vendor/egui-wgpu` is a 3-hunk local fork that deletes egui-wgpu's
-  unconditional `panic!` in `update_buffers`, and `App::logic` then saves the
-  workspace and respawns. Never try to recreate the wgpu device
-  (gfx-rs/wgpu#9277 — even a fill-the-screen app could not do it reliably).
-  Crash evidence is `%APPDATA%\foreman\foreman_panic.log` (absolute and
-  timestamped since v0.3.5). Full story: `docs/gpu-device-loss.md`; the flags,
-  crash-loop guard and respawn primitive live in `src/gpu.rs`.
+- **foreman renders on glow (OpenGL), not wgpu.** That is a deliberate,
+  measured choice, not a leftover: Windows loses the GPU device on sleep and
+  display power transitions, and `egui-wgpu` responds with an unconditional
+  `panic!` in `update_buffers` that aborts the process. `egui_glow` only logs.
+  Do not "modernize" the `eframe` line in `Cargo.toml` back to wgpu — read
+  `docs/gpu-device-loss.md` first; it records the side-by-side test that
+  settled it. Crash evidence is `%APPDATA%\foreman\foreman_panic.log`
+  (absolute and timestamped).
 
 Details, seam map, threading model, and the borrow rules: **foreman-architecture-contract**.
 

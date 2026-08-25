@@ -936,7 +936,11 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self) {
+    /// The `_gl` parameter is not optional styling — `eframe::App::on_exit` is
+    /// `cfg`'d on the renderer feature (eframe `src/epi.rs:231-238`), so the
+    /// glow build's trait method takes the context and the wgpu build's does
+    /// not. This is the only foreman signature the backend switch touches.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_workspace();
     }
 }
