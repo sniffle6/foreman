@@ -126,77 +126,6 @@ the human viewer shows it and neither agent PTY receives bytes.
 
 ---
 
-### #12 — `foreman state` cooperative verb + CLI hook adapters (turn-boundary signal; campaign-gated)
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Depends on:** nothing hard; **must route through the agent-state campaign** (`.claude/skills/foreman-agent-state-campaign/SKILL.md`)
-
-**Request.** Implement the campaign's pre-planned cooperative verb —
-`foreman state working|blocked|done|idle` — and ship adapters that auto-wire
-it for known CLIs. Per the campaign, **self-reporting is the primary
-mechanism, not a fallback**: passive PTY signals cleanly detect *working*
-(output flowing), but done vs idle vs waiting-on-you is observationally
-ambiguous (TUI spinners keep the screen changing while parked at an input
-box). Heuristics for needs-input are explicitly out of scope, as are the
-campaign's fenced-off approaches (keyword-sniffing screen text, parsing
-agent session files).
-
-1. **Verb:** new control-plane subcommand in `src/control.rs` (same
-   named-pipe plane as `open`/`chat`/`close`; `FOREMAN_TERMINAL_ID` makes it
-   self-targeting). **Additive wire change — ask-first per
-   foreman-change-control**; this issue notes the gate, it does not preempt
-   the decision. The exact state vocabulary is owned by the campaign (its
-   G1–G3 anti-flap validation gates and phase structure apply) — don't
-   finalize the word list in this issue.
-2. **Claude Code adapter:** wire Claude Code's Stop hook (fires at end of
-   turn) and Notification hooks to call `foreman state`, installed via the
-   existing skill/config-install mechanism (`src/skills_install.rs` pattern —
-   best-effort, never blocks launch).
-3. **Codex adapter:** same via Codex's `notify` config.
-4. **Degradation:** unadapted/unknown CLIs simply have no turn-boundary
-   state; consumers (e.g. #13) get nothing and must deliver immediately.
-
-**Notes.** Agent identity for choosing an adapter already exists
-(process-tree scan in `src/proc.rs` + OSC-title fallback). Staleness: a
-`working` report from a process that died must not wedge consumers — clear
-state on process exit (foreman owns the PTY and sees it) plus a long
-staleness timeout back to unknown. Self-reported state is a scheduling
-signal, not a security boundary.
-
----
-
-### #13 — Turn-boundary chat queueing: hold routine posts until the recipient's turn ends; `--urgent` bypass
-
-**Status:** open · **Filed:** 2026-07-10 · **Severity:** enhancement · **Depends on:** #12
-
-**Symptom.** Chat posts land mid-task as fake user input while the recipient
-agent is mid-turn, forcing a context switch. There is no way to hold routine
-messages until the agent finishes its turn.
-
-**Request.** Default chat delivery waits for the recipient's **turn
-boundary** — #12's self-reported state (`done`/`idle`). A member whose CLI has
-no adapter reports no state and is delivered to immediately, exactly as today.
-Add an `--urgent`/`--interrupt` flag to `foreman chat` preserving immediate
-injection for adapted members too.
-
-**Notes.** This decides *when a message becomes eligible* — it says nothing
-about whether the keystrokes physically landed, which remains unsolved (see
-the delivery-reliability note below). The per-member delivery cursor already
-provides ordering: a held member accumulates and then receives the batch in
-seq order (existing `deliver_after` semantics). Beware starvation — an agent
-that never reports `idle`/`done` must not hold messages forever, so #12's
-staleness fallback has to force delivery rather than queue indefinitely.
-
-**Known unsolved, adjacent.** Chat injection is fire-and-forget: posts typed
-into a recipient CLI sometimes sit in its input field and never submit,
-because the synthetic keystrokes race the TUI's repaint and get swallowed.
-Nobody notices the loss. This issue makes that *less* likely by delivering at
-a quiet moment, but does not detect or retry a swallowed message. Recorded
-here so the gap is not forgotten: a previous entry specced an echo-detection
-ACK plus bounded retry for it, and was dropped on 2026-08-25 as over-built —
-the symptom is still real, the cure was worse.
-
----
-
 ### #16 — Text selection vs scrolling: highlight doesn't track content; can't scroll mid-selection
 
 **Status:** open · **Filed:** 2026-07-10 · **Severity:** medium (core-interaction correctness)
@@ -247,6 +176,34 @@ forwards to the app (see #7/#8) and selection there is screen-static by
 nature. Repro before fixing: two panes, generate scrollback (`dir -r` /
 long build log), select mid-screen, wheel both ways; then repeat holding the
 drag.
+
+### #18 — Chat injection is fire-and-forget: posts get swallowed and silently lost
+
+**Status:** open · **Filed:** 2026-08-25 · **Severity:** high (silent message loss)
+
+**Symptom.** The project chat room delivers posts by injecting them into each
+member terminal's PTY as typed input. Sometimes the injected text lands in the
+recipient CLI's input field and is never submitted — the synthetic keystrokes
+(and the Enter) race the TUI's repaint and get swallowed. Delivery is
+fire-and-forget, so nothing notices: the sender sees success, the recipient
+never sees the message, and the delivery cursor advances past it anyway.
+
+**Evidence / where it lives.** `ChatRoom::tick` (`src/chat.rs`) produces
+per-member `Delivery` batches that the wm writes into the `Session`.
+`Tab::last_delivered_seq` advances at hand-off, not on confirmed receipt, so a
+swallowed post is skipped rather than retried. There is no ACK path.
+
+**Related but not a fix.** A `--re <seq>` handshake exists (`src/control.rs`,
+frames in `chat.rs`) where an agent's reply counts as an acknowledgement. That
+is an agent-level courtesy, not delivery detection — it cannot fire for a
+message the agent never saw.
+
+**Candidate directions (deliberately unspecified).** An earlier entry specced
+a quiescence gate plus echo-detection ACK plus bounded retry; it was dropped
+on 2026-08-25 as over-built for a delivery model that is not yet proven. If
+this is picked up, weigh simply not injecting into PTYs at all — a pull model
+(agents read chat when they choose) removes the failure class rather than
+detecting it.
 
 ---
 
