@@ -941,19 +941,56 @@ impl eframe::App for App {
     }
 }
 
-/// Log any panic (message + location + backtrace) to `foreman_panic.log` before
-/// the default hook runs. A panic inside the egui/winit callback unwinds across
-/// the platform event loop and aborts the process with an opaque exit code, so
-/// without this the cause is invisible. Safe to keep; it only writes on a panic.
+/// File name of the crash log, kept in the same `%APPDATA%\foreman` directory
+/// that holds `settings.json`.
+const PANIC_LOG_FILE: &str = "foreman_panic.log";
+
+/// Absolute path to the crash log. Falls back to a CWD-relative file when
+/// `APPDATA` cannot be resolved — a log in an awkward place beats no log.
+fn crash_log_path() -> std::path::PathBuf {
+    crash_log_path_in(config::config_dir())
+}
+
+/// Pure seam for [`crash_log_path`], so the fallback is testable without
+/// mutating the process environment (`set_var` is `unsafe` in edition 2024 and
+/// races every other test in the binary).
+fn crash_log_path_in(dir: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    dir.map(|d| d.join(PANIC_LOG_FILE))
+        .unwrap_or_else(|| std::path::PathBuf::from(PANIC_LOG_FILE))
+}
+
+/// Log any panic (message + location + backtrace) to
+/// `%APPDATA%\foreman\foreman_panic.log` before the default hook runs. A panic
+/// inside the egui/winit callback unwinds across the platform event loop and
+/// aborts the process with an opaque exit code, so without this the cause is
+/// invisible. Safe to keep; it only writes on a panic.
+///
+/// Two properties this file is useless without, both learned while diagnosing a
+/// GPU device-loss crash (GH #2, #3):
+///
+/// - **Absolute path.** Opening a bare relative name puts the log in whatever
+///   CWD the process inherited, so it lands somewhere different depending on
+///   whether foreman started from the Start Menu, a shell, or an installer
+///   shim — and a bug report saying "the log is at X" is then true only for the
+///   reporter.
+/// - **A timestamp per entry.** The file is append-only, so without one you can
+///   date exactly one panic (the last, via file mtime) however many it holds.
+///   Correlating panics against Windows Kernel-Power sleep/resume events is what
+///   identified GH #2, and 8 of its 10 recorded panics were undateable.
 fn install_panic_logger() {
     let default = std::panic::take_hook();
+    // Resolve ONCE, out here: `config_dir` does a `create_dir_all`, which must
+    // not run on an already-unwinding thread.
+    let path = crash_log_path();
     std::panic::set_hook(Box::new(move |info| {
+        // Local time, matching how Kernel-Power events read in Event Viewer.
+        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
         let bt = std::backtrace::Backtrace::force_capture();
-        let line = format!("=== foreman panic ===\n{info}\nbacktrace:\n{bt}\n\n");
+        let line = format!("=== foreman panic {ts} ===\n{info}\nbacktrace:\n{bt}\n\n");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("foreman_panic.log")
+            .open(&path)
         {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
@@ -1189,6 +1226,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(rx, upd_event_rx, upd_effect_tx)))
         }),
     )
+}
+
+#[cfg(test)]
+mod crash_log_tests {
+    use super::*;
+
+    #[test]
+    fn crash_log_lands_next_to_settings_when_appdata_resolves() {
+        let dir = std::path::PathBuf::from(r"C:\Users\someone\AppData\Roaming\foreman");
+        assert_eq!(
+            crash_log_path_in(Some(dir.clone())),
+            dir.join("foreman_panic.log")
+        );
+    }
+
+    #[test]
+    fn crash_log_falls_back_to_a_bare_name_when_appdata_is_unresolvable() {
+        // Not a silent no-op: losing the record entirely is strictly worse than
+        // writing it to the CWD, which is what every build did before GH #3.
+        assert_eq!(
+            crash_log_path_in(None),
+            std::path::PathBuf::from("foreman_panic.log")
+        );
+    }
 }
 
 #[cfg(test)]
