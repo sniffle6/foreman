@@ -74,6 +74,28 @@ viewer window is the exception — it always opens floating.
 Tabs are unchanged: a tab stack is just a window (`Win.tabs`), so a tree leaf
 with multiple tabs IS a tabbed container sitting in the layout.
 
+### Why there is no `Node::Tabbed`
+
+`enum Node` in `src/layout.rs` has only `Leaf` and `Split`, which looks
+incomplete next to i3 and tmux — both of which do have a tabbed container node.
+It was considered and rejected on 2026-06-11, and the reasoning is worth keeping
+because this is the change a reader is most likely to re-propose.
+
+A window in this codebase *already is* a tab stack: `Win.tabs` with `Win.active`,
+plus merge and untab, and a body of tests built on that primitive
+(`rg -o 'fn [a-z_]*tab[a-z_]*\(\)' src/wm.rs`). A tree leaf pointing at a
+multi-tab `Win` delivers every agreed behavior — a tabbed group inside any
+split, and splitting from a tab splits that stack's pane — so a `Tabbed` node
+would have bought nothing and cost a rewrite of the primitive those tests pin.
+
+The one thing the chosen model cannot express is **a tab containing a split
+subtree**. That was not wanted, and still isn't. If it ever is, `Node::Leaf` can
+become a node-with-layout later without redoing the tree work — so the cheap
+model is not a dead end, which is the other half of why it won.
+
+(Recorded here because the plan that carried this decision was deleted once the
+work shipped, and unlike the rest of that plan it had no surviving spec.)
+
 ## Gotchas
 
 - **Zoom is an overlay, not a layout change.** Un-zooming never reflows

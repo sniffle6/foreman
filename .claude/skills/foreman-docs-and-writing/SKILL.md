@@ -41,6 +41,18 @@ built", "not yet honored", an epic header that still says PLANNED) read as
 perfectly good prose to a grep, and they were the second-largest source of wrong
 claims in the audit. Nothing but the discipline below catches those.
 
+**Never read `cite-guard: clean` as "this doc is accurate."** It proves every
+symbol the doc names still exists. It says nothing about whether the *behavior*
+described around those symbols is still true, and a doc that names only live
+symbols passes green while being wrong in every sentence that matters. That is
+not hypothetical: `docs/project-directories.md` documented the directory picker
+as a highlight-and-drill list — Right/Tab to descend, type to filter — long
+after it was rewritten as an address-bar path field where Tab is eaten and Enter
+accepts the field, not the highlight. Every symbol it cited was live, so the
+hook reported clean the whole time; it was caught by a human reading it against
+the running app. When you change how something *behaves* without renaming
+anything, the guard will not save you — reread the feature doc yourself.
+
 Three ways to say "I meant it", in order of preference: put a negation cue on the
 line (`any hit means…`, `expect nothing`, `was deleted`, `no longer`), which is
 how a negative probe or a removal record should read anyway; declare the whole
