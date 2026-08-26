@@ -101,7 +101,7 @@ Foreman's first window model: a `Zone` enum with 9 variants
 | 2026-06-04 | `87464e4` | Initial commit ships snap zones (incl. hold-to-maximize) |
 | 2026-06-05 | `e438a83` | `compose_zone` per-axis transition table: two perpendicular directions walk into a corner |
 | 2026-06-11 | (epic banner) | User reverses the epic's §1 decision "we are NOT building a BSP tile tree" |
-| 2026-06-11 21:46 | `4bbc55a` | 1433-line plan `docs/superpowers/plans/2026-06-11-tree-floating-windows.md` |
+| 2026-06-11 21:46 | `4bbc55a` | The tree + floating-windows plan lands (deleted once it shipped; `git show 4bbc55a`) |
 | 2026-06-11 21:59 | `daeda90` | Layout tree lands as a single squash (683-line `src/layout.rs`) — see history hazards |
 | 2026-06-11 evening | `f3c76f0`..`0d714de`, `37687b5` | Tree wired into keyboard/move/split/resize; new Wins tile by default |
 | 2026-06-11 22:43 | `31a9120` | "delete the 9-zone snap system" — `Zone`, `zone_rect`, `Win.snap`, `WindowManager.split` removed |
@@ -165,8 +165,9 @@ plane would confirm a Member acknowledged a post.
   existed **on no branch**. `git log --all -S "Selection::new"` matched only
   the doc commit itself. The tree plan records why: the doc was "untracked
   pending the selection-rewrite recovery"
-  (`docs/superpowers/plans/2026-06-11-tree-floating-windows.md`) — the
+  (the tree + floating-windows plan) — the
   rewrite lived in a working tree that was lost; only the doc was recovered.
+  (That plan has since been deleted — read it back with `git show 4bbc55a`.)
   Throughout the window the real code stayed hand-rolled
   `sel_anchor`/`sel_head: Option<(usize, usize)>` viewport cells, copied by a
   `selection_text` that converted with the *current* `display_offset`.
@@ -395,9 +396,9 @@ One row is kept because it is the incident that taught the lesson:
 | `31a3db4` consolidation | 12 files, +2080/−164 across caret/chat/config/control/icons/input/inspect/proc/terminal/wm **plus** two 06-15-dated docs, under a `feat(tabs)` subject; body admits "Also consolidates in-progress work across ... modules" | ~2 weeks of multi-module WIP under one tabs-flavored subject — blame or bisect landing here tells you almost nothing about intent |
 | `37687b5` | First message line is literally `@` (PowerShell here-string leak); the real subject is line 2: "feat(wm): new terminals and projects tile by default" | Subject greps and changelog tools misread it. Commit-message conventions: **foreman-docs-and-writing** |
 | Few merge commits | Run `git log --oneline --merges` first — the count grows, but history stays overwhelmingly linear | `git log --first-parent main` ≈ the full mainline; first-parent reading rarely hides anything |
-| Zero file deletions | `git log --diff-filter=D --oneline --all` returns **nothing** — still true; re-run it, it is a one-line check | Every file ever added still exists; dead code dies by in-file edits — hunt lifetimes with `-S`, not `--follow` on deleted paths |
+| Almost no file deletions | `git log --diff-filter=D --oneline --all` — re-run it, it is a one-line check. The 2026-08-25 plan purge under `docs/superpowers/plans/` is the bulk of what it returns; **no `src/` file has ever been deleted** (`git log --diff-filter=D --oneline --all -- 'src/*'` is the check that matters for code) | Dead code dies by in-file edits, not by removing files — hunt lifetimes with `-S`, not `--follow` on deleted paths. For a plan that vanished, `--diff-filter=D --name-only` names the removing commit and `git show <commit>^:<path>` reads it back |
 | Commit-activity gaps | No commits (any ref) 06-06..06-08, 06-13..06-17, 06-19..06-25 | Gaps ≠ idle: the A/B plan is dated 06-15, mid-gap, committed 06-29. Look for later consolidation commits and dangling objects |
-| Plan dates ≠ commit dates | `docs/superpowers/plans/*` filenames carry authoring dates; several were committed much later | Date a decision by the plan filename *and* `git log -- <path>` |
+| Plan/spec dates ≠ commit dates | `docs/superpowers/` filenames carry authoring dates; several were committed much later | Date a decision by the filename *and* `git log --all -- <path>` (use `--all` and keep the path even if the file is gone — deleted plans still answer) |
 
 **Notable dangling objects.** Enumerate the current set yourself —
 `git fsck --no-reflogs 2>$null | Select-String "dangling commit"` — the list
@@ -449,8 +450,10 @@ git log --all -S "exact code string"   # or pivot to string lifetime
 ```
 
 **Blame discipline:** when `git blame` answers `daeda90` or `31a3db4`, you
-have learned nothing — pivot to `-S`/`-L`, the dated plan under
-`docs/superpowers/plans/`, and (for `daeda90`) the dangling chain.
+have learned nothing — pivot to `-S`/`-L`, the dated spec under
+`docs/superpowers/specs/` (or the plan of that era, which lives in history now:
+`git log --diff-filter=D --name-only -- docs/superpowers/plans/`), and (for
+`daeda90`) the dangling chain.
 
 **Adding an entry:** when a battle settles (fix rejected, decision reversed,
 investigation closed), append it here in the same symptom → wrong turns →

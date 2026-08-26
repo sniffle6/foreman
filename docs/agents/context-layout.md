@@ -42,11 +42,12 @@ routing table.
 - **Don't re-fatten `CLAUDE.md`.** The instinct when a bug bites is to add a
   warning at the top. Add it to the matching skill instead and let the routing
   table do its job. Over ~110 lines means something belongs elsewhere.
-- **Watch the plan-template ratchet.** The old implementation plans under
-  `docs/superpowers/plans/` each ended with a step like "add one line to the
-  `CLAUDE.md` architecture bullet". One line per plan, plan after plan, and
-  that is literally how the module map got there. New plans update
-  `docs/HANDOFF.md` §2 instead.
+- **Watch the plan-template ratchet.** The old implementation plans each ended
+  with a step like "add one line to the `CLAUDE.md` architecture bullet". One
+  line per plan, plan after plan, and that is literally how the module map got
+  there. Those plans were deleted once their work shipped — read one back with
+  `git log --diff-filter=D --name-only -- docs/superpowers/plans/`. New plans
+  update `docs/HANDOFF.md` §2 instead.
 - **One home per fact.** If a skill and `CLAUDE.md` both say it, `CLAUDE.md`
   loses. Duplicates drift and the stale copy wins about half the time.
 - **`AGENTS.md` routes by file path, `CLAUDE.md` routes by skill name.** Codex

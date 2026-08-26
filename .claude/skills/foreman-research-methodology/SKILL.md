@@ -125,9 +125,9 @@ quite the one that was agreed" — that unsolved gate is now
 |---|---|---|
 | 1. Hunch / observed problem | A dated, measured problem statement | "invoked the foreman-dispatch skill, then still spent 5m34s / 23.5k tokens re-deriving facts from source" (`docs/superpowers/specs/2026-06-10-foreman-skills-split-design.md`) |
 | 2. Spec | `docs/superpowers/specs/<date>-<name>-design.md` — Status line, decision table, **rejected alternatives with why**, out-of-scope list | the A/B design; the mentions design |
-| 3. Plan | `docs/superpowers/plans/<date>-<name>.md` — checkbox-executable ("Steps use checkbox (`- [ ]`) syntax for tracking") | `2026-06-15-chat-room-ab-experiment.md` |
-| 4. Execution | Subagent-driven commit series; session state in `docs/superpowers/sessions/` | agent-group-chat: 11 commits `61b515e`→`45f4725`, each task a fresh implementer + spec review + quality review |
-| 5. Consolidation | Feature doc in `docs/`, vocabulary entry in `CONTEXT.md`, tests | `docs/tiling-tree.md`; CONTEXT.md's "Outbox", "Caret gate" |
+| 3. Plan | `docs/superpowers/plans/<date>-<name>.md` — checkbox-executable ("Steps use checkbox (`- [ ]`) syntax for tracking") | `2026-06-15-chat-room-ab-experiment.md` — still there because the experiment was never run |
+| 4. Execution | Subagent-driven commit series | agent-group-chat: 11 commits `61b515e`→`45f4725`, each task a fresh implementer + spec review + quality review |
+| 5. Consolidation | Feature doc in `docs/`, vocabulary entry in `CONTEXT.md`, tests — **then delete the plan** (`docs/superpowers/README.md`); the spec stays forever | `docs/tiling-tree.md`; CONTEXT.md's "Outbox", "Caret gate" |
 | 6. Distillation | Serena memory write for cross-session recall (location referenced in `CLAUDE.md` § Session Context) | — |
 
 House style for stages 2–5 docs is **foreman-docs-and-writing**; what "tests"

@@ -119,12 +119,10 @@ The pins: `mono_paint_cache_hit_does_zero_layouts`,
 - `src/geom.rs` — `CellMetrics`, the live pixel geometry the blit uses
 - `docs/theme-system.md` — why `colors` is in the key (live theme edits)
 
-> **Stale doc warning:** `docs/superpowers/plans/2026-07-04-render-read-perf.md`
-> describes an earlier design for this — `frame::text_rows` returning `StyleRun`
-> spans, cached behind a single `Option<(GalleyKey, Arc<Galley>)>` on `Session`.
-> The per-placement design above superseded it. `frame::overlays` from that plan
-> is still live, but `text_rows`/`StyleRun` no longer have a production caller
-> (the compiler says so) — they survive only as a **test oracle**:
-> `plan_paint_clamps_like_text_rows` checks the new walk clamps the grid the same
-> way the old one did. Don't delete them expecting dead code, and read the plan
-> as history rather than as the current shape.
+> **Don't delete `text_rows` expecting dead code.** An earlier design (2026-07-04)
+> cached whole-row `StyleRun` spans from `frame::text_rows` behind a single
+> `Option<(GalleyKey, Arc<Galley>)>` on `Session`. The per-placement design above
+> superseded it. `frame::overlays` from that era is still live, but
+> `text_rows` / `StyleRun` no longer have a production caller (the compiler says
+> so) — they survive only as a **test oracle**: `plan_paint_clamps_like_text_rows`
+> checks the new walk clamps the grid the same way the old one did.

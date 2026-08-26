@@ -78,7 +78,8 @@ invalidates one section instead of the whole file.
 | `docs/foreman.md` | **TRAP** (older narrative notes) | Carries a partial-supersession banner: only the "Tiling tree + floating" section near the end is current; the snap-zone sections above it describe deleted code. Read the banner first. |
 | `docs/epics/*.md` | Design + decision history | **Decision history reliable; status headers LAG code.** See below. |
 | `docs/contracts/` | Pinned seam agreements + status trackers | When a contract's header and its remaining-work tracker disagree, **the tracker wins over the contract header** — the tracker is edited as work lands, the header is written once. |
-| `docs/superpowers/` and `docs/plans/` | Workflow HISTORY — specs, executable plans, session resume-state | **Tier-D history: read for *why*, never for *how*.** Do not count them and do not edit them to match later reality. |
+| `docs/superpowers/specs/` | Design records — the decision AND its rejected alternatives | **Tier-D history: read for *why*, never for *how*.** Kept permanently; do not edit them to match later reality. Some `src/` module headers cite one by path (`rg -n 'docs/superpowers' src/`). |
+| `docs/superpowers/plans/`, `docs/plans/` | Checkbox-executable plans for work that has **not shipped yet** | A plan is deleted once its work lands (`docs/superpowers/README.md`), so anything still here is unbuilt — read it as a proposal, never as a description of the tree. |
 | Dated snapshot docs (`docs/YYYY-MM-DD-*.md`) | Point-in-time session findings | Historical by construction. The date in the filename is the claim's expiry warning. |
 | `docs/followups-latency-and-control.md`, `docs/chat-missing-features.md`, `docs/chat-persistence.md` | Gap lists and session snapshots that are *not* date-named | Historical — the filename carries no expiry warning, so check the date in the title line. Believe their own headers ("designed, not built"); do not read them as current state. Other skills cite `followups-…` as live evidence; it is a session snapshot, so re-verify against code before acting on it. |
 
@@ -146,6 +147,9 @@ Get-ChildItem src/*.rs | Select-String -Pattern "compose_zone|snap_or_tab" | Sel
 ### Checklist — when a feature ships
 
 - [ ] Feature doc created or updated (with `## Key files`).
+- [ ] The plan that drove the work is **deleted** — after its durable content
+      moved into that feature doc, and after any inbound reference to it is
+      rewritten (`rg -n 'docs/superpowers/plans' . src/`).
 - [ ] Any doc the change supersedes gets a **banner** (next section).
 - [ ] Epic status header updated if the epic's phase state changed.
 - [ ] New named seam? Add a CONTEXT.md glossary entry (below).
@@ -252,11 +256,15 @@ The lifecycle itself (hunch → spec → plan → result) is owned by
   keyboard-control epic's "Decision history (settled with the user): …
   → **rejected**" blocks are the model.
 - **Plans** (`docs/superpowers/plans/`, `docs/plans/`) are checkbox-executable:
-  `- [ ] **Step N:** …` steps a cold session can run top-to-bottom.
-- **Sessions** (`docs/superpowers/sessions/`) are resume-state for interrupted
-  work.
-- All are dated `YYYY-MM-DD-<slug>.md` and become history the moment the work
-  lands — never edit them to match later reality; supersede or let them age.
+  `- [ ] **Step N:** …` steps a cold session can run top-to-bottom. **A plan is
+  scaffolding, and it is deleted when its work ships** — the code becomes the
+  truth and `docs/<feature>.md` becomes the explanation, so a surviving plan
+  would be a third, stale copy a reader can mistake for current design. That
+  makes shipping a feature a two-part act: move whatever a future reader needs
+  into the feature doc *first*, then `git rm` the plan. `docs/superpowers/README.md`
+  carries the rule and the `git log --diff-filter=D` recipe for reading one back.
+- All are dated `YYYY-MM-DD-<slug>.md`. A spec becomes history the moment the
+  work lands — never edit it to match later reality; supersede or let it age.
 
 ## When NOT to use this skill
 

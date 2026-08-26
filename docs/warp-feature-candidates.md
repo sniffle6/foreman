@@ -262,7 +262,8 @@ calls with near-zero CPU-side layout. 144–400+ fps.
   unchanged.
 - **Settled measurements say render is parse-bound, not draw-bound:** idle
   0.072 ms/frame; 12 max-rate floods 0.317 ms avg / 0.357 p95 post-galley-cache
-  (docs/superpowers/plans/2026-07-04-render-read-perf.md metrics table).
+  (measured 2026-07-04; the plan that carried the metrics table was deleted once
+  the work shipped — `git log --diff-filter=D -- docs/superpowers/plans/`).
   The lever for 20-30 noisy agents is **bounded per-frame VTE parsing** — a
   PTY-path change, not a renderer change.
 - Vsync is a settled decision (ON; foreman-change-control settled list).

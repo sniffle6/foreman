@@ -112,9 +112,7 @@ and the landing site for future agent-state badges.
 - `src/layout.rs` — `set_leaf_extent` (axis-aware; `set_leaf_width` wraps it)
 - `src/keymap.rs` — `Command::ToggleTaskManager` (default leader `M`)
 - `src/config.rs` — persistence fields
-- Spec/plan: `docs/superpowers/specs/2026-07-09-task-manager-panel-design.md`,
-  `docs/superpowers/plans/2026-07-09-task-manager-panel.md`,
-  `docs/superpowers/plans/2026-07-10-panel-horizontal-mode.md`
+- Spec: `docs/superpowers/specs/2026-07-09-task-manager-panel-design.md`
 - Mockups: `docs/superpowers/specs/2026-07-09-task-manager-panel-mockup.html`
   (vertical), `2026-07-10-task-manager-panel-horizontal-mockup.html`
 

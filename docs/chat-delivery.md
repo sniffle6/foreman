@@ -110,6 +110,11 @@ The engine adapter (`src/wm.rs`):
   `chat_post` / `chat_post_human` (thin), auto-join in `add_terminal_cmd`,
   membership in `status_dispatch`, the `Content::Chat` viewer pull,
   `drain_chat_clicks` (resolve click → window by id).
+- `src/chat_view.rs` — the dispatcher's-desk window: `ChatView::show` renders
+  the crew board (ordered by last-heard, amber when stale), the grouped/wrapped
+  log with system lines and the NEW divider, and the human input line. It
+  borrows the room and pulls `crew()` / `blocks()` rather than being handed a
+  snapshot. Design: `docs/superpowers/specs/2026-06-10-chat-dispatcher-window-design.md`.
 - `src/terminal.rs` — `Session::term_id()` / `set_term_id()` (the stable Member
   id) and `ready()` (the DSR-answered + first-paint latch the outbox gates on;
   `InkScan` is the paint detector).

@@ -96,6 +96,5 @@ discard take_opened + poll dirty   # restore must not write recents or re-save
   `mark_workspace_dirty` / `poll_workspace_dirty`
 - `src/main.rs` — first-frame restore, debounce, `flush_workspace`, `on_exit`
 - `src/config.rs` — shared `load_json` / `save_json` only (no layout fields)
-- Spec/plan (history):  
-  `docs/superpowers/specs/2026-07-13-workspace-persistence-design.md`,  
-  `docs/superpowers/plans/2026-07-13-workspace-persistence.md`
+- Spec (history):
+  `docs/superpowers/specs/2026-07-13-workspace-persistence-design.md`

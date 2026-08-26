@@ -1,16 +1,16 @@
 # Terminal Completeness — Epic
 
-**Active remainder plan (2026-07-13):**
-[`docs/superpowers/plans/2026-07-13-terminal-completeness-remainder.md`](../superpowers/plans/2026-07-13-terminal-completeness-remainder.md)
-covers the requested unfinished owner slice: bold/italic, mouse click/drag/
-motion, and scrollback search. The broader phase catalog below remains the
-historical record; unrelated unchecked polish is not silently pulled into that
-plan.
+**The 2026-07-13 remainder slice** was the requested unfinished owner slice:
+bold/italic, mouse click/drag/motion, and scrollback search. It shipped, and
+each piece now has its own feature doc — [`docs/terminal-font-styles.md`](../terminal-font-styles.md),
+[`docs/terminal-mouse-reporting.md`](../terminal-mouse-reporting.md), and
+[`docs/terminal-scrollback-search.md`](../terminal-scrollback-search.md), which
+describe the shipped behavior and win over this file. The broader phase catalog
+below remains the historical record; unrelated unchecked polish was not silently
+pulled into that slice.
 
 **Status:** remainder slice implemented; correctness fix pass (2026-07-14) —
-**not signed off.** Real bold/italic faces, mouse click/drag/motion, and
-bounded scrollback search land under
-[`docs/superpowers/plans/2026-07-13-terminal-completeness-remainder.md`](../superpowers/plans/2026-07-13-terminal-completeness-remainder.md).
+**not signed off.**
 Correctness fixes: query changes search without Enter; content quiescence
 non-sliding; one shared line/time budget per frame; deep-history wrap once;
 focused ordinal reconcile; search-bar hit exclusion; topmost mouse ownership;
