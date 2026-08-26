@@ -1326,10 +1326,16 @@ mod tests {
         let mut s = SearchState::default();
         s.apply(SearchCmd::Open);
         s.apply(SearchCmd::SetQuery("alpha".into()));
-        s.tick(&mut term, sgen(1, 40, 5), 0, std::time::Instant::now());
+        // `tick` is time-sliced: it stops at `now + TICK_TIME_BUDGET_MS`. Passing
+        // the real clock makes a single tick a race against a 4 ms budget, which
+        // loses under parallel test load and fails the assert below. Hand it a
+        // far-future deadline so the scan runs to completion, same as
+        // `needs_repaint_false_when_scan_and_seek_idle` above.
+        let t_far = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        s.tick(&mut term, sgen(1, 40, 5), 0, t_far);
         assert!(!s.view().visible.is_empty() || s.view().focused.is_some());
         s.apply(SearchCmd::SetQuery(String::new()));
-        s.tick(&mut term, sgen(2, 40, 5), 0, std::time::Instant::now());
+        s.tick(&mut term, sgen(2, 40, 5), 0, t_far);
         assert!(s.view().visible.is_empty());
     }
 
