@@ -258,6 +258,12 @@ impl Content {
 pub struct Tab {
     pub title: String,
     pub content: Content,
+    /// Panel presentation rank: this tab's row position in the sessions panel.
+    /// Presentation-only — never affects the real tab strip, layout tree, or
+    /// z-order. `None` = unranked (sorts after ranked rows, structural order).
+    /// Dense ranks are rewritten per scope on each panel reorder; the value
+    /// travels with the tab through merge/untab/capture/restore.
+    pub panel_order: Option<u64>,
     /// When true, [`WindowManager::refresh_auto_titles`] may replace `title`
     /// with an agent name once the Session detects one (hand-launched / landing
     /// agents in a default-named shell). Cleared by manual rename; never set
@@ -274,6 +280,7 @@ impl Tab {
         Self {
             title: title.as_ref().to_string(),
             content,
+            panel_order: None,
             auto_title: false,
             agent_title: Default::default(),
         }
@@ -284,6 +291,7 @@ impl Tab {
         Self {
             title: title.as_ref().to_string(),
             content,
+            panel_order: None,
             auto_title: true,
             agent_title: Default::default(),
         }
@@ -622,6 +630,7 @@ impl WindowManager {
                         t.title.clone()
                     },
                     managed_title: t.auto_title,
+                    panel_order: t.panel_order,
                     content,
                 });
             }
@@ -809,10 +818,11 @@ impl WindowManager {
                     }
                     _ => tab_snap.title.clone(),
                 };
-                let tab = match &content {
+                let mut tab = match &content {
                     Content::Terminal(_) if managed => Tab::shell_default(restored_title, content),
                     _ => Tab::fixed(restored_title, content),
                 };
+                tab.panel_order = tab_snap.panel_order;
                 tabs.push(tab);
             }
 
@@ -5933,6 +5943,46 @@ mod tests {
         id
     }
 
+    fn ranked_proj_win(wm: &mut WindowManager, rank: Option<u64>, tag: &str) {
+        let mut inner = WindowManager::new();
+        inner.cwd = Some(std::env::temp_dir()); // restore skips projects without a real cwd
+        inner.tag = Some(tag.into());
+        let mut tab = Tab::fixed(tag, Content::Project(Box::new(inner)));
+        tab.panel_order = rank;
+        let id = wm.next;
+        wm.next += 1;
+        wm.z += 1;
+        wm.windows.push(Win {
+            id,
+            tabs: vec![tab],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 60.0)),
+            z: wm.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+    }
+
+    #[test]
+    fn panel_order_survives_capture_and_restore() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, Some(2), "p1");
+        ranked_proj_win(&mut wm, None, "p2");
+        ranked_proj_win(&mut wm, Some(0), "p3");
+        let snap = wm.capture_workspace();
+        let mut fresh = WindowManager::new();
+        fresh.apply_workspace(&snap, &ctx);
+        // Fresh runtime ids, same ranks, same (z-ascending) capture order.
+        let ranks: Vec<Option<u64>> = fresh
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter().map(|t| t.panel_order))
+            .collect();
+        assert_eq!(ranks, vec![Some(2), None, Some(0)]);
+    }
+
     #[test]
     fn nested_mark_surfaces_on_desktop_poll() {
         let mut d = WindowManager::new().as_desktop();
@@ -6091,6 +6141,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "proj".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -6103,6 +6154,7 @@ mod tests {
                                     tabs: vec![TabSnap {
                                         title: "cmd".into(),
                                         managed_title: false,
+                                        panel_order: None,
                                         content: ContentSnap::Terminal {
                                             shell: "cmd".into(),
                                         },
@@ -6187,6 +6239,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "gone".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(
@@ -7437,6 +7490,7 @@ mod tests {
         let tab = || TabSnap {
             title: "cmd".into(),
             managed_title: false,
+            panel_order: None,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -7478,6 +7532,7 @@ mod tests {
         let terminal = || TabSnap {
             title: "cmd".into(),
             managed_title: false,
+            panel_order: None,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -7501,6 +7556,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "Project".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Project { child },
                     }],
                     ..Default::default()
@@ -7554,6 +7610,7 @@ mod tests {
         let project = |title: &str| TabSnap {
             title: title.into(),
             managed_title: false,
+            panel_order: None,
             content: ContentSnap::Project {
                 child: ManagerSnap {
                     cwd: Some(std::env::current_dir().unwrap()),
@@ -7563,6 +7620,7 @@ mod tests {
                         tabs: vec![TabSnap {
                             title: "cmd".into(),
                             managed_title: true,
+                            panel_order: None,
                             content: ContentSnap::Terminal {
                                 shell: "cmd".into(),
                             },

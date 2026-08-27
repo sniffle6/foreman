@@ -81,6 +81,10 @@ pub struct TabSnap {
     /// not persisted; restore starts from a fresh shell label and may name the
     /// next agent session from its own first prompt.
     pub managed_title: bool,
+    /// Panel presentation rank. Additive post-v1 field: omitted when unset so
+    /// v1 files and old builds stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_order: Option<u64>,
     pub content: ContentSnap,
 }
 
@@ -89,6 +93,7 @@ impl Default for TabSnap {
         Self {
             title: String::new(),
             managed_title: false,
+            panel_order: None,
             content: ContentSnap::Chat,
         }
     }
@@ -324,6 +329,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tab_snap_panel_order_is_wire_compat_with_v1() {
+        // A v1 tab (no panel_order key) still parses → None.
+        let mut v1 = serde_json::to_value(TabSnap::default()).unwrap();
+        v1.as_object_mut().unwrap().remove("panel_order");
+        let snap: TabSnap = serde_json::from_value(v1).expect("v1 tab parses");
+        assert_eq!(snap.panel_order, None);
+        // Unset rank serializes away — old builds see byte-identical tabs.
+        let out = serde_json::to_string(&snap).unwrap();
+        assert!(!out.contains("panel_order"), "None must be omitted: {out}");
+        // A set rank round-trips.
+        let mut ranked = snap.clone();
+        ranked.panel_order = Some(7);
+        let back: TabSnap = serde_json::from_str(&serde_json::to_string(&ranked).unwrap()).unwrap();
+        assert_eq!(back.panel_order, Some(7));
+    }
+
+    #[test]
     fn empty_object_loads_as_default() {
         // Default::version is 1 so `{}` and a hand-built default agree after load().
         let s: WorkspaceSnapshot = serde_json::from_str("{}").unwrap();
@@ -355,6 +377,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "foreman".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(r"C:\code\foreman")),
@@ -367,6 +390,7 @@ mod tests {
                                     tabs: vec![TabSnap {
                                         title: "powershell  ·  #1".into(),
                                         managed_title: true,
+                                        panel_order: None,
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
                                         },
@@ -420,6 +444,7 @@ mod tests {
         let snap = TabSnap {
             title: "armed.png".into(),
             managed_title: false,
+            panel_order: None,
             content: ContentSnap::Image {
                 path: PathBuf::from(r"C:\shots\armed.png"),
             },
@@ -472,6 +497,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "t".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
                         },
@@ -491,6 +517,7 @@ mod tests {
                     tabs: vec![TabSnap {
                         title: "p".into(),
                         managed_title: false,
+                        panel_order: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap::default(),
                         },
