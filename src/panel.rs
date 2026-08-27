@@ -1061,6 +1061,10 @@ impl PanelView {
             bell: bool,
             div_before: bool,
             w: f32,
+            /// Some = this chip is a drag-reorder source, exactly as
+            /// `RowPaintOwned::drag_ref` in the other two modes.
+            drag_ref: Option<PanelRowRef>,
+            project_chip: bool,
         }
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let p = ui.painter_at(rect);
@@ -1094,6 +1098,11 @@ impl PanelView {
                 dim: proj.minimized,
                 bell: false, // the tab chips beside it carry the ring
                 div_before: pi > 0,
+                drag_ref: Some(PanelRowRef {
+                    path: proj.path,
+                    identity: proj.identity.clone(),
+                }),
+                project_chip: true,
             });
             for (ti, t) in proj.tabs.iter().enumerate() {
                 let galley = layout(&t.title);
@@ -1107,6 +1116,11 @@ impl PanelView {
                     dim: t.minimized || !t.active_tab || t.exited,
                     bell: bell_gate && t.bell,
                     div_before: false,
+                    drag_ref: Some(PanelRowRef {
+                        path: t.path,
+                        identity: t.identity.clone(),
+                    }),
+                    project_chip: false,
                 });
             }
         }
@@ -1122,9 +1136,13 @@ impl PanelView {
         }
         let p = ui.painter_at(content_rect);
 
-        // Pass 2: place, interact, paint.
+        // Pass 2: place (rects only, dividers paint immediately since they
+        // carry no interaction). Buffered into `placed` so the drag-target
+        // pass below can resolve insertion against final X positions before
+        // any chip is interacted with or painted.
         let cy = content_rect.center().y;
         let mut x = content_rect.min.x + 8.0 - self.scroll;
+        let mut placed: Vec<(egui::Rect, Chip)> = Vec::new();
         for chip in chips {
             if chip.div_before {
                 x += 4.0;
@@ -1140,13 +1158,71 @@ impl PanelView {
             );
             x += chip.w + chip_gap;
             if chip_rect.max.x < content_rect.min.x || chip_rect.min.x > content_rect.max.x {
-                continue; // scrolled out of view: no paint, no interact
+                continue; // scrolled out of view: no paint, no interact, no drag slot
             }
-            let resp = ui.interact(
-                chip_rect.intersect(content_rect),
-                chip.id,
-                egui::Sense::click(),
-            );
+            placed.push((chip_rect, chip));
+        }
+
+        // Drag target: chips within the drag's scope (Project-ownership
+        // boundary — project chips for a project source, else only chips
+        // whose path.project/path.ptab match the source's), resolved by X
+        // midpoint. Cleared and recomputed every frame — a drag that started
+        // in columns mode and survives a columns→strip flip (same Horizontal
+        // axis, so the axis-cancel in `show` doesn't fire) would otherwise
+        // commit a target computed against the old layout.
+        if let Some(d) = &mut self.drag {
+            d.target = None;
+            d.marker = None;
+            if let Some(ptr) = ui.ctx().pointer_latest_pos() {
+                let scope: Vec<(egui::Rect, PanelRowRef)> = placed
+                    .iter()
+                    .filter_map(|(rect, chip)| {
+                        let r = chip.drag_ref.clone()?;
+                        let same = if d.source_is_project {
+                            chip.project_chip
+                        } else {
+                            !chip.project_chip
+                                && r.path.project == d.source.path.project
+                                && r.path.ptab == d.source.path.ptab
+                        };
+                        same.then_some((*rect, r))
+                    })
+                    .collect();
+                let centers: Vec<f32> = scope.iter().map(|(r, _)| r.center().x).collect();
+                if let Some((idx, placement)) = insertion_at(&centers, ptr.x) {
+                    let (rect, anchor) = &scope[idx];
+                    let x = match placement {
+                        Placement::Before => rect.min.x,
+                        Placement::After => rect.max.x,
+                    };
+                    d.target = Some((anchor.clone(), placement));
+                    d.marker = Some((
+                        egui::pos2(x, content_rect.min.y),
+                        egui::pos2(x, content_rect.max.y),
+                    ));
+                }
+            }
+        }
+
+        // Pass 3: interact + paint, in final position order.
+        for (chip_rect, chip) in placed {
+            let sense = if chip.drag_ref.is_some() {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::click()
+            };
+            let resp = ui.interact(chip_rect.intersect(content_rect), chip.id, sense);
+            if let Some(dr) = &chip.drag_ref
+                && resp.drag_started()
+            {
+                self.drag = Some(PanelDrag {
+                    source: dr.clone(),
+                    source_is_project: chip.project_chip,
+                    axis: ScrollAxis::Horizontal,
+                    target: None,
+                    marker: None,
+                });
+            }
             let over = resp.hovered() || resp.contains_pointer();
             if chip.focused || over {
                 p.rect_filled(chip_rect, egui::CornerRadius::same(5), th.sel_bg);
@@ -1216,6 +1292,13 @@ impl PanelView {
                 self.click = Some(chip.path);
             }
         }
+        if let Some((a, b)) = self.drag.as_ref().and_then(|d| d.marker) {
+            ui.painter()
+                .with_clip_rect(content_rect)
+                .line_segment([a, b], egui::Stroke::new(2.0, th.text));
+        }
+        let strip_max_scroll = (content_w - rect.width()).max(0.0);
+        self.drag_autoscroll(ui, content_rect, ScrollAxis::Horizontal, strip_max_scroll);
         if let Some(scrollbar) = scrollbar {
             self.paint_scrollbar(ui, scrollbar);
         }
