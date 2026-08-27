@@ -176,6 +176,50 @@ fn chip_glyph(chip: &UpdateChip) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Placement {
+    Before,
+    After,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PanelRowRef {
+    pub path: TargetPath,
+    pub identity: RowIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PanelReorder {
+    pub source: PanelRowRef,
+    pub anchor: PanelRowRef,
+    pub placement: Placement,
+}
+
+/// Rank-splice: order `items` (given in structural order) by rank — unranked
+/// last, stable — then move `src` to sit `placement` relative to `anchor`.
+/// Returns the new key order, or `None` for a self-drop, an adjacent no-op,
+/// or a missing key. Pure; the caller writes the dense ranks back.
+pub fn splice_order<K: Copy + Eq>(
+    items: &[(K, Option<u64>)],
+    src: K,
+    anchor: K,
+    placement: Placement,
+) -> Option<Vec<K>> {
+    let mut order: Vec<(K, Option<u64>)> = items.to_vec();
+    order.sort_by_key(|(_, r)| r.unwrap_or(u64::MAX)); // stable → structural ties
+    let keys: Vec<K> = order.iter().map(|(k, _)| *k).collect();
+    let si = keys.iter().position(|k| *k == src)?;
+    let mut next = keys.clone();
+    next.remove(si);
+    let ai = next.iter().position(|k| *k == anchor)?; // anchor == src → None
+    let at = match placement {
+        Placement::Before => ai,
+        Placement::After => ai + 1,
+    };
+    next.insert(at, src);
+    (next != keys).then_some(next)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PanelModel {
     pub projects: Vec<ProjectEntry>,
@@ -225,6 +269,9 @@ pub struct PanelView {
     pub toggle_collapse: bool,
     /// Latched when the user clicks the update chip; wm drains it each frame.
     pub update_click: bool,
+    /// Latched when the user drops a dragged row onto another; wm drains it
+    /// each frame and resolves it against live structure.
+    pub reorder: Option<PanelReorder>,
 }
 
 impl PanelView {
@@ -247,6 +294,7 @@ impl PanelView {
             hover_act: None,
             toggle_collapse: false,
             update_click: false,
+            reorder: None,
         }
     }
 
@@ -1423,6 +1471,39 @@ fn paint_icon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splice_order_moves_before_and_after() {
+        let items = [("a", Some(0)), ("b", Some(1)), ("c", Some(2))];
+        assert_eq!(
+            splice_order(&items, "c", "a", Placement::Before).unwrap(),
+            vec!["c", "a", "b"]
+        );
+        assert_eq!(
+            splice_order(&items, "a", "c", Placement::After).unwrap(),
+            vec!["b", "c", "a"]
+        );
+    }
+
+    #[test]
+    fn splice_order_rejects_noops_and_missing_keys() {
+        let items = [("a", Some(0)), ("b", Some(1))];
+        assert!(splice_order(&items, "a", "a", Placement::Before).is_none()); // self-drop
+        assert!(splice_order(&items, "a", "b", Placement::Before).is_none()); // adjacent no-op
+        assert!(splice_order(&items, "b", "a", Placement::After).is_none()); // adjacent no-op
+        assert!(splice_order(&items, "x", "a", Placement::Before).is_none()); // stale source
+        assert!(splice_order(&items, "a", "x", Placement::After).is_none()); // stale anchor
+    }
+
+    #[test]
+    fn splice_order_folds_unranked_after_ranked() {
+        // Display order is b (ranked) then a (unranked); moving a before b is real.
+        let items = [("a", None), ("b", Some(5))];
+        assert_eq!(
+            splice_order(&items, "a", "b", Placement::Before).unwrap(),
+            vec!["a", "b"]
+        );
+    }
 
     #[test]
     fn chip_text_names_the_staged_version_and_flags_danger_right() {

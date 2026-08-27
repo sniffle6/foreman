@@ -396,6 +396,28 @@ enum Act {
     MinPath(crate::panel::TargetPath),
     /// Close a panel row target (routes through the close-confirm path).
     ClosePath(crate::panel::TargetPath),
+    /// Panel drag-drop reorder: presentation-only rank rewrite. Never touches
+    /// the tree, z-order, tab-strip order, focus, or active tabs. Deferred:
+    /// renumbering needs `&mut` across windows while the panel view's render
+    /// borrow is live.
+    ReorderPanel(crate::panel::PanelReorder),
+}
+
+/// A panel row resolved to live structure. Indices are only valid until
+/// the next structural mutation — resolve and use within one act.
+/// Values are indices into `self.windows` / `.tabs` (and, for Session
+/// rows, into the owning project's nested manager).
+enum ResolvedRow {
+    Project {
+        win: usize,
+        tab: usize,
+    },
+    Session {
+        pwin: usize,
+        ptab: usize,
+        cwin: usize,
+        tab: usize,
+    },
 }
 
 /// What a validated chat request resolved to. Posting is split from injection
@@ -2050,6 +2072,169 @@ impl WindowManager {
         }
     }
 
+    /// Resolve a drag ref by stable identity (identity-first; strict path only
+    /// for Loose rows). Returns None on any drift — a cancelled drop, never a
+    /// wrong-row move.
+    fn resolve_panel_row(&self, r: &crate::panel::PanelRowRef) -> Option<ResolvedRow> {
+        use crate::panel::RowIdentity;
+        match &r.identity {
+            RowIdentity::Project(Some(tag)) => {
+                for (wi, w) in self.windows.iter().enumerate() {
+                    for (pi, t) in w.tabs.iter().enumerate() {
+                        if let Content::Project(inner) = &t.content {
+                            if inner.tag.as_deref() == Some(tag.as_str()) {
+                                return Some(ResolvedRow::Project { win: wi, tab: pi });
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            RowIdentity::Project(None) => {
+                // Untagged stub (tests only): strict path.
+                let wi = self.windows.iter().position(|w| w.id == r.path.project)?;
+                let pi = r.path.tab?;
+                let t = self.windows[wi].tabs.get(pi)?;
+                matches!(t.content, Content::Project(_))
+                    .then_some(ResolvedRow::Project { win: wi, tab: pi })
+            }
+            RowIdentity::Terminal(tid) => {
+                for (wi, w) in self.windows.iter().enumerate() {
+                    for (pi, t) in w.tabs.iter().enumerate() {
+                        let Content::Project(inner) = &t.content else {
+                            continue;
+                        };
+                        for (ci, cw) in inner.windows.iter().enumerate() {
+                            for (ti, ct) in cw.tabs.iter().enumerate() {
+                                if let Content::Terminal(s) = &ct.content {
+                                    if s.term_id() == *tid {
+                                        return Some(ResolvedRow::Session {
+                                            pwin: wi,
+                                            ptab: pi,
+                                            cwin: ci,
+                                            tab: ti,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            RowIdentity::Loose => {
+                // Chat/Image rows: strict path + kind family check.
+                let wi = self.windows.iter().position(|w| w.id == r.path.project)?;
+                let pi = r.path.ptab?;
+                let Content::Project(inner) = &self.windows[wi].tabs.get(pi)?.content else {
+                    return None;
+                };
+                let cid = r.path.window?;
+                let ci = inner.windows.iter().position(|w| w.id == cid)?;
+                let ti = r.path.tab?;
+                let ct = inner.windows[ci].tabs.get(ti)?;
+                (!matches!(
+                    ct.content,
+                    Content::TaskManager(_) | Content::Settings(_) | Content::Terminal(_)
+                ))
+                .then_some(ResolvedRow::Session {
+                    pwin: wi,
+                    ptab: pi,
+                    cwin: ci,
+                    tab: ti,
+                })
+            }
+        }
+    }
+
+    /// Validate + apply one panel reorder. Returns false (and mutates nothing)
+    /// for stale refs, scope mixes, cross-project drops, and no-ops.
+    pub(crate) fn apply_panel_reorder(&mut self, r: &crate::panel::PanelReorder) -> bool {
+        let (src, anchor) = match (
+            self.resolve_panel_row(&r.source),
+            self.resolve_panel_row(&r.anchor),
+        ) {
+            (Some(s), Some(a)) => (s, a),
+            _ => return false,
+        };
+        match (src, anchor) {
+            (
+                ResolvedRow::Project { win: sw, tab: st },
+                ResolvedRow::Project { win: aw, tab: at },
+            ) => self.renumber_projects((sw, st), (aw, at), r.placement),
+            (
+                ResolvedRow::Session {
+                    pwin: sp,
+                    ptab: spt,
+                    cwin: sc,
+                    tab: st,
+                },
+                ResolvedRow::Session {
+                    pwin: ap,
+                    ptab: apt,
+                    cwin: ac,
+                    tab: at,
+                },
+            ) if sp == ap && spt == apt => {
+                let Content::Project(inner) = &mut self.windows[sp].tabs[spt].content else {
+                    return false;
+                };
+                inner.renumber_session_rows((sc, st), (ac, at), r.placement)
+            }
+            // Project↔Session mixes and cross-project Session drops: invalid.
+            _ => false,
+        }
+    }
+
+    /// Dense-renumber the desktop's Project-tab scope after a splice.
+    fn renumber_projects(
+        &mut self,
+        src: (usize, usize),
+        anchor: (usize, usize),
+        placement: crate::panel::Placement,
+    ) -> bool {
+        let mut items: Vec<((usize, usize), Option<u64>)> = Vec::new();
+        for (wi, w) in self.windows.iter().enumerate() {
+            for (pi, t) in w.tabs.iter().enumerate() {
+                if matches!(t.content, Content::Project(_)) {
+                    items.push(((wi, pi), t.panel_order));
+                }
+            }
+        }
+        let Some(next) = crate::panel::splice_order(&items, src, anchor, placement) else {
+            return false;
+        };
+        for (rank, (wi, pi)) in next.into_iter().enumerate() {
+            self.windows[wi].tabs[pi].panel_order = Some(rank as u64);
+        }
+        true
+    }
+
+    /// Dense-renumber this (nested) manager's eligible-tab scope. Eligibility
+    /// mirrors `panel_model`: everything except TaskManager/Settings tabs.
+    fn renumber_session_rows(
+        &mut self,
+        src: (usize, usize),
+        anchor: (usize, usize),
+        placement: crate::panel::Placement,
+    ) -> bool {
+        let mut items: Vec<((usize, usize), Option<u64>)> = Vec::new();
+        for (ci, cw) in self.windows.iter().enumerate() {
+            for (ti, t) in cw.tabs.iter().enumerate() {
+                if !matches!(t.content, Content::TaskManager(_) | Content::Settings(_)) {
+                    items.push(((ci, ti), t.panel_order));
+                }
+            }
+        }
+        let Some(next) = crate::panel::splice_order(&items, src, anchor, placement) else {
+            return false;
+        };
+        for (rank, (ci, ti)) in next.into_iter().enumerate() {
+            self.windows[ci].tabs[ti].panel_order = Some(rank as u64);
+        }
+        true
+    }
+
     /// Chip to show in the panel (None = hidden, i.e. `update::State::Idle`).
     pub fn set_update_chip(&mut self, v: Option<crate::panel::UpdateChip>) {
         self.update_chip = v;
@@ -2231,6 +2416,7 @@ impl WindowManager {
         let mut click = None;
         let mut hover = None;
         let mut toggle = false;
+        let mut reorder = None;
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 if let Content::TaskManager(v) = &mut t.content {
@@ -2248,6 +2434,9 @@ impl WindowManager {
                         v.update_click = false;
                         self.update_clicked = true;
                     }
+                    if let Some(r) = v.reorder.take() {
+                        reorder = Some(r);
+                    }
                 }
             }
         }
@@ -2259,6 +2448,9 @@ impl WindowManager {
                 crate::panel::PanelBtn::Min => Act::MinPath(p),
                 crate::panel::PanelBtn::Close => Act::ClosePath(p),
             });
+        }
+        if let Some(r) = reorder {
+            acts.push(Act::ReorderPanel(r));
         }
         if toggle {
             self.toggle_panel();
@@ -5180,6 +5372,11 @@ impl WindowManager {
                 Act::FocusPath(p) => self.toggle_surface_target(p),
                 Act::MinPath(p) => self.apply_min_path(p),
                 Act::ClosePath(p) => self.apply_close_path(p),
+                Act::ReorderPanel(r) => {
+                    // Rejects are no-ops; the trailing mark_workspace_dirty()
+                    // over-dirties by design (see the comment below the loop).
+                    self.apply_panel_reorder(&r);
+                }
             }
         }
         // Any applied act can change focus/layout/tabs; over-dirty is intentional.
@@ -6046,6 +6243,196 @@ mod tests {
             m.projects[0].identity,
             crate::panel::RowIdentity::Project(Some("p1".into()))
         );
+    }
+
+    fn row_ref(p: &crate::panel::ProjectEntry) -> crate::panel::PanelRowRef {
+        crate::panel::PanelRowRef {
+            path: p.path,
+            identity: p.identity.clone(),
+        }
+    }
+
+    fn tab_ref(t: &crate::panel::TabEntry) -> crate::panel::PanelRowRef {
+        crate::panel::PanelRowRef {
+            path: t.path,
+            identity: t.identity.clone(),
+        }
+    }
+
+    #[test]
+    fn reorder_projects_renumbers_scope_dense() {
+        use crate::panel::{PanelReorder, Placement};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        ranked_proj_win(&mut wm, None, "p2");
+        ranked_proj_win(&mut wm, None, "p3");
+        let m = wm.panel_model();
+        let r = PanelReorder {
+            source: row_ref(&m.projects[2]), // p3
+            anchor: row_ref(&m.projects[0]), // p1
+            placement: Placement::Before,
+        };
+        assert!(wm.apply_panel_reorder(&r));
+        let m = wm.panel_model();
+        let titles: Vec<&str> = m.projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["p3", "p1", "p2"]);
+        // First mutation normalizes the whole scope to dense ranks.
+        let ranks: Vec<Option<u64>> = m.projects.iter().map(|p| p.rank).collect();
+        assert_eq!(ranks, vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn reorder_session_rows_within_a_project() {
+        use crate::panel::{PanelReorder, Placement};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        for title in ["a", "b", "c"] {
+            let id = inner.next;
+            inner.next += 1;
+            inner.z += 1;
+            inner.windows.push(Win {
+                id,
+                tabs: vec![Tab::fixed(
+                    title,
+                    Content::Project(Box::new(WindowManager::new())),
+                )],
+                active: 0,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+                z: inner.z,
+                minimized: false,
+                min_from_tree: false,
+                prev: None,
+            });
+        }
+        let m = wm.panel_model();
+        let r = PanelReorder {
+            source: tab_ref(&m.projects[0].tabs[2]), // c
+            anchor: tab_ref(&m.projects[0].tabs[0]), // a
+            placement: Placement::Before,
+        };
+        assert!(wm.apply_panel_reorder(&r));
+        let m = wm.panel_model();
+        let rows: Vec<&str> = m.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(rows, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn reorder_rejects_cross_project_and_mixed_and_stale() {
+        use crate::panel::{PanelReorder, PanelRowRef, Placement, RowIdentity};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        ranked_proj_win(&mut wm, None, "p2");
+        for w in 0..2 {
+            let Content::Project(inner) = &mut wm.windows[w].tabs[0].content else {
+                unreachable!()
+            };
+            let id = inner.next;
+            inner.next += 1;
+            inner.z += 1;
+            inner.windows.push(Win {
+                id,
+                tabs: vec![Tab::fixed(
+                    "t",
+                    Content::Project(Box::new(WindowManager::new())),
+                )],
+                active: 0,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+                z: inner.z,
+                minimized: false,
+                min_from_tree: false,
+                prev: None,
+            });
+        }
+        let m = wm.panel_model();
+        // Session → Session across projects: reject.
+        let cross = PanelReorder {
+            source: tab_ref(&m.projects[0].tabs[0]),
+            anchor: tab_ref(&m.projects[1].tabs[0]),
+            placement: Placement::Before,
+        };
+        assert!(!wm.apply_panel_reorder(&cross));
+        // Project → Session mix: reject.
+        let mixed = PanelReorder {
+            source: row_ref(&m.projects[0]),
+            anchor: tab_ref(&m.projects[1].tabs[0]),
+            placement: Placement::Before,
+        };
+        assert!(!wm.apply_panel_reorder(&mixed));
+        // Stale identity: reject.
+        let stale = PanelReorder {
+            source: PanelRowRef {
+                path: m.projects[0].path,
+                identity: RowIdentity::Project(Some("p99".into())),
+            },
+            anchor: row_ref(&m.projects[1]),
+            placement: Placement::Before,
+        };
+        assert!(!wm.apply_panel_reorder(&stale));
+        // Nothing mutated by any rejection.
+        let after = wm.panel_model();
+        assert!(after.projects.iter().all(|p| p.rank.is_none()));
+        assert!(
+            after
+                .projects
+                .iter()
+                .flat_map(|p| &p.tabs)
+                .all(|t| t.rank.is_none())
+        );
+    }
+
+    #[test]
+    fn panel_rank_travels_through_tab_merge() {
+        use crate::panel::{PanelReorder, Placement};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        for title in ["a", "b"] {
+            let id = inner.next;
+            inner.next += 1;
+            inner.z += 1;
+            inner.windows.push(Win {
+                id,
+                tabs: vec![Tab::fixed(
+                    title,
+                    Content::Project(Box::new(WindowManager::new())),
+                )],
+                active: 0,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+                z: inner.z,
+                minimized: false,
+                min_from_tree: false,
+                prev: None,
+            });
+        }
+        // Rank b before a, then merge b's window onto a's — order must survive.
+        let m = wm.panel_model();
+        let r = PanelReorder {
+            source: tab_ref(&m.projects[0].tabs[1]), // b
+            anchor: tab_ref(&m.projects[0].tabs[0]), // a
+            placement: Placement::Before,
+        };
+        assert!(wm.apply_panel_reorder(&r));
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        let (a_id, b_id) = (inner.windows[0].id, inner.windows[1].id);
+        inner.merge_windows(b_id, a_id);
+        let m = wm.panel_model();
+        let rows: Vec<&str> = m.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(rows, ["b", "a"]);
     }
 
     #[test]
