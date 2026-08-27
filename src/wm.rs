@@ -2194,6 +2194,8 @@ impl WindowManager {
         placement: crate::panel::Placement,
     ) -> bool {
         let mut items: Vec<((usize, usize), Option<u64>)> = Vec::new();
+        // No is_panel() skip needed: the Act::Merge guard keeps the panel non-tabbable, so a
+        // panel window can never hold a Project tab.
         for (wi, w) in self.windows.iter().enumerate() {
             for (pi, t) in w.tabs.iter().enumerate() {
                 if matches!(t.content, Content::Project(_)) {
@@ -6378,6 +6380,68 @@ mod tests {
         // Nothing mutated by any rejection.
         let after = wm.panel_model();
         assert!(after.projects.iter().all(|p| p.rank.is_none()));
+        assert!(
+            after
+                .projects
+                .iter()
+                .flat_map(|p| &p.tabs)
+                .all(|t| t.rank.is_none())
+        );
+    }
+
+    #[test]
+    fn reorder_rejects_stale_terminal_and_loose_identities() {
+        use crate::panel::{PanelReorder, PanelRowRef, Placement, RowIdentity};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        let id = inner.next;
+        inner.next += 1;
+        inner.z += 1;
+        inner.windows.push(Win {
+            id,
+            tabs: vec![Tab::fixed(
+                "t",
+                Content::Project(Box::new(WindowManager::new())),
+            )],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+            z: inner.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let m = wm.panel_model();
+        let anchor = PanelRowRef {
+            path: m.projects[0].tabs[0].path,
+            identity: m.projects[0].tabs[0].identity.clone(),
+        };
+        // Stale Terminal identity: no session with this term_id exists anywhere.
+        let stale_term = PanelReorder {
+            source: PanelRowRef {
+                path: m.projects[0].tabs[0].path,
+                identity: RowIdentity::Terminal(999),
+            },
+            anchor: anchor.clone(),
+            placement: Placement::Before,
+        };
+        assert!(!wm.apply_panel_reorder(&stale_term));
+        // Loose ref whose strict path drifted (wrong child window id): cancels.
+        let mut bad_path = m.projects[0].tabs[0].path;
+        bad_path.window = Some(9999);
+        let stale_loose = PanelReorder {
+            source: PanelRowRef {
+                path: bad_path,
+                identity: RowIdentity::Loose,
+            },
+            anchor,
+            placement: Placement::Before,
+        };
+        assert!(!wm.apply_panel_reorder(&stale_loose));
+        // Nothing mutated by either rejection.
+        let after = wm.panel_model();
         assert!(
             after
                 .projects

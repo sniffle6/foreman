@@ -26,7 +26,8 @@ and the landing site for future agent-state badges.
   drag to reorder Project groups, and Session/chat/image rows within their
   Project. One `PanelReorder` intent drains into `Act::ReorderPanel`;
   `WindowManager` re-resolves source/anchor by stable identity (`term_id` /
-  project `pN` tag; strict path for chat/image — drift cancels), rejects
+  project `pN` tag; strict path for chat/image — path drift cancels; a
+  same-kind index shift on these id-less rows can retarget), rejects
   cross-project and Project↔Session drops, and rewrites that scope to dense
   per-tab `panel_order` ranks. The real tab strip, tiles, z-order, and focus
   never move. Unranked (`None`) rows sort after ranked ones in structural
