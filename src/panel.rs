@@ -504,6 +504,7 @@ impl PanelView {
 
             if let Some((a, b)) = self.drag.as_ref().and_then(|d| d.marker) {
                 ui.painter()
+                    .with_clip_rect(rows_rect)
                     .line_segment([a, b], egui::Stroke::new(2.0, th.text));
             }
             let vert_max_scroll = (content_h - body.height()).max(0.0);
@@ -1024,6 +1025,7 @@ impl PanelView {
         }
         if let Some((a, b)) = self.drag.as_ref().and_then(|d| d.marker) {
             ui.painter()
+                .with_clip_rect(content_rect)
                 .line_segment([a, b], egui::Stroke::new(2.0, th.text));
         }
         let cols_max_scroll = (content_w - rect.width()).max(0.0);
