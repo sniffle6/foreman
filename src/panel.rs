@@ -67,6 +67,20 @@ pub enum RowKind {
     Image,
 }
 
+/// Stable identity for a panel row, used to re-resolve a drag's source and
+/// anchor at drop time without trusting multi-frame `TargetPath` indices.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RowIdentity {
+    /// Nested manager tag ("pN"). `None` only for untagged test stubs, which
+    /// fall back to strict-path resolution.
+    Project(Option<String>),
+    /// Session member id (`Session::term_id`) — stable across merge/untab.
+    Terminal(u64),
+    /// Chat/Image rows (and nested-Project test stand-ins): no stable id.
+    /// Resolved by strict path + content-kind check; any drift cancels.
+    Loose,
+}
+
 #[derive(Clone, Debug)]
 pub struct TabEntry {
     pub path: TargetPath,
@@ -82,6 +96,10 @@ pub struct TabEntry {
     pub exited: bool,
     /// Terminal has a latched Bell (rang, not yet focused). Chat rows: false.
     pub bell: bool,
+    /// Panel presentation rank (drives row order; `None` = unranked).
+    pub rank: Option<u64>,
+    /// Stable identity for drag-drop resolution across frames.
+    pub identity: RowIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +112,10 @@ pub struct ProjectEntry {
     /// where individual rows are not visible).
     pub bell: bool,
     pub tabs: Vec<TabEntry>,
+    /// Panel presentation rank (drives row order; `None` = unranked).
+    pub rank: Option<u64>,
+    /// Stable identity for drag-drop resolution across frames.
+    pub identity: RowIdentity,
 }
 
 /// Display variant for the update chip; one per Phase-4 `update::State` case

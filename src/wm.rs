@@ -2015,6 +2015,11 @@ impl WindowManager {
                                 _ => false,
                             },
                             bell: t.content.bell_active(),
+                            rank: t.panel_order,
+                            identity: match &t.content {
+                                Content::Terminal(s) => RowIdentity::Terminal(s.term_id()),
+                                _ => RowIdentity::Loose,
+                            },
                         });
                     }
                 }
@@ -2024,10 +2029,21 @@ impl WindowManager {
                     minimized: w.minimized,
                     focused: pfocused,
                     bell: tabs.iter().any(|t| t.bell),
+                    rank: pt.panel_order,
+                    identity: RowIdentity::Project(inner.tag.clone()),
                     tabs,
                 });
             }
         }
+        // Rank-ordered projection: ranked ascending, unranked after in
+        // structural order (stable sort supplies the tie-break).
+        fn rank_key(r: Option<u64>) -> u64 {
+            r.unwrap_or(u64::MAX)
+        }
+        for p in &mut projects {
+            p.tabs.sort_by_key(|t| rank_key(t.rank));
+        }
+        projects.sort_by_key(|p| rank_key(p.rank));
         PanelModel {
             projects,
             update: self.update_chip.clone(),
@@ -5981,6 +5997,55 @@ mod tests {
             .flat_map(|w| w.tabs.iter().map(|t| t.panel_order))
             .collect();
         assert_eq!(ranks, vec![Some(2), None, Some(0)]);
+    }
+
+    #[test]
+    fn panel_model_orders_projects_by_rank_unranked_last() {
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, Some(2), "p1");
+        ranked_proj_win(&mut wm, None, "p2");
+        ranked_proj_win(&mut wm, Some(0), "p3");
+        let m = wm.panel_model();
+        let titles: Vec<&str> = m.projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["p3", "p1", "p2"]);
+    }
+
+    #[test]
+    fn panel_model_orders_session_rows_by_rank_within_project() {
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        // Two PTY-free stub rows inside p1's nested manager, ranks None / Some(0).
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        for (rank, title) in [(None, "a"), (Some(0), "b")] {
+            let id = inner.next;
+            inner.next += 1;
+            inner.z += 1;
+            let mut t = Tab::fixed(title, Content::Project(Box::new(WindowManager::new())));
+            t.panel_order = rank;
+            inner.windows.push(Win {
+                id,
+                tabs: vec![t],
+                active: 0,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+                z: inner.z,
+                minimized: false,
+                min_from_tree: false,
+                prev: None,
+            });
+        }
+        let m = wm.panel_model();
+        let rows: Vec<&str> = m.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(rows, ["b", "a"]); // ranked first, unranked structural after
+        assert_eq!(
+            m.projects[0].identity,
+            crate::panel::RowIdentity::Project(Some("p1".into()))
+        );
     }
 
     #[test]
