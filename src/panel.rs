@@ -195,6 +195,35 @@ pub struct PanelReorder {
     pub placement: Placement,
 }
 
+/// Insertion slot from same-scope row midpoints along the drag axis (midpoints
+/// in display order): before the first row whose midpoint the pointer hasn't
+/// passed, else after the last.
+pub fn insertion_at(centers: &[f32], pointer: f32) -> Option<(usize, Placement)> {
+    if centers.is_empty() {
+        return None;
+    }
+    for (i, c) in centers.iter().enumerate() {
+        if pointer < *c {
+            return Some((i, Placement::Before));
+        }
+    }
+    Some((centers.len() - 1, Placement::After))
+}
+
+/// Live drag-reorder gesture (expanded modes only). Runtime-only view state —
+/// never persisted; cancelled on collapse or orientation change.
+#[derive(Clone, Debug)]
+pub struct PanelDrag {
+    pub source: PanelRowRef,
+    pub source_is_project: bool,
+    /// Panel orientation at drag start; a mismatch on a later frame cancels.
+    pub axis: ScrollAxis,
+    /// Latest valid drop slot, recomputed each frame from same-scope rows.
+    pub target: Option<(PanelRowRef, Placement)>,
+    /// Insertion-marker segment to paint this frame (screen coords).
+    pub marker: Option<(egui::Pos2, egui::Pos2)>,
+}
+
 /// Rank-splice: order `items` (given in structural order) by rank — unranked
 /// last, stable — then move `src` to sit `placement` relative to `anchor`.
 /// Returns the new key order, or `None` for a self-drop, an adjacent no-op,
@@ -272,6 +301,9 @@ pub struct PanelView {
     /// Latched when the user drops a dragged row onto another; wm drains it
     /// each frame and resolves it against live structure.
     pub reorder: Option<PanelReorder>,
+    /// Live drag-reorder gesture, while the pointer is down on a row in an
+    /// expanded mode. Runtime-only — never persisted.
+    pub drag: Option<PanelDrag>,
 }
 
 impl PanelView {
@@ -295,6 +327,7 @@ impl PanelView {
             toggle_collapse: false,
             update_click: false,
             reorder: None,
+            drag: None,
         }
     }
 
@@ -334,6 +367,11 @@ impl PanelView {
         // means the panel is bottom/top-docked and content runs left-to-right.
         // No stored state — move the leaf back to a tall slot and it flips back.
         let horizontal = rect.width() > rect.height();
+        let axis = if horizontal {
+            ScrollAxis::Horizontal
+        } else {
+            ScrollAxis::Vertical
+        };
         if self.collapsed {
             self.thumb_drag = None;
             if horizontal {
@@ -341,94 +379,162 @@ impl PanelView {
             } else {
                 self.paint_rail(ui, rect, base);
             }
-            return;
-        }
-        if horizontal {
+        } else if horizontal {
             if rect.height() < STRIP_H {
                 self.paint_strip(ui, body, base);
             } else {
                 self.paint_columns(ui, body, base);
             }
-            return;
-        }
-
-        let row_h = 22.0;
-        // Entry clamp: `scroll` may carry a large x-offset back from a wide
-        // horizontal dock; without it every row paints above the rect (panel
-        // looks empty) until the first wheel tick re-clamps.
-        let content_h: f32 = 4.0
-            + self
-                .model
-                .projects
-                .iter()
-                .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
-                .sum::<f32>();
-        let scrollbar = self.prepare_scrollbar(ui, body, base, ScrollAxis::Vertical, content_h);
-        let mut rows_rect = body;
-        if let Some(s) = &scrollbar {
-            rows_rect.max.x = (s.band.min.x - 2.0).max(rows_rect.min.x);
-        }
-        let mut y = body.min.y + 4.0 - self.scroll;
-
-        // Collect paint specs first so we can mutate self (click/hover) without
-        // holding a borrow on model.
-        let mut specs: Vec<(egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
-        for (pi, proj) in self.model.projects.iter().enumerate() {
-            let row = egui::Rect::from_min_size(
-                egui::pos2(rows_rect.min.x + 4.0, y),
-                egui::vec2((rows_rect.width() - 8.0).max(0.0), row_h),
-            );
-            if row_visible(row, rows_rect) {
-                specs.push((
-                    row,
-                    base.with(("prow", pi, proj.path.project)),
-                    RowPaintOwned {
-                        path: proj.path,
-                        title: proj.title.clone(),
-                        kind: None,
-                        focused: proj.focused,
-                        minimized: proj.minimized,
-                        background_tab: false,
-                        exited: false,
-                        bell: false,
-                        project_row: true,
-                    },
-                ));
+        } else {
+            let row_h = 22.0;
+            // Entry clamp: `scroll` may carry a large x-offset back from a wide
+            // horizontal dock; without it every row paints above the rect (panel
+            // looks empty) until the first wheel tick re-clamps.
+            let content_h: f32 = 4.0
+                + self
+                    .model
+                    .projects
+                    .iter()
+                    .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
+                    .sum::<f32>();
+            let scrollbar = self.prepare_scrollbar(ui, body, base, ScrollAxis::Vertical, content_h);
+            let mut rows_rect = body;
+            if let Some(s) = &scrollbar {
+                rows_rect.max.x = (s.band.min.x - 2.0).max(rows_rect.min.x);
             }
-            y += row_h;
+            let mut y = body.min.y + 4.0 - self.scroll;
 
-            for (ti, t) in proj.tabs.iter().enumerate() {
+            // Collect paint specs first so we can mutate self (click/hover) without
+            // holding a borrow on model.
+            let mut specs: Vec<(egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
+            for (pi, proj) in self.model.projects.iter().enumerate() {
                 let row = egui::Rect::from_min_size(
-                    egui::pos2(rows_rect.min.x + 16.0, y),
-                    egui::vec2((rows_rect.width() - 20.0).max(0.0), row_h),
+                    egui::pos2(rows_rect.min.x + 4.0, y),
+                    egui::vec2((rows_rect.width() - 8.0).max(0.0), row_h),
                 );
                 if row_visible(row, rows_rect) {
                     specs.push((
                         row,
-                        base.with(("trow", pi, ti, t.path.window, t.path.tab)),
+                        base.with(("prow", pi, proj.path.project)),
                         RowPaintOwned {
-                            path: t.path,
-                            title: t.title.clone(),
-                            kind: Some(t.kind),
-                            focused: t.focused,
-                            minimized: t.minimized,
-                            background_tab: !t.active_tab,
-                            exited: t.exited,
-                            bell: bell_gate && t.bell,
-                            project_row: false,
+                            path: proj.path,
+                            title: proj.title.clone(),
+                            kind: None,
+                            focused: proj.focused,
+                            minimized: proj.minimized,
+                            background_tab: false,
+                            exited: false,
+                            bell: false,
+                            project_row: true,
+                            drag_ref: Some(PanelRowRef {
+                                path: proj.path,
+                                identity: proj.identity.clone(),
+                            }),
                         },
                     ));
                 }
                 y += row_h;
+
+                for (ti, t) in proj.tabs.iter().enumerate() {
+                    let row = egui::Rect::from_min_size(
+                        egui::pos2(rows_rect.min.x + 16.0, y),
+                        egui::vec2((rows_rect.width() - 20.0).max(0.0), row_h),
+                    );
+                    if row_visible(row, rows_rect) {
+                        specs.push((
+                            row,
+                            base.with(("trow", pi, ti, t.path.window, t.path.tab)),
+                            RowPaintOwned {
+                                path: t.path,
+                                title: t.title.clone(),
+                                kind: Some(t.kind),
+                                focused: t.focused,
+                                minimized: t.minimized,
+                                background_tab: !t.active_tab,
+                                exited: t.exited,
+                                bell: bell_gate && t.bell,
+                                project_row: false,
+                                drag_ref: Some(PanelRowRef {
+                                    path: t.path,
+                                    identity: t.identity.clone(),
+                                }),
+                            },
+                        ));
+                    }
+                    y += row_h;
+                }
+                y += 4.0;
             }
-            y += 4.0;
-        }
-        for (row, id, rp) in specs {
-            self.paint_row(ui, row, id, rows_rect, rp);
+
+            // Drag target: same-scope rows only, resolved by Y midpoint.
+            if let Some(d) = &mut self.drag {
+                let scope_rows: Vec<(egui::Rect, PanelRowRef)> = specs
+                    .iter()
+                    .filter_map(|(rect, _, rp)| {
+                        let r = rp.drag_ref.clone()?;
+                        let same = if d.source_is_project {
+                            rp.project_row
+                        } else {
+                            !rp.project_row
+                                && r.path.project == d.source.path.project
+                                && r.path.ptab == d.source.path.ptab
+                        };
+                        same.then_some((*rect, r))
+                    })
+                    .collect();
+                d.target = None;
+                d.marker = None;
+                if let Some(ptr) = ui.ctx().pointer_latest_pos() {
+                    let centers: Vec<f32> = scope_rows.iter().map(|(r, _)| r.center().y).collect();
+                    if let Some((idx, placement)) = insertion_at(&centers, ptr.y) {
+                        let (rect, anchor) = &scope_rows[idx];
+                        let y = match placement {
+                            Placement::Before => rect.min.y,
+                            Placement::After => rect.max.y,
+                        };
+                        d.target = Some((anchor.clone(), placement));
+                        d.marker = Some((egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)));
+                    }
+                }
+            }
+
+            for (row, id, rp) in specs {
+                self.paint_row(ui, row, id, rows_rect, rp, ScrollAxis::Vertical);
+            }
+
+            if let Some((a, b)) = self.drag.as_ref().and_then(|d| d.marker) {
+                ui.painter()
+                    .line_segment([a, b], egui::Stroke::new(2.0, th.text));
+            }
+            let vert_max_scroll = (content_h - body.height()).max(0.0);
+            self.drag_autoscroll(ui, rows_rect, ScrollAxis::Vertical, vert_max_scroll);
+
+            if let Some(scrollbar) = scrollbar {
+                self.paint_scrollbar(ui, scrollbar);
+            }
         }
 
-        if let Some(scrollbar) = scrollbar {
-            self.paint_scrollbar(ui, scrollbar);
+        // Drag completion/cancellation — one place, after the mode painters
+        // updated `target`. Collapse, orientation flip, or lost pointer state
+        // cancels; a release over a valid slot records ONE reorder intent.
+        if self.drag.is_some() {
+            let (released, down) =
+                ui.input(|i| (i.pointer.primary_released(), i.pointer.primary_down()));
+            let flipped = self.drag.as_ref().is_some_and(|d| d.axis != axis);
+            if self.collapsed || flipped || (!down && !released) {
+                self.drag = None;
+            } else if released {
+                let d = self.drag.take().unwrap();
+                if let Some((anchor, placement)) = d.target {
+                    if anchor != d.source {
+                        self.reorder = Some(PanelReorder {
+                            source: d.source,
+                            anchor,
+                            placement,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -821,6 +927,10 @@ impl PanelView {
                     exited: false,
                     bell: false,
                     project_row: true,
+                    drag_ref: Some(PanelRowRef {
+                        path: proj.path,
+                        identity: proj.identity.clone(),
+                    }),
                 },
             ));
             y += row_h;
@@ -846,14 +956,78 @@ impl PanelView {
                         exited: t.exited,
                         bell: bell_gate && t.bell,
                         project_row: false,
+                        drag_ref: Some(PanelRowRef {
+                            path: t.path,
+                            identity: t.identity.clone(),
+                        }),
                     },
                 ));
                 y += row_h;
             }
         }
-        for (row, clip, id, rp) in specs {
-            self.paint_row(ui, row, id, clip, rp);
+
+        // Drag target: project-header rows resolve by X midpoint (columns run
+        // left-to-right); session rows resolve by Y midpoint among same-project
+        // rows, exactly as vertical mode.
+        if let Some(d) = &mut self.drag {
+            d.target = None;
+            d.marker = None;
+            if let Some(ptr) = ui.ctx().pointer_latest_pos() {
+                if d.source_is_project {
+                    let scope_rows: Vec<(egui::Rect, egui::Rect, PanelRowRef)> = specs
+                        .iter()
+                        .filter_map(|(rect, clip, _, rp)| {
+                            if !rp.project_row {
+                                return None;
+                            }
+                            rp.drag_ref.clone().map(|r| (*rect, *clip, r))
+                        })
+                        .collect();
+                    let centers: Vec<f32> =
+                        scope_rows.iter().map(|(r, _, _)| r.center().x).collect();
+                    if let Some((idx, placement)) = insertion_at(&centers, ptr.x) {
+                        let (rect, clip, anchor) = &scope_rows[idx];
+                        let x = match placement {
+                            Placement::Before => rect.min.x,
+                            Placement::After => rect.max.x,
+                        };
+                        d.target = Some((anchor.clone(), placement));
+                        d.marker = Some((egui::pos2(x, clip.min.y), egui::pos2(x, clip.max.y)));
+                    }
+                } else {
+                    let scope_rows: Vec<(egui::Rect, PanelRowRef)> = specs
+                        .iter()
+                        .filter_map(|(rect, _, _, rp)| {
+                            let r = rp.drag_ref.clone()?;
+                            let same = !rp.project_row
+                                && r.path.project == d.source.path.project
+                                && r.path.ptab == d.source.path.ptab;
+                            same.then_some((*rect, r))
+                        })
+                        .collect();
+                    let centers: Vec<f32> = scope_rows.iter().map(|(r, _)| r.center().y).collect();
+                    if let Some((idx, placement)) = insertion_at(&centers, ptr.y) {
+                        let (rect, anchor) = &scope_rows[idx];
+                        let y = match placement {
+                            Placement::Before => rect.min.y,
+                            Placement::After => rect.max.y,
+                        };
+                        d.target = Some((anchor.clone(), placement));
+                        d.marker = Some((egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)));
+                    }
+                }
+            }
         }
+
+        for (row, clip, id, rp) in specs {
+            self.paint_row(ui, row, id, clip, rp, ScrollAxis::Horizontal);
+        }
+        if let Some((a, b)) = self.drag.as_ref().and_then(|d| d.marker) {
+            ui.painter()
+                .line_segment([a, b], egui::Stroke::new(2.0, th.text));
+        }
+        let cols_max_scroll = (content_w - rect.width()).max(0.0);
+        self.drag_autoscroll(ui, rect, ScrollAxis::Horizontal, cols_max_scroll);
         let p = ui.painter_at(content_rect);
         for dx in dividers {
             p.line_segment(
@@ -1192,6 +1366,42 @@ impl PanelView {
         }
     }
 
+    /// While dragging near a clip edge, advance the existing scroll offset on
+    /// the current axis and request a repaint (egui only repaints on input
+    /// otherwise, and a held-still pointer generates none).
+    fn drag_autoscroll(
+        &mut self,
+        ui: &egui::Ui,
+        clip: egui::Rect,
+        axis: ScrollAxis,
+        max_scroll: f32,
+    ) {
+        const ZONE: f32 = 24.0;
+        const SPEED: f32 = 420.0; // px/s
+        if self.drag.is_none() {
+            return;
+        }
+        let Some(p) = ui.ctx().pointer_latest_pos() else {
+            return;
+        };
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let (pos, lo, hi) = match axis {
+            ScrollAxis::Vertical => (p.y, clip.min.y, clip.max.y),
+            ScrollAxis::Horizontal => (p.x, clip.min.x, clip.max.x),
+        };
+        let delta = if pos < lo + ZONE {
+            -SPEED * dt
+        } else if pos > hi - ZONE {
+            SPEED * dt
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            self.scroll = (self.scroll + delta).clamp(0.0, max_scroll);
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn paint_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -1199,13 +1409,30 @@ impl PanelView {
         id: egui::Id,
         clip: egui::Rect,
         rp: RowPaintOwned,
+        axis: ScrollAxis,
     ) {
         let th = crate::theme::live(ui.ctx());
         let p = ui.painter().with_clip_rect(clip);
         // Paint may use the full row and rely on the painter clip, but input
         // must use the clipped rect too. Horizontal columns can end on a
         // partial row immediately above the scrollbar band.
-        let resp = ui.interact(row.intersect(clip), id, egui::Sense::click());
+        let sense = if rp.drag_ref.is_some() {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        };
+        let resp = ui.interact(row.intersect(clip), id, sense);
+        if let Some(dr) = &rp.drag_ref
+            && resp.drag_started()
+        {
+            self.drag = Some(PanelDrag {
+                source: dr.clone(),
+                source_is_project: rp.project_row,
+                axis,
+                target: None,
+                marker: None,
+            });
+        }
         // Geometric containment, not `hovered()`: the min/close buttons below
         // are registered on top of this row, so hovering them un-hovers the
         // row — gating on `hovered()` made the buttons flicker in and out of
@@ -1391,6 +1618,9 @@ struct RowPaintOwned {
     /// Latched Bell on this terminal row (already gated by the master switch).
     bell: bool,
     project_row: bool,
+    /// Some = this row is a drag-reorder source (expanded modes). Rail rows
+    /// stay None/non-draggable.
+    drag_ref: Option<PanelRowRef>,
 }
 
 /// An up/down chevron as two line segments. The default egui fonts have no
@@ -1503,6 +1733,16 @@ mod tests {
             splice_order(&items, "a", "b", Placement::Before).unwrap(),
             vec!["a", "b"]
         );
+    }
+
+    #[test]
+    fn insertion_at_resolves_slots_by_midpoint() {
+        let centers = [10.0, 30.0, 50.0];
+        assert_eq!(insertion_at(&centers, 5.0), Some((0, Placement::Before)));
+        assert_eq!(insertion_at(&centers, 25.0), Some((1, Placement::Before)));
+        assert_eq!(insertion_at(&centers, 40.0), Some((2, Placement::Before)));
+        assert_eq!(insertion_at(&centers, 60.0), Some((2, Placement::After)));
+        assert_eq!(insertion_at(&[], 10.0), None);
     }
 
     #[test]
