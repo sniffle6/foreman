@@ -41,7 +41,10 @@ right edge so it fattens in place instead of shifting.
 
 ## How it works
 
-The geometry is pure math in `src/geom.rs`, unit-tested with no GUI:
+The geometry is pure math in `src/geom.rs`, unit-tested with no GUI. The
+axis-generic `scrollbar_*` functions serve both the terminal and the Sessions
+panel; the terminal-facing functions below preserve the original vertical,
+bottom-origin API:
 
 - `thumb_rect(track, rows, hist, off)` — where the bar sits. 4px wide, with a
   16px minimum height so a deep buffer still leaves something to grab.

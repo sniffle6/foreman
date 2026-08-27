@@ -216,6 +216,13 @@ plan. The grid walk is clamped to the grid's real bounds first, so a stale index
 can't panic and abort the process.
 _Avoid_: display list, render list, draw commands.
 
+**Scrollbar geometry**:
+The pure, axis-generic mapping between a scrollable viewport, its content
+offset, and the thumb's paint and interaction rects. Terminal scrollback and
+the Sessions panel share it so sizing, edge clearance, and dragging stay in
+sync.
+_Avoid_: scroll state, scroll view, thumb math.
+
 **Selection cull**:
 The step that re-projects the selection onto the visible viewport for painting.
 The selection itself lives in the grid model (`term.selection`, buffer

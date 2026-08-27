@@ -80,6 +80,19 @@ and the landing site for future agent-state badges.
     can't fit band + body).
   Wheels have no x axis, so `smooth_scroll_delta.y` (plus `.x` for trackpads)
   drives the horizontal scroll offset.
+- **Overflow follows the terminal scrollbar design:** expanded vertical mode
+  paints a vertical thumb at the right edge; expanded horizontal columns and
+  strip modes paint a horizontal thumb at the bottom edge. Both use the
+  terminal's resting/hot bar sizes, enlarged interaction band, minimum grab
+  extent, grab-point-preserving drag, centred track click, and fade curve. The
+  thumb only exists when content overflows. Collapsed rails stay visually quiet
+  but remain wheel-scrollable on their visible axis, because the thumb's
+  interaction band would consume too much of the compact rail.
+- **Scrollbar geometry is axis-generic:** `src/geom.rs` owns the shared
+  `ScrollAxis` math for bar placement, hit/track bands, hot growth, and the
+  drag inverse. The panel reserves that interaction band before painting rows
+  or chips, and the edge inset remains derived from `wm::RESIZE_BAND`, so the
+  window resize handle and scrollbar do not overlap.
 - **Collapse glyph orients to the shrink axis:** `»`/`«` when right-docked,
   chevrons when bottom/top-docked (top/left mirror). The `⌃`/`⌄` codepoints
   are tofu in egui's default fonts, so chevrons are drawn as vector strokes
@@ -105,8 +118,10 @@ and the landing site for future agent-state badges.
 
 ## Key files
 
-- `src/panel.rs` — model types + row paint; horizontal painters
-  (`paint_columns`, `paint_strip`, `paint_rail_h`, `hscroll`, `paint_chevron`)
+- `src/panel.rs` — model types + row paint; axis-aware scrollbar input/paint;
+  horizontal painters (`paint_columns`, `paint_strip`, `paint_rail_h`,
+  `paint_chevron`)
+- `src/geom.rs` — shared axis-generic scrollbar geometry and terminal wrappers
 - `src/wm.rs` — `panel_model`, `surface_target`, `ensure_panel`, path Acts,
   drains, `apply_panel_ratio` (H→V axis fallback)
 - `src/layout.rs` — `set_leaf_extent` (axis-aware; `set_leaf_width` wraps it)

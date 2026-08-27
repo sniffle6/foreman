@@ -95,12 +95,43 @@ impl CellMetrics {
     }
 }
 
-/// Painted width of the scrollback thumb at rest.
+/// Axis a scrollbar travels along. The cross-axis edge is always the rect's
+/// trailing edge: right for vertical bars, bottom for horizontal bars.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub(crate) enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+impl ScrollAxis {
+    pub(crate) fn extent(self, rect: egui::Rect) -> f32 {
+        match self {
+            Self::Horizontal => rect.width(),
+            Self::Vertical => rect.height(),
+        }
+    }
+
+    pub(crate) fn main_min(self, rect: egui::Rect) -> f32 {
+        match self {
+            Self::Horizontal => rect.min.x,
+            Self::Vertical => rect.min.y,
+        }
+    }
+
+    pub(crate) fn main_pos(self, pos: egui::Pos2) -> f32 {
+        match self {
+            Self::Horizontal => pos.x,
+            Self::Vertical => pos.y,
+        }
+    }
+}
+
+/// Painted cross-axis width of a scrollbar thumb at rest.
 const THUMB_W: f32 = 4.0;
-/// Painted width while the pointer is in the track band, or during a drag — so
+/// Painted cross-axis width while the pointer is in the track band, or during a drag — so
 /// it reads as a control you can take hold of rather than a position readout.
 const THUMB_HOT_W: f32 = 8.0;
-/// How far the thumb keeps clear of the pane's right edge.
+/// How far the thumb keeps clear of the pane's trailing cross-axis edge.
 ///
 /// The window manager puts an invisible resize hit-zone [`crate::wm::RESIZE_BAND`]
 /// wide along every edge, and registers it with `ui.interact` AFTER the content,
@@ -110,25 +141,127 @@ const THUMB_HOT_W: f32 = 8.0;
 /// reach for it. Deriving the inset from the band keeps the two from drifting.
 const THUMB_EDGE_INSET: f32 = crate::wm::RESIZE_BAND;
 /// Grab width. A 4px target is not hittable with a mouse, so the interactive
-/// zone reaches further left than the bar the user sees.
+/// zone reaches inward from the edge further than the bar the user sees.
 const THUMB_HIT_W: f32 = 14.0;
-/// Floor on thumb height so a deep buffer still leaves something to grab.
-const THUMB_MIN_H: f32 = 16.0;
+/// Floor on thumb length so deep content still leaves something to grab.
+const THUMB_MIN_LEN: f32 = 16.0;
 
-/// Thumb height and the distance its top can travel down the track.
-///
-/// Travel is `track_h - thumb_h`, NOT the raw track height: once
-/// [`THUMB_MIN_H`] kicks in on a deep buffer the thumb is taller than its
-/// proportional share, so mapping over the full track would put the bottom of
-/// the range past the end of the track and leave the last stretch of history
-/// unreachable by dragging.
-fn thumb_metrics(track: egui::Rect, rows: usize, hist: usize) -> (f32, f32) {
-    let total = (rows + hist).max(1);
-    let track_h = track.height();
-    let thumb_h = (track_h * rows as f32 / total as f32)
-        .max(THUMB_MIN_H)
-        .min(track_h);
-    (thumb_h, (track_h - thumb_h).max(0.0))
+/// Thumb length and the distance its leading edge can travel along `axis`.
+/// Shared by terminal scrollback and the Sessions panel so the two controls
+/// cannot drift in proportional sizing or drag range.
+fn scrollbar_metrics(
+    track: egui::Rect,
+    viewport_extent: f32,
+    content_extent: f32,
+    axis: ScrollAxis,
+) -> (f32, f32) {
+    let track_extent = axis.extent(track).max(0.0);
+    let viewport_extent = viewport_extent.max(0.0);
+    let content_extent = content_extent.max(viewport_extent).max(1.0);
+    let thumb_extent = (track_extent * viewport_extent / content_extent)
+        .max(THUMB_MIN_LEN)
+        .min(track_extent);
+    (thumb_extent, (track_extent - thumb_extent).max(0.0))
+}
+
+/// Axis-generic scrollbar thumb. `offset` is measured from the content's
+/// leading edge (top or left) and clamped to the scrollable range.
+pub(crate) fn scrollbar_thumb_rect(
+    track: egui::Rect,
+    viewport_extent: f32,
+    content_extent: f32,
+    offset: f32,
+    axis: ScrollAxis,
+) -> egui::Rect {
+    let (thumb_extent, travel) = scrollbar_metrics(track, viewport_extent, content_extent, axis);
+    let max_scroll = (content_extent - viewport_extent).max(0.0);
+    let frac = if max_scroll <= 0.0 {
+        0.0
+    } else {
+        offset.clamp(0.0, max_scroll) / max_scroll
+    };
+    let main = axis.main_min(track) + travel * frac;
+    match axis {
+        ScrollAxis::Vertical => {
+            let right = track.max.x - THUMB_EDGE_INSET;
+            egui::Rect::from_min_size(
+                egui::pos2(right - THUMB_W, main),
+                egui::vec2(THUMB_W, thumb_extent),
+            )
+        }
+        ScrollAxis::Horizontal => {
+            let bottom = track.max.y - THUMB_EDGE_INSET;
+            egui::Rect::from_min_size(
+                egui::pos2(main, bottom - THUMB_W),
+                egui::vec2(thumb_extent, THUMB_W),
+            )
+        }
+    }
+}
+
+/// Painted thumb while hovered or dragged, grown inward from the same edge.
+pub(crate) fn scrollbar_hot_rect(bar: egui::Rect, axis: ScrollAxis) -> egui::Rect {
+    match axis {
+        ScrollAxis::Vertical => {
+            egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HOT_W, bar.min.y), bar.max)
+        }
+        ScrollAxis::Horizontal => {
+            egui::Rect::from_min_max(egui::pos2(bar.min.x, bar.max.y - THUMB_HOT_W), bar.max)
+        }
+    }
+}
+
+/// Grab zone for a thumb: same main-axis span, wider toward the content.
+pub(crate) fn scrollbar_hit_rect(bar: egui::Rect, axis: ScrollAxis) -> egui::Rect {
+    match axis {
+        ScrollAxis::Vertical => {
+            egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HIT_W, bar.min.y), bar.max)
+        }
+        ScrollAxis::Horizontal => {
+            egui::Rect::from_min_max(egui::pos2(bar.min.x, bar.max.y - THUMB_HIT_W), bar.max)
+        }
+    }
+}
+
+/// Full track band used for hover, track clicks, and drag capture.
+pub(crate) fn scrollbar_track_rect(track: egui::Rect, axis: ScrollAxis) -> egui::Rect {
+    match axis {
+        ScrollAxis::Vertical => {
+            let right = track.max.x - THUMB_EDGE_INSET;
+            egui::Rect::from_min_max(
+                egui::pos2(right - THUMB_HIT_W, track.min.y),
+                egui::pos2(right, track.max.y),
+            )
+        }
+        ScrollAxis::Horizontal => {
+            let bottom = track.max.y - THUMB_EDGE_INSET;
+            egui::Rect::from_min_max(
+                egui::pos2(track.min.x, bottom - THUMB_HIT_W),
+                egui::pos2(track.max.x, bottom),
+            )
+        }
+    }
+}
+
+/// Inverse of [`scrollbar_thumb_rect`]. `thumb_start` is the desired leading
+/// edge of the thumb along `axis`; the returned content offset is clamped.
+pub(crate) fn scrollbar_offset_for_thumb_start(
+    track: egui::Rect,
+    viewport_extent: f32,
+    content_extent: f32,
+    thumb_start: f32,
+    axis: ScrollAxis,
+) -> f32 {
+    let max_scroll = (content_extent - viewport_extent).max(0.0);
+    if max_scroll <= 0.0 {
+        return 0.0;
+    }
+    let (_, travel) = scrollbar_metrics(track, viewport_extent, content_extent, axis);
+    if travel <= 0.0 {
+        return 0.0;
+    }
+    let frac = ((thumb_start - axis.main_min(track)) / travel).clamp(0.0, 1.0);
+    frac * max_scroll
 }
 
 /// Scrollback thumb geometry: where the right-edge thumb sits for a viewport
@@ -139,38 +272,32 @@ fn thumb_metrics(track: egui::Rect, rows: usize, hist: usize) -> (f32, f32) {
 /// the track; `off == 0` (live prompt) puts its bottom at the bottom.
 /// [`offset_for_thumb_top`] is the exact inverse.
 pub(crate) fn thumb_rect(track: egui::Rect, rows: usize, hist: usize, off: i32) -> egui::Rect {
-    let (thumb_h, travel) = thumb_metrics(track, rows, hist);
-    let back = (hist as i32 - off).clamp(0, hist as i32) as f32;
-    let frac = if hist == 0 { 0.0 } else { back / hist as f32 };
-    let thumb_y = track.min.y + travel * frac;
-    let right = track.max.x - THUMB_EDGE_INSET;
-    egui::Rect::from_min_size(
-        egui::pos2(right - THUMB_W, thumb_y),
-        egui::vec2(THUMB_W, thumb_h),
+    let from_top = (hist as i32 - off).clamp(0, hist as i32) as f32;
+    scrollbar_thumb_rect(
+        track,
+        rows as f32,
+        (rows + hist) as f32,
+        from_top,
+        ScrollAxis::Vertical,
     )
 }
 
 /// The bar as painted while hovered or dragged: same rows and same right edge,
 /// grown leftward. Pure so the widen is pinned without a GUI.
 pub(crate) fn thumb_hot_rect(bar: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HOT_W, bar.min.y), bar.max)
+    scrollbar_hot_rect(bar, ScrollAxis::Vertical)
 }
 
 /// The thumb's grab zone: same rows as the painted bar, but wide enough to hit.
 pub(crate) fn thumb_hit_rect(track: egui::Rect, rows: usize, hist: usize, off: i32) -> egui::Rect {
-    let bar = thumb_rect(track, rows, hist, off);
-    egui::Rect::from_min_max(egui::pos2(bar.max.x - THUMB_HIT_W, bar.min.y), bar.max)
+    scrollbar_hit_rect(thumb_rect(track, rows, hist, off), ScrollAxis::Vertical)
 }
 
 /// The full-height band on the right edge that counts as "the scrollbar" for
 /// hit-testing — same width as [`thumb_hit_rect`], spanning the whole track.
 /// A press in here but outside the thumb is a track click.
 pub(crate) fn thumb_track_rect(track: egui::Rect) -> egui::Rect {
-    let right = track.max.x - THUMB_EDGE_INSET;
-    egui::Rect::from_min_max(
-        egui::pos2(right - THUMB_HIT_W, track.min.y),
-        egui::pos2(right, track.max.y),
-    )
+    scrollbar_track_rect(track, ScrollAxis::Vertical)
 }
 
 /// Inverse of [`thumb_rect`]: the `display_offset` that would place the thumb's
@@ -186,12 +313,14 @@ pub(crate) fn offset_for_thumb_top(
     if hist == 0 {
         return 0;
     }
-    let (_, travel) = thumb_metrics(track, rows, hist);
-    if travel <= 0.0 {
-        return 0;
-    }
-    let frac = ((thumb_top_y - track.min.y) / travel).clamp(0.0, 1.0);
-    let back = (frac * hist as f32).round() as i32;
+    let back = scrollbar_offset_for_thumb_start(
+        track,
+        rows as f32,
+        (rows + hist) as f32,
+        thumb_top_y,
+        ScrollAxis::Vertical,
+    )
+    .round() as i32;
     (hist as i32 - back).clamp(0, hist as i32)
 }
 
@@ -351,6 +480,56 @@ mod tests {
         assert_eq!((hot.min.y, hot.max.y), (bar.min.y, bar.max.y), "same rows");
         assert_eq!(hot.max.x, bar.max.x, "same right edge - it grows inward");
         assert!(hot.width() > bar.width());
+    }
+
+    #[test]
+    fn generic_scrollbar_geometry_is_axis_symmetric() {
+        let vertical_track =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 400.0));
+        let vertical =
+            scrollbar_thumb_rect(vertical_track, 200.0, 400.0, 0.0, ScrollAxis::Vertical);
+        assert_eq!(vertical.height(), 200.0);
+        assert_eq!(vertical.min.y, vertical_track.min.y);
+        assert_eq!(
+            vertical.max.x,
+            vertical_track.max.x - crate::wm::RESIZE_BAND
+        );
+
+        let horizontal_track =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 200.0));
+        let horizontal =
+            scrollbar_thumb_rect(horizontal_track, 200.0, 400.0, 0.0, ScrollAxis::Horizontal);
+        assert_eq!(horizontal.width(), 200.0);
+        assert_eq!(horizontal.min.x, horizontal_track.min.x);
+        assert_eq!(
+            horizontal.max.y,
+            horizontal_track.max.y - crate::wm::RESIZE_BAND
+        );
+        let horizontal_band = scrollbar_track_rect(horizontal_track, ScrollAxis::Horizontal);
+        let horizontal_hit = scrollbar_hit_rect(horizontal, ScrollAxis::Horizontal);
+        let horizontal_hot = scrollbar_hot_rect(horizontal, ScrollAxis::Horizontal);
+        assert_eq!(horizontal_band.max.y, horizontal.max.y);
+        assert_eq!(horizontal_hit.max.y, horizontal.max.y);
+        assert_eq!(horizontal_hot.max.y, horizontal.max.y);
+        assert_eq!(horizontal_band.height(), THUMB_HIT_W);
+        assert_eq!(horizontal_hit.height(), THUMB_HIT_W);
+        assert_eq!(horizontal_hot.height(), THUMB_HOT_W);
+    }
+
+    #[test]
+    fn generic_scrollbar_drag_inverse_round_trips_on_both_axes() {
+        let track = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(420.0, 310.0));
+        for axis in [ScrollAxis::Vertical, ScrollAxis::Horizontal] {
+            for offset in [0.0, 75.0, 300.0] {
+                let bar = scrollbar_thumb_rect(track, 100.0, 400.0, offset, axis);
+                let recovered =
+                    scrollbar_offset_for_thumb_start(track, 100.0, 400.0, axis.main_min(bar), axis);
+                assert!(
+                    (recovered - offset).abs() < 0.01,
+                    "axis={axis:?} offset={offset}"
+                );
+            }
+        }
     }
 
     #[test]

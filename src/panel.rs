@@ -4,6 +4,7 @@
 //! `WindowManager::panel_model()`. The view paints rows and records clicks into
 //! fields drained after the draw pass (same deferred-Act pattern as chat).
 
+use crate::geom::ScrollAxis;
 use crate::theme::*;
 use crate::wm::{Dir, WinId};
 use eframe::egui;
@@ -166,6 +167,21 @@ pub enum PanelBtn {
     Close,
 }
 
+#[derive(Clone, Copy)]
+struct PanelThumbDrag {
+    axis: ScrollAxis,
+    /// Pointer distance from the thumb's leading edge along `axis`.
+    grab: f32,
+}
+
+struct PanelScrollbar {
+    axis: ScrollAxis,
+    bar: egui::Rect,
+    band: egui::Rect,
+    alpha: f32,
+    hot: bool,
+}
+
 /// Per-window view state for the task-manager panel (shallow view).
 /// `model` is stashed by the desktop each frame before the draw pass;
 /// `click` / `hover_act` / `toggle_collapse` are drained after it.
@@ -179,6 +195,9 @@ pub struct PanelView {
     /// right rail. Only changes when the user moves the panel in the tree.
     pub dock: Dir,
     pub scroll: f32,
+    thumb_drag: Option<PanelThumbDrag>,
+    thumb_seen: Option<std::time::Instant>,
+    thumb_last_scroll: f32,
     pub click: Option<TargetPath>,
     pub hover_act: Option<(TargetPath, PanelBtn)>,
     pub toggle_collapse: bool,
@@ -199,6 +218,9 @@ impl PanelView {
             expanded_width: expanded_width.clamp(PANEL_MIN_EXPANDED, max),
             dock,
             scroll: 0.0,
+            thumb_drag: None,
+            thumb_seen: None,
+            thumb_last_scroll: 0.0,
             click: None,
             hover_act: None,
             toggle_collapse: false,
@@ -243,6 +265,7 @@ impl PanelView {
         // No stored state — move the leaf back to a tall slot and it flips back.
         let horizontal = rect.width() > rect.height();
         if self.collapsed {
+            self.thumb_drag = None;
             if horizontal {
                 self.paint_rail_h(ui, rect, base);
             } else {
@@ -270,19 +293,22 @@ impl PanelView {
                 .iter()
                 .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
                 .sum::<f32>();
-        self.scroll = self.scroll.clamp(0.0, (content_h - body.height()).max(0.0));
+        let scrollbar = self.prepare_scrollbar(ui, body, base, ScrollAxis::Vertical, content_h);
+        let mut rows_rect = body;
+        if let Some(s) = &scrollbar {
+            rows_rect.max.x = (s.band.min.x - 2.0).max(rows_rect.min.x);
+        }
         let mut y = body.min.y + 4.0 - self.scroll;
-        let start_y = y;
 
         // Collect paint specs first so we can mutate self (click/hover) without
         // holding a borrow on model.
         let mut specs: Vec<(egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
         for (pi, proj) in self.model.projects.iter().enumerate() {
             let row = egui::Rect::from_min_size(
-                egui::pos2(body.min.x + 4.0, y),
-                egui::vec2((body.width() - 8.0).max(0.0), row_h),
+                egui::pos2(rows_rect.min.x + 4.0, y),
+                egui::vec2((rows_rect.width() - 8.0).max(0.0), row_h),
             );
-            if row_visible(row, body) {
+            if row_visible(row, rows_rect) {
                 specs.push((
                     row,
                     base.with(("prow", pi, proj.path.project)),
@@ -303,10 +329,10 @@ impl PanelView {
 
             for (ti, t) in proj.tabs.iter().enumerate() {
                 let row = egui::Rect::from_min_size(
-                    egui::pos2(body.min.x + 16.0, y),
-                    egui::vec2((body.width() - 20.0).max(0.0), row_h),
+                    egui::pos2(rows_rect.min.x + 16.0, y),
+                    egui::vec2((rows_rect.width() - 20.0).max(0.0), row_h),
                 );
-                if row_visible(row, body) {
+                if row_visible(row, rows_rect) {
                     specs.push((
                         row,
                         base.with(("trow", pi, ti, t.path.window, t.path.tab)),
@@ -328,16 +354,154 @@ impl PanelView {
             y += 4.0;
         }
         for (row, id, rp) in specs {
-            self.paint_row(ui, row, id, body, rp);
+            self.paint_row(ui, row, id, rows_rect, rp);
         }
 
-        let content_h = (y - start_y) + self.scroll;
-        let resp = ui.interact(body, base.with("panel-scroll"), egui::Sense::hover());
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if resp.hovered() && scroll != 0.0 {
-            let max_scroll = (content_h - body.height()).max(0.0);
-            self.scroll = (self.scroll - scroll).clamp(0.0, max_scroll);
+        if let Some(scrollbar) = scrollbar {
+            self.paint_scrollbar(ui, scrollbar);
         }
+    }
+
+    /// Handle wheel, track-click, and grab-point-preserving thumb drag before
+    /// content placement. Painting stays deferred until after the rows/chips so
+    /// the thin bar is always the topmost visual.
+    fn prepare_scrollbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        track: egui::Rect,
+        base: egui::Id,
+        axis: ScrollAxis,
+        content_extent: f32,
+    ) -> Option<PanelScrollbar> {
+        // The layout can flip axes when the panel is moved or resized. A drag
+        // captured on the old edge must not spring back to life if that axis
+        // becomes visible again before the button is released.
+        if self.thumb_drag.is_some_and(|d| d.axis != axis) {
+            self.thumb_drag = None;
+        }
+        let viewport_extent = axis.extent(track);
+        let max_scroll = (content_extent - viewport_extent).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        if max_scroll <= 0.0 {
+            self.thumb_drag = None;
+            self.thumb_last_scroll = self.scroll;
+            return None;
+        }
+
+        let wheel_resp = ui.interact(
+            track,
+            base.with(("panel-scroll", axis)),
+            egui::Sense::hover(),
+        );
+        let wheel = ui.input(|i| panel_wheel_delta(axis, i.smooth_scroll_delta));
+        // Rows and chips are registered after this pane-wide response. They
+        // win `hovered()`, but the containing response still reports
+        // `contains_pointer()` for its same-layer children.
+        if (wheel_resp.hovered() || wheel_resp.contains_pointer()) && wheel != 0.0 {
+            self.scroll = (self.scroll - wheel).clamp(0.0, max_scroll);
+        }
+
+        let mut bar = crate::geom::scrollbar_thumb_rect(
+            track,
+            viewport_extent,
+            content_extent,
+            self.scroll,
+            axis,
+        );
+        let band = crate::geom::scrollbar_track_rect(track, axis);
+        let hit = crate::geom::scrollbar_hit_rect(bar, axis);
+        let band_resp = ui.interact(
+            band,
+            base.with(("panel-scrollbar", axis)),
+            egui::Sense::click_and_drag(),
+        );
+        let pointer = ui.ctx().pointer_latest_pos();
+        let pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
+        if pressed
+            && band_resp.hovered()
+            && let Some(p) = pointer
+        {
+            let grab = if hit.contains(p) {
+                axis.main_pos(p) - axis.main_min(bar)
+            } else {
+                axis.extent(bar) / 2.0
+            };
+            self.thumb_drag = Some(PanelThumbDrag { axis, grab });
+        }
+
+        let primary_down = ui.input(|i| i.pointer.primary_down());
+        if let Some(drag) = self.thumb_drag
+            && drag.axis == axis
+        {
+            if primary_down {
+                if let Some(p) = pointer {
+                    self.scroll = crate::geom::scrollbar_offset_for_thumb_start(
+                        track,
+                        viewport_extent,
+                        content_extent,
+                        axis.main_pos(p) - drag.grab,
+                        axis,
+                    );
+                }
+            } else {
+                self.thumb_drag = None;
+            }
+        }
+
+        bar = crate::geom::scrollbar_thumb_rect(
+            track,
+            viewport_extent,
+            content_extent,
+            self.scroll,
+            axis,
+        );
+        let in_band = band_resp.hovered();
+        let dragging = self.thumb_drag.is_some_and(|d| d.axis == axis);
+        let scrolled = (self.scroll - self.thumb_last_scroll).abs() > f32::EPSILON;
+        self.thumb_last_scroll = self.scroll;
+        if in_band || dragging || scrolled {
+            self.thumb_seen = Some(std::time::Instant::now());
+        }
+
+        let pointer_in_panel = pointer.is_some_and(|p| track.contains(p));
+        let floor = if self.scroll > 0.0 || pointer_in_panel {
+            THUMB_DIM_FLOOR
+        } else {
+            0.0
+        };
+        let idle = self
+            .thumb_seen
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(f64::INFINITY);
+        if self.thumb_seen.is_some() && !thumb_settled(idle) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
+
+        Some(PanelScrollbar {
+            axis,
+            bar,
+            band,
+            alpha: thumb_alpha(idle, floor),
+            hot: in_band || dragging,
+        })
+    }
+
+    fn paint_scrollbar(&self, ui: &egui::Ui, scrollbar: PanelScrollbar) {
+        if scrollbar.alpha <= 0.0 {
+            return;
+        }
+        let th = crate::theme::live(ui.ctx());
+        let bar = if scrollbar.hot {
+            crate::geom::scrollbar_hot_rect(scrollbar.bar, scrollbar.axis)
+        } else {
+            scrollbar.bar
+        };
+        ui.painter().with_clip_rect(scrollbar.band).rect_filled(
+            bar,
+            egui::CornerRadius::same(2),
+            th.scroll_thumb.gamma_multiply(scrollbar.alpha),
+        );
     }
 
     /// Quiet update chip pinned to the panel's bottom edge. Label and color
@@ -387,8 +551,8 @@ impl PanelView {
     /// the panel. No pulse animation for `Restart`/`Failed` — Progress events
     /// already repaint per percent, and a rail user gets the tooltip; a
     /// steady glyph avoids a per-frame animation loop for a rarely-visible
-    /// state. Fills BG behind itself because the vertical rail has no scroll
-    /// clamp and icons can flow underneath.
+    /// state. Fills BG behind itself so project icons cannot paint underneath
+    /// the reserved update-glyph cell.
     fn paint_rail_update_glyph(
         &mut self,
         ui: &mut egui::Ui,
@@ -440,7 +604,11 @@ impl PanelView {
     fn paint_rail(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         let th = crate::theme::live(ui.ctx());
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
-        let p = ui.painter().with_clip_rect(rect);
+        let mut body = rect;
+        if self.model.update.is_some() {
+            body.max.y = (body.max.y - 32.0).max(body.min.y);
+        }
+        let p = ui.painter().with_clip_rect(body);
         let rails: Vec<_> = self
             .model
             .projects
@@ -457,12 +625,20 @@ impl PanelView {
                 )
             })
             .collect();
-        let mut y = rect.min.y + 6.0;
+        let content_h = rails.len() as f32 * 32.0 + 12.0;
+        let max_scroll = (content_h - body.height()).max(0.0);
+        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        self.wheel_scroll(ui, body, base, ScrollAxis::Vertical, max_scroll);
+        let mut y = body.min.y + 6.0 - self.scroll;
         for (pi, path, title, focused, minimized, bell) in rails {
             let cell = egui::Rect::from_center_size(
                 egui::pos2(rect.center().x, y + 14.0),
                 egui::vec2(28.0, 28.0),
             );
+            if cell.max.y < body.min.y || cell.min.y > body.max.y {
+                y += 32.0;
+                continue;
+            }
             let resp = ui
                 .interact(
                     cell,
@@ -536,26 +712,29 @@ impl PanelView {
         let gap = 9.0; // pad + hairline + pad between groups
         let n = self.model.projects.len();
         let content_w = n as f32 * GROUP_W + n.saturating_sub(1) as f32 * gap + 8.0;
-        let max_scroll = (content_w - rect.width()).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let scrollbar = self.prepare_scrollbar(ui, rect, base, ScrollAxis::Horizontal, content_w);
+        let mut content_rect = rect;
+        if let Some(s) = &scrollbar {
+            content_rect.max.y = (s.band.min.y - 2.0).max(content_rect.min.y);
+        }
 
         let mut specs: Vec<(egui::Rect, egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
         let mut dividers: Vec<f32> = Vec::new();
         let mut x = rect.min.x + 4.0 - self.scroll;
         for (pi, proj) in self.model.projects.iter().enumerate() {
             let group = egui::Rect::from_min_size(
-                egui::pos2(x, rect.min.y),
-                egui::vec2(GROUP_W, rect.height()),
+                egui::pos2(x, content_rect.min.y),
+                egui::vec2(GROUP_W, content_rect.height()),
             );
             if pi + 1 < n {
                 dividers.push(group.max.x + gap * 0.5);
             }
             x += GROUP_W + gap;
-            if group.max.x < rect.min.x || group.min.x > rect.max.x {
+            if group.max.x < content_rect.min.x || group.min.x > content_rect.max.x {
                 continue; // scrolled out of view: no paint, no interact
             }
-            let clip = group.intersect(rect);
-            let mut y = rect.min.y + 4.0;
+            let clip = group.intersect(content_rect);
+            let mut y = content_rect.min.y + 4.0;
             let row =
                 egui::Rect::from_min_size(egui::pos2(group.min.x, y), egui::vec2(GROUP_W, row_h));
             specs.push((
@@ -576,7 +755,7 @@ impl PanelView {
             ));
             y += row_h;
             for (ti, t) in proj.tabs.iter().enumerate() {
-                if y >= rect.max.y {
+                if y >= content_rect.max.y {
                     break; // below the panel: clipped, never interactive
                 }
                 let row = egui::Rect::from_min_size(
@@ -605,17 +784,19 @@ impl PanelView {
         for (row, clip, id, rp) in specs {
             self.paint_row(ui, row, id, clip, rp);
         }
-        let p = ui.painter_at(rect);
+        let p = ui.painter_at(content_rect);
         for dx in dividers {
             p.line_segment(
                 [
-                    egui::pos2(dx, rect.min.y + 4.0),
-                    egui::pos2(dx, rect.max.y - 4.0),
+                    egui::pos2(dx, content_rect.min.y + 4.0),
+                    egui::pos2(dx, content_rect.max.y - 4.0),
                 ],
                 egui::Stroke::new(1.0, th.border.gamma_multiply(0.6)),
             );
         }
-        self.hscroll(ui, rect, base, max_scroll);
+        if let Some(scrollbar) = scrollbar {
+            self.paint_scrollbar(ui, scrollbar);
+        }
     }
 
     /// Strip mode: the body is too short for stacked rows, so projects and
@@ -688,12 +869,16 @@ impl PanelView {
                 .iter()
                 .map(|c| c.w + chip_gap + if c.div_before { 9.0 } else { 0.0 })
                 .sum::<f32>();
-        let max_scroll = (content_w - rect.width()).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        let scrollbar = self.prepare_scrollbar(ui, rect, base, ScrollAxis::Horizontal, content_w);
+        let mut content_rect = rect;
+        if let Some(s) = &scrollbar {
+            content_rect.max.y = (s.band.min.y - 2.0).max(content_rect.min.y);
+        }
+        let p = ui.painter_at(content_rect);
 
         // Pass 2: place, interact, paint.
-        let cy = rect.center().y;
-        let mut x = rect.min.x + 8.0 - self.scroll;
+        let cy = content_rect.center().y;
+        let mut x = content_rect.min.x + 8.0 - self.scroll;
         for chip in chips {
             if chip.div_before {
                 x += 4.0;
@@ -708,10 +893,14 @@ impl PanelView {
                 egui::vec2(chip.w, chip_h),
             );
             x += chip.w + chip_gap;
-            if chip_rect.max.x < rect.min.x || chip_rect.min.x > rect.max.x {
+            if chip_rect.max.x < content_rect.min.x || chip_rect.min.x > content_rect.max.x {
                 continue; // scrolled out of view: no paint, no interact
             }
-            let resp = ui.interact(chip_rect, chip.id, egui::Sense::click());
+            let resp = ui.interact(
+                chip_rect.intersect(content_rect),
+                chip.id,
+                egui::Sense::click(),
+            );
             let over = resp.hovered() || resp.contains_pointer();
             if chip.focused || over {
                 p.rect_filled(chip_rect, egui::CornerRadius::same(5), th.sel_bg);
@@ -781,7 +970,9 @@ impl PanelView {
                 self.click = Some(chip.path);
             }
         }
-        self.hscroll(ui, rect, base, max_scroll);
+        if let Some(scrollbar) = scrollbar {
+            self.paint_scrollbar(ui, scrollbar);
+        }
     }
 
     /// Collapsed horizontal rail: a 36px-tall strip with project icons flowing
@@ -907,17 +1098,26 @@ impl PanelView {
             );
             self.paint_rail_update_glyph(ui, cell, base, &chip);
         }
-        self.hscroll(ui, rect, base, max_scroll);
+        self.wheel_scroll(ui, rect, base, ScrollAxis::Horizontal, max_scroll);
     }
 
-    /// Wheel → x-offset for the horizontal modes. Mouse wheels have no x axis,
-    /// so the vertical delta drives the horizontal scroll; `.x` is added for
-    /// trackpads that do emit it.
-    fn hscroll(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id, max_scroll: f32) {
-        let resp = ui.interact(rect, base.with("panel-scroll"), egui::Sense::hover());
-        let d = ui.input(|i| i.smooth_scroll_delta);
-        let scroll = d.x + d.y;
-        if resp.hovered() && scroll != 0.0 {
+    /// Wheel-only scrolling for collapsed rails. Expanded modes use
+    /// `prepare_scrollbar`, which handles the same wheel policy plus the thumb.
+    fn wheel_scroll(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        base: egui::Id,
+        axis: ScrollAxis,
+        max_scroll: f32,
+    ) {
+        let resp = ui.interact(
+            rect,
+            base.with(("panel-scroll", axis)),
+            egui::Sense::hover(),
+        );
+        let scroll = ui.input(|i| panel_wheel_delta(axis, i.smooth_scroll_delta));
+        if (resp.hovered() || resp.contains_pointer()) && scroll != 0.0 {
             self.scroll = (self.scroll - scroll).clamp(0.0, max_scroll);
         }
     }
@@ -932,7 +1132,10 @@ impl PanelView {
     ) {
         let th = crate::theme::live(ui.ctx());
         let p = ui.painter().with_clip_rect(clip);
-        let resp = ui.interact(row, id, egui::Sense::click());
+        // Paint may use the full row and rely on the painter clip, but input
+        // must use the clipped rect too. Horizontal columns can end on a
+        // partial row immediately above the scrollbar band.
+        let resp = ui.interact(row.intersect(clip), id, egui::Sense::click());
         // Geometric containment, not `hovered()`: the min/close buttons below
         // are registered on top of this row, so hovering them un-hovers the
         // row — gating on `hovered()` made the buttons flicker in and out of
@@ -1031,8 +1234,12 @@ impl PanelView {
             let close_c = egui::pos2(row.max.x - 10.0, btn_y);
             let min_r = egui::Rect::from_center_size(min_c, egui::vec2(16.0, 16.0));
             let close_r = egui::Rect::from_center_size(close_c, egui::vec2(16.0, 16.0));
-            let min_resp = ui.interact(min_r, id.with("min"), egui::Sense::click());
-            let close_resp = ui.interact(close_r, id.with("close"), egui::Sense::click());
+            let min_resp = ui.interact(min_r.intersect(clip), id.with("min"), egui::Sense::click());
+            let close_resp = ui.interact(
+                close_r.intersect(clip),
+                id.with("close"),
+                egui::Sense::click(),
+            );
             p.text(
                 min_c,
                 egui::Align2::CENTER_CENTER,
@@ -1163,6 +1370,15 @@ fn row_visible(row: egui::Rect, clip: egui::Rect) -> bool {
     row.max.y >= clip.min.y && row.min.y <= clip.max.y
 }
 
+fn panel_wheel_delta(axis: ScrollAxis, delta: egui::Vec2) -> f32 {
+    match axis {
+        ScrollAxis::Vertical => delta.y,
+        // Mouse wheels commonly have no x axis, so vertical motion drives a
+        // horizontal panel too; real trackpad x motion adds naturally.
+        ScrollAxis::Horizontal => delta.x + delta.y,
+    }
+}
+
 fn paint_icon(
     ui: &mut egui::Ui,
     p: &egui::Painter,
@@ -1214,5 +1430,12 @@ mod tests {
             1,
         );
         assert_eq!(t, "Restart? 1 session closes");
+    }
+
+    #[test]
+    fn panel_wheel_follows_the_visible_scroll_axis() {
+        let delta = egui::vec2(3.0, 7.0);
+        assert_eq!(panel_wheel_delta(ScrollAxis::Vertical, delta), 7.0);
+        assert_eq!(panel_wheel_delta(ScrollAxis::Horizontal, delta), 10.0);
     }
 }
