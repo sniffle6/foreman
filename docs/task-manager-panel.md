@@ -22,6 +22,17 @@ and the landing site for future agent-state badges.
   by a zoomed sibling (un-zoom first; do not minimize a window the user cannot
   see). Explicit hover min still uses `MinPath`; crew-board/chat click paths
   call `surface_target` directly (no toggle).
+- **Drag to reorder (presentation-only):** rows/chips in the expanded modes
+  drag to reorder Project groups, and Session/chat/image rows within their
+  Project. One `PanelReorder` intent drains into `Act::ReorderPanel`;
+  `WindowManager` re-resolves source/anchor by stable identity (`term_id` /
+  project `pN` tag; strict path for chat/image — drift cancels), rejects
+  cross-project and Project↔Session drops, and rewrites that scope to dense
+  per-tab `panel_order` ranks. The real tab strip, tiles, z-order, and focus
+  never move. Unranked (`None`) rows sort after ranked ones in structural
+  order, so new tabs append. A 2px marker (clipped to the panel body) shows
+  the drop slot; edge auto-scroll follows the active `ScrollAxis`; collapse
+  or an orientation flip cancels the gesture. Collapsed rails don't drag (v1).
 - **Tabbed projects need `ptab`:** nested managers number child windows
   independently (each starts at 1), so when projects are tabbed a bare
   child-id scan always resolves to the first project tab. `TargetPath.ptab`
@@ -123,7 +134,8 @@ and the landing site for future agent-state badges.
   `paint_chevron`)
 - `src/geom.rs` — shared axis-generic scrollbar geometry and terminal wrappers
 - `src/wm.rs` — `panel_model`, `surface_target`, `ensure_panel`, path Acts,
-  drains, `apply_panel_ratio` (H→V axis fallback)
+  drains, `apply_panel_reorder` + `Tab::panel_order` (drag ordering),
+  `apply_panel_ratio` (H→V axis fallback)
 - `src/layout.rs` — `set_leaf_extent` (axis-aware; `set_leaf_width` wraps it)
 - `src/keymap.rs` — `Command::ToggleTaskManager` (default leader `M`)
 - `src/config.rs` — persistence fields

@@ -159,6 +159,13 @@ A window interaction recorded during the draw pass and applied after it, because
 the draw cannot mutate nested Window managers mid-render.
 _Avoid_: command, event (overloaded), callback.
 
+**Panel order**:
+Presentation-only per-tab rank (`Tab::panel_order`) driving sessions-panel row
+order. Written only by `Act::ReorderPanel` (dense per scope), projected by
+`panel_model()`, persisted additively in `TabSnap`. Never touches the tab
+strip, Layout tree, z-order, or focus.
+_Avoid_: tab order (that's the real strip), z-order, sort index.
+
 **Input-encoding seam**:
 The pure step that turns a Session's keyboard and mouse events into the exact
 bytes a terminal program expects, with no dependency on the GUI — so it can be

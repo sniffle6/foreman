@@ -13,6 +13,8 @@ On restart, Foreman reloads the last desktop layout from
 - Minimized windows (`min_from_tree` so restore re-tiles when appropriate)
 - Focus (window + active tab) and zoom, when set
 - Terminal **shell kind** (`powershell` / `cmd` / `bash`) and chat viewer tabs
+- Per-tab sessions-panel rank (`TabSnap.panel_order`, additive `Option` —
+  omitted when unset, so v1 files and old builds are unaffected)
 - Whether each terminal title is Foreman-managed. Generated semantic text is
   not authoritative state; snapshots store only a generic source/member label
   plus `managed_title = true`, and current restore starts the title lifecycle
@@ -91,6 +93,11 @@ discard take_opened + poll dirty   # restore must not write recents or re-save
   tag even after tabs share a window.
 - **Over-dirty is intentional.** Focus-only acts and continuous drag/resize
   refresh the debounce timer; writes still only happen after 600 ms idle.
+- **Panel ranks are `Option`.** Unranked tabs project after ranked ones in
+  structural order; ranks are only normalized (dense per scope) when a panel
+  reorder applies — restore never rewrites them. Pre-existing quirk: unranked
+  rows can shuffle across a restart because capture orders windows by z;
+  ranked rows are immune.
 - **Coordinates are local** to each manager's area (never screen space).
 - Do not put layout fields on `Settings` — keep the workspace file separate.
 
