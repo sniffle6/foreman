@@ -171,6 +171,13 @@ reading it — the default way `send` returns a settled screen instead of a
 mid-update race.
 _Avoid_: sleep, debounce, delay.
 
+**Title lane**:
+The bounded, one-way path from an agent's first meaningful prompt hook to the
+single background naming worker and back to its owning Session tab. It is not
+part of the Control plane: hooks never wait for a reply, and the GUI never waits
+for a provider.
+_Avoid_: title API, hook server, naming pool.
+
 **Caret**:
 What Foreman paints for a Session's cursor: the grid model's cursor cell, drawn
 every frame exactly where the model says it is — `?25l` (hide) honored, no

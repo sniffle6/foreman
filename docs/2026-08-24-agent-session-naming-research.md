@@ -6,7 +6,7 @@ Date: 2026-08-24
 > but the accepted v1 design does not use a deterministic first-prompt title or
 > a Codex-only backend. Foreman keeps the generic agent label until one
 > asynchronous result from the user's selected Codex, Claude, or Grok CLI. See
-> [the executable implementation plan](superpowers/plans/2026-08-25-agent-session-naming.md).
+> [the subsystem contract](agent-session-naming.md) for the implemented design.
 
 ## Question
 

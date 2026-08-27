@@ -73,6 +73,14 @@ as distinct.
   highlight), **Ctrl+C** copies if there's a selection else sends interrupt
   (SIGINT), **Ctrl+Shift+C** copies, **Ctrl+V / Ctrl+Shift+V / Shift+Insert /
   right-click** paste. Control codes (Ctrl+L/R/D/A/E…) forward to the shell.
+- **Automatic agent Session naming** (opt-in): guarded Claude/Codex/Grok
+  `UserPromptSubmit` hooks feed one instance-specific local pipe; one bounded
+  worker invokes the selected installed CLI and applies a validated title only
+  while the exact Project/Member/vendor-session generation still owns it. Manual
+  titles win. Project and Member ids remain attached to their tabs across
+  merge/restore rather than inheriting the containing window's id. Cost,
+  privacy, failure behavior, and module seams:
+  `docs/agent-session-naming.md`.
 
 `bash` works via `wsl.exe`, but the user's machine needs WSL2 enabled ("Virtual
 Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fine.
@@ -80,12 +88,16 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
 ### Architecture / files
 - `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
   Closing the last project quits (`WindowManager::deserted`); an open
-  picker/settings modal holds the app alive.
+  picker/settings modal holds the app alive. `App::logic` services channels and
+  recursively pumps live Sessions while the native viewport is hidden; visible
+  frames do that work once through `App::ui`.
 - `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
   zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
-  z, minimized, prev }`, `Content::{Terminal, Project, Chat, TaskManager, Image}`.
+  z, minimized, prev }`, `Content::{Terminal, Project, Chat, TaskManager, Image,
+  Settings}`.
   `show(ui, area, active, base)` is the whole thing. Headers at both levels are
-  always-on quiet chrome (`docs/window-chrome.md`).
+  always-on quiet chrome (`docs/window-chrome.md`). `WindowManager::term_env`
+  owns the environment injected into every Session.
 - `src/layout.rs` — the tiling tree (pure data + math, unit-tested): insert /
   remove / rect layout / drop targets / divider resize. See
   `docs/tiling-tree.md`.
@@ -100,9 +112,19 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
 - `src/input.rs` — pure key/paste/wheel/mouse encoding + Ctrl+F open-search.
 - `src/search.rs` — bounded scrollback-search model.
 - `src/control.rs` — the `foreman` CLI + IPC control plane over the named pipe
-  `\.\pipe\foreman`. Injects `FOREMAN`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`,
-  `FOREMAN_TERMINAL_ID` into every terminal so agents can dispatch and
-  self-target.
+  `\.\pipe\foreman`. The environment injected by `wm.rs` gives its CLI
+  `FOREMAN`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`, and `FOREMAN_TERMINAL_ID` for
+  dispatch/self-targeting, plus the instance-specific `FOREMAN_TITLE_PIPE` for
+  passive title events.
+- `src/title_notify.rs` — early `foreman title-event` CLI path plus the bounded,
+  one-way instance title pipe. Hook helpers normalize vendor payloads, reject
+  subagent traffic, write once, and never wait for a reply.
+- `src/agent_hooks.rs` — opt-in semantic installation of guarded global
+  Claude/Codex/Grok `UserPromptSubmit` hooks. Preserves unrelated configuration,
+  backs up once, replaces atomically, and reports install status to the GUI.
+- `src/terminal_titles.rs` — Title lane domain state, transcript-prefix context,
+  provider command adapters, one bounded worker, process deadlines, and
+  untrusted-output validation. It knows nothing about window layout.
 - `src/chat.rs` — per-project chat room model (append-only log, pure data).
   Posts are injected into member terminals' PTYs as typed input (push, not
   poll). Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.

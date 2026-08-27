@@ -1,6 +1,6 @@
 ---
 name: foreman-config-and-flags
-description: Use when auditing or changing any foreman configuration axis - %APPDATA%\foreman settings.json or keybindings.json, font-size zoom persistence, default Leader/Chord bindings, injected env vars (FOREMAN, FOREMAN_TERMINAL_ID, FOREMAN_PROJECT_ID, FOREMAN_EXE, TERM, COLORTERM), CLAUDE_CONFIG_DIR/CODEX_HOME skill installs, tunable timing constants, .claude hooks, adding a persisted setting. Symptoms - setting not saved, binding ignored, "FOREMAN_TERMINAL_ID unset", zoom resets on restart.
+description: Use when auditing or changing any foreman configuration axis - %APPDATA%\foreman settings.json or keybindings.json, font-size zoom persistence, default Leader/Chord bindings, injected env vars (FOREMAN, FOREMAN_TERMINAL_ID, FOREMAN_PROJECT_ID, FOREMAN_EXE, FOREMAN_TITLE_PIPE, TERM, COLORTERM), CLAUDE_CONFIG_DIR/CODEX_HOME/GROK_HOME installs, tunable timing constants, managed agent hooks, .claude development hooks, adding a persisted setting. Symptoms - setting not saved, binding ignored, "FOREMAN_TERMINAL_ID unset", zoom resets on restart.
 ---
 
 # Foreman configuration and flags
@@ -25,8 +25,9 @@ field is the normal way a knob becomes user-facing; several already have.
 | Restored workspace | `%APPDATA%\foreman\workspace.json` via `src/workspace.rs` | App-written layout snapshot; gated on `Settings::restore_workspace` | Production |
 | User themes | `%APPDATA%\foreman\themes\<slug>.json` via `src/theme.rs` (`config::themes_dir`) | One file per user theme; `Settings::theme` selects by name | Production |
 | Env vars injected into every Session | `src/wm.rs` `fn term_env` | Contract for agents/CLI inside Sessions | Production |
-| Env vars foreman consumes | `APPDATA`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `USERPROFILE`, `FOREMAN_*` (CLI client) | Ambient environment | Production |
+| Env vars foreman consumes | `APPDATA`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `USERPROFILE`, `FOREMAN_*` | Ambient environment | Production |
 | Skill auto-install | `src/skills_install.rs` `install()`, run at GUI startup and gated on `Settings::install_skills` | Writes managed SKILL.md files into Claude/Codex skill dirs | Production, best-effort |
+| Agent naming hook install | `src/agent_hooks.rs`, gated on `Settings::auto_name_agent_sessions` | Semantically merges guarded global Claude/Codex hooks and owns one dedicated Grok hook file | Production, opt-in, recoverable |
 | Tuning constants | `const`s across `src/` (table below) | Code-level knobs, compile-time only | Production values; change via foreman-change-control |
 | Claude Code hooks | `.claude/settings.json` + `.claude/hooks/*.ps1` | Dev-workflow automation for sessions working ON this repo (not app config) | Production |
 | Local permissions | `.claude/settings.local.json` (untracked/ignored) | Machine-local Claude Code permissions | Local only |
@@ -210,6 +211,7 @@ Read the function for the current list; the entries with non-obvious reasons:
 | `KITTY_WINDOW_ID` | `1` | Always. The narrowest signal that makes agent CLIs pick the kitty graphics protocol. `TERM` stays truthful because foreman implements the graphics *subset* (`src/graphics.rs`), not all of kitty |
 | `FOREMAN_PROJECT_ID` | `p<id>` | **Only** Sessions inside a Project (the nested manager has a tag). Desktop-level Sessions get none |
 | `FOREMAN_EXE` | Full path to the running exe | When `current_exe()` resolves — `target\debug` is not on PATH, so agents need this to find the CLI |
+| `FOREMAN_TITLE_PIPE` | Random per-process local pipe name | When the title listener starts. Global prompt hooks inherit it from the Session and therefore route only to the Foreman instance that spawned that Session |
 
 Consequence of the `FOREMAN_PROJECT_ID` conditional: the CLI's self-target
 verbs (bare `foreman close`, `foreman send` without `--terminal`) require BOTH
@@ -226,11 +228,13 @@ Verb-by-verb behavior belongs to **foreman-run-and-operate**.
 | Var | Read at | Purpose |
 |---|---|---|
 | `APPDATA` | `src/config.rs` `config_dir`, `src/keymap.rs` `load`/`save` | Locate `%APPDATA%\foreman`. Unset (nearly impossible on Windows) → in-code defaults, no persistence. Also where `foreman_panic.log` lands |
-| `CLAUDE_CONFIG_DIR` | `src/skills_install.rs` | Claude skills root when non-empty; else `%USERPROFILE%\.claude` |
-| `CODEX_HOME` | `src/skills_install.rs` | Codex skills root when non-empty; else `%USERPROFILE%\.codex` |
-| `USERPROFILE` | `src/skills_install.rs` | Fallback base for both of the above |
+| `CLAUDE_CONFIG_DIR` | `src/skills_install.rs`, `src/agent_hooks.rs`, `src/terminal_titles.rs` | Claude skills/hooks/session root when non-empty; else `%USERPROFILE%\.claude` |
+| `CODEX_HOME` | `src/skills_install.rs`, `src/agent_hooks.rs`, `src/terminal_titles.rs` | Codex skills/hooks/session root when non-empty; else `%USERPROFILE%\.codex` |
+| `GROK_HOME` | `src/agent_hooks.rs`, `src/terminal_titles.rs` | Grok hook/session root when non-empty; else `%USERPROFILE%\.grok` |
+| `USERPROFILE` / `HOME` | skill, hook, and title-context resolvers | Non-empty fallback base for the provider homes above; an empty override is treated as absent, never as the current directory |
 | `FOREMAN_PROJECT_ID`, `FOREMAN_TERMINAL_ID` | `src/control.rs` (CLI client mode) | Self-target defaults for `open`/`chat`/`close`/`send`/`snapshot`/`view` |
-| `FOREMAN_EXE` | **Not read by foreman source** | Consumed by agents (the user-facing foreman-dispatch / foreman-chat skills) to invoke the CLI |
+| `FOREMAN_TITLE_PIPE` | `src/title_notify.rs` (`title-event` client mode) | Routes one passive prompt event to the owning GUI instance; absent/invalid/unreachable is a silent no-op |
+| `FOREMAN_EXE` | **Not read directly by foreman source** | Consumed by agent-facing skills and the managed prompt-hook command to invoke the exact running Foreman executable |
 
 ### Skill auto-install as a config side effect
 
@@ -247,6 +251,24 @@ repo at compile time, so **the source of truth is `.claude/skills/` and
 `.codex/skills/` here — edit those and rebuild to propagate.** `rg -n
 'include_str!' src/skills_install.rs` lists exactly what is embedded. Add a
 bundle without adding its `include_str!` and it silently ships nothing.
+
+### Agent naming hooks as a config side effect
+
+When `Settings::auto_name_agent_sessions` changes from off to on — and at GUI
+startup while it is already on — `src/agent_hooks.rs` updates three global
+hook targets in one background install pass:
+
+- Claude: `CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.json`
+- Codex: `CODEX_HOME/hooks.json` or `~/.codex/hooks.json`
+- Grok: `GROK_HOME/hooks/foreman-session-naming.json` or the default equivalent
+
+Claude/Codex are semantic merges; Grok owns only its dedicated file. Existing
+unrelated hooks survive, malformed JSON is refused, the first replaced file is
+backed up as `.pre-foreman.bak`, and repeated installs are byte-stable. Empty
+home overrides fall back — they must never resolve to a relative path. Disabling
+naming does not rewrite user files; installed passive hooks remain, but the GUI
+drops their events before any provider request. This side effect is independent
+of `Settings::install_skills`.
 
 ## Axis 4: tuning constants (compile-time)
 
@@ -265,6 +287,8 @@ the change through **foreman-change-control**. Current values:
 | `REPLY_TIMEOUT` | `src/control.rs` | Pipe server wait for the GUI to answer one request |
 | `CONNECT_TIMEOUT` | `src/control.rs` | Client deadline connecting to a busy pipe |
 | `MAX_INFLIGHT` | `src/control.rs` | Concurrent pipe handler cap (bounds thread leak from wedged clients) |
+| `PROMPT_CHARS`, `CONTEXT_PROMPT_CHARS`, `OPENING_PROMPTS`, `TRANSCRIPT_BYTES` | `src/terminal_titles.rs` | Bounded title-provider context: at most 2,000 current chars + three 600-char opening prompts from a 512 KiB transcript prefix |
+| `QUEUE_MAX_AGE`, `PROCESS_TIMEOUT`, `OUTPUT_BYTES` | `src/terminal_titles.rs` | Single Title lane freshness/deadline/output caps; model work never blocks GUI or hook execution |
 | `DEFAULT_HISTORY` | `src/control.rs` | Lines a bare `foreman chat --history` returns |
 | `MAX_SETTLE_MS` | `src/wm.rs` | Hard cap on total settle wait. **Invariant: `MAX_SETTLE_MS` < `REPLY_TIMEOUT`** so the pipe server's reply timeout never fires before a settle reply lands |
 | `STALE_AFTER` | `src/chat.rs` | Crew board fallback: a Member unheard this long renders its age in amber (`Settings::crew_stale_secs` is the live value) |

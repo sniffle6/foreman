@@ -48,7 +48,7 @@ on purpose — a user slider on those creates support tickets, not value).
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
 | Keybindings | The keybindings editor, inline — leader, per-command chords, conflicts, reset-one / reset-all |
-| Agents | Install skills on launch (on); crew stale after (5 min); send settle default (120 ms) |
+| Agents | Install skills on launch (on); automatic Session naming (off); naming provider (Codex); naming model (`gpt-5.6-luna`, blank = provider default); crew stale after (5 min); send settle default (120 ms) |
 | Startup & Updates | Restore workspace (on); default project directory (blank = old behavior); update check on launch (on); Check now; open settings folder; version |
 
 ## Gotchas
@@ -57,6 +57,16 @@ on purpose — a user slider on those creates support tickets, not value).
   history size they spawned with.
 - **"Install skills on launch" takes effect next launch** — the install runs
   once at startup, before any frame.
+- **Automatic Session naming is a separate opt-in.** Enabling it installs or
+  updates guarded Claude, Codex, and Grok prompt hooks in the background; it
+  does not install with Foreman's skills. Hook install success/failure is shown
+  as a toast, and provider/timeout/output failures produce a content-free,
+  rate-limited warning instead of failing invisibly. A resumed Session may send
+  up to 3,800 user-prompt characters plus a prior generated title to the
+  selected provider. Changing provider selects Luna for Codex and the configured
+  CLI default for Claude/Grok; the exact model id can then be edited. See
+  `docs/agent-session-naming.md` for cost, privacy, backup, and title-lifecycle
+  details.
 - **Send settle is clamped to 2000 ms** (UI and on load). The pipe server's
   reply timeout is 5 s and `MAX_SETTLE_MS` is 4 s; the clamp keeps a
   hand-edited settings.json from wedging `foreman send`.

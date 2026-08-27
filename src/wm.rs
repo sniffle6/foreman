@@ -30,6 +30,21 @@ fn rect_from_snap(r: &crate::workspace::RectSnap) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h))
 }
 
+/// Reuse the containing window id for the first identity-bearing restored tab,
+/// then allocate one fresh id per additional Project or Terminal tab. Window
+/// layout identity and Session/Project routing identity coincide for the common
+/// one-tab case but are deliberately independent once tabs are merged.
+fn restored_identity_id(next: &mut WinId, win_id: WinId, win_id_taken: &mut bool) -> WinId {
+    if *win_id_taken {
+        let id = *next;
+        *next += 1;
+        id
+    } else {
+        *win_id_taken = true;
+        win_id
+    }
+}
+
 // Quiescence window for `foreman send`: after writing input, wait this long
 // with no new PTY bytes before replying so a following snapshot reads settled
 // state. The default (absent an explicit `settle_ms` on the request) is
@@ -248,6 +263,9 @@ pub struct Tab {
     /// agents in a default-named shell). Cleared by manual rename; never set
     /// for dispatch-spawned titles, projects, chat, or the sessions panel.
     auto_title: bool,
+    /// At most one model-generated naming attempt per upstream agent session.
+    /// This is runtime-only; workspace restore deliberately starts fresh.
+    agent_title: crate::terminal_titles::AgentTitleState,
 }
 
 impl Tab {
@@ -257,6 +275,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             auto_title: false,
+            agent_title: Default::default(),
         }
     }
 
@@ -266,6 +285,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             auto_title: true,
+            agent_title: Default::default(),
         }
     }
 }
@@ -580,7 +600,28 @@ impl WindowManager {
                     }
                 };
                 tabs.push(TabSnap {
-                    title: t.title.clone(),
+                    // Never persist provider output as authoritative workspace
+                    // state. Keep a generic readable label for older Foreman
+                    // versions, while `managed_title` makes current restore
+                    // regenerate identity and return to Waiting.
+                    title: if t.auto_title {
+                        let Content::Terminal(session) = &t.content else {
+                            unreachable!("only terminal tabs have managed titles")
+                        };
+                        let label = session
+                            .icon_kind()
+                            .agent_label()
+                            .unwrap_or_else(|| session.shell.label());
+                        let exit_marker = t
+                            .title
+                            .find("  ·  exited (")
+                            .map(|start| &t.title[start..])
+                            .unwrap_or_default();
+                        format!("{label}  ·  #{}{exit_marker}", session.term_id())
+                    } else {
+                        t.title.clone()
+                    },
+                    managed_title: t.auto_title,
                     content,
                 });
             }
@@ -706,14 +747,8 @@ impl WindowManager {
             // for identity plus env injection.
             let win_id = self.next;
             self.next += 1;
-            // Every terminal tab needs its OWN id: FOREMAN_TERMINAL_ID and the
-            // chat member id are derived from it, so sharing one across a
-            // restored tab stack makes `foreman send`/`snapshot` target the
-            // wrong pane and collapses several chat members into one. The live
-            // spawn path already consumes a fresh `self.next` per pane; restore
-            // used to hoist a single id across the whole loop. The first
-            // terminal tab reuses the window id (matching pre-fix ids for the
-            // common single-terminal window); every later one gets its own.
+            // Every Project and Terminal tab needs its OWN routing identity.
+            // Containers may be merged without changing either identity.
             let mut win_id_taken = false;
             let mut tabs: Vec<Tab> = Vec::new();
             let mut new_active = 0usize;
@@ -723,14 +758,7 @@ impl WindowManager {
                 let content = match &tab_snap.content {
                     ContentSnap::Terminal { shell } => {
                         let shell = shell_from_str(shell);
-                        let tid = if win_id_taken {
-                            let t = self.next;
-                            self.next += 1;
-                            t
-                        } else {
-                            win_id_taken = true;
-                            win_id
-                        };
+                        let tid = restored_identity_id(&mut self.next, win_id, &mut win_id_taken);
                         let env = self.term_env(tid);
                         match Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()) {
                             Ok(mut s) => {
@@ -756,10 +784,11 @@ impl WindowManager {
                         }
                         let mut nested = WindowManager::new();
                         nested.cwd = child.cwd.clone();
-                        // Tag before nested apply so child terminals get
-                        // FOREMAN_PROJECT_ID. Keyed to the WINDOW id, not a
-                        // per-terminal one — a project is one window.
-                        nested.tag = Some(format!("p{win_id}"));
+                        // Tag before nested apply so child terminals get the
+                        // Project tab's stable FOREMAN_PROJECT_ID. A tab keeps
+                        // this identity even when its containing window changes.
+                        let pid = restored_identity_id(&mut self.next, win_id, &mut win_id_taken);
+                        nested.tag = Some(format!("p{pid}"));
                         let nested_rep = nested.apply_manager(child, ctx);
                         report.merge(nested_rep);
                         report.projects_restored += 1;
@@ -770,14 +799,19 @@ impl WindowManager {
                     new_active = tabs.len();
                     found_active = true;
                 }
-                // Terminals whose title is still a managed default (shell or
-                // prior agent auto-name) keep auto_title so a re-detected agent
-                // renames them. Custom user names stay fixed.
-                let tab = match &content {
-                    Content::Terminal(_) if title_is_auto_managed(&tab_snap.title) => {
-                        Tab::shell_default(tab_snap.title.clone(), content)
+                // Managed task titles are runtime identity, not workspace
+                // identity. Restore to a fresh generic shell label with the new
+                // member id; legacy v1 shell/agent defaults get the same policy.
+                let managed = tab_snap.managed_title || title_is_auto_managed(&tab_snap.title);
+                let restored_title = match &content {
+                    Content::Terminal(session) if managed => {
+                        format!("{}  ·  #{}", session.shell.label(), session.term_id())
                     }
-                    _ => Tab::fixed(tab_snap.title.clone(), content),
+                    _ => tab_snap.title.clone(),
+                };
+                let tab = match &content {
+                    Content::Terminal(_) if managed => Tab::shell_default(restored_title, content),
+                    _ => Tab::fixed(restored_title, content),
                 };
                 tabs.push(tab);
             }
@@ -1015,32 +1049,38 @@ impl WindowManager {
         if let Ok(exe) = std::env::current_exe() {
             v.push(("FOREMAN_EXE".to_string(), exe.display().to_string()));
         }
+        if let Some(pipe) = crate::title_notify::pipe_name() {
+            v.push(("FOREMAN_TITLE_PIPE".to_string(), pipe.to_string()));
+        }
         v
     }
 
-    /// Resolve a control-request project spec ("p3"; None = focused project)
-    /// to a desktop window id. Only checks the ACTIVE tab — after tab-merging
-    /// projects, the swallowed project's old id is stale (documented gotcha).
+    /// Resolve a control-request project spec ("p3"; None = focused Project
+    /// tab) to its stable Project id. A Project id belongs to the nested manager,
+    /// not to whichever desktop window currently contains its tab.
     fn resolve_project(&self, spec: Option<&str>) -> Result<WinId, String> {
-        let is_project = |w: &&Win| matches!(w.tabs[w.active].content, Content::Project(_));
         match spec {
             Some(s) => {
-                let id: WinId = s
-                    .strip_prefix('p')
-                    .and_then(|n| n.parse().ok())
-                    .ok_or_else(|| format!("bad project id: {s}"))?;
-                self.windows
-                    .iter()
-                    .filter(is_project)
-                    .find(|w| w.id == id)
-                    .map(|w| w.id)
-                    .ok_or_else(|| format!("no such project: {s}"))
+                let id = project_id(s).ok_or_else(|| format!("bad project id: {s}"))?;
+                self.project_child(id)
+                    .map(|_| id)
+                    .map_err(|_| format!("no such project: {s}"))
             }
-            None => self
-                .focused
-                .and_then(|id| self.windows.iter().filter(is_project).find(|w| w.id == id))
-                .map(|w| w.id)
-                .ok_or_else(|| "no focused project (pass --project)".to_string()),
+            None => {
+                let child = self
+                    .focused
+                    .and_then(|id| self.windows.iter().find(|w| w.id == id))
+                    .and_then(|window| match &window.tabs[window.active].content {
+                        Content::Project(child) => Some(child.as_ref()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| "no focused project (pass --project)".to_string())?;
+                child
+                    .tag
+                    .as_deref()
+                    .and_then(project_id)
+                    .ok_or_else(|| "focused project has no routing id".to_string())
+            }
         }
     }
 
@@ -1275,14 +1315,12 @@ impl WindowManager {
         }
     }
 
-    /// Build the `status` listing: one header line per project window, one
+    /// Build the `status` listing: one header line per Project tab, one
     /// line per terminal TAB inside it (`Content::Chat`/nested projects are
-    /// skipped). Merged tabs in one window share the window's `tN` id —
-    /// status emits one line per tab, duplicating the shared id, same
-    /// identity family as chat. `None` project = every desktop window whose
-    /// ACTIVE tab is a project (the same visibility rule as
-    /// `resolve_project`); a filter that doesn't resolve is an error, not an
-    /// empty list. Running/exited truth comes from `Session::exited()`
+    /// skipped). Project and Terminal ids belong to their tabs and survive
+    /// merge/untab. `None` project = every Project tab; a filter that doesn't
+    /// resolve is an error, not an empty list. Running/exited truth comes from
+    /// `Session::exited()`
     /// (try_wait on the live process), never from the `"  ·  exited (code)"`
     /// title stamp — titles are cleaned with `display_name`.
     fn status_dispatch(
@@ -1295,47 +1333,50 @@ impl WindowManager {
         };
         let mut lines = Vec::new();
         for w in self.windows.iter_mut() {
-            if let Some(pid) = filter
-                && w.id != pid
-            {
-                continue;
-            }
-            // title read (and detached) BEFORE the mutable content borrow
-            let name = display_name(&w.tabs[w.active].title).to_string();
-            let Content::Project(child) = &mut w.tabs[w.active].content else {
-                continue; // resolve_project guarantees this never skips a filtered pid
-            };
-            let cwd = child
-                .cwd
-                .as_deref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "-".into());
-            lines.push(format!("p{}  {}  {}", w.id, name, cwd));
-            // Clone the room Rc before the terminal loop so membership reads
-            // don't borrow `child` a second time while it is borrowed mutably.
-            let room = Rc::clone(&child.chat);
-            for win in child.windows.iter_mut() {
-                for tab in win.tabs.iter_mut() {
-                    let Content::Terminal(s) = &mut tab.content else {
-                        continue;
-                    };
-                    let tag = term_tag(s.term_id());
-                    let state = match s.exited() {
-                        Some(code) => format!("exited({code})"),
-                        None => "running".into(),
-                    };
-                    let member = if room.borrow().is_member(&tag) {
-                        "chat"
-                    } else {
-                        "-"
-                    };
-                    lines.push(format!(
-                        "  {}  {}  {}  {}",
-                        tag,
-                        state,
-                        member,
-                        display_name(&tab.title)
-                    ));
+            for project_tab in &mut w.tabs {
+                // Detach the display title before borrowing its content.
+                let name = display_name(&project_tab.title).to_string();
+                let Content::Project(child) = &mut project_tab.content else {
+                    continue;
+                };
+                let Some(pid) = child.tag.as_deref().and_then(project_id) else {
+                    continue;
+                };
+                if filter.is_some_and(|wanted| wanted != pid) {
+                    continue;
+                }
+                let cwd = child
+                    .cwd
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "-".into());
+                lines.push(format!("p{pid}  {name}  {cwd}"));
+                // Clone the room Rc before the terminal loop so membership reads
+                // don't borrow `child` a second time while it is borrowed mutably.
+                let room = Rc::clone(&child.chat);
+                for win in child.windows.iter_mut() {
+                    for tab in win.tabs.iter_mut() {
+                        let Content::Terminal(s) = &mut tab.content else {
+                            continue;
+                        };
+                        let tag = term_tag(s.term_id());
+                        let state = match s.exited() {
+                            Some(code) => format!("exited({code})"),
+                            None => "running".into(),
+                        };
+                        let member = if room.borrow().is_member(&tag) {
+                            "chat"
+                        } else {
+                            "-"
+                        };
+                        lines.push(format!(
+                            "  {}  {}  {}  {}",
+                            tag,
+                            state,
+                            member,
+                            display_name(&tab.title)
+                        ));
+                    }
                 }
             }
         }
@@ -1346,13 +1387,10 @@ impl WindowManager {
     }
 
     /// Validate a close request WITHOUT executing it (D5: atomic and loud).
-    /// Every id must name an existing terminal window in the project or the
-    /// WHOLE request fails and nothing closes. A window whose tabs hold no
-    /// `Content::Terminal` (the chat viewer) is refused. Exited terminals
-    /// are valid targets; duplicates are allowed. Closing a window closes
-    /// ALL its merged tabs — terminal identity is the window id, shared by
-    /// merged tabs (same identity family as chat). Execution is the caller's
-    /// job via [`Self::close_terminal`], AFTER the reply is delivered.
+    /// Every id must name an existing Session in the project or the WHOLE
+    /// request fails and nothing closes. Exited terminals and duplicates are
+    /// valid. Execution is the caller's job via [`Self::close_terminal`], AFTER
+    /// the reply is delivered.
     fn close_dispatch(
         &self,
         req: &crate::control::CloseRequest,
@@ -1365,27 +1403,20 @@ impl WindowManager {
         let mut tids = Vec::new();
         for spec in &req.terminals {
             let tid = term_id(spec)?;
-            let w = child
-                .windows
-                .iter()
-                .find(|w| w.id == tid)
-                .ok_or_else(|| format!("no such terminal: {spec}"))?;
-            if !w
-                .tabs
-                .iter()
-                .any(|t| matches!(t.content, Content::Terminal(_)))
-            {
-                return Err(format!("not a terminal: {spec}"));
+            if child.terminal_session(tid).is_none() {
+                return Err(if child.windows.iter().any(|window| window.id == tid) {
+                    format!("not a terminal: {spec}")
+                } else {
+                    format!("no such terminal: {spec}")
+                });
             }
             tids.push(tid);
         }
         Ok((pid, tids))
     }
 
-    /// Resolve a `(project, terminal)` pair to their `WinId`s.
-    /// `project` uses the existing `resolve_project` logic; `terminal` is
-    /// validated to exist in that project's child manager and to have at
-    /// least one `Content::Terminal` tab.
+    /// Resolve a `(project, terminal)` pair to their stable ids. The containing
+    /// windows/tabs are an implementation detail resolved by the child manager.
     fn resolve_terminal(
         &self,
         project: Option<&str>,
@@ -1394,95 +1425,105 @@ impl WindowManager {
         let pid = self.resolve_project(project)?;
         let tid = term_id(terminal)?;
         let child = self.project_child(pid)?;
-        let tw = child
-            .windows
-            .iter()
-            .find(|w| w.id == tid)
-            .ok_or_else(|| format!("no such terminal: {terminal}"))?;
-        if !tw
-            .tabs
-            .iter()
-            .any(|t| matches!(t.content, Content::Terminal(_)))
-        {
-            return Err(format!("not a terminal: {terminal}"));
+        if child.terminal_session(tid).is_none() {
+            return Err(if child.windows.iter().any(|window| window.id == tid) {
+                format!("not a terminal: {terminal}")
+            } else {
+                format!("no such terminal: {terminal}")
+            });
         }
         Ok((pid, tid))
     }
 
-    /// The desktop→project hop shared by the control executors: the child
-    /// `WindowManager` inside project `pid`'s ACTIVE tab. Callers pass a
-    /// freshly `resolve_project`-ed pid, so a missing window is a logic
-    /// error (`expect`) and a non-project active tab is unreachable.
+    /// The desktop→Project hop shared by control executors. Project routing id
+    /// is stored on the nested manager, independent of container window/tab.
     fn project_child(&self, pid: WinId) -> Result<&WindowManager, String> {
-        let win = self.windows.iter().find(|w| w.id == pid).expect("resolved");
-        match &win.tabs[win.active].content {
-            Content::Project(child) => Ok(child),
-            _ => Err("not a project".into()), // unreachable after resolve
-        }
+        let tag = format!("p{pid}");
+        self.windows
+            .iter()
+            .flat_map(|window| window.tabs.iter())
+            .find_map(|tab| match &tab.content {
+                Content::Project(child) if child.tag.as_deref() == Some(tag.as_str()) => {
+                    Some(child.as_ref())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| format!("no such project: {tag}"))
     }
 
     /// Mutable sibling of [`Self::project_child`].
     fn project_child_mut(&mut self, pid: WinId) -> Result<&mut WindowManager, String> {
-        let win = self
-            .windows
+        let tag = format!("p{pid}");
+        self.windows
             .iter_mut()
-            .find(|w| w.id == pid)
-            .expect("resolved");
-        match &mut win.tabs[win.active].content {
-            Content::Project(child) => Ok(child),
-            _ => Err("not a project".into()), // unreachable after resolve
+            .flat_map(|window| window.tabs.iter_mut())
+            .find_map(|tab| match &mut tab.content {
+                Content::Project(child) if child.tag.as_deref() == Some(tag.as_str()) => {
+                    Some(child.as_mut())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| format!("no such project: {tag}"))
+    }
+
+    /// Locate a stable Session id inside this manager's current containers.
+    /// This is the sole seam that knows a Session can live in any tab of any
+    /// window after merge, untab, or restore.
+    fn terminal_location(&self, tid: WinId) -> Option<(WinId, usize)> {
+        self.windows.iter().find_map(|window| {
+            window
+                .tabs
+                .iter()
+                .position(|tab| {
+                    matches!(&tab.content, Content::Terminal(session) if session.term_id() == tid)
+                })
+                .map(|tab| (window.id, tab))
+        })
+    }
+
+    fn terminal_session(&self, tid: WinId) -> Option<&Session> {
+        let (window_id, tab_idx) = self.terminal_location(tid)?;
+        let window = self.windows.iter().find(|window| window.id == window_id)?;
+        match &window.tabs.get(tab_idx)?.content {
+            Content::Terminal(session) => Some(session),
+            _ => None,
         }
     }
 
-    /// Get a mutable reference to the `Session` for the given (pid, tid).
-    /// Tab choice is `terminal_tab_idx` (active-tab-preferred). Uses
-    /// immutable checks first to find the tab index, then takes a single
-    /// mutable borrow — satisfying the borrow checker without unsafe.
+    fn terminal_session_mut(&mut self, tid: WinId) -> Option<&mut Session> {
+        let (window_id, tab_idx) = self.terminal_location(tid)?;
+        let window = self
+            .windows
+            .iter_mut()
+            .find(|window| window.id == window_id)?;
+        match &mut window.tabs.get_mut(tab_idx)?.content {
+            Content::Terminal(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    fn session(&self, pid: WinId, tid: WinId) -> Result<&Session, String> {
+        self.project_child(pid)?
+            .terminal_session(tid)
+            .ok_or_else(|| format!("no such terminal: t{tid}"))
+    }
+
+    /// Get a mutable reference to the Session for the stable (pid, tid) pair.
     fn session_mut(
         &mut self,
         pid: WinId,
         tid: WinId,
     ) -> Result<&mut crate::terminal::Session, String> {
-        // Immutable pass: find which tab index holds a terminal.
-        let tab_idx = {
-            let child = self.project_child(pid)?;
-            let tw = child
-                .windows
-                .iter()
-                .find(|w| w.id == tid)
-                .ok_or_else(|| format!("no such terminal: t{tid}"))?;
-            terminal_tab_idx(tw).ok_or_else(|| format!("no terminal tab in t{tid}"))?
-        };
-        // Mutable pass: take the borrow with the known index.
-        let child = self.project_child_mut(pid)?;
-        let tw = child
-            .windows
-            .iter_mut()
-            .find(|w| w.id == tid)
-            .ok_or_else(|| format!("no such terminal: t{tid}"))?;
-        let Content::Terminal(s) = &mut tw.tabs[tab_idx].content else {
-            return Err(format!("tab {tab_idx} is not a terminal"));
-        };
-        Ok(s)
+        self.project_child_mut(pid)?
+            .terminal_session_mut(tid)
+            .ok_or_else(|| format!("no such terminal: t{tid}"))
     }
 
-    /// Read-only `output_gen` of the terminal at (pid, tid). Tab choice is
-    /// `terminal_tab_idx`, same as `session_mut` — but this walk takes
-    /// `&self` and degrades to `None` instead of erroring: the settle
-    /// machinery polls freshness while iterating the pending list, and the
-    /// project/terminal may have closed since the request was parked (so no
-    /// `project_child`, which expects a live pid).
+    /// Read-only `output_gen` of the terminal at (pid, tid). This uses the same
+    /// stable-id lookup as `session_mut`, but degrades to `None`: settle polling
+    /// may outlive a closed Project or Session.
     fn session_gen(&self, pid: WinId, tid: WinId) -> Option<u64> {
-        let win = self.windows.iter().find(|w| w.id == pid)?;
-        let Content::Project(child) = &win.tabs[win.active].content else {
-            return None;
-        };
-        let tw = child.windows.iter().find(|w| w.id == tid)?;
-        let idx = terminal_tab_idx(tw)?;
-        let Content::Terminal(s) = &tw.tabs[idx].content else {
-            return None;
-        };
-        Some(s.output_gen())
+        self.session(pid, tid).ok().map(Session::output_gen)
     }
 
     /// Drive every pending settle one tick. Called each frame after `show()`
@@ -1537,19 +1578,7 @@ impl WindowManager {
         let terminal = req.terminal.as_deref().ok_or("send: missing terminal")?;
         let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
         // Read the term mode BEFORE mutably borrowing the session for feed.
-        let mode = {
-            let child = self.project_child(pid)?;
-            let tw = child
-                .windows
-                .iter()
-                .find(|w| w.id == tid)
-                .expect("resolved");
-            let idx = terminal_tab_idx(tw).ok_or_else(|| format!("no terminal tab in t{tid}"))?;
-            let Content::Terminal(s) = &tw.tabs[idx].content else {
-                return Err("not a terminal tab".into());
-            };
-            s.term_mode()
-        };
+        let mode = self.session(pid, tid)?.term_mode();
         // Same encoder as the live keyboard.
         let key_bytes = crate::inspect::parse_keys(&req.keys, mode)?;
         let session = self.session_mut(pid, tid)?;
@@ -1587,11 +1616,11 @@ impl WindowManager {
 
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
     fn close_terminal(&mut self, pid: WinId, tid: WinId) {
-        if let Some(win) = self.windows.iter_mut().find(|w| w.id == pid) {
-            if let Content::Project(child) = &mut win.tabs[win.active].content {
-                child.close(tid);
-                child.mark_workspace_dirty();
-            }
+        if let Ok(child) = self.project_child_mut(pid)
+            && let Some((window_id, tab_idx)) = child.terminal_location(tid)
+        {
+            child.close_tab(window_id, tab_idx);
+            child.mark_workspace_dirty();
         }
     }
 
@@ -1654,8 +1683,10 @@ impl WindowManager {
         let pid = self
             .windows
             .iter()
-            .find(|w| matches!(w.tabs[w.active].content, Content::Project(_)))
-            .map(|w| w.id)
+            .find_map(|window| match &window.tabs[window.active].content {
+                Content::Project(child) => child.tag.as_deref().and_then(project_id),
+                _ => None,
+            })
             .unwrap_or_else(|| self.add_project(shell, cwd, ctx));
         if let Ok(child) = self.project_child_mut(pid) {
             child.add_image(path);
@@ -2651,6 +2682,21 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// Debug-only startup preview used by native screenshot validation.
+    #[cfg(debug_assertions)]
+    pub fn debug_open_settings_agents(&mut self) {
+        self.open_settings();
+        for window in &mut self.windows {
+            for tab in &mut window.tabs {
+                if let Content::Settings(menu) = &mut tab.content {
+                    menu.select_pane(crate::settings_menu::Pane::Agents);
+                    menu.in_rail = false;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Mutable borrow of the focused window's child manager, if it is a project.
     fn focused_child(&mut self) -> Option<&mut WindowManager> {
         let id = self.focused?;
@@ -3189,7 +3235,7 @@ impl WindowManager {
     /// Mirrors `Content::keepalive` but reaches every tab of every window, since an
     /// un-rendered manager's show loop (which normally pumps the active tab) never
     /// runs this frame.
-    fn keepalive(&mut self) {
+    pub(crate) fn keepalive(&mut self) {
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 t.content.keepalive();
@@ -3493,6 +3539,9 @@ impl WindowManager {
             for t in &mut w.tabs {
                 match &mut t.content {
                     Content::Terminal(s) => {
+                        if t.agent_title.is_settled() {
+                            continue;
+                        }
                         if let Some(new) =
                             auto_agent_title(&t.title, t.auto_title, s.icon_kind(), s.term_id())
                         {
@@ -3504,6 +3553,122 @@ impl WindowManager {
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {}
+                }
+            }
+        }
+    }
+
+    /// Turn a scoped hook notification into work for the single background
+    /// naming lane. Identity and one-attempt policy live with the terminal tab,
+    /// so tabbing/untabbing never invalidates a legitimate request.
+    pub fn prepare_title_request(
+        &mut self,
+        event: &crate::title_notify::TitlePromptEvent,
+        provider: crate::config::NamingProvider,
+        model: &str,
+        epoch: u64,
+    ) -> Option<crate::terminal_titles::TitleRequest> {
+        if self.tag.as_deref() == event.project_id.as_deref() {
+            for window in &mut self.windows {
+                for tab in &mut window.tabs {
+                    let Content::Terminal(session) = &tab.content else {
+                        continue;
+                    };
+                    if term_tag(session.term_id()) != event.terminal_id
+                        || !tab.auto_title
+                        || !source_matches_icon(event.source_agent, session.icon_kind())
+                    {
+                        continue;
+                    }
+                    let accepted =
+                        tab.agent_title
+                            .begin(&event.vendor_session_id, &event.prompt, epoch)?;
+                    if accepted.new_session {
+                        tab.title =
+                            format!("{}  ·  #{}", event.source_agent.label(), session.term_id());
+                    }
+                    return Some(crate::terminal_titles::TitleRequest {
+                        identity: crate::terminal_titles::TitleIdentity {
+                            project_id: event.project_id.clone(),
+                            terminal_id: event.terminal_id.clone(),
+                            vendor_session_id: event.vendor_session_id.clone(),
+                            generation: accepted.generation,
+                            epoch,
+                        },
+                        source_agent: event.source_agent,
+                        transcript_path: event.transcript_path.clone(),
+                        provider,
+                        model: model.to_string(),
+                        prompt: accepted.prompt,
+                        queued_at: std::time::Instant::now(),
+                    });
+                }
+            }
+        }
+        for window in &mut self.windows {
+            for tab in &mut window.tabs {
+                if let Content::Project(child) = &mut tab.content
+                    && let Some(request) =
+                        child.prepare_title_request(event, provider, model, epoch)
+                {
+                    return Some(request);
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply a worker result only if its complete identity still names the
+    /// pending request. A stale result is indistinguishable from no result.
+    pub fn apply_title_result(&mut self, result: crate::terminal_titles::TitleResult) -> bool {
+        if self.tag.as_deref() == result.identity.project_id.as_deref() {
+            for window in &mut self.windows {
+                for tab in &mut window.tabs {
+                    let Content::Terminal(session) = &tab.content else {
+                        continue;
+                    };
+                    if term_tag(session.term_id()) != result.identity.terminal_id {
+                        continue;
+                    }
+                    if !tab.agent_title.settle(
+                        &result.identity.vendor_session_id,
+                        result.identity.generation,
+                        result.identity.epoch,
+                    ) {
+                        return false;
+                    }
+                    if let Ok(title) = result.title {
+                        let exit_marker = tab
+                            .title
+                            .find("  ·  exited (")
+                            .map(|start| tab.title[start..].to_string())
+                            .unwrap_or_default();
+                        tab.title = format!("{title}  ·  #{}{exit_marker}", session.term_id());
+                    }
+                    return true;
+                }
+            }
+        }
+        for window in &mut self.windows {
+            for tab in &mut window.tabs {
+                if let Content::Project(child) = &mut tab.content
+                    && child.apply_title_result(result.clone())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Retire every in-flight result after settings disable/provider/model
+    /// changes. Settled session ids preserve the one-attempt cost bound.
+    pub fn invalidate_title_requests(&mut self) {
+        for window in &mut self.windows {
+            for tab in &mut window.tabs {
+                tab.agent_title.invalidate_pending();
+                if let Content::Project(child) = &mut tab.content {
+                    child.invalidate_title_requests();
                 }
             }
         }
@@ -4038,6 +4203,7 @@ impl WindowManager {
                             self.windows[i].tabs[a].title = t;
                             // Manual rename permanently opts out of auto-title.
                             self.windows[i].tabs[a].auto_title = false;
+                            self.windows[i].tabs[a].agent_title.invalidate_pending();
                             self.mark_workspace_dirty();
                         }
                         self.renaming = None;
@@ -5603,6 +5769,20 @@ fn auto_agent_title(
     Some(want)
 }
 
+fn source_matches_icon(
+    source: crate::terminal_titles::SourceAgent,
+    icon: crate::icons::IconKind,
+) -> bool {
+    icon.agent_label()
+        .is_none_or(|label| label == source.label())
+}
+
+/// Parse a "p3"-style Project id.
+fn project_id(spec: &str) -> Option<WinId> {
+    spec.strip_prefix('p')
+        .and_then(|number| number.parse().ok())
+}
+
 /// Parse a "t4"-style terminal id.
 fn term_id(spec: &str) -> Result<WinId, String> {
     spec.strip_prefix('t')
@@ -5613,21 +5793,6 @@ fn term_id(spec: &str) -> Result<WinId, String> {
 /// Inverse of `term_id`: render a WinId as the chat identity string.
 fn term_tag(id: WinId) -> String {
     format!("t{id}")
-}
-
-/// Active-tab-preferred terminal-tab pick: the active tab if it holds a
-/// `Content::Terminal`, else the first terminal tab (`None` if the window
-/// has no terminal tabs at all). This is the ONE place the policy lives —
-/// every control executor that reads or feeds "the terminal in window `tN`"
-/// must agree on which tab that means.
-fn terminal_tab_idx(tw: &Win) -> Option<usize> {
-    if matches!(tw.tabs[tw.active].content, Content::Terminal(_)) {
-        Some(tw.active)
-    } else {
-        tw.tabs
-            .iter()
-            .position(|t| matches!(t.content, Content::Terminal(_)))
-    }
 }
 
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
@@ -5749,9 +5914,14 @@ mod tests {
         let id = wm.next;
         wm.next += 1;
         wm.z += 1;
+        let mut child = WindowManager::new();
+        child.tag = Some(format!("p{id}"));
         wm.windows.push(Win {
             id,
-            tabs: vec![Tab::fixed(title.to_string(), stub_content())],
+            tabs: vec![Tab::fixed(
+                title.to_string(),
+                Content::Project(Box::new(child)),
+            )],
             active: 0,
             rect: egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(400.0, 300.0)),
             z: wm.z,
@@ -5920,6 +6090,7 @@ mod tests {
                     active: 0,
                     tabs: vec![TabSnap {
                         title: "proj".into(),
+                        managed_title: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -5931,6 +6102,7 @@ mod tests {
                                     active: 0,
                                     tabs: vec![TabSnap {
                                         title: "cmd".into(),
+                                        managed_title: false,
                                         content: ContentSnap::Terminal {
                                             shell: "cmd".into(),
                                         },
@@ -6014,6 +6186,7 @@ mod tests {
                     active: 0,
                     tabs: vec![TabSnap {
                         title: "gone".into(),
+                        managed_title: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(
@@ -6337,6 +6510,34 @@ mod tests {
     }
 
     #[test]
+    fn hidden_manager_keepalive_keeps_its_active_terminal_alive() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let id = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .expect("spawn failed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // This is the exact non-painting path App::logic drives while the
+            // native viewport is minimized or fully occluded.
+            wm.keepalive();
+            let w = wm.windows.iter().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &w.tabs[w.active].content else {
+                panic!("test window stopped being a terminal");
+            };
+            if session.ready() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hidden manager never answered its terminal's startup DSR"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn unminimize_retiles_a_window_minimized_from_the_tree() {
         let mut wm = WindowManager::new();
         wm.last_area = egui::vec2(1000.0, 600.0);
@@ -6601,6 +6802,124 @@ mod tests {
             wm.windows.iter().find(|w| w.id == id).unwrap().title(),
             "my pane",
             "user rename must stick"
+        );
+    }
+
+    #[test]
+    fn agent_prompt_names_the_scoped_auto_managed_terminal_once() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p9".into());
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        {
+            let window = wm
+                .windows
+                .iter_mut()
+                .find(|window| window.id == id)
+                .unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session.set_osc_title_for_test(Some("claude".into()));
+        }
+        let event = crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Claude,
+            vendor_session_id: "claude-session-1".into(),
+            transcript_path: None,
+            project_id: Some("p9".into()),
+            terminal_id: term_tag(id),
+            prompt: "fix the authentication race".into(),
+        };
+        let request = wm
+            .prepare_title_request(
+                &event,
+                crate::config::NamingProvider::Codex,
+                "gpt-5.6-luna",
+                4,
+            )
+            .expect("first prompt accepted");
+        assert!(
+            wm.prepare_title_request(
+                &event,
+                crate::config::NamingProvider::Codex,
+                "gpt-5.6-luna",
+                4,
+            )
+            .is_none()
+        );
+        assert!(wm.apply_title_result(crate::terminal_titles::TitleResult {
+            identity: request.identity,
+            title: Ok("Fix authentication race".into()),
+        }));
+        assert_eq!(
+            wm.windows
+                .iter()
+                .find(|window| window.id == id)
+                .unwrap()
+                .title(),
+            &format!("Fix authentication race  ·  #{id}")
+        );
+
+        let snapshot = wm.capture_manager();
+        assert!(snapshot.windows[0].tabs[0].managed_title);
+        assert_eq!(
+            snapshot.windows[0].tabs[0].title,
+            format!("Claude  ·  #{id}")
+        );
+    }
+
+    #[test]
+    fn late_agent_title_preserves_an_existing_exit_marker() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p9".into());
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        {
+            let window = wm
+                .windows
+                .iter_mut()
+                .find(|window| window.id == id)
+                .unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session.set_osc_title_for_test(Some("claude".into()));
+        }
+        let event = crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Claude,
+            vendor_session_id: "claude-session-exit".into(),
+            transcript_path: None,
+            project_id: Some("p9".into()),
+            terminal_id: term_tag(id),
+            prompt: "diagnose the failed worker".into(),
+        };
+        let request = wm
+            .prepare_title_request(
+                &event,
+                crate::config::NamingProvider::Codex,
+                "gpt-5.6-luna",
+                4,
+            )
+            .expect("prompt accepted");
+        wm.windows
+            .iter_mut()
+            .find(|window| window.id == id)
+            .unwrap()
+            .tabs[0]
+            .title
+            .push_str("  ·  exited (7)");
+
+        assert!(wm.apply_title_result(crate::terminal_titles::TitleResult {
+            identity: request.identity,
+            title: Ok("Diagnose Worker Failure".into()),
+        }));
+        assert_eq!(
+            wm.windows
+                .iter()
+                .find(|window| window.id == id)
+                .unwrap()
+                .title(),
+            &format!("Diagnose Worker Failure  ·  #{id}  ·  exited (7)")
         );
     }
 
@@ -7117,6 +7436,7 @@ mod tests {
         let ctx = egui::Context::default();
         let tab = || TabSnap {
             title: "cmd".into(),
+            managed_title: false,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -7149,6 +7469,169 @@ mod tests {
         // The first tab keeps the window id, so single-terminal windows restore
         // with exactly the ids they had before this fix.
         assert_eq!(ids[0], win.id);
+    }
+
+    #[test]
+    fn restored_terminal_tab_ids_drive_snapshot_and_close() {
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap, WorkspaceSnapshot};
+        let ctx = egui::Context::default();
+        let terminal = || TabSnap {
+            title: "cmd".into(),
+            managed_title: false,
+            content: ContentSnap::Terminal {
+                shell: "cmd".into(),
+            },
+        };
+        let child = ManagerSnap {
+            cwd: Some(std::env::current_dir().unwrap()),
+            windows: vec![WinSnap {
+                id: 1,
+                active: 0,
+                tabs: vec![terminal(), terminal(), terminal()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snap = WorkspaceSnapshot {
+            desktop: ManagerSnap {
+                focused: Some(1),
+                windows: vec![WinSnap {
+                    id: 1,
+                    active: 0,
+                    tabs: vec![TabSnap {
+                        title: "Project".into(),
+                        managed_title: false,
+                        content: ContentSnap::Project { child },
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut desktop = WindowManager::new().as_desktop();
+        desktop.apply_workspace(&snap, &ctx);
+        let ids = {
+            let child = desktop.project_child(1).unwrap();
+            child.windows[0]
+                .tabs
+                .iter()
+                .map(|tab| match &tab.content {
+                    Content::Terminal(session) => session.term_id(),
+                    _ => panic!("expected terminal"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let target = term_tag(ids[1]);
+
+        let (msg, reply) = snapshot_msg(Some("p1"), &target, std::time::Instant::now());
+        desktop.handle_ctrl(msg, &ctx);
+        let reply = reply.try_recv().expect("snapshot reply");
+        assert!(reply.ok, "restored tab must resolve: {:?}", reply.error);
+
+        let (msg, reply) = close_msg(Some("p1"), &[&target], std::time::Instant::now());
+        desktop.handle_ctrl(msg, &ctx);
+        let reply = reply.try_recv().expect("close reply");
+        assert!(reply.ok, "restored tab must close: {:?}", reply.error);
+        let remaining = {
+            let child = desktop.project_child(1).unwrap();
+            child.windows[0]
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.content {
+                    Content::Terminal(session) => Some(session.term_id()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(remaining, vec![ids[0], ids[2]]);
+    }
+
+    #[test]
+    fn restored_project_tabs_get_unique_ids_and_route_titles_exactly() {
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap, WorkspaceSnapshot};
+        let ctx = egui::Context::default();
+        let project = |title: &str| TabSnap {
+            title: title.into(),
+            managed_title: false,
+            content: ContentSnap::Project {
+                child: ManagerSnap {
+                    cwd: Some(std::env::current_dir().unwrap()),
+                    windows: vec![WinSnap {
+                        id: 1,
+                        active: 0,
+                        tabs: vec![TabSnap {
+                            title: "cmd".into(),
+                            managed_title: true,
+                            content: ContentSnap::Terminal {
+                                shell: "cmd".into(),
+                            },
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            },
+        };
+        let snap = WorkspaceSnapshot {
+            desktop: ManagerSnap {
+                focused: Some(1),
+                windows: vec![WinSnap {
+                    id: 1,
+                    active: 0,
+                    tabs: vec![project("First"), project("Second")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut desktop = WindowManager::new().as_desktop();
+        desktop.apply_workspace(&snap, &ctx);
+        let tags = desktop.windows[0]
+            .tabs
+            .iter()
+            .map(|tab| match &tab.content {
+                Content::Project(child) => child.tag.clone().unwrap(),
+                _ => panic!("expected project"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tags, vec!["p1", "p2"]);
+        assert_eq!(desktop.resolve_project(Some("p2")), Ok(2));
+
+        let event = crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Codex,
+            vendor_session_id: "codex-second".into(),
+            transcript_path: None,
+            project_id: Some("p2".into()),
+            terminal_id: "t1".into(),
+            prompt: "repair the second project".into(),
+        };
+        let request = desktop
+            .prepare_title_request(
+                &event,
+                crate::config::NamingProvider::Codex,
+                "gpt-5.6-luna",
+                1,
+            )
+            .expect("second project should own the event");
+        assert_eq!(request.identity.project_id.as_deref(), Some("p2"));
+        assert!(
+            desktop.apply_title_result(crate::terminal_titles::TitleResult {
+                identity: request.identity,
+                title: Ok("Second Project Repair".into()),
+            })
+        );
+        let titles = desktop.windows[0]
+            .tabs
+            .iter()
+            .map(|tab| match &tab.content {
+                Content::Project(child) => child.windows[0].tabs[0].title.clone(),
+                _ => panic!("expected project"),
+            })
+            .collect::<Vec<_>>();
+        assert!(!titles[0].contains("Second Project Repair"));
+        assert!(titles[1].contains("Second Project Repair"));
     }
 
     // --- group chat: membership, post, broadcast, history ---

@@ -169,6 +169,7 @@ each — put new logic of that kind THERE.
 | Cell metrics | `src/geom.rs` `CellMetrics` | One frame's pixel↔cell geometry; all clamping in one place |
 | Outbox | `src/chat.rs` `ChatRoom::tick` | Per-frame chat delivery decision (who gets which framed lines); the engine wiring (`WindowManager::chat_tick`, `src/wm.rs`) only injects what the Outbox returns |
 | Paint plan | `src/frame.rs` `plan_paint(grid, metrics, colors) -> PaintPlan` (plus `text_rows` and `overlays`) | One frame's paint geometry/content for a Session, pure; `Session::show` calls it and replays the result. Clamps the grid walk to the grid's REAL bounds first because a stale index panic aborts the whole process (module docs, `src/frame.rs`) |
+| Title lane | `src/title_notify.rs`, `src/terminal_titles.rs`, `WindowManager::prepare_title_request` / `apply_title_result` | Passive agent hooks → instance-scoped event → one bounded provider worker → exact Project/Member/vendor-session/epoch ownership check. Separate from the Control plane; no reply and no GUI/provider wait on the hook path |
 
 ## Pure-module map (testable without a GUI)
 
@@ -196,10 +197,14 @@ serves it.
 
 | Thread | Created | Blocks on |
 |---|---|---|
-| GUI/render (winit main) | eframe | Nothing. PTY drain is `rx.try_recv()` (`Session::pump`); control drain is `ctrl.try_recv()` in `App::ui`; settles are deferred cross-frame (`advance_settles`) |
+| GUI/render (winit main) | eframe | Nothing. PTY drain is `rx.try_recv()` (`Session::pump`); background channels drain in `App::service_background`; settles are deferred cross-frame (`advance_settles`). Visible viewports use `App::ui`; hidden/occluded viewports use `App::logic` to keep every Session pumped without painting |
 | 1 reader thread per Session | `Session::spawn` (`src/terminal.rs`) | Blocking `reader.read()` on the PTY → sends chunk over mpsc → `note_pty_output()` + `ctx.request_repaint()`. Dies when the PTY closes |
 | 1 control serve thread | spawned from `main` | `listener.incoming()` on the named pipe (`control::serve`) |
 | 1 short-lived thread per pipe connection | `control::serve` | The **only** reply wait in the app: `rrx.recv_timeout(REPLY_TIMEOUT)`. Capped by `MAX_INFLIGHT` concurrent handlers; over the cap, reject fast |
+| 1 title listener thread | spawned from `main` (`title_notify::serve`) | Accepts the random per-instance local pipe and forwards bounded prompt events to the GUI; no reply channel |
+| Up to 8 short-lived title connection threads | `title_notify::serve` | Read one capped JSON event, then exit. Over the cap, the listener drops the connection fast |
+| 1 title worker | `terminal_titles::spawn_worker` | Waits on the four-item request queue, runs at most one provider child at a time, and sends one success/failure result. Provider stdout/stderr readers are short-lived and their waits share the process deadline |
+| 1 short-lived hook installer | `agent_hooks::spawn_install` | Reads/merges/writes the three user hook targets, then sends one content-free report to the GUI |
 
 **Shared-state inventory:**
 
@@ -209,7 +214,7 @@ serves it.
 | `PTY_OUTPUT` | `static AtomicBool` (`src/terminal.rs`) | Yes — written by reader threads, swapped by the GUI thread for the adaptive repaint cadence (hot tick after input/output, slow idle tick; `App::ui`, `src/main.rs`). Scheduling only, never correctness |
 | Chat room | `Rc<RefCell<ChatRoom>>` (`src/wm.rs`) | No — single-threaded by construction; shared between the manager and `Content::Chat` viewers. Borrow discipline: `chat_tick` clones the Rc and drops the `borrow_mut` before injecting |
 | Process-table Scanner | `thread_local!` (`src/proc.rs`) | Per-thread; used from the GUI thread |
-| Channels | mpsc: PTY bytes (reader→Session), `CtrlMsg` (conn thread→GUI), `OpenReply` (GUI→conn thread) | Yes — the sanctioned cross-thread paths |
+| Channels | mpsc: PTY bytes (reader→Session), `CtrlMsg` (conn thread→GUI), `OpenReply` (GUI→conn thread), title event/request/result, hook-install report | Yes — the sanctioned cross-thread paths |
 
 **The request flow, in words** (Control plane CLI usage/verbs belong to
 **foreman-run-and-operate**; agent-facing usage to **foreman-dispatch** /
@@ -223,6 +228,25 @@ calls `ctx.request_repaint()` so an idle render loop wakes NOW → `App::ui`
 drains via `try_recv` → `desktop.handle_ctrl` executes → reply goes back over
 the reply channel → the connection thread's `recv_timeout(REPLY_TIMEOUT)`
 returns it → one JSON line back → the CLI prints and exits.
+
+The separate Title lane is one-way: a Claude/Codex/Grok `UserPromptSubmit`
+hook inherits `FOREMAN_EXE` and the random `FOREMAN_TITLE_PIPE` from its Session
+→ the early `foreman title-event` process reads capped stdin and writes one
+normalized event → the bounded title listener applies a per-client read deadline
+and wakes the GUI → `service_background`
+asks the recursive Window manager to resolve the exact Project/Member/source
+and one-attempt vendor session → one bounded worker invokes the selected local
+CLI outside the repository → the GUI applies a valid result only if generation,
+epoch, ownership, and vendor-session identity still match. A manual title,
+closed tab, new session, settings change, overload, or failure leaves the
+generic label.
+
+Project and Terminal routing identities belong to their content, not to the
+window currently containing a tab. A Project's child-manager tag is its `pN`;
+a Session's `term_id` is its `tN`. Resolution scans tabs for those stable ids,
+so merge/restore may move content without changing the control or Title-lane
+target. A containing `WinId` is only a location and may be reused as the first
+content id during construction.
 
 Contract riders on that flow (`WindowManager::handle_ctrl`, `src/wm.rs`):
 
@@ -243,8 +267,10 @@ Contract riders on that flow (`WindowManager::handle_ctrl`, `src/wm.rs`):
       `Event::PtyWrite` (DSR replies, color-query answers) and `pump()` flushes
       it back, which is also what latches `Ready`. A `VoidListener` Session
       hangs black forever.
-- [ ] The GUI thread never blocks; the only `recv_timeout` lives on pipe
-      connection threads.
+- [ ] The GUI thread never blocks. Any `recv_timeout` belongs to a background
+      connection/worker thread and has a hard deadline.
+- [ ] Hidden/occluded native viewports keep every Session pumped through
+      `App::logic`; visible frames do the same work once through `App::ui`.
 - [ ] Exactly one Session reads the keyboard (`active` ANDs down; modals
       suppress all).
 - [ ] `Win.tabs` never empty.

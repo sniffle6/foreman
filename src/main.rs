@@ -3,6 +3,7 @@
 // eprintln/panic output lands somewhere during development.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_hooks;
 mod appearance;
 mod caret;
 mod chat;
@@ -37,13 +38,26 @@ mod settings_menu;
 mod skills_install;
 mod terminal;
 mod terminal_font;
+mod terminal_titles;
 mod theme;
+mod title_notify;
 mod update;
 mod wm;
 mod workspace;
 
 use eframe::egui;
 use wm::WindowManager;
+
+/// The complete background I/O lane for automatic agent-session naming.
+/// Keeping it as one value prevents App construction from exposing each
+/// internal channel as an unrelated dependency.
+struct TitleRuntime {
+    events: std::sync::mpsc::Receiver<title_notify::TitlePromptEvent>,
+    requests: std::sync::mpsc::SyncSender<terminal_titles::TitleRequest>,
+    results: std::sync::mpsc::Receiver<terminal_titles::TitleResult>,
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    hook_install: Option<std::sync::mpsc::Receiver<agent_hooks::InstallReport>>,
+}
 
 struct App {
     desktop: WindowManager,
@@ -61,6 +75,20 @@ struct App {
     chrome_t: f32,
     /// Agent-dispatch requests from the control pipe thread.
     ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
+    /// Passive first-prompt notices from per-agent hooks.
+    title_events: std::sync::mpsc::Receiver<title_notify::TitlePromptEvent>,
+    /// Bounded submission side of the one global provider worker.
+    title_requests: std::sync::mpsc::SyncSender<terminal_titles::TitleRequest>,
+    /// Completed (or safely failed) provider requests.
+    title_results: std::sync::mpsc::Receiver<terminal_titles::TitleResult>,
+    /// Invalidates queued/in-flight results when naming settings change.
+    title_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// At most one background hook installation/update at a time.
+    hook_install: Option<std::sync::mpsc::Receiver<agent_hooks::InstallReport>>,
+    /// Content-free, rate-limited GUI diagnostic for the title lane. Release
+    /// builds have no useful stderr surface, so provider failures must not be
+    /// invisible to the user.
+    last_title_error: Option<(terminal_titles::TitleError, std::time::Instant)>,
     /// Update-check events from the worker (update::spawn); drained per-frame.
     update_rx: std::sync::mpsc::Receiver<update::Event>,
     /// Effects for the worker to execute (fetch now / open releases page).
@@ -129,6 +157,7 @@ impl App {
         ctrl: std::sync::mpsc::Receiver<control::CtrlMsg>,
         update_rx: std::sync::mpsc::Receiver<update::Event>,
         update_fx: std::sync::mpsc::Sender<update::Effect>,
+        title: TitleRuntime,
     ) -> Self {
         // Debug-only preview: FOREMAN_UPDATE_TEST picks an initial update::State
         // so every chip variant can be seen/screenshotted without a real newer
@@ -201,6 +230,12 @@ impl App {
             chrome_leave_since: None,
             chrome_t: 0.0,
             ctrl,
+            title_events: title.events,
+            title_requests: title.requests,
+            title_results: title.results,
+            title_epoch: title.epoch,
+            hook_install: title.hook_install,
+            last_title_error: None,
             update_rx,
             update_fx,
             update_state,
@@ -231,6 +266,110 @@ impl App {
             eprintln!("foreman: could not save workspace: {e}");
         }
         self.workspace_dirty_at = None;
+    }
+
+    fn drain_title_events(&mut self) -> bool {
+        let mut activity = false;
+        while let Ok(event) = self.title_events.try_recv() {
+            activity = true;
+            if !self.settings.auto_name_agent_sessions {
+                continue;
+            }
+            let epoch = self.title_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let Some(request) = self.desktop.prepare_title_request(
+                &event,
+                self.settings.title_provider,
+                &self.settings.title_model,
+                epoch,
+            ) else {
+                continue;
+            };
+            if let Err(error) = self.title_requests.try_send(request) {
+                let request = match error {
+                    std::sync::mpsc::TrySendError::Full(request)
+                    | std::sync::mpsc::TrySendError::Disconnected(request) => request,
+                };
+                self.desktop
+                    .apply_title_result(terminal_titles::TitleResult {
+                        identity: request.identity,
+                        title: Err(terminal_titles::TitleError::Stale),
+                    });
+            }
+        }
+        while let Ok(result) = self.title_results.try_recv() {
+            activity = true;
+            if let Err(error) = &result.title {
+                self.report_title_error(*error);
+            }
+            self.desktop.apply_title_result(result);
+        }
+        activity
+    }
+
+    fn report_title_error(&mut self, error: terminal_titles::TitleError) {
+        if error == terminal_titles::TitleError::Stale {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let should_report = self.last_title_error.is_none_or(|(prior, at)| {
+            prior != error || at.elapsed() > std::time::Duration::from_secs(60)
+        });
+        if should_report {
+            self.notify.push(
+                notify::Level::Warning,
+                format!("Session naming failed: {}", error.label()),
+            );
+            self.last_title_error = Some((error, now));
+        }
+    }
+
+    fn poll_hook_install(&mut self) {
+        let Some(receiver) = &self.hook_install else {
+            return;
+        };
+        let Ok(report) = receiver.try_recv() else {
+            return;
+        };
+        self.hook_install = None;
+        if report.errors.is_empty() {
+            let detail = if report.changed == 0 {
+                "Agent naming hooks are up to date".to_string()
+            } else {
+                format!("Agent naming hooks installed ({})", report.changed)
+            };
+            self.notify.push(notify::Level::Success, detail);
+        } else {
+            self.notify.push(
+                notify::Level::Error,
+                format!(
+                    "Agent naming hook install failed: {}",
+                    report.errors.join("; ")
+                ),
+            );
+        }
+    }
+
+    /// Drain background-to-GUI channels without painting. `eframe` calls
+    /// [`eframe::App::logic`] instead of [`eframe::App::ui`] while the native
+    /// window is minimized or fully occluded, so this path must stay usable by
+    /// both lifecycle callbacks.
+    fn service_background(&mut self, ctx: &egui::Context) -> bool {
+        let mut ctrl_activity = false;
+        while let Ok(msg) = self.ctrl.try_recv() {
+            // Drops server-abandoned requests and undoes orphaned spawns; see
+            // WindowManager::handle_ctrl for the reply-timeout contract.
+            self.desktop.handle_ctrl(msg, ctx);
+            ctrl_activity = true;
+        }
+
+        while let Ok(ev) = self.update_rx.try_recv() {
+            self.drive_update(ev, ctx);
+        }
+        if self.drain_title_events() {
+            ctrl_activity = true;
+        }
+        self.poll_hook_install();
+        ctrl_activity
     }
 
     /// Feed one event through the state machine and dispatch its effects.
@@ -270,11 +409,8 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(e) => {
-                self.notify.push(
-                    notify::Level::Error,
-                    format!("update restart failed: {e}"),
-                    std::time::Instant::now(),
-                );
+                self.notify
+                    .push(notify::Level::Error, format!("update restart failed: {e}"));
             }
         }
     }
@@ -580,6 +716,27 @@ fn chrome_glyph(
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe always calls `logic`, including immediately before visible
+        // `ui`. Only do the headless work when it will skip `ui`; otherwise the
+        // normal frame below remains the single pump/delivery pass.
+        if ctx.input(|i| i.viewport().visible()) != Some(false) {
+            return;
+        }
+
+        self.service_background(ctx);
+        // A hidden viewport is not painted, but its terminals are still live.
+        // Pump every Session so PTY output cannot build an unbounded restore
+        // backlog and device/status replies, chat delivery, and send settles
+        // keep advancing while the window is away.
+        self.desktop.keepalive();
+        self.desktop.chat_tick();
+        self.desktop.advance_settles(std::time::Instant::now());
+        // Reader/control/title threads wake us immediately. This is the quiet
+        // backstop for deferred submits and settles when no new bytes arrive.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.started {
@@ -647,19 +804,15 @@ impl eframe::App for App {
                     &ctx,
                 );
             }
+            // Debug-only preview for the Agents settings pane. This avoids
+            // synthetic mouse/keyboard input during native screenshot QA.
+            #[cfg(debug_assertions)]
+            if std::env::var("FOREMAN_SETTINGS_TEST").ok().as_deref() == Some("agents") {
+                self.desktop.debug_open_settings_agents();
+            }
         }
 
-        let mut ctrl_activity = false;
-        while let Ok(msg) = self.ctrl.try_recv() {
-            // Drops server-abandoned requests and undoes orphaned spawns; see
-            // WindowManager::handle_ctrl for the reply-timeout contract.
-            self.desktop.handle_ctrl(msg, &ctx);
-            ctrl_activity = true;
-        }
-
-        while let Ok(ev) = self.update_rx.try_recv() {
-            self.drive_update(ev, &ctx);
-        }
+        let ctrl_activity = self.service_background(&ctx);
 
         // Auto-disarm the restart chip 5s after it's first armed, so a stray
         // click doesn't leave a live restart primed indefinitely.
@@ -781,7 +934,6 @@ impl eframe::App for App {
                     Some(_) => self.notify.push(
                         notify::Level::Error,
                         format!("{} isn't installed", act.kind.label()),
-                        std::time::Instant::now(),
                     ),
                 }
             }
@@ -819,9 +971,25 @@ impl eframe::App for App {
         // their own fields below — the menu never touches those, so live_cfg's
         // copies of them equal this frame's seed and won't stomp a live zoom.
         let live_cfg = config::live(&ctx);
+        let naming_was_enabled = self.settings.auto_name_agent_sessions;
+        let naming_changed = self.settings.auto_name_agent_sessions
+            != live_cfg.auto_name_agent_sessions
+            || self.settings.title_provider != live_cfg.title_provider
+            || self.settings.title_model != live_cfg.title_model;
         if *live_cfg != self.settings {
             self.settings = (*live_cfg).clone();
             settings_dirty = true;
+        }
+        if naming_changed {
+            self.title_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.desktop.invalidate_title_requests();
+            if !naming_was_enabled
+                && self.settings.auto_name_agent_sessions
+                && self.hook_install.is_none()
+            {
+                self.hook_install = Some(agent_hooks::spawn_install(ctx.clone()));
+            }
         }
         let live = terminal::font_size(&ctx);
         if live != self.settings.font_size {
@@ -1164,6 +1332,9 @@ fn main() -> eframe::Result {
     }
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "title-event") {
+        std::process::exit(title_notify::client_main(&args[2..]));
+    }
     if args.len() > 1 {
         attach_parent_console();
         std::process::exit(control::client_main(&args[1..]));
@@ -1181,6 +1352,10 @@ fn main() -> eframe::Result {
     let startup_settings = config::Settings::load();
     if startup_settings.install_skills {
         skills_install::install();
+    }
+    let title_pipe = title_notify::new_pipe_name();
+    if let Err(error) = title_notify::set_pipe_name(title_pipe.clone()) {
+        eprintln!("foreman: {error}");
     }
     conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1213,6 +1388,16 @@ fn main() -> eframe::Result {
             // arrives, rather than waiting on the idle repaint tick.
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
+            let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(16);
+            let title_ctx = cc.egui_ctx.clone();
+            let title_pipe = title_pipe.clone();
+            std::thread::spawn(move || title_notify::serve(&title_pipe, title_event_tx, title_ctx));
+            let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+            let (title_request_tx, title_result_rx) =
+                terminal_titles::spawn_worker(title_epoch.clone(), cc.egui_ctx.clone());
+            let hook_install = startup_settings
+                .auto_name_agent_sessions
+                .then(|| agent_hooks::spawn_install(cc.egui_ctx.clone()));
             let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
             let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
             // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch
@@ -1227,7 +1412,18 @@ fn main() -> eframe::Result {
             {
                 update::spawn(cc.egui_ctx.clone(), upd_event_tx, upd_effect_rx);
             }
-            Ok(Box::new(App::new(rx, upd_event_rx, upd_effect_tx)))
+            Ok(Box::new(App::new(
+                rx,
+                upd_event_rx,
+                upd_effect_tx,
+                TitleRuntime {
+                    events: title_event_rx,
+                    requests: title_request_tx,
+                    results: title_result_rx,
+                    epoch: title_epoch,
+                    hook_install,
+                },
+            )))
         }),
     )
 }
@@ -1252,6 +1448,94 @@ mod crash_log_tests {
         assert_eq!(
             crash_log_path_in(None),
             std::path::PathBuf::from("foreman_panic.log")
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_logic_tests {
+    use super::*;
+
+    #[test]
+    fn background_service_answers_control_requests_without_a_ui_pass() {
+        let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+        let (_update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_fx, _update_fx_rx) = std::sync::mpsc::channel();
+        let (_title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(1);
+        let (title_request_tx, _title_request_rx) = std::sync::mpsc::sync_channel(1);
+        let (_title_result_tx, title_result_rx) = std::sync::mpsc::channel();
+        let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut app = App::new(
+            ctrl_rx,
+            update_rx,
+            update_fx,
+            TitleRuntime {
+                events: title_event_rx,
+                requests: title_request_tx,
+                results: title_result_rx,
+                epoch: title_epoch,
+                hook_install: None,
+            },
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        ctrl_tx
+            .send(control::CtrlMsg::Status(
+                control::StatusRequest {
+                    cmd: "status".into(),
+                    project: None,
+                },
+                reply_tx,
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        assert!(app.service_background(&egui::Context::default()));
+        let reply = reply_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("background service should answer the control request");
+        assert!(reply.ok);
+        assert_eq!(reply.history, Some(vec!["no projects".to_string()]));
+    }
+
+    #[test]
+    fn background_service_surfaces_content_free_title_failures() {
+        let (_ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+        let (_update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_fx, _update_fx_rx) = std::sync::mpsc::channel();
+        let (_title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(1);
+        let (title_request_tx, _title_request_rx) = std::sync::mpsc::sync_channel(1);
+        let (title_result_tx, title_result_rx) = std::sync::mpsc::channel();
+        let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut app = App::new(
+            ctrl_rx,
+            update_rx,
+            update_fx,
+            TitleRuntime {
+                events: title_event_rx,
+                requests: title_request_tx,
+                results: title_result_rx,
+                epoch: title_epoch,
+                hook_install: None,
+            },
+        );
+        title_result_tx
+            .send(terminal_titles::TitleResult {
+                identity: terminal_titles::TitleIdentity {
+                    project_id: Some("p1".into()),
+                    terminal_id: "t1".into(),
+                    vendor_session_id: "session-1".into(),
+                    generation: 1,
+                    epoch: 1,
+                },
+                title: Err(terminal_titles::TitleError::Timeout),
+            })
+            .unwrap();
+
+        assert!(app.service_background(&egui::Context::default()));
+        assert!(app.notify.contains_text("provider CLI timed out"));
+        assert_eq!(
+            app.last_title_error.map(|(error, _)| error),
+            Some(terminal_titles::TitleError::Timeout)
         );
     }
 }

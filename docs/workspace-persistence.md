@@ -13,6 +13,10 @@ On restart, Foreman reloads the last desktop layout from
 - Minimized windows (`min_from_tree` so restore re-tiles when appropriate)
 - Focus (window + active tab) and zoom, when set
 - Terminal **shell kind** (`powershell` / `cmd` / `bash`) and chat viewer tabs
+- Whether each terminal title is Foreman-managed. Generated semantic text is
+  not authoritative state; snapshots store only a generic source/member label
+  plus `managed_title = true`, and current restore starts the title lifecycle
+  fresh
 
 Every terminal spawns a **fresh** shell of that kind at the **project `cwd`**.
 No agents are re-dispatched; no scrollback or Ready state is recovered.
@@ -78,11 +82,13 @@ discard take_opened + poll dirty   # restore must not write recents or re-save
 - **Missing project directories are skipped** (`ApplyReport.projects_skipped`);
   remaining projects still restore.
 - **Snapshot ids are file-local.** Runtime `WinId`, `tN`, and `pN` regenerate
-  on apply. Fine for layout; chat cursor restore and stable dispatch ids need
-  more work later.
-- **Multi-tab terminals in one window** may share one `term_id` on restore
-  (stamped from the window id). Prefer unique per-tab ids before relying on
-  chat/dispatch against restored multi-tab stacks.
+  on apply. They remain stable for that runtime and are resolved independently
+  of a tab's containing window.
+- **Every restored identity-bearing tab gets its own runtime id.** The first
+  Terminal or Project in a Win may reuse the Win id; later Terminal and Project
+  tabs consume fresh ids. Do not hoist one id across the tab loop: Control,
+  Chat, inspection, and the Title lane route by stable `term_id` / Project child
+  tag even after tabs share a window.
 - **Over-dirty is intentional.** Focus-only acts and continuous drag/resize
   refresh the debounce timer; writes still only happen after 600 ms idle.
 - **Coordinates are local** to each manager's area (never screen space).

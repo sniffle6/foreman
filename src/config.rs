@@ -142,6 +142,37 @@ impl DefaultShell {
     }
 }
 
+/// Installed agent CLI Foreman asks to generate a Session title. This is
+/// independent of which agent owns the source Session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamingProvider {
+    #[default]
+    Codex,
+    Claude,
+    Grok,
+}
+
+impl NamingProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::Grok => "Grok",
+        }
+    }
+
+    /// Safe initial model when switching providers. Codex intentionally uses
+    /// Luna; the other CLIs use their own configured default until the user
+    /// enters an exact provider-specific model id.
+    pub fn initial_model(self) -> &'static str {
+        match self {
+            Self::Codex => "gpt-5.6-luna",
+            Self::Claude | Self::Grok => "",
+        }
+    }
+}
+
 /// Persisted app settings (`%APPDATA%\foreman\settings.json`). Flat by design:
 /// `#[serde(default)]` means a missing file, a missing field, or extra fields
 /// written by a newer foreman all load cleanly — so adding a setting later never
@@ -190,6 +221,13 @@ pub struct Settings {
     // -- agents --
     /// Write foreman-dispatch/foreman-chat skills into Claude & Codex dirs on launch.
     pub install_skills: bool,
+    /// Generate one title from the first meaningful prompt in each new agent
+    /// Session. Off by default because the prompt crosses a provider boundary.
+    pub auto_name_agent_sessions: bool,
+    /// Installed CLI used for Session-title generation.
+    pub title_provider: NamingProvider,
+    /// Provider model id. Blank means that CLI's configured default.
+    pub title_model: String,
     /// Seconds since last heard-from before a Crew member shows its age in amber.
     pub crew_stale_secs: u32,
     /// Default quiescence wait for `foreman send` when the caller omits one.
@@ -228,6 +266,9 @@ impl Default for Settings {
             focus_follows_mouse: false,
             dim_unfocused: false,
             install_skills: true,
+            auto_name_agent_sessions: false,
+            title_provider: NamingProvider::Codex,
+            title_model: "gpt-5.6-luna".into(),
             crew_stale_secs: 300,
             send_settle_ms: 120,
             restore_workspace: true,
@@ -263,6 +304,13 @@ impl Settings {
         self.toast_secs = self.toast_secs.clamp(1.0, 30.0);
         self.crew_stale_secs = self.crew_stale_secs.clamp(30, 3600);
         self.send_settle_ms = self.send_settle_ms.min(2000);
+        self.title_model = self
+            .title_model
+            .trim()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(128)
+            .collect();
         // Empty theme name self-heals to the built-in (full unknown-name
         // validation against the theme list lands with the Duplicate wiring).
         if self.theme.trim().is_empty() {
@@ -374,6 +422,9 @@ mod tests {
         assert!(s.install_skills);
         assert_eq!(s.crew_stale_secs, 300);
         assert_eq!(s.send_settle_ms, 120);
+        assert!(!s.auto_name_agent_sessions);
+        assert_eq!(s.title_provider, NamingProvider::Codex);
+        assert_eq!(s.title_model, "gpt-5.6-luna");
         assert!(s.restore_workspace);
         assert_eq!(s.default_project_dir, "");
         assert!(s.update_check);
@@ -426,9 +477,24 @@ mod tests {
         s.default_shell = DefaultShell::Cmd;
         s.copy_on_select = true;
         s.default_project_dir = "H:\\claude code".into();
+        s.auto_name_agent_sessions = true;
+        s.title_provider = NamingProvider::Grok;
+        s.title_model = "grok-code-fast-1".into();
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.default_shell, DefaultShell::Cmd);
         assert!(back.copy_on_select);
         assert_eq!(back.default_project_dir, "H:\\claude code");
+        assert!(back.auto_name_agent_sessions);
+        assert_eq!(back.title_provider, NamingProvider::Grok);
+        assert_eq!(back.title_model, "grok-code-fast-1");
+    }
+
+    #[test]
+    fn title_model_is_trimmed_and_bounded_on_load() {
+        let mut s = Settings::default();
+        s.title_model = format!("  {}\n{}  ", "x".repeat(100), "x".repeat(100));
+        s.sanitize();
+        assert_eq!(s.title_model.len(), 128);
+        assert!(s.title_model.chars().all(|c| c == 'x'));
     }
 }

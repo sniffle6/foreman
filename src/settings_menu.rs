@@ -2,7 +2,7 @@
 //! descriptors, and a pure `adjust` over &mut Settings — all unit-tested
 //! without a GUI. The egui view lives in the same file below (Task 3).
 
-use crate::config::{DefaultShell, Settings};
+use crate::config::{DefaultShell, NamingProvider, Settings};
 use crate::keymap::Keymap;
 use crate::settings::{Outcome as EditorOutcome, SettingsView};
 use eframe::egui;
@@ -61,6 +61,9 @@ pub enum Field {
     FocusFollowsMouse,
     DimUnfocused,
     InstallSkills,
+    AutoNameAgentSessions,
+    TitleProvider,
+    TitleModel,
     CrewStale,
     SendSettle,
     RestoreWorkspace,
@@ -190,6 +193,24 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 kind: Kind::Toggle,
             },
             RowSpec {
+                field: Field::AutoNameAgentSessions,
+                label: "Automatically name agent Sessions",
+                desc: "Enabling installs guarded global hooks; Codex may ask you to trust its hook",
+                kind: Kind::Toggle,
+            },
+            RowSpec {
+                field: Field::TitleProvider,
+                label: "Naming provider",
+                desc: "Can differ from the source agent; Foreman never injects an API key",
+                kind: Kind::Choice,
+            },
+            RowSpec {
+                field: Field::TitleModel,
+                label: "Naming model",
+                desc: "Model id for the selected CLI (blank = provider default)",
+                kind: Kind::Text,
+            },
+            RowSpec {
                 field: Field::CrewStale,
                 label: "Crew stale after",
                 desc: "A member unheard this long shows its age in amber",
@@ -234,6 +255,23 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 kind: Kind::Action,
             },
         ],
+    }
+}
+
+fn description(spec: &RowSpec, settings: &Settings) -> &'static str {
+    if spec.field != Field::AutoNameAgentSessions || !settings.auto_name_agent_sessions {
+        return spec.desc;
+    }
+    match settings.title_provider {
+        NamingProvider::Codex => {
+            "Shares up to 3,800 prompt chars + prior title from any agent with Codex; consumes its allowance"
+        }
+        NamingProvider::Claude => {
+            "Shares up to 3,800 prompt chars + prior title with Claude; counts against subscription usage"
+        }
+        NamingProvider::Grok => {
+            "Shares up to 3,800 prompt chars + prior title from any agent with Grok; consumes its plan allowance"
+        }
     }
 }
 
@@ -319,6 +357,25 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::FocusFollowsMouse => flip(&mut s.focus_follows_mouse),
         Field::DimUnfocused => flip(&mut s.dim_unfocused),
         Field::InstallSkills => flip(&mut s.install_skills),
+        Field::AutoNameAgentSessions => flip(&mut s.auto_name_agent_sessions),
+        Field::TitleProvider => {
+            let next = match (s.title_provider, a) {
+                (NamingProvider::Codex, Adjust::Inc | Adjust::Toggle) => NamingProvider::Claude,
+                (NamingProvider::Claude, Adjust::Inc | Adjust::Toggle) => NamingProvider::Grok,
+                (NamingProvider::Grok, Adjust::Inc | Adjust::Toggle) => NamingProvider::Codex,
+                (NamingProvider::Codex, Adjust::Dec) => NamingProvider::Grok,
+                (NamingProvider::Claude, Adjust::Dec) => NamingProvider::Codex,
+                (NamingProvider::Grok, Adjust::Dec) => NamingProvider::Claude,
+            };
+            if next == s.title_provider {
+                false
+            } else {
+                s.title_provider = next;
+                s.title_model = next.initial_model().to_string();
+                true
+            }
+        }
+        Field::TitleModel => false,
         Field::CrewStale => step_u32(&mut s.crew_stale_secs, a, 30, 30, 3600),
         Field::SendSettle => step_u64(&mut s.send_settle_ms, a, 20, 0, 2000),
         Field::RestoreWorkspace => flip(&mut s.restore_workspace),
@@ -345,6 +402,9 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::FocusFollowsMouse => s.focus_follows_mouse.to_string(),
         Field::DimUnfocused => s.dim_unfocused.to_string(),
         Field::InstallSkills => s.install_skills.to_string(),
+        Field::AutoNameAgentSessions => s.auto_name_agent_sessions.to_string(),
+        Field::TitleProvider => s.title_provider.label().to_string(),
+        Field::TitleModel => s.title_model.clone(),
         Field::CrewStale => {
             if s.crew_stale_secs % 60 == 0 {
                 format!("{} min", s.crew_stale_secs / 60)
@@ -910,11 +970,12 @@ impl SettingsMenu {
                         egui::FontId::proportional(13.0),
                         th.text,
                     );
-                    if !spec.desc.is_empty() {
+                    let desc = description(spec, s);
+                    if !desc.is_empty() {
                         ui.painter().text(
                             egui::pos2(r.min.x + pad, r.min.y + 32.0),
                             egui::Align2::LEFT_CENTER,
-                            spec.desc,
+                            desc,
                             egui::FontId::proportional(11.0),
                             th.dim,
                         );
@@ -1091,6 +1152,11 @@ impl SettingsMenu {
                                     s.default_project_dir = committed;
                                     bump(outcome, MenuOutcome::Changed);
                                 }
+                                Field::TitleModel => {
+                                    s.title_model = committed;
+                                    s.sanitize();
+                                    bump(outcome, MenuOutcome::Changed);
+                                }
                                 other => {
                                     debug_assert!(
                                         false,
@@ -1107,7 +1173,10 @@ impl SettingsMenu {
                 } else {
                     let raw = display(spec.field, s);
                     let shown = if raw.is_empty() {
-                        "(home)".to_string()
+                        match spec.field {
+                            Field::TitleModel => "(provider default)".to_string(),
+                            _ => "(home)".to_string(),
+                        }
                     } else {
                         raw
                     };
@@ -1233,6 +1302,46 @@ mod tests {
         assert_eq!(s.default_shell, DefaultShell::Sh);
         adjust(Field::DefaultShellF, Adjust::Inc, &mut s);
         assert_eq!(s.default_shell, DefaultShell::PowerShell, "wraps");
+    }
+
+    #[test]
+    fn naming_provider_choice_selects_a_valid_initial_model() {
+        let mut s = Settings::default();
+        assert_eq!(s.title_provider, crate::config::NamingProvider::Codex);
+        assert_eq!(s.title_model, "gpt-5.6-luna");
+        assert!(adjust(Field::TitleProvider, Adjust::Inc, &mut s));
+        assert_eq!(s.title_provider, crate::config::NamingProvider::Claude);
+        assert_eq!(s.title_model, "");
+        s.title_model = "claude-haiku-4-5".into();
+        assert!(adjust(Field::TitleProvider, Adjust::Inc, &mut s));
+        assert_eq!(s.title_provider, crate::config::NamingProvider::Grok);
+        assert_eq!(s.title_model, "");
+        assert!(adjust(Field::TitleProvider, Adjust::Inc, &mut s));
+        assert_eq!(s.title_provider, crate::config::NamingProvider::Codex);
+        assert_eq!(s.title_model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn agents_pane_discloses_cross_provider_prompt_sharing() {
+        let rows = rows(Pane::Agents);
+        assert!(rows.iter().any(|r| r.field == Field::AutoNameAgentSessions));
+        assert!(rows.iter().any(|r| r.field == Field::TitleProvider));
+        assert!(rows.iter().any(|r| r.field == Field::TitleModel));
+        let spec = rows
+            .iter()
+            .find(|r| r.field == Field::AutoNameAgentSessions)
+            .unwrap();
+        let mut settings = Settings {
+            auto_name_agent_sessions: true,
+            ..Default::default()
+        };
+        let disclosure = description(spec, &settings);
+        assert!(disclosure.contains("3,800"));
+        assert!(disclosure.contains("prior title"));
+        assert!(disclosure.contains("allowance"));
+        assert!(disclosure.contains("any agent"));
+        settings.title_provider = crate::config::NamingProvider::Claude;
+        assert!(description(spec, &settings).contains("subscription usage"));
     }
 
     #[test]

@@ -77,6 +77,10 @@ pub struct WinSnap {
 #[serde(default)]
 pub struct TabSnap {
     pub title: String,
+    /// True when Foreman owns the title. Managed task names are intentionally
+    /// not persisted; restore starts from a fresh shell label and may name the
+    /// next agent session from its own first prompt.
+    pub managed_title: bool,
     pub content: ContentSnap,
 }
 
@@ -84,6 +88,7 @@ impl Default for TabSnap {
     fn default() -> Self {
         Self {
             title: String::new(),
+            managed_title: false,
             content: ContentSnap::Chat,
         }
     }
@@ -349,6 +354,7 @@ mod tests {
                     active: 0,
                     tabs: vec![TabSnap {
                         title: "foreman".into(),
+                        managed_title: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(r"C:\code\foreman")),
@@ -360,6 +366,7 @@ mod tests {
                                     active: 0,
                                     tabs: vec![TabSnap {
                                         title: "powershell  ·  #1".into(),
+                                        managed_title: true,
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
                                         },
@@ -412,6 +419,7 @@ mod tests {
     fn image_content_round_trips() {
         let snap = TabSnap {
             title: "armed.png".into(),
+            managed_title: false,
             content: ContentSnap::Image {
                 path: PathBuf::from(r"C:\shots\armed.png"),
             },
@@ -463,6 +471,7 @@ mod tests {
                     id: 1,
                     tabs: vec![TabSnap {
                         title: "t".into(),
+                        managed_title: false,
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
                         },
@@ -481,6 +490,7 @@ mod tests {
                     id: 1,
                     tabs: vec![TabSnap {
                         title: "p".into(),
+                        managed_title: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap::default(),
                         },

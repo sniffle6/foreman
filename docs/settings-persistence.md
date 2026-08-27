@@ -18,12 +18,16 @@ setting instead of hand-rolling file I/O again.
   `%APPDATA%\foreman\settings.json`. Holds `font_size`, the panel prefs
   (`panel_collapsed`/`panel_width`/`panel_dock`), `bell`, and the whole
   settings-menu phase-1 set (shell, scrollback, zoom/scroll, clipboard, bell
-  timing, WM behaviors, agent knobs, startup gates — see
+  timing, WM behaviors, agent knobs (including the opt-in naming provider and
+  exact model id), startup gates — see
   `docs/settings-menu.md` for the full list). `Settings::sanitize()` clamps
   every numeric field on load so hand-edited files can't violate invariants.
   `seed_live(ctx, &settings)` / `live(ctx)` park a per-frame `Arc<Settings>`
   in egui context data so deep consumers (terminal, wm, chat) read settings
   without parameter threading — same pattern as `terminal::font_size`.
+  Agent naming adds `auto_name_agent_sessions` (off), `title_provider` (Codex),
+  and `title_model` (`gpt-5.6-luna`); model ids are trimmed and capped at 128
+  characters on load.
 
 ## Why it exists
 
