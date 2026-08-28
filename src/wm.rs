@@ -1290,6 +1290,15 @@ impl WindowManager {
                 }
                 let _ = reply.send(Self::open_reply(self.view_dispatch(&req)));
             }
+            // TEMP (Task 2 of the kanban-board plan): Task 3 replaces this
+            // with real dispatch to a per-project CardStore. Keeps the
+            // control-plane/CLI commit standalone-compilable.
+            CtrlMsg::Kanban(_req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(OpenReply::err("kanban: not wired yet"));
+            }
         }
     }
 

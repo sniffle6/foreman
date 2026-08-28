@@ -49,6 +49,10 @@ pub struct OpenReply {
     /// replies stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// The id `kanban add` created. Skipped on the wire when None so v1
+    /// replies stay byte-identical (same pattern as `seq`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Per-cell attribute grid for `snapshot --attrs`. None (omitted on the
     /// wire) unless `--attrs` was requested, so v1 replies stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,6 +190,31 @@ pub struct SnapshotRequest {
     pub tail: Option<usize>,
 }
 
+/// Kanban board verb (spec: kanban-board §wire shape). `action` selects the
+/// operation; unused fields are omitted on the wire so a plain `list`
+/// request stays minimal and future v1 additions don't affect old callers.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct KanbanRequest {
+    pub cmd: String,    // always "kanban"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>, // caller's FOREMAN_TERMINAL_ID; required for start
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>, // list filter
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json: bool, // list output mode
+}
+
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
 /// `default_project` is the dispatcher's own project (from FOREMAN_PROJECT_ID).
 pub fn parse_open_args(
@@ -248,6 +277,7 @@ pub enum CtrlMsg {
     Send(SendRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Kanban(KanbanRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Create the pipe listener, retrying briefly: after an update-restart the
@@ -340,6 +370,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
                             .map_err(|e| format!("bad request: {e}")),
                         "view" => serde_json::from_str::<ViewRequest>(&line)
                             .map(|r| CtrlMsg::View(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "kanban" => serde_json::from_str::<KanbanRequest>(&line)
+                            .map(|r| CtrlMsg::Kanban(r, rtx, now))
                             .map_err(|e| format!("bad request: {e}")),
                         other => Err(format!("unknown cmd: {other}")),
                     },
@@ -795,6 +828,291 @@ pub fn parse_view_args(
     })
 }
 
+/// Result of parsing `foreman kanban <action> ...`. `wait` never becomes a
+/// wire request — it drives a client-side poll loop (see `kanban_wait`)
+/// against repeated `list` requests, so the server never blocks a connection
+/// open (the pipe server is serial; a held connection would wedge dispatch
+/// for every other agent).
+#[derive(Debug)]
+pub enum KanbanAction {
+    Request(KanbanRequest),
+    Wait {
+        project: Option<String>,
+        target: crate::kanban::WaitTarget,
+        timeout: Option<u64>,
+    },
+}
+
+/// Parse `foreman kanban <action> ...` per the spec's closed verb table.
+/// Every action accepts `--project P`, overriding `default_project`
+/// (FOREMAN_PROJECT_ID).
+pub fn parse_kanban_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<KanbanAction, String> {
+    let action = args.first().ok_or("missing kanban action")?.clone();
+    let rest = &args[1..];
+    match action.as_str() {
+        "add" => parse_kanban_add(rest, default_project),
+        "list" => parse_kanban_list(rest, default_project),
+        "start" => parse_kanban_start(rest, default_project, self_terminal),
+        "done" => parse_kanban_simple(rest, default_project, "done"),
+        "rm" => parse_kanban_simple(rest, default_project, "rm"),
+        "block" => parse_kanban_block(rest, default_project),
+        "wait" => parse_kanban_wait(rest, default_project),
+        other => Err(format!("unknown kanban action: {other}")),
+    }
+}
+
+/// `add <title words...> [--body B] [--project P]` — positional words join
+/// (space-separated) into the title.
+fn parse_kanban_add(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut body: Option<String> = None;
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--body" => {
+                body = Some(args.get(i + 1).ok_or("--body needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                words.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let title = words.join(" ");
+    if title.trim().is_empty() {
+        return Err("title cannot be empty".into());
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "add".into(),
+        project,
+        title: Some(title),
+        body,
+        ..Default::default()
+    }))
+}
+
+/// `list [--state backlog|in_progress|blocked|done] [--json] [--project P]`.
+fn parse_kanban_list(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut state: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--state" => {
+                let v = args.get(i + 1).ok_or("--state needs a value")?.clone();
+                if !matches!(v.as_str(), "backlog" | "in_progress" | "blocked" | "done") {
+                    return Err(format!(
+                        "bad --state value: {v} (expected backlog|in_progress|blocked|done)"
+                    ));
+                }
+                state = Some(v);
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "list".into(),
+        project,
+        state,
+        json,
+        ..Default::default()
+    }))
+}
+
+/// One positional `<id>` plus `[--project P]` — shared by `start`, `done`,
+/// and `rm`. Any other flag is an error (no other verb-specific flags exist
+/// for these three actions).
+fn parse_kanban_id_and_project(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("missing <id>")?;
+    Ok((id, project))
+}
+
+/// `start <id> [--project P]` — requires `self_terminal` (FOREMAN_TERMINAL_ID).
+fn parse_kanban_start(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<KanbanAction, String> {
+    let (id, project) = parse_kanban_id_and_project(args, default_project)?;
+    let from = self_terminal.ok_or("not inside a foreman terminal (FOREMAN_TERMINAL_ID unset)")?;
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "start".into(),
+        project,
+        from: Some(from),
+        id: Some(id),
+        ..Default::default()
+    }))
+}
+
+/// `done <id> [--project P]` / `rm <id> [--project P]`.
+fn parse_kanban_simple(
+    args: &[String],
+    default_project: Option<String>,
+    action: &str,
+) -> Result<KanbanAction, String> {
+    let (id, project) = parse_kanban_id_and_project(args, default_project)?;
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: action.into(),
+        project,
+        id: Some(id),
+        ..Default::default()
+    }))
+}
+
+/// `block <id> --reason R [--project P]` — `--reason` is mandatory and
+/// non-empty (a Blocked column without reasons costs the human an
+/// investigation per card).
+fn parse_kanban_block(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--reason" => {
+                reason = Some(args.get(i + 1).ok_or("--reason needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("missing <id>")?;
+    let reason = reason.ok_or("--reason is required")?;
+    if reason.trim().is_empty() {
+        return Err("--reason cannot be empty".into());
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "block".into(),
+        project,
+        id: Some(id),
+        reason: Some(reason),
+        ..Default::default()
+    }))
+}
+
+/// `wait <id>` or `wait --any`, `[--timeout SECS] [--project P]` — exactly
+/// one of `<id>` / `--any`.
+fn parse_kanban_wait(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut any = false;
+    let mut timeout: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--any" => {
+                any = true;
+                i += 1;
+            }
+            "--timeout" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or("--timeout needs a number of seconds")?;
+                timeout = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--timeout needs a number, got: {v}"))?,
+                );
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let target = match (id, any) {
+        (Some(_), true) => return Err("give either <id> or --any, not both".into()),
+        (Some(id), false) => crate::kanban::WaitTarget::Id(id),
+        (None, true) => crate::kanban::WaitTarget::Any,
+        (None, false) => return Err("wait needs <id> or --any".into()),
+    };
+    Ok(KanbanAction::Wait {
+        project,
+        target,
+        timeout,
+    })
+}
+
 const HELP: &str = "\
 foreman — a desktop for running fleets of AI-agent terminals
 
@@ -809,9 +1127,10 @@ USAGE
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
+  foreman kanban <action> ...                add/list/start/done/block/rm/wait a card
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
-                                            snapshot --help, view --help)
+                                            snapshot --help, view --help, kanban --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -921,6 +1240,42 @@ Reply: {\"ok\":true,\"terminal\":\"tN\",\"project\":\"pN\"}.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments (nonexistent file or
 non-.png extension fail here, before touching the pipe).";
 
+const HELP_KANBAN: &str = "\
+foreman kanban add <title words...> [--body B] [--project P]
+foreman kanban list [--state backlog|in_progress|blocked|done] [--json] [--project P]
+foreman kanban start <id> [--project P]
+foreman kanban done <id> [--project P]
+foreman kanban block <id> --reason R [--project P]
+foreman kanban rm <id> [--project P]
+foreman kanban wait <id> [--timeout SECS] [--project P]
+foreman kanban wait --any [--timeout SECS] [--project P]
+
+Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
+focused project).
+  add     positional words join into the title; --body attaches a longer
+          description. Reply: {\"ok\":true,\"id\":\"a3f8k2\"}.
+  list    line per card by default (id, state, title, then a context tail —
+          claim/blocked-reason/orphan marker). --json emits one JSON card
+          object per line instead, each carrying a derived \"orphaned\" flag
+          (true when the card's claim points at a Session that is gone —
+          this flag is never stored in the card file itself).
+  start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
+          foreman terminal). Errors if another live Session already holds
+          the card; succeeds and seizes an orphaned claim.
+  done    InProgress -> Done. Errors on any other state or a missing card
+          (close-out never resurrects a card).
+  block   InProgress -> Blocked; --reason is mandatory and non-empty.
+  rm      delete the card's file, from any state.
+  wait    poll (client-side, no pipe verb) until the card (or, with --any,
+          any card seen InProgress) reaches Done, Blocked, or orphaned, or
+          is removed. --timeout SECS bounds the wait.
+Exit codes for add/list/start/done/block/rm: 0 ok, 1 refused/unreachable,
+2 bad arguments.
+Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
+(Blocked, orphaned, or removed), 2 timeout or foreman unreachable — a
+different unreachable code than the other verbs, since a stuck wait must be
+distinguishable from a stuck board.";
+
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
@@ -932,6 +1287,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("snapshot") => snapshot_main(&args[1..]),
         Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("view") => view_main(&args[1..]),
+        Some("kanban") => kanban_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -948,6 +1304,7 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman icat <file.png> [--cols N]");
             eprintln!("       foreman view <file.png> [--project P]");
+            eprintln!("       foreman kanban <action> ...");
             eprintln!("       foreman help");
             2
         }
@@ -1078,6 +1435,86 @@ fn view_main(args: &[String]) -> i32 {
     report("foreman view", request(PIPE, &req))
 }
 
+fn kanban_main(args: &[String]) -> i32 {
+    // before env/parsing: help must work outside a foreman terminal
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_KANBAN}");
+        return 0;
+    }
+    let action = match parse_kanban_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("foreman kanban: {e}");
+            return 2;
+        }
+    };
+    match action {
+        // `id` rides the JSON ok-reply that `report` already prints; `list`
+        // output rides `history` and prints line-per-line.
+        KanbanAction::Request(req) => report("foreman kanban", request(PIPE, &req)),
+        KanbanAction::Wait {
+            project,
+            target,
+            timeout,
+        } => kanban_wait(project, target, timeout),
+    }
+}
+
+/// Client-side poll loop for `foreman kanban wait`: repeated `list --json`
+/// requests, verdict decided by the pure [`crate::kanban::wait_verdict`].
+/// Never a held pipe connection — the server is serial, so a blocking wait
+/// would wedge dispatch for every other agent.
+fn kanban_wait(
+    project: Option<String>,
+    target: crate::kanban::WaitTarget,
+    timeout: Option<u64>,
+) -> i32 {
+    let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let mut watched = std::collections::HashSet::new();
+    loop {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "list".into(),
+            project: project.clone(),
+            json: true,
+            ..Default::default()
+        };
+        match request(PIPE, &req) {
+            // Spec exit-code contract: 2 = timeout or foreman unreachable
+            // (deliberately different from other verbs' unreachable=1).
+            Err(e) => {
+                eprintln!("foreman kanban wait: cannot reach foreman ({e})");
+                return 2;
+            }
+            Ok(r) if !r.ok => {
+                eprintln!("foreman kanban wait: {}", r.error.unwrap_or_default());
+                return 1;
+            }
+            Ok(r) => {
+                let cards: Vec<crate::kanban::CardLine> = r
+                    .history
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                if let Some(code) = crate::kanban::wait_verdict(&target, &mut watched, &cards) {
+                    return code;
+                }
+            }
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            eprintln!("foreman kanban wait: timeout");
+            return 2;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2)); // client-side poll: the pipe
+        // server is serial; a held connection would wedge dispatch for every agent (spec).
+    }
+}
+
 /// Print the pipe reply (or the connection failure) the way all subcommands do.
 /// History replies print line-per-line for agent readability; other ok replies
 /// print as JSON (the open reply carries terminal/project ids the caller needs).
@@ -1146,6 +1583,154 @@ mod tests {
         assert_eq!(OpenReply::err("boom").error.as_deref(), Some("boom"));
     }
 
+    #[test]
+    fn open_reply_id_is_wire_compatible_with_v1() {
+        // unset id serializes away (byte-identical to v1)…
+        let ok = OpenReply {
+            ok: true,
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&ok).unwrap().contains("\"id\""));
+        // …and a v1 reply without the key still parses.
+        let r: OpenReply = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(r.id, None);
+    }
+
+    #[test]
+    fn kanban_request_wire_roundtrips_and_omits_unset_fields() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "list".into(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(!j.contains("\"id\"") && !j.contains("\"title\"") && !j.contains("\"json\""));
+        let back: KanbanRequest = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn parse_kanban_args_add_joins_title_words_and_takes_body() {
+        let req = match parse_kanban_args(
+            &s(&["add", "fix", "resize", "flicker", "--body", "detail"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "add");
+        assert_eq!(req.title.as_deref(), Some("fix resize flicker"));
+        assert_eq!(req.body.as_deref(), Some("detail"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn parse_kanban_args_add_rejects_empty_title() {
+        assert!(parse_kanban_args(&s(&["add"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["add", "--body", "x"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_list_happy_path_and_bad_state() {
+        let req = match parse_kanban_args(&s(&["list", "--state", "blocked", "--json"]), None, None)
+            .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "list");
+        assert_eq!(req.state.as_deref(), Some("blocked"));
+        assert!(req.json);
+        let e = parse_kanban_args(&s(&["list", "--state", "bogus"]), None, None).unwrap_err();
+        assert!(e.contains("bogus"), "{e}");
+    }
+
+    #[test]
+    fn parse_kanban_args_start_requires_self_terminal() {
+        let req =
+            match parse_kanban_args(&s(&["start", "a1"]), Some("p1".into()), Some("t4".into()))
+                .unwrap()
+            {
+                KanbanAction::Request(r) => r,
+                _ => panic!("expected a request"),
+            };
+        assert_eq!(req.action, "start");
+        assert_eq!(req.id.as_deref(), Some("a1"));
+        assert_eq!(req.from.as_deref(), Some("t4"));
+        let e = parse_kanban_args(&s(&["start", "a1"]), None, None).unwrap_err();
+        assert!(e.contains("FOREMAN_TERMINAL_ID"), "{e}");
+    }
+
+    #[test]
+    fn parse_kanban_args_done_and_rm_take_one_id() {
+        let req = match parse_kanban_args(&s(&["done", "a1"]), None, None).unwrap() {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "done");
+        assert_eq!(req.id.as_deref(), Some("a1"));
+
+        let req = match parse_kanban_args(&s(&["rm", "a1"]), None, None).unwrap() {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "rm");
+        assert_eq!(req.id.as_deref(), Some("a1"));
+
+        assert!(parse_kanban_args(&s(&["done"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_block_demands_a_reason() {
+        let req = match parse_kanban_args(&s(&["block", "a1", "--reason", "waiting"]), None, None)
+            .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "block");
+        assert_eq!(req.reason.as_deref(), Some("waiting"));
+        let e = parse_kanban_args(&s(&["block", "a1"]), None, None).unwrap_err();
+        assert!(e.contains("--reason"), "{e}");
+        let e = parse_kanban_args(&s(&["block", "a1", "--reason", ""]), None, None).unwrap_err();
+        assert!(e.contains("--reason"), "{e}");
+    }
+
+    #[test]
+    fn parse_kanban_args_wait_needs_exactly_one_of_id_or_any() {
+        let target =
+            match parse_kanban_args(&s(&["wait", "a1", "--timeout", "30"]), None, None).unwrap() {
+                KanbanAction::Wait {
+                    target, timeout, ..
+                } => {
+                    assert_eq!(timeout, Some(30));
+                    target
+                }
+                _ => panic!("expected a wait"),
+            };
+        assert_eq!(target, crate::kanban::WaitTarget::Id("a1".into()));
+
+        let target = match parse_kanban_args(&s(&["wait", "--any"]), None, None).unwrap() {
+            KanbanAction::Wait { target, .. } => target,
+            _ => panic!("expected a wait"),
+        };
+        assert_eq!(target, crate::kanban::WaitTarget::Any);
+
+        assert!(parse_kanban_args(&s(&["wait", "a1", "--any"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["wait"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_rejects_unknown_action_and_flags() {
+        let e = parse_kanban_args(&s(&["bogus"]), None, None).unwrap_err();
+        assert!(e.contains("bogus"), "{e}");
+        let e = parse_kanban_args(&s(&["list", "--nope"]), None, None).unwrap_err();
+        assert!(e.contains("--nope"), "{e}");
+    }
+
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
     }
@@ -1170,6 +1755,8 @@ mod tests {
         assert_eq!(client_main(&s(&["send", "-h"])), 0);
         assert_eq!(client_main(&s(&["snapshot", "--help"])), 0);
         assert_eq!(client_main(&s(&["snapshot", "-h"])), 0);
+        assert_eq!(client_main(&s(&["kanban", "--help"])), 0);
+        assert_eq!(client_main(&s(&["kanban", "-h"])), 0);
     }
 
     #[test]
@@ -1276,6 +1863,47 @@ mod tests {
         let reply = reply.expect("no reply");
         assert!(reply.ok);
         assert_eq!(reply.project.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn kanban_pipe_roundtrip() {
+        let pipe = format!("foreman-test-kanban-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Kanban(req, reply, _) => {
+                    assert_eq!(req.action, "add");
+                    assert_eq!(req.title.as_deref(), Some("fix resize flicker"));
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        id: Some("a3f8k2".into()),
+                        ..Default::default()
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Kanban"),
+            }
+        });
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "add".into(),
+            title: Some("fix resize flicker".into()),
+            ..Default::default()
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply");
+        assert!(reply.ok);
+        assert_eq!(reply.id.as_deref(), Some("a3f8k2"));
     }
 
     #[test]
