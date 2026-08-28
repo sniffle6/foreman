@@ -67,20 +67,6 @@ pub enum RowKind {
     Image,
 }
 
-/// Stable identity for a panel row, used to re-resolve a drag's source and
-/// anchor at drop time without trusting multi-frame `TargetPath` indices.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RowIdentity {
-    /// Nested manager tag ("pN"). `None` only for untagged test stubs, which
-    /// fall back to strict-path resolution.
-    Project(Option<String>),
-    /// Session member id (`Session::term_id`) — stable across merge/untab.
-    Terminal(u64),
-    /// Chat/Image rows (and nested-Project test stand-ins): no stable id.
-    /// Resolved by strict path + content-kind check; any drift cancels.
-    Loose,
-}
-
 #[derive(Clone, Debug)]
 pub struct TabEntry {
     pub path: TargetPath,
@@ -98,8 +84,10 @@ pub struct TabEntry {
     pub bell: bool,
     /// Panel presentation rank (drives row order; `None` = unranked).
     pub rank: Option<u64>,
-    /// Stable identity for drag-drop resolution across frames.
-    pub identity: RowIdentity,
+    /// Stable identity for drag-drop resolution across frames: the row's
+    /// `Tab` uid (`src/wm.rs`), process-unique and travelling with the tab
+    /// through merge/untab.
+    pub uid: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -114,8 +102,10 @@ pub struct ProjectEntry {
     pub tabs: Vec<TabEntry>,
     /// Panel presentation rank (drives row order; `None` = unranked).
     pub rank: Option<u64>,
-    /// Stable identity for drag-drop resolution across frames.
-    pub identity: RowIdentity,
+    /// Stable identity for drag-drop resolution across frames: the row's
+    /// `Tab` uid (`src/wm.rs`), process-unique and travelling with the tab
+    /// through merge/untab.
+    pub uid: u64,
 }
 
 /// Display variant for the update chip; one per Phase-4 `update::State` case
@@ -184,8 +174,11 @@ pub enum Placement {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PanelRowRef {
+    /// Frame-of-capture location. Presentation only (mid-drag scope
+    /// filtering); drop-time resolution never trusts it.
     pub path: TargetPath,
-    pub identity: RowIdentity,
+    /// The row's `Tab` uid — the sole drop-time resolution key.
+    pub uid: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -428,7 +421,7 @@ impl PanelView {
                             project_row: true,
                             drag_ref: Some(PanelRowRef {
                                 path: proj.path,
-                                identity: proj.identity.clone(),
+                                uid: proj.uid,
                             }),
                         },
                     ));
@@ -456,7 +449,7 @@ impl PanelView {
                                 project_row: false,
                                 drag_ref: Some(PanelRowRef {
                                     path: t.path,
-                                    identity: t.identity.clone(),
+                                    uid: t.uid,
                                 }),
                             },
                         ));
@@ -930,7 +923,7 @@ impl PanelView {
                     project_row: true,
                     drag_ref: Some(PanelRowRef {
                         path: proj.path,
-                        identity: proj.identity.clone(),
+                        uid: proj.uid,
                     }),
                 },
             ));
@@ -959,7 +952,7 @@ impl PanelView {
                         project_row: false,
                         drag_ref: Some(PanelRowRef {
                             path: t.path,
-                            identity: t.identity.clone(),
+                            uid: t.uid,
                         }),
                     },
                 ));
@@ -1100,7 +1093,7 @@ impl PanelView {
                 div_before: pi > 0,
                 drag_ref: Some(PanelRowRef {
                     path: proj.path,
-                    identity: proj.identity.clone(),
+                    uid: proj.uid,
                 }),
                 project_chip: true,
             });
@@ -1118,7 +1111,7 @@ impl PanelView {
                     div_before: false,
                     drag_ref: Some(PanelRowRef {
                         path: t.path,
-                        identity: t.identity.clone(),
+                        uid: t.uid,
                     }),
                     project_chip: false,
                 });

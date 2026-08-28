@@ -164,6 +164,12 @@ Presentation-only per-tab rank (`Tab::panel_order`) driving sessions-panel row
 order. Written only by `Act::ReorderPanel` (dense per scope), projected by
 `panel_model()`, persisted additively in `TabSnap`. Never touches the tab
 strip, Layout tree, z-order, or focus.
+
+**Tab uid**:
+Runtime-only per-tab identity (`Tab::tab_uid`), stamped at construction from a
+process-global counter; how a panel drag ref finds its row at drop time.
+Separate system from Panel order (rank = position, uid = identity); never
+persisted — uids regenerate on workspace restore.
 _Avoid_: tab order (that's the real strip), z-order, sort index.
 
 **Input-encoding seam**:

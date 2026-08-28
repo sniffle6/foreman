@@ -25,10 +25,11 @@ and the landing site for future agent-state badges.
 - **Drag to reorder (presentation-only):** rows/chips in the expanded modes
   drag to reorder Project groups, and Session/chat/image rows within their
   Project. One `PanelReorder` intent drains into `Act::ReorderPanel`;
-  `WindowManager` re-resolves source/anchor by stable identity (`term_id` /
-  project `pN` tag; strict path for chat/image — path drift cancels; a
-  same-kind index shift on these id-less rows can retarget), rejects
-  cross-project and Project↔Session drops, and rewrites that scope to dense
+  `WindowManager` re-resolves source/anchor by stable identity — every row
+  carries its tab's runtime uid (`Tab::tab_uid`), so a ref follows its row
+  through any same-frame structural shift or cancels if the row is gone —
+  rejects cross-project and Project↔Session drops, and rewrites that scope
+  to dense
   per-tab `panel_order` ranks. The real tab strip, tiles, z-order, and focus
   never move. Unranked (`None`) rows sort after ranked ones in structural
   order, so new tabs append. A 2px marker (clipped to the panel body) shows

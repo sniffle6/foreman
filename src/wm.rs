@@ -264,6 +264,12 @@ pub struct Tab {
     /// Dense ranks are rewritten per scope on each panel reorder; the value
     /// travels with the tab through merge/untab/capture/restore.
     pub panel_order: Option<u64>,
+    /// Runtime-only stable row identity for panel drag-drop resolution:
+    /// stamped once at construction from a process-global counter; travels
+    /// with the tab through merge/untab. Never persisted — uids regenerate on
+    /// workspace restore, which is fine because drag refs never span a
+    /// restart.
+    tab_uid: u64,
     /// When true, [`WindowManager::refresh_auto_titles`] may replace `title`
     /// with an agent name once the Session detects one (hand-launched / landing
     /// agents in a default-named shell). Cleared by manual rename; never set
@@ -274,6 +280,14 @@ pub struct Tab {
     agent_title: crate::terminal_titles::AgentTitleState,
 }
 
+/// Process-global source for [`Tab::tab_uid`]. Tab construction happens on
+/// the GUI thread, but an atomic is trivially correct and needs no plumbing.
+static NEXT_TAB_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_tab_uid() -> u64 {
+    NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Tab {
     /// Fixed title (no auto-rename). Used for projects, chat, panel, dispatch.
     fn fixed(title: impl AsRef<str>, content: Content) -> Self {
@@ -281,6 +295,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             panel_order: None,
+            tab_uid: next_tab_uid(),
             auto_title: false,
             agent_title: Default::default(),
         }
@@ -292,6 +307,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             panel_order: None,
+            tab_uid: next_tab_uid(),
             auto_title: true,
             agent_title: Default::default(),
         }
@@ -2038,10 +2054,7 @@ impl WindowManager {
                             },
                             bell: t.content.bell_active(),
                             rank: t.panel_order,
-                            identity: match &t.content {
-                                Content::Terminal(s) => RowIdentity::Terminal(s.term_id()),
-                                _ => RowIdentity::Loose,
-                            },
+                            uid: t.tab_uid,
                         });
                     }
                 }
@@ -2052,7 +2065,7 @@ impl WindowManager {
                     focused: pfocused,
                     bell: tabs.iter().any(|t| t.bell),
                     rank: pt.panel_order,
-                    identity: RowIdentity::Project(inner.tag.clone()),
+                    uid: pt.tab_uid,
                     tabs,
                 });
             }
@@ -2072,79 +2085,34 @@ impl WindowManager {
         }
     }
 
-    /// Resolve a drag ref by stable identity (identity-first; strict path only
-    /// for Loose rows). Returns None on any drift — a cancelled drop, never a
-    /// wrong-row move.
+    /// Resolve a drag ref by its row's `Tab` uid — uniform for every row kind.
+    /// Uids are process-unique and travel with the tab through merge/untab, so
+    /// a hit is always the captured row. Returns None when the row is gone —
+    /// a cancelled drop, never a wrong-row move.
     fn resolve_panel_row(&self, r: &crate::panel::PanelRowRef) -> Option<ResolvedRow> {
-        use crate::panel::RowIdentity;
-        match &r.identity {
-            RowIdentity::Project(Some(tag)) => {
-                for (wi, w) in self.windows.iter().enumerate() {
-                    for (pi, t) in w.tabs.iter().enumerate() {
-                        if let Content::Project(inner) = &t.content {
-                            if inner.tag.as_deref() == Some(tag.as_str()) {
-                                return Some(ResolvedRow::Project { win: wi, tab: pi });
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            RowIdentity::Project(None) => {
-                // Untagged stub (tests only): strict path.
-                let wi = self.windows.iter().position(|w| w.id == r.path.project)?;
-                let pi = r.path.tab?;
-                let t = self.windows[wi].tabs.get(pi)?;
-                matches!(t.content, Content::Project(_))
-                    .then_some(ResolvedRow::Project { win: wi, tab: pi })
-            }
-            RowIdentity::Terminal(tid) => {
-                for (wi, w) in self.windows.iter().enumerate() {
-                    for (pi, t) in w.tabs.iter().enumerate() {
-                        let Content::Project(inner) = &t.content else {
-                            continue;
-                        };
-                        for (ci, cw) in inner.windows.iter().enumerate() {
-                            for (ti, ct) in cw.tabs.iter().enumerate() {
-                                if let Content::Terminal(s) = &ct.content {
-                                    if s.term_id() == *tid {
-                                        return Some(ResolvedRow::Session {
-                                            pwin: wi,
-                                            ptab: pi,
-                                            cwin: ci,
-                                            tab: ti,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            RowIdentity::Loose => {
-                // Chat/Image rows: strict path + kind family check.
-                let wi = self.windows.iter().position(|w| w.id == r.path.project)?;
-                let pi = r.path.ptab?;
-                let Content::Project(inner) = &self.windows[wi].tabs.get(pi)?.content else {
-                    return None;
+        for (wi, w) in self.windows.iter().enumerate() {
+            for (pi, t) in w.tabs.iter().enumerate() {
+                let Content::Project(inner) = &t.content else {
+                    continue;
                 };
-                let cid = r.path.window?;
-                let ci = inner.windows.iter().position(|w| w.id == cid)?;
-                let ti = r.path.tab?;
-                let ct = inner.windows[ci].tabs.get(ti)?;
-                (!matches!(
-                    ct.content,
-                    Content::TaskManager(_) | Content::Settings(_) | Content::Terminal(_)
-                ))
-                .then_some(ResolvedRow::Session {
-                    pwin: wi,
-                    ptab: pi,
-                    cwin: ci,
-                    tab: ti,
-                })
+                if t.tab_uid == r.uid {
+                    return Some(ResolvedRow::Project { win: wi, tab: pi });
+                }
+                for (ci, cw) in inner.windows.iter().enumerate() {
+                    for (ti, ct) in cw.tabs.iter().enumerate() {
+                        if ct.tab_uid == r.uid {
+                            return Some(ResolvedRow::Session {
+                                pwin: wi,
+                                ptab: pi,
+                                cwin: ci,
+                                tab: ti,
+                            });
+                        }
+                    }
+                }
             }
         }
+        None
     }
 
     /// Validate + apply one panel reorder. Returns false (and mutates nothing)
@@ -6241,23 +6209,21 @@ mod tests {
             .map(|t| t.title.as_str())
             .collect();
         assert_eq!(rows, ["b", "a"]); // ranked first, unranked structural after
-        assert_eq!(
-            m.projects[0].identity,
-            crate::panel::RowIdentity::Project(Some("p1".into()))
-        );
+        // The model row carries the project tab's uid as its identity.
+        assert_eq!(m.projects[0].uid, wm.windows[0].tabs[0].tab_uid);
     }
 
     fn row_ref(p: &crate::panel::ProjectEntry) -> crate::panel::PanelRowRef {
         crate::panel::PanelRowRef {
             path: p.path,
-            identity: p.identity.clone(),
+            uid: p.uid,
         }
     }
 
     fn tab_ref(t: &crate::panel::TabEntry) -> crate::panel::PanelRowRef {
         crate::panel::PanelRowRef {
             path: t.path,
-            identity: t.identity.clone(),
+            uid: t.uid,
         }
     }
 
@@ -6327,7 +6293,7 @@ mod tests {
 
     #[test]
     fn reorder_rejects_cross_project_and_mixed_and_stale() {
-        use crate::panel::{PanelReorder, PanelRowRef, Placement, RowIdentity};
+        use crate::panel::{PanelReorder, PanelRowRef, Placement};
         let mut wm = WindowManager::new();
         ranked_proj_win(&mut wm, None, "p1");
         ranked_proj_win(&mut wm, None, "p2");
@@ -6367,11 +6333,11 @@ mod tests {
             placement: Placement::Before,
         };
         assert!(!wm.apply_panel_reorder(&mixed));
-        // Stale identity: reject.
+        // Stale identity (no row with this uid exists): reject.
         let stale = PanelReorder {
             source: PanelRowRef {
                 path: m.projects[0].path,
-                identity: RowIdentity::Project(Some("p99".into())),
+                uid: u64::MAX,
             },
             anchor: row_ref(&m.projects[1]),
             placement: Placement::Before,
@@ -6390,8 +6356,8 @@ mod tests {
     }
 
     #[test]
-    fn reorder_rejects_stale_terminal_and_loose_identities() {
-        use crate::panel::{PanelReorder, PanelRowRef, Placement, RowIdentity};
+    fn reorder_rejects_stale_uid() {
+        use crate::panel::{PanelReorder, PanelRowRef, Placement};
         let mut wm = WindowManager::new();
         ranked_proj_win(&mut wm, None, "p1");
         let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
@@ -6414,33 +6380,18 @@ mod tests {
             prev: None,
         });
         let m = wm.panel_model();
-        let anchor = PanelRowRef {
-            path: m.projects[0].tabs[0].path,
-            identity: m.projects[0].tabs[0].identity.clone(),
-        };
-        // Stale Terminal identity: no session with this term_id exists anywhere.
-        let stale_term = PanelReorder {
+        let anchor = tab_ref(&m.projects[0].tabs[0]);
+        // A uid that exists nowhere (the captured row was closed): reject.
+        let stale = PanelReorder {
             source: PanelRowRef {
                 path: m.projects[0].tabs[0].path,
-                identity: RowIdentity::Terminal(999),
-            },
-            anchor: anchor.clone(),
-            placement: Placement::Before,
-        };
-        assert!(!wm.apply_panel_reorder(&stale_term));
-        // Loose ref whose strict path drifted (wrong child window id): cancels.
-        let mut bad_path = m.projects[0].tabs[0].path;
-        bad_path.window = Some(9999);
-        let stale_loose = PanelReorder {
-            source: PanelRowRef {
-                path: bad_path,
-                identity: RowIdentity::Loose,
+                uid: u64::MAX,
             },
             anchor,
             placement: Placement::Before,
         };
-        assert!(!wm.apply_panel_reorder(&stale_loose));
-        // Nothing mutated by either rejection.
+        assert!(!wm.apply_panel_reorder(&stale));
+        // Nothing mutated by the rejection.
         let after = wm.panel_model();
         assert!(
             after
@@ -6449,6 +6400,81 @@ mod tests {
                 .flat_map(|p| &p.tabs)
                 .all(|t| t.rank.is_none())
         );
+    }
+
+    #[test]
+    fn reorder_follows_row_a_when_same_kind_rows_swap() {
+        use crate::panel::{PanelReorder, Placement};
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "p1");
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        // One window holding two same-kind stub tabs [a, b] — the pair whose
+        // indices swap in the drop frame — plus a separate anchor row c.
+        let id = inner.next;
+        inner.next += 1;
+        inner.z += 1;
+        inner.windows.push(Win {
+            id,
+            tabs: vec![
+                Tab::fixed("a", Content::Project(Box::new(WindowManager::new()))),
+                Tab::fixed("b", Content::Project(Box::new(WindowManager::new()))),
+            ],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+            z: inner.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let id2 = inner.next;
+        inner.next += 1;
+        inner.z += 1;
+        inner.windows.push(Win {
+            id: id2,
+            tabs: vec![Tab::fixed(
+                "c",
+                Content::Project(Box::new(WindowManager::new())),
+            )],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(40.0, 30.0)),
+            z: inner.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let m = wm.panel_model();
+        let rows: Vec<&str> = m.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(rows, ["a", "b", "c"]);
+        let r = PanelReorder {
+            source: tab_ref(&m.projects[0].tabs[0]), // a
+            anchor: tab_ref(&m.projects[0].tabs[2]), // c
+            placement: Placement::After,
+        };
+        // Same-kind index swap between capture and drop: a and b trade places.
+        let Content::Project(inner) = &mut wm.windows[0].tabs[0].content else {
+            unreachable!()
+        };
+        inner.windows[0].tabs.swap(0, 1);
+        // The ref must follow row a (or reject) — never move b, which a stale
+        // index-based resolution would ("a", "c", "b").
+        let applied = wm.apply_panel_reorder(&r);
+        let m = wm.panel_model();
+        let rows: Vec<&str> = m.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        if applied {
+            assert_eq!(rows, ["b", "c", "a"]);
+        } else {
+            assert_eq!(rows, ["b", "a", "c"]); // rejected: nothing moved
+        }
     }
 
     #[test]
