@@ -1264,6 +1264,14 @@ impl PanelView {
                 }
                 Some(RowKind::Image) => paint_image_glyph(&p, icon_c, col),
             }
+            // Full-title tooltip when the chip label was … truncated
+            // (suppressed while a reorder drag is live). The layout job keeps
+            // the untruncated string, so no extra title field is needed.
+            let resp = if chip.galley.elided && self.drag.is_none() {
+                resp.on_hover_text(chip.galley.job.text.clone())
+            } else {
+                resp
+            };
             let tp = egui::pos2(
                 chip_rect.min.x + pad + icon_w + text_gap,
                 cy - chip.galley.size().y / 2.0,
@@ -1589,6 +1597,13 @@ impl PanelView {
         job.wrap = egui::text::TextWrapping::truncate_at_width(avail);
         let galley = p.layout_job(job);
         let text_size = galley.size();
+        // Full-title tooltip when the … truncation kicked in (suppressed
+        // while a reorder drag is live — a popup mid-drag is noise).
+        let resp = if galley.elided && self.drag.is_none() {
+            resp.on_hover_text(rp.title.clone())
+        } else {
+            resp
+        };
         p.galley(
             egui::pos2(text_x, row.center().y - text_size.y / 2.0),
             galley,

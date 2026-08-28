@@ -35,6 +35,10 @@ and the landing site for future agent-state badges.
   order, so new tabs append. A 2px marker (clipped to the panel body) shows
   the drop slot; edge auto-scroll follows the active `ScrollAxis`; collapse
   or an orientation flip cancels the gesture. Collapsed rails don't drag (v1).
+- **Elided titles get a hover tooltip:** rows (expanded modes) and strip chips
+  attach egui's `on_hover_text` with the full title only when the `…`
+  truncation actually kicked in (`Galley::elided`), and never while a reorder
+  drag is live. A fully visible name hovers quietly.
 - **Tabbed projects need `ptab`:** nested managers number child windows
   independently (each starts at 1), so when projects are tabbed a bare
   child-id scan always resolves to the first project tab. `TargetPath.ptab`
