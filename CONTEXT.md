@@ -149,6 +149,16 @@ The Chat viewer's presence panel, showing each Member and how recently it was
 heard from.
 _Avoid_: roster, sidebar, presence list.
 
+**Card**:
+One unit of work-in-flight on a project's board; a file in `.foreman/tasks/`
+owned by the app.
+_Avoid_: task (taken), ticket, issue (GitHub's word).
+
+**Claim**:
+The card↔Session link recorded at dispatch or `start`: terminal id, app run
+nonce, agent, timestamp. Dead claims are derived (orphan), never stored.
+_Avoid_: assignment, lock.
+
 ### Seams & patterns
 
 These name deliberate seams — places where behaviour is isolated behind a small

@@ -23,6 +23,7 @@ mod imageview;
 mod input;
 mod inspect;
 mod job;
+mod kanban;
 mod keymap;
 mod landing;
 mod layout;
