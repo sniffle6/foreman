@@ -481,6 +481,10 @@ pub struct WindowManager {
     /// `tick` no-ops with no members). Shared with the viewer window
     /// (`Content::Chat`), hence the Rc<RefCell<…>>.
     pub chat: Rc<RefCell<crate::chat::ChatRoom>>,
+    /// This project's kanban board store (a harmless dir-less, inert store at
+    /// desktop level — same posture as `chat`). Shared with the board viewer
+    /// window, hence the Rc<RefCell<…>>.
+    pub kanban: Rc<RefCell<crate::kanban::CardStore>>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -563,6 +567,7 @@ impl WindowManager {
             cwd: None,
             tag: None,
             chat: Rc::new(RefCell::new(crate::chat::ChatRoom::new())),
+            kanban: Rc::new(RefCell::new(crate::kanban::CardStore::default())),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -1290,14 +1295,21 @@ impl WindowManager {
                 }
                 let _ = reply.send(Self::open_reply(self.view_dispatch(&req)));
             }
-            // TEMP (Task 2 of the kanban-board plan): Task 3 replaces this
-            // with real dispatch to a per-project CardStore. Keeps the
-            // control-plane/CLI commit standalone-compilable.
-            CtrlMsg::Kanban(_req, reply, sent) => {
+            CtrlMsg::Kanban(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
-                    return;
+                    return; // stale: the client was already told "foreman did not respond"
                 }
-                let _ = reply.send(OpenReply::err("kanban: not wired yet"));
+                // Repaint only on a successful WRITE — an open board reacts
+                // to the app's own change; a `list` read changes nothing.
+                let is_write = req.action != "list";
+                let res = self.kanban_dispatch(&req);
+                if is_write && res.is_ok() {
+                    ctx.request_repaint();
+                }
+                let _ = reply.send(match res {
+                    Ok(r) => r,
+                    Err(e) => OpenReply::err(e),
+                });
             }
         }
     }
@@ -1369,6 +1381,142 @@ impl WindowManager {
                 Ok(ChatOutcome::Posted { seq: Some(seq) })
             }
             _ => Err("chat needs exactly one of text/history".into()),
+        }
+    }
+
+    /// Resolve + execute one `foreman kanban <action>` wire request against
+    /// the target project's `CardStore`. `set_dir` runs once up front (a
+    /// project with no `cwd` errors before any action-specific work) so every
+    /// arm below operates on a store already pointed at `.foreman/tasks`.
+    fn kanban_dispatch(
+        &mut self,
+        req: &crate::control::KanbanRequest,
+    ) -> Result<crate::control::OpenReply, String> {
+        use crate::control::OpenReply;
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let child = self.project_child_mut(pid)?;
+        let cwd = child
+            .cwd
+            .clone()
+            .ok_or("project has no working directory")?;
+        child.kanban.borrow_mut().set_dir(Some(&cwd));
+
+        match req.action.as_str() {
+            "add" => {
+                let title = req.title.as_deref().ok_or("add requires a title")?;
+                let id = child.kanban.borrow_mut().add(title, req.body.as_deref())?;
+                Ok(OpenReply {
+                    ok: true,
+                    id: Some(id),
+                    ..Default::default()
+                })
+            }
+            "list" => {
+                // Files are authoritative: a CLI list must never serve a
+                // stale in-memory copy, even though `set_dir` above may have
+                // already reloaded once for a directory change.
+                child.kanban.borrow_mut().reload();
+                let states = child.term_states();
+                let run = crate::kanban::run_nonce();
+                let filter: Option<crate::kanban::CardState> = match req.state.as_deref() {
+                    None => None,
+                    Some(s) => Some(
+                        serde_json::from_value(serde_json::Value::String(s.to_string()))
+                            .map_err(|_| format!("unknown kanban state filter: {s}"))?,
+                    ),
+                };
+                let store = child.kanban.borrow();
+                let history: Vec<String> = store
+                    .cards()
+                    .iter()
+                    .filter(|c| filter.map(|f| c.state == f).unwrap_or(true))
+                    .map(|c| {
+                        let line = crate::kanban::CardLine {
+                            card: c.clone(),
+                            orphaned: crate::kanban::is_orphaned(c, run, &states),
+                        };
+                        if req.json {
+                            line.json_line()
+                        } else {
+                            line.human_line()
+                        }
+                    })
+                    .collect();
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(history),
+                    ..Default::default()
+                })
+            }
+            "start" => {
+                let from = req
+                    .from
+                    .as_deref()
+                    .ok_or("start requires FOREMAN_TERMINAL_ID (run inside a foreman terminal)")?;
+                let id = req.id.as_deref().ok_or("missing id")?;
+                let states = child.term_states();
+                // A claim by an exited/unknown terminal would be born
+                // orphaned — reject before it ever reaches the store.
+                if states.get(from).copied() != Some(crate::kanban::TermState::Running) {
+                    return Err(format!(
+                        "terminal {from} is not a live terminal in this project"
+                    ));
+                }
+                // The state of the card's EXISTING claim's terminal (not
+                // `from`'s) — `claim_common` needs this to tell a live claim
+                // (reject) from a dead one worth seizing.
+                let existing_term = child
+                    .kanban
+                    .borrow()
+                    .get(id)
+                    .and_then(|c| c.claim.as_ref())
+                    .map(|claim| {
+                        states
+                            .get(&claim.terminal)
+                            .copied()
+                            .unwrap_or(crate::kanban::TermState::Missing)
+                    })
+                    .unwrap_or(crate::kanban::TermState::Missing);
+                child.kanban.borrow_mut().start(
+                    id,
+                    from,
+                    crate::kanban::run_nonce(),
+                    existing_term,
+                )?;
+                Ok(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            "done" => {
+                let id = req.id.as_deref().ok_or("missing id")?;
+                child.kanban.borrow_mut().done(id)?;
+                Ok(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            "block" => {
+                let id = req.id.as_deref().ok_or("missing id")?;
+                // The store re-checks non-empty server-side regardless of
+                // what the client sent — a missing `reason` field is just an
+                // empty string here, same rejection path.
+                let reason = req.reason.as_deref().unwrap_or("");
+                child.kanban.borrow_mut().block(id, reason)?;
+                Ok(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            "rm" => {
+                let id = req.id.as_deref().ok_or("missing id")?;
+                child.kanban.borrow_mut().rm(id)?;
+                Ok(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
+            other => Err(format!("unknown kanban action: {other}")),
         }
     }
 
@@ -2618,6 +2766,69 @@ impl WindowManager {
                 }
             }
         }
+    }
+
+    /// This manager's own terminal tabs' liveness, keyed by chat/kanban member
+    /// id (`term_tag`) — `Running` unless the cached exit latch is set,
+    /// `Exited` once it is; a card whose claimed terminal is absent from the
+    /// map reads as `Missing` by lookup convention (see
+    /// [`crate::kanban::is_orphaned`]). `&self`-safe: it reads only
+    /// `Session::has_exited`'s cached latch, which `chat_tick`'s per-frame
+    /// `exited()` call (run just before `kanban_tick`, see `main.rs`) keeps
+    /// fresh — this never polls the child process itself.
+    fn term_states(&self) -> std::collections::HashMap<String, crate::kanban::TermState> {
+        let mut states = std::collections::HashMap::new();
+        for w in &self.windows {
+            for tab in &w.tabs {
+                if let Content::Terminal(s) = &tab.content {
+                    let state = if s.has_exited() {
+                        crate::kanban::TermState::Exited
+                    } else {
+                        crate::kanban::TermState::Running
+                    };
+                    states.insert(term_tag(s.term_id()), state);
+                }
+            }
+        }
+        states
+    }
+
+    /// Per-frame kanban maintenance (spec: kanban-board Reconciliation).
+    /// Mirrors `chat_tick`'s recursion shape: recurse into every nested
+    /// project first (each board owns its own store), then — only on a
+    /// manager with a `cwd`, i.e. a project, never the desktop — point the
+    /// store at `.foreman/tasks` and recompute the derived orphan set. The
+    /// staleness re-read (`maybe_reload`) only runs when the board view
+    /// stamped `shown_recently` this frame, so a minimized or background
+    /// board costs nothing (the spec's "nothing while hidden") with zero
+    /// window-state plumbing here.
+    pub fn kanban_tick(&mut self) {
+        for w in self.windows.iter_mut() {
+            for tab in w.tabs.iter_mut() {
+                if let Content::Project(child) = &mut tab.content {
+                    child.kanban_tick();
+                }
+            }
+        }
+        let Some(cwd) = self.cwd.clone() else {
+            return; // desktop (or a manager with no project cwd): stay inert
+        };
+        let now = std::time::Instant::now();
+        self.kanban.borrow_mut().set_dir(Some(&cwd));
+        if self.kanban.borrow().shown_recently(now) {
+            self.kanban.borrow_mut().maybe_reload(now);
+        }
+        let states = self.term_states();
+        let run = crate::kanban::run_nonce();
+        let orphans: std::collections::HashSet<String> = self
+            .kanban
+            .borrow()
+            .cards()
+            .iter()
+            .filter(|c| crate::kanban::is_orphaned(c, run, &states))
+            .map(|c| c.id.clone())
+            .collect();
+        self.kanban.borrow_mut().set_orphans(orphans);
     }
 
     /// Last `n` chat lines (the `--history` verb; reading does not join).
@@ -11461,5 +11672,220 @@ mod tests {
             m.windows.iter().any(|w| w.id == 7),
             "and must not close the window"
         );
+    }
+
+    // --- kanban: server dispatch + store wiring ---
+
+    /// Desktop manager with one project tab whose child manager's `cwd` is
+    /// `cwd` — the minimum shape `kanban_dispatch` needs (`resolve_project`
+    /// finds it via focus; `project_child_mut` finds its store).
+    fn kanban_desktop(cwd: PathBuf) -> WindowManager {
+        let mut m = WindowManager::new();
+        let (id, rect) = m.next_slot(egui::vec2(720.0, 480.0));
+        let mut child = WindowManager::new();
+        child.tag = Some(format!("p{id}"));
+        child.cwd = Some(cwd);
+        m.push_win(
+            id,
+            Tab::fixed("proj", Content::Project(Box::new(child))),
+            rect,
+        );
+        m
+    }
+
+    fn kanban_req(action: &str) -> crate::control::KanbanRequest {
+        crate::control::KanbanRequest {
+            cmd: "kanban".into(),
+            action: action.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Pump `m` (via `keepalive`, so every nested project's Sessions advance)
+    /// until the terminal `tid` inside project `pid` has answered its startup
+    /// DSR query — the documented fresh-Session pattern (never sleep-and-hope
+    /// on a bare delay).
+    fn pump_until_ready(m: &mut WindowManager, pid: WinId, tid: WinId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            m.keepalive();
+            let child = m.project_child_mut(pid).unwrap();
+            let w = child.windows.iter().find(|w| w.id == tid).unwrap();
+            if let Content::Terminal(s) = &w.tabs[w.active].content {
+                if s.ready() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal never answered its startup DSR"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn kanban_add_list_roundtrip_reports_backlog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+
+        let mut add = kanban_req("add");
+        add.title = Some("Fix resize flicker".into());
+        let reply = m.kanban_dispatch(&add).unwrap();
+        assert!(reply.ok);
+        let id = reply.id.clone().expect("add reply carries the new id");
+
+        let mut list = kanban_req("list");
+        list.json = true;
+        let reply = m.kanban_dispatch(&list).unwrap();
+        let lines = reply.history.expect("list reply carries history");
+        assert_eq!(lines.len(), 1);
+        let line: crate::kanban::CardLine = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(line.card.id, id);
+        assert_eq!(line.card.state, crate::kanban::CardState::Backlog);
+        assert!(!line.orphaned);
+    }
+
+    #[test]
+    fn kanban_start_records_claim_and_second_start_is_rejected() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (t1, t2) = {
+            let child = m.project_child_mut(pid).unwrap();
+            let t1 = child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap();
+            let t2 = child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap();
+            (t1, t2)
+        };
+        pump_until_ready(&mut m, pid, t1);
+        pump_until_ready(&mut m, pid, t2);
+
+        let mut add = kanban_req("add");
+        add.title = Some("card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        let mut start1 = kanban_req("start");
+        start1.id = Some(id.clone());
+        start1.from = Some(term_tag(t1));
+        assert!(m.kanban_dispatch(&start1).unwrap().ok);
+
+        let mut start2 = kanban_req("start");
+        start2.id = Some(id.clone());
+        start2.from = Some(term_tag(t2));
+        let e = m.kanban_dispatch(&start2).unwrap_err();
+        assert!(e.contains("cannot be claimed"), "{e}");
+    }
+
+    #[test]
+    fn kanban_card_orphans_when_its_terminal_exits_and_start_seizes_it() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (t1, t2) = {
+            let child = m.project_child_mut(pid).unwrap();
+            let t1 = child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap();
+            let t2 = child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap();
+            (t1, t2)
+        };
+
+        let mut add = kanban_req("add");
+        add.title = Some("card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        let mut start = kanban_req("start");
+        start.id = Some(id.clone());
+        start.from = Some(term_tag(t1));
+        assert!(m.kanban_dispatch(&start).unwrap().ok);
+
+        // Kill t1 by injecting a byte (`cmd /c pause` exits on any stdin),
+        // pumping through the DSR window like the chat exit tests.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            m.keepalive();
+            let child = m.project_child_mut(pid).unwrap();
+            let w = child.windows.iter_mut().find(|w| w.id == t1).unwrap();
+            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
+                panic!()
+            };
+            s.inject_input("x");
+            if s.exited().is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "t1 never exited");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        m.kanban_tick();
+
+        let mut list = kanban_req("list");
+        list.json = true;
+        let lines = m.kanban_dispatch(&list).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1);
+        let line: crate::kanban::CardLine = serde_json::from_str(&lines[0]).unwrap();
+        assert!(line.orphaned, "{lines:?}");
+
+        // A second, live terminal seizes the orphaned claim.
+        let mut seize = kanban_req("start");
+        seize.id = Some(id.clone());
+        seize.from = Some(term_tag(t2));
+        assert!(m.kanban_dispatch(&seize).unwrap().ok);
+    }
+
+    #[test]
+    fn kanban_closeout_verbs_enforce_the_table_over_the_wire_path() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let t1 = {
+            let child = m.project_child_mut(pid).unwrap();
+            child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap()
+        };
+        pump_until_ready(&mut m, pid, t1);
+
+        let mut add = kanban_req("add");
+        add.title = Some("card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        // done on a Backlog card: Err (only InProgress -> Done is legal)
+        let mut done = kanban_req("done");
+        done.id = Some(id.clone());
+        let e = m.kanban_dispatch(&done).unwrap_err();
+        assert!(e.contains("not in progress"), "{e}");
+
+        // block with no reason: Err, server-side, regardless of what the
+        // client sent (a missing `reason` field dispatches as "").
+        let mut block = kanban_req("block");
+        block.id = Some(id.clone());
+        let e = m.kanban_dispatch(&block).unwrap_err();
+        assert!(e.contains("reason"), "{e}");
+
+        // start, then done: ok
+        let mut start = kanban_req("start");
+        start.id = Some(id.clone());
+        start.from = Some(term_tag(t1));
+        assert!(m.kanban_dispatch(&start).unwrap().ok);
+        assert!(m.kanban_dispatch(&done).unwrap().ok);
+
+        // rm: ok
+        let mut rm = kanban_req("rm");
+        rm.id = Some(id.clone());
+        assert!(m.kanban_dispatch(&rm).unwrap().ok);
+
+        // done on a now-missing id: Err
+        let e = m.kanban_dispatch(&done).unwrap_err();
+        assert!(e.contains("no such card"), "{e}");
     }
 }

@@ -732,6 +732,7 @@ impl eframe::App for App {
         // keep advancing while the window is away.
         self.desktop.keepalive();
         self.desktop.chat_tick();
+        self.desktop.kanban_tick();
         self.desktop.advance_settles(std::time::Instant::now());
         // Reader/control/title threads wake us immediately. This is the quiet
         // backstop for deferred submits and settles when no new bytes arrive.
@@ -1069,6 +1070,7 @@ impl eframe::App for App {
         // just-spawned member that wasn't ready when a post arrived gets it on
         // this frame).
         self.desktop.chat_tick();
+        self.desktop.kanban_tick();
         // Drive cross-frame `foreman send` settles now that every Session has
         // pumped this frame; pending entries reply when their terminal quiets.
         self.desktop.advance_settles(std::time::Instant::now());
