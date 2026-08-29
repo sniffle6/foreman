@@ -1391,7 +1391,13 @@ fn main() -> eframe::Result {
             // the egui Context and wake the render loop the instant a dispatch
             // arrives, rather than waiting on the idle repaint tick.
             let ctx = cc.egui_ctx.clone();
+            let inst_tx = tx.clone();
+            let inst_ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
+            // Second listener on this instance's own pipe: terminals we spawn
+            // carry FOREMAN_PIPE pointing here, so their CLI calls reach THIS
+            // host even when another foreman also serves the well-known name.
+            std::thread::spawn(move || control::serve(control::instance_pipe(), inst_tx, inst_ctx));
             let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(16);
             let title_ctx = cc.egui_ctx.clone();
             let title_pipe = title_pipe.clone();

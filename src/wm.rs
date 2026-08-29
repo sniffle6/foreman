@@ -1116,6 +1116,13 @@ impl WindowManager {
         if let Ok(exe) = std::env::current_exe() {
             v.push(("FOREMAN_EXE".to_string(), exe.display().to_string()));
         }
+        // This instance's own control pipe, so the CLI inside this terminal
+        // reaches the host that spawned it even when several foremans run
+        // (installed daily driver + a dev build under test side by side).
+        v.push((
+            "FOREMAN_PIPE".to_string(),
+            crate::control::instance_pipe().to_string(),
+        ));
         if let Some(pipe) = crate::title_notify::pipe_name() {
             v.push(("FOREMAN_TITLE_PIPE".to_string(), pipe.to_string()));
         }
@@ -8531,6 +8538,10 @@ mod tests {
         assert_eq!(get("FOREMAN_PROJECT_ID").as_deref(), Some("p3"));
         assert_eq!(get("FOREMAN_TERMINAL_ID").as_deref(), Some("t7"));
         assert!(get("FOREMAN_EXE").is_some());
+        assert_eq!(
+            get("FOREMAN_PIPE").as_deref(),
+            Some(crate::control::instance_pipe())
+        );
 
         // Desktop (untagged) managers must not claim a project id.
         let desktop = WindowManager::new();

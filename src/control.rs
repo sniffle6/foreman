@@ -5,6 +5,36 @@
 /// Pipe name; `GenericNamespaced` maps it to `\\.\pipe\foreman` on Windows.
 pub const PIPE: &str = "foreman";
 
+/// This GUI instance's own control pipe name, served alongside [`PIPE`] and
+/// injected into every terminal as `FOREMAN_PIPE`. With several foremans
+/// running at once (installed daily driver + a dev build under test), the
+/// well-known name routes to whichever instance answers first — an agent
+/// inside the dev build could reach the installed host and get "unknown cmd"
+/// for verbs its own host supports. The instance pipe makes in-foreman
+/// clients bind to the host that spawned them, deterministically. Pid + nonce
+/// for uniqueness among live instances (same recipe as the title pipe).
+pub fn instance_pipe() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("foreman-ctl-{}-{nonce}", std::process::id())
+    })
+}
+
+/// Which pipe a CLI invocation talks to: the host-injected `FOREMAN_PIPE`
+/// inside a foreman terminal, the well-known [`PIPE`] outside one.
+fn client_pipe() -> String {
+    pipe_for(std::env::var("FOREMAN_PIPE").ok())
+}
+
+/// Pure seam for [`client_pipe`]: blank or unset env falls back to [`PIPE`].
+fn pipe_for(env: Option<String>) -> String {
+    env.filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| PIPE.to_string())
+}
+
 /// How long the pipe server waits for the GUI to answer one request. The GUI
 /// drain uses the same constant to drop requests the server has given up on.
 pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1323,7 +1353,7 @@ fn open_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman open", request(PIPE, &req))
+    report("foreman open", request(&client_pipe(), &req))
 }
 
 fn chat_main(args: &[String]) -> i32 {
@@ -1343,7 +1373,7 @@ fn chat_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman chat", request(PIPE, &req))
+    report("foreman chat", request(&client_pipe(), &req))
 }
 
 fn status_main(args: &[String]) -> i32 {
@@ -1358,7 +1388,7 @@ fn status_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman status", request(PIPE, &req))
+    report("foreman status", request(&client_pipe(), &req))
 }
 
 fn close_main(args: &[String]) -> i32 {
@@ -1378,7 +1408,7 @@ fn close_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman close", request(PIPE, &req))
+    report("foreman close", request(&client_pipe(), &req))
 }
 
 fn send_main(args: &[String]) -> i32 {
@@ -1398,7 +1428,7 @@ fn send_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman send", request(PIPE, &req))
+    report("foreman send", request(&client_pipe(), &req))
 }
 
 fn snapshot_main(args: &[String]) -> i32 {
@@ -1417,7 +1447,7 @@ fn snapshot_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman snapshot", request(PIPE, &req))
+    report("foreman snapshot", request(&client_pipe(), &req))
 }
 
 fn view_main(args: &[String]) -> i32 {
@@ -1432,7 +1462,7 @@ fn view_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    report("foreman view", request(PIPE, &req))
+    report("foreman view", request(&client_pipe(), &req))
 }
 
 fn kanban_main(args: &[String]) -> i32 {
@@ -1456,7 +1486,7 @@ fn kanban_main(args: &[String]) -> i32 {
         // `id` rides the JSON ok-reply that `report` already prints; `list`
         // output rides `history` and prints line-per-line.
         KanbanAction::Request(req) => {
-            let res = request(PIPE, &req).map(|mut r| {
+            let res = request(&client_pipe(), &req).map(|mut r| {
                 if let Some(e) = r.error.take() {
                     r.error = Some(kanban_stale_host_hint(e));
                 }
@@ -1506,7 +1536,7 @@ fn kanban_wait(
             json: true,
             ..Default::default()
         };
-        match request(PIPE, &req) {
+        match request(&client_pipe(), &req) {
             // Spec exit-code contract: 2 = timeout or foreman unreachable
             // (deliberately different from other verbs' unreachable=1).
             Err(e) => {
@@ -1633,6 +1663,23 @@ mod tests {
         assert!(!j.contains("\"id\"") && !j.contains("\"title\"") && !j.contains("\"json\""));
         let back: KanbanRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn client_pipe_prefers_injected_name_and_falls_back_when_blank_or_unset() {
+        assert_eq!(
+            pipe_for(Some("foreman-ctl-7-42".into())),
+            "foreman-ctl-7-42"
+        );
+        assert_eq!(pipe_for(None), PIPE);
+        assert_eq!(pipe_for(Some("  ".into())), PIPE);
+    }
+
+    #[test]
+    fn instance_pipe_is_stable_within_the_process_and_never_the_shared_name() {
+        assert!(instance_pipe().starts_with("foreman-ctl-"));
+        assert_eq!(instance_pipe(), instance_pipe());
+        assert_ne!(instance_pipe(), PIPE);
     }
 
     #[test]
