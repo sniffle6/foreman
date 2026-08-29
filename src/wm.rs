@@ -11827,6 +11827,21 @@ mod tests {
 
         m.kanban_tick();
 
+        // Exercise `kanban_tick`'s own derivation directly — recursion into
+        // the nested project, the orphan recompute, and `set_orphans` — via
+        // `orphans()` rather than through `list` below, which recomputes
+        // orphans independently via `is_orphaned` and would pass identically
+        // even if `kanban_tick`'s body were emptied.
+        assert!(
+            m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .orphans()
+                .contains(&id),
+            "kanban_tick must have set_orphans the now-orphaned card"
+        );
+
         let mut list = kanban_req("list");
         list.json = true;
         let lines = m.kanban_dispatch(&list).unwrap().history.unwrap();
@@ -11839,6 +11854,18 @@ mod tests {
         seize.id = Some(id.clone());
         seize.from = Some(term_tag(t2));
         assert!(m.kanban_dispatch(&seize).unwrap().ok);
+    }
+
+    #[test]
+    fn kanban_tick_recurses_into_projects_but_leaves_the_desktop_store_dir_less() {
+        // `kanban_tick`'s recursion visits the nested project (pointing ITS
+        // store at `tmp`) before checking `self.cwd` — the desktop manager
+        // itself has no `cwd`, so its own store must stay untouched and
+        // empty no matter what its children just did.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        m.kanban_tick();
+        assert!(m.kanban.borrow().cards().is_empty());
     }
 
     #[test]
