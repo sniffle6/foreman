@@ -1455,12 +1455,35 @@ fn kanban_main(args: &[String]) -> i32 {
     match action {
         // `id` rides the JSON ok-reply that `report` already prints; `list`
         // output rides `history` and prints line-per-line.
-        KanbanAction::Request(req) => report("foreman kanban", request(PIPE, &req)),
+        KanbanAction::Request(req) => {
+            let res = request(PIPE, &req).map(|mut r| {
+                if let Some(e) = r.error.take() {
+                    r.error = Some(kanban_stale_host_hint(e));
+                }
+                r
+            });
+            report("foreman kanban", res)
+        }
         KanbanAction::Wait {
             project,
             target,
             timeout,
         } => kanban_wait(project, target, timeout),
+    }
+}
+
+/// An out-of-date foreman host answers the kanban verb with its generic
+/// unknown-cmd parse error. The newer client knows what that actually means —
+/// the host process predates the verb (e.g. a dev fleet whose GUI was launched
+/// before a rebuild) — so it says that instead of letting the operator chase a
+/// phantom CLI bug. Client-side only: old hosts cannot be taught new errors.
+fn kanban_stale_host_hint(err: String) -> String {
+    if err.starts_with("unknown cmd") {
+        format!(
+            "{err} — the running foreman predates the kanban verb; restart it on the current build"
+        )
+    } else {
+        err
     }
 }
 
@@ -1491,7 +1514,10 @@ fn kanban_wait(
                 return 2;
             }
             Ok(r) if !r.ok => {
-                eprintln!("foreman kanban wait: {}", r.error.unwrap_or_default());
+                eprintln!(
+                    "foreman kanban wait: {}",
+                    kanban_stale_host_hint(r.error.unwrap_or_default())
+                );
                 return 1;
             }
             Ok(r) => {
@@ -1607,6 +1633,18 @@ mod tests {
         assert!(!j.contains("\"id\"") && !j.contains("\"title\"") && !j.contains("\"json\""));
         let back: KanbanRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn stale_host_unknown_cmd_error_gains_a_restart_hint_others_pass_through() {
+        let hinted = kanban_stale_host_hint("unknown cmd: kanban".into());
+        assert!(hinted.starts_with("unknown cmd: kanban"));
+        assert!(hinted.contains("restart it on the current build"));
+        // Any other server error is real and not ours to editorialize.
+        assert_eq!(
+            kanban_stale_host_hint("no such card: x".into()),
+            "no such card: x"
+        );
     }
 
     #[test]
