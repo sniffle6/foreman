@@ -125,12 +125,20 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
 - `src/terminal_titles.rs` — Title lane domain state, transcript-prefix context,
   provider command adapters, one bounded worker, process deadlines, and
   untrusted-output validation. It knows nothing about window layout.
+- `src/board.rs` — `Content::Board`: the per-project kanban board view (four
+  fixed columns, quick-add, dispatch picker). Read seam is a per-frame store
+  snapshot; writes drain as `BoardAct` intents via `drain_board_acts` in wm.rs.
+  See `docs/kanban-board.md`.
 - `src/chat.rs` — per-project chat room model (append-only log, pure data).
   Posts are injected into member terminals' PTYs as typed input (push, not
   poll). Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
 - `src/dirpicker.rs` — keyboard-driven project directory picker.
 - `src/imageview.rs` — `Content::Image`: `foreman view <path.png>` opens a
   persistent PNG viewer (fit/zoom/pan, no PTY). See `docs/image-viewer.md`.
+- `src/kanban.rs` — pure card domain for the per-project board: file-per-card
+  store under `.foreman/tasks/`, single-writer transitions, derived orphan
+  detection (`is_orphaned`), dispatch prompt template, wait verdicts. GUI-free.
+  See `docs/kanban-board.md`.
 - `src/keymap.rs` — data-driven leader-key bindings. Defaults in
   `Keymap::default`; `%APPDATA%\foreman\keybindings.json` merges *over* them so
   new commands always get a default chord. Leader is `Ctrl+B`.
@@ -141,7 +149,7 @@ Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fin
   See `docs/settings-menu.md`.
 - `src/theme.rs` — every color token as consts, glob-imported by consumers.
 - `src/skills_install.rs` — embeds and best-effort installs the
-  `foreman-dispatch`/`foreman-chat`/`foreman-icat` skills into Claude and Codex
+  `foreman-dispatch`/`foreman-chat`/`foreman-icat`/`foreman-kanban` skills into Claude and Codex
   global skill dirs at GUI startup. Claude sources live in `.claude/skills/`;
   Codex sources live in `.codex/skills/`. Keep the paired copies semantically
   synced, then rebuild to propagate.

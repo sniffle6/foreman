@@ -91,7 +91,8 @@ adding a new file.
 
 ## Paired skill copies
 
-`foreman-dispatch`, `foreman-chat`, and `foreman-icat` exist in BOTH
+`foreman-dispatch`, `foreman-chat`, `foreman-icat`, and `foreman-kanban` exist
+in BOTH
 `.claude/skills/` and `.codex/skills/`, because `src/skills_install.rs` embeds
 them and installs them into the Claude and Codex global skill dirs at startup so
 agents in any repo can find them. When you change dispatch or chat behavior:
