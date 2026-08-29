@@ -44,6 +44,20 @@ fn column_title(state: crate::kanban::CardState) -> &'static str {
     }
 }
 
+/// Pointer-in-sub-rect gate for a nested region (a column body, a card).
+/// `over` must be `resp.hovered() || resp.contains_pointer()`, never
+/// `hovered()` alone: same-layer children registered later in the same draw
+/// (a card's own buttons, its jump rect, its title-hover rect) win
+/// `hovered()` away from the containing response the moment the pointer sits
+/// over them, which made the hover-action row and the column's wheel gate
+/// flicker and drop input the instant the mouse reached what it was trying
+/// to click — `contains_pointer()` doesn't get defeated by same-layer
+/// children (see the identical fix and rationale in `panel.rs`). Extracted
+/// so the gate itself is unit-testable without a live egui frame.
+fn gated_by_pointer(over: bool, pointer: Option<egui::Pos2>, sub_rect: egui::Rect) -> bool {
+    over && pointer.is_some_and(|p| sub_rect.contains(p))
+}
+
 /// One user intent recorded during the draw; drained by the window manager
 /// after `apply_acts` (content cannot mutate the manager mid-loop).
 pub enum BoardAct {
@@ -114,6 +128,13 @@ impl BoardView {
         let col_w = rect.width() / COLUMNS.len() as f32;
         let mut picker_click_consumed = false;
 
+        // Raw pointer position (not `resp.hover_pos()`, which is gated on
+        // `resp.hovered()` and so goes `None` the instant a nested widget
+        // wins hover away from `resp` — see `gated_by_pointer`) plus whether
+        // the pointer genuinely belongs to this window at all this frame.
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let over = resp.hovered() || resp.contains_pointer();
+
         for (i, &state) in COLUMNS.iter().enumerate() {
             let col_rect = egui::Rect::from_min_size(
                 egui::pos2(rect.min.x + col_w * i as f32, rect.min.y),
@@ -133,7 +154,8 @@ impl BoardView {
                 state,
                 &cards,
                 &orphans,
-                resp,
+                pointer,
+                over,
                 base,
                 &th,
                 &mut picker_click_consumed,
@@ -158,7 +180,8 @@ impl BoardView {
         state: crate::kanban::CardState,
         cards: &[crate::kanban::Card],
         orphans: &std::collections::HashSet<String>,
-        resp: &egui::Response,
+        pointer: Option<egui::Pos2>,
+        over: bool,
         base: egui::Id,
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
@@ -211,9 +234,7 @@ impl BoardView {
 
         let content_h = matching.len() as f32 * (CARD_H + CARD_GAP);
         let max_scroll = (content_h - body_rect.height()).max(0.0);
-        let pointer = resp.hover_pos();
-        let hovering_body = pointer.is_some_and(|pp| body_rect.contains(pp));
-        let wheel = if resp.hovered() && hovering_body {
+        let wheel = if gated_by_pointer(over, pointer, body_rect) {
             ui.input(|i| i.smooth_scroll_delta.y)
         } else {
             0.0
@@ -238,7 +259,7 @@ impl BoardView {
                     card,
                     orphans.contains(&card.id),
                     pointer,
-                    resp,
+                    over,
                     base,
                     th,
                     picker_click_consumed,
@@ -258,13 +279,13 @@ impl BoardView {
         card: &crate::kanban::Card,
         orphaned: bool,
         pointer: Option<egui::Pos2>,
-        resp: &egui::Response,
+        over: bool,
         base: egui::Id,
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
     ) {
-        let hovered = resp.hovered()
-            && pointer.is_some_and(|pp| card_rect.contains(pp) && body_rect.contains(pp));
+        let hovered = gated_by_pointer(over, pointer, card_rect)
+            && pointer.is_some_and(|pp| body_rect.contains(pp));
         let is_picked = self.picker.as_deref() == Some(card.id.as_str());
 
         if hovered || is_picked {
@@ -405,7 +426,15 @@ impl BoardView {
             if btn_resp.clicked() {
                 match act {
                     Some(a) => self.acts.push(a),
-                    None => self.picker = Some(card.id.clone()),
+                    None => {
+                        // Opening the picker is itself a click this frame:
+                        // `show`'s end-of-frame dismiss check also sees
+                        // `any_click() == true` this same frame and would
+                        // otherwise immediately clear what we just set —
+                        // consume it here exactly like an agent pick does.
+                        self.picker = Some(card.id.clone());
+                        *picker_click_consumed = true;
+                    }
                 }
             }
             bx -= BTN_W + BTN_GAP;
@@ -456,5 +485,167 @@ impl BoardView {
             }
             bx -= BTN_W + BTN_GAP;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn store_at(dir: &std::path::Path) -> Rc<RefCell<crate::kanban::CardStore>> {
+        let mut s = crate::kanban::CardStore::default();
+        s.set_dir(Some(dir));
+        Rc::new(RefCell::new(s))
+    }
+
+    #[test]
+    fn gated_by_pointer_requires_over_window_and_containment() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let inside = egui::pos2(50.0, 50.0);
+        let outside = egui::pos2(500.0, 500.0);
+
+        assert!(gated_by_pointer(true, Some(inside), rect));
+        // `over` (hovered() || contains_pointer()) must be required even
+        // when the raw pointer position is inside the rect — a same-layer
+        // child widget can be topmost there without the pointer having left
+        // the window at all, but if `over` is false the pointer belongs to
+        // a DIFFERENT window entirely (occluded), and the gate must not fire.
+        assert!(!gated_by_pointer(false, Some(inside), rect));
+        assert!(!gated_by_pointer(true, Some(outside), rect));
+        assert!(!gated_by_pointer(true, None, rect));
+    }
+
+    // Replicates `show_card`'s button-row layout for the sole card in an
+    // empty Backlog column, so the click-survival test below can land a real
+    // pointer click on the "Go" button without reaching into private layout
+    // internals from outside a `show()` call. Kept in lock-step with
+    // `show_card`'s button loop: Backlog + not-orphaned => `[Go, Del]`, Del
+    // rightmost.
+    fn go_button_center(rect: egui::Rect) -> egui::Pos2 {
+        let col_w = rect.width() / COLUMNS.len() as f32; // Backlog is column 0
+        let card_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + PAD, rect.min.y + HEADER_H + QUICK_ADD_H),
+            egui::vec2(col_w - PAD * 2.0, CARD_H),
+        );
+        let del_min_x = card_rect.max.x - PAD - BTN_W;
+        let go_max_x = del_min_x - BTN_GAP;
+        let go_min_x = go_max_x - BTN_W;
+        let btn_y = card_rect.max.y - BTN_H - 4.0;
+        egui::pos2((go_min_x + go_max_x) / 2.0, btn_y + BTN_H / 2.0)
+    }
+
+    // Anywhere on the same card's body, away from the button row — where the
+    // pointer starts before it moves onto the Go button.
+    fn card_body_pos(rect: egui::Rect) -> egui::Pos2 {
+        egui::pos2(
+            rect.min.x + PAD + 4.0,
+            rect.min.y + HEADER_H + QUICK_ADD_H + 6.0,
+        )
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        board: &mut BoardView,
+        rect: egui::Rect,
+        base: egui::Id,
+        events: Vec<egui::Event>,
+    ) {
+        let mut input = egui::RawInput::default();
+        input.events = events;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Sense::click(), matching the real `content_rect` response a
+                // project-hosted `Content::Board` is actually painted with in
+                // wm.rs (project content senses clicks only, not drags).
+                let resp =
+                    ui.interact(rect, egui::Id::new("test-board-resp"), egui::Sense::click());
+                board.show(ui, rect, true, &resp, base);
+            });
+        });
+    }
+
+    fn moved(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerMoved(pos)
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// Drives a real click through egui frame-by-frame — pointer settles on
+    /// the card (registering the hover action row for the first time), then
+    /// moves onto the Go button and clicks it. Pins both Criticals from the
+    /// review: (1) the picker must survive the SAME frame it opened on, not
+    /// get wiped by the end-of-frame "clicking elsewhere" dismiss check that
+    /// also sees this frame's click; (2) the Go button must still be
+    /// clickable at all once the pointer sits exactly over it — a bare
+    /// `resp.hovered()` gate would already have gone false by then (the
+    /// button, registered last frame at that spot, wins hover away from the
+    /// containing response), so the hover row would never repaint there and
+    /// the click would land on nothing.
+    #[test]
+    fn dispatch_picker_survives_the_frame_it_opened_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store.borrow_mut().add("card", None).unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 400.0));
+        let base = egui::Id::new("test-board");
+        let ctx = egui::Context::default();
+        let card_pos = card_body_pos(rect);
+        let go_pos = go_button_center(rect);
+
+        // Frame 0: warm-up. egui's hover/contains_pointer hit-testing for a
+        // widget is resolved against the PRIOR frame's finalized paint order
+        // (there is none yet on a brand-new Context), so every response
+        // reads `hovered() == false`, `contains_pointer() == false` on the
+        // very first frame no matter where the pointer is. One throwaway
+        // frame establishes that order for frame 1 onward.
+        run_frame(&ctx, &mut board, rect, base, vec![moved(card_pos)]);
+
+        // Frame 1: pointer settles on the card body — this is what makes the
+        // hover action row (including Go) exist at its fixed spot at all.
+        run_frame(&ctx, &mut board, rect, base, vec![moved(card_pos)]);
+
+        // Frame 2: pointer moves onto the Go button and presses down.
+        run_frame(
+            &ctx,
+            &mut board,
+            rect,
+            base,
+            vec![moved(go_pos), button(go_pos, true)],
+        );
+
+        // Frame 3: release over the same spot — "the open click's frame":
+        // `any_click()` is true here, and this is exactly the frame the
+        // dismiss-check bug fired the picker closed in.
+        run_frame(
+            &ctx,
+            &mut board,
+            rect,
+            base,
+            vec![moved(go_pos), button(go_pos, false)],
+        );
+        assert_eq!(
+            board.picker.as_deref(),
+            Some(id.as_str()),
+            "the Go click must open the picker and survive its own frame's dismiss check"
+        );
+
+        // Frame 4: no new click — the picker must still be showing.
+        run_frame(&ctx, &mut board, rect, base, vec![moved(go_pos)]);
+        assert_eq!(
+            board.picker.as_deref(),
+            Some(id.as_str()),
+            "the picker must survive into the next frame too"
+        );
     }
 }
