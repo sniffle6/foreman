@@ -122,6 +122,10 @@ const CODEX_CHAT_OPENAI: &str = include_str!("../.codex/skills/foreman-chat/agen
 const ICAT_SKILL: &str = include_str!("../.claude/skills/foreman-icat/SKILL.md");
 const CODEX_ICAT_SKILL: &str = include_str!("../.codex/skills/foreman-icat/SKILL.md");
 const CODEX_ICAT_OPENAI: &str = include_str!("../.codex/skills/foreman-icat/agents/openai.yaml");
+const KANBAN_SKILL: &str = include_str!("../.claude/skills/foreman-kanban/SKILL.md");
+const CODEX_KANBAN_SKILL: &str = include_str!("../.codex/skills/foreman-kanban/SKILL.md");
+const CODEX_KANBAN_OPENAI: &str =
+    include_str!("../.codex/skills/foreman-kanban/agents/openai.yaml");
 
 #[derive(Clone, Copy)]
 struct SkillBundle {
@@ -148,6 +152,11 @@ const CLAUDE_SKILLS: &[SkillBundle] = &[
         skill_md: ICAT_SKILL,
         openai_yaml: None,
     },
+    SkillBundle {
+        name: "foreman-kanban",
+        skill_md: KANBAN_SKILL,
+        openai_yaml: None,
+    },
 ];
 
 /// Codex installs also include UI metadata under `agents/openai.yaml`.
@@ -166,6 +175,11 @@ const CODEX_SKILLS: &[SkillBundle] = &[
         name: "foreman-icat",
         skill_md: CODEX_ICAT_SKILL,
         openai_yaml: Some(CODEX_ICAT_OPENAI),
+    },
+    SkillBundle {
+        name: "foreman-kanban",
+        skill_md: CODEX_KANBAN_SKILL,
+        openai_yaml: Some(CODEX_KANBAN_OPENAI),
     },
 ];
 
@@ -388,11 +402,17 @@ mod tests {
         let first = install_into(&dir, CLAUDE_SKILLS, OBSOLETE_SKILLS).unwrap();
         assert_eq!(
             first.written,
-            vec!["foreman-dispatch", "foreman-chat", "foreman-icat"]
+            vec![
+                "foreman-dispatch",
+                "foreman-chat",
+                "foreman-icat",
+                "foreman-kanban"
+            ]
         );
         assert!(dir.join("foreman-dispatch").join("SKILL.md").exists());
         assert!(dir.join("foreman-chat").join("SKILL.md").exists());
         assert!(dir.join("foreman-icat").join("SKILL.md").exists());
+        assert!(dir.join("foreman-kanban").join("SKILL.md").exists());
         // second run: nothing changes
         let second = install_into(&dir, CLAUDE_SKILLS, OBSOLETE_SKILLS).unwrap();
         assert!(
@@ -408,7 +428,12 @@ mod tests {
         let first = install_into(&dir, CODEX_SKILLS, OBSOLETE_SKILLS).unwrap();
         assert_eq!(
             first.written,
-            vec!["foreman-dispatch", "foreman-chat", "foreman-icat"]
+            vec![
+                "foreman-dispatch",
+                "foreman-chat",
+                "foreman-icat",
+                "foreman-kanban"
+            ]
         );
         let yaml = dir
             .join("foreman-dispatch")

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Foreman Kanban"
+  short_description: "Coordinate Foreman agents through the kanban board"
+  default_prompt: "Use $foreman-kanban to pick up, close out, or create cards on the Foreman project's kanban board."
