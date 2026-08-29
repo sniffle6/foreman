@@ -44,6 +44,15 @@ not the last word on syntax.
   blocked/orphaned/removed (needs a human), `2` timeout or foreman
   unreachable.
 
+## Fast path: one command, trust the exit code
+
+Creating a card is a single `add` call. Do not research the repo to compose
+a body — write the pointer you already have, or go title-only and move on.
+Exit code `0` means the card exists; no follow-up `list` to verify. The
+ok-reply JSON on stdout carries the new card's `id` — capture it if you
+will `wait` on the card later; if your harness ate stdout, `list --json`
+recovers it.
+
 ## Close-out discipline
 
 A card you claimed with `start` ends with `done` or `block --reason "..."` —
