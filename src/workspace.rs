@@ -106,6 +106,11 @@ pub enum ContentSnap {
         shell: String,
     },
     Chat,
+    /// Per-project kanban board (`Content::Board`). Unit variant — the store
+    /// lives at `.foreman/tasks`, not in the snapshot; restore rebuilds the
+    /// view against the project's own `CardStore`. Old workspace files simply
+    /// lack this variant — no migration.
+    Board,
     Project {
         child: ManagerSnap,
     },

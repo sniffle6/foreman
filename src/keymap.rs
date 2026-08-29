@@ -35,6 +35,8 @@ pub enum Command {
     TabPrev,
     /// Open (or focus) the focused project's chat viewer window.
     OpenChat,
+    /// Open (or focus) the focused project's kanban board window.
+    OpenBoard,
     /// Toggle the focused terminal between tiled (in the layout tree) and floating.
     TermFloat,
     // project (outer) level
@@ -97,6 +99,7 @@ impl Command {
             TabCycle,
             TabPrev,
             OpenChat,
+            OpenBoard,
             TermFloat,
             // Actions
             Help,
@@ -112,7 +115,7 @@ impl Command {
             ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject
             | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
-            | LastTerm | TabCycle | TabPrev | OpenChat | TermFloat => Group::Terminals,
+            | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | TermFloat => Group::Terminals,
             Help | OpenSettings | ToggleTaskManager => Group::Actions,
         }
     }
@@ -165,6 +168,7 @@ impl Command {
             TabCycle => "Next tab / last terminal",
             TabPrev => "Previous tab",
             OpenChat => "Open project chat",
+            OpenBoard => "Open project board",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
             ToggleTaskManager => "Toggle task panel",
@@ -510,6 +514,9 @@ impl Default for Keymap {
         // --- project chat viewer (agent-group-chat §4) ---
         t.insert(plain(K::G), OpenChat);
 
+        // --- project kanban board (kanban-board spec) ---
+        t.insert(plain(K::K), OpenBoard);
+
         // --- float toggle: tiled ⇄ floating ---
         t.insert(plain(K::F), TermFloat);
         t.insert(ctrl(K::F), ProjFloat);
@@ -748,11 +755,16 @@ mod tests {
             km.resolve(Chord::new(K::Questionmark, false, false, false)),
             Some(Command::Help)
         );
-        // vi keys are no longer bound by default (dropped in the §2 rebind).
+        // vi keys are no longer bound by default (dropped in the §2 rebind);
+        // plain K was later reclaimed by OpenBoard (kanban-board spec) — the
+        // merge contract gives old keybindings.json files this default too.
         assert_eq!(km.resolve(Chord::new(K::H, false, false, false)), None);
         assert_eq!(km.resolve(Chord::new(K::J, false, false, false)), None);
-        assert_eq!(km.resolve(Chord::new(K::K, false, false, false)), None);
         assert_eq!(km.resolve(Chord::new(K::L, false, false, false)), None);
+        assert_eq!(
+            km.resolve(Chord::new(K::K, false, false, false)),
+            Some(Command::OpenBoard)
+        );
     }
 
     #[test]

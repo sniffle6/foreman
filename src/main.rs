@@ -5,6 +5,7 @@
 
 mod agent_hooks;
 mod appearance;
+mod board;
 mod caret;
 mod chat;
 mod chat_view;

@@ -159,6 +159,12 @@ The card↔Session link recorded at dispatch or `start`: terminal id, app run
 nonce, agent, timestamp. Dead claims are derived (orphan), never stored.
 _Avoid_: assignment, lock.
 
+**Board**:
+The per-project kanban surface (a window content variant) — shows Cards in
+four fixed columns (Backlog / In Progress / Blocked / Done) and dispatches a
+Worker straight from a Card.
+_Avoid_: kanban window, task board, panel (taken).
+
 ### Seams & patterns
 
 These name deliberate seams — places where behaviour is isolated behind a small

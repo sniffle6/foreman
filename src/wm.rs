@@ -136,6 +136,10 @@ pub enum Content {
     /// view state; shares the log via Rc — a viewer, not a member: never
     /// injected into (spec §4).
     Chat(crate::chat::ChatView),
+    /// Per-project kanban board (spec: kanban-board). Carries per-window view
+    /// state; shares the project's `CardStore` via `Rc` — no PTY, no
+    /// membership, same shape as `Chat`.
+    Board(crate::board::BoardView),
     /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
     /// Floating/closable/tabbable/tileable like any normal window; restored
     /// across restarts by path only (see `ContentSnap::Image`).
@@ -178,6 +182,10 @@ impl Content {
                 // Paint lives in chat_view.rs; click/pending_post drained after
                 // apply_acts (see ChatView::show docs).
                 view.show(ui, rect, active, resp, base.with((win_id, "chat-input")));
+                false
+            }
+            Content::Board(view) => {
+                view.show(ui, rect, active, resp, base.with((win_id, "board")));
                 false
             }
             Content::Image(view) => {
@@ -227,6 +235,7 @@ impl Content {
             Content::Terminal(s) => s.keepalive(),
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
+            Content::Board(_) => {} // no PTY; the store is shared state, nothing to pump
             Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
         }
@@ -239,6 +248,7 @@ impl Content {
             Content::Terminal(s) => Some(s.icon_kind()),
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
+            Content::Board(_) => None,
             Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
@@ -640,6 +650,7 @@ impl WindowManager {
                         shell: shell_to_str(s.shell).into(),
                     },
                     Content::Chat(_) => ContentSnap::Chat,
+                    Content::Board(_) => ContentSnap::Board,
                     Content::Image(view) => ContentSnap::Image {
                         path: view.path.clone(),
                     },
@@ -825,6 +836,9 @@ impl WindowManager {
                     }
                     ContentSnap::Chat => {
                         Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat)))
+                    }
+                    ContentSnap::Board => {
+                        Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban)))
                     }
                     ContentSnap::Image { path } => {
                         Content::Image(crate::imageview::ImageView::load(path.clone()))
@@ -1947,6 +1961,36 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// Open (or focus) this project's kanban board — singleton per project,
+    /// same shape as `open_chat_window`. No PTY, no membership; the store is
+    /// shared state, so closing the window doesn't touch it.
+    fn open_board_window(&mut self) {
+        if let Some((win, tab)) = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::Board(_)))
+                .map(|i| (w.id, i))
+        }) {
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                ptab: None,
+                window: None,
+                tab: Some(tab),
+            });
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(520.0, 380.0));
+        self.push_win(
+            id,
+            Tab::fixed(
+                "board",
+                Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban))),
+            ),
+            rect,
+        );
+        self.mark_workspace_dirty();
+    }
+
     /// Apply crew-board clicks recorded during the draw (content cannot
     /// mutate sibling windows mid-loop). The recorded value is a member id
     /// (`tN`); re-resolve the live terminal holding it and focus its window +
@@ -1989,6 +2033,126 @@ impl WindowManager {
             });
         }
         // else: no live terminal for that id (human seat, or closed) — no-op.
+    }
+
+    /// Apply board-view intents recorded during the draw (content cannot
+    /// mutate the manager mid-loop — same discipline as `drain_chat_clicks`).
+    /// Runs in THIS manager — the project level, where the store and
+    /// terminals live. Reached for nested projects the same way
+    /// `drain_chat_clicks` is: every manager's own `show()` calls its own
+    /// `drain_board_acts`, and `show` recurses into `Content::Project`.
+    fn drain_board_acts(&mut self, ctx: &egui::Context) {
+        let mut acts = Vec::new();
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Board(v) = &mut t.content {
+                    acts.append(&mut v.acts);
+                }
+            }
+        }
+        for act in acts {
+            match act {
+                crate::board::BoardAct::QuickAdd(title) => {
+                    if let Err(e) = self.kanban.borrow_mut().add(&title, None) {
+                        eprintln!("board: quick-add failed: {e}");
+                    }
+                }
+                crate::board::BoardAct::Done(id) => {
+                    if let Err(e) = self.kanban.borrow_mut().done(&id) {
+                        eprintln!("board: done failed for {id}: {e}");
+                    }
+                }
+                crate::board::BoardAct::Release(id) => {
+                    if let Err(e) = self.kanban.borrow_mut().release(&id) {
+                        eprintln!("board: release failed for {id}: {e}");
+                    }
+                }
+                crate::board::BoardAct::Rm(id) => {
+                    if let Err(e) = self.kanban.borrow_mut().rm(&id) {
+                        eprintln!("board: rm failed for {id}: {e}");
+                    }
+                }
+                crate::board::BoardAct::JumpTo(tag) => {
+                    // Re-resolve the live terminal from the tag (same
+                    // staleness family as `drain_chat_clicks`'s member click).
+                    let mut hit = None;
+                    for w in &self.windows {
+                        for (i, t) in w.tabs.iter().enumerate() {
+                            if let Content::Terminal(s) = &t.content
+                                && term_tag(s.term_id()) == tag
+                            {
+                                hit = Some((w.id, i));
+                                break;
+                            }
+                        }
+                        if hit.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some((win, tab)) = hit {
+                        self.surface_target(crate::panel::TargetPath {
+                            project: win,
+                            ptab: None,
+                            window: None,
+                            tab: Some(tab),
+                        });
+                    }
+                }
+                crate::board::BoardAct::Dispatch { id, agent } => {
+                    let Some(card) = self.kanban.borrow().get(&id).cloned() else {
+                        eprintln!("board: dispatch on missing card {id}");
+                        continue;
+                    };
+                    let prompt =
+                        crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
+                    match self.add_terminal_cmd(
+                        &[agent.clone(), prompt],
+                        None,
+                        Some(&card.title),
+                        ctx,
+                    ) {
+                        Ok(tid) => {
+                            // The claim transition cares about the STATE OF
+                            // THE CARD'S EXISTING CLAIM (to decide whether a
+                            // live InProgress claim may be seized), not the
+                            // just-spawned terminal — same lookup as
+                            // `is_orphaned`.
+                            let states = self.term_states();
+                            let existing_term = card
+                                .claim
+                                .as_ref()
+                                .and_then(|c| states.get(&c.terminal).copied())
+                                .unwrap_or(crate::kanban::TermState::Missing);
+                            let run = crate::kanban::run_nonce();
+                            // Bind the result before matching on it: an
+                            // `if let` on the `borrow_mut()` call directly
+                            // would extend the `RefMut` temporary's lifetime
+                            // over the whole `if` body, which then can't
+                            // borrow `self` mutably for the undo path below.
+                            let claimed = self.kanban.borrow_mut().claim_for_dispatch(
+                                &id,
+                                &term_tag(tid),
+                                &agent,
+                                run,
+                                existing_term,
+                            );
+                            if let Err(e) = claimed {
+                                eprintln!("board: dispatch claim failed for {id}: {e}");
+                                // Open-undo: the card was closed out (or
+                                // re-claimed) mid-frame — close the terminal
+                                // we just spawned rather than leave an
+                                // unclaimed dispatch running.
+                                if let Some((win, tab)) = self.terminal_location(tid) {
+                                    self.close_tab(win, tab);
+                                    self.mark_workspace_dirty();
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("board: dispatch spawn failed for {id}: {e}"),
+                    }
+                }
+            }
+        }
     }
 
     /// Apply a settings-window lifecycle outcome recorded during the draw
@@ -2180,7 +2344,9 @@ impl WindowManager {
                     for (ti, t) in cw.tabs.iter().enumerate() {
                         let kind = match &t.content {
                             Content::Terminal(s) => RowKind::Terminal(s.icon_kind()),
-                            Content::Chat(_) => RowKind::Chat,
+                            // A board row surfaces like any auxiliary tab; a
+                            // dedicated row kind is out of scope for v1.
+                            Content::Chat(_) | Content::Board(_) => RowKind::Chat,
                             // Nested project content is not a product path today; tests
                             // use empty Project stubs as PTY-free tab stand-ins.
                             Content::Project(_) => {
@@ -2733,6 +2899,7 @@ impl WindowManager {
                         exited: s.exited().is_some(),
                     }),
                     Content::Chat(_)
+                    | Content::Board(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {} // not members
@@ -3047,6 +3214,7 @@ impl WindowManager {
                         Command::TabCycle => child.cycle_tab(true),
                         Command::TabPrev => child.cycle_tab(false),
                         Command::OpenChat => child.open_chat_window(),
+                        Command::OpenBoard => child.open_board_window(),
                         // project-level handled above
                         _ => {}
                     }
@@ -3929,6 +4097,7 @@ impl WindowManager {
                     }
                     Content::Project(wm) => wm.refresh_exit_titles(),
                     Content::Chat(_)
+                    | Content::Board(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {} // no process
@@ -3958,6 +4127,7 @@ impl WindowManager {
                     }
                     Content::Project(wm) => wm.refresh_auto_titles(),
                     Content::Chat(_)
+                    | Content::Board(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {}
@@ -5290,6 +5460,7 @@ impl WindowManager {
         // the fixed order that lets the member, not the viewer, end up focused.
         self.drain_chat_clicks();
         self.drain_chat_posts();
+        self.drain_board_acts(&ctx);
         if self.drain_settings() {
             self.swallow_input(ui);
         }
@@ -6249,9 +6420,11 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
             }
         }
         Content::Project(wm) => wm.terminal_groups(),
-        Content::Chat(_) | Content::Image(_) | Content::TaskManager(_) | Content::Settings(_) => {
-            Vec::new()
-        }
+        Content::Chat(_)
+        | Content::Board(_)
+        | Content::Image(_)
+        | Content::TaskManager(_)
+        | Content::Settings(_) => Vec::new(),
     }
 }
 
@@ -6856,6 +7029,34 @@ mod tests {
     }
 
     #[test]
+    fn capture_records_board_tab() {
+        let mut m = WindowManager::new();
+        m.cwd = Some(std::path::PathBuf::from(r"C:\p"));
+        let id = m.next;
+        m.next += 1;
+        m.z += 1;
+        m.windows.push(Win {
+            id,
+            tabs: vec![Tab::fixed(
+                "board",
+                Content::Board(crate::board::BoardView::new(std::rc::Rc::clone(&m.kanban))),
+            )],
+            active: 0,
+            rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
+            z: m.z,
+            minimized: false,
+            min_from_tree: false,
+            prev: None,
+        });
+        let snap = crate::workspace::capture_manager(&m);
+        assert!(matches!(
+            snap.windows[0].tabs[0].content,
+            crate::workspace::ContentSnap::Board
+        ));
+        assert_eq!(snap.windows[0].id, id);
+    }
+
+    #[test]
     fn capture_workspace_excludes_settings() {
         let mut m = WindowManager::new();
         let id = m.next;
@@ -6978,6 +7179,103 @@ mod tests {
         }
         // Apply must not pollute the recents open-drain.
         assert!(d.take_opened().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_restores_a_board_tab_sharing_the_projects_own_store() {
+        use crate::workspace::{
+            ContentSnap, ManagerSnap, NodeSnap, RectSnap, TabSnap, WORKSPACE_VERSION, WinSnap,
+            WorkspaceSnapshot,
+        };
+        let dir = std::env::temp_dir().join(format!("foreman-ws-board-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ctx = egui::Context::default();
+        let snap = WorkspaceSnapshot {
+            version: WORKSPACE_VERSION,
+            desktop: ManagerSnap {
+                cwd: None,
+                focused: None,
+                last_focused: None,
+                zoomed: None,
+                windows: vec![WinSnap {
+                    id: 1,
+                    active: 0,
+                    tabs: vec![TabSnap {
+                        title: "proj".into(),
+                        managed_title: false,
+                        panel_order: None,
+                        content: ContentSnap::Project {
+                            child: ManagerSnap {
+                                cwd: Some(dir.clone()),
+                                focused: None,
+                                last_focused: None,
+                                zoomed: None,
+                                // Old workspace files simply lack this variant
+                                // (no migration) — this is the current-version
+                                // shape: a bare unit variant, no card data.
+                                windows: vec![WinSnap {
+                                    id: 2,
+                                    active: 0,
+                                    tabs: vec![TabSnap {
+                                        title: "board".into(),
+                                        managed_title: false,
+                                        panel_order: None,
+                                        content: ContentSnap::Board,
+                                    }],
+                                    minimized: false,
+                                    min_from_tree: false,
+                                    rect: RectSnap {
+                                        x: 0.0,
+                                        y: 0.0,
+                                        w: 520.0,
+                                        h: 380.0,
+                                    },
+                                    prev: None,
+                                }],
+                                tree: None,
+                            },
+                        },
+                    }],
+                    minimized: false,
+                    min_from_tree: false,
+                    rect: RectSnap {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 720.0,
+                        h: 480.0,
+                    },
+                    prev: None,
+                }],
+                tree: Some(NodeSnap::Leaf { id: 1 }),
+            },
+        };
+        let mut d = WindowManager::new().as_desktop();
+        let rep = d.apply_workspace(&snap, &ctx);
+        assert_eq!(rep.projects_restored, 1);
+
+        let w = d
+            .windows
+            .iter()
+            .find(|w| w.is_project())
+            .expect("project window");
+        let Content::Project(child) = &w.tabs[0].content else {
+            panic!("expected Project content");
+        };
+        let board = child
+            .windows
+            .iter()
+            .find_map(|cw| {
+                cw.tabs.iter().find_map(|t| match &t.content {
+                    Content::Board(v) => Some(v),
+                    _ => None,
+                })
+            })
+            .expect("expected a Board tab inside the restored project");
+        assert!(
+            std::rc::Rc::ptr_eq(board.store(), &child.kanban),
+            "restore must rebuild the view against the project's own store, not a fresh one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8649,6 +8947,29 @@ mod tests {
         wm.focused = None;
         wm.open_chat_window();
         assert_eq!(chat_wins(&wm), 1);
+        assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn open_board_window_is_a_per_project_singleton() {
+        let mut wm = WindowManager::new();
+        wm.open_board_window();
+        let board_wins = |wm: &WindowManager| {
+            wm.windows
+                .iter()
+                .filter(|w| {
+                    w.tabs
+                        .iter()
+                        .any(|t| matches!(t.content, Content::Board(_)))
+                })
+                .count()
+        };
+        assert_eq!(board_wins(&wm), 1);
+        let first = wm.windows.last().unwrap().id;
+        // focus something else, then reopen: focuses, does not duplicate
+        wm.focused = None;
+        wm.open_board_window();
+        assert_eq!(board_wins(&wm), 1);
         assert_eq!(wm.focused, Some(first));
     }
 
@@ -11914,5 +12235,152 @@ mod tests {
         // done on a now-missing id: Err
         let e = m.kanban_dispatch(&done).unwrap_err();
         assert!(e.contains("no such card"), "{e}");
+    }
+
+    // --- board: view acts drained by the manager ---
+
+    // Push a `Content::Board` tab into `child` (mirrors how `open_board_window`
+    // shapes one) and record `act` on it, as if the view had recorded it
+    // during the draw. Returns the board window's id.
+    fn push_board_act(child: &mut WindowManager, act: crate::board::BoardAct) -> WinId {
+        let (bid, brect) = child.next_slot(egui::vec2(400.0, 300.0));
+        child.push_win(
+            bid,
+            Tab::fixed(
+                "board",
+                Content::Board(crate::board::BoardView::new(Rc::clone(&child.kanban))),
+            ),
+            brect,
+        );
+        let w = child.windows.iter_mut().find(|w| w.id == bid).unwrap();
+        let Content::Board(v) = &mut w.tabs[0].content else {
+            panic!("just-pushed board tab");
+        };
+        v.acts.push(act);
+        bid
+    }
+
+    #[test]
+    fn board_dispatch_act_spawns_claims_and_titles_from_the_card() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+
+        // The wire path (`kanban_dispatch`) sets the store's dir before
+        // touching it — a direct `store.add()` without that would error "no
+        // project selected", same as the CLI would outside a project.
+        let mut add = kanban_req("add");
+        add.title = Some("Fix resize flicker".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        // The act carries an argv-capable agent string; any spawnable command
+        // works here — the assertions are on the recorded claim and the
+        // spawned tab's title, not on what the process itself does.
+        let agent = pause_argv()[0].clone();
+        push_board_act(
+            m.project_child_mut(pid).unwrap(),
+            crate::board::BoardAct::Dispatch {
+                id: id.clone(),
+                agent: agent.clone(),
+            },
+        );
+
+        m.project_child_mut(pid).unwrap().drain_board_acts(&ctx);
+
+        let child = m.project_child_mut(pid).unwrap();
+        let card = child.kanban.borrow().get(&id).unwrap().clone();
+        assert_eq!(card.state, crate::kanban::CardState::InProgress);
+        let claim = card.claim.expect("dispatch must claim the card atomically");
+        assert_eq!(claim.agent.as_deref(), Some(agent.as_str()));
+
+        let w = child
+            .windows
+            .iter()
+            .find(|w| {
+                w.tabs.iter().any(|t| {
+                    matches!(&t.content, Content::Terminal(s) if term_tag(s.term_id()) == claim.terminal)
+                })
+            })
+            .expect("dispatch must spawn a terminal window");
+        assert_eq!(
+            w.title(),
+            "Fix resize flicker",
+            "the window title must read as the work, not the argv"
+        );
+    }
+
+    #[test]
+    fn board_dispatch_act_on_a_missing_card_logs_and_spawns_nothing() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let before = m.project_child_mut(pid).unwrap().windows.len();
+
+        push_board_act(
+            m.project_child_mut(pid).unwrap(),
+            crate::board::BoardAct::Dispatch {
+                id: "no0000".into(),
+                agent: pause_argv()[0].clone(),
+            },
+        );
+        m.project_child_mut(pid).unwrap().drain_board_acts(&ctx);
+
+        // Only the board window from `push_board_act` — no terminal spawned.
+        assert_eq!(m.project_child_mut(pid).unwrap().windows.len(), before + 1);
+    }
+
+    #[test]
+    fn board_release_act_returns_an_orphaned_card_to_backlog() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+
+        let mut add = kanban_req("add");
+        add.title = Some("card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        // A stale run nonce: a claim from a launch that is no longer this one.
+        m.project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t999",
+                "claude",
+                "STALE_RUN",
+                crate::kanban::TermState::Running,
+            )
+            .unwrap();
+
+        m.project_child_mut(pid).unwrap().kanban_tick();
+        assert!(
+            m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .orphans()
+                .contains(&id),
+            "the stale-nonce claim must be derived orphaned before release"
+        );
+
+        push_board_act(
+            m.project_child_mut(pid).unwrap(),
+            crate::board::BoardAct::Release(id.clone()),
+        );
+        m.project_child_mut(pid).unwrap().drain_board_acts(&ctx);
+
+        let card = m
+            .project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow()
+            .get(&id)
+            .unwrap()
+            .clone();
+        assert_eq!(card.state, crate::kanban::CardState::Backlog);
+        assert!(card.claim.is_none());
     }
 }
