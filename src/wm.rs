@@ -4321,6 +4321,7 @@ impl WindowManager {
             crate::keymap::seed_live(ui.ctx(), &self.keymap);
         }
 
+        self.protect_terminal_keyboard(ui.ctx(), live);
         self.pump_commands(ui, live);
 
         ui.painter_at(area)
@@ -5587,6 +5588,42 @@ impl WindowManager {
                     }
                 }
             }
+        }
+    }
+
+    /// Follow the same active-tab chain as rendering, stopping at local overlays.
+    fn terminal_owns_keyboard(&self) -> bool {
+        if self.picker.is_some() || self.renaming.is_some() || self.pending_close.is_some() {
+            return false;
+        }
+        let Some(win) = self
+            .windows
+            .iter()
+            .find(|w| Some(w.id) == self.focused && !w.minimized)
+        else {
+            return false;
+        };
+        match &win.tabs[win.active].content {
+            Content::Project(child) => child.terminal_owns_keyboard(),
+            Content::Terminal(session) => session.owns_terminal_keyboard(),
+            _ => false,
+        }
+    }
+
+    fn protect_terminal_keyboard(&self, ctx: &egui::Context, active: bool) {
+        if self.desktop && active && self.terminal_owns_keyboard() {
+            // egui schedules Tab/arrow traversal before our UI runs. Consuming
+            // the event later cannot undo it (and would steal completion from
+            // the PTY). Cancel traversal before any window widget registers.
+            // Clear stray widget focus too: otherwise Enter/Space synthesizes
+            // a click on that window, and the leader is incorrectly suppressed.
+            // Search, rename, dialogs and non-terminal content keep egui focus.
+            ctx.memory_mut(|m| {
+                m.move_focus(egui::FocusDirection::None);
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
         }
     }
 
@@ -9237,6 +9274,220 @@ mod tests {
             0,
             "blank input appends nothing"
         );
+    }
+
+    #[test]
+    fn terminal_keyboard_does_not_traverse_or_activate_window_widgets() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+            std::fs::read(p)
+        }));
+        let mut child = WindowManager::new();
+        let first = child
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let second = child
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        child.focused = Some(first);
+        let mut wm = WindowManager::new();
+        wm.desktop = true;
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+        wm.push_win(
+            1,
+            Tab::fixed("project", Content::Project(Box::new(child))),
+            area,
+        );
+        wm.focused = Some(1);
+        let base = egui::Id::new("keyboard-test");
+        let stray = base.with(("proj", 1_u64)).with((second, "content"));
+        // Establish PTY sizes, then wait for actual child prompts: raw GUI
+        // keyboard input deliberately bypasses the injection readiness gate.
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            wm.show(ui, area, true, base, false);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut ready = true;
+            for w in &mut wm.focused_child().unwrap().windows {
+                let Content::Terminal(s) = w.active_content() else {
+                    panic!()
+                };
+                ready &= s
+                    .snapshot_text(None)
+                    .iter()
+                    .any(|line| line.contains("Press any key"))
+                    && s.ready();
+            }
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child prompts never appeared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for (key, modifiers, expected) in [
+            (egui::Key::Tab, egui::Modifiers::NONE, b"\t".as_slice()),
+            (egui::Key::Tab, egui::Modifiers::SHIFT, b"\t".as_slice()),
+            (
+                egui::Key::ArrowRight,
+                egui::Modifiers::NONE,
+                b"\x1b[C".as_slice(),
+            ),
+            (egui::Key::Enter, egui::Modifiers::NONE, b"\r".as_slice()),
+            (egui::Key::Space, egui::Modifiers::NONE, b" ".as_slice()),
+        ] {
+            // Include recovery from focus left on a different window, not just
+            // the clean-start case. Enter/Space used to synthesize a click here.
+            ctx.memory_mut(|m| m.request_focus(stray));
+            let mut input = egui::RawInput {
+                screen_rect: Some(area),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            if key == egui::Key::Space {
+                input.events.push(egui::Event::Text(" ".into()));
+            }
+            let _ = ctx.run_ui(input, |ui| {
+                wm.show(ui, area, true, base, false);
+                assert_eq!(ui.ctx().memory(|m| m.focused()), None, "{key:?}");
+                let outcome = ui.input(|i| {
+                    crate::input::process_input(
+                        &i.events,
+                        modifiers,
+                        alacritty_terminal::term::TermMode::empty(),
+                        false,
+                    )
+                });
+                assert_eq!(
+                    outcome.pty_bytes, expected,
+                    "{key:?} must still reach the terminal encoder"
+                );
+            });
+            assert_eq!(wm.focused, Some(1));
+            assert_eq!(wm.focused_child().unwrap().focused, Some(first), "{key:?}");
+            if key == egui::Key::Tab && modifiers == egui::Modifiers::NONE {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let mut first_exited = false;
+                    for w in &mut wm.focused_child().unwrap().windows {
+                        let id = w.id;
+                        let Content::Terminal(s) = w.active_content() else {
+                            panic!()
+                        };
+                        s.keepalive();
+                        if id == first {
+                            first_exited = s.exited().is_some();
+                        } else {
+                            assert!(s.exited().is_none(), "Tab reached the background child");
+                        }
+                    }
+                    if first_exited {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Tab did not reach the focused child"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        // Stray egui focus must not disable the existing leader shortcut.
+        ctx.memory_mut(|m| m.request_focus(stray));
+        let input = egui::RawInput {
+            screen_rect: Some(area),
+            events: vec![egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            wm.show(ui, area, true, base, false);
+        });
+        assert!(wm.armed);
+        let input = egui::RawInput {
+            screen_rect: Some(area),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        wm.focused_child().unwrap().last_focused = Some(second);
+        let _ = ctx.run_ui(input, |ui| {
+            wm.show(ui, area, true, base, false);
+        });
+        assert!(!wm.armed);
+        assert_eq!(wm.focused_child().unwrap().focused, Some(second));
+    }
+
+    #[test]
+    fn terminal_keyboard_guard_preserves_local_ui_navigation() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.desktop = true;
+        let term = wm
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        wm.focused = Some(term);
+        assert!(wm.terminal_owns_keyboard());
+        wm.renaming = Some(term);
+        assert!(!wm.terminal_owns_keyboard());
+        wm.renaming = None;
+        wm.windows[0].minimized = true;
+        assert!(!wm.terminal_owns_keyboard());
+        wm.windows[0].minimized = false;
+        let field = egui::Id::new("text-field");
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ctx.memory_mut(|m| m.request_focus(field));
+            wm.protect_terminal_keyboard(ui.ctx(), false);
+            assert_eq!(
+                ctx.memory(|m| m.focused()),
+                Some(field),
+                "inactive/modal desktop"
+            );
+        });
+        wm.open_settings();
+        assert!(!wm.terminal_owns_keyboard());
+        for key in [None, Some(egui::Key::Tab), Some(egui::Key::Tab)] {
+            let mut input = egui::RawInput::default();
+            if let Some(key) = key {
+                input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run_ui(input, |ui| {
+                let before = ctx.memory(|m| m.focused());
+                wm.protect_terminal_keyboard(ui.ctx(), true);
+                assert_eq!(ctx.memory(|m| m.focused()), before);
+                let mut text = String::new();
+                let response = ui.add(egui::TextEdit::singleline(&mut text).id(field));
+                let _ = ui.button("Next");
+                if key.is_none() {
+                    response.request_focus();
+                }
+            });
+        }
     }
 
     #[test]

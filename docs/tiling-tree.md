@@ -33,6 +33,13 @@ earlier floating-only decision recorded in the tabbing epic).
 
 ## How to use it
 
+While a terminal owns the keyboard, plain Tab and arrow keys go to its child
+process. They do not navigate Foreman's window widgets. The desktop cancels
+egui's already-scheduled focus traversal before drawing any windows and clears
+stray widget focus, so Enter/Space cannot activate another window accidentally.
+Search, rename, confirmation dialogs and non-terminal views keep their local
+keyboard handling. See `WindowManager::protect_terminal_keyboard` in `src/wm.rs`.
+
 Keyboard (after the `Ctrl+B` leader):
 
 | Keys | Action |

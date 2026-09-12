@@ -1899,6 +1899,11 @@ impl Session {
         self.search.is_open()
     }
 
+    /// Whether keys belong to the child process rather than a local UI overlay.
+    pub fn owns_terminal_keyboard(&self) -> bool {
+        !self.search.is_open() && self.pending_paste.is_none()
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -2646,6 +2651,27 @@ mod tests {
     use alacritty_terminal::index::Line;
 
     type RecordedWrites = Arc<Mutex<Vec<(Vec<u8>, Option<String>)>>>;
+
+    #[test]
+    fn terminal_keyboard_belongs_to_search_and_paste_overlays_when_open() {
+        let ctx = egui::Context::default();
+        let mut session = Session::spawn_argv(
+            &["cmd.exe".into(), "/c".into(), "pause".into()],
+            None,
+            &[],
+            ctx,
+        )
+        .unwrap();
+        assert!(session.owns_terminal_keyboard());
+        session.search.apply(crate::search::SearchCmd::Open);
+        assert!(!session.owns_terminal_keyboard());
+        session.search.apply(crate::search::SearchCmd::Close);
+        assert!(session.owns_terminal_keyboard());
+        session.pending_paste = Some("two\nlines".into());
+        assert!(!session.owns_terminal_keyboard());
+        session.pending_paste = None;
+        assert!(session.owns_terminal_keyboard());
+    }
 
     /// Acceptance for the PSReadLine-side wide-edit fix: drives a REAL
     /// PowerShell spawned exactly as production spawns it (`Session::spawn`,
