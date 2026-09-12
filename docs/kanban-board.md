@@ -12,8 +12,8 @@ sibling — read those for *why*, this doc for *how*.
 
 - **Cards** are one unit of work-in-flight each: title, optional body, state,
   and (while claimed) a claim linking the card to the Session working it.
-- **Dispatch from a card**: hovering a Backlog or Blocked card offers an agent
-  picker (claude / codex / grok). Picking one spawns a new Session in the
+- **Dispatch from a card**: Start on a Backlog or Blocked card offers an agent
+  picker. Picking one spawns a new Session in the
   project cwd whose prompt embeds the card body and the exact close-out
   commands, then claims the card and moves it to In Progress in the same
   action — a card-spawned agent never runs `start` itself.
@@ -30,9 +30,25 @@ sibling — read those for *why*, this doc for *how*.
 
 **Board window**: leader then `K` (`Command::OpenBoard`) opens the project's
 board — one per project; reopening surfaces the existing one. Quick-add at the
-top of Backlog creates title-only cards. Hover a card for its actions:
-dispatch/re-dispatch, mark Done, send back to Backlog (orphaned cards), and
-delete. Click a claimed card's terminal tag to jump to that Session. There is
+top of Backlog creates title-only cards. Click a column header to collapse it
+into a rail with its name and count; click the rail to expand it. Expanded
+columns share the remaining width. Collapse and scroll positions belong to
+the open board view and are not persisted across app restarts.
+
+Cards have a stable action footer: Start or Restart opens the agent picker;
+Open terminal surfaces a live claimed Session. Click the card body or its
+ellipsis to read the full stored task in a scrollable detail page inside the
+board pane. The detail page preserves multiline text and offers web links,
+claim information, and timestamps, with task actions below. Back to board
+preserves column collapse and scroll positions. A card removed while its
+details are open returns the view to the board. Description and blocker text
+are existing card fields, not a separate notes or attachments store.
+
+Card surfaces, text, attention indicators, and controls use the shared theme
+tokens and Visuals bridge; there is no board-specific palette. There is
+no separate board font-size setting: text follows the shared terminal font
+size, with proportional card heights, spacing, and button hit areas. Changes
+apply to the open board and its detail page on the next frame. There is
 deliberately no block button — blocking demands a typed reason, so it is the
 CLI's move.
 

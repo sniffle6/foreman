@@ -8,6 +8,7 @@ use crate::geom::ScrollAxis;
 use crate::theme::*;
 use crate::wm::{Dir, WinId};
 use eframe::egui;
+use std::collections::HashSet;
 
 /// Expanded panel width target (px).
 pub const PANEL_W: f32 = 260.0;
@@ -242,6 +243,33 @@ pub fn splice_order<K: Copy + Eq>(
     (next != keys).then_some(next)
 }
 
+/// Toggle whether a project's nested session rows are hidden.
+/// Returns the new collapsed state (`true` = children hidden).
+pub fn toggle_folder(collapsed: &mut HashSet<u64>, uid: u64) -> bool {
+    if collapsed.remove(&uid) {
+        false
+    } else {
+        collapsed.insert(uid);
+        true
+    }
+}
+
+/// Vertical-list content height: each project contributes its header row,
+/// its tab rows unless that folder is collapsed, and a 4px group gap.
+pub fn vertical_content_height(
+    projects: &[(u64, usize)],
+    collapsed: &HashSet<u64>,
+    row_h: f32,
+) -> f32 {
+    4.0 + projects
+        .iter()
+        .map(|(uid, n_tabs)| {
+            let kids = if collapsed.contains(uid) { 0 } else { *n_tabs };
+            row_h * (1.0 + kids as f32) + 4.0
+        })
+        .sum::<f32>()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PanelModel {
     pub projects: Vec<ProjectEntry>,
@@ -297,6 +325,11 @@ pub struct PanelView {
     /// Live drag-reorder gesture, while the pointer is down on a row in an
     /// expanded mode. Runtime-only — never persisted.
     pub drag: Option<PanelDrag>,
+    /// Project-row `Tab` uids whose nested session/chat/image rows are hidden.
+    /// Runtime-only — like board column collapse, not persisted across restarts.
+    /// Keyed by uid so a fold follows the project through panel reorder and
+    /// does not leak onto an unrelated project that later reuses a WinId.
+    collapsed_folders: HashSet<u64>,
 }
 
 impl PanelView {
@@ -321,6 +354,7 @@ impl PanelView {
             update_click: false,
             reorder: None,
             drag: None,
+            collapsed_folders: HashSet::new(),
         }
     }
 
@@ -338,6 +372,13 @@ impl PanelView {
         }
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, th.bg);
+
+        // Drop folds whose project is gone so a later project that reuses
+        // nothing still can't inherit a stale uid — the set stays bounded.
+        {
+            let live: HashSet<u64> = self.model.projects.iter().map(|pr| pr.uid).collect();
+            self.collapsed_folders.retain(|u| live.contains(u));
+        }
 
         // Quiet update-available chip pinned to the bottom edge of every
         // expanded layout (rows, columns, strip); the collapsed rails get a
@@ -383,13 +424,13 @@ impl PanelView {
             // Entry clamp: `scroll` may carry a large x-offset back from a wide
             // horizontal dock; without it every row paints above the rect (panel
             // looks empty) until the first wheel tick re-clamps.
-            let content_h: f32 = 4.0
-                + self
-                    .model
-                    .projects
-                    .iter()
-                    .map(|p| row_h * (1.0 + p.tabs.len() as f32) + 4.0)
-                    .sum::<f32>();
+            let heights: Vec<(u64, usize)> = self
+                .model
+                .projects
+                .iter()
+                .map(|p| (p.uid, p.tabs.len()))
+                .collect();
+            let content_h = vertical_content_height(&heights, &self.collapsed_folders, row_h);
             let scrollbar = self.prepare_scrollbar(ui, body, base, ScrollAxis::Vertical, content_h);
             let mut rows_rect = body;
             if let Some(s) = &scrollbar {
@@ -401,6 +442,7 @@ impl PanelView {
             // holding a borrow on model.
             let mut specs: Vec<(egui::Rect, egui::Id, RowPaintOwned)> = Vec::new();
             for (pi, proj) in self.model.projects.iter().enumerate() {
+                let folded = self.collapsed_folders.contains(&proj.uid);
                 let row = egui::Rect::from_min_size(
                     egui::pos2(rows_rect.min.x + 4.0, y),
                     egui::vec2((rows_rect.width() - 8.0).max(0.0), row_h),
@@ -417,8 +459,9 @@ impl PanelView {
                             minimized: proj.minimized,
                             background_tab: false,
                             exited: false,
-                            bell: false,
+                            bell: folded && bell_gate && proj.bell,
                             project_row: true,
+                            folder_collapsed: Some(folded),
                             drag_ref: Some(PanelRowRef {
                                 path: proj.path,
                                 uid: proj.uid,
@@ -427,6 +470,11 @@ impl PanelView {
                     ));
                 }
                 y += row_h;
+
+                if folded {
+                    y += 4.0;
+                    continue;
+                }
 
                 for (ti, t) in proj.tabs.iter().enumerate() {
                     let row = egui::Rect::from_min_size(
@@ -447,6 +495,7 @@ impl PanelView {
                                 exited: t.exited,
                                 bell: bell_gate && t.bell,
                                 project_row: false,
+                                folder_collapsed: None,
                                 drag_ref: Some(PanelRowRef {
                                     path: t.path,
                                     uid: t.uid,
@@ -892,6 +941,7 @@ impl PanelView {
         let mut dividers: Vec<f32> = Vec::new();
         let mut x = rect.min.x + 4.0 - self.scroll;
         for (pi, proj) in self.model.projects.iter().enumerate() {
+            let folded = self.collapsed_folders.contains(&proj.uid);
             let group = egui::Rect::from_min_size(
                 egui::pos2(x, content_rect.min.y),
                 egui::vec2(GROUP_W, content_rect.height()),
@@ -919,8 +969,9 @@ impl PanelView {
                     minimized: proj.minimized,
                     background_tab: false,
                     exited: false,
-                    bell: false,
+                    bell: folded && bell_gate && proj.bell,
                     project_row: true,
+                    folder_collapsed: Some(folded),
                     drag_ref: Some(PanelRowRef {
                         path: proj.path,
                         uid: proj.uid,
@@ -928,6 +979,9 @@ impl PanelView {
                 },
             ));
             y += row_h;
+            if folded {
+                continue;
+            }
             for (ti, t) in proj.tabs.iter().enumerate() {
                 if y >= content_rect.max.y {
                     break; // below the panel: clipped, never interactive
@@ -950,6 +1004,7 @@ impl PanelView {
                         exited: t.exited,
                         bell: bell_gate && t.bell,
                         project_row: false,
+                        folder_collapsed: None,
                         drag_ref: Some(PanelRowRef {
                             path: t.path,
                             uid: t.uid,
@@ -1058,6 +1113,8 @@ impl PanelView {
             /// `RowPaintOwned::drag_ref` in the other two modes.
             drag_ref: Option<PanelRowRef>,
             project_chip: bool,
+            /// `Some` on project chips: whether nested session chips are hidden.
+            folder_collapsed: Option<bool>,
         }
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
         let p = ui.painter_at(rect);
@@ -1080,6 +1137,7 @@ impl PanelView {
         };
         let mut chips: Vec<Chip> = Vec::new();
         for (pi, proj) in self.model.projects.iter().enumerate() {
+            let folded = self.collapsed_folders.contains(&proj.uid);
             let galley = layout(&proj.title);
             chips.push(Chip {
                 id: base.with(("pchip", pi, proj.path.project)),
@@ -1089,14 +1147,18 @@ impl PanelView {
                 kind: None,
                 focused: proj.focused,
                 dim: proj.minimized,
-                bell: false, // the tab chips beside it carry the ring
+                bell: folded && bell_gate && proj.bell,
                 div_before: pi > 0,
                 drag_ref: Some(PanelRowRef {
                     path: proj.path,
                     uid: proj.uid,
                 }),
                 project_chip: true,
+                folder_collapsed: Some(folded),
             });
+            if folded {
+                continue;
+            }
             for (ti, t) in proj.tabs.iter().enumerate() {
                 let galley = layout(&t.title);
                 chips.push(Chip {
@@ -1114,6 +1176,7 @@ impl PanelView {
                         uid: t.uid,
                     }),
                     project_chip: false,
+                    folder_collapsed: None,
                 });
             }
         }
@@ -1205,16 +1268,25 @@ impl PanelView {
                 egui::Sense::click()
             };
             let resp = ui.interact(chip_rect.intersect(content_rect), chip.id, sense);
+            let icon_c = egui::pos2(chip_rect.min.x + pad + icon_w / 2.0, cy);
             if let Some(dr) = &chip.drag_ref
                 && resp.drag_started()
             {
-                self.drag = Some(PanelDrag {
-                    source: dr.clone(),
-                    source_is_project: chip.project_chip,
-                    axis: ScrollAxis::Horizontal,
-                    target: None,
-                    marker: None,
-                });
+                let folder_r = egui::Rect::from_center_size(icon_c, egui::vec2(16.0, 16.0));
+                let from_folder = chip.folder_collapsed.is_some()
+                    && ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .is_some_and(|p| folder_r.contains(p));
+                if !from_folder {
+                    self.drag = Some(PanelDrag {
+                        source: dr.clone(),
+                        source_is_project: chip.project_chip,
+                        axis: ScrollAxis::Horizontal,
+                        target: None,
+                        marker: None,
+                    });
+                }
             }
             let over = resp.hovered() || resp.contains_pointer();
             if chip.focused || over {
@@ -1239,7 +1311,7 @@ impl PanelView {
             } else {
                 th.dim
             };
-            let icon_c = egui::pos2(chip_rect.min.x + pad + icon_w / 2.0, cy);
+            let mut folder_hit = false;
             match chip.kind {
                 None => {
                     let tint = if chip.dim {
@@ -1248,6 +1320,27 @@ impl PanelView {
                         crate::icons::IconKind::Folder.tint()
                     };
                     paint_icon(ui, &p, icon_c, 12.0, crate::icons::IconKind::Folder, tint);
+                    if let Some(folded) = chip.folder_collapsed {
+                        paint_folder_disclosure(&p, icon_c, folded, tint);
+                        let icon_r = egui::Rect::from_center_size(icon_c, egui::vec2(16.0, 16.0));
+                        let folder_resp = ui
+                            .interact(
+                                icon_r.intersect(content_rect),
+                                chip.id.with("folder"),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_text(if folded {
+                                "Expand sessions"
+                            } else {
+                                "Collapse sessions"
+                            });
+                        if folder_resp.clicked() {
+                            if let Some(uid) = chip.drag_ref.as_ref().map(|r| r.uid) {
+                                toggle_folder(&mut self.collapsed_folders, uid);
+                            }
+                            folder_hit = true;
+                        }
+                    }
                 }
                 Some(RowKind::Terminal(k)) => {
                     let tint = if chip.dim { th.dim } else { k.tint() };
@@ -1289,7 +1382,7 @@ impl PanelView {
                     ),
                 );
             }
-            if resp.clicked() {
+            if resp.clicked() && !folder_hit {
                 self.click = Some(chip.path);
             }
         }
@@ -1508,16 +1601,27 @@ impl PanelView {
             egui::Sense::click()
         };
         let resp = ui.interact(row.intersect(clip), id, sense);
+        let icon_c = egui::pos2(row.min.x + 9.0, row.center().y);
+        let folder_hit_rect = egui::Rect::from_center_size(icon_c, egui::vec2(16.0, 16.0));
         if let Some(dr) = &rp.drag_ref
             && resp.drag_started()
         {
-            self.drag = Some(PanelDrag {
-                source: dr.clone(),
-                source_is_project: rp.project_row,
-                axis,
-                target: None,
-                marker: None,
-            });
+            // Folder icon is the fold toggle; a drag starting there is a
+            // click that overshot, not a reorder.
+            let from_folder = rp.folder_collapsed.is_some()
+                && ui
+                    .ctx()
+                    .pointer_latest_pos()
+                    .is_some_and(|p| folder_hit_rect.contains(p));
+            if !from_folder {
+                self.drag = Some(PanelDrag {
+                    source: dr.clone(),
+                    source_is_project: rp.project_row,
+                    axis,
+                    target: None,
+                    marker: None,
+                });
+            }
         }
         // Geometric containment, not `hovered()`: the min/close buttons below
         // are registered on top of this row, so hovering them un-hovers the
@@ -1550,7 +1654,7 @@ impl PanelView {
         };
 
         // Icon
-        let icon_c = egui::pos2(row.min.x + 9.0, row.center().y);
+        let mut folder_hit = false;
         match rp.kind {
             None => {
                 let tint = if rp.minimized {
@@ -1559,6 +1663,26 @@ impl PanelView {
                     crate::icons::IconKind::Folder.tint()
                 };
                 paint_icon(ui, &p, icon_c, 12.0, crate::icons::IconKind::Folder, tint);
+                if let Some(folded) = rp.folder_collapsed {
+                    paint_folder_disclosure(&p, icon_c, folded, tint);
+                    let folder_resp = ui
+                        .interact(
+                            folder_hit_rect.intersect(clip),
+                            id.with("folder"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text(if folded {
+                            "Expand sessions"
+                        } else {
+                            "Collapse sessions"
+                        });
+                    if folder_resp.clicked() {
+                        if let Some(uid) = rp.drag_ref.as_ref().map(|r| r.uid) {
+                            toggle_folder(&mut self.collapsed_folders, uid);
+                        }
+                        folder_hit = true;
+                    }
+                }
             }
             Some(RowKind::Terminal(k)) => {
                 let tint = if rp.minimized || rp.background_tab || rp.exited {
@@ -1694,7 +1818,7 @@ impl PanelView {
             );
         }
 
-        if resp.clicked() && !btn_hit {
+        if resp.clicked() && !btn_hit && !folder_hit {
             self.click = Some(rp.path);
         }
     }
@@ -1711,6 +1835,8 @@ struct RowPaintOwned {
     /// Latched Bell on this terminal row (already gated by the master switch).
     bell: bool,
     project_row: bool,
+    /// `Some` on project rows: whether nested session rows are hidden.
+    folder_collapsed: Option<bool>,
     /// Some = this row is a drag-reorder source (expanded modes). Rail rows
     /// stay None/non-draggable.
     drag_ref: Option<PanelRowRef>,
@@ -1719,6 +1845,36 @@ struct RowPaintOwned {
 /// An up/down chevron as two line segments. The default egui fonts have no
 /// glyph for U+2303/U+2304 (they render as tofu), so the expand/collapse
 /// arrows are drawn as vector strokes — same policy as the wm control icons.
+/// Tiny filled disclosure triangle overlaid on a project folder icon.
+/// Points right when collapsed (children hidden), down when expanded.
+fn paint_folder_disclosure(
+    p: &egui::Painter,
+    icon_c: egui::Pos2,
+    collapsed: bool,
+    color: egui::Color32,
+) {
+    let c = egui::pos2(icon_c.x + 5.4, icon_c.y + 5.0);
+    let s = 2.5;
+    let pts = if collapsed {
+        [
+            egui::pos2(c.x - s * 0.55, c.y - s),
+            egui::pos2(c.x + s * 0.85, c.y),
+            egui::pos2(c.x - s * 0.55, c.y + s),
+        ]
+    } else {
+        [
+            egui::pos2(c.x - s, c.y - s * 0.55),
+            egui::pos2(c.x + s, c.y - s * 0.55),
+            egui::pos2(c.x, c.y + s * 0.85),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(
+        pts.to_vec(),
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
 pub(crate) fn paint_chevron(p: &egui::Painter, c: egui::Pos2, up: bool, color: egui::Color32) {
     let (hw, hh) = (4.0, 2.2);
     let dy = if up { hh } else { -hh };
@@ -1873,5 +2029,41 @@ mod tests {
         let delta = egui::vec2(3.0, 7.0);
         assert_eq!(panel_wheel_delta(ScrollAxis::Vertical, delta), 7.0);
         assert_eq!(panel_wheel_delta(ScrollAxis::Horizontal, delta), 10.0);
+    }
+
+    #[test]
+    fn toggle_folder_collapses_then_expands() {
+        let mut folded = HashSet::new();
+        assert!(toggle_folder(&mut folded, 7));
+        assert!(folded.contains(&7));
+        assert!(!toggle_folder(&mut folded, 7));
+        assert!(folded.is_empty());
+    }
+
+    #[test]
+    fn toggle_folder_does_not_affect_other_projects() {
+        let mut folded = HashSet::new();
+        toggle_folder(&mut folded, 1);
+        toggle_folder(&mut folded, 2);
+        assert!(folded.contains(&1));
+        assert!(folded.contains(&2));
+        toggle_folder(&mut folded, 1);
+        assert!(!folded.contains(&1));
+        assert!(folded.contains(&2));
+    }
+
+    #[test]
+    fn vertical_content_height_shrinks_only_the_folded_project() {
+        let projects = [(1, 3usize), (2, 2usize)];
+        let row_h = 22.0;
+        let open = vertical_content_height(&projects, &HashSet::new(), row_h);
+        let mut folded = HashSet::new();
+        folded.insert(1);
+        let shut = vertical_content_height(&projects, &folded, row_h);
+        // Project 1 drops 3 tab rows; project 2 is unchanged.
+        assert_eq!(open - shut, row_h * 3.0);
+        folded.insert(2);
+        let both = vertical_content_height(&projects, &folded, row_h);
+        assert_eq!(open - both, row_h * 5.0);
     }
 }

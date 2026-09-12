@@ -35,6 +35,16 @@ and the landing site for future agent-state badges.
   order, so new tabs append. A 2px marker (clipped to the panel body) shows
   the drop slot; edge auto-scroll follows the active `ScrollAxis`; collapse
   or an orientation flip cancels the gesture. Collapsed rails don't drag (v1).
+- **Project folder icon folds nested rows:** clicking the folder glyph on a
+  project row (or the matching strip chip) hides or shows that project's
+  session/chat/image children. The rest of the row still surfaces the project.
+  Fold state lives on `PanelView` keyed by the project's `Tab` uid, so it
+  survives panel reorder and does not leak onto an unrelated project; it is
+  runtime-only (like board column collapse, not written to settings). A
+  disclosure triangle on the icon points right when collapsed and down when
+  expanded. Collapsed rails already show only project icons, so a rail click
+  still surfaces rather than folding. A latched Bell on a hidden child
+  promotes to the project row/chip so the ring is not lost.
 - **Elided titles get a hover tooltip:** rows (expanded modes) and strip chips
   attach egui's `on_hover_text` with the full title only when the `…`
   truncation actually kicked in (`Galley::elided`), and never while a reorder
@@ -137,7 +147,8 @@ and the landing site for future agent-state badges.
 
 - `src/panel.rs` — model types + row paint; axis-aware scrollbar input/paint;
   horizontal painters (`paint_columns`, `paint_strip`, `paint_rail_h`,
-  `paint_chevron`)
+  `paint_chevron`); folder fold (`toggle_folder`, `vertical_content_height`,
+  `PanelView` `collapsed_folders`)
 - `src/geom.rs` — shared axis-generic scrollbar geometry and terminal wrappers
 - `src/wm.rs` — `panel_model`, `surface_target`, `ensure_panel`, path Acts,
   drains, `apply_panel_reorder` + `Tab::panel_order` (drag ordering),
