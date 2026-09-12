@@ -333,16 +333,27 @@ mod tests {
             terminal_id: "t8".into(),
             prompt: "trace the rendering regression".into(),
         };
-        let mut sent = false;
-        for _ in 0..100 {
-            if send_event(&pipe, &event).is_ok() {
-                sent = true;
-                break;
+        // A successful write is not a delivery acknowledgement: this passive
+        // lane intentionally drops attempts when its reader misses a deadline
+        // under load. Retry the attempt until the GUI queue observes it, rather
+        // than treating a connected pipe as proof of receipt. Keep one overall
+        // deadline so missing listeners and lost attempts fail the same way.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = send_event(&pipe, &event);
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(received) => {
+                    assert_eq!(received, event);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("listener stopped"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            std::thread::sleep(Duration::from_millis(10));
+            assert!(
+                Instant::now() < deadline,
+                "listener never delivered the event"
+            );
         }
-        assert!(sent, "listener did not bind");
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), event);
     }
 
     #[test]
