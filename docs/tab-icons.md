@@ -15,6 +15,10 @@ glyph) and the tab chips are styled like classic browser tabs.
 - Tab chips are **classic browser tabs**: rounded on top, flat on the bottom so
   the active tab joins the content area below it. The close `×` shows only on the
   active or hovered tab.
+- Overflowing tab names fade at the right edge before the close button. Hover
+  the tab to read its complete name in a tooltip. Short names remain fully
+  visible without a fade or tooltip. Chip packing and single-window titles
+  retain their existing behavior.
 
 ## Why it exists
 

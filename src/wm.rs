@@ -4884,7 +4884,7 @@ impl WindowManager {
                 } else if let HeaderContentLayout::Tabs { chips } = &hl.content {
                     // --- tab bar (multi-tab stacks only) ---
                     // One pre-packed chip per visible tab: the geometry (chip
-                    // metrics, the control-zone fence, truncation) lives in
+                    // metrics, the control-zone fence, label bounds) lives in
                     // header_layout. Chips are registered after the window-drag
                     // rect so they win pointer priority; dragging a chip off
                     // the bar detaches it (untab).
@@ -4980,16 +4980,45 @@ impl WindowManager {
                                 tint,
                             );
                         }
-                        p.text(
-                            ch.label_pos,
-                            egui::Align2::LEFT_CENTER,
-                            &label,
-                            tab_font.clone(),
-                            txt_col,
+                        let galley = p.layout_no_wrap(label.clone(), tab_font.clone(), txt_col);
+                        let overflowing = galley.size().x > ch.label_rect.width();
+                        let label_painter = p.with_clip_rect(ch.label_rect);
+                        let text_pos = egui::pos2(
+                            ch.label_rect.min.x,
+                            ch.label_rect.center().y - galley.size().y / 2.0,
                         );
+                        // Clip only the label; the icon, border and close affordance
+                        // keep their own paint and hit regions.
+                        label_painter.galley(text_pos, galley, txt_col);
+                        if overflowing {
+                            let fade = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    (ch.label_rect.max.x - 12.0).max(ch.label_rect.min.x),
+                                    ch.label_rect.min.y + 1.0,
+                                ),
+                                egui::pos2(ch.label_rect.max.x, ch.label_rect.max.y - 1.0),
+                            );
+                            let mut mesh = egui::Mesh::default();
+                            mesh.colored_vertex(fade.left_top(), egui::Color32::TRANSPARENT);
+                            mesh.colored_vertex(fade.right_top(), bg);
+                            mesh.colored_vertex(fade.left_bottom(), egui::Color32::TRANSPARENT);
+                            mesh.colored_vertex(fade.right_bottom(), bg);
+                            mesh.add_triangle(0, 1, 2);
+                            mesh.add_triangle(2, 1, 3);
+                            label_painter.add(egui::Shape::mesh(mesh));
+                        }
+                        // Reuse the chip response so a tooltip cannot steal tab
+                        // clicks or drag-out. The close button has its own response.
+                        let chip_resp = if overflowing {
+                            chip_resp.on_hover_text(&label)
+                        } else {
+                            chip_resp
+                        };
                         // Close affordance — shown only on the active or hovered tab
                         // (browser-style), and interactable only when shown.
-                        let show_x = is_active_tab || chip_resp.hovered();
+                        // `hovered` becomes false while the nested close button
+                        // owns a press. Keep it registered through release.
+                        let show_x = is_active_tab || chip_resp.contains_pointer();
                         let xr = ch.close;
                         let xresp = if show_x {
                             let r =
@@ -6231,7 +6260,8 @@ struct ChipLayout {
     idx: usize,
     rect: egui::Rect,
     icon: Option<egui::Rect>,
-    label_pos: egui::Pos2,
+    /// Text-only slot, ending before the close hit region.
+    label_rect: egui::Rect,
     close: egui::Rect,
 }
 
@@ -6321,11 +6351,15 @@ fn header_layout(
                     egui::pos2(cx + chip_w - close_w, cy),
                     egui::vec2(close_w, chip_h),
                 );
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(label_pos.x, rect.min.y),
+                    egui::pos2(close.min.x, rect.max.y),
+                );
                 chips.push(ChipLayout {
                     idx,
                     rect,
                     icon,
-                    label_pos,
+                    label_rect,
                     close,
                 });
                 cx += chip_w + 4.0;
@@ -8507,6 +8541,94 @@ mod tests {
         assert_eq!(m.renaming, Some(b));
         m.minimize(b);
         assert!(m.renaming.is_none(), "minimize left a dangling rename");
+    }
+
+    #[test]
+    fn inactive_tab_close_survives_press_and_release() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let title = "A long active project title that must survive closing its neighbour";
+        let id = push(&mut wm, title);
+        wm.windows[0].rect.set_width(700.0);
+        wm.windows[0].tabs.push(Tab::fixed(
+            "An overflowing inactive project title to close",
+            stub_content(),
+        ));
+        let area = egui::Rect::from_min_size(egui::pos2(71.0, 43.0), egui::vec2(900.0, 500.0));
+        // Both titles exceed the cap, so their packed geometry is identical.
+        let measures = [TabMeasure {
+            label_w: 300.0,
+            has_icon: true,
+        }; 2];
+        let hl = header_layout(
+            wm.windows[0].rect.translate(area.min.to_vec2()),
+            true,
+            false,
+            HeaderSpec::Tabs(&measures),
+        );
+        let HeaderContentLayout::Tabs { chips } = hl.content else {
+            panic!()
+        };
+        let pos = chips[1].close.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for (frame, events) in [
+            vec![],
+            vec![egui::Event::PointerMoved(pos)],
+            vec![],
+            vec![button(true)],
+            vec![], // Keep the close control alive while it owns the press.
+            vec![button(false)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input = egui::RawInput {
+                screen_rect: Some(area),
+                time: Some(frame as f64 * 0.05),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                wm.show(ui, area, true, egui::Id::new("tab-close-test"), false);
+            });
+        }
+        let window = wm.windows.iter().find(|w| w.id == id).unwrap();
+        assert_eq!(
+            window.tabs.len(),
+            1,
+            "inactive close must receive the release"
+        );
+        assert_eq!(window.title(), title, "only the inactive tab should close");
+    }
+
+    #[test]
+    fn tab_label_slot_stays_between_icon_and_close() {
+        for has_icon in [false, true] {
+            for label_w in [0.0, 50.0, 120.0, 5000.0] {
+                let tabs = [TabMeasure { label_w, has_icon }; 2];
+                let scr =
+                    egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(600.0, 300.0));
+                for is_project in [false, true] {
+                    let hl = header_layout(scr, is_project, false, HeaderSpec::Tabs(&tabs));
+                    let HeaderContentLayout::Tabs { chips } = hl.content else {
+                        panic!("expected tab chips");
+                    };
+                    for chip in chips {
+                        assert!(chip.rect.contains_rect(chip.label_rect));
+                        assert_eq!(chip.label_rect.max.x, chip.close.min.x);
+                        assert_eq!(chip.label_rect.width(), label_w.min(120.0) + 6.0);
+                        if let Some(icon) = chip.icon {
+                            assert!(icon.max.x < chip.label_rect.min.x);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
