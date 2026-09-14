@@ -1,6 +1,6 @@
 ---
 name: foreman-run-and-operate
-description: Use when running the foreman app or driving its control plane as a developer or operator - GUI launch, the open/chat/status/close/send/snapshot/icat/view CLI verbs and flags, the \\.\pipe\foreman named pipe, exit codes 0/1/2, connect/reply timeouts, settle behavior, or errors like "cannot reach foreman", "foreman did not respond", "control server busy", "not inside a foreman terminal", "no focused project". Also foreman_panic.log, %APPDATA%\foreman artifacts, and src/control.rs questions.
+description: Use when running the foreman app or driving its control plane as a developer or operator - GUI launch, the open/chat/status/close/send/snapshot/icat/view CLI verbs and flags, the \\.\pipe\foreman well-known pipe and the per-instance FOREMAN_PIPE, exit codes 0/1/2, connect/reply timeouts, settle behavior, or errors like "cannot reach foreman", "foreman did not respond", "control server busy", "not inside a foreman terminal", "no focused project". Also foreman_panic.log, %APPDATA%\foreman artifacts, and src/control.rs questions.
 ---
 
 # Run and operate foreman: app + control-plane ground truth
@@ -46,10 +46,12 @@ Build-environment traps (GNU toolchain, `Access is denied (os error 5)`, kill
 before build) are **foreman-build-and-env**'s home. Screenshot-based visual
 verification is the **build-screenshot** skill.
 
-**One foreman per machine owns the pipe.** A second GUI instance still opens,
-but its pipe listener fails to bind and it prints
-`control: pipe unavailable after N attempts (...); agent dispatch disabled` —
-GUI-only, no Control plane (`listen_retry`, `src/control.rs`).
+**The first-launched foreman owns the well-known pipe.** A later GUI instance
+still opens; its well-known bind fails after `listen_retry` and it prints
+`control: well-known pipe unavailable after N attempts (...)`. That instance's
+own terminals still reach it through `FOREMAN_PIPE` (`instance_pipe`). Only
+callers outside any Session, or a CLI that does not read `FOREMAN_PIPE`, talk
+to the well-known name.
 
 ## Subcommand reference
 
@@ -161,8 +163,12 @@ A Worker that spawned and instantly died still returned ok; `status` shows it as
 
 ## Transport
 
-- Named pipe `\\.\pipe\foreman` (`PIPE = "foreman"` mapped via the
-  `interprocess` crate's `GenericNamespaced`, `src/control.rs`).
+- Two pipes, same protocol. The well-known name `\\.\pipe\foreman`
+  (`PIPE = "foreman"` mapped via the `interprocess` crate's
+  `GenericNamespaced`, `src/control.rs`) is bound by the first-launched
+  instance. Every instance also serves `instance_pipe` and injects that name
+  as `FOREMAN_PIPE`. `client_pipe` prefers `FOREMAN_PIPE` and falls back to
+  `PIPE` when it is blank or unset.
 - Protocol: **one JSON line request → one JSON line reply per connection**,
   verbs discriminated by the `"cmd"` field. You can drive it from any local
   process, not just the CLI (that is how test harnesses script it — see
@@ -206,7 +212,7 @@ Operator triage for client-side errors:
 
 | stderr message | Meaning | Action |
 |---|---|---|
-| `cannot reach foreman (...) — is it running?` | No pipe: foreman not running, or this instance lost the bind race | Start foreman / find the owning instance |
+| `cannot reach foreman (...) — is it running?` | No pipe at `client_pipe()`: foreman not running, or this caller is not inside a Session and the well-known name is unbound | Start foreman / run from inside a Session so `FOREMAN_PIPE` is set |
 | `foreman is running but its control pipe stayed busy for 10s — retry, or check for a wedged dispatch` | Pipe exists but connect deadline expired | Retry; if persistent, a handler thread is wedged by a dead client |
 | `foreman did not respond` | GUI did not answer within `REPLY_TIMEOUT` | The request did NOT and will NOT execute; safe to retry |
 | `foreman: control server busy` | In-flight handlers past `MAX_INFLIGHT` | Back off and retry |
@@ -215,9 +221,10 @@ Operator triage for client-side errors:
 ## Env contract and per-verb self-targeting
 
 Every foreman-spawned Session gets `FOREMAN=1`, `FOREMAN_EXE` (path to the
-binary — PATH won't have `target\debug`), `FOREMAN_PROJECT_ID` (`pN`), and
-`FOREMAN_TERMINAL_ID` (`tN`), plus terminal-capability vars
-(`WindowManager::term_env`, `src/wm.rs`). The full injected-env table and how to extend it is
+binary — PATH won't have `target\debug`), `FOREMAN_PROJECT_ID` (`pN`),
+`FOREMAN_TERMINAL_ID` (`tN`), and `FOREMAN_PIPE` (this instance's control
+pipe), plus terminal-capability vars (`WindowManager::term_env`, `src/wm.rs`).
+The full injected-env table and how to extend it is
 **foreman-config-and-flags**' home. The CLI reads them to default targets:
 
 | Verb | `FOREMAN_PROJECT_ID` | `FOREMAN_TERMINAL_ID` |

@@ -75,11 +75,14 @@ about anything performance-shaped — scroll smoothness, paint cost, input laten
 Reach for `-Debug` when you want a panic backtrace, not when you want a verdict
 on speed.
 
-**The control plane still points at your *other* foreman.** `src/control.rs`
-binds a fixed global pipe name (`\\.\pipe\foreman`), and your existing instance
-owns it. So `foreman open` / `chat` / `send` / `snapshot` from any terminal keep
-addressing that instance, not the dev one. GUI behaviour — rendering, scrolling,
-input, layout, settings — tests fine. Dispatch and headless snapshotting do not.
+**The well-known pipe belongs to whichever instance bound it first.**
+`src/control.rs` `PIPE` is `\\.\pipe\foreman`; the first-launched foreman owns
+it and later instances fail that bind. Terminals spawned by an instance get
+`FOREMAN_PIPE` pointing at *that* instance's own pipe (`instance_pipe`), so
+`foreman open` / `chat` / `send` / `snapshot` from inside a dev-build terminal
+reach the dev host. Callers outside any foreman terminal — or a pre-v0.4.0
+CLI that does not read `FOREMAN_PIPE` — still talk to the well-known name
+(usually the installed daily driver). GUI behaviour tests fine either way.
 
 **The sandbox lives under `target\`,** so `cargo clean` deletes it. That is
 usually what you want, but don't park anything you care about in there.
@@ -100,6 +103,7 @@ entirely when `FOREMAN=1` because it kills without knowing the caller's intent.
 - `src/config.rs` — `config_dir()`, which reads `APPDATA`; the isolation hinges on it
 - `src/workspace.rs` — the `workspace.json` load/save that hazard 2 is about
 - `src/main.rs` — captures the live tree and debounce-writes the workspace
-- `src/control.rs` — the fixed `\\.\pipe\foreman` name behind the CLI caveat
+- `src/control.rs` — `PIPE` (well-known) and `instance_pipe` / `FOREMAN_PIPE`
+  (per-instance; what in-foreman CLIs use)
 - `.claude/hooks/kill-foreman.ps1` — the kill-safety precedent, and both incidents
 - `docs/HANDOFF.md` § 3 — the plain build/verify loop this script wraps

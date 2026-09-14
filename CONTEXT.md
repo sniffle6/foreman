@@ -30,7 +30,7 @@ stacking order, and a Content. A single-tab Win reads as a plain window.
 _Avoid_: pane, frame, widget.
 
 **Content**:
-What a Win holds — a Terminal, a Project, or a Chat viewer.
+What a Win holds — a Terminal, a Project, or one of the PTY-less viewers.
 _Avoid_: body, payload.
 
 **Project**:
@@ -110,6 +110,12 @@ _Avoid_: spawn, run, fork.
 The local request channel an in-terminal agent uses to drive Foreman — open a
 terminal, post to chat, query status, close.
 _Avoid_: API, IPC bus, server.
+
+**FOREMAN_PIPE**:
+The per-instance Control-plane pipe name injected into every Session, so a CLI
+inside that Session talks to the host that spawned it.
+_Avoid_: well-known pipe (that is `PIPE` / `\\.\pipe\foreman`, for callers
+outside a Session).
 
 **Inspection**:
 Driving a Session with input (**send**) and reading back its rendered screen

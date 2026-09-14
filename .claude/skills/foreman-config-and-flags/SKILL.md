@@ -1,6 +1,6 @@
 ---
 name: foreman-config-and-flags
-description: Use when auditing or changing any foreman configuration axis - %APPDATA%\foreman settings.json or keybindings.json, font-size zoom persistence, default Leader/Chord bindings, injected env vars (FOREMAN, FOREMAN_TERMINAL_ID, FOREMAN_PROJECT_ID, FOREMAN_EXE, FOREMAN_TITLE_PIPE, TERM, COLORTERM), CLAUDE_CONFIG_DIR/CODEX_HOME/GROK_HOME installs, tunable timing constants, managed agent hooks, .claude development hooks, adding a persisted setting. Symptoms - setting not saved, binding ignored, "FOREMAN_TERMINAL_ID unset", zoom resets on restart.
+description: Use when auditing or changing any foreman configuration axis - %APPDATA%\foreman settings.json or keybindings.json, font-size zoom persistence, default Leader/Chord bindings, injected env vars (FOREMAN, FOREMAN_TERMINAL_ID, FOREMAN_PROJECT_ID, FOREMAN_EXE, FOREMAN_PIPE, FOREMAN_TITLE_PIPE, TERM, COLORTERM), CLAUDE_CONFIG_DIR/CODEX_HOME/GROK_HOME installs, tunable timing constants, managed agent hooks, .claude development hooks, adding a persisted setting. Symptoms - setting not saved, binding ignored, "FOREMAN_TERMINAL_ID unset", zoom resets on restart.
 ---
 
 # Foreman configuration and flags
@@ -122,10 +122,7 @@ worth understanding, because it is not a plain struct deserialize:
 - **Malformed file falls back silently to defaults** (stderr warning, never a
   crash).
 - Written by the in-app keybindings editor (`src/settings.rs` signals
-  `Outcome::Changed`; the desktop `WindowManager` calls `keymap.save()`). Note:
-  the module doc at the top of `src/keymap.rs` still says "There is no write
-  path in this phase — the file is hand-edited". **That comment is stale** —
-  the write path exists.
+  `Outcome::Changed`; the desktop `WindowManager` calls `keymap.save()`).
 
 On-disk shape (from `struct KeymapFile`, `src/keymap.rs`; both fields
 optional, partial files valid):
@@ -211,6 +208,7 @@ Read the function for the current list; the entries with non-obvious reasons:
 | `KITTY_WINDOW_ID` | `1` | Always. The narrowest signal that makes agent CLIs pick the kitty graphics protocol. `TERM` stays truthful because foreman implements the graphics *subset* (`src/graphics.rs`), not all of kitty |
 | `FOREMAN_PROJECT_ID` | `p<id>` | **Only** Sessions inside a Project (the nested manager has a tag). Desktop-level Sessions get none |
 | `FOREMAN_EXE` | Full path to the running exe | When `current_exe()` resolves — `target\debug` is not on PATH, so agents need this to find the CLI |
+| `FOREMAN_PIPE` | This instance's control-pipe name (`instance_pipe`) | Always. In-foreman CLIs talk to the host that spawned them even when another foreman owns the well-known `PIPE` |
 | `FOREMAN_TITLE_PIPE` | Random per-process local pipe name | When the title listener starts. Global prompt hooks inherit it from the Session and therefore route only to the Foreman instance that spawned that Session |
 
 Consequence of the `FOREMAN_PROJECT_ID` conditional: the CLI's self-target
@@ -233,6 +231,7 @@ Verb-by-verb behavior belongs to **foreman-run-and-operate**.
 | `GROK_HOME` | `src/agent_hooks.rs`, `src/terminal_titles.rs` | Grok hook/session root when non-empty; else `%USERPROFILE%\.grok` |
 | `USERPROFILE` / `HOME` | skill, hook, and title-context resolvers | Non-empty fallback base for the provider homes above; an empty override is treated as absent, never as the current directory |
 | `FOREMAN_PROJECT_ID`, `FOREMAN_TERMINAL_ID` | `src/control.rs` (CLI client mode) | Self-target defaults for `open`/`chat`/`close`/`send`/`snapshot`/`view` |
+| `FOREMAN_PIPE` | `src/control.rs` `client_pipe` | Selects this instance's control pipe; blank or unset falls back to the well-known `PIPE` |
 | `FOREMAN_TITLE_PIPE` | `src/title_notify.rs` (`title-event` client mode) | Routes one passive prompt event to the owning GUI instance; absent/invalid/unreachable is a silent no-op |
 | `FOREMAN_EXE` | **Not read directly by foreman source** | Consumed by agent-facing skills and the managed prompt-hook command to invoke the exact running Foreman executable |
 
@@ -364,9 +363,7 @@ Gaps (verified against the matchers/scripts):
    read/write arms for its `Field`. Leaving it file-only is allowed but must be
    a *stated* choice: say so in the field's doc comment, and keep that comment
    true. (`rg -n "Field::" src/settings_menu.rs` against the `Settings` field
-   list tells you which fields are actually surfaced. `bell`'s doc comment
-   still claims "File-only in v1 — no settings UI"; it has a Bell pane row, so
-   do not copy it as the model.)
+   list tells you which fields are actually surfaced.)
 7. Add serde compat tests mirroring the existing ones in `src/config.rs`:
    missing field → default, known field round-trips, unknown fields ignored.
 8. Update `docs/settings-persistence.md` and classify the change per
@@ -386,5 +383,5 @@ Gaps (verified against the matchers/scripts):
 | The `Settings` field set (never trust a list) | `rg -n "pub struct Settings" -A 60 src/config.rs` |
 | Every numeric field is clamped on load | `rg -n "fn sanitize" -A 20 src/config.rs` |
 | Which skills are embedded and shipped | `rg -n "include_str!" src/skills_install.rs` |
-| `keymap.rs` module doc still claims "no write path" (delete the flag above when fixed) | `rg -n "no write path" src/keymap.rs` |
+| `Keymap::save` still exists (the write path) | `rg -n "fn save" src/keymap.rs` |
 | The `.claude` hook matchers | `cat .claude/settings.json` |

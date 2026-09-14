@@ -60,12 +60,12 @@ wrapped to the pane.
 - **No file watching.** Editing the PNG on disk doesn't refresh an open
   viewer — reopen with `foreman view` (or close and re-`view`) to see changes.
 - **`FOREMAN_VIEW_TEST=<path.png>`** (debug builds only): opens an image
-  window at startup, for screenshotting the happy path without a live control
-  pipe. Exists because a debug instance normally can't reach its *own* pipe
-  during testing — the user's real foreman already holds
-  `\\.\pipe\foreman`, so a debug `foreman view` from inside the debug
-  instance would dispatch to the wrong (real) foreman. Not a general-purpose
-  flag — see `src/main.rs`'s `if !self.started` block.
+  window at startup, for screenshotting the happy path without driving the
+  control plane. A debug instance's *own* terminals reach it via
+  `FOREMAN_PIPE`; this flag is for the case where you are not inside that
+  instance (the well-known `\\.\pipe\foreman` may belong to the installed
+  daily driver). Not a general-purpose flag — see `src/main.rs`'s
+  `if !self.started` block.
 - **OSC 8 links** (clickable file paths in terminal output opening a viewer)
   are a natural follow-up, not built — v1 requires the explicit `foreman
   view` command.

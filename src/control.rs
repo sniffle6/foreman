@@ -6,13 +6,13 @@
 pub const PIPE: &str = "foreman";
 
 /// This GUI instance's own control pipe name, served alongside [`PIPE`] and
-/// injected into every terminal as `FOREMAN_PIPE`. With several foremans
-/// running at once (installed daily driver + a dev build under test), the
-/// well-known name routes to whichever instance answers first — an agent
-/// inside the dev build could reach the installed host and get "unknown cmd"
-/// for verbs its own host supports. The instance pipe makes in-foreman
-/// clients bind to the host that spawned them, deterministically. Pid + nonce
-/// for uniqueness among live instances (same recipe as the title pipe).
+/// injected into every terminal as `FOREMAN_PIPE`. The well-known name is
+/// bound by the first-launched instance (`create_sync` fails for later ones);
+/// an agent inside a later instance that talked to `PIPE` could reach the
+/// installed host and get "unknown cmd" for verbs its own host supports.
+/// The instance pipe makes in-foreman clients bind to the host that spawned
+/// them, deterministically. Pid + nonce for uniqueness among live instances
+/// (same recipe as the title pipe).
 pub fn instance_pipe() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -312,8 +312,9 @@ pub enum CtrlMsg {
 
 /// Create the pipe listener, retrying briefly: after an update-restart the
 /// old instance can hold the pipe a beat past its window closing, and two
-/// instances launched fast race it. First success wins; None = give up
-/// (dispatch disabled), same behavior as the old one-shot failure.
+/// instances launched fast race the well-known name. First success wins;
+/// None = this instance did not bind that name. Its own terminals still
+/// reach it through [`instance_pipe`] / `FOREMAN_PIPE`.
 fn listen_retry(
     name: interprocess::local_socket::Name<'_>,
     attempts: u32,
@@ -324,7 +325,7 @@ fn listen_retry(
             Ok(l) => return Some(l),
             Err(e) if i + 1 == attempts => {
                 eprintln!(
-                    "control: pipe unavailable after {attempts} attempts ({e}); agent dispatch disabled"
+                    "control: well-known pipe unavailable after {attempts} attempts ({e}); in-foreman CLIs still use FOREMAN_PIPE"
                 );
             }
             Err(_) => std::thread::sleep(delay),
@@ -1170,7 +1171,8 @@ ENVIRONMENT (injected into every foreman-spawned terminal)
   FOREMAN=1            you are inside a foreman terminal
   FOREMAN_EXE          path to this binary — dispatch via & $env:FOREMAN_EXE
   FOREMAN_PROJECT_ID   your project (the default for open/chat)
-  FOREMAN_TERMINAL_ID  your terminal id (the chat sender; required to post)";
+  FOREMAN_TERMINAL_ID  your terminal id (the chat sender; required to post)
+  FOREMAN_PIPE         this instance's control pipe (outside a Session: well-known name)";
 
 const HELP_OPEN: &str = "\
 foreman open [--project P] [--title T] [--cwd D] -- <command...>

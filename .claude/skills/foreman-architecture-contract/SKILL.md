@@ -25,7 +25,7 @@ Outbox, Control plane, Snapshot, Dispatch, Leader, Chord, Keymap). Read
 | Native Rust + `eframe`/`egui` | egui 0.34.3 | "Lag in a program like this makes it DOA" — that's why it's native Rust, not Electron/Tauri (`docs/HANDOFF.md`). egui is an immediate-mode GUI library: the whole UI is re-described in code every frame instead of kept as a retained widget tree. Traps and idioms: see **egui-immediate-mode-reference**. |
 | `alacritty_terminal` | 0.26.0 | Full VT/ANSI terminal emulation — the grid-engine crate extracted from the Alacritty terminal (also used by Zed; general knowledge, not a repo citation). Foreman does not parse escape sequences itself. Domain pack: **terminal-emulation-reference**. |
 | `portable-pty` | 0.9.0 | A PTY (pseudo-terminal) is the OS object a shell believes is its terminal; on Windows the implementation is ConPTY. This crate wraps it. |
-| `interprocess` | 2 | The Control plane transport: a Windows named pipe `\\.\pipe\foreman` (`src/control.rs` `PIPE`). |
+| `interprocess` | 2 | The Control plane transport: well-known pipe `\\.\pipe\foreman` (`src/control.rs` `PIPE`) plus the per-instance `FOREMAN_PIPE` (`instance_pipe`). |
 
 **The `eframe` line carries `default-features = false` and selects glow, and
 that is load-bearing, not a leftover.** eframe prefers wgpu whenever both
@@ -221,13 +221,14 @@ serves it.
 **foreman-chat**):
 
 `foreman <verb>` runs as a second foreman.exe process (subcommand short-circuit
-in `main`) → one JSON line over the named pipe `\\.\pipe\foreman` → `serve`
-accepts and spawns a connection thread → parses into a `CtrlMsg` carrying a
-reply `Sender` and the arrival `Instant` → sends it over mpsc to the GUI and
-calls `ctx.request_repaint()` so an idle render loop wakes NOW → `App::ui`
-drains via `try_recv` → `desktop.handle_ctrl` executes → reply goes back over
-the reply channel → the connection thread's `recv_timeout(REPLY_TIMEOUT)`
-returns it → one JSON line back → the CLI prints and exits.
+in `main`) → one JSON line over `client_pipe()` (`FOREMAN_PIPE` inside a
+Session, else the well-known `PIPE`) → `serve` accepts and spawns a connection
+thread → parses into a `CtrlMsg` carrying a reply `Sender` and the arrival
+`Instant` → sends it over mpsc to the GUI and calls `ctx.request_repaint()` so
+an idle render loop wakes NOW → `App::ui` drains via `try_recv` →
+`desktop.handle_ctrl` executes → reply goes back over the reply channel → the
+connection thread's `recv_timeout(REPLY_TIMEOUT)` returns it → one JSON line
+back → the CLI prints and exits.
 
 The separate Title lane is one-way: a Claude/Codex/Grok `UserPromptSubmit`
 hook inherits `FOREMAN_EXE` and the random `FOREMAN_TITLE_PIPE` from its Session
@@ -294,18 +295,16 @@ Contract riders on that flow (`WindowManager::handle_ctrl`, `src/wm.rs`):
 | No per-Session panic isolation: one panic anywhere in the frame aborts the whole process and kills the entire fleet | `rg catch_unwind src/` returns nothing; the panic logger (`%APPDATA%\foreman\foreman_panic.log`) is post-mortem only | Open. frame.rs's clamp guard removes one panic class, not the blast radius |
 | Chat log is in-memory only — restart/crash wipes it, `#N` cites dangle | `rg "std::fs" src/chat.rs` returns nothing | **Designed, not built**: `docs/chat-persistence.md` (append-only JSONL plan, converged 2026-06-27) |
 | Toolchain is machine-global | rustup default + w64devkit on PATH; nothing pinned in-repo | Open; recreate steps in **foreman-build-and-env** |
-| `docs/HANDOFF.md` drift | HANDOFF.md declares itself authoritative but never mentions frame.rs/geom.rs/caret.rs — one `rg` run per filename over `docs/HANDOFF.md` returns nothing (commands below the table) | Trust map in **foreman-docs-and-writing**; prefer code + this skill for structure |
+| `docs/HANDOFF.md` drift | HANDOFF §2 is a pointer at `src/*.rs`, not a census; feature facts still rot | Trust map in **foreman-docs-and-writing**; prefer code + this skill for structure |
 | Ordinary commits and PRs are ungated by CI | `.github/workflows/release.yml` is the only workflow, and it runs `cargo test` only on `v*` tag pushes, on PRs whose paths touch `release.yml`/`install.ps1`, and on `workflow_dispatch` | Open. Local `cargo test` is the real gate for normal changes — **foreman-validation-and-qa** |
 | WSL blind spots | `Shell::Bash` spawns `wsl.exe`; the process-tree agent scan cannot see inside the WSL VM (`src/proc.rs` module docs), so WSL agents rely on the OSC-title path | Known limitation, documented in proc.rs module docs |
 | Stringly JSON v1 protocol | wire format is one JSON line with a string `cmd` discriminator, matched by hand in `control::serve`; unknown fields silently ignored by serde defaults | Open; protocol details in **foreman-run-and-operate** |
 | Control pipe is same-user trust, a guardrail not a security boundary | "NOT a security boundary — any local process can speak to the pipe and claim any `from`" (`src/control.rs` module docs) | Deliberate scope decision; rationale in **foreman-change-control** |
 
-Re-check the HANDOFF.md drift row (still drifted = every run prints nothing):
+HANDOFF §2 should keep saying it is not a census:
 
 ```
-rg -n "frame\.rs" docs/HANDOFF.md
-rg -n "geom\.rs" docs/HANDOFF.md
-rg -n "caret\.rs" docs/HANDOFF.md
+rg -n "not a census" docs/HANDOFF.md
 ```
 
 ## When NOT to use this skill
