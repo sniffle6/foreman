@@ -49,6 +49,9 @@ workspace.json     → last desktop layout (this feature)
 I/O goes through `config::load_json` / `save_json` (atomic `.tmp` + rename).
 Missing, corrupt, or **future** `version > 1` files load as an empty default
 and never take the app down.
+Malformed files are preserved by the shared config loader in a unique
+`workspace.json.corrupt-<timestamp>-<pid>-<sequence>` backup, with a warning
+toast. If preservation fails, subsequent saves to that path are refused.
 
 ## When it saves
 
@@ -57,7 +60,8 @@ and never take the app down.
    managers bubble dirty up via `poll_workspace_dirty`.
 2. End of frame: if dirty and quiet for **600 ms**
    (`WORKSPACE_SAVE_DEBOUNCE`), capture + write.
-3. Clean quit flushes immediately (`App::flush_workspace` and `on_exit`).
+3. Clean quit and update restart flush pending settings and user-theme edits,
+   then capture the workspace immediately (`App::flush_all` and `on_exit`).
 4. **Empty layout is saved too** — closing every project then quitting must
    not resurrect the previous layout on the next launch.
 

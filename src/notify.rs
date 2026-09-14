@@ -49,6 +49,17 @@ pub struct Notifications {
     ttl: Duration,
 }
 
+/// Queue from nested window managers without threading the App through them.
+pub fn queue(ctx: &egui::Context, level: Level, text: impl Into<String>) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<(Level, String)>>(egui::Id::new(
+            "pending_notifications",
+        ))
+        .push((level, text.into()));
+    });
+    ctx.request_repaint();
+}
+
 impl Notifications {
     pub fn new() -> Self {
         Self {
@@ -99,6 +110,7 @@ impl Notifications {
     /// Prune expired toasts and paint the rest as a top-right overlay. Call once
     /// per frame, after everything else, so toasts sit on top.
     pub fn show(&mut self, ctx: &egui::Context, now: Instant) {
+        self.drain_pending(ctx);
         self.prune(now);
         if self.toasts.is_empty() {
             return;
@@ -143,6 +155,16 @@ impl Notifications {
         }
         // Keep expiry ticking without needing other input (only while live).
         ctx.request_repaint_after(Duration::from_millis(120));
+    }
+
+    pub(crate) fn drain_pending(&mut self, ctx: &egui::Context) {
+        let pending = ctx.data_mut(|data| {
+            data.remove_temp::<Vec<(Level, String)>>(egui::Id::new("pending_notifications"))
+                .unwrap_or_default()
+        });
+        for (level, text) in pending {
+            self.push(level, text);
+        }
     }
 }
 

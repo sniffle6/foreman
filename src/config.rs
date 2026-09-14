@@ -4,12 +4,63 @@
 //! `load_json`/`save_json` for any new flat config rather than hand-rolling the
 //! dir-resolve + serde + fallback dance again.
 //!
-//! (`keybindings.json` in `keymap.rs` is the older, hand-rolled precedent; the
+//! Keybindings use this layer before merging over their defaults. The
 //! append-only chat log in `docs/chat-persistence.md` is a *different* problem —
-//! a growing event log, not a settings bag — and intentionally does not use this.)
+//! a growing event log, not a settings bag — and intentionally does not use this.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
+
+#[derive(Default)]
+struct LoadRecovery {
+    warnings: Vec<String>,
+    protected: std::collections::HashSet<PathBuf>,
+}
+
+static LOAD_RECOVERY: std::sync::LazyLock<std::sync::Mutex<LoadRecovery>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LoadRecovery::default()));
+
+/// Startup loads happen before the GUI exists; App drains these into toasts.
+pub fn take_load_warnings() -> Vec<String> {
+    std::mem::take(
+        &mut LOAD_RECOVERY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .warnings,
+    )
+}
+
+fn load_warning(path: &std::path::Path, message: String, protect: bool) {
+    eprintln!("foreman: {message}");
+    let mut recovery = LOAD_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
+    if protect {
+        recovery.protected.insert(path.to_path_buf());
+    }
+    recovery.warnings.push(message);
+}
+
+fn backup_invalid(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(
+        ".corrupt-{timestamp}-{}-{sequence}",
+        std::process::id()
+    ));
+    let backup = PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(backup)
+}
 
 /// Default terminal text size, in egui points. The size every pane starts at and
 /// what Ctrl+0 resets to.
@@ -48,31 +99,63 @@ pub fn themes_dir() -> Option<PathBuf> {
 }
 
 /// Load a JSON config file from `dir`. Tolerant by design: a missing file, an
-/// unreadable file, or invalid JSON all fall back to `T::default()` (with a
-/// stderr warning for the non-missing cases). Never panics — a bad config must
-/// not take the app down. [`load_json`] is the `config_dir()` flavor.
+/// unreadable file, or invalid JSON all fall back to `T::default()`. Invalid
+/// bytes are backed up before defaults may be saved; failed reads or backups
+/// protect the original from writes. Warnings are queued for the GUI.
+/// [`load_json`] is the `config_dir()` flavor.
 pub fn load_json_from<T: DeserializeOwned + Default>(dir: &std::path::Path, file: &str) -> T {
     let path = dir.join(file);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
         Err(e) => {
-            eprintln!(
-                "foreman: could not read {}: {} — using defaults",
-                path.display(),
-                e
+            load_warning(
+                &path,
+                format!(
+                    "Could not read {}: {e}. Using defaults; saves to this file are disabled until it loads successfully.",
+                    path.display()
+                ),
+                true,
             );
             return T::default();
         }
     };
-    match serde_json::from_str(&text) {
-        Ok(v) => v,
+    match serde_json::from_slice(&text) {
+        Ok(v) => {
+            LOAD_RECOVERY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .protected
+                .remove(&path);
+            v
+        }
         Err(e) => {
-            eprintln!(
-                "foreman: {} is invalid JSON: {} — using defaults",
-                path.display(),
-                e
-            );
+            match backup_invalid(&path, &text) {
+                Ok(backup) => {
+                    LOAD_RECOVERY
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .protected
+                        .remove(&path);
+                    load_warning(
+                        &path,
+                        format!(
+                            "{} is invalid: {e}. Using defaults. Original saved to {}.",
+                            path.display(),
+                            backup.display()
+                        ),
+                        false,
+                    );
+                }
+                Err(backup_error) => load_warning(
+                    &path,
+                    format!(
+                        "{} is invalid: {e}. Using defaults, but backup failed: {backup_error}. Saves to this file are disabled until it loads successfully.",
+                        path.display()
+                    ),
+                    true,
+                ),
+            }
             T::default()
         }
     }
@@ -88,6 +171,17 @@ pub fn save_json_in<T: Serialize>(
     value: &T,
 ) -> Result<(), String> {
     let path = dir.join(file);
+    if LOAD_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .protected
+        .contains(&path)
+    {
+        return Err(format!(
+            "refusing to overwrite unpreserved config {}",
+            path.display()
+        ));
+    }
     let tmp = dir.join(format!("{file}.tmp"));
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| format!("could not serialize {file}: {e}"))?;
@@ -336,6 +430,46 @@ pub fn live(ctx: &eframe::egui::Context) -> std::sync::Arc<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_backup_prevents_overwrite_until_a_valid_file_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        // The original fits a filesystem component; its backup suffix cannot.
+        let filename = format!("{}.json", "a".repeat(230));
+        let path = dir.path().join(&filename);
+        let original = br#"{"font_size":"13"}"#;
+        std::fs::write(&path, original).unwrap();
+        let defaults: Settings = load_json_from(dir.path(), &filename);
+        let error = save_json_in(dir.path(), &filename, &defaults).unwrap_err();
+        assert!(error.contains("refusing to overwrite unpreserved config"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        // A deliberate external repair and reload lifts protection.
+        std::fs::write(&path, br#"{"font_size":17}"#).unwrap();
+        let repaired: Settings = load_json_from(dir.path(), &filename);
+        assert_eq!(repaired.font_size, 17.0);
+        save_json_in(dir.path(), &filename, &repaired).unwrap();
+    }
+
+    #[test]
+    fn wrong_typed_settings_survive_a_default_save_in_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = br#"{"font_size":"13","bell":false}"#;
+        std::fs::write(dir.path().join("settings.json"), original).unwrap();
+        let settings: Settings = load_json_from(dir.path(), "settings.json");
+        assert_eq!(settings.font_size, DEFAULT_FONT_SIZE);
+        save_json_in(dir.path(), "settings.json", &settings).unwrap();
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.corrupt-")
+            })
+            .expect("invalid settings must be preserved before defaults can replace them");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), original);
+    }
 
     #[test]
     fn json_helpers_round_trip_in_an_arbitrary_dir() {

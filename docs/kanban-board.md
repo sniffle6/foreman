@@ -17,6 +17,10 @@ sibling — read those for *why*, this doc for *how*.
   project cwd whose prompt embeds the card body and the exact close-out
   commands, then claims the card and moves it to In Progress in the same
   action — a card-spawned agent never runs `start` itself.
+  Failed board actions show an error toast. A failed spawn leaves the card
+  unchanged; if claiming fails after spawning, Foreman closes the new Session.
+  Command shims that cannot accept the multiline card prompt report that
+  limitation and suggest installing a native executable.
 - **Derived orphan detection**: a card is orphaned when it is In Progress but
   its claim no longer checks out — wrong app run, or the claimed terminal is
   gone or exited. Orphan state is recomputed every frame and exists nowhere in
@@ -69,6 +73,10 @@ foreman kanban wait <id> | --any [--timeout SECS]
 human), `2` timeout or foreman unreachable. `foreman kanban --help` is ground
 truth for flags. Agents not spawned from a card learn all of this from the
 embedded **foreman-kanban** skill.
+
+Host errors also exit `2`. Busy and no-response replies retry until the wait
+deadline; other host errors exit immediately. Only card-state verdicts produce
+exit `1`, so temporary host load does not masquerade as a blocked Card.
 
 **Transitions** are enforced identically for CLI and board: claims move
 Backlog/Blocked cards to In Progress; `start` on a card with a live claim is

@@ -172,8 +172,18 @@ fn read_event_bytes(reader: &mut impl Read, timeout: Duration) -> Option<Vec<u8>
         }
         let chunk = remaining.min(buffer.len());
         match reader.read(&mut buffer[..chunk]) {
-            Ok(0) => return Some(bytes),
-            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            // Windows PIPE_NOWAIT maps an empty, still-connected pipe to
+            // Ok(0), just like EOF. Only a complete event ends this read.
+            Ok(0) => std::thread::sleep(Duration::from_millis(2)),
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.len() as u64 > INPUT_BYTES {
+                    return None;
+                }
+                if serde_json::from_slice::<TitlePromptEvent>(&bytes).is_ok() {
+                    return Some(bytes);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return None;
@@ -320,6 +330,40 @@ mod tests {
     }
 
     #[test]
+    fn connected_client_can_delay_its_first_write() {
+        let pipe = new_pipe_name();
+        let listener = ListenerOptions::new()
+            .name(pipe.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut connection = listener.accept().unwrap();
+            connection.set_nonblocking(true).unwrap();
+            started_tx.send(()).unwrap();
+            read_event_bytes(&mut connection, READ_TIMEOUT)
+        });
+        let mut client = ConnectOptions::new()
+            .name(pipe.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .connect_sync()
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let event = TitlePromptEvent {
+            source_agent: SourceAgent::Codex,
+            vendor_session_id: "delayed-session".into(),
+            transcript_path: None,
+            project_id: Some("p3".into()),
+            terminal_id: "t8".into(),
+            prompt: "fix delayed delivery".into(),
+        };
+        let payload = serde_json::to_vec(&event).unwrap();
+        // The broken reader may already have closed the connection.
+        let _ = client.write_all(&payload);
+        assert_eq!(server.join().unwrap(), Some(payload));
+    }
+
+    #[test]
     fn one_way_pipe_round_trip_preserves_routing_identity() {
         let pipe = new_pipe_name();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -333,27 +377,45 @@ mod tests {
             terminal_id: "t8".into(),
             prompt: "trace the rendering regression".into(),
         };
-        // A successful write is not a delivery acknowledgement: this passive
-        // lane intentionally drops attempts when its reader misses a deadline
-        // under load. Retry the attempt until the GUI queue observes it, rather
-        // than treating a connected pipe as proof of receipt. Keep one overall
-        // deadline so missing listeners and lost attempts fail the same way.
+        // Retry only connection establishment while the listener binds. Once
+        // connected, send exactly one event: ordinary delivery must not race.
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let _ = send_event(&pipe, &event);
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(received) => {
-                    assert_eq!(received, event);
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("listener stopped"),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+        let mut connection = loop {
+            if let Ok(connection) = ConnectOptions::new()
+                .name(pipe.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+                .connect_sync()
+            {
+                break connection;
             }
-            assert!(
-                Instant::now() < deadline,
-                "listener never delivered the event"
-            );
+            assert!(Instant::now() < deadline, "listener never bound");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        serde_json::to_writer(&mut connection, &event).unwrap();
+        connection.flush().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), event);
+    }
+
+    #[test]
+    fn partial_event_survives_empty_reads_and_incomplete_eof_times_out() {
+        struct PausedChunks {
+            chunks: std::collections::VecDeque<Vec<u8>>,
         }
+        impl Read for PausedChunks {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let chunk = self.chunks.pop_front().unwrap_or_default();
+                buffer[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+        let payload = br#"{"source_agent":"codex","vendor_session_id":"s1","terminal_id":"t1","prompt":"fix it"}"#;
+        let mut reader = PausedChunks {
+            chunks: [payload[..30].to_vec(), vec![], payload[30..].to_vec()].into(),
+        };
+        assert_eq!(
+            read_event_bytes(&mut reader, READ_TIMEOUT),
+            Some(payload.to_vec())
+        );
+        assert!(read_event_bytes(&mut &payload[..30], Duration::from_millis(20)).is_none());
     }
 
     #[test]

@@ -1519,12 +1519,28 @@ fn kanban_stale_host_hint(err: String) -> String {
 
 /// Client-side poll loop for `foreman kanban wait`: repeated `list --json`
 /// requests, verdict decided by the pure [`crate::kanban::wait_verdict`].
-/// Never a held pipe connection — the server is serial, so a blocking wait
-/// would wedge dispatch for every other agent.
+/// Never a held pipe connection: polling releases the server's bounded
+/// connection slots between replies.
 fn kanban_wait(
     project: Option<String>,
     target: crate::kanban::WaitTarget,
     timeout: Option<u64>,
+) -> i32 {
+    kanban_wait_with(
+        project,
+        target,
+        timeout,
+        |req| request(&client_pipe(), req),
+        std::thread::sleep,
+    )
+}
+
+fn kanban_wait_with(
+    project: Option<String>,
+    target: crate::kanban::WaitTarget,
+    timeout: Option<u64>,
+    mut poll: impl FnMut(&KanbanRequest) -> std::io::Result<OpenReply>,
+    mut sleep: impl FnMut(std::time::Duration),
 ) -> i32 {
     let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let mut watched = std::collections::HashSet::new();
@@ -1536,7 +1552,7 @@ fn kanban_wait(
             json: true,
             ..Default::default()
         };
-        match request(&client_pipe(), &req) {
+        match poll(&req) {
             // Spec exit-code contract: 2 = timeout or foreman unreachable
             // (deliberately different from other verbs' unreachable=1).
             Err(e) => {
@@ -1544,11 +1560,15 @@ fn kanban_wait(
                 return 2;
             }
             Ok(r) if !r.ok => {
-                eprintln!(
-                    "foreman kanban wait: {}",
-                    kanban_stale_host_hint(r.error.unwrap_or_default())
+                let error = r.error.unwrap_or_default();
+                let retryable = matches!(
+                    error.as_str(),
+                    "foreman did not respond" | "foreman: control server busy"
                 );
-                return 1;
+                eprintln!("foreman kanban wait: {}", kanban_stale_host_hint(error));
+                if !retryable {
+                    return 2;
+                }
             }
             Ok(r) => {
                 let cards: Vec<crate::kanban::CardLine> = r
@@ -1566,8 +1586,10 @@ fn kanban_wait(
             eprintln!("foreman kanban wait: timeout");
             return 2;
         }
-        std::thread::sleep(std::time::Duration::from_secs(2)); // client-side poll: the pipe
-        // server is serial; a held connection would wedge dispatch for every agent (spec).
+        let interval = std::time::Duration::from_secs(2);
+        sleep(deadline.map_or(interval, |d| {
+            interval.min(d.saturating_duration_since(std::time::Instant::now()))
+        }));
     }
 }
 
@@ -1650,6 +1672,47 @@ mod tests {
         // …and a v1 reply without the key still parses.
         let r: OpenReply = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(r.id, None);
+    }
+
+    #[test]
+    fn kanban_wait_host_errors_never_mean_a_card_needs_a_human() {
+        for error in [
+            "foreman did not respond",
+            "foreman: control server busy",
+            "project has no working directory",
+        ] {
+            let code = kanban_wait_with(
+                None,
+                crate::kanban::WaitTarget::Any,
+                Some(0),
+                |_| Ok(OpenReply::err(error)),
+                |_| panic!("deadline already elapsed"),
+            );
+            assert_eq!(code, 2, "{error}");
+        }
+    }
+
+    #[test]
+    fn kanban_wait_retries_transient_host_replies() {
+        for error in ["foreman did not respond", "foreman: control server busy"] {
+            let mut polls = 0;
+            let code = kanban_wait_with(
+                None,
+                crate::kanban::WaitTarget::Any,
+                None,
+                |_| {
+                    polls += 1;
+                    Ok(OpenReply::err(if polls == 1 {
+                        error
+                    } else {
+                        "project has no working directory"
+                    }))
+                },
+                |_| {},
+            );
+            assert_eq!(polls, 2, "{error}");
+            assert_eq!(code, 2);
+        }
     }
 
     #[test]

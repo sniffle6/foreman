@@ -10,8 +10,12 @@ setting instead of hand-rolling file I/O again.
 - `config_dir()` → `%APPDATA%\foreman` (created if missing). `None` only if
   `APPDATA` is unset.
 - `load_json::<T>(file)` → reads a JSON file from that dir. Missing file, bad
-  file, or invalid JSON all fall back to `T::default()` (with a stderr warning
-  for the bad cases). **Never panics** — a corrupt config can't crash the app.
+  file, or invalid JSON all fall back to `T::default()`. Invalid files, including
+  wrong-typed fields and invalid UTF-8, are copied byte-for-byte to a unique
+  `<file>.corrupt-<timestamp>-<pid>-<sequence>` sibling before defaults can be
+  saved. A warning toast names the backup. If reading or backup creation fails,
+  saves to that path are refused until a subsequent load succeeds or preserves
+  the original. **Never panics** — a corrupt config can't crash the app.
 - `save_json(file, &value)` → writes JSON **atomically** (write a `.tmp`, then
   rename over the real file). A crash mid-write leaves the old good file intact.
 - `Settings` → the actual app-settings struct, saved to
@@ -63,6 +67,9 @@ Read with `Settings::load()`, write with `settings.save()`. That's it.
 - **Don't save on a hot path.** `save_json` touches disk. The font-zoom caller
   debounces (writes once ~400ms after the last change), not once per scroll
   notch. Do the same for anything that changes rapidly.
+  Clean quit and update restart flush pending settings and user-theme edits
+  immediately, then save the workspace. The built-in theme is never written.
+  Explicit quit paths read back this frame's live edits before flushing.
 - **This is for settings, not logs.** A growing append-only log (e.g. the chat
   history in `docs/chat-persistence.md`) is a different problem — JSONL, one line
   per event — and intentionally does not go through here.
@@ -70,9 +77,9 @@ Read with `Settings::load()`, write with `settings.save()`. That's it.
   lives in `%APPDATA%\foreman\workspace.json` — see
   `docs/workspace-persistence.md`. Do not add layout fields to `Settings`; the
   panel prefs above stay here so wipe-layout and wipe-prefs stay independent.
-- `keybindings.json` still uses its own older code (it has bespoke merge-over-
-  defaults semantics). Fine to leave; migrate it onto `config_dir()` /
-  `save_json` opportunistically if you touch it.
+- `keybindings.json` uses the same protected load and atomic save helpers.
+  Its parsed overrides still merge over defaults so new commands retain their
+  default bindings when loading an older file.
 
 ## Key files
 
@@ -81,4 +88,4 @@ Read with `Settings::load()`, write with `settings.save()`. That's it.
   `FONT_ZOOM_STEP`).
 - `src/main.rs` — `App` owns a `Settings`, loads it at startup, and saves it
   (debounced) when the live font size changes.
-- `src/keymap.rs` — the older hand-rolled precedent this generalizes.
+- `src/keymap.rs` — merges the protected config load over default bindings.

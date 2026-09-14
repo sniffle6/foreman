@@ -270,6 +270,27 @@ impl App {
         self.workspace_dirty_at = None;
     }
 
+    fn flush_all(&mut self) {
+        let (settings, theme) = pending_preferences(
+            self.font_dirty_at,
+            self.theme_dirty_at,
+            &self.active_theme_name,
+        );
+        if settings {
+            if let Err(e) = self.settings.save() {
+                eprintln!("foreman: could not save settings: {e}");
+            }
+            self.font_dirty_at = None;
+        }
+        if theme {
+            if let Err(e) = self.active_theme.save(&self.active_theme_name) {
+                eprintln!("foreman: could not save theme: {e}");
+            }
+        }
+        self.theme_dirty_at = None;
+        self.flush_workspace();
+    }
+
     fn drain_title_events(&mut self) -> bool {
         let mut activity = false;
         while let Ok(event) = self.title_events.try_recv() {
@@ -398,7 +419,7 @@ impl App {
         if self.force_quit {
             return;
         }
-        self.flush_workspace();
+        self.flush_all();
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
@@ -952,19 +973,6 @@ impl eframe::App for App {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if self.desktop.take_quit_confirmed() {
-            self.flush_workspace();
-            self.force_quit = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        // Closing the last project quits the app — an empty desktop is a dead
-        // end, and terminal emulators (tmux, Windows Terminal) exit with their
-        // last session. `deserted` stays false while the dir picker or the
-        // settings modal is up, so a project being created mid-modal survives.
-        if self.started && !self.landing_enabled && self.desktop.deserted() {
-            self.flush_workspace();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
         // Capture any zoom a pane applied this frame (Ctrl+Scroll / Ctrl+0) and
         // panel collapse/width, persist after a debounce so a scroll/drag
         // gesture writes the file once.
@@ -1066,6 +1074,17 @@ impl eframe::App for App {
                 self.flush_workspace();
             }
         }
+        // Read back this frame's preferences before any explicit quit flush.
+        if self.desktop.take_quit_confirmed() {
+            self.flush_all();
+            self.force_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // `deserted` stays false while a project picker or settings is open.
+        if self.started && !self.landing_enabled && self.desktop.deserted() {
+            self.flush_all();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Deliver chat now that every Session has pumped this frame: the room
         // reconciles presence and injects each ready member's missed posts (a
         // just-spawned member that wasn't ready when a post arrived gets it on
@@ -1079,6 +1098,9 @@ impl eframe::App for App {
         self.show_os_chrome(&ctx);
 
         // Transient toasts, on top of everything (chrome included).
+        for warning in config::take_load_warnings() {
+            self.notify.push(notify::Level::Warning, warning);
+        }
         self.notify.show(&ctx, std::time::Instant::now());
 
         // Adaptive repaint cadence. The real fast paths are all event-driven and
@@ -1113,7 +1135,7 @@ impl eframe::App for App {
     /// glow build's trait method takes the context and the wgpu build's does
     /// not. This is the only foreman signature the backend switch touches.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.flush_workspace();
+        self.flush_all();
     }
 }
 
@@ -1462,9 +1484,38 @@ mod crash_log_tests {
     }
 }
 
+fn pending_preferences(
+    settings_dirty: Option<std::time::Instant>,
+    theme_dirty: Option<std::time::Instant>,
+    theme_name: &str,
+) -> (bool, bool) {
+    (
+        settings_dirty.is_some(),
+        theme_dirty.is_some() && !theme::Theme::is_builtin(theme_name),
+    )
+}
+
 #[cfg(test)]
 mod app_logic_tests {
     use super::*;
+
+    #[test]
+    fn quitting_flushes_recent_preferences_without_waiting_for_debounce() {
+        let just_edited = Some(std::time::Instant::now());
+        assert_eq!(
+            pending_preferences(just_edited, just_edited, "My theme"),
+            (true, true)
+        );
+        assert_eq!(
+            pending_preferences(None, just_edited, config::DEFAULT_THEME),
+            (false, false)
+        );
+        assert_eq!(pending_preferences(None, None, "My theme"), (false, false));
+        assert_eq!(
+            pending_preferences(just_edited, None, config::DEFAULT_THEME),
+            (true, false)
+        );
+    }
 
     #[test]
     fn background_service_answers_control_requests_without_a_ui_pass() {

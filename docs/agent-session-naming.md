@@ -40,6 +40,12 @@ prior title from a bounded transcript prefix. At most 3,800 user-prompt
 characters plus the prior title reach the selected provider. A Claude Session
 may therefore be named by Codex or Grok, and vice versa.
 
+The listener waits for a complete JSON event within its read deadline. On
+Windows, an empty nonblocking named-pipe read also looks like EOF, so it is
+retried while the client has time remaining. Delayed first writes and gaps
+between chunks do not discard an event. Stalled or disconnected clients still
+release their slot at the deadline; overload remains best-effort delivery.
+
 The worker runs in the empty `%APPDATA%\foreman\title-namer` directory so the
 naming CLI does not discover or inspect the active repository. Tools, approvals,
 session persistence, and repository rules are disabled where the CLI supports

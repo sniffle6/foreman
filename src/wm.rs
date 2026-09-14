@@ -2067,22 +2067,38 @@ impl WindowManager {
             match act {
                 crate::board::BoardAct::QuickAdd(title) => {
                     if let Err(e) = self.kanban.borrow_mut().add(&title, None) {
-                        eprintln!("board: quick-add failed: {e}");
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: quick-add failed: {e}"),
+                        );
                     }
                 }
                 crate::board::BoardAct::Done(id) => {
                     if let Err(e) = self.kanban.borrow_mut().done(&id) {
-                        eprintln!("board: done failed for {id}: {e}");
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: done failed for {id}: {e}"),
+                        );
                     }
                 }
                 crate::board::BoardAct::Release(id) => {
                     if let Err(e) = self.kanban.borrow_mut().release(&id) {
-                        eprintln!("board: release failed for {id}: {e}");
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: release failed for {id}: {e}"),
+                        );
                     }
                 }
                 crate::board::BoardAct::Rm(id) => {
                     if let Err(e) = self.kanban.borrow_mut().rm(&id) {
-                        eprintln!("board: rm failed for {id}: {e}");
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: rm failed for {id}: {e}"),
+                        );
                     }
                 }
                 crate::board::BoardAct::JumpTo(tag) => {
@@ -2113,7 +2129,11 @@ impl WindowManager {
                 }
                 crate::board::BoardAct::Dispatch { id, agent } => {
                     let Some(card) = self.kanban.borrow().get(&id).cloned() else {
-                        eprintln!("board: dispatch on missing card {id}");
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: dispatch on missing card {id}"),
+                        );
                         continue;
                     };
                     let prompt =
@@ -2150,7 +2170,11 @@ impl WindowManager {
                                 existing_term,
                             );
                             if let Err(e) = claimed {
-                                eprintln!("board: dispatch claim failed for {id}: {e}");
+                                crate::notify::queue(
+                                    ctx,
+                                    crate::notify::Level::Error,
+                                    format!("board: dispatch claim failed for {id}: {e}"),
+                                );
                                 // Open-undo: the card was closed out (or
                                 // re-claimed) mid-frame — close the terminal
                                 // we just spawned rather than leave an
@@ -2161,7 +2185,21 @@ impl WindowManager {
                                 }
                             }
                         }
-                        Err(e) => eprintln!("board: dispatch spawn failed for {id}: {e}"),
+                        Err(e) => {
+                            eprintln!("board: dispatch spawn failed for {id}: {e}");
+                            let detail = if e.to_string().contains("runs via a cmd-shim") {
+                                format!(
+                                    "{agent} could not start directly. Install a native executable; command shims cannot carry the card's multiline prompt."
+                                )
+                            } else {
+                                e.to_string()
+                            };
+                            crate::notify::queue(
+                                ctx,
+                                crate::notify::Level::Error,
+                                format!("board: dispatch spawn failed for {id}: {detail}"),
+                            );
+                        }
                     }
                 }
             }
@@ -12804,6 +12842,39 @@ mod tests {
         };
         v.acts.push(act);
         bid
+    }
+
+    #[test]
+    fn board_dispatch_spawn_failure_reaches_the_notification_center() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("Failed dispatch".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        push_board_act(
+            child,
+            crate::board::BoardAct::Dispatch {
+                id: id.clone(),
+                agent: tmp
+                    .path()
+                    .join("missing-agent.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        );
+        let before = child.windows.len();
+        child.drain_board_acts(&ctx);
+        assert_eq!(child.windows.len(), before);
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::Backlog
+        );
+        let mut notifications = crate::notify::Notifications::new();
+        notifications.drain_pending(&ctx);
+        assert!(notifications.contains_text(&format!("dispatch spawn failed for {id}")));
     }
 
     #[test]

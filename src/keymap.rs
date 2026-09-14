@@ -396,42 +396,21 @@ impl Keymap {
     /// Load from `%APPDATA%\foreman\keybindings.json`, merged over the defaults.
     ///
     /// Missing file → defaults (silent, the common case). Unreadable or
-    /// unparseable file → defaults plus a clear stderr warning. The app never
-    /// crashes on a bad config.
+    /// unparseable file → defaults plus a warning toast. The shared config
+    /// loader preserves invalid bytes before a later edit can replace them.
     pub fn load() -> Self {
+        let Some(dir) = crate::config::config_dir() else {
+            return Self::default();
+        };
+        Self::load_from(&dir)
+    }
+
+    fn load_from(dir: &std::path::Path) -> Self {
         let mut km = Self::default();
-
-        let Ok(appdata) = std::env::var("APPDATA") else {
-            // No APPDATA (extremely unusual on Windows) — just use defaults.
-            return km;
-        };
-        let path = std::path::Path::new(&appdata)
-            .join("foreman")
-            .join("keybindings.json");
-
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return km, // no file: defaults
-            Err(e) => {
-                eprintln!(
-                    "foreman: could not read keybindings {}: {} — using defaults",
-                    path.display(),
-                    e
-                );
-                return km;
-            }
-        };
-
-        match serde_json::from_str::<KeymapFile>(&text) {
-            Ok(file) => km.merge(file),
-            Err(e) => {
-                eprintln!(
-                    "foreman: keybindings {} is invalid JSON: {} — using defaults",
-                    path.display(),
-                    e
-                );
-            }
-        }
+        km.merge(crate::config::load_json_from::<KeymapFile>(
+            dir,
+            "keybindings.json",
+        ));
         km
     }
 
@@ -843,13 +822,22 @@ mod tests {
 
     #[test]
     fn malformed_json_falls_back_to_defaults() {
-        // We can't easily point load() at a temp path (it reads APPDATA), but we
-        // can prove the merge/parse contract: bad JSON does not parse, so a
-        // freshly-defaulted keymap is what callers keep.
-        let parsed = serde_json::from_str::<KeymapFile>("{ this is not json ]");
-        assert!(parsed.is_err());
-        let km = Keymap::default();
-        assert!(km.resolve(Chord::new(K::C, false, false, false)).is_some());
+        let dir = tempfile::tempdir().unwrap();
+        let original = br#"{"bindings":[{"key":"NotAKey","command":"Help"}]}"#;
+        std::fs::write(dir.path().join("keybindings.json"), original).unwrap();
+        let km = Keymap::load_from(dir.path());
+        assert_eq!(km, Keymap::default());
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("keybindings.json.corrupt-")
+            })
+            .expect("invalid keybindings are backed up");
+        assert_eq!(std::fs::read(backup.path()).unwrap(), original);
     }
 
     #[test]
