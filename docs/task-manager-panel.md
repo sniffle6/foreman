@@ -1,6 +1,7 @@
 # Task-manager panel
 
-Desktop right-edge panel listing every project and its terminal/chat tabs.
+Desktop panel listing every project and its terminal/chat tabs. Docks to any
+edge; default is the right.
 Click a row to focus/restore; click the already-focused visible row again to
 minimize (taskbar-style). Hover for explicit minimize and close. Fully replaces
 the old bottom-left minimize chips.

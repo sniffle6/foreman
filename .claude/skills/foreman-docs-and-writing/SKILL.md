@@ -30,7 +30,9 @@ genuinely matters to a point you are making, cite the command that derives it �
 
 **Half of this rule is enforced, so you will hear about it.** A PostToolUse hook,
 `.claude/hooks/cite-guard.ps1`, runs after every `.md` edit under `.claude/skills/`,
-`.codex/skills/`, `.claude/agents/` and `docs/`, and reports two things: a
+`.codex/skills/`, `.claude/agents/` and `docs/` — except `docs/superpowers/*`,
+`docs/epics/*`, `docs/plans/*`, and date-named docs (`docs/YYYY-MM-DD-*.md`),
+which the script exempts. It reports two things: a
 `src/foo.rs:NNN` cite into a module that actually exists, and a backticked symbol
 named beside a `src/*.rs` path that has zero hits in the tree. It derives the
 symbols from your text rather than checking a list of known-dead names — a list
@@ -83,7 +85,7 @@ invalidates one section instead of the whole file.
 |---|---|---|
 | `CLAUDE.md` | **Router, not a library** (thinned 2026-08-24) | Deliberately minimal: identity, the destructive gotchas, the structural invariants, a skill routing table, working agreement. It carries no build loop, no gotcha dictionary, no module map — those live in skills and `docs/HANDOFF.md`. Rationale + the don't-re-fatten rule: `docs/agents/context-layout.md`. |
 | `AGENTS.md` | Codex counterpart, same router shape (thinned 2026-08-24) | Mirrors CLAUDE.md's structure but routes by **file path** into `.claude/skills/`, since Codex does not get skill descriptions auto-injected. Carries the Codex-only sections with no other home: why `.claude/skills/` is readable by Codex, and the paired skill-copy rules. Adding a project skill means adding a row to **both** tables. |
-| `docs/HANDOFF.md` | Authoritative deep doc (CLAUDE.md: "HANDOFF.md wins on any conflict") | **Trust section-by-section**, and check §2's "Architecture / files" against `ls src/*.rs` — that list is the single complete module map and it drifts whenever a module is added. |
+| `docs/HANDOFF.md` | Authoritative deep doc (CLAUDE.md: "HANDOFF.md wins on any conflict") | **Trust section-by-section**. §2's "Architecture / files" is a pointer at `src/*.rs` plus a few facts the `//!` one-liners do not carry — not a census. |
 | `CONTEXT.md` | **Glossary of record** (ubiquitous language) | Glossary ONLY, by its own charter (stated in its opening lines). |
 | `docs/adr/` | Numbered architecture decision records | The decision + its rejected alternatives. Long-lived: an ADR is superseded by a later ADR, never edited to match new reality. |
 | `docs/<feature>.md` | Subsystem feature docs — one per subsystem, `ls docs/*.md` for the live set | Generally current. Spot-check by grepping the symbols the doc's "Key files" section names; if a named symbol is gone, the doc is describing deleted code. |
@@ -167,13 +169,12 @@ Get-ChildItem src/*.rs | Select-String -Pattern "compose_zone|snap_or_tab" | Sel
 - [ ] New named seam? Add a CONTEXT.md glossary entry (below).
 - [ ] Project skill added/renamed? Add a row to the routing table in **both**
       `CLAUDE.md` (by skill name) and `AGENTS.md` (by `SKILL.md` path).
-- [ ] Module added/renamed? Update the `docs/HANDOFF.md` §2 "Architecture /
-      files" list — **not** CLAUDE.md. CLAUDE.md carries no module map by
-      design (`docs/agents/context-layout.md`); adding one line "just this once"
-      is exactly how it bloated to the size that forced the 2026-08-24 thinning.
-- [ ] Touched an **embedded** skill (`foreman-dispatch`, `foreman-chat`,
-      `foreman-icat`)? Sync the `.codex/skills` twin, its `agents/openai.yaml`,
-      and **rebuild** — see Skill maintenance.
+- [ ] Module added/renamed? Do **not** add a census line to HANDOFF or
+      CLAUDE.md. The map is `src/*.rs` plus each file's `//!`. CLAUDE.md
+      carries no module map by design (`docs/agents/context-layout.md`).
+- [ ] Touched an **embedded** skill (the `include_str!` list in
+      `src/skills_install.rs`)? Sync the `.codex/skills` twin, its
+      `agents/openai.yaml`, and **rebuild** — see Skill maintenance.
 
 ## Supersession discipline
 
@@ -239,15 +240,17 @@ Read the live convention rather than trusting a list: `git log --oneline -40`.
 
 ## Skill maintenance
 
-Repo skills live in `.claude/skills/`. Four of them are **twinned** into
-`.codex/skills/`: `foreman-dispatch`, `foreman-chat`, `foreman-icat`, and
-`build-screenshot`. Three of those four are **embedded in the exe**:
-`foreman-dispatch`, `foreman-chat`, `foreman-icat` — `build-screenshot` is not.
-Derive the embed list, never trust a list written down:
+Repo skills live in `.claude/skills/`. A subset is **twinned** into
+`.codex/skills/` and a subset of *that* is **embedded in the exe**. Derive
+both lists; never trust an enumeration written down here:
 
 ```powershell
 Select-String -Path src/skills_install.rs -Pattern 'include_str!'
+Get-ChildItem .codex/skills -Directory | Select-Object -ExpandProperty Name
 ```
+
+`build-screenshot` is twinned but not embedded — confirm against those two
+commands rather than this sentence.
 
 | Rule | Detail |
 |---|---|
@@ -294,7 +297,7 @@ than no check at all.
 | Claim | Re-verify with |
 |---|---|
 | The embedded-skill list drives the rebuild rule | `Select-String -Path src/skills_install.rs -Pattern 'include_str!'` — the file list it prints IS the answer |
-| HANDOFF §2's module map still covers the tree | `(Get-ChildItem src/*.rs).Name` vs `Select-String -Path docs/HANDOFF.md -Pattern 'src/\w+\.rs'` — compare the two sets |
+| HANDOFF §2 is still a pointer, not a census | `Select-String -Path docs/HANDOFF.md -Pattern 'not a census'` — a missing hit means someone rebuilt the file list |
 | CLAUDE.md has not been re-fattened (routing only) | `(Get-Content CLAUDE.md).Count` — over ~110 lines means something belongs in a skill |
 | Epic status headers lag | `Get-Content docs/epics/keyboard-control-epic.md -TotalCount 4` vs `Test-Path src/keymap.rs` |
 | The "@" commit incident | `git show 37687b5 --no-patch --format=%B` |

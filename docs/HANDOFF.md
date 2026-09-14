@@ -5,8 +5,9 @@ the current state, the build/verify loop, the gotchas that already cost hours, a
 the next phases. Paths are relative to the repo root (the `foreman` directory,
 wherever you cloned it).
 
-Companion: `docs/foreman.md` (user-facing narrative notes) — treat this file as
-authoritative on any conflict.
+Historical companion: `docs/foreman.md` — banner at the top; only the tiling
+section near the end is current. Treat this file as authoritative on any
+conflict, and still verify claims against `src/`.
 
 ---
 
@@ -58,7 +59,8 @@ as distinct.
     floats. Drag a header to tear a tile out; while dragging, leaf edges show
     split hints, leaf centers tab-merge, area edge bands split the root.
     Leader `WASD` moves within the tree, `Alt+WASD` splits, `F`/`Ctrl+F`
-    toggles float. New windows tile by default (chat viewer stays floating).
+    toggles float. New terminals and projects tile by default; PTY-less
+    viewers (chat, board, settings, image) open floating via `push_win`.
     Full doc: `docs/tiling-tree.md`.
   - **Zoom (tmux-style)**: `Z` / titlebar max renders the window full-area on
     top; the tree underneath is untouched (`WindowManager.zoomed`).
@@ -86,73 +88,36 @@ as distinct.
 Machine Platform" + BIOS virtualization). Not an app bug; cmd/powershell are fine.
 
 ### Architecture / files
-- `src/main.rs` — eframe `App`; hosts the desktop `WindowManager` full-bleed.
-  Closing the last project quits (`WindowManager::deserted`); an open
-  picker/settings modal holds the app alive. `App::logic` services channels and
-  recursively pumps live Sessions while the native viewport is hidden; visible
-  frames do that work once through `App::ui`.
-- `src/wm.rs` — the reusable window engine. `WindowManager { windows, tree,
-  zoomed, z, focused, next, … }`, `Win { id, tabs, active, rect (LOCAL coords),
-  z, minimized, prev }`, `Content::{Terminal, Project, Chat, TaskManager, Image,
-  Settings}`.
-  `show(ui, area, active, base)` is the whole thing. Headers at both levels are
-  always-on quiet chrome (`docs/window-chrome.md`). `WindowManager::term_env`
-  owns the environment injected into every Session.
-- `src/layout.rs` — the tiling tree (pure data + math, unit-tested): insert /
-  remove / rect layout / drop targets / divider resize. See
-  `docs/tiling-tree.md`.
-- `src/panel.rs` — task-manager panel model + shallow view; desktop right-edge
-  list of projects/tabs. See `docs/task-manager-panel.md`.
-- `src/terminal.rs` — `Session` (PTY + alacritty + reader thread + writer +
-  `resp` reply buffer), color resolver, selection, mouse capture, search
-  adapter, `read_input` (keys + clipboard), `show(ui, rect, active, resp)`
-  renders the grid + overlays. `read_clipboard` uses `arboard`; copy uses
-  `ctx.copy_text`.
-- `src/terminal_font.rs` — four Hack faces + system fallbacks; `font_id`.
-- `src/input.rs` — pure key/paste/wheel/mouse encoding + Ctrl+F open-search.
-- `src/search.rs` — bounded scrollback-search model.
-- `src/control.rs` — the `foreman` CLI + IPC control plane over the named pipe
-  `\.\pipe\foreman`. The environment injected by `wm.rs` gives its CLI
-  `FOREMAN`, `FOREMAN_EXE`, `FOREMAN_PROJECT_ID`, and `FOREMAN_TERMINAL_ID` for
-  dispatch/self-targeting, plus the instance-specific `FOREMAN_TITLE_PIPE` for
-  passive title events.
-- `src/title_notify.rs` — early `foreman title-event` CLI path plus the bounded,
-  one-way instance title pipe. Hook helpers normalize vendor payloads, reject
-  subagent traffic, write once, and never wait for a reply.
-- `src/agent_hooks.rs` — opt-in semantic installation of guarded global
-  Claude/Codex/Grok `UserPromptSubmit` hooks. Preserves unrelated configuration,
-  backs up once, replaces atomically, and reports install status to the GUI.
-- `src/terminal_titles.rs` — Title lane domain state, transcript-prefix context,
-  provider command adapters, one bounded worker, process deadlines, and
-  untrusted-output validation. It knows nothing about window layout.
-- `src/board.rs` — `Content::Board`: the per-project kanban board view (four
-  fixed columns, quick-add, dispatch picker). Read seam is a per-frame store
-  snapshot; writes drain as `BoardAct` intents via `drain_board_acts` in wm.rs.
-  See `docs/kanban-board.md`.
-- `src/chat.rs` — per-project chat room model (append-only log, pure data).
-  Posts are injected into member terminals' PTYs as typed input (push, not
-  poll). Wiring lives in control.rs/wm.rs; `Content::Chat` is a read-only viewer.
-- `src/dirpicker.rs` — keyboard-driven project directory picker.
-- `src/imageview.rs` — `Content::Image`: `foreman view <path.png>` opens a
-  persistent PNG viewer (fit/zoom/pan, no PTY). See `docs/image-viewer.md`.
-- `src/kanban.rs` — pure card domain for the per-project board: file-per-card
-  store under `.foreman/tasks/`, single-writer transitions, derived orphan
-  detection (`is_orphaned`), dispatch prompt template, wait verdicts. GUI-free.
-  See `docs/kanban-board.md`.
-- `src/keymap.rs` — data-driven leader-key bindings. Defaults in
-  `Keymap::default`; `%APPDATA%\foreman\keybindings.json` merges *over* them so
-  new commands always get a default chord. Leader is `Ctrl+B`.
-- `src/settings.rs` — in-app keybindings editor (desktop-level modal, mirrors
-  `dirpicker.rs`); edits the live `Keymap`, signals the wm to persist.
-- `src/settings_menu.rs` — the settings menu (`Ctrl+B ,`): pure model + egui
-  modal view. Edits `config::Settings` live via `config::seed_live`/`live`.
-  See `docs/settings-menu.md`.
-- `src/theme.rs` — every color token as consts, glob-imported by consumers.
-- `src/skills_install.rs` — embeds and best-effort installs the
-  `foreman-dispatch`/`foreman-chat`/`foreman-icat`/`foreman-kanban` skills into Claude and Codex
-  global skill dirs at GUI startup. Claude sources live in `.claude/skills/`;
-  Codex sources live in `.codex/skills/`. Keep the paired copies semantically
-  synced, then rebuild to propagate.
+
+Every `src/*.rs` file is a module; each opens with a `//!` one-liner.
+`Get-ChildItem src/*.rs` is the map — this section is not a census. Facts the
+one-liners do not carry:
+
+- **Content.** Read `enum Content` in `src/wm.rs`. `Content::Project` nests
+  another `WindowManager`. Everything else is either a Terminal (has a PTY) or
+  a PTY-less viewer. `show(ui, area, active, base)` is the engine; headers at
+  both levels are always-on quiet chrome (`docs/window-chrome.md`).
+- **Quit.** Landing is the default (unset `FOREMAN_NO_LANDING`). Quit-on-deserted
+  only when landing is off (`App` in `src/main.rs`, `WindowManager::deserted`).
+  Settings is a Content window and counts as a non-panel window. An open
+  directory picker or pending close-confirm still holds the app alive. See
+  `docs/landing-recents.md`. Hidden/occluded viewports keep Sessions pumped
+  through `App::logic`; visible frames do that work once through `App::ui`.
+- **Injected env.** `WindowManager::term_env` injects `FOREMAN`, `FOREMAN_EXE`,
+  `FOREMAN_PROJECT_ID`, `FOREMAN_TERMINAL_ID`, `FOREMAN_TITLE_PIPE`, and
+  `FOREMAN_PIPE` (this instance's control pipe). Callers outside any Session
+  talk to the well-known `\\.\pipe\foreman`. Full table:
+  `.claude/skills/foreman-config-and-flags/SKILL.md`.
+- **Settings.** Leader + `,` is Rename; settings is leader + `Ctrl+,`
+  (`OpenSettings` in `src/keymap.rs`). The settings menu is a desktop-level
+  Content window; the keybindings editor is its Keybindings pane. See
+  `docs/settings-menu.md`.
+- **Panel.** Docks to any edge, default right. See `docs/task-manager-panel.md`.
+- **PTY-less viewers** (chat, board, settings, image) open floating via
+  `push_win`, never `tile_new`.
+- **Control plane.** `src/control.rs` — the `foreman` CLI plus IPC over the
+  well-known pipe and the per-instance `FOREMAN_PIPE`. Feature docs live
+  one-per-subsystem in `docs/`.
 
 ### Coordinate model (matters for new work)
 Each `WindowManager` works in its own `area: Rect`. Window rects are **local**
@@ -255,26 +220,26 @@ MOUSE/FOCUS, so do it sparingly and tell them.
 
 ## 5. Next phases (pick up here)
 
-**Verified against `src/` on 2026-08-24.** Most of what this section listed as
+**Verified against `src/` on 2026-09-14.** Most of what this section listed as
 future in 2026-06 has since shipped. Re-verify before believing any roadmap,
 including this one.
 
 Shipped since the original list: the Control plane, Chat room and Dispatch
 (`src/control.rs`, `src/chat.rs`); terminal inspection (`foreman send` /
 `snapshot`); scrollback, wheel scrolling and scrollback search; word and line
-selection via double/triple click (terminal.rs:2031-2047); tab stacks and
-tab-merge by drag; the leader keymap and settings menu; workspace persistence;
-the image viewer; and shell selection, which retired the old `Session.shell`
-dead-code warning by giving the field a job. The `TOP_HOLD`/`GROW_LEAD`
-constants the old backlog wanted tuned no longer exist.
+selection via double/triple click (`Session` in `src/terminal.rs`); tab stacks
+and tab-merge by drag; the leader keymap and settings menu; workspace
+persistence; the image viewer; and shell selection, which retired the old
+`Session.shell` dead-code warning by giving the field a job. The
+`TOP_HOLD`/`GROW_LEAD` constants the old backlog wanted tuned no longer exist.
 
 Genuinely still open:
 
-1. **Status lines** — project titlebar: repo + branch (+ git status).
-   Per-terminal: model, token usage, state. Nothing renders these today; the
-   only `branch` string in `src/` is preview text at `appearance.rs:473`.
-   (Reference: the old web mockup had these; ask the user if you want the
-   visual.)
+1. **Project-titlebar status** — repo + branch (+ git status). The only trace
+   is the `TODO(status line)` on the project titlebar path in `src/wm.rs`.
+   Per-terminal model/token/state lines were **rejected**: the CLIs already
+   render that in-pane (`docs/epics/keyboard-control-epic.md` decision
+   history). Do not re-open that half.
 2. **Agent-state detection** — the unbuilt half of "AI-agent integration".
    Running the claude/codex CLIs in terminals works, and `proc.rs::agent_for`
    already identifies which agent owns a Session (it drives the tab icons). What
@@ -282,8 +247,8 @@ Genuinely still open:
    badge on the terminal or project titlebar, "jump to next needs-you". Design
    notes: `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
 3. **`Content::Browser`** — a new enum variant plus a `Content::show` arm; the
-   rest of the engine is reused. `Content` today is Terminal / Project / Chat /
-   Image / TaskManager (wm.rs:116).
+   rest of the engine is reused. Read `enum Content` in `src/wm.rs` for what
+   exists today.
 4. **Daemon/client split** — move PTYs into a headless core so sessions survive
    UI restarts (true tmux-style). Native launch is already instant, so this is
    about live process survival, not open-speed. **Cold layout restore** (fresh

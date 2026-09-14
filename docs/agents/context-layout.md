@@ -26,7 +26,7 @@ route to a skill instead of inlining it.
 | Question | File |
 |---|---|
 | What is this repo, and what will hurt me in the first 5 minutes? | `CLAUDE.md` |
-| Vision, architecture narrative, module map, next phases | `docs/HANDOFF.md` |
+| Vision, architecture narrative, next phases | `docs/HANDOFF.md` (module map is `src/*.rs` + each `//!`) |
 | What does this word mean here? | `CONTEXT.md` |
 | Why was this decided? | `docs/adr/` |
 | How does feature X work? | `docs/<feature>.md` |
@@ -44,10 +44,11 @@ routing table.
   table do its job. Over ~110 lines means something belongs elsewhere.
 - **Watch the plan-template ratchet.** The old implementation plans each ended
   with a step like "add one line to the `CLAUDE.md` architecture bullet". One
-  line per plan, plan after plan, and that is literally how the module map got
-  there. Those plans were deleted once their work shipped — read one back with
-  `git log --diff-filter=D --name-only -- docs/superpowers/plans/`. New plans
-  update `docs/HANDOFF.md` §2 instead.
+  line per plan, plan after plan, and that is literally how a module census
+  got into CLAUDE.md and then HANDOFF. Those plans were deleted once their
+  work shipped — read one back with
+  `git log --diff-filter=D --name-only -- docs/superpowers/plans/`. New
+  modules do **not** get a HANDOFF census line; the map is `src/*.rs`.
 - **One home per fact.** If a skill and `CLAUDE.md` both say it, `CLAUDE.md`
   loses. Duplicates drift and the stale copy wins about half the time.
 - **`AGENTS.md` routes by file path, `CLAUDE.md` routes by skill name.** Codex
