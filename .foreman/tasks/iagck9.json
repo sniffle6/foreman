@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "iagck9",
+  "title": "Fix settings-menu overlap at constrained window sizes",
+  "body": "Theme tokens already landed (ff816f8, 2026-07-22: settings_menu.rs reads theme::live). Remaining: controls/labels/sections overlap at constrained window sizes. Reproduce at a window too narrow for the 660pt menu plus rail, then fix wrap/scroll. Screenshot evidence.",
+  "state": "backlog",
+  "created": "2026-08-29T09:44:26Z",
+  "updated": "2026-08-29T09:44:26Z"
+}

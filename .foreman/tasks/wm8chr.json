@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "wm8chr",
+  "title": "Move window-chrome Color32 literals onto theme tokens",
+  "body": "src/wm.rs still has Color32::from_rgb sites in window chrome plus a from_black_alpha scrim. Point those at theme::live. Out of scope on purpose: terminal.rs ANSI ramp, icons.rs brand tints, landing.rs. Screenshot a custom theme after.",
+  "state": "backlog",
+  "created": "2026-09-14T00:00:00Z",
+  "updated": "2026-09-14T00:00:00Z"
+}
