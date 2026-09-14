@@ -9,6 +9,15 @@ The room today (built 2026-06-10): push-injected posts, broadcast + targeted
 (last-heard age + amber stale), a NEW divider, join/exit events, and seq numbers
 you can cite. See `docs/epics/agent-dispatch-epic.md` § "Group chat".
 
+## Status (2026-09)
+
+- **#5 wait** and **#6 claims** are satisfied by kanban (`foreman kanban wait`,
+  board `claim`). The result-file convention from #5 is still absent.
+- **#1 backstop** is built — see `docs/chat-delivery.md`.
+- **#2, #3, #4, #7, #8, #9** remain open.
+- `src/notify.rs` is in-app toasts, not OS notifications (#7 is still the OS /
+  sound / threshold work).
+
 ## The one big idea: three layers
 
 The discussion converged on a layering. Don't mix them up — each lower layer is

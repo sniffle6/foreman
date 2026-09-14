@@ -322,7 +322,7 @@ a one-shot injection lands; under full-suite load (dozens of concurrent
 conhost spawns) it resolves late and the injection is swallowed — nothing ever
 re-sends.
 
-**Fix / fence — the pattern (docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md):**
+**Fix / fence — the pattern (`git show 23446e5:docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`):**
 - pump every Session each loop iteration (`keepalive()`), and
 - **re-send the injection every iteration until the child's output proves it
   arrived**, then assert.

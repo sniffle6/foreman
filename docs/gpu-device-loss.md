@@ -100,7 +100,8 @@ scrollback depth cannot affect the index count.)
 
 ## The road not taken
 
-`wip/wgpu-device-loss-fix` holds the alternative: a `[patch.crates-io]` fork of
+Tag `archive/wgpu-device-loss-fix` (formerly branch `wip/wgpu-device-loss-fix`)
+holds the alternative: a `[patch.crates-io]` fork of
 `egui-wgpu` that swaps the panic for a sticky flag, plus `src/gpu.rs` with a
 crash-loop guard and an ordered save-and-respawn. It works, and it is kept in
 case glow ever proves worse.

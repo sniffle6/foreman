@@ -26,7 +26,7 @@ loop on demand.
 
 ## Remaining work (prioritized)
 
-### 1. Per-pane panic isolation — HIGH (queued for the WM branch)
+### 1. Per-pane panic isolation — HIGH (unscheduled)
 One terminal can abort the whole process: indexing alacritty's grid with a
 stale `Line`/`Column` panics (`src/terminal.rs`, on the selection path where
 alacritty's `Selection::to_range` clamps the coords and `sel_viewport_range`
@@ -44,8 +44,8 @@ entire app.
   `sel_viewport_range` in `src/terminal.rs` culls onto the viewport; see the
   `..._are_clamped_not_panicking` tests there); this is about surviving the
   unknown ones.
-- **Blocked on:** `wm.rs`/`layout.rs` have uncommitted WIP; do this after that
-  branch lands so the change doesn't tangle with it.
+- **Unblocked since 2026-06; unscheduled.** The WM WIP that blocked this
+  landed 2026-06-11. The item itself (panic isolation) stays open.
 
 ### 2. Grace fallback for ready-gated injection — MEDIUM
 `inject_input` now queues a post until the session is `ready` (DSR scan done). A

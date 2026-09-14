@@ -191,7 +191,7 @@ child's device-status scan. Details: **terminal-emulation-reference**.
 
 - **Symptom:** `human_post_appends_with_reserved_id_and_broadcasts_to_all_members`
   failed in nearly every full parallel `cargo test` run, passed in isolation.
-- **Root cause** (diagnosed in `docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`):
+- **Root cause** (diagnosed in `git show 23446e5:docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`):
   the test injected the post **once**, immediately after spawn — pre-Ready. In
   isolation the deferred 150 ms submit `\r` landed post-Ready and rescued it;
   under full-suite load (dozens of concurrent conhost spawns) DSR resolved
@@ -339,7 +339,8 @@ child's device-status scan. Details: **terminal-emulation-reference**.
   enabled. foreman is renderer-agnostic (every texture goes through
   `egui::ColorImage` + `ctx.load_texture`), so the only source change was
   `App::on_exit`, whose signature eframe `cfg`s on the renderer feature.
-- **The road not taken:** branch `wip/wgpu-device-loss-fix` holds a working
+- **The road not taken:** tag `archive/wgpu-device-loss-fix` (formerly
+  branch `wip/wgpu-device-loss-fix`) holds a working
   alternative — a `[patch.crates-io]` fork of `egui-wgpu` swapping the panic for
   a sticky flag, plus `src/gpu.rs` with a crash-loop guard and an ordered
   save-and-respawn. Rejected because **it never saved the agents**: every

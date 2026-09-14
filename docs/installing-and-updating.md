@@ -34,6 +34,8 @@ version exists. Spec with the full decision history:
   new exe, which waits out the old process, then the old one exits), and
   letting the 5 s pass disarms it back to a plain restart prompt. It's fine to
   stage a swap and never restart — the new exe just sits there until you do.
+  After a staged swap the installed path IS the new binary, so every CLI verb
+  and hook from the old host runs the new build.
   Failures split in two: a bad hash or a failed download are retryable
   (clicking the chip re-downloads); a failed swap is not (clicking opens the
   releases page so you can grab the zip by hand).
@@ -50,10 +52,13 @@ version exists. Spec with the full decision history:
 
 ## How to cut a release
 
-1. Edit `version` in `Cargo.toml` (strict `X.Y.Z`), commit, push main.
+1. Bump `version` in `Cargo.toml` (strict `X.Y.Z`) in its own `chore(release)`
+   commit, then push main.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. CI refuses if the tag and Cargo.toml disagree. Otherwise ~12 min later the
-   release is live and every running foreman ≥0.2.0 will chip within 6 h.
+3. Write release notes by hand or from `git log <prev-tag>..HEAD`
+   (`gh release`'s `--generate-notes` is empty for direct-to-main). CI refuses
+   if the tag and Cargo.toml disagree. Otherwise ~12 min later the release is
+   live and every running foreman ≥0.2.0 will chip within 6 h.
 
 Dry-run: PRs touching the workflow/installer upload the zip as an artifact
 instead of publishing.
@@ -65,7 +70,9 @@ instead of publishing.
   suffix — never rebuild the name from a version.
 - Prereleases, drafts, and non-`X.Y.Z` tags are silently ignored by the
   updater (`parse_version` returns None → no chip).
-- Debug builds never check for updates. `FOREMAN_NO_UPDATE=1` disables the
+- Debug builds never check for updates. A local `--release` build under
+  `target\` does check, and can self-swap (`update::swap_exe` uses
+  `current_exe()`, not the installed path). `FOREMAN_NO_UPDATE=1` disables the
   check in release builds. `FOREMAN_UPDATE_TEST` (debug only) fakes an update
   and picks which chip state to preview: unset/empty = no chip, `apply` =
   offer, `down` = downloading, `ready`/`armed` = restart prompt (unarmed/

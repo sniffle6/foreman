@@ -373,7 +373,7 @@ theory can't explain why it ever passed, it's not the mechanism.
 5. Explicitly record the rejected hide-the-race fixes and why.
 
 **Worked example — the flaky chat broadcast test
-(`docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`).**
+(`git show 23446e5:docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`).**
 
 - **Pattern:** `human_post_appends_with_reserved_id_and_broadcasts_to_all_members`
   failed nearly every full parallel run, passed in isolation.

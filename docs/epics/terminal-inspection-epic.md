@@ -1,10 +1,11 @@
 # Terminal Inspection — Epic
 
-**Status:** **Phases 1–3 built & green (2026-06-26), 249 tests passing, reviewed
-clean.** The core feedback loop works: `foreman send` (with cross-frame quiescence
-settle) + `foreman snapshot` (text). Remaining: Phase 4 opt-ins
-(`--attrs`/`--cursor`/`--region`/`--wait-for`/`--since-seq`, plus the
-`REPLY_TIMEOUT` exemption that long `--wait-for` needs) and Phase 5 (dogfood).
+**Status:** **Phases 1–3 built (2026-06-26).** The core feedback loop works:
+`foreman send` (with cross-frame quiescence settle) + `foreman snapshot` (text).
+`--attrs` and `--cursor` shipped (`src/control.rs` `parse_snapshot_args` /
+`SnapshotRequest`). Remaining: Phase 4 `--region` / `--wait-for` / `--since-seq`
+(plus the `REPLY_TIMEOUT` exemption that long `--wait-for` needs) and Phase 5
+(dogfood).
 Spec produced via codebase-design *design-it-twice* (three parallel interface
 explorations → the hybrid below). Built on the `src/input.rs` encoder seam from
 the terminal-completeness epic (Session A).

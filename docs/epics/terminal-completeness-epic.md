@@ -16,9 +16,12 @@ non-sliding; one shared line/time budget per frame; deep-history wrap once;
 focused ordinal reconcile; search-bar hit exclusion; topmost mouse ownership;
 1003 suppress under any capture/history; same-frame focus-loss block;
 unencodable press no ghost drag/release; pairwise-distinct face proof.
-Optional resize-preservation stays open (not authorized). Full suite still has
-3 pre-existing WM dock test failures. Human acid matrix + screenshot
-acceptance still open — do **not** treat this epic as complete.
+Resize-preservation was rejected in code, not left optional: `Session::resize`
+snaps the viewport to the live prompt (`scroll_display(Scroll::Bottom)`) because
+a preserved scroll offset after reflow would point at stale content. Phase 6
+OSC title is captured (`Session::osc_title`) but only feeds icon detection
+(`Session::icon_kind`). Human acid matrix + screenshot acceptance still open —
+do **not** treat this epic as complete.
 
 **Goal:** make the terminal *feel like a finished product* before any more
 "built for AI" work. Today it renders a shell and verifies green, but it is not
@@ -447,7 +450,7 @@ order):
 - [x] Bold / italic render with real font faces (Phase 1b) — Hack four-face set; `docs/terminal-font-styles.md`
 - [x] Mouse works in vim / lazygit / htop; Shift forces local select (Phase 3) — wheel (2026-06-27) + click/drag/motion (2026-07-14); `docs/terminal-mouse-reporting.md`
 - [x] Double-click word, triple-click line; CJK selection is correct (Phase 4) — alacritty `Selection` in `term.selection`, acid-tested (word/path/line highlights + CJK copy hex-verified); see `docs/terminal-selection.md`
-- [~] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5) — **search done** (`docs/terminal-scrollback-search.md`); **resize preservation** still open (optional follow-up, not authorized with the remainder)
+- [~] Ctrl+F searches scrollback; resize keeps scroll position (Phase 5) — **search done** (`docs/terminal-scrollback-search.md`); **resize preservation rejected** in `Session::resize` (`scroll_display(Scroll::Bottom)`), not an open optional
 - [ ] Tab title follows OSC 0/2; bell gives feedback (Phase 6)
 - [ ] UI stays at frame rate under `yes` (Phase 9)
 - [ ] OSC 52 clipboard (Phase 8)

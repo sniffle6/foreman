@@ -1,7 +1,8 @@
 # Epic — Keyboard-Driven Control (tmux-style)
 
-**Status:** designed, not started. Phases are independent sessions; do them in order
-(2 depends on 1, 3 depends on 2).
+**Status:** built (2026-06-05). Kept for decision history. How it works today:
+`docs/settings-menu.md` (`src/keymap.rs` `Command` enum and leader, JSON
+persistence, settings editor).
 
 **Read first:** `docs/HANDOFF.md` (architecture + gotchas), then this file. Each phase
 section below is written to be picked up cold in a fresh session.

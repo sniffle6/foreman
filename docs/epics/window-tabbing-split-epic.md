@@ -7,10 +7,8 @@
 > specifics in Phases 2–3 (`Zone`, snap-on-collision, `compose_zone`) no longer
 > exist — split/move now operate on the tree.
 
-**Status:** designed, not started. Builds on the keyboard-control epic (leader +
-data-driven keymap already shipped). Phases are independent sessions, in order:
-**tabs → split → rebind** (split needs the tab primitive; the binding rework is a
-cheap data-driven consolidation done last).
+**Status:** built in tree form. See `docs/tiling-tree.md`. Split (`Split` in
+`src/keymap.rs`, Alt+WASD), the WASD rebind, and `TabCycle`/`TabPrev` are live.
 
 **Read first:** `docs/HANDOFF.md`, then `docs/epics/keyboard-control-epic.md`
 (the keymap/leader system this extends), then this file. Each phase below is written

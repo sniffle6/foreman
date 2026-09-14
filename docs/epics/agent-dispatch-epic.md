@@ -27,10 +27,12 @@ means it works with any model or CLI, not just Claude.
 
 ### 1. Control pipe (foreman side)
 
-Foreman listens on the named pipe `\\.\pipe\foreman` from a background
-thread. One JSON request per connection; the request is pushed over an
-`mpsc` channel that the egui `App` drains each frame (the app already
-repaints every 16ms, so latency is one frame).
+Foreman listens on the well-known named pipe `\\.\pipe\foreman` and on a
+per-instance pipe injected as `FOREMAN_PIPE` (`instance_pipe` in
+`src/control.rs`). One JSON request per connection; the request is pushed
+over an `mpsc` channel that the egui `App` drains each frame (the app
+already repaints every 16ms, so latency is one frame). In-foreman CLIs use
+`FOREMAN_PIPE`; callers outside a Session use the well-known name.
 
 v1 protocol — one verb:
 
@@ -407,8 +409,8 @@ separate, undecided idea.
 
 ## Out of scope (v1)
 
-- **Round-trip**: `status`/`wait` verbs and a result-file convention are
-  designed-for (IDs exist, protocol is JSON-extensible) but not built.
+- **Round-trip**: `foreman status` exists; `wait` shipped as `foreman kanban wait`.
+  A result-file convention is still absent (IDs exist, protocol is JSON-extensible).
 - **Agent-teams integration**: rejected. Watching `~/.claude/teams/*` state
   files means parsing another tool's private format that can break on any
   Claude update.

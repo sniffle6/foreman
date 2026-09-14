@@ -76,10 +76,10 @@ load workspace.json
 if snapshot has restorable projects:
     apply_workspace  (fresh shells; skip missing cwds)
 ensure_panel from settings   # always; panel never in workspace.json
-if nothing restored && !FOREMAN_LANDING:
+if nothing restored && FOREMAN_NO_LANDING:
     auto-open project at cwd (legacy path)
-# With FOREMAN_LANDING: empty *or all-minimized* desktop shows the landing
-# beside the Sessions panel strip (should_show_landing).
+# Unset FOREMAN_NO_LANDING (landing on): empty *or all-minimized* desktop
+# shows the landing beside the Sessions panel strip (should_show_landing).
 discard take_opened + poll dirty   # restore must not write recents or re-save
 ```
 

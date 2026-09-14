@@ -140,7 +140,7 @@ Rules, each backed by an in-tree precedent:
   pump in a loop (nothing else latches Ready in a test), and the raw `feed()`
   path used by `foreman send` bypasses the queue entirely.
 - **NEVER serialize the suite to hide a race.** The full diagnosis is
-  `docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`: the flake appeared
+  `git show 23446e5:docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`: the flake appeared
   only under full-suite parallel load (DSR resolving late under dozens of
   concurrent conhost spawns); serializing "would only hide the race". Fix the
   test's delivery loop, not the scheduler.
@@ -182,7 +182,7 @@ reproduced in nearly every full run): **three consecutive green full runs** —
 - While a **release fleet** is running (`target\release\foreman.exe` in daily
   use): debug `cargo test` is safe — the test harness links its own binary and
   doesn't touch the release exe. **Never `cargo test --release`, never kill the
-  fleet** (documented in `docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`).
+  fleet** (documented in `git show 23446e5:docs/plans/2026-06-11-fix-flaky-chat-broadcast-test.md`).
 - **Gotcha:** the PreToolUse hook (`.claude/hooks/kill-foreman.ps1`) kills
   foreman when a Bash command matches `cargo (build|run|test)`. It filters by
   exe path — only instances run from *this repo's* `target\` dir — so an
