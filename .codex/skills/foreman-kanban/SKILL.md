@@ -5,6 +5,9 @@ description: Use when running inside Foreman (the FOREMAN env var is 1) and Code
 
 # The Foreman Project Kanban Board
 
+**This skill is complete. Do NOT read foreman source or docs to learn kanban
+mechanics — every fact you need is below.** Researching your task's subject
+matter is separate and fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
@@ -18,8 +21,8 @@ Address the CLI the same way as dispatch/chat:
 "$FOREMAN_EXE" kanban <verb> ...
 ```
 
-`--help` on any verb is ground truth for flags — treat this skill as the map,
-not the last word on syntax.
+`foreman kanban --help` is ground truth for flags — treat this skill as the
+map, not the last word on syntax. Per-verb `--help` is not accepted.
 
 ## Verbs
 

@@ -8,8 +8,9 @@ Electron/Tauri. That constraint has already settled several arguments; check
 
 This file is deliberately thin. The knowledge lives in the reference
 library under `.claude/skills/` and in `docs/` - see the routing table below.
-`docs/HANDOFF.md` is the authoritative deep doc (vision, architecture, complete
-module map, next phases) and wins on any conflict.
+`docs/HANDOFF.md` is the authoritative deep doc (vision, architecture, next
+phases) and wins on any conflict. The module map is `src/*.rs` itself — each
+file opens with a `//!` one-liner; HANDOFF §2 is not a census.
 
 **About `.claude/skills/`:** despite the directory name, that library is not
 Claude-specific and is not off-limits to you. It is the project's reference
@@ -76,6 +77,9 @@ Paths below are files to read, not skills to invoke.
 | Writing a doc, epic, spec, or commit message | `.claude/skills/foreman-docs-and-writing/SKILL.md` |
 | Tempted to retry a settled battle (resize reflow, vsync, snap zones) | `.claude/skills/foreman-failure-archaeology/SKILL.md` |
 | Forming a theory or designing an experiment | `.claude/skills/foreman-research-methodology/SKILL.md` |
+| Implementing per-Session agent-state (needs-input / working / done) | `.claude/skills/foreman-agent-state-campaign/SKILL.md` |
+| Proving a claim with evidence, splitting our bug from ConPTY, wire-compat | `.claude/skills/foreman-proof-and-analysis-toolkit/SKILL.md` |
+| Asking whether work is novel, preparing an external claim, reopening ConPTY | `.claude/skills/foreman-research-frontier/SKILL.md` |
 | Verifying GUI behavior with a screenshot | `.codex/skills/build-screenshot` |
 
 Vocabulary is `CONTEXT.md` (ubiquitous language). Decisions are `docs/adr/`.

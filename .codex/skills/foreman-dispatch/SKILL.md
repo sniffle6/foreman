@@ -5,6 +5,9 @@ description: Use when running inside Foreman (the FOREMAN env var is 1) and Code
 
 # Dispatch a Visible Agent Into Foreman
 
+**This skill is complete. Do NOT read foreman source or docs to learn
+dispatch mechanics — every fact you need (including quoting safety) is
+below.** Researching your task's subject matter is separate and fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
@@ -36,6 +39,9 @@ The reply JSON gives the new terminal id and project id:
 ```
 
 The ids are assigned by Foreman. Do not invent them or predict them.
+The reply is NOT the worker's result: fire-and-watch, do not poll the pane.
+Check on a worker with `& $env:FOREMAN_EXE status` — it lists every terminal
+as running or exited(code).
 
 ## Prompt Quoting
 
@@ -60,6 +66,10 @@ $prompt = 'Review src/wm.rs for local-vs-screen coordinate regressions and repor
 
 If Foreman reports a `cmd-shim` error, flatten the prompt to one quote-free line
 or install/use a native executable for that tool.
+
+**Variadic-flag trap:** flags like `--ask-for-approval` / `--full-auto` that
+swallow following words must not sit between the CLI name and the prompt.
+Prompt immediately after `codex` / `codex exec`; flags after the prompt.
 
 ## Targeting
 

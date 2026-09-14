@@ -69,6 +69,9 @@ Details, seam map, threading model, and the borrow rules: **foreman-architecture
 | Writing a doc, epic, spec, or commit message | **foreman-docs-and-writing** |
 | Tempted to retry a settled battle (resize reflow, vsync, snap zones) | **foreman-failure-archaeology** |
 | Forming a theory or designing an experiment | **foreman-research-methodology** |
+| Implementing per-Session agent-state (needs-input / working / done) | **foreman-agent-state-campaign** |
+| Proving a claim with evidence, splitting our bug from ConPTY, wire-compat | **foreman-proof-and-analysis-toolkit** |
+| Asking whether work is novel, preparing an external claim, reopening ConPTY | **foreman-research-frontier** |
 
 Vocabulary is `CONTEXT.md` (ubiquitous language). Decisions are `docs/adr/`.
 Feature docs are one-per-subsystem in `docs/` — check for an existing one before

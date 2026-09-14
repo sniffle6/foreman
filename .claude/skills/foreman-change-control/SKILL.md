@@ -93,12 +93,12 @@ Why these exist architecturally → **foreman-architecture-contract**.
 | 7 | **Never bypass hooks** (`--no-verify`, disabling `.claude/settings.json` hooks). | Library policy codified here (not quoted from a repo doc): the hooks ARE the mechanical-fix gate; nothing routes around change control. |
 | 8 | **Wire compat v1** (section above). | `src/control.rs` comments + compat tests. |
 
-## Three-way skill sync (editing an EMBEDDED skill: dispatch, chat, icat)
+## Three-way skill sync (editing an EMBEDDED skill)
 
-**Three skills are embedded in the exe: `foreman-dispatch`, `foreman-chat`, and
-`foreman-icat`** — plus their `.codex/skills` twins and those twins'
-`agents/openai.yaml` variants. Each embedded skill exists in **three places**
-that must move together (`src/skills_install.rs`):
+The embedded set is the `include_str!` list in `src/skills_install.rs` — plus
+those skills' `.codex/skills` twins and the twins' `agents/openai.yaml`
+variants. Derive it; do not copy a name list here. Each embedded skill exists
+in **three places** that must move together:
 
 1. `.claude/skills/<name>/SKILL.md` — source copy, Claude wording
    (`claude` / `claude -p`). Listed in `CLAUDE_SKILLS`.

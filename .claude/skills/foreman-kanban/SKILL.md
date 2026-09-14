@@ -15,8 +15,8 @@ Address the CLI the same way as dispatch/chat:
 
     "$FOREMAN_EXE" kanban <verb> ...         # bash
 
-`--help` on any verb is ground truth for flags — treat this skill as the map,
-not the last word on syntax.
+`foreman kanban --help` is ground truth for flags — treat this skill as the
+map, not the last word on syntax. Per-verb `--help` is not accepted.
 
 ## Verbs
 

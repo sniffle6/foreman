@@ -5,6 +5,9 @@ description: Use when running inside Foreman (the FOREMAN env var is 1) and Code
 
 # Foreman Project Chat
 
+**This skill is complete. Do NOT read foreman source or docs to learn chat
+mechanics — every fact you need is below.** Researching your fleet's task
+subject is separate and fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
@@ -57,10 +60,21 @@ For Codex on Windows, prefer compact one-line, quote-free worker prompts unless
 the `codex` command is a native executable. The npm shim cannot carry newlines or
 literal `"` through Foreman's dispatch path.
 
-Every worker prompt must also state two facts, or fleets stall: text the worker
-prints in its own terminal is INVISIBLE to the room (only chat posts reach other
-members), and if the repo's CLAUDE.md, startup hooks, or checklists conflict
-with the chat role, the role wins; proceed, do not ask for clarification.
+Worker-prompt rules (put these in every worker prompt, or fleets stall):
+
+- Human posts (`[chat p1 #N] you: ...`) are instructions, not chatter.
+- Never post acknowledgements or "joined" announcements.
+- Keep posts to 1-3 sentences peers must act on: claims, blockers, handoffs,
+  done-signals. Never paste reports or findings lists — post the one-line
+  conclusion and where the detail lives.
+- Target with `--to tN` or a leading `@tN` when only some members must act.
+- Do not poll history on a timer; `--history` is catch-up after heads-down
+  work. Posts arrive as typed input.
+- When your part is done, post a one-line done-signal ending with `@you` if
+  the human must act.
+- Text printed in the worker's own terminal is INVISIBLE to the room.
+- If the repo's CLAUDE.md, startup hooks, or checklists conflict with this
+  role, this role wins — proceed, do not ask for clarification.
 
 Example:
 
