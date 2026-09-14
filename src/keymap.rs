@@ -4,8 +4,8 @@
 //! the Phase 1 hardcoded `match` exactly. A user file at
 //! `%APPDATA%\foreman\keybindings.json` is loaded and merged *over* the defaults:
 //! any command absent from the file keeps its default chord, so new commands
-//! always get a binding even on an old config. There is no write path in this
-//! phase — the file is hand-edited.
+//! always get a binding even on an old config. `Keymap::save` writes the file
+//! (atomic, via `config::save_json`) on every editor change.
 
 use crate::wm::Dir;
 use eframe::egui;
@@ -640,8 +640,8 @@ pub fn key_label(key: egui::Key) -> &'static str {
 /// egui's own `from_name`, which understands the names produced by
 /// [`key_to_name`] (arrows, letters, "Comma", "Questionmark", "OpenBracket",
 /// "Space", …) plus many friendly aliases ("Left", "?", ",", "[", " ", …).
-/// Returns `None` for unknown names so the loader can reject the entry with a
-/// warning instead of crashing.
+/// Returns `None` for unknown names. The JSON loader rejects the whole file
+/// on a bad chord (corrupt → defaults) rather than skipping one entry.
 pub fn name_to_key(name: &str) -> Option<egui::Key> {
     egui::Key::from_name(name)
 }

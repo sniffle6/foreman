@@ -30,10 +30,10 @@ pub fn take_pty_output() -> bool {
     PTY_OUTPUT.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Per-thread count of text layout calls during terminal paint. Thread-local so
-/// parallel `cargo test` workers cannot clobber each other (unlike a process-wide
-/// atomic). Cheap enough to leave on in normal builds so Session paint can call
-/// [`note_layout_call`] without cfg gymnastics. Task 3 wires the note sites.
+// Per-thread count of text layout calls during terminal paint. Thread-local so
+// parallel `cargo test` workers cannot clobber each other (unlike a process-wide
+// atomic). Cheap enough to leave on in normal builds so Session paint can call
+// `note_layout_call` without cfg gymnastics.
 thread_local! {
     static LAYOUT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -1212,7 +1212,8 @@ impl Session {
     }
 
     /// Pump pending PTY output into the grid, then return the rendered viewport
-    /// as plain text rows (trailing spaces trimmed). Used by `foreman snapshot`.
+    /// as plain text rows (trailing spaces trimmed). Test / inspection helper;
+    /// production `foreman snapshot` goes through [`Self::snapshot_all`].
     ///
     /// Each call pumps. For a consistent multi-field read (text + attrs and/or
     /// cursor) use [`Self::snapshot_all`] — chaining this with

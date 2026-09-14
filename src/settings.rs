@@ -1,12 +1,10 @@
-//! In-app keybindings editor (Phase 3 of the keyboard-control epic).
+//! In-app keybindings editor (the Keybindings pane of the settings menu).
 //!
-//! A **desktop-level modal overlay** — settings are global, so this mirrors the
-//! `dirpicker.rs` overlay pattern (dim the desktop, centered panel, keyboard
-//! driven, all input captured) rather than being a `Content` window.
-//!
-//! It edits the live [`Keymap`] in place and tells the caller (the desktop
-//! `WindowManager`) when to persist via [`Keymap::save`]. The overlay never
-//! touches disk itself; the wm owns the keymap and the persistence trigger.
+//! The settings menu itself is a desktop-level `Content` window
+//! (`Content::Settings` in `wm.rs`); this module is the pane that edits the
+//! live [`Keymap`]. It tells the caller (the desktop `WindowManager`) when to
+//! persist via [`Keymap::save`]. The editor never touches disk itself; the wm
+//! owns the keymap and the persistence trigger.
 
 use crate::keymap::{Chord, Command, Group, Keymap};
 use eframe::egui;

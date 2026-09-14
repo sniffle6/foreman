@@ -111,7 +111,7 @@ fn is_wide_spacer(flags: Flags) -> bool {
     crate::input::CellWide::is_wide_spacer(flags)
 }
 
-/// Walk the visible grid like [`text_rows`], but emit one [`GlyphPlacement`] per
+/// Walk the visible grid and emit one [`GlyphPlacement`] per
 /// logical cell at its grid column. Skips wide spacers (incl. leading/wrap);
 /// wide chars get `width_cells = 2` when the trailing cell fits on this row.
 /// Clamps to real grid bounds (same process-abort guard).

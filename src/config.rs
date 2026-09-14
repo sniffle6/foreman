@@ -284,8 +284,8 @@ pub struct Settings {
     /// and restart; only changes when the user moves the panel in the tree.
     pub panel_dock: crate::wm::Dir,
     /// Master switch for Bell attention (the visual pulse; any later sound or
-    /// push notification must honor the same key). File-only in v1 — no
-    /// settings UI, no leader chord. Missing key = on.
+    /// push notification must honor the same key). Edited in the Bell pane
+    /// (`Field::BellOn`). Missing key = on.
     pub bell: bool,
     // -- terminal --
     /// What a bare new terminal spawns.
@@ -405,8 +405,8 @@ impl Settings {
             .filter(|ch| !ch.is_control())
             .take(128)
             .collect();
-        // Empty theme name self-heals to the built-in (full unknown-name
-        // validation against the theme list lands with the Duplicate wiring).
+        // Empty theme name self-heals to the built-in. Unknown names are not
+        // validated here; Duplicate creates a user theme, it does not check this.
         if self.theme.trim().is_empty() {
             self.theme = DEFAULT_THEME.into();
         }

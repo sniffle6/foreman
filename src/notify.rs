@@ -18,8 +18,8 @@ const TTL: Duration = Duration::from_secs(6);
 
 /// Severity — tints the toast's accent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // reusable API: Info/Success/Warning land with future callers
 pub enum Level {
+    #[allow(dead_code)] // reusable API; no caller yet
     Info,
     Success,
     Warning,

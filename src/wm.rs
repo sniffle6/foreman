@@ -454,7 +454,7 @@ enum ResolvedRow {
 
 /// What a validated chat request resolved to. Posting is split from injection
 /// so the reply (the ack handle) is sent before the per-frame
-/// `chat_delivery_sweep` injects the post (spec §3: reply-before-inject).
+/// `chat_tick` injects the post (spec §3: reply-before-inject).
 enum ChatOutcome {
     Posted {
         /// The posted message's seq — returned to the sender as its ack handle.
@@ -1206,7 +1206,7 @@ impl WindowManager {
                     // accepted v1.
                     Ok(ChatOutcome::Posted { seq }) => {
                         // Reply-before-inject (spec §3): the ack handle returns
-                        // now; chat_delivery_sweep injects the post into each
+                        // now; chat_tick injects the post into each
                         // ready member on a later frame.
                         let ok = OpenReply {
                             ok: true,

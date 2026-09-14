@@ -1,6 +1,6 @@
 //! Settings menu (phase 1): pure model half. Categories, declarative row
 //! descriptors, and a pure `adjust` over &mut Settings — all unit-tested
-//! without a GUI. The egui view lives in the same file below (Task 3).
+//! without a GUI. The egui view lives in the same file below.
 
 use crate::config::{DefaultShell, NamingProvider, Settings};
 use crate::keymap::Keymap;
@@ -9,7 +9,6 @@ use eframe::egui;
 
 /// Left-rail categories, in display order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // constructed/matched by the view (Task 3)
 pub enum Pane {
     Appearance,
     Terminal,
@@ -20,7 +19,6 @@ pub enum Pane {
     Startup,
 }
 
-#[allow(dead_code)] // used by the view (Task 3)
 impl Pane {
     pub const ALL: [Pane; 7] = [
         Pane::Appearance,
@@ -44,9 +42,8 @@ impl Pane {
     }
 }
 
-/// One editable setting. Task 3+ match on these exact variants.
+/// One editable setting. The view matches on these exact variants.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // constructed by rows()/adjust(); consumed by the view (Task 3)
 pub enum Field {
     DefaultShellF,
     ScrollbackLines,
@@ -73,9 +70,8 @@ pub enum Field {
     OpenConfigFolder,
 }
 
-/// How a row's value is edited. Drives the view's widget choice (Task 3).
+/// How a row's value is edited. Drives the view's widget choice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // read by the view (Task 3)
 pub enum Kind {
     Toggle,
     Stepper,
@@ -87,7 +83,6 @@ pub enum Kind {
 /// A declarative row: what field it edits, its label/description, and how
 /// it should be presented. `rows()` returns static slices of these per pane.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // fields read by the view (Task 3)
 pub struct RowSpec {
     pub field: Field,
     pub label: &'static str,
@@ -96,7 +91,6 @@ pub struct RowSpec {
 }
 
 /// The static row list for a pane, in display order.
-#[allow(dead_code)] // called by the view (Task 3)
 pub fn rows(pane: Pane) -> &'static [RowSpec] {
     match pane {
         // The pane itself *is* the editor (draw_pane special-cases it before
@@ -279,7 +273,6 @@ fn description(spec: &RowSpec, settings: &Settings) -> &'static str {
 /// (ignored) and vice versa (flip ignores it) — each `adjust` arm picks what
 /// applies to its field's `Kind`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // constructed by the view (Task 3)
 pub enum Adjust {
     Toggle,
     Inc,
@@ -289,7 +282,6 @@ pub enum Adjust {
 /// Apply one nav action to one field. Returns whether the value actually
 /// changed (steppers at a clamp bound report `false`; `Action` fields are
 /// handled by the view and always report `false` here).
-#[allow(dead_code)] // called by the view (Task 3)
 pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
     fn step_f32(v: &mut f32, a: Adjust, step: f32, min: f32, max: f32) -> bool {
         let next = match a {
@@ -386,7 +378,6 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
 }
 
 /// Render a field's current value as the view's row-trailing text.
-#[allow(dead_code)] // called by the view (Task 3)
 pub fn display(field: Field, s: &Settings) -> String {
     match field {
         Field::DefaultShellF => s.default_shell.label().to_string(),
@@ -421,9 +412,8 @@ pub fn display(field: Field, s: &Settings) -> String {
 }
 
 /// Navigation/focus state for the settings menu. Pure — no egui here; the
-/// view (Task 3) drives it from key events and reads it back to render.
+/// view drives it from key events and reads it back to render.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // driven/read by the view (Task 3)
 pub struct SettingsMenu {
     pub pane: Pane,
     pub row: usize,
@@ -453,7 +443,6 @@ pub struct SettingsMenu {
     pub editor_just_entered: bool,
 }
 
-#[allow(dead_code)] // driven by the view (Task 3)
 impl SettingsMenu {
     pub fn new() -> Self {
         Self {
@@ -520,7 +509,7 @@ impl Default for SettingsMenu {
 }
 
 // ---------------------------------------------------------------------------
-// View (Task 3): an egui modal over the pure model above. Mirrors the
+// View: an egui window over the pure model above. Mirrors the
 // keybindings editor's overlay scaffolding (dim layer, centered panel, full
 // input capture) — see `src/settings.rs`.
 // ---------------------------------------------------------------------------
