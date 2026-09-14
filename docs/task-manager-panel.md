@@ -58,40 +58,39 @@ and the landing site for future agent-state badges.
   tiled (`Win::min_from_tree`); `unminimize` re-enters the tree at the leaf
   under the window's old center (best effort — the tree may have changed).
   Windows minimized while floating restore floating.
-- **Dock edge is sticky:** the panel remembers which edge it occupies
-  (`PanelView::dock`, default right). While it has a sibling the live tree
-  re-derives the edge each frame; when every project is minimized the panel is
-  a sole leaf (no dividers) and the last edge is kept. `tile_new` /
-  `unminimize` fall back to inserting on the *opposite* side of that edge, so
-  minimize-all → restore does not shove a bottom-docked panel back to the
-  right rail. The dock only changes when the user moves the panel in the tree.
-- **Sole-leaf strip:** when the panel is the only tiled leaf (all projects
-  closed or minimized), layout pins it to a dock strip of the remembered
-  `expanded_width` / rail extent instead of filling the desktop. That keeps
-  size stable across minimize-all → restore. With `FOREMAN_LANDING`, the
-  landing paints in the remaining content rect (`should_show_landing` —
-  no visible non-panel window, including all-minimized).
-- **Re-pin after tree moves:** any structural tree change that can reshuffle
-  ratios (`insert_beside_panel`, drag-drop split/root, `move_dir`,
-  `place_split`, float toggle, unminimize) calls `repin_panel` — refresh dock
-  from dividers, then `apply_panel_ratio` — so the Sessions panel keeps its
-  remembered extent when dragged to another edge or swapped, not `insert_*`'s
-  50/50.
-- **Collapsed rail is pinned:** while collapsed the desktop re-applies the
-  rail extent every frame via `LayoutTree::set_leaf_extent` (which may go below
-  `MIN_RATIO`, unlike a normal divider drag), so resizing it — from its own
-  edge or a neighbour's — springs back. Works wherever the panel sits in the
-  tree, not just as the rightmost root leaf. The pin tries the H axis first
-  (right/left dock = width), then falls back to the V axis (bottom/top dock =
-  height); a panel with dividers on both axes stays width-pinned.
-- **Expanded drags use the panel's pixel floor, not `MIN_RATIO`:** the pinned
-  extent (260px default) sits *below* 10% of a wide desktop, so a plain
-  `resize_edge` clamp would ratchet — grow the panel by dragging and it could
-  never shrink back past ~10% of the screen. Interactive edge drags in `wm.rs`
-  call `LayoutTree::resize_edge_soft_min` with `(panel_id,
-  PANEL_MIN_EXPANDED)` (76px), which applies that pixel floor whenever the
-  panel leaf sits on either side of the dragged divider; every other tile
-  keeps the `MIN_RATIO` clamp.
+- **Preferred size survives fitting:** `PanelView::expanded_width` is the
+  user's preferred extent, carried between dock axes through the existing
+  `panel_width` setting. `panel::effective_extent` applies the destination
+  cap (420px at the sides, 240px at top/bottom, and available-space bounds)
+  without overwriting that preference. Slow desktop resizing on either axis,
+  collapse, and sibling removal preserve it; growing the space restores it.
+- **Dock edge is sticky:** explicit panel placement chooses `PanelView::dock`.
+  Structural changes retain that edge while its divider exists, otherwise
+  choose a compatible edge deterministically from the tree. A sole leaf keeps
+  the remembered edge. Rectangle aspect never chooses the sizing axis.
+- **Sole-leaf strip:** with every project closed or minimized, the panel uses
+  the same effective extent as a strip at its remembered edge. The landing
+  occupies the remaining content rectangle. Restoring or opening a project
+  inserts it opposite that edge and re-applies the preferred panel extent.
+- **Geometry follows structural changes:** `repin_panel` normalizes a tiled
+  panel after detach, insert, swap, restore, or float toggle. Area changes on
+  either dimension normalize before placements. Unchanged frames do no extra
+  sizing work and never read rendered rectangles back into preferences.
+- **Explicit divider resizing saves size:** a drag on the panel or its
+  neighbor reads fresh tree geometry, bounds the extent, and updates the
+  preference. `LayoutTree::resize_edge_soft_min` permits the panel's 76px
+  expanded floor below ordinary `MIN_RATIO`. `set_leaf_extent` selects the
+  closest divider across both sides of the chosen axis. Collapsed panels
+  remain at the 36px rail extent, including drags from a neighbor's edge,
+  and keep their expanded preference.
+- **Floating geometry:** movement retains the ordinary floating rectangle.
+  Explicit floating width resizing and collapse/expand use width bounds,
+  regardless of the remembered dock. Re-docking uses the expanded preference
+  along the destination axis.
+- **Exact drop hints:** `WindowManager::drop_proposal` computes the accepted
+  layout with panel bounds before drawing the amber rectangle. Release uses
+  the same resolver through `Act::Drop`, against current state. Panel tab
+  merges have no hint and leave the dragged window floating.
 - **Horizontal mode:** when the panel's content rect is wider than tall
   (bottom/top dock), `PanelView::show` flows content left-to-right. Derived
   per-frame from the rect — no new state, no persistence; move the leaf back

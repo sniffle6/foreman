@@ -380,8 +380,20 @@ impl Win {
 // Phase 2). Terminal-level variants act on the focused project's child manager;
 // project-level variants act on the desktop.
 
+/// A drop resolved against current manager state; only layout data is cloned.
+struct DropProposal {
+    target: crate::layout::DropTarget,
+    tree: crate::layout::LayoutTree,
+    dock: Dir,
+    hint: egui::Rect,
+}
+
 #[derive(Clone)]
 enum Act {
+    Drop {
+        src: WinId,
+        pointer: egui::Pos2,
+    },
     Focus(WinId),
     Close(WinId),
     Min(WinId),
@@ -400,12 +412,6 @@ enum Act {
     SetTab(WinId, usize),
     /// Close tab index `usize` of window `WinId` (tab-bar close affordance).
     CloseTab(WinId, usize),
-    /// Merge the source window's tabs onto the target window's stack, then remove
-    /// the source. Fired when a window's titlebar is dropped onto another window.
-    Merge {
-        src: WinId,
-        dst: WinId,
-    },
     /// Detach tab `idx` of window `id` into a new floating window at `pos` (local).
     /// `grab` transfers the in-progress pointer drag onto the new window's title so
     /// it keeps following the cursor (live drag-out); set false for a drop-release
@@ -2492,7 +2498,7 @@ impl WindowManager {
         placement: crate::panel::Placement,
     ) -> bool {
         let mut items: Vec<((usize, usize), Option<u64>)> = Vec::new();
-        // No is_panel() skip needed: the Act::Merge guard keeps the panel non-tabbable, so a
+        // No is_panel() skip needed: the merge_windows guard keeps the panel non-tabbable, so a
         // panel window can never hold a Project tab.
         for (wi, w) in self.windows.iter().enumerate() {
             for (pi, t) in w.tabs.iter().enumerate() {
@@ -2629,7 +2635,7 @@ impl WindowManager {
     /// 50/50; without this, moving the Sessions panel (or splitting against
     /// it) would randomly resize it.
     fn repin_panel(&mut self) {
-        if !self.desktop || self.panel_id().is_none() {
+        if !self.desktop || !self.panel_id().is_some_and(|p| self.tree.contains(p)) {
             return;
         }
         self.sync_panel_dock_from_layout();
@@ -2653,61 +2659,66 @@ impl WindowManager {
         }
     }
 
-    /// Size the panel leaf: rail extent when collapsed, else expanded_width
-    /// ("expanded extent along the dock axis"). The constrained axis is
-    /// whichever one `set_leaf_extent` can actually pin: try H first (right/
-    /// left dock — today's behavior), fall back to V (bottom/top dock). A
-    /// panel with dividers on both axes stays width-pinned. Extent is capped
-    /// by [`crate::panel::max_expanded`] so a bottom strip can't eat half the
-    /// landing.
+    /// Apply rendered bounds without writing the user's expanded preference.
     fn apply_panel_ratio(&mut self, area_w: f32) {
         let Some(pid) = self.panel_id() else {
             return;
         };
-        let (collapsed, expanded_width, dock) =
-            self.panel_prefs()
-                .unwrap_or((false, crate::panel::PANEL_W, Dir::Right));
-        let axis_len = match dock {
-            Dir::Left | Dir::Right => area_w,
-            Dir::Up | Dir::Down => self.last_area.y.max(1.0),
+        let Some((collapsed, preferred, dock)) = self.panel_prefs() else {
+            return;
         };
-        let max = crate::panel::max_expanded(dock, axis_len);
-        // Keep stored preference inside the hard cap (e.g. after a dock flip
-        // or a stale settings value from before the cap existed).
-        if !collapsed && expanded_width > max + 0.5 {
-            for win in &mut self.windows {
-                for t in &mut win.tabs {
-                    if let Content::TaskManager(v) = &mut t.content {
-                        v.expanded_width = max;
-                    }
+        let size = egui::vec2(area_w, self.last_area.y.max(1.0));
+        if self.tree.contains(pid) {
+            Self::pin_panel_tree(&mut self.tree, pid, collapsed, preferred, dock, size);
+        } else if let Some(w) = self.windows.iter_mut().find(|w| w.id == pid) {
+            w.rect.set_width(crate::panel::effective_extent(
+                Dir::Right,
+                preferred,
+                collapsed,
+                size,
+            ));
+        }
+    }
+
+    fn resolved_panel_dock(tree: &crate::layout::LayoutTree, pid: WinId, dock: Dir) -> Dir {
+        if tree.has_divider(pid, dock.opposite()) {
+            return dock;
+        }
+        [Dir::Right, Dir::Left, Dir::Down, Dir::Up]
+            .into_iter()
+            .find(|d| tree.has_divider(pid, d.opposite()))
+            .unwrap_or(dock)
+    }
+
+    fn pin_panel_tree(
+        tree: &mut crate::layout::LayoutTree,
+        pid: WinId,
+        collapsed: bool,
+        preferred: f32,
+        dock: Dir,
+        size: egui::Vec2,
+    ) {
+        let axis = match dock {
+            Dir::Left | Dir::Right => crate::layout::SplitDir::H,
+            Dir::Up | Dir::Down => crate::layout::SplitDir::V,
+        };
+        let extent = crate::panel::effective_extent(dock, preferred, collapsed, size);
+        tree.set_leaf_extent(
+            pid,
+            axis,
+            extent,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+            SNAP_GAP,
+        );
+    }
+
+    fn set_panel_dock(&mut self, dock: Dir) {
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::TaskManager(v) = &mut t.content {
+                    v.dock = dock;
                 }
             }
-        }
-        let target_w = if collapsed {
-            crate::panel::RAIL_W
-        } else {
-            expanded_width.min(max)
-        }
-        .clamp(crate::panel::RAIL_W, max);
-
-        if self.tree.contains(pid) {
-            let local = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(area_w, self.last_area.y.max(1.0)),
-            );
-            use crate::layout::SplitDir;
-            if !self
-                .tree
-                .set_leaf_extent(pid, SplitDir::H, target_w, local, SNAP_GAP)
-            {
-                self.tree
-                    .set_leaf_extent(pid, SplitDir::V, target_w, local, SNAP_GAP);
-            }
-        } else if let Some(w) = self.windows.iter_mut().find(|w| w.id == pid) {
-            // Floating panel: resize width only.
-            let h = w.rect.height();
-            w.rect.set_width(target_w);
-            w.rect.set_height(h);
         }
     }
 
@@ -3307,6 +3318,7 @@ impl WindowManager {
     /// for floating windows. Call before any close/minimize/merge-consume/tear-out.
     fn detach(&mut self, id: WinId) {
         self.tree.remove(id);
+        self.repin_panel();
         if self.zoomed == Some(id) {
             self.zoomed = None;
         }
@@ -3430,19 +3442,13 @@ impl WindowManager {
     /// extent so the panel does not inflate to fill the desktop.
     fn panel_strip_local(&self, asz: egui::Vec2) -> Option<egui::Rect> {
         let (collapsed, width, dock) = self.panel_prefs()?;
-        let axis_len = match dock {
-            Dir::Left | Dir::Right => asz.x,
-            Dir::Up | Dir::Down => asz.y,
-        };
-        let max = crate::panel::max_expanded(dock, axis_len);
-        let extent = if collapsed {
-            crate::panel::RAIL_W
-        } else {
-            width.min(max)
-        }
-        .clamp(crate::panel::RAIL_W, max);
+        Some(Self::panel_strip(dock, width, collapsed, asz))
+    }
+
+    fn panel_strip(dock: Dir, width: f32, collapsed: bool, asz: egui::Vec2) -> egui::Rect {
+        let extent = crate::panel::effective_extent(dock, width, collapsed, asz);
         let full = egui::Rect::from_min_size(egui::Pos2::ZERO, asz);
-        Some(match dock {
+        match dock {
             Dir::Right => {
                 egui::Rect::from_min_max(egui::pos2(full.max.x - extent, full.min.y), full.max)
             }
@@ -3455,7 +3461,7 @@ impl WindowManager {
             Dir::Up => {
                 egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, full.min.y + extent))
             }
-        })
+        }
     }
 
     /// Screen-space content rect beside/above the docked panel strip — where
@@ -3718,6 +3724,10 @@ impl WindowManager {
         let Some(di) = self.windows.iter().position(|w| w.id == dst) else {
             return;
         };
+        // Defensive commit guard: no caller may merge the Sessions panel.
+        if self.windows[si].is_panel() || self.windows[di].is_panel() {
+            return;
+        }
         // Remove the source first; recompute the destination index afterwards
         // since removal may shift it.
         self.detach(src);
@@ -3908,6 +3918,9 @@ impl WindowManager {
             }
             self.tree.insert_root(id, d);
         }
+        if self.panel_id() == Some(id) {
+            self.set_panel_dock(d);
+        }
         // Swap / edge re-insert / float-enter all reshuffle ratios; keep the
         // Sessions panel on its remembered extent (and refresh dock edge).
         self.repin_panel();
@@ -3998,8 +4011,16 @@ impl WindowManager {
                         Dir::Down
                     };
                     self.tree.insert_split(leaf, id, side);
+                    if self.panel_id() == Some(id) {
+                        self.set_panel_dock(side);
+                    }
                 }
-                None => self.tree.insert_root(id, Dir::Right),
+                None => {
+                    self.tree.insert_root(id, Dir::Right);
+                    if self.panel_id() == Some(id) {
+                        self.set_panel_dock(Dir::Right);
+                    }
+                }
             }
             self.repin_panel();
         }
@@ -4074,7 +4095,7 @@ impl WindowManager {
         // `order` is back-to-front; iterate in reverse for top-most-first.
         for &j in order.iter().rev() {
             let w = &self.windows[j];
-            if w.id == src || w.minimized || w.is_panel() {
+            if w.id == src || w.minimized {
                 continue;
             }
             let scr = w.rect.translate(area.min.to_vec2());
@@ -4084,6 +4105,94 @@ impl WindowManager {
             }
         }
         None
+    }
+
+    fn drop_proposal(&self, src: WinId, pointer: egui::Pos2) -> Option<DropProposal> {
+        use crate::layout::DropTarget;
+        let source = self.windows.iter().find(|w| w.id == src && !w.minimized)?;
+        if self.tree.contains(src) {
+            return None;
+        }
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+        // Titlebar hit-testing includes forbidden destinations, so rejection
+        // cannot fall through into an unrelated split behind the titlebar.
+        let target = if let Some(i) = self.merge_target_at(src, pointer, area, &self.draw_order()) {
+            DropTarget::Tab(self.windows[i].id)
+        } else {
+            self.tree.drop_target(pointer, area, SNAP_GAP)?
+        };
+        let mut tree = self.tree.clone();
+        let mut dock = self.panel_dock();
+        match target {
+            DropTarget::Tab(dst) => {
+                let dest = self.windows.iter().find(|w| w.id == dst && !w.minimized)?;
+                if source.is_panel() || dest.is_panel() || src == dst {
+                    return None;
+                }
+                return Some(DropProposal {
+                    target,
+                    tree,
+                    dock,
+                    hint: dest.rect,
+                });
+            }
+            DropTarget::Root(side) => {
+                tree.insert_root(src, side);
+                if source.is_panel() {
+                    dock = side;
+                }
+            }
+            DropTarget::Split(dst, side) => {
+                if !self.windows.iter().any(|w| w.id == dst && !w.minimized) {
+                    return None;
+                }
+                if !tree.insert_split(dst, src, side) {
+                    return None;
+                }
+                if source.is_panel() {
+                    dock = side;
+                }
+            }
+        }
+        if let Some(pid) = self.panel_id().filter(|p| tree.contains(*p)) {
+            dock = Self::resolved_panel_dock(&tree, pid, dock);
+            let (collapsed, preferred, _) = self.panel_prefs()?;
+            Self::pin_panel_tree(&mut tree, pid, collapsed, preferred, dock, self.last_area);
+        }
+        let mut hint = tree
+            .layout(area, SNAP_GAP)
+            .into_iter()
+            .find(|(id, _)| *id == src)?
+            .1;
+        if source.is_panel() && tree.leaves() == [src] {
+            let (collapsed, preferred, _) = self.panel_prefs()?;
+            hint = Self::panel_strip(dock, preferred, collapsed, self.last_area);
+        }
+        Some(DropProposal {
+            target,
+            tree,
+            dock,
+            hint,
+        })
+    }
+
+    fn commit_drop(&mut self, src: WinId, pointer: egui::Pos2) {
+        let Some(proposal) = self.drop_proposal(src, pointer) else {
+            return;
+        };
+        if let crate::layout::DropTarget::Tab(dst) = proposal.target {
+            self.merge_windows(src, dst);
+        } else {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == src) {
+                if w.prev.is_none() {
+                    w.prev = Some(w.rect);
+                }
+            }
+            self.tree = proposal.tree;
+            self.set_panel_dock(proposal.dock);
+            self.mark_workspace_dirty();
+            // Rect refits next frame, preserving the floating restore geometry.
+        }
     }
 
     /// Append an `exited (code)` marker to terminals whose process ended. Runs
@@ -4276,7 +4385,7 @@ impl WindowManager {
         let th = crate::theme::live(ui.ctx());
         // Record the area so keyboard-driven zoom/snap can commit to a sensible
         // rect before the next render refits it.
-        let prev_area_w = self.last_area.x;
+        let prev_area = self.last_area;
         self.last_area = area.size();
 
         // A confirm dialog anywhere in the app is globally modal: freeze this
@@ -4289,16 +4398,8 @@ impl WindowManager {
         if self.desktop {
             self.refresh_exit_titles();
             self.refresh_auto_titles();
-            // First real area (or large area change): size the panel leaf.
-            // While collapsed, re-pin every frame so divider drags (from the
-            // panel's edge or a neighbour's) spring back to the rail width.
-            let panel_collapsed = self.panel_prefs().is_some_and(|(c, _, _)| c);
-            if area.width() > 1.0
-                && (panel_collapsed
-                    || prev_area_w < 1.0
-                    || (area.width() - prev_area_w).abs() > 80.0)
-            {
-                self.apply_panel_ratio(area.width());
+            if area.size() != prev_area && self.panel_id().is_some_and(|p| self.tree.contains(p)) {
+                self.repin_panel();
             }
             // Stash the read-model snapshot into the panel before painting.
             let model = self.panel_model();
@@ -4343,8 +4444,7 @@ impl WindowManager {
             .layout(egui::Rect::from_min_size(egui::Pos2::ZERO, asz), SNAP_GAP)
             .into_iter()
             .collect();
-        // Sole panel leaf would otherwise fill the desktop and blow
-        // `expanded_width` via sync. Pin it to the remembered dock strip so
+        // A sole panel leaf uses its dock strip instead of filling the desktop so
         // size survives minimize-all (and the landing can occupy the rest).
         if self.desktop {
             if let Some(pid) = self.panel_id().filter(|p| self.tree.contains(*p)) {
@@ -4367,10 +4467,6 @@ impl WindowManager {
         let mut acts: Vec<Act> = vec![];
         // overlay rect (screen coords) for the snap zone of the window being dragged
         let mut snap_overlay: Option<egui::Rect> = None;
-        // index (into self.windows) of a window the dragged title is hovering as a
-        // merge (tab) target; painted with a highlight to telegraph the drop.
-        let mut merge_hint: Option<usize> = None;
-
         // While the directory picker/renaming is open, no window is "live" —
         // this stops the focused terminal from consuming keystrokes meant for
         // the overlay, and (below) stops a hover under the overlay from
@@ -4574,69 +4670,22 @@ impl WindowManager {
                 let snap_ok =
                     self.drag_from_tree == Some(id) || ui.input(|inp| inp.modifiers.shift);
                 let pointer = ui.ctx().pointer_latest_pos();
-                let over_target = if snap_ok {
-                    pointer.and_then(|p| self.merge_target_at(id, p, area, &order))
-                } else {
-                    None
-                };
-                if let Some(tgt) = over_target {
-                    merge_hint = Some(tgt);
-                } else if snap_ok {
-                    if let Some(p) = pointer {
-                        // Tree drop hint: leaf edges split, leaf centers tab-merge,
-                        // area edge bands split the root. Painted like the old snap overlay.
-                        if let Some((_, hint)) = self.tree.drop_target(p, area, SNAP_GAP) {
-                            snap_overlay = Some(hint);
-                        }
+                if snap_ok {
+                    if let Some(proposal) =
+                        pointer.and_then(|p| self.drop_proposal(id, p - area.min.to_vec2()))
+                    {
+                        snap_overlay = Some(proposal.hint.translate(area.min.to_vec2()));
                     }
                 }
             }
             if dr.drag_stopped() {
-                // Drag origin decides drop rights (Shift overrides for floating
-                // drags). take() clears the flag at end-of-gesture either way.
                 let snap_ok =
                     self.drag_from_tree.take() == Some(id) || ui.input(|inp| inp.modifiers.shift);
-                // Without drop rights the pointer counts as nowhere: no merge, no
-                // tree insert — the floating window simply stays where dropped.
-                let pointer = ui.ctx().pointer_latest_pos().filter(|_| snap_ok);
-                // A drop onto another window's titlebar merges (tabs) onto it and wins
-                // over the tree drop: the dragged window is consumed entirely.
-                let merge_dst = pointer.and_then(|p| self.merge_target_at(id, p, area, &order));
-                if let Some(dst_i) = merge_dst {
-                    let dst = self.windows[dst_i].id;
-                    acts.push(Act::Merge { src: id, dst });
-                } else if let Some(p) = pointer {
-                    if let Some((target, _)) = self.tree.drop_target(p, area, SNAP_GAP) {
-                        match target {
-                            crate::layout::DropTarget::Tab(dst) => {
-                                acts.push(Act::Merge { src: id, dst });
-                            }
-                            crate::layout::DropTarget::Split(t, side) => {
-                                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                                    if w.prev.is_none() {
-                                        w.prev = Some(w.rect);
-                                    }
-                                }
-                                self.tree.insert_split(t, id, side);
-                                // Panel drop (or drop against the panel) must
-                                // keep the remembered Sessions extent, not 50/50.
-                                self.repin_panel();
-                                self.mark_workspace_dirty();
-                            }
-                            crate::layout::DropTarget::Root(side) => {
-                                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                                    if w.prev.is_none() {
-                                        w.prev = Some(w.rect);
-                                    }
-                                }
-                                self.tree.insert_root(id, side);
-                                self.repin_panel();
-                                self.mark_workspace_dirty();
-                            }
-                        }
-                        // Rect refits from the tree next frame (one frame at the drop
-                        // position — invisible at 60fps; intentionally no immediate set).
-                    }
+                if let Some(p) = ui.ctx().pointer_latest_pos().filter(|_| snap_ok) {
+                    acts.push(Act::Drop {
+                        src: id,
+                        pointer: p - area.min.to_vec2(),
+                    });
                 }
             }
 
@@ -5411,6 +5460,7 @@ impl WindowManager {
                         .panel_id()
                         .filter(|p| self.tree.contains(*p))
                         .map(|p| (p, crate::panel::PANEL_MIN_EXPANDED));
+                    let panel_before = self.panel_layout_extent();
                     for (on, edge, delta) in [
                         (hl, Dir::Left, d.x),
                         (hrr, Dir::Right, d.x),
@@ -5430,11 +5480,16 @@ impl WindowManager {
                             }
                         }
                     }
+                    if self.panel_layout_extent() != panel_before {
+                        self.sync_panel_width_from_layout();
+                    }
                 } else {
                     // The settings window has a larger resize floor than the
                     // global minimum so its rows don't cramp horizontally
                     // (there is no horizontal scroll).
-                    let min = if self.windows[i]
+                    let min = if is_panel {
+                        egui::vec2(crate::panel::PANEL_MIN_EXPANDED, MIN_H)
+                    } else if self.windows[i]
                         .tabs
                         .iter()
                         .any(|t| matches!(t.content, Content::Settings(_)))
@@ -5445,12 +5500,32 @@ impl WindowManager {
                         egui::vec2(MIN_W, MIN_H)
                     };
                     resize_floating(&mut self.windows[i].rect, d, hl, hrr, ht, hb, asz, min);
+                    if is_panel && (hl || hrr) {
+                        let width = crate::panel::effective_extent(
+                            Dir::Right,
+                            self.windows[i].rect.width(),
+                            false,
+                            asz,
+                        );
+                        let right = self.windows[i].rect.right();
+                        self.windows[i].rect.set_width(width);
+                        if hl {
+                            self.windows[i].rect = self.windows[i]
+                                .rect
+                                .translate(egui::vec2(right - self.windows[i].rect.right(), 0.0));
+                        }
+                        for t in &mut self.windows[i].tabs {
+                            if let Content::TaskManager(v) = &mut t.content {
+                                v.expanded_width = width;
+                            }
+                        }
+                    }
                 }
                 self.mark_workspace_dirty();
             }
         }
 
-        self.paint_drag_overlays(ui, area, snap_overlay, merge_hint);
+        self.paint_drag_overlays(ui, area, snap_overlay);
         // Chip taskbar removed — minimized windows restore via the panel.
 
         let ctx = ui.ctx().clone();
@@ -5472,11 +5547,6 @@ impl WindowManager {
         if self.drain_settings() {
             self.swallow_input(ui);
         }
-        // Remember expanded panel extent + dock edge from the live tree.
-        if self.desktop {
-            self.sync_panel_width_from_layout();
-            self.sync_panel_dock_from_layout();
-        }
         self.show_modals(ui, area, &ctx);
 
         // Read back any keymap edit the Keybindings pane published this frame
@@ -5495,100 +5565,67 @@ impl WindowManager {
         interacted
     }
 
-    /// Re-derive the panel's dock edge from tree dividers while it has a
-    /// sibling. No-op when the panel is the sole leaf (no dividers) — the last
-    /// known dock is kept so minimize-all → restore does not force Right.
+    /// Retain the chosen edge until its divider disappears; never infer from a stale rect.
     fn sync_panel_dock_from_layout(&mut self) {
         let Some(pid) = self.panel_id() else {
             return;
         };
-        if !self.tree.contains(pid) {
-            return;
-        }
-        let Some(rect) = self.windows.iter().find(|w| w.id == pid).map(|w| w.rect) else {
-            return;
-        };
-        let left = self.tree.has_divider(pid, Dir::Left);
-        let right = self.tree.has_divider(pid, Dir::Right);
-        let up = self.tree.has_divider(pid, Dir::Up);
-        let down = self.tree.has_divider(pid, Dir::Down);
-        // Prefer the axis matching the leaf's aspect (wide → top/bottom dock),
-        // but fall through so a one-frame rect lag after drop still works.
-        let dock = if rect.width() > rect.height() {
-            if up && !down {
-                Some(Dir::Down)
-            } else if down && !up {
-                Some(Dir::Up)
-            } else if left && !right {
-                Some(Dir::Right)
-            } else if right && !left {
-                Some(Dir::Left)
-            } else {
-                None
-            }
-        } else if left && !right {
-            Some(Dir::Right)
-        } else if right && !left {
-            Some(Dir::Left)
-        } else if up && !down {
-            Some(Dir::Down)
-        } else if down && !up {
-            Some(Dir::Up)
-        } else {
-            None
-        };
-        if let Some(d) = dock {
-            for win in &mut self.windows {
-                for t in &mut win.tabs {
-                    if let Content::TaskManager(v) = &mut t.content {
-                        v.dock = d;
-                    }
-                }
-            }
+        if self.tree.contains(pid) {
+            self.set_panel_dock(Self::resolved_panel_dock(
+                &self.tree,
+                pid,
+                self.panel_dock(),
+            ));
         }
     }
 
-    /// After layout, store the panel's tiled extent along its dock axis into
-    /// `expanded_width` when expanded so divider drags persist. A horizontal
-    /// (bottom/top-docked) panel pinned only by a V divider persists its
-    /// height; anything width-pinnable persists its width, as before. (The
-    /// persisted `panel_width` setting means "expanded extent along the dock
-    /// axis" — the key is deliberately not renamed.)
+    fn panel_layout_extent(&self) -> Option<f32> {
+        let pid = self.panel_id()?;
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+        let (_, rect) = self
+            .tree
+            .layout(area, SNAP_GAP)
+            .into_iter()
+            .find(|(id, _)| *id == pid)?;
+        Some(match self.panel_dock() {
+            Dir::Left | Dir::Right => rect.width(),
+            _ => rect.height(),
+        })
+    }
+
+    /// Called only after an explicit divider resize, using fresh tree geometry.
     fn sync_panel_width_from_layout(&mut self) {
         let Some(pid) = self.panel_id() else {
             return;
         };
-        if !self.tree.contains(pid) {
+        if !self.tree.contains(pid) || self.tree.leaves() == [pid] {
             return;
         }
-        let Some(rect) = self.windows.iter().find(|w| w.id == pid).map(|w| w.rect) else {
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
+        let Some((_, rect)) = self
+            .tree
+            .layout(local, SNAP_GAP)
+            .into_iter()
+            .find(|(id, _)| *id == pid)
+        else {
             return;
         };
-        // Prefer the remembered dock axis: sole-leaf strip layout has no
-        // dividers, and a bottom strip is *wide* so the old width>height
-        // heuristic would wrongly persist the full desktop width.
         let dock = self.panel_dock();
-        let w = match dock {
+        let extent = match dock {
             Dir::Left | Dir::Right => rect.width(),
-            Dir::Up | Dir::Down => rect.height(),
+            _ => rect.height(),
         };
-        if w < 1.0 {
-            return;
-        }
-        let axis_len = match dock {
-            Dir::Left | Dir::Right => self.last_area.x.max(1.0),
-            Dir::Up | Dir::Down => self.last_area.y.max(1.0),
-        };
-        let max = crate::panel::max_expanded(dock, axis_len);
+        let bounded = crate::panel::effective_extent(dock, extent, false, self.last_area);
         for win in &mut self.windows {
             for t in &mut win.tabs {
                 if let Content::TaskManager(v) = &mut t.content {
-                    if !v.collapsed && (w - v.expanded_width).abs() > 0.5 {
-                        v.expanded_width = w.clamp(crate::panel::PANEL_MIN_EXPANDED, max);
+                    if !v.collapsed {
+                        v.expanded_width = bounded;
                     }
                 }
             }
         }
+        self.apply_panel_ratio(self.last_area.x);
     }
 
     /// Follow the same active-tab chain as rendering, stopping at local overlays.
@@ -5661,14 +5698,12 @@ impl WindowManager {
     }
 
     /// Overlays painted above all windows while a title drag is in flight: the
-    /// amber snap-zone preview, and (mutually exclusive) the merge/tab drop hint
-    /// highlighting the window the pointer is over.
+    /// accepted proposal rectangle, shared by split and merge targets.
     fn paint_drag_overlays(
         &self,
         ui: &egui::Ui,
         area: egui::Rect,
         snap_overlay: Option<egui::Rect>,
-        merge_hint: Option<usize>,
     ) {
         let th = crate::theme::live(ui.ctx());
         // --- snap overlay (amber), painted above all windows while dragging ---
@@ -5685,20 +5720,6 @@ impl WindowManager {
         }
 
         // --- merge (tab) drop hint: highlight the target window while hovering ---
-        if let Some(j) = merge_hint {
-            let r = self.windows[j]
-                .rect
-                .translate(area.min.to_vec2())
-                .intersect(area);
-            let p = ui.painter_at(area);
-            p.rect_filled(r, egui::CornerRadius::same(8), th.snap_fill);
-            p.rect_stroke(
-                r,
-                egui::CornerRadius::same(8),
-                egui::Stroke::new(2.0, th.snap_stroke),
-                egui::StrokeKind::Inside,
-            );
-        }
     }
 
     /// Deferred window mutations collected during render, applied after the render
@@ -5726,6 +5747,7 @@ impl WindowManager {
         }
         for a in acts {
             match a {
+                Act::Drop { src, pointer } => self.commit_drop(src, pointer),
                 Act::Focus(id) => self.focus(id),
                 Act::AddTerm(id, shell) => {
                     if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
@@ -5752,15 +5774,6 @@ impl WindowManager {
                     self.focus(id);
                 }
                 Act::CloseTab(id, idx) => self.request_close_tab(id, idx),
-                Act::Merge { src, dst } => {
-                    let panelish =
-                        |id: WinId| self.windows.iter().any(|w| w.id == id && w.is_panel());
-                    if panelish(src) || panelish(dst) {
-                        // Panel is non-tabbable.
-                    } else {
-                        self.merge_windows(src, dst);
-                    }
-                }
                 Act::Untab { id, idx, pos, grab } => {
                     if let Some(new_id) = self.untab(id, idx, pos) {
                         if grab {
@@ -11709,6 +11722,274 @@ mod tests {
         assert_eq!(inner.focused, Some(cw));
     }
 
+    fn sizing_fixture(dock: Dir, preferred: f32) -> (WindowManager, WinId, WinId) {
+        let mut wm = WindowManager::new();
+        wm.desktop = true;
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        let project = push(&mut wm, "Project");
+        wm.tree.insert_root(project, Dir::Right);
+        wm.ensure_panel(false, preferred, dock);
+        let panel = wm.panel_id().unwrap();
+        (wm, panel, project)
+    }
+
+    fn sizing_frame(wm: &mut WindowManager, ctx: &egui::Context, size: egui::Vec2) {
+        let area = egui::Rect::from_min_size(egui::pos2(71.0, 43.0), size);
+        let input = egui::RawInput {
+            screen_rect: Some(area),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            wm.show(ui, area, false, egui::Id::new("sizing-test"), false);
+        });
+    }
+
+    #[test]
+    fn panel_preference_survives_gradual_resize_and_collapse_frames() {
+        for dock in [Dir::Left, Dir::Right, Dir::Up, Dir::Down] {
+            let (mut wm, panel, _) = sizing_fixture(dock, 300.0);
+            let ctx = egui::Context::default();
+            for step in (0..=80).chain((0..80).rev()) {
+                let size = egui::vec2(1000.0 - step as f32 * 9.0, 800.0 - step as f32 * 7.0);
+                sizing_frame(&mut wm, &ctx, size);
+                let rect = wm.windows.iter().find(|w| w.id == panel).unwrap().rect;
+                let actual = match dock {
+                    Dir::Left | Dir::Right => rect.width(),
+                    _ => rect.height(),
+                };
+                let expected = crate::panel::effective_extent(dock, 300.0, false, size);
+                assert!(
+                    (actual - expected).abs() < 0.1,
+                    "{dock:?}: {actual} != {expected}"
+                );
+                assert_eq!(wm.panel_prefs(), Some((false, 300.0, dock)));
+            }
+            wm.toggle_panel();
+            for _ in 0..3 {
+                sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+            }
+            assert!((wm.panel_layout_extent().unwrap() - crate::panel::RAIL_W).abs() < 0.1);
+            wm.toggle_panel();
+            for _ in 0..3 {
+                sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+            }
+            assert_eq!(wm.panel_prefs(), Some((false, 300.0, dock)));
+        }
+    }
+
+    #[test]
+    fn panel_height_only_resize_recovers_and_floating_moves_keep_geometry() {
+        let (mut wm, panel, _) = sizing_fixture(Dir::Down, 220.0);
+        let ctx = egui::Context::default();
+        for height in [800.0, 400.0, 300.0, 800.0] {
+            sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, height));
+            assert!((wm.panel_layout_extent().unwrap() - 220.0_f32.min(height * 0.5)).abs() < 0.1);
+            assert_eq!(wm.panel_prefs().unwrap().1, 220.0);
+        }
+        wm.detach(panel);
+        let rect = egui::Rect::from_min_size(egui::pos2(80.0, 90.0), egui::vec2(390.0, 310.0));
+        wm.windows.iter_mut().find(|w| w.id == panel).unwrap().rect = rect;
+        for _ in 0..3 {
+            sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+        }
+        assert_eq!(
+            wm.windows.iter().find(|w| w.id == panel).unwrap().rect,
+            rect
+        );
+        wm.toggle_panel();
+        assert_eq!(
+            wm.windows
+                .iter()
+                .find(|w| w.id == panel)
+                .unwrap()
+                .rect
+                .width(),
+            36.0
+        );
+        wm.toggle_panel();
+        assert_eq!(
+            wm.windows
+                .iter()
+                .find(|w| w.id == panel)
+                .unwrap()
+                .rect
+                .width(),
+            220.0
+        );
+    }
+
+    #[test]
+    fn panel_drop_preview_matches_deferred_commit_and_subsequent_frames() {
+        for (dock, point) in [
+            (Dir::Left, egui::pos2(3.0, 400.0)),
+            (Dir::Right, egui::pos2(997.0, 400.0)),
+            (Dir::Up, egui::pos2(500.0, 45.0)),
+            (Dir::Down, egui::pos2(500.0, 797.0)),
+            (Dir::Down, egui::pos2(500.0, 690.0)),
+        ] {
+            let (mut wm, panel, _) = sizing_fixture(Dir::Right, 300.0);
+            let ctx = egui::Context::default();
+            wm.detach(panel);
+            sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+            let hint = wm
+                .drop_proposal(panel, point)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no proposal for {dock:?} at {point:?}; project rects {:?}",
+                        wm.windows
+                            .iter()
+                            .map(|w| (w.id, w.rect))
+                            .collect::<Vec<_>>()
+                    )
+                })
+                .hint;
+            let before = wm.windows.iter().find(|w| w.id == panel).unwrap().rect;
+            wm.apply_acts(
+                vec![Act::Drop {
+                    src: panel,
+                    pointer: point,
+                }],
+                wm.last_area,
+                egui::Id::new("drop-test"),
+                &ctx,
+            );
+            assert_eq!(
+                wm.windows.iter().find(|w| w.id == panel).unwrap().rect,
+                before
+            );
+            assert_eq!(wm.panel_dock(), dock);
+            for _ in 0..3 {
+                sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+                let actual = wm.windows.iter().find(|w| w.id == panel).unwrap().rect;
+                assert!(
+                    (actual.min - hint.min).length() < 0.1
+                        && (actual.max - hint.max).length() < 0.1
+                );
+                assert_eq!(wm.panel_prefs().unwrap().1, 300.0);
+            }
+            let extent = match dock {
+                Dir::Left | Dir::Right => hint.width(),
+                _ => hint.height(),
+            };
+            assert!(
+                (extent
+                    - if matches!(dock, Dir::Left | Dir::Right) {
+                        300.0
+                    } else {
+                        240.0
+                    })
+                .abs()
+                    < 0.1
+            );
+        }
+    }
+
+    #[test]
+    fn panel_project_split_preview_includes_gap_and_rejects_merges() {
+        let (mut wm, panel, project) = sizing_fixture(Dir::Right, 260.0);
+        let ctx = egui::Context::default();
+        sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+        let other = push(&mut wm, "Other");
+        let panel_rect = wm.windows.iter().find(|w| w.id == panel).unwrap().rect;
+        assert!(wm.drop_proposal(other, panel_rect.center()).is_none());
+        assert!(
+            wm.drop_proposal(other, panel_rect.min + egui::vec2(50.0, 10.0))
+                .is_none()
+        );
+        let point = egui::pos2(panel_rect.left() + 12.0, 400.0);
+        let proposal = wm.drop_proposal(other, point).unwrap();
+        assert!(
+            matches!(proposal.target, crate::layout::DropTarget::Split(id, Dir::Left) if id == panel)
+        );
+        let hint = proposal.hint;
+        wm.commit_drop(other, point);
+        sizing_frame(&mut wm, &ctx, egui::vec2(1000.0, 800.0));
+        let actual = wm.windows.iter().find(|w| w.id == other).unwrap().rect;
+        assert!((actual.min - hint.min).length() < 0.1 && (actual.max - hint.max).length() < 0.1);
+        let panel_rect = wm.windows.iter().find(|w| w.id == panel).unwrap().rect;
+        assert!((panel_rect.left() - actual.right() - SNAP_GAP).abs() < 0.1);
+        wm.detach(panel);
+        let project_rect = wm.windows.iter().find(|w| w.id == project).unwrap().rect;
+        assert!(
+            wm.drop_proposal(panel, project_rect.min + egui::vec2(50.0, 10.0))
+                .is_none()
+        );
+        assert!(wm.drop_proposal(panel, project_rect.center()).is_none());
+        wm.detach(other);
+        assert!(wm.drop_proposal(other, project_rect.center()).is_some());
+    }
+
+    #[test]
+    fn panel_drop_recomputes_after_target_changes_without_losing_new_leaves() {
+        let (mut wm, panel, project) = sizing_fixture(Dir::Right, 260.0);
+        wm.detach(panel);
+        let point = egui::pos2(990.0, 400.0);
+        assert!(wm.drop_proposal(panel, point).is_some());
+        let added = push(&mut wm, "Added after hover");
+        wm.tree.insert_split(project, added, Dir::Down);
+        wm.commit_drop(panel, point);
+        assert!(wm.tree.contains(project) && wm.tree.contains(added) && wm.tree.contains(panel));
+        wm.detach(panel);
+        wm.close(project);
+        wm.close(added);
+        wm.commit_drop(panel, egui::pos2(500.0, 400.0));
+        assert!(!wm.tree.contains(panel), "empty center rejects safely");
+        let hint = wm.drop_proposal(panel, point).unwrap().hint;
+        wm.commit_drop(panel, point);
+        assert_eq!(hint, wm.panel_strip_local(wm.last_area).unwrap());
+    }
+
+    #[test]
+    fn collapsed_panel_resists_neighbor_resize_without_changing_preference() {
+        let (mut wm, panel, project) = sizing_fixture(Dir::Right, 260.0);
+        wm.toggle_panel();
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
+        wm.tree.resize_edge_soft_min(
+            project,
+            Dir::Right,
+            -100.0,
+            area,
+            SNAP_GAP,
+            (panel, crate::panel::PANEL_MIN_EXPANDED),
+        );
+        wm.sync_panel_width_from_layout();
+        assert_eq!(wm.panel_prefs(), Some((true, 260.0, Dir::Right)));
+        assert!((wm.panel_layout_extent().unwrap() - 36.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn panel_mixed_axes_pin_height_and_resize_from_neighbor() {
+        let (mut wm, panel, project) = sizing_fixture(Dir::Down, 220.0);
+        let other = push(&mut wm, "Other");
+        wm.tree.insert_split(panel, other, Dir::Left);
+        wm.repin_panel();
+        assert_eq!(wm.panel_dock(), Dir::Down);
+        assert!((wm.panel_layout_extent().unwrap() - 220.0).abs() < 0.1);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
+        wm.tree.resize_edge_soft_min(
+            project,
+            Dir::Down,
+            -50.0,
+            area,
+            SNAP_GAP,
+            (panel, crate::panel::PANEL_MIN_EXPANDED),
+        );
+        wm.sync_panel_width_from_layout();
+        assert_eq!(wm.panel_prefs().unwrap().1, crate::panel::PANEL_MAX_EDGE);
+        wm.tree.resize_edge_soft_min(
+            panel,
+            Dir::Up,
+            60.0,
+            area,
+            SNAP_GAP,
+            (panel, crate::panel::PANEL_MIN_EXPANDED),
+        );
+        wm.sync_panel_width_from_layout();
+        assert!((wm.panel_prefs().unwrap().1 - 180.0).abs() < 0.1);
+        wm.repin_panel();
+        assert!((wm.panel_layout_extent().unwrap() - 180.0).abs() < 0.1);
+    }
+
     #[test]
     fn ensure_panel_is_idempotent_and_tiled_right() {
         let mut desk = WindowManager::new();
@@ -11810,8 +12091,8 @@ mod tests {
         // Stale/large height from before the cap (or a fat divider drag).
         desk.ensure_panel(false, 500.0, Dir::Down);
         assert!(
-            desk.panel_prefs().unwrap().1 <= crate::panel::PANEL_MAX_EDGE + 0.5,
-            "constructor should hard-cap stored width"
+            desk.panel_prefs().unwrap().1 == crate::panel::PANEL_MAX_SIDE,
+            "constructor sanitizes the shared preference independent of dock"
         );
         let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
         desk.tree = crate::layout::LayoutTree::default();
@@ -11840,8 +12121,8 @@ mod tests {
             "bottom dock must cap at PANEL_MAX_EDGE, got {h}"
         );
         assert!(
-            desk.panel_prefs().unwrap().1 <= crate::panel::PANEL_MAX_EDGE + 0.5,
-            "stored preference must be rewound to the cap"
+            desk.panel_prefs().unwrap().1 == 500.0,
+            "rendered cap must preserve preference"
         );
 
         // Sole-leaf strip (landing) must use the same cap.
@@ -11864,11 +12145,14 @@ mod tests {
         desk.tree = crate::layout::LayoutTree::default();
         desk.tree.insert_root(999, Dir::Right);
         desk.tree.insert_root(pid, Dir::Down);
-        // Post-layout rect of a bottom-docked panel after a divider drag
-        // (under PANEL_MAX_EDGE so the cap is not the thing under test).
-        if let Some(w) = desk.windows.iter_mut().find(|w| w.id == pid) {
-            w.rect = egui::Rect::from_min_size(egui::pos2(0.0, 580.0), egui::vec2(1000.0, 220.0));
-        }
+        // Deliberately leave Win.rect stale; explicit resize reads the live tree.
+        desk.tree.set_leaf_extent(
+            pid,
+            crate::layout::SplitDir::V,
+            220.0,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, desk.last_area),
+            SNAP_GAP,
+        );
         desk.sync_panel_width_from_layout();
         assert_eq!(
             desk.panel_prefs().unwrap(),

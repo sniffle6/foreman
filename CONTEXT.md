@@ -278,3 +278,8 @@ second theme actually lands; a switchable system today would be interface with
 nothing behind it.
 _Avoid_: palette (that's the ANSI 16-color table, one token among many),
 stylesheet, skin.
+
+**Drop proposal**:
+An accepted window drop and its predicted layout rectangle, resolved from the
+current manager state for both preview and release.
+_Avoid_: snap zone.

@@ -33,6 +33,26 @@ pub fn max_expanded(dock: Dir, axis_len: f32) -> f32 {
     hard.min((axis_len * 0.5).max(RAIL_W))
         .max(PANEL_MIN_EXPANDED)
 }
+
+/// Rendered extent; fitting a smaller destination never changes the preference.
+pub fn effective_extent(dock: Dir, preferred: f32, collapsed: bool, size: egui::Vec2) -> f32 {
+    let available = match dock {
+        Dir::Left | Dir::Right => size.x,
+        Dir::Up | Dir::Down => size.y,
+    }
+    .max(0.0);
+    let preferred = if preferred.is_finite() {
+        preferred
+    } else {
+        PANEL_W
+    };
+    if collapsed {
+        RAIL_W
+    } else {
+        preferred.clamp(PANEL_MIN_EXPANDED, max_expanded(dock, available))
+    }
+    .min(available)
+}
 /// Per-project column width in horizontal (columns) mode (px).
 const GROUP_W: f32 = 200.0;
 /// Horizontal body shorter than this (project row + one tab row) falls back
@@ -305,8 +325,8 @@ pub struct PanelView {
     pub model: PanelModel,
     pub collapsed: bool,
     pub expanded_width: f32,
-    /// Edge the panel is docked against (`Right` default). Updated from the
-    /// live tree while the panel has a sibling; retained when it is the sole
+    /// Edge the panel is docked against (`Right` default). Chosen by explicit
+    /// placement, with structural fallback; retained when it is the sole
     /// leaf (all projects minimized) so re-tile does not shove it back to the
     /// right rail. Only changes when the user moves the panel in the tree.
     pub dock: Dir,
@@ -338,11 +358,15 @@ impl PanelView {
     }
 
     pub fn with_dock(collapsed: bool, expanded_width: f32, dock: Dir) -> Self {
-        let max = max_expanded(dock, 10_000.0); // no area yet; hard cap only
+        let expanded_width = if expanded_width.is_finite() {
+            expanded_width
+        } else {
+            PANEL_W
+        };
         Self {
             model: PanelModel::default(),
             collapsed,
-            expanded_width: expanded_width.clamp(PANEL_MIN_EXPANDED, max),
+            expanded_width: expanded_width.clamp(PANEL_MIN_EXPANDED, PANEL_MAX_SIDE),
             dock,
             scroll: 0.0,
             thumb_drag: None,

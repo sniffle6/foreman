@@ -23,6 +23,22 @@ vertical splits with per-child ratios. A window is tiled if and only if its id
 is a leaf (`tree.contains(id)`). There is no "snap zone" concept anymore — the
 old 9-zone system (halves/quarters/hold-to-maximize) was deleted.
 
+## Drop geometry
+
+`LayoutTree::drop_target` only hit-tests the requested action. The manager's
+`drop_proposal` checks source and destination legality, clones only the layout
+data, applies insertion and panel sizing, and takes the inserted leaf's real
+rectangle, including gaps. The sole Sessions leaf uses its dock strip.
+Preview geometry stays manager-local until painting translates it once.
+
+Titlebars take precedence over tree targets. Sessions cannot merge as either
+source or destination: a rejected titlebar or center drop has no hint and
+leaves the source floating. Ordinary same-manager tabs retain their behavior.
+On release, `Act::Drop` resolves again against current windows and tree, so
+intervening layout edits cannot be overwritten by a hover-time snapshot.
+The floating restore rectangle is preserved; tiled rectangles refit on the
+next frame as before.
+
 ## Why it exists
 
 The zone system capped layouts at halves and quarters — you could not make
@@ -139,7 +155,7 @@ work shipped, and unlike the rest of that plan it had no surviving spec.)
   `layout()` rect math, `hit_leaf`, `drop_target`, `swap`, `resize_edge`.
   Pure data + math, fully unit-tested, no egui interaction.
 - `src/wm.rs` — integration: per-frame refit from `tree.layout()`, drag
-  tear-out + drop commit in `show()`, `move_dir` / `place_split` /
+  tear-out in `show()`, `drop_proposal` / `commit_drop` via `Act::Drop`, `move_dir` / `place_split` /
   `toggle_float` / `toggle_zoom` / `tile_new` / `detach`.
 - `src/keymap.rs` — `TermFloat`/`ProjFloat` commands; `TermSnap`/`ProjSnap`
   kept their serialized names (user keybinding files still work) but are

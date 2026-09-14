@@ -99,7 +99,7 @@ pub struct LayoutTree {
     pub root: Option<Node>,
 }
 
-/// What dropping / inserting at a point would do. Returned with a hint rect to paint.
+/// The requested action at a drop point, before manager-level legality checks.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DropTarget {
     /// Split the whole root on this side (or become the first tile of an empty tree).
@@ -347,59 +347,33 @@ impl LayoutTree {
             .find(|(_, r)| r.expand(gap * 0.5 + 1.0).contains(p))
     }
 
-    /// What inserting a window at `p` would do, plus the hint rect to paint.
+    /// Hit-test a drop action. The manager resolves legality and resulting geometry.
     /// Precedence: area edge band (root split) → leaf center (tab) → leaf
     /// nearest-edge (split). Empty tree: edge band makes the first tile.
-    pub fn drop_target(
-        &self,
-        p: egui::Pos2,
-        area: egui::Rect,
-        gap: f32,
-    ) -> Option<(DropTarget, egui::Rect)> {
+    pub fn drop_target(&self, p: egui::Pos2, area: egui::Rect, gap: f32) -> Option<DropTarget> {
         const EDGE: f32 = 0.085; // same band feel as the old detect_zone
         let fx = (p.x - area.min.x) / area.width();
         let fy = (p.y - area.min.y) / area.height();
         if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
             return None;
         }
-        let inner = area.shrink(gap);
-        if self.root.is_none() {
-            let on_edge = fx < EDGE || fx > 1.0 - EDGE || fy < EDGE || fy > 1.0 - EDGE;
-            return on_edge.then_some((DropTarget::Root(Dir::Right), inner));
-        }
-        let half = |side: Dir| -> egui::Rect {
-            match side {
-                Dir::Left => {
-                    egui::Rect::from_min_max(inner.min, egui::pos2(inner.center().x, inner.max.y))
-                }
-                Dir::Right => {
-                    egui::Rect::from_min_max(egui::pos2(inner.center().x, inner.min.y), inner.max)
-                }
-                Dir::Up => {
-                    egui::Rect::from_min_max(inner.min, egui::pos2(inner.max.x, inner.center().y))
-                }
-                Dir::Down => {
-                    egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.center().y), inner.max)
-                }
-            }
-        };
         if fx < EDGE {
-            return Some((DropTarget::Root(Dir::Left), half(Dir::Left)));
+            return Some(DropTarget::Root(Dir::Left));
         }
         if fx > 1.0 - EDGE {
-            return Some((DropTarget::Root(Dir::Right), half(Dir::Right)));
+            return Some(DropTarget::Root(Dir::Right));
         }
         if fy < EDGE {
-            return Some((DropTarget::Root(Dir::Up), half(Dir::Up)));
+            return Some(DropTarget::Root(Dir::Up));
         }
         if fy > 1.0 - EDGE {
-            return Some((DropTarget::Root(Dir::Down), half(Dir::Down)));
+            return Some(DropTarget::Root(Dir::Down));
         }
         let (id, r) = self.hit_leaf(p, area, gap)?;
         let cx = ((p.x - r.min.x) / r.width()).clamp(0.0, 1.0);
         let cy = ((p.y - r.min.y) / r.height()).clamp(0.0, 1.0);
         if (0.30..=0.70).contains(&cx) && (0.30..=0.70).contains(&cy) {
-            return Some((DropTarget::Tab(id), r));
+            return Some(DropTarget::Tab(id));
         }
         let (dl, dr, dt, db) = (cx, 1.0 - cx, cy, 1.0 - cy);
         let side = if dl <= dr && dl <= dt && dl <= db {
@@ -411,13 +385,7 @@ impl LayoutTree {
         } else {
             Dir::Down
         };
-        let hint = match side {
-            Dir::Left => egui::Rect::from_min_max(r.min, egui::pos2(r.center().x, r.max.y)),
-            Dir::Right => egui::Rect::from_min_max(egui::pos2(r.center().x, r.min.y), r.max),
-            Dir::Up => egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.center().y)),
-            Dir::Down => egui::Rect::from_min_max(egui::pos2(r.min.x, r.center().y), r.max),
-        };
-        Some((DropTarget::Split(id, side), hint))
+        Some(DropTarget::Split(id, side))
     }
 
     /// Swap the positions of two leaves. False unless both are present.
@@ -586,16 +554,18 @@ impl LayoutTree {
             SplitDir::H => [Dir::Right, Dir::Left],
             SplitDir::V => [Dir::Down, Dir::Up],
         };
-        for edge in edges {
-            let found = match &self.root {
-                Some(r) => {
-                    find_interior_split(r, area.shrink(gap), id, edge, axis, gap, Vec::new())
-                }
-                None => None,
-            };
-            let Some((addr, idx, avail)) = found else {
-                continue;
-            };
+        // Pick the nearest divider on either side. Choosing an ancestor on
+        // the first side can resize a whole subtree instead of this leaf.
+        let found = edges
+            .into_iter()
+            .filter_map(|edge| {
+                let root = self.root.as_ref()?;
+                let (addr, idx, avail) =
+                    find_interior_split(root, area.shrink(gap), id, edge, axis, gap, Vec::new())?;
+                Some((edge, addr, idx, avail))
+            })
+            .max_by_key(|(_, addr, _, _)| addr.len());
+        if let Some((edge, addr, idx, avail)) = found {
             let mut node = self.root.as_mut().unwrap();
             for i in addr {
                 let Node::Split { children, .. } = node else {
@@ -800,15 +770,15 @@ mod tests {
     fn drop_target_center_tabs_edges_split() {
         let mut t = LayoutTree::default();
         t.insert_root(1, Dir::Right);
-        let (tgt, _) = t
+        let tgt = t
             .drop_target(egui::pos2(500.0, 400.0), area(), 8.0)
             .unwrap();
         assert_eq!(tgt, DropTarget::Tab(1));
-        let (tgt, _) = t
+        let tgt = t
             .drop_target(egui::pos2(200.0, 400.0), area(), 8.0)
             .unwrap();
         assert_eq!(tgt, DropTarget::Split(1, Dir::Left));
-        let (tgt, _) = t
+        let tgt = t
             .drop_target(egui::pos2(500.0, 700.0), area(), 8.0)
             .unwrap();
         assert_eq!(tgt, DropTarget::Split(1, Dir::Down));
@@ -818,9 +788,9 @@ mod tests {
     fn drop_target_area_edge_band_splits_the_root() {
         let mut t = LayoutTree::default();
         t.insert_root(1, Dir::Right);
-        let (tgt, _) = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
+        let tgt = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
         assert_eq!(tgt, DropTarget::Root(Dir::Left));
-        let (tgt, _) = t
+        let tgt = t
             .drop_target(egui::pos2(500.0, 795.0), area(), 8.0)
             .unwrap();
         assert_eq!(tgt, DropTarget::Root(Dir::Down));
@@ -833,9 +803,8 @@ mod tests {
             t.drop_target(egui::pos2(500.0, 400.0), area(), 8.0)
                 .is_none()
         ); // center: nothing
-        let (tgt, hint) = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
+        let tgt = t.drop_target(egui::pos2(10.0, 400.0), area(), 8.0).unwrap();
         assert!(matches!(tgt, DropTarget::Root(_)));
-        assert!((hint.width() - 984.0).abs() < 0.01); // full inner area
     }
 
     // ── Task 4: swap and resize_edge ─────────────────────────────────────────
@@ -993,6 +962,25 @@ mod tests {
     // ── set_leaf_extent, V axis (mirrors the set_leaf_width trio) ───────────
 
     #[test]
+    fn set_leaf_extent_uses_deepest_divider_across_both_edges() {
+        // H root: [V:[upper, H:[neighbor, panel]], unrelated]. The panel's
+        // right divider is at the root; its left divider belongs to its row.
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        t.insert_root(2, Dir::Right);
+        t.insert_split(1, 3, Dir::Down);
+        t.insert_split(3, 4, Dir::Right);
+        let before = t.layout(area(), 8.0);
+        t.set_leaf_extent(4, SplitDir::H, 120.0, area(), 8.0);
+        let after = t.layout(area(), 8.0);
+        let rect =
+            |items: &Vec<(WinId, egui::Rect)>, id| items.iter().find(|(w, _)| *w == id).unwrap().1;
+        assert!((rect(&after, 4).width() - 120.0).abs() < 0.1);
+        assert_eq!(rect(&before, 1), rect(&after, 1));
+        assert_eq!(rect(&before, 2), rect(&after, 2));
+    }
+
+    #[test]
     fn set_leaf_extent_v_pins_a_leaf_below_min_ratio() {
         let mut t = LayoutTree::default();
         t.insert_root(1, Dir::Right);
@@ -1032,8 +1020,7 @@ mod tests {
 
     #[test]
     fn set_leaf_extent_v_is_false_when_only_h_dividers_exist() {
-        // The axis probe is what lets the wm try H then fall back to V:
-        // an H-only tree must refuse a V pin (and vice versa).
+        // An H-only tree must refuse a V pin (and vice versa).
         let mut t = LayoutTree::default();
         t.insert_root(1, Dir::Right);
         t.insert_split(1, 2, Dir::Right); // [1 | 2] — no V split anywhere
