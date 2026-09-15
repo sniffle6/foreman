@@ -113,6 +113,7 @@ pub struct TabEntry {
 
 #[derive(Clone, Debug)]
 pub struct ProjectEntry {
+    pub collapsed: bool,
     pub path: TargetPath,
     pub title: String,
     pub minimized: bool,
@@ -346,10 +347,12 @@ pub struct PanelView {
     /// expanded mode. Runtime-only — never persisted.
     pub drag: Option<PanelDrag>,
     /// Project-row `Tab` uids whose nested session/chat/image rows are hidden.
-    /// Runtime-only — like board column collapse, not persisted across restarts.
+    /// Refreshed from the workspace-backed project tabs each frame.
     /// Keyed by uid so a fold follows the project through panel reorder and
     /// does not leak onto an unrelated project that later reuses a WinId.
     collapsed_folders: HashSet<u64>,
+    /// Project tab whose folder was clicked; drained by the window manager.
+    pub folder_toggle: Option<u64>,
 }
 
 impl PanelView {
@@ -379,6 +382,7 @@ impl PanelView {
             reorder: None,
             drag: None,
             collapsed_folders: HashSet::new(),
+            folder_toggle: None,
         }
     }
 
@@ -397,12 +401,13 @@ impl PanelView {
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 0.0, th.bg);
 
-        // Drop folds whose project is gone so a later project that reuses
-        // nothing still can't inherit a stale uid — the set stays bounded.
-        {
-            let live: HashSet<u64> = self.model.projects.iter().map(|pr| pr.uid).collect();
-            self.collapsed_folders.retain(|u| live.contains(u));
-        }
+        self.collapsed_folders = self
+            .model
+            .projects
+            .iter()
+            .filter(|project| project.collapsed)
+            .map(|project| project.uid)
+            .collect();
 
         // Quiet update-available chip pinned to the bottom edge of every
         // expanded layout (rows, columns, strip); the collapsed rails get a
@@ -1361,6 +1366,7 @@ impl PanelView {
                         if folder_resp.clicked() {
                             if let Some(uid) = chip.drag_ref.as_ref().map(|r| r.uid) {
                                 toggle_folder(&mut self.collapsed_folders, uid);
+                                self.folder_toggle = Some(uid);
                             }
                             folder_hit = true;
                         }
@@ -1703,6 +1709,7 @@ impl PanelView {
                     if folder_resp.clicked() {
                         if let Some(uid) = rp.drag_ref.as_ref().map(|r| r.uid) {
                             toggle_folder(&mut self.collapsed_folders, uid);
+                            self.folder_toggle = Some(uid);
                         }
                         folder_hit = true;
                     }

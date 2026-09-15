@@ -85,6 +85,9 @@ pub struct TabSnap {
     /// v1 files and old builds stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_order: Option<u64>,
+    /// Whether this project hides its children in the Sessions pane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub panel_collapsed: bool,
     pub content: ContentSnap,
 }
 
@@ -94,6 +97,7 @@ impl Default for TabSnap {
             title: String::new(),
             managed_title: false,
             panel_order: None,
+            panel_collapsed: false,
             content: ContentSnap::Chat,
         }
     }
@@ -383,6 +387,7 @@ mod tests {
                         title: "foreman".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(r"C:\code\foreman")),
@@ -396,6 +401,7 @@ mod tests {
                                         title: "powershell  ·  #1".into(),
                                         managed_title: true,
                                         panel_order: None,
+                                        panel_collapsed: false,
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
                                         },
@@ -450,6 +456,7 @@ mod tests {
             title: "armed.png".into(),
             managed_title: false,
             panel_order: None,
+            panel_collapsed: false,
             content: ContentSnap::Image {
                 path: PathBuf::from(r"C:\shots\armed.png"),
             },
@@ -503,6 +510,7 @@ mod tests {
                         title: "t".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
                         },
@@ -523,6 +531,7 @@ mod tests {
                         title: "p".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap::default(),
                         },

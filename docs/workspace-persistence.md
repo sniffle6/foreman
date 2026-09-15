@@ -13,6 +13,7 @@ On restart, Foreman reloads the last desktop layout from
 - Minimized windows (`min_from_tree` so restore re-tiles when appropriate)
 - Focus (window + active tab) and zoom, when set
 - Terminal **shell kind** (`powershell` / `cmd` / `bash`) and chat viewer tabs
+- Per-project Sessions-pane folder collapse state (older files default to expanded)
 - Per-tab sessions-panel rank (`TabSnap.panel_order`, additive `Option` —
   omitted when unset, so v1 files and old builds are unaffected)
 - Whether each terminal title is Foreman-managed. Generated semantic text is

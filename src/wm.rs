@@ -274,6 +274,8 @@ pub struct Tab {
     /// Dense ranks are rewritten per scope on each panel reorder; the value
     /// travels with the tab through merge/untab/capture/restore.
     pub panel_order: Option<u64>,
+    /// Whether this project hides its children in the Sessions pane.
+    pub panel_collapsed: bool,
     /// Runtime-only stable row identity for panel drag-drop resolution:
     /// stamped once at construction from a process-global counter; travels
     /// with the tab through merge/untab. Never persisted — uids regenerate on
@@ -305,6 +307,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             panel_order: None,
+            panel_collapsed: false,
             tab_uid: next_tab_uid(),
             auto_title: false,
             agent_title: Default::default(),
@@ -317,6 +320,7 @@ impl Tab {
             title: title.as_ref().to_string(),
             content,
             panel_order: None,
+            panel_collapsed: false,
             tab_uid: next_tab_uid(),
             auto_title: true,
             agent_title: Default::default(),
@@ -691,6 +695,7 @@ impl WindowManager {
                     },
                     managed_title: t.auto_title,
                     panel_order: t.panel_order,
+                    panel_collapsed: t.panel_collapsed,
                     content,
                 });
             }
@@ -886,6 +891,7 @@ impl WindowManager {
                     _ => Tab::fixed(restored_title, content),
                 };
                 tab.panel_order = tab_snap.panel_order;
+                tab.panel_collapsed = tab_snap.panel_collapsed;
                 tabs.push(tab);
             }
 
@@ -2439,6 +2445,7 @@ impl WindowManager {
                     focused: pfocused,
                     bell: tabs.iter().any(|t| t.bell),
                     rank: pt.panel_order,
+                    collapsed: pt.panel_collapsed,
                     uid: pt.tab_uid,
                     tabs,
                 });
@@ -2766,6 +2773,7 @@ impl WindowManager {
         let mut hover = None;
         let mut toggle = false;
         let mut reorder = None;
+        let mut folder_toggle = None;
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 if let Content::TaskManager(v) = &mut t.content {
@@ -2783,9 +2791,21 @@ impl WindowManager {
                         v.update_click = false;
                         self.update_clicked = true;
                     }
+                    if let Some(uid) = v.folder_toggle.take() {
+                        folder_toggle = Some(uid);
+                    }
                     if let Some(r) = v.reorder.take() {
                         reorder = Some(r);
                     }
+                }
+            }
+        }
+        if let Some(uid) = folder_toggle {
+            for tab in self.windows.iter_mut().flat_map(|w| &mut w.tabs) {
+                if tab.tab_uid == uid && matches!(tab.content, Content::Project(_)) {
+                    tab.panel_collapsed = !tab.panel_collapsed;
+                    self.workspace_dirty = true;
+                    break;
                 }
             }
         }
@@ -6670,6 +6690,48 @@ mod tests {
     }
 
     #[test]
+    fn panel_folder_toggle_survives_workspace_roundtrip() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        ranked_proj_win(&mut wm, None, "folded");
+        ranked_proj_win(&mut wm, None, "expanded");
+        wm.ensure_panel(false, 240.0, Dir::Right);
+        wm.poll_workspace_dirty();
+        let uid = wm.panel_model().projects[0].uid;
+        for tab in wm.windows.iter_mut().flat_map(|w| &mut w.tabs) {
+            if let Content::TaskManager(view) = &mut tab.content {
+                view.folder_toggle = Some(uid);
+            }
+        }
+        wm.drain_panel_acts(&mut Vec::new());
+        assert!(wm.poll_workspace_dirty());
+        let json = serde_json::to_string(&wm.capture_workspace()).unwrap();
+        let snap = crate::workspace::parse_workspace_json(&json);
+        let mut restored = WindowManager::new();
+        restored.apply_workspace(&snap, &ctx);
+        restored.ensure_panel(false, 240.0, Dir::Right);
+        let projects = restored.panel_model().projects;
+        assert_ne!(projects[0].uid, uid);
+        assert!(projects[0].collapsed);
+        assert!(!projects[1].collapsed);
+
+        // Expanding again updates the saved state too.
+        for tab in restored.windows.iter_mut().flat_map(|w| &mut w.tabs) {
+            if let Content::TaskManager(view) = &mut tab.content {
+                view.folder_toggle = Some(projects[0].uid);
+            }
+        }
+        restored.poll_workspace_dirty();
+        restored.drain_panel_acts(&mut Vec::new());
+        assert!(restored.poll_workspace_dirty());
+        let expanded = serde_json::to_string(&restored.capture_workspace()).unwrap();
+        assert!(!expanded.contains("panel_collapsed"));
+        let legacy = crate::workspace::parse_workspace_json(&expanded);
+        restored.apply_workspace(&legacy, &ctx);
+        assert!(restored.panel_model().projects.iter().all(|p| !p.collapsed));
+    }
+
+    #[test]
     fn panel_order_survives_capture_and_restore() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
@@ -7234,6 +7296,7 @@ mod tests {
                         title: "proj".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -7247,6 +7310,7 @@ mod tests {
                                         title: "cmd".into(),
                                         managed_title: false,
                                         panel_order: None,
+                                        panel_collapsed: false,
                                         content: ContentSnap::Terminal {
                                             shell: "cmd".into(),
                                         },
@@ -7334,6 +7398,7 @@ mod tests {
                         title: "proj".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -7350,6 +7415,7 @@ mod tests {
                                         title: "board".into(),
                                         managed_title: false,
                                         panel_order: None,
+                                        panel_collapsed: false,
                                         content: ContentSnap::Board,
                                     }],
                                     minimized: false,
@@ -7429,6 +7495,7 @@ mod tests {
                         title: "gone".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(
@@ -8772,6 +8839,7 @@ mod tests {
             title: "cmd".into(),
             managed_title: false,
             panel_order: None,
+            panel_collapsed: false,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -8814,6 +8882,7 @@ mod tests {
             title: "cmd".into(),
             managed_title: false,
             panel_order: None,
+            panel_collapsed: false,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -8838,6 +8907,7 @@ mod tests {
                         title: "Project".into(),
                         managed_title: false,
                         panel_order: None,
+                        panel_collapsed: false,
                         content: ContentSnap::Project { child },
                     }],
                     ..Default::default()
@@ -8892,6 +8962,7 @@ mod tests {
             title: title.into(),
             managed_title: false,
             panel_order: None,
+            panel_collapsed: false,
             content: ContentSnap::Project {
                 child: ManagerSnap {
                     cwd: Some(std::env::current_dir().unwrap()),
@@ -8902,6 +8973,7 @@ mod tests {
                             title: "cmd".into(),
                             managed_title: true,
                             panel_order: None,
+                            panel_collapsed: false,
                             content: ContentSnap::Terminal {
                                 shell: "cmd".into(),
                             },

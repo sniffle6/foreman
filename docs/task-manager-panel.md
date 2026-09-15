@@ -39,9 +39,9 @@ and the landing site for future agent-state badges.
 - **Project folder icon folds nested rows:** clicking the folder glyph on a
   project row (or the matching strip chip) hides or shows that project's
   session/chat/image children. The rest of the row still surfaces the project.
-  Fold state lives on `PanelView` keyed by the project's `Tab` uid, so it
-  survives panel reorder and does not leak onto an unrelated project; it is
-  runtime-only (like board column collapse, not written to settings). A
+  Fold state lives on the project's `Tab` and is saved in `workspace.json`,
+  so it survives panel reorder, tab moves, and workspace restore. Folder
+  clicks resolve by runtime tab uid; old workspaces default to expanded. A
   disclosure triangle on the icon points right when collapsed and down when
   expanded. Collapsed rails already show only project icons, so a rail click
   still surfaces rather than folding. A latched Bell on a hidden child
