@@ -160,24 +160,14 @@ target dir that doesn't lock the running exe: `cargo build --target-dir target/a
 `docs/dev-launcher.md`.
 
 **Run + screenshot the window** (you can't see the GUI otherwise — capture it and
-`Read` the PNG):
+`Read` the PNG). The capture script lives with the **build-screenshot** skill:
 ```powershell
-$p = Start-Process -FilePath ".\target\debug\foreman.exe" -PassThru
-Start-Sleep -Seconds 6
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class Cap { [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  public struct RECT { public int Left, Top, Right, Bottom; } }
-"@
-[Cap]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 400
-$r = New-Object Cap+RECT; [Cap]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
-Add-Type -AssemblyName System.Drawing
-$b = New-Object System.Drawing.Bitmap(($r.Right-$r.Left), ($r.Bottom-$r.Top))
-$g = [System.Drawing.Graphics]::FromImage($b); $g.CopyFromScreen($r.Left,$r.Top,0,0,$b.Size)
-$b.Save("$(Get-Location)\win.png"); $g.Dispose(); $b.Dispose()
+pwsh -NoProfile -File ".claude/skills/build-screenshot/screenshot.ps1"          # target\debug, real config
+pwsh -NoProfile -File ".claude/skills/build-screenshot/screenshot.ps1" -Exe .\target\agent\debug\foreman.exe -AppData .\target\agent\appdata
 ```
-Then `Read` `win.png`.
+It captures via `PrintWindow` (nothing in front of the window pollutes the
+shot), stops only the instance it launched, and `-AppData` sandboxes the
+config exactly as `scripts\run-dev.ps1` does. Then `Read` `win.png`.
 
 To test multi-window/nested layouts without hijacking the user's mouse,
 temporarily spawn a few projects/terminals at startup in `main.rs` (call
