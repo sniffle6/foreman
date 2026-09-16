@@ -315,6 +315,11 @@ pub struct Settings {
     // -- agents --
     /// Write foreman-dispatch/foreman-chat skills into Claude & Codex dirs on launch.
     pub install_skills: bool,
+    /// Dispatch each card into its own git worktree under
+    /// `.foreman/worktrees/<id>` (spec: dispatch-worktrees). Off = dispatch
+    /// in the project cwd as before. Silently skipped when the cwd is not
+    /// inside a git repository.
+    pub dispatch_worktrees: bool,
     /// Generate one title from the first meaningful prompt in each new agent
     /// Session. Off by default because the prompt crosses a provider boundary.
     pub auto_name_agent_sessions: bool,
@@ -360,6 +365,7 @@ impl Default for Settings {
             focus_follows_mouse: false,
             dim_unfocused: false,
             install_skills: true,
+            dispatch_worktrees: true,
             auto_name_agent_sessions: false,
             title_provider: NamingProvider::Codex,
             title_model: "gpt-5.6-luna".into(),
@@ -554,6 +560,7 @@ mod tests {
         assert!(!s.focus_follows_mouse);
         assert!(!s.dim_unfocused);
         assert!(s.install_skills);
+        assert!(s.dispatch_worktrees);
         assert_eq!(s.crew_stale_secs, 300);
         assert_eq!(s.send_settle_ms, 120);
         assert!(!s.auto_name_agent_sessions);
@@ -563,6 +570,14 @@ mod tests {
         assert_eq!(s.default_project_dir, "");
         assert!(s.update_check);
         assert_eq!(s.theme, "Foreman Warm");
+    }
+
+    #[test]
+    fn dispatch_worktrees_defaults_on_for_old_settings_files() {
+        let s: Settings = serde_json::from_str(r#"{"font_size":13.0}"#).unwrap();
+        assert!(s.dispatch_worktrees);
+        let off: Settings = serde_json::from_str(r#"{"dispatch_worktrees":false}"#).unwrap();
+        assert!(!off.dispatch_worktrees);
     }
 
     #[test]

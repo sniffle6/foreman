@@ -58,6 +58,7 @@ pub enum Field {
     FocusFollowsMouse,
     DimUnfocused,
     InstallSkills,
+    DispatchWorktrees,
     AutoNameAgentSessions,
     TitleProvider,
     TitleModel,
@@ -184,6 +185,12 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 field: Field::InstallSkills,
                 label: "Install agent skills on launch",
                 desc: "Writes foreman-dispatch / foreman-chat into Claude & Codex skill dirs",
+                kind: Kind::Toggle,
+            },
+            RowSpec {
+                field: Field::DispatchWorktrees,
+                label: "Dispatch cards into git worktrees",
+                desc: "Each dispatched card works in .foreman/worktrees/<id> on branch card/<id>",
                 kind: Kind::Toggle,
             },
             RowSpec {
@@ -349,6 +356,7 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::FocusFollowsMouse => flip(&mut s.focus_follows_mouse),
         Field::DimUnfocused => flip(&mut s.dim_unfocused),
         Field::InstallSkills => flip(&mut s.install_skills),
+        Field::DispatchWorktrees => flip(&mut s.dispatch_worktrees),
         Field::AutoNameAgentSessions => flip(&mut s.auto_name_agent_sessions),
         Field::TitleProvider => {
             let next = match (s.title_provider, a) {
@@ -393,6 +401,7 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::FocusFollowsMouse => s.focus_follows_mouse.to_string(),
         Field::DimUnfocused => s.dim_unfocused.to_string(),
         Field::InstallSkills => s.install_skills.to_string(),
+        Field::DispatchWorktrees => s.dispatch_worktrees.to_string(),
         Field::AutoNameAgentSessions => s.auto_name_agent_sessions.to_string(),
         Field::TitleProvider => s.title_provider.label().to_string(),
         Field::TitleModel => s.title_model.clone(),
