@@ -118,11 +118,17 @@ fn gated_by_pointer(over: bool, pointer: Option<egui::Pos2>, sub_rect: egui::Rec
 /// after `apply_acts` (content cannot mutate the manager mid-loop).
 pub enum BoardAct {
     QuickAdd(String),
-    Dispatch { id: String, agent: String },
+    Dispatch {
+        id: String,
+        agent: String,
+    },
     Done(String),
     Release(String),
     Rm(String),
     JumpTo(String),
+    /// Human-only forcing teardown of a card's worktree (spec:
+    /// dispatch-worktrees §Teardown). The manager opens a confirm first.
+    DiscardWorktree(String),
 }
 
 pub struct BoardView {

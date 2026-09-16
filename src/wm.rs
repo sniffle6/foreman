@@ -482,6 +482,31 @@ enum CloseTarget {
     Tab(WinId, usize),
     /// The whole app: set by the app-quit guard (Task 5).
     Quit,
+    /// Force-remove card `id`'s worktree and branch (the human-only Discard
+    /// action; spec: dispatch-worktrees §Teardown).
+    DiscardWorktree(String),
+}
+
+/// Results from the worktree background threads (teardown, status poll),
+/// drained once per frame by `drain_worktree_msgs`.
+enum WorktreeMsg {
+    Teardown {
+        id: String,
+        outcome: crate::kanban::TeardownOutcome,
+    },
+    Status(std::collections::HashMap<String, crate::kanban::WorktreeStatus>),
+}
+
+/// A teardown waiting for its moment. `held_by` names the terminal that
+/// claimed the card when the transition happened: on Windows a directory
+/// that is some process's cwd cannot be deleted, and the worker's shell sits
+/// in the worktree when it runs `kanban done`, so the teardown starts only
+/// once that terminal is no longer running (closed or exited).
+struct PendingTeardown {
+    id: String,
+    wt: crate::kanban::Worktree,
+    held_by: Option<String>,
+    force: bool,
 }
 
 /// An in-flight close awaiting confirmation: the doomed target plus the modal
@@ -511,6 +536,13 @@ pub struct WindowManager {
     /// desktop level — same posture as `chat`). Shared with the board viewer
     /// window, hence the Rc<RefCell<…>>.
     pub kanban: Rc<RefCell<crate::kanban::CardStore>>,
+    /// Worktree thread results (see `WorktreeMsg`). The sender is cloned
+    /// into each spawned thread; the receiver is drained per frame.
+    worktree_tx: std::sync::mpsc::Sender<WorktreeMsg>,
+    worktree_rx: std::sync::mpsc::Receiver<WorktreeMsg>,
+    /// Teardowns queued by `done`/release/`rm`/Discard, started by
+    /// `drain_worktree_msgs` once their holding terminal is gone.
+    pending_teardowns: Vec<PendingTeardown>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -585,6 +617,7 @@ pub struct WindowManager {
 
 impl WindowManager {
     pub fn new() -> Self {
+        let (worktree_tx, worktree_rx) = std::sync::mpsc::channel();
         Self {
             windows: vec![],
             z: 1,
@@ -594,6 +627,9 @@ impl WindowManager {
             tag: None,
             chat: Rc::new(RefCell::new(crate::chat::ChatRoom::new())),
             kanban: Rc::new(RefCell::new(crate::kanban::CardStore::default())),
+            worktree_tx,
+            worktree_rx,
+            pending_teardowns: Vec::new(),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -1530,7 +1566,9 @@ impl WindowManager {
             }
             "done" => {
                 let id = req.id.as_deref().ok_or("missing id")?;
+                let held = child.claim_terminal(id);
                 child.kanban.borrow_mut().done(id)?;
+                child.teardown_after(id, held);
                 Ok(OpenReply {
                     ok: true,
                     ..Default::default()
@@ -1550,7 +1588,7 @@ impl WindowManager {
             }
             "rm" => {
                 let id = req.id.as_deref().ok_or("missing id")?;
-                child.kanban.borrow_mut().rm(id)?;
+                child.kanban_rm(id)?;
                 Ok(OpenReply {
                     ok: true,
                     ..Default::default()
@@ -2088,31 +2126,62 @@ impl WindowManager {
                     }
                 }
                 crate::board::BoardAct::Done(id) => {
-                    if let Err(e) = self.kanban.borrow_mut().done(&id) {
-                        crate::notify::queue(
+                    let held = self.claim_terminal(&id);
+                    let done = self.kanban.borrow_mut().done(&id);
+                    match done {
+                        Ok(()) => self.teardown_after(&id, held),
+                        Err(e) => crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
                             format!("board: done failed for {id}: {e}"),
-                        );
+                        ),
                     }
                 }
                 crate::board::BoardAct::Release(id) => {
-                    if let Err(e) = self.kanban.borrow_mut().release(&id) {
-                        crate::notify::queue(
+                    let held = self.claim_terminal(&id);
+                    let released = self.kanban.borrow_mut().release(&id);
+                    match released {
+                        Ok(()) => self.teardown_after(&id, held),
+                        Err(e) => crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
                             format!("board: release failed for {id}: {e}"),
-                        );
+                        ),
                     }
                 }
                 crate::board::BoardAct::Rm(id) => {
-                    if let Err(e) = self.kanban.borrow_mut().rm(&id) {
+                    if let Err(e) = self.kanban_rm(&id) {
                         crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
                             format!("board: rm failed for {id}: {e}"),
                         );
                     }
+                }
+                crate::board::BoardAct::DiscardWorktree(id) => {
+                    if self.overlay_blocks_close() {
+                        continue;
+                    }
+                    let wt = self
+                        .kanban
+                        .borrow()
+                        .get(&id)
+                        .and_then(|c| c.worktree.clone());
+                    let Some(wt) = wt else {
+                        continue;
+                    };
+                    self.pending_close = Some(PendingClose {
+                        target: CloseTarget::DiscardWorktree(id),
+                        view: crate::confirm::ConfirmClose::new(
+                            "Discard worktree?",
+                            format!(
+                                "Deletes {} and branch {}, including any uncommitted or unmerged work.",
+                                wt.path, wt.branch
+                            ),
+                            "Discard",
+                            Vec::new(),
+                        ),
+                    });
                 }
                 crate::board::BoardAct::JumpTo(tag) => {
                     // Re-resolve the live terminal from the tag (same
@@ -2141,7 +2210,7 @@ impl WindowManager {
                     }
                 }
                 crate::board::BoardAct::Dispatch { id, agent } => {
-                    let Some(card) = self.kanban.borrow().get(&id).cloned() else {
+                    let Some(mut card) = self.kanban.borrow().get(&id).cloned() else {
                         crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
@@ -2149,11 +2218,48 @@ impl WindowManager {
                         );
                         continue;
                     };
+                    // Bring-up (spec: dispatch-worktrees). `record` is what
+                    // the claim write stores; `card.worktree` only steers the
+                    // prompt template. Any git failure aborts before the
+                    // spawn with the card untouched.
+                    let mut record: Option<crate::kanban::Worktree> = None;
+                    if crate::config::live(ctx).dispatch_worktrees {
+                        if let Some(cwd) = self.cwd.clone() {
+                            match crate::kanban::bring_up_worktree(&cwd, &card) {
+                                Ok(crate::kanban::BringUp::Worktree(wt)) => {
+                                    card.worktree = Some(wt.clone());
+                                    record = Some(wt);
+                                }
+                                Ok(crate::kanban::BringUp::InPlace) => card.worktree = None,
+                                Ok(crate::kanban::BringUp::Detached) => {
+                                    card.worktree = None;
+                                    crate::notify::queue(
+                                        ctx,
+                                        crate::notify::Level::Warning,
+                                        format!(
+                                            "card {id}: no branch checked out; dispatched without a worktree"
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    crate::notify::queue(
+                                        ctx,
+                                        crate::notify::Level::Error,
+                                        format!("card {id}: worktree bring-up failed: {e}"),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    } else {
+                        card.worktree = None; // the prompt renders today's text
+                    }
                     let prompt =
                         crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
+                    let spawn_cwd = record.as_ref().map(|w| std::path::PathBuf::from(&w.path));
                     match self.add_terminal_cmd(
                         &[agent.clone(), prompt],
-                        None,
+                        spawn_cwd.as_deref(),
                         Some(&card.title),
                         ctx,
                     ) {
@@ -2181,7 +2287,7 @@ impl WindowManager {
                                 &agent,
                                 run,
                                 existing_term,
-                                None,
+                                record,
                             );
                             if let Err(e) = claimed {
                                 crate::notify::queue(
@@ -2217,6 +2323,158 @@ impl WindowManager {
                     }
                 }
             }
+        }
+    }
+
+    /// The terminal tag holding `id`'s claim right now, captured BEFORE a
+    /// transition clears the claim (deferred teardown waits on it).
+    fn claim_terminal(&self, id: &str) -> Option<String> {
+        self.kanban
+            .borrow()
+            .get(id)
+            .and_then(|c| c.claim.as_ref().map(|cl| cl.terminal.clone()))
+    }
+
+    /// Queue the non-forcing teardown for `id` after `done`/release, if the
+    /// card carries a worktree. Starts on a later frame once `held_by` (the
+    /// claiming terminal) is no longer running — see `PendingTeardown`.
+    fn teardown_after(&mut self, id: &str, held_by: Option<String>) {
+        let wt = self
+            .kanban
+            .borrow()
+            .get(id)
+            .and_then(|c| c.worktree.clone());
+        if let Some(wt) = wt {
+            self.pending_teardowns.push(PendingTeardown {
+                id: id.to_string(),
+                wt,
+                held_by,
+                force: false,
+            });
+        }
+    }
+
+    /// `rm` pre-check + delete + teardown (spec: dispatch-worktrees §Teardown,
+    /// the `rm` row): refuse while the tree is dirty or ahead of base, so a
+    /// deleted card never orphans a branch nobody can find. The verdict is
+    /// synchronous (the status-probe commands, ~100 ms) because the card
+    /// file is gone before the asynchronous teardown reports.
+    fn kanban_rm(&mut self, id: &str) -> Result<(), String> {
+        let wt = self
+            .kanban
+            .borrow()
+            .get(id)
+            .and_then(|c| c.worktree.clone());
+        if let (Some(wt), Some(cwd)) = (&wt, self.cwd.as_deref()) {
+            let st = crate::kanban::worktree_status_now(cwd, wt);
+            if st.dirty || st.ahead > 0 {
+                return Err(format!(
+                    "card {id} has unmerged work in its worktree; discard it first"
+                ));
+            }
+        }
+        let held = self.claim_terminal(id);
+        self.kanban.borrow_mut().rm(id)?;
+        if let Some(wt) = wt {
+            self.pending_teardowns.push(PendingTeardown {
+                id: id.to_string(),
+                wt,
+                held_by: held,
+                force: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Spawn one queued teardown on a thread; the outcome lands in
+    /// `worktree_rx`. Removing a tree that holds a `target/` dir deletes
+    /// gigabytes — never on the UI thread.
+    fn start_teardown(&self, pending: PendingTeardown, ctx: &egui::Context) {
+        let Some(cwd) = self.cwd.clone() else {
+            return;
+        };
+        let tx = self.worktree_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let outcome = crate::kanban::teardown_worktree(&cwd, &pending.wt, pending.force);
+            let _ = tx.send(WorktreeMsg::Teardown {
+                id: pending.id,
+                outcome,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Per-frame worktree maintenance (spec: dispatch-worktrees): start
+    /// queued teardowns whose holding terminal is gone, apply thread results
+    /// (clear the field on success, toast the kept cases), and kick the
+    /// status poll when the store says a round is due. Runs from `show`,
+    /// per manager — each project owns its threads' channel like its store.
+    fn drain_worktree_msgs(&mut self, ctx: &egui::Context) {
+        if !self.pending_teardowns.is_empty() {
+            let states = self.term_states();
+            let (ready, wait): (Vec<_>, Vec<_>) = self.pending_teardowns.drain(..).partition(|p| {
+                p.held_by.as_ref().is_none_or(|tag| {
+                    states.get(tag).copied() != Some(crate::kanban::TermState::Running)
+                })
+            });
+            self.pending_teardowns = wait;
+            for p in ready {
+                self.start_teardown(p, ctx);
+            }
+        }
+        while let Ok(msg) = self.worktree_rx.try_recv() {
+            match msg {
+                WorktreeMsg::Status(map) => {
+                    self.kanban.borrow_mut().set_worktree_statuses(map);
+                }
+                WorktreeMsg::Teardown { id, outcome } => {
+                    use crate::kanban::TeardownOutcome::*;
+                    match outcome {
+                        Removed => {
+                            // An rm'd card has nothing to clear — not an error.
+                            let _ = self.kanban.borrow_mut().clear_worktree(&id);
+                        }
+                        Dirty => crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Warning,
+                            format!("card {id}: worktree kept: uncommitted changes"),
+                        ),
+                        Unmerged { ahead } => {
+                            let base = self
+                                .kanban
+                                .borrow()
+                                .get(&id)
+                                .and_then(|c| c.worktree.as_ref().map(|w| w.base.clone()))
+                                .unwrap_or_else(|| "base".into());
+                            crate::notify::queue(
+                                ctx,
+                                crate::notify::Level::Warning,
+                                format!("card {id}: branch kept: {ahead} commits not on {base}"),
+                            );
+                        }
+                        Failed(e) => crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("card {id}: worktree teardown failed: {e}"),
+                        ),
+                    }
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        let batch = self.kanban.borrow_mut().take_status_poll(now);
+        if let (Some(batch), Some(cwd)) = (batch, self.cwd.clone()) {
+            let tx = self.worktree_tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let map = batch
+                    .iter()
+                    .map(|(id, wt)| (id.clone(), crate::kanban::worktree_status_now(&cwd, wt)))
+                    .collect();
+                let _ = tx.send(WorktreeMsg::Status(map));
+                ctx.request_repaint();
+            });
         }
     }
 
@@ -3694,6 +3952,21 @@ impl WindowManager {
                     CloseTarget::ActiveTab(id) => self.close_active_tab(id),
                     CloseTarget::Tab(id, idx) => self.close_tab(id, idx),
                     CloseTarget::Quit => self.quit_confirmed = true,
+                    CloseTarget::DiscardWorktree(id) => {
+                        let wt = self
+                            .kanban
+                            .borrow()
+                            .get(&id)
+                            .and_then(|c| c.worktree.clone());
+                        if let Some(wt) = wt {
+                            self.pending_teardowns.push(PendingTeardown {
+                                id,
+                                wt,
+                                held_by: None,
+                                force: true,
+                            });
+                        }
+                    }
                 }
                 // Close (and quit-accept) are structural; empty desktop after
                 // last-project close should persist as empty on next launch.
@@ -5649,6 +5922,7 @@ impl WindowManager {
         self.drain_chat_clicks();
         self.drain_chat_posts();
         self.drain_board_acts(&ctx);
+        self.drain_worktree_msgs(&ctx);
         if self.drain_settings() {
             self.swallow_input(ui);
         }
@@ -13310,6 +13584,203 @@ mod tests {
             w.title(),
             "Fix resize flicker",
             "the window title must read as the work, not the argv"
+        );
+    }
+
+    // --- dispatch-worktrees: bring-up, deferred teardown, rm guard ---
+
+    /// `git init -b main` + one tracked file; `None` = no git on PATH (skip).
+    fn kanban_git_repo() -> Option<tempfile::TempDir> {
+        if !crate::kanban::git_available() {
+            eprintln!("git not on PATH; skipping");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        Some(tmp)
+    }
+
+    /// Drain the worktree channel until `pred` holds or 15 s pass — teardown
+    /// runs on a thread, so the test polls the same seam the frame loop does.
+    fn drain_until(
+        m: &mut WindowManager,
+        ctx: &egui::Context,
+        mut pred: impl FnMut(&WindowManager) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !pred(m) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting on the worktree thread"
+            );
+            m.drain_worktree_msgs(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Dispatch `id` into a pause Session from the board and return the
+    /// (window, tab) of the spawned terminal.
+    fn dispatch_from_board(
+        child: &mut WindowManager,
+        id: &str,
+        ctx: &egui::Context,
+    ) -> (WinId, usize) {
+        push_board_act(
+            child,
+            crate::board::BoardAct::Dispatch {
+                id: id.to_string(),
+                agent: pause_argv()[0].clone(),
+            },
+        );
+        child.drain_board_acts(ctx);
+        let tag = child
+            .kanban
+            .borrow()
+            .get(id)
+            .unwrap()
+            .claim
+            .as_ref()
+            .expect("dispatch claims")
+            .terminal
+            .clone();
+        for w in &child.windows {
+            for (i, t) in w.tabs.iter().enumerate() {
+                if matches!(&t.content, Content::Terminal(s) if term_tag(s.term_id()) == tag) {
+                    return (w.id, i);
+                }
+            }
+        }
+        panic!("dispatched terminal not found");
+    }
+
+    #[test]
+    fn dispatch_creates_a_worktree_and_done_tears_it_down_once_the_terminal_is_gone() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("wt card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        let (win, tab) = dispatch_from_board(child, &id, &ctx);
+
+        let wt = child
+            .kanban
+            .borrow()
+            .get(&id)
+            .unwrap()
+            .worktree
+            .clone()
+            .expect("dispatch records the worktree");
+        assert_eq!(wt.branch, format!("card/{id}"));
+        assert_eq!(wt.base, "main");
+        assert!(std::path::Path::new(&wt.path).is_dir());
+
+        // done while the worker's terminal is alive: Done, but the tree is
+        // kept (a live process holds the directory) — teardown is deferred.
+        push_board_act(child, crate::board::BoardAct::Done(id.clone()));
+        child.drain_board_acts(&ctx);
+        child.drain_worktree_msgs(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        child.drain_worktree_msgs(&ctx);
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::Done
+        );
+        assert!(child.kanban.borrow().get(&id).unwrap().worktree.is_some());
+        assert!(std::path::Path::new(&wt.path).is_dir());
+
+        // the worker's pane goes away → teardown runs → field cleared
+        child.close_tab(win, tab);
+        drain_until(child, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().worktree.is_none()
+        });
+        assert!(!std::path::Path::new(&wt.path).exists());
+        let mut notifications = crate::notify::Notifications::new();
+        notifications.drain_pending(&ctx);
+        assert!(
+            !notifications.contains_text("teardown failed"),
+            "a clean merged tree must tear down silently"
+        );
+    }
+
+    #[test]
+    fn dispatch_with_the_setting_off_records_no_worktree() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut settings = crate::config::Settings::default();
+        settings.dispatch_worktrees = false;
+        crate::config::seed_live(&ctx, &settings);
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("plain card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        dispatch_from_board(child, &id, &ctx);
+        let card = child.kanban.borrow().get(&id).unwrap().clone();
+        assert!(card.claim.is_some());
+        assert!(card.worktree.is_none());
+        assert!(!repo.path().join(".foreman").join("worktrees").exists());
+    }
+
+    #[test]
+    fn rm_refuses_a_card_whose_worktree_has_unmerged_work() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("dirty card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        dispatch_from_board(m.project_child_mut(pid).unwrap(), &id, &ctx);
+        let wt = m
+            .project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow()
+            .get(&id)
+            .unwrap()
+            .worktree
+            .clone()
+            .unwrap();
+        std::fs::write(std::path::Path::new(&wt.path).join("f.txt"), "edit\n").unwrap();
+        let mut rm = kanban_req("rm");
+        rm.id = Some(id.clone());
+        let e = m.kanban_dispatch(&rm).unwrap_err();
+        assert!(e.contains("unmerged work"), "{e}");
+        assert!(
+            m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .get(&id)
+                .is_some()
         );
     }
 

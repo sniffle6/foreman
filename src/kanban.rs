@@ -1077,7 +1077,24 @@ pub fn teardown_worktree(
         } else {
             &["worktree", "remove", &wt.path]
         };
-        git(project_cwd, args).map(|_| ())
+        // A process that just exited inside the tree (the worker's shell)
+        // can hold the directory for a moment on Windows; a refusal that is
+        // neither "dirty" nor a git usage error is retried briefly.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match git(project_cwd, args) {
+                Ok(_) => break Ok(()),
+                Err(e) if attempt < 5 && !e.to_lowercase().contains("modified or untracked") => {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    if !std::path::Path::new(&wt.path).is_dir() {
+                        break Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => break Err(e),
+            }
+        }
     } else {
         git(project_cwd, &["worktree", "prune"]).map(|_| ())
     };
