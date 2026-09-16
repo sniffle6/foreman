@@ -83,6 +83,9 @@ pub struct OpenReply {
     /// replies stay byte-identical (same pattern as `seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// The number `kanban add` issued (`#12`), beside `id`. Same skip rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num: Option<u32>,
     /// Per-cell attribute grid for `snapshot --attrs`. None (omitted on the
     /// wire) unless `--attrs` was requested, so v1 replies stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +234,8 @@ pub struct KanbanRequest {
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>, // caller's FOREMAN_TERMINAL_ID; required for start
+    /// A card reference as typed — `#12`, `12`, or a storage id. The host
+    /// resolves it (`CardStore::resolve`); the field keeps its v1 name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1006,7 +1011,7 @@ fn parse_kanban_id_and_project(
             }
         }
     }
-    let id = id.ok_or("missing <id>")?;
+    let id = id.ok_or("missing <card>")?;
     Ok((id, project))
 }
 
@@ -1075,7 +1080,7 @@ fn parse_kanban_block(
             }
         }
     }
-    let id = id.ok_or("missing <id>")?;
+    let id = id.ok_or("missing <card>")?;
     let reason = reason.ok_or("--reason is required")?;
     if reason.trim().is_empty() {
         return Err("--reason cannot be empty".into());
@@ -1132,10 +1137,10 @@ fn parse_kanban_wait(
         }
     }
     let target = match (id, any) {
-        (Some(_), true) => return Err("give either <id> or --any, not both".into()),
+        (Some(_), true) => return Err("give either <card> or --any, not both".into()),
         (Some(id), false) => crate::kanban::WaitTarget::Id(id),
         (None, true) => crate::kanban::WaitTarget::Any,
-        (None, false) => return Err("wait needs <id> or --any".into()),
+        (None, false) => return Err("wait needs <card> or --any".into()),
     };
     Ok(KanbanAction::Wait {
         project,
@@ -1275,25 +1280,29 @@ non-.png extension fail here, before touching the pipe).";
 const HELP_KANBAN: &str = "\
 foreman kanban add <title words...> [--body B] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--json] [--project P]
-foreman kanban start <id> [--project P]
-foreman kanban done <id> [--project P]
-foreman kanban block <id> --reason R [--project P]
-foreman kanban rm <id> [--project P]
-foreman kanban wait <id> [--timeout SECS] [--project P]
+foreman kanban start <card> [--project P]
+foreman kanban done <card> [--project P]
+foreman kanban block <card> --reason R [--project P]
+foreman kanban rm <card> [--project P]
+foreman kanban wait <card> [--timeout SECS] [--project P]
 foreman kanban wait --any [--timeout SECS] [--project P]
 
 Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
+<card> is the card's number (#12 or 12) or its id (a3f8k2). Numbers are
+per project, issued in order, and never reused after rm. If two clones of
+the repo numbered cards independently and a number matches more than one
+card, the verb refuses and lists the ids; use the id.
   add     positional words join into the title; --body attaches a longer
-          description. Reply: {\"ok\":true,\"id\":\"a3f8k2\"}.
-  list    line per card by default (id, state, title, then a context tail —
-          claim/blocked-reason/orphan marker; a card dispatched into a git
-          worktree appends [wt card/<id> +ahead -behind dirty|missing]).
+          description. Reply: {\"ok\":true,\"id\":\"a3f8k2\",\"num\":12}.
+  list    line per card by default (#num, id, state, title, then a context
+          tail — claim/blocked-reason/orphan marker; a card dispatched into
+          a git worktree appends [wt card/<id> +ahead -behind dirty|missing]).
           --json emits one JSON card object per line instead, each carrying
-          a derived \"orphaned\" flag (true when the card's claim points at
-          a Session that is gone) and, for worktree cards, the stored
-          \"worktree\" object plus a derived \"worktree_status\" — neither
-          derived field is ever stored in the card file itself.
+          \"num\", a derived \"orphaned\" flag (true when the card's claim
+          points at a Session that is gone) and, for worktree cards, the
+          stored \"worktree\" object plus a derived \"worktree_status\" —
+          neither derived field is ever stored in the card file itself.
   start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
@@ -1549,6 +1558,11 @@ fn kanban_wait_with(
 ) -> i32 {
     let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     let mut watched = std::collections::HashSet::new();
+    // `Id` holds what the user typed (`#12`, `12`, or an id) until the
+    // first listing resolves it; from then on it is pinned to the storage
+    // id, so a later removal is "removed" (exit 1) and never a re-resolve.
+    let mut target = target;
+    let mut resolved = !matches!(target, crate::kanban::WaitTarget::Id(_));
     loop {
         let req = KanbanRequest {
             cmd: "kanban".into(),
@@ -1582,6 +1596,35 @@ fn kanban_wait_with(
                     .iter()
                     .filter_map(|l| serde_json::from_str(l).ok())
                     .collect();
+                if !resolved {
+                    if let crate::kanban::WaitTarget::Id(reference) = &target {
+                        let plain: Vec<crate::kanban::Card> =
+                            cards.iter().map(|c| c.card.clone()).collect();
+                        match crate::kanban::find_by_ref(&plain, reference) {
+                            Ok(card) => target = crate::kanban::WaitTarget::Id(card.id.clone()),
+                            // Missing at the outset is the same verdict as
+                            // removed under the waiter: needs a human.
+                            Err(crate::kanban::RefError::NotFound) => {
+                                eprintln!(
+                                    "foreman kanban wait: no such card: {}",
+                                    reference.trim()
+                                );
+                                return 1;
+                            }
+                            // A bad reference is a usage problem, not a
+                            // card state: refuse before watching anything.
+                            Err(crate::kanban::RefError::Ambiguous(ids)) => {
+                                eprintln!(
+                                    "foreman kanban wait: card {} is ambiguous ({}); use the id",
+                                    reference.trim(),
+                                    ids.join(", ")
+                                );
+                                return 2;
+                            }
+                        }
+                    }
+                    resolved = true;
+                }
                 if let Some(code) = crate::kanban::wait_verdict(&target, &mut watched, &cards) {
                     return code;
                 }
@@ -1668,15 +1711,98 @@ mod tests {
 
     #[test]
     fn open_reply_id_is_wire_compatible_with_v1() {
-        // unset id serializes away (byte-identical to v1)…
+        // unset id/num serialize away (byte-identical to v1)…
         let ok = OpenReply {
             ok: true,
             ..Default::default()
         };
-        assert!(!serde_json::to_string(&ok).unwrap().contains("\"id\""));
-        // …and a v1 reply without the key still parses.
+        let s = serde_json::to_string(&ok).unwrap();
+        assert!(!s.contains("\"id\""));
+        assert!(!s.contains("\"num\""));
+        // …and a v1 reply without the keys still parses.
         let r: OpenReply = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(r.id, None);
+        assert_eq!(r.num, None);
+        let r: OpenReply = serde_json::from_str(r#"{"ok":true,"id":"a3f8k2","num":12}"#).unwrap();
+        assert_eq!(r.num, Some(12));
+    }
+
+    fn listing(cards: &[crate::kanban::Card]) -> OpenReply {
+        OpenReply {
+            ok: true,
+            history: Some(
+                cards
+                    .iter()
+                    .map(|c| {
+                        crate::kanban::CardLine {
+                            card: c.clone(),
+                            orphaned: false,
+                            worktree_status: None,
+                        }
+                        .json_line()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kanban_wait_resolves_a_number_once_then_pins_the_id() {
+        let mut card = crate::kanban::Card::new(
+            12,
+            "a3f8k2".into(),
+            "t".into(),
+            None,
+            "2026-08-28T00:00:00Z".into(),
+        );
+        card.state = crate::kanban::CardState::InProgress;
+        let mut done = card.clone();
+        done.state = crate::kanban::CardState::Done;
+        // Poll 1: in progress (keep waiting). Poll 2: a NEW card wearing the
+        // same number appears while the watched one is done — the pinned
+        // id, not the number, decides.
+        let mut impostor = card.clone();
+        impostor.id = "zzzzzz".into();
+        let mut polls = 0;
+        let code = kanban_wait_with(
+            None,
+            crate::kanban::WaitTarget::Id("#12".into()),
+            None,
+            |_| {
+                polls += 1;
+                Ok(if polls == 1 {
+                    listing(&[card.clone()])
+                } else {
+                    listing(&[impostor.clone(), done.clone()])
+                })
+            },
+            |_| {},
+        );
+        assert_eq!(code, 0);
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn kanban_wait_refuses_a_missing_or_ambiguous_reference_up_front() {
+        let a = crate::kanban::Card::new(3, "aaaaaa".into(), "t".into(), None, String::new());
+        let b = crate::kanban::Card::new(3, "bbbbbb".into(), "t".into(), None, String::new());
+        let code = kanban_wait_with(
+            None,
+            crate::kanban::WaitTarget::Id("#3".into()),
+            None,
+            |_| Ok(listing(&[a.clone(), b.clone()])),
+            |_| panic!("must not poll again"),
+        );
+        assert_eq!(code, 2, "ambiguous is a usage error");
+        let code = kanban_wait_with(
+            None,
+            crate::kanban::WaitTarget::Id("#9".into()),
+            None,
+            |_| Ok(listing(&[a.clone()])),
+            |_| panic!("must not poll again"),
+        );
+        assert_eq!(code, 1, "missing needs a human, same as removed");
     }
 
     #[test]

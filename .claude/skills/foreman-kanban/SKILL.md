@@ -22,18 +22,26 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 
     & $env:FOREMAN_EXE kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
     & $env:FOREMAN_EXE kanban list --state backlog
-    & $env:FOREMAN_EXE kanban start a3f8k2
-    & $env:FOREMAN_EXE kanban done a3f8k2
-    & $env:FOREMAN_EXE kanban block a3f8k2 --reason "needs a design decision"
-    & $env:FOREMAN_EXE kanban rm a3f8k2
-    & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 300
+    & $env:FOREMAN_EXE kanban start 12
+    & $env:FOREMAN_EXE kanban done 12
+    & $env:FOREMAN_EXE kanban block 12 --reason "needs a design decision"
+    & $env:FOREMAN_EXE kanban rm 12
+    & $env:FOREMAN_EXE kanban wait 12 --timeout 300
     & $env:FOREMAN_EXE kanban wait --any --timeout 300
 
+Every verb that names one card takes the card's **number** (`12` or `#12`,
+what the board and `list` show) or its six-char **id** (`a3f8k2`). Numbers
+are per project, issued in order, and never reused after `rm`; a wrong
+number errors with `no such card: #12`. Dispatch prompts and branch names
+use the id — it can never be ambiguous. The one edge: two clones of a repo
+numbering cards independently can collide, and then the verb refuses and
+lists the ids (`card #12 is ambiguous (a3f8k2, b7c1d2); use the id`).
+
 - `add` — positional words join into the title; `--body` attaches a longer
-  description. Reply carries the new card's id.
-- `list` — one line per card by default (id, state, title, context tail);
-  `--json` emits full card objects, one per line, including a derived
-  `orphaned` flag (claim points at a Session that's gone).
+  description. Reply carries the new card's `num` and `id`.
+- `list` — one line per card by default (`#num`, id, state, title, context
+  tail); `--json` emits full card objects, one per line, including `num`
+  and a derived `orphaned` flag (claim points at a Session that's gone).
 - `start` — self-service claim of a backlog card. Requires you to be inside a
   foreman terminal (`FOREMAN_TERMINAL_ID` set).
 - `done` — closes a card you hold: in-progress -> done.
@@ -49,9 +57,9 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 Creating a card is a single `add` call. Do not research the repo to compose
 a body — write the pointer you already have, or go title-only and move on.
 Exit code `0` means the card exists; no follow-up `list` to verify. The
-ok-reply JSON on stdout carries the new card's `id` — capture it if you
-will `wait` on the card later; if your harness ate stdout, `list --json`
-recovers it.
+ok-reply JSON on stdout carries the new card's `num` and `id` — capture
+one if you will `wait` on the card later; if your harness ate stdout,
+`list --json` recovers it.
 
 ## Close-out discipline
 

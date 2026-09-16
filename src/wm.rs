@@ -1486,13 +1486,30 @@ impl WindowManager {
             .ok_or("project has no working directory")?;
         child.kanban.borrow_mut().set_dir(Some(&cwd));
 
+        // Verbs that address one card take a reference as typed (`#12`,
+        // `12`, or an id). Files are authoritative: reload before resolving
+        // so a card another instance added seconds ago answers to its
+        // number, then hand the store the id it was resolved to.
+        let resolved = match req.action.as_str() {
+            "start" | "done" | "block" | "rm" => {
+                let reference = req.id.as_deref().ok_or("missing card reference")?;
+                let mut store = child.kanban.borrow_mut();
+                store.reload();
+                Some(store.resolve(reference)?)
+            }
+            _ => None,
+        };
+        let id = resolved.as_deref().ok_or("missing card reference");
+
         match req.action.as_str() {
             "add" => {
                 let title = req.title.as_deref().ok_or("add requires a title")?;
                 let id = child.kanban.borrow_mut().add(title, req.body.as_deref())?;
+                let num = child.kanban.borrow().get(&id).map(|c| c.num);
                 Ok(OpenReply {
                     ok: true,
                     id: Some(id),
+                    num,
                     ..Default::default()
                 })
             }
@@ -1539,7 +1556,7 @@ impl WindowManager {
                     .from
                     .as_deref()
                     .ok_or("start requires FOREMAN_TERMINAL_ID (run inside a foreman terminal)")?;
-                let id = req.id.as_deref().ok_or("missing id")?;
+                let id = id?;
                 let states = child.term_states();
                 // A claim by an exited/unknown terminal would be born
                 // orphaned — reject before it ever reaches the store.
@@ -1575,7 +1592,7 @@ impl WindowManager {
                 })
             }
             "done" => {
-                let id = req.id.as_deref().ok_or("missing id")?;
+                let id = id?;
                 let held = child.claim_terminal(id);
                 child.kanban.borrow_mut().done(id)?;
                 child.teardown_after(id, held);
@@ -1585,7 +1602,7 @@ impl WindowManager {
                 })
             }
             "block" => {
-                let id = req.id.as_deref().ok_or("missing id")?;
+                let id = id?;
                 // The store re-checks non-empty server-side regardless of
                 // what the client sent — a missing `reason` field is just an
                 // empty string here, same rejection path.
@@ -1597,7 +1614,7 @@ impl WindowManager {
                 })
             }
             "rm" => {
-                let id = req.id.as_deref().ok_or("missing id")?;
+                let id = id?;
                 child.kanban_rm(id)?;
                 Ok(OpenReply {
                     ok: true,
@@ -13688,13 +13705,29 @@ mod tests {
 
         let mut add = kanban_req("add");
         add.title = Some("card".into());
-        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let reply = m.kanban_dispatch(&add).unwrap();
+        let id = reply.id.clone().unwrap();
+        // The first card on a fresh board is #1, and the reply says so.
+        assert_eq!(reply.num, Some(1));
 
         // done on a Backlog card: Err (only InProgress -> Done is legal)
         let mut done = kanban_req("done");
         done.id = Some(id.clone());
         let e = m.kanban_dispatch(&done).unwrap_err();
         assert!(e.contains("not in progress"), "{e}");
+
+        // Every one-card verb takes the number as well as the id; a wrong
+        // number names the reference as typed.
+        let mut by_num = kanban_req("done");
+        by_num.id = Some("#1".into());
+        let e = m.kanban_dispatch(&by_num).unwrap_err();
+        assert!(e.contains("not in progress"), "{e}");
+        by_num.id = Some("#7".into());
+        let e = m.kanban_dispatch(&by_num).unwrap_err();
+        assert_eq!(e, "no such card: #7");
+        by_num.id = None;
+        let e = m.kanban_dispatch(&by_num).unwrap_err();
+        assert_eq!(e, "missing card reference");
 
         // block with no reason: Err, server-side, regardless of what the
         // client sent (a missing `reason` field dispatches as "").
@@ -13703,9 +13736,9 @@ mod tests {
         let e = m.kanban_dispatch(&block).unwrap_err();
         assert!(e.contains("reason"), "{e}");
 
-        // start, then done: ok
+        // start by bare number, then done by id: ok
         let mut start = kanban_req("start");
-        start.id = Some(id.clone());
+        start.id = Some("1".into());
         start.from = Some(term_tag(t1));
         assert!(m.kanban_dispatch(&start).unwrap().ok);
         assert!(m.kanban_dispatch(&done).unwrap().ok);

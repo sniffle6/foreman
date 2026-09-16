@@ -7,7 +7,16 @@
 //! design and the transition/verdict tables this module implements.
 
 /// Card file schema version. Bump only alongside a documented migration.
+/// (`num` was added additively: an absent field reads as 0 = unnumbered and
+/// is backfilled by [`CardStore::reload`], so v1 files stay v1.)
 pub const CARD_V: u32 = 1;
+
+/// High-water mark of issued card numbers, one decimal integer, beside the
+/// card files: `.foreman/tasks/counter`. Not `.json`, so the card loader and
+/// the staleness fingerprint both ignore it. Numbers only ever go up — a
+/// removed card's number is a gap forever, so `#12` in a chat log or a
+/// commit message never silently starts meaning a different card.
+pub const COUNTER_FILE: &str = "counter";
 
 /// How often [`CardStore::maybe_reload`] re-checks the on-disk fingerprint —
 /// the branch-switch/pull staleness poll from the spec's Reconciliation
@@ -122,6 +131,17 @@ pub fn worktree_summary(wt: &Worktree, st: Option<&WorktreeStatus>) -> String {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Card {
     pub v: u32,
+    /// Project-local card number, the human handle (`#12`). Monotonic per
+    /// clone via [`COUNTER_FILE`]; `0` means "not yet numbered" (a file
+    /// written before numbering existed) and is backfilled on reload.
+    /// Two clones numbering independently — or two foreman processes on
+    /// the same directory racing the unlocked counter — can collide; a
+    /// collision makes the number ambiguous (see [`find_by_ref`]), never
+    /// wrong.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub num: u32,
+    /// Opaque storage id (six base36 chars) — the file name, the branch
+    /// name, and what the wire and the board carry internally.
     pub id: String,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,10 +159,15 @@ pub struct Card {
     pub updated: String,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 impl Card {
-    pub fn new(id: String, title: String, body: Option<String>, now: String) -> Self {
+    pub fn new(num: u32, id: String, title: String, body: Option<String>, now: String) -> Self {
         Card {
             v: CARD_V,
+            num,
             id,
             title,
             body,
@@ -264,8 +289,98 @@ pub fn is_orphaned(
 /// changes (branch switch, `git pull`, hand-edited file) between polls.
 type Fingerprint = Vec<(String, std::time::SystemTime, u64)>;
 
+/// Number first (the handle people read the board by), then creation time
+/// and id for unnumbered cards and clone collisions.
 fn sort_cards(cards: &mut [Card]) {
-    cards.sort_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)));
+    cards.sort_by(|a, b| (a.num, &a.created, &a.id).cmp(&(b.num, &b.created, &b.id)));
+}
+
+/// Last issued number per [`COUNTER_FILE`]; a missing or unparseable file
+/// reads as 0 and the surviving cards' highest number takes over.
+pub fn read_counter(dir: &std::path::Path) -> u32 {
+    std::fs::read_to_string(dir.join(COUNTER_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// One card's file straight from disk (see `CardStore::read_one`).
+fn read_card_in(dir: &std::path::Path, id: &str) -> Result<Card, String> {
+    let path = dir.join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("no such card: {id}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("card {id} is corrupt: {e}"))
+}
+
+/// Atomic write: temp file in the same dir, then rename — a reader (or a
+/// crash) never observes a half-written card file. Free function so the
+/// reload-time backfill can write while iterating `cards` mutably.
+fn write_card_in(dir: &std::path::Path, card: &Card) -> Result<(), String> {
+    let path = dir.join(format!("{}.json", card.id));
+    let tmp = dir.join(format!("{}.json.tmp", card.id));
+    let json = serde_json::to_string_pretty(card).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, json).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot finalize {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Atomic like `write_card_in`: temp file then rename.
+fn write_counter(dir: &std::path::Path, n: u32) -> Result<(), String> {
+    let path = dir.join(COUNTER_FILE);
+    let tmp = dir.join(format!("{COUNTER_FILE}.tmp"));
+    std::fs::write(&tmp, format!("{n}\n"))
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot finalize {}: {e}", path.display()))
+}
+
+/// The number the next card gets: one past the counter or the highest
+/// numbered card, whichever is larger — a pulled card can carry a number
+/// this clone's counter never issued.
+fn next_number(dir: &std::path::Path, cards: &[Card]) -> u32 {
+    let high = cards.iter().map(|c| c.num).max().unwrap_or(0);
+    read_counter(dir).max(high) + 1
+}
+
+/// How a typed card reference failed to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefError {
+    NotFound,
+    /// Two or more cards carry the number (independent clones); the ids, in
+    /// board order, so the caller can say which to use instead.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve what a human or agent typed — `#12`, `12`, or an id — to a card.
+/// A leading `#` means number only. Bare digits try the number first and
+/// fall back to an id match (a base36 id can be all digits), so the
+/// natural `start 12` works and the rare digit-only id stays reachable.
+/// Anything else is an id. `0` is never a number (it marks "unnumbered").
+pub fn find_by_ref<'a>(cards: &'a [Card], reference: &str) -> Result<&'a Card, RefError> {
+    let r = reference.trim();
+    let (num_only, digits) = match r.strip_prefix('#') {
+        Some(rest) => (true, rest),
+        None => (false, r),
+    };
+    let num: Option<u32> = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    };
+    if let Some(n) = num.filter(|n| *n > 0) {
+        let hits: Vec<&Card> = cards.iter().filter(|c| c.num == n).collect();
+        match hits.len() {
+            1 => return Ok(hits[0]),
+            0 => {}
+            _ => {
+                return Err(RefError::Ambiguous(
+                    hits.iter().map(|c| c.id.clone()).collect(),
+                ));
+            }
+        }
+    }
+    if num_only {
+        return Err(RefError::NotFound);
+    }
+    cards.iter().find(|c| c.id == r).ok_or(RefError::NotFound)
 }
 
 fn fingerprint_of(dir: Option<&std::path::Path>) -> Fingerprint {
@@ -362,7 +477,57 @@ impl CardStore {
         }
         sort_cards(&mut cards);
         self.cards = cards;
+        self.backfill_numbers(&dir);
         self.fingerprint = fingerprint_of(Some(&dir));
+    }
+
+    /// One-time migration for files written before numbering existed:
+    /// every `num == 0` card gets the next number, in creation order, and
+    /// is written back so the number is stable across reloads and clones.
+    /// A write failure leaves that card unnumbered (it is retried on the
+    /// next reload) and is reported, never fatal — same policy as a corrupt
+    /// file. No-op when every card is numbered, which is every reload after
+    /// the first.
+    fn backfill_numbers(&mut self, dir: &std::path::Path) {
+        if self.cards.iter().all(|c| c.num != 0) {
+            return;
+        }
+        let mut next = next_number(dir, &self.cards);
+        let mut issued = false;
+        // Sorted with num first, so the unnumbered cards lead in
+        // (created, id) order — exactly the order they should be numbered.
+        for card in self.cards.iter_mut().filter(|c| c.num == 0) {
+            // Files are authoritative: re-read right before writing, like
+            // every other mutator, so another instance's transition (or
+            // its own backfill) landing between the bulk load and this
+            // write is kept, never overwritten with the stale copy.
+            let mut fresh = match read_card_in(dir, &card.id) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("kanban: cannot number card {}: {e}", card.id);
+                    continue;
+                }
+            };
+            if fresh.num == 0 {
+                fresh.num = next;
+                fresh.updated = now_stamp();
+                if let Err(e) = write_card_in(dir, &fresh) {
+                    eprintln!("kanban: cannot number card {}: {e}", card.id);
+                    continue;
+                }
+                issued = true;
+            }
+            // Either way the disk copy wins; a number the other instance
+            // issued is skipped past, never issued again here.
+            next = next.max(fresh.num + 1);
+            *card = fresh;
+        }
+        if issued {
+            if let Err(e) = write_counter(dir, next - 1) {
+                eprintln!("kanban: cannot write card counter: {e}");
+            }
+            sort_cards(&mut self.cards);
+        }
     }
 
     /// No-op unless [`POLL_INTERVAL`] has elapsed since the last poll; then
@@ -386,6 +551,20 @@ impl CardStore {
 
     pub fn get(&self, id: &str) -> Option<&Card> {
         self.cards.iter().find(|c| c.id == id)
+    }
+
+    /// [`find_by_ref`] against the in-memory cards, answering the storage
+    /// id every store verb takes. Errors name the reference as typed.
+    pub fn resolve(&self, reference: &str) -> Result<String, String> {
+        match find_by_ref(&self.cards, reference) {
+            Ok(c) => Ok(c.id.clone()),
+            Err(RefError::NotFound) => Err(format!("no such card: {}", reference.trim())),
+            Err(RefError::Ambiguous(ids)) => Err(format!(
+                "card {} is ambiguous ({}); use the id",
+                reference.trim(),
+                ids.join(", ")
+            )),
+        }
     }
 
     pub fn orphans(&self) -> &std::collections::HashSet<String> {
@@ -480,22 +659,13 @@ impl CardStore {
     /// Read one card's file straight from disk — the "files are authoritative
     /// over memory" re-read every mutation performs before touching a card.
     fn read_one(&self, id: &str) -> Result<Card, String> {
-        let dir = self.dir_or_err()?;
-        let path = dir.join(format!("{id}.json"));
-        let text = std::fs::read_to_string(&path).map_err(|_| format!("no such card: {id}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("card {id} is corrupt: {e}"))
+        read_card_in(self.dir_or_err()?, id)
     }
 
     /// Atomic write: temp file in the same dir, then rename — a reader (or a
     /// crash) never observes a half-written card file.
     fn write_card(&self, dir: &std::path::Path, card: &Card) -> Result<(), String> {
-        let path = dir.join(format!("{}.json", card.id));
-        let tmp = dir.join(format!("{}.json.tmp", card.id));
-        let json = serde_json::to_string_pretty(card).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, json).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| format!("cannot finalize {}: {e}", path.display()))?;
-        Ok(())
+        write_card_in(dir, card)
     }
 
     /// Update the in-memory mirror after a successful write: replace (or
@@ -526,7 +696,12 @@ impl CardStore {
         let existing: std::collections::HashSet<String> =
             self.cards.iter().map(|c| c.id.clone()).collect();
         let id = gen_id(&existing);
+        // Counter first: if the card write then fails the number is simply
+        // skipped, which is allowed; the reverse order could issue it twice.
+        let num = next_number(&dir, &self.cards);
+        write_counter(&dir, num)?;
         let card = Card::new(
+            num,
             id.clone(),
             title.to_string(),
             body.map(str::to_string),
@@ -668,6 +843,7 @@ impl CardStore {
     }
 
     /// Delete the card's file, from any state; error if it doesn't exist.
+    /// The counter is untouched: the number is retired, not recycled.
     pub fn rm(&mut self, id: &str) -> Result<(), String> {
         let dir = self.dir_or_err()?.to_path_buf();
         let path = dir.join(format!("{id}.json"));
@@ -721,14 +897,21 @@ pub fn closeout_style() -> CloseoutStyle {
 /// style-independent integration lines (spec: dispatch-worktrees). A card
 /// without a worktree renders exactly the pre-worktree text.
 pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
+    // The opening line names the card the way the board does (`#12`), with
+    // the id beside it; the close-out commands below use the id alone —
+    // it can never be ambiguous, and it is what the branch is named after.
+    let handle = if card.num > 0 {
+        format!("#{} ({})", card.num, card.id)
+    } else {
+        card.id.clone()
+    };
     let mut out = format!(
-        "You are a worker Session dispatched from card {id} on this project's board.\n\
+        "You are a worker Session dispatched from card {handle} on this project's board.\n\
          \n\
          # Task: {title}\n\
          \n\
          {body}\n\
          \n",
-        id = card.id,
         title = card.title,
         body = card.body.as_deref().unwrap_or(""),
     );
@@ -796,9 +979,10 @@ impl CardLine {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    /// One aligned human line: id, state, title, then a context tail —
-    /// `[terminal agent]` while claimed, `(reason)` when blocked, an
-    /// `ORPHANED` marker when the claim is dead.
+    /// One aligned human line: `#num`, id, state, title, then a context
+    /// tail — `[terminal agent]` while claimed, `(reason)` when blocked, an
+    /// `ORPHANED` marker when the claim is dead. An unnumbered card (only
+    /// possible before its first reload) has no number column.
     pub fn human_line(&self) -> String {
         let state = match self.card.state {
             CardState::Backlog => "backlog",
@@ -825,7 +1009,14 @@ impl CardLine {
         if self.orphaned {
             tail.push("ORPHANED".to_string());
         }
-        let mut line = format!("{}  {state}  {}", self.card.id, self.card.title);
+        let mut line = if self.card.num > 0 {
+            format!(
+                "#{}  {}  {state}  {}",
+                self.card.num, self.card.id, self.card.title
+            )
+        } else {
+            format!("{}  {state}  {}", self.card.id, self.card.title)
+        };
         if !tail.is_empty() {
             line.push_str("  ");
             line.push_str(&tail.join(" "));
@@ -1168,7 +1359,13 @@ mod tests {
             at: String::new(),
         };
         let states = std::collections::HashMap::new(); // t4 absent = Missing
-        let mut card = Card::new("a1".into(), "t".into(), None, "2026-08-28T00:00:00Z".into());
+        let mut card = Card::new(
+            1,
+            "a1".into(),
+            "t".into(),
+            None,
+            "2026-08-28T00:00:00Z".into(),
+        );
         card.claim = Some(dead_claim.clone());
 
         for state in [CardState::Backlog, CardState::Blocked, CardState::Done] {
@@ -1187,6 +1384,14 @@ mod tests {
         let mut s = CardStore::default();
         s.set_dir(Some(dir));
         s
+    }
+
+    /// The store's own directory under a project cwd, created so a test can
+    /// plant card files by hand before the store first looks.
+    fn tasks_dir(project: &std::path::Path) -> std::path::PathBuf {
+        let dir = project.join(".foreman").join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -1306,7 +1511,7 @@ mod tests {
         assert_eq!(store.cards().len(), 1);
 
         let dir = tmp.path().join(".foreman").join("tasks");
-        let extra = Card::new("zz9999".into(), "external".into(), None, now_stamp());
+        let extra = Card::new(9, "zz9999".into(), "external".into(), None, now_stamp());
         std::fs::write(
             dir.join("zz9999.json"),
             serde_json::to_string(&extra).unwrap(),
@@ -1360,6 +1565,7 @@ mod tests {
     #[test]
     fn card_json_matches_spec_shape_and_omits_empty_options() {
         let c = Card::new(
+            12,
             "a3f8k2".into(),
             "Fix resize flicker".into(),
             None,
@@ -1367,6 +1573,7 @@ mod tests {
         );
         let s = serde_json::to_string(&c).unwrap();
         assert!(s.contains(r#""v":1"#));
+        assert!(s.contains(r#""num":12"#));
         assert!(s.contains(r#""state":"backlog""#));
         assert!(!s.contains("body"));
         assert!(!s.contains("blocked_reason"));
@@ -1383,6 +1590,8 @@ mod tests {
         let c: Card = serde_json::from_str(j).unwrap();
         assert_eq!(c.state, CardState::InProgress);
         assert_eq!(c.claim.as_ref().unwrap().terminal, "t4");
+        // a pre-numbering v1 file reads as unnumbered (0) until backfilled
+        assert_eq!(c.num, 0);
     }
 
     #[test]
@@ -1408,6 +1617,7 @@ mod tests {
 
     fn sample_card(body: Option<&str>) -> Card {
         Card::new(
+            12,
             "a3f8k2".into(),
             "Fix resize flicker".into(),
             body.map(str::to_string),
@@ -1421,7 +1631,7 @@ mod tests {
         let s = dispatch_prompt(&card, CloseoutStyle::Path);
         assert_eq!(
             s,
-            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+            "You are a worker Session dispatched from card #12 (a3f8k2) on this project's board.\n\
              \n\
              # Task: Fix resize flicker\n\
              \n\
@@ -1440,7 +1650,7 @@ mod tests {
         let s = dispatch_prompt(&card, CloseoutStyle::Path);
         assert_eq!(
             s,
-            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+            "You are a worker Session dispatched from card #12 (a3f8k2) on this project's board.\n\
              \n\
              # Task: Fix resize flicker\n\
              \n\
@@ -1459,7 +1669,7 @@ mod tests {
         let s = dispatch_prompt(&card, CloseoutStyle::EnvVar);
         assert_eq!(
             s,
-            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+            "You are a worker Session dispatched from card #12 (a3f8k2) on this project's board.\n\
              \n\
              # Task: Fix resize flicker\n\
              \n\
@@ -1479,7 +1689,7 @@ mod tests {
         let s = dispatch_prompt(&card, CloseoutStyle::EnvVar);
         assert_eq!(
             s,
-            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+            "You are a worker Session dispatched from card #12 (a3f8k2) on this project's board.\n\
              \n\
              # Task: Fix resize flicker\n\
              \n\
@@ -1507,6 +1717,31 @@ mod tests {
     }
 
     #[test]
+    fn card_line_human_line_omits_the_number_column_for_an_unnumbered_card() {
+        let mut card = sample_card(None);
+        card.num = 0;
+        let line = CardLine {
+            card,
+            orphaned: false,
+            worktree_status: None,
+        };
+        assert_eq!(line.human_line(), "a3f8k2  backlog  Fix resize flicker");
+    }
+
+    #[test]
+    fn dispatch_prompt_for_an_unnumbered_card_names_the_id_alone() {
+        let mut card = sample_card(None);
+        card.num = 0;
+        let out = dispatch_prompt(&card, CloseoutStyle::Path);
+        assert!(
+            out.starts_with(
+                "You are a worker Session dispatched from card a3f8k2 on this project's board.\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn card_line_human_line_shows_claim_reason_and_orphan_marker() {
         let mut card = sample_card(None);
         card.state = CardState::InProgress;
@@ -1523,7 +1758,7 @@ mod tests {
         };
         assert_eq!(
             line.human_line(),
-            "a3f8k2  in_progress  Fix resize flicker  [t4 claude] ORPHANED"
+            "#12  a3f8k2  in_progress  Fix resize flicker  [t4 claude] ORPHANED"
         );
 
         let mut blocked = sample_card(None);
@@ -1536,12 +1771,18 @@ mod tests {
         };
         assert_eq!(
             line.human_line(),
-            "a3f8k2  blocked  Fix resize flicker  (waiting on design)"
+            "#12  a3f8k2  blocked  Fix resize flicker  (waiting on design)"
         );
     }
 
     fn line_with_state(id: &str, state: CardState, orphaned: bool) -> CardLine {
-        let mut card = Card::new(id.into(), "t".into(), None, "2026-08-28T00:00:00Z".into());
+        let mut card = Card::new(
+            1,
+            id.into(),
+            "t".into(),
+            None,
+            "2026-08-28T00:00:00Z".into(),
+        );
         card.state = state;
         CardLine {
             card,
@@ -1646,7 +1887,7 @@ mod tests {
     #[test]
     fn bring_up_creates_a_listed_worktree_on_the_card_branch_and_excludes_it() {
         let Some(repo) = git_repo() else { return };
-        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
             panic!("expected a worktree");
         };
@@ -1687,7 +1928,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         assert!(matches!(
             bring_up_worktree(tmp.path(), &card).unwrap(),
             BringUp::InPlace
@@ -1704,7 +1945,7 @@ mod tests {
     #[test]
     fn bring_up_reuses_an_existing_tree_and_readds_a_leftover_branch() {
         let Some(repo) = git_repo() else { return };
-        let mut card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let mut card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
             panic!()
         };
@@ -1739,7 +1980,7 @@ mod tests {
     #[test]
     fn teardown_after_merge_leaves_nothing() {
         let Some(repo) = git_repo() else { return };
-        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
             panic!()
         };
@@ -1759,7 +2000,7 @@ mod tests {
     #[test]
     fn teardown_keeps_a_dirty_tree() {
         let Some(repo) = git_repo() else { return };
-        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
             panic!()
         };
@@ -1783,7 +2024,7 @@ mod tests {
     #[test]
     fn teardown_keeps_an_unmerged_branch_and_reports_the_count() {
         let Some(repo) = git_repo() else { return };
-        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let card = Card::new(1, "a1b2c3".into(), "t".into(), None, now_stamp());
         let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
             panic!()
         };
@@ -1811,7 +2052,7 @@ mod tests {
         let s = dispatch_prompt(&card, CloseoutStyle::Path);
         assert_eq!(
             s,
-            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+            "You are a worker Session dispatched from card #12 (a3f8k2) on this project's board.\n\
              \n\
              # Task: Fix resize flicker\n\
              \n\
@@ -2081,7 +2322,156 @@ mod tests {
         assert_eq!(back, line);
         assert_eq!(
             line.human_line(),
-            "a3f8k2  backlog  Fix resize flicker  [wt card/a3f8k2 +3 -1 dirty]"
+            "#12  a3f8k2  backlog  Fix resize flicker  [wt card/a3f8k2 +3 -1 dirty]"
+        );
+    }
+
+    #[test]
+    fn add_numbers_cards_monotonically_and_never_reuses_a_removed_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let a = store.add("one", None).unwrap();
+        let b = store.add("two", None).unwrap();
+        let c = store.add("three", None).unwrap();
+        assert_eq!(store.get(&a).unwrap().num, 1);
+        assert_eq!(store.get(&b).unwrap().num, 2);
+        assert_eq!(store.get(&c).unwrap().num, 3);
+        store.rm(&c).unwrap();
+        let d = store.add("four", None).unwrap();
+        assert_eq!(
+            store.get(&d).unwrap().num,
+            4,
+            "a removed number is a gap forever"
+        );
+        // A fresh store on the same dir continues from the counter file,
+        // not from the highest surviving card.
+        store.rm(&d).unwrap();
+        let mut store2 = store_at(tmp.path());
+        let e = store2.add("five", None).unwrap();
+        assert_eq!(store2.get(&e).unwrap().num, 5);
+    }
+
+    #[test]
+    fn reload_backfills_numbers_on_unnumbered_cards_in_created_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tasks_dir(tmp.path());
+        let older = r#"{"v":1,"id":"zz9999","title":"older","state":"backlog","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        let newer = r#"{"v":1,"id":"aa1111","title":"newer","state":"done","created":"2026-08-29T13:55:00Z","updated":"2026-08-29T13:55:00Z"}"#;
+        std::fs::write(dir.join("zz9999.json"), older).unwrap();
+        std::fs::write(dir.join("aa1111.json"), newer).unwrap();
+        let store = store_at(tmp.path());
+        assert_eq!(store.get("zz9999").unwrap().num, 1);
+        assert_eq!(store.get("aa1111").unwrap().num, 2);
+        // Written back, so the number is stable across reloads and clones.
+        let text = std::fs::read_to_string(dir.join("aa1111.json")).unwrap();
+        assert!(text.contains("\"num\": 2"), "{text}");
+        assert_eq!(read_counter(&dir), 2);
+        let mut store2 = store_at(tmp.path());
+        let id = store2.add("next", None).unwrap();
+        assert_eq!(store2.get(&id).unwrap().num, 3);
+    }
+
+    #[test]
+    fn numbering_continues_past_a_number_that_arrived_from_another_clone() {
+        // A pulled card file can carry a number above this clone's counter.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        store.add("one", None).unwrap();
+        let pulled = r#"{"v":1,"num":7,"id":"pull01","title":"pulled","state":"backlog","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        std::fs::write(tasks_dir(tmp.path()).join("pull01.json"), pulled).unwrap();
+        let id = store.add("two", None).unwrap();
+        assert_eq!(store.get(&id).unwrap().num, 8);
+        assert_eq!(read_counter(&tasks_dir(tmp.path())), 8);
+    }
+
+    #[test]
+    fn cards_sort_by_number_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        store.add("one", None).unwrap();
+        // Older by timestamp but numbered later (pulled from another clone).
+        let pulled = r#"{"v":1,"num":7,"id":"pull01","title":"pulled","state":"backlog","created":"2020-01-01T00:00:00Z","updated":"2020-01-01T00:00:00Z"}"#;
+        std::fs::write(tasks_dir(tmp.path()).join("pull01.json"), pulled).unwrap();
+        store.reload();
+        let nums: Vec<u32> = store.cards().iter().map(|c| c.num).collect();
+        assert_eq!(nums, vec![1, 7]);
+    }
+
+    fn by(cards: &[Card], r: &str) -> Result<String, RefError> {
+        find_by_ref(cards, r).map(|c| c.id.clone())
+    }
+
+    #[test]
+    fn find_by_ref_covers_number_hash_id_and_error_rows() {
+        let mut cards = vec![
+            Card::new(
+                1,
+                "a1b2c3".into(),
+                "one".into(),
+                None,
+                "2026-08-28T00:00:00Z".into(),
+            ),
+            Card::new(
+                2,
+                "123456".into(),
+                "two".into(),
+                None,
+                "2026-08-28T00:00:01Z".into(),
+            ),
+            Card::new(
+                3,
+                "d4e5f6".into(),
+                "three".into(),
+                None,
+                "2026-08-28T00:00:02Z".into(),
+            ),
+            Card::new(
+                3,
+                "g7h8i9".into(),
+                "again".into(),
+                None,
+                "2026-08-28T00:00:03Z".into(),
+            ),
+        ];
+        assert_eq!(by(&cards, "#1").unwrap(), "a1b2c3");
+        assert_eq!(by(&cards, "1").unwrap(), "a1b2c3");
+        assert_eq!(by(&cards, " #2 ").unwrap(), "123456");
+        assert_eq!(by(&cards, "a1b2c3").unwrap(), "a1b2c3");
+        // An all-digit id is reachable when no card carries that number...
+        assert_eq!(by(&cards, "123456").unwrap(), "123456");
+        // ...but a leading hash means number only.
+        assert_eq!(by(&cards, "#123456").unwrap_err(), RefError::NotFound);
+        assert_eq!(by(&cards, "#9").unwrap_err(), RefError::NotFound);
+        assert_eq!(by(&cards, "zzzzzz").unwrap_err(), RefError::NotFound);
+        assert_eq!(by(&cards, "").unwrap_err(), RefError::NotFound);
+        assert_eq!(by(&cards, "#").unwrap_err(), RefError::NotFound);
+        assert_eq!(by(&cards, "#0").unwrap_err(), RefError::NotFound);
+        // Two clones can number independently; the collision is reported,
+        // never silently picked.
+        assert_eq!(
+            by(&cards, "#3").unwrap_err(),
+            RefError::Ambiguous(vec!["d4e5f6".into(), "g7h8i9".into()])
+        );
+        cards.pop();
+        assert_eq!(by(&cards, "3").unwrap(), "d4e5f6");
+    }
+
+    #[test]
+    fn store_resolve_names_the_reference_in_its_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let id = store.add("one", None).unwrap();
+        assert_eq!(store.resolve("#1").unwrap(), id);
+        assert_eq!(store.resolve("1").unwrap(), id);
+        assert_eq!(store.resolve(&id).unwrap(), id);
+        assert_eq!(store.resolve("#2").unwrap_err(), "no such card: #2");
+        assert_eq!(store.resolve("nope").unwrap_err(), "no such card: nope");
+        let dup = r#"{"v":1,"num":1,"id":"dup001","title":"dup","state":"backlog","created":"2020-01-01T00:00:00Z","updated":"2020-01-01T00:00:00Z"}"#;
+        std::fs::write(tasks_dir(tmp.path()).join("dup001.json"), dup).unwrap();
+        store.reload();
+        assert_eq!(
+            store.resolve("#1").unwrap_err(),
+            format!("card #1 is ambiguous (dup001, {id}); use the id")
         );
     }
 

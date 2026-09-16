@@ -160,6 +160,22 @@ One unit of work-in-flight on a project's board; a file in `.foreman/tasks/`
 owned by the app.
 _Avoid_: task (taken), ticket, issue (GitHub's word).
 
+**Card number**:
+A Card's project-local, monotonic handle, shown as `#12`; issued from the
+board's counter file and never reused. What people and agents quote.
+_Avoid_: task number, index, serial.
+
+**Card id**:
+A Card's six-char base36 storage name — the file, the branch, the wire field.
+Opaque, never ambiguous, never shown as the primary handle.
+_Avoid_: hash, key, slug.
+
+**Card reference**:
+What a verb accepts to name one Card: `#12`, `12`, or an id, resolved on the
+host to an id. A number nobody has is `no such card`; a number two clones
+both issued is ambiguous and refused.
+_Avoid_: selector, handle (that is the number).
+
 **Claim**:
 The card↔Session link recorded at dispatch or `start`: terminal id, app run
 nonce, agent, timestamp. Dead claims are derived (orphan), never stored.

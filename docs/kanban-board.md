@@ -12,6 +12,23 @@ sibling — read those for *why*, this doc for *how*.
 
 - **Cards** are one unit of work-in-flight each: title, optional body, state,
   and (while claimed) a claim linking the card to the Session working it.
+- **Card numbers**: every card has a project-local number shown as `#12` on
+  the card face, in the detail page subtitle, first on each `kanban list`
+  line, and as `num` in `list --json` and the `add` reply. The number is the
+  handle people and agents quote; the six-char id stays the storage name
+  (file, branch, dispatch close-out commands). Numbers come from a
+  high-water mark in `.foreman/tasks/counter`: `add` issues
+  `max(counter, highest card) + 1` and writes the counter before the card,
+  so a number is never issued twice and a removed card's number is a gap
+  forever. Cards written before numbering existed read as unnumbered and
+  are backfilled on the store's next reload, in creation order, and written
+  back. Every one-card verb (`start`, `done`, `block`, `rm`, `wait`) accepts
+  `#12`, `12`, or the id: a leading `#` means number only; bare digits try
+  the number first and fall back to an id match (a base36 id can be all
+  digits); a missing number errors `no such card: #12`; a number two clones
+  issued independently errors `card #12 is ambiguous (a, b); use the id`.
+  Resolution happens on the host, so the wire shape is unchanged (`id`
+  carries the reference as typed).
 - **Dispatch from a card**: Start on a Backlog or Blocked card offers an agent
   picker. Picking one spawns a new Session in the
   project cwd whose prompt embeds the card body and the exact close-out
@@ -91,12 +108,14 @@ installed exe is also on PATH as `foreman`):
 ```
 foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
 foreman kanban list [--state backlog|in_progress|blocked|done] [--json]
-foreman kanban start <id>                 # claim a card yourself
-foreman kanban done <id>                  # close out: In Progress -> Done
-foreman kanban block <id> --reason "..."  # close out: needs a human
-foreman kanban rm <id>                    # delete the card file, any state
-foreman kanban wait <id> | --any [--timeout SECS]
+foreman kanban start <card>                 # claim a card yourself
+foreman kanban done <card>                  # close out: In Progress -> Done
+foreman kanban block <card> --reason "..."  # close out: needs a human
+foreman kanban rm <card>                    # delete the card file, any state
+foreman kanban wait <card> | --any [--timeout SECS]
 ```
+
+`<card>` is the number (`#12` or `12`) or the id (`a3f8k2`).
 
 `wait` exit codes: `0` Done, `1` Blocked / orphaned / removed (needs a
 human), `2` timeout or foreman unreachable. `foreman kanban --help` is ground
@@ -122,6 +141,23 @@ Backlog; Done is terminal — delete or promote to a GitHub issue.
 - **Close-out on a missing card errors, never creates.** A deleted card is not
   resurrected by its worker's `done`; the worker sees the error, the board
   simply lacks the card.
+- **`.foreman/tasks/counter` is part of the board.** Deleting it does not
+  renumber anything (the surviving cards' highest number takes over) but it
+  does let a removed card's number come back on the next `add`. Leave it
+  committed alongside the cards. It is not `.json`, so the loader and the
+  staleness fingerprint ignore it.
+- **Numbers can collide across clones.** Two checkouts adding cards on
+  different branches both issue the next number; after a merge, both cards
+  exist and the number is ambiguous until one is removed. Every verb
+  refuses an ambiguous reference and lists the ids — nothing renumbers
+  automatically, because a renumber would break every `#12` already quoted.
+- **`wait` pins the id after the first listing.** A `wait 12` that saw the
+  card once keeps watching that id even if a later merge brings in another
+  `#12`; a reference that resolves to nothing at the outset exits `1`
+  (same as removed), an ambiguous one exits `2` (a usage error).
+- **First reload after upgrading rewrites every card file.** Pre-numbering
+  cards get `num` backfilled in creation order and written back, and the
+  counter file appears. Expect a dirty `.foreman/tasks/` once.
 - **`.foreman/tasks/` travels with the clone.** Cards are repo files by
   design (they merge branch-to-branch); add the directory to a repo's
   `.gitignore` to opt out per-project.
@@ -161,7 +197,9 @@ Backlog; Done is terminal — delete or promote to a GitHub issue.
 - `src/kanban.rs` — the pure domain: `Card`/`Claim`/`CardState`, `CardStore`
   (file-per-card load/save, transition verbs, staleness poll), `claim_is_dead`
   / `is_orphaned` (derived orphan rule), `run_nonce`, `dispatch_prompt` +
-  `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
+  `CloseoutStyle`, `CardLine`, `wait_verdict`; numbering: `COUNTER_FILE`,
+  `read_counter`, `CardStore::backfill_numbers`, `find_by_ref` / `RefError`
+  / `CardStore::resolve` (reference → id); the worktree half:
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
   `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` +
   `teardown_verdict`, `CardStore::take_status_poll`.
