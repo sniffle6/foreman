@@ -1012,10 +1012,17 @@ pub fn bring_up_worktree(project_cwd: &std::path::Path, card: &Card) -> Result<B
 /// Live status probe (spec §Status poll): dirty from inside the tree,
 /// ahead/behind from any checkout of the repo. Also the synchronous `rm`
 /// pre-check. A vanished directory reads as `missing` with counts intact.
-pub fn worktree_status_now(project_cwd: &std::path::Path, wt: &Worktree) -> WorktreeStatus {
+///
+/// Fails CLOSED: a git error (no binary, lock contention, bad ref) is an
+/// `Err`, never a clean-looking zero status — `rm` refuses on it rather than
+/// deleting a card whose worktree it could not inspect.
+pub fn worktree_status_now(
+    project_cwd: &std::path::Path,
+    wt: &Worktree,
+) -> Result<WorktreeStatus, String> {
     let tree = std::path::Path::new(&wt.path);
     let porcelain = if tree.is_dir() {
-        Some(git(tree, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default())
+        Some(git(tree, &["status", "--porcelain", "--untracked-files=no"])?)
     } else {
         None
     };
@@ -1023,9 +1030,8 @@ pub fn worktree_status_now(project_cwd: &std::path::Path, wt: &Worktree) -> Work
     let rev_list = git(
         project_cwd,
         &["rev-list", "--left-right", "--count", &range],
-    )
-    .unwrap_or_default();
-    parse_status(porcelain.as_deref(), &rev_list)
+    )?;
+    Ok(parse_status(porcelain.as_deref(), &rev_list))
 }
 
 /// Spec §Teardown outcome table.
@@ -1072,7 +1078,11 @@ pub fn teardown_worktree(
     wt: &Worktree,
     force: bool,
 ) -> TeardownOutcome {
-    let ahead = worktree_status_now(project_cwd, wt).ahead;
+    // Count only; a failed probe reads as 0 here because the outcome below
+    // is decided by git's own refusal, not by this number.
+    let ahead = worktree_status_now(project_cwd, wt)
+        .map(|s| s.ahead)
+        .unwrap_or(0);
     let remove = if std::path::Path::new(&wt.path).is_dir() {
         let args: &[&str] = if force {
             &["worktree", "remove", "--force", &wt.path]
@@ -1606,6 +1616,22 @@ mod tests {
     }
 
     #[test]
+    fn status_probe_fails_closed_when_git_cannot_answer() {
+        // `rm` decides on this verdict; a git failure must be an error, not a
+        // clean-looking zero status that lets the card file be deleted.
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap(); // not a repository
+        let wt = Worktree {
+            path: tmp.path().join("nope").to_string_lossy().into_owned(),
+            branch: "card/a1b2c3".into(),
+            base: "main".into(),
+        };
+        assert!(worktree_status_now(tmp.path(), &wt).is_err());
+    }
+
+    #[test]
     fn bring_up_creates_a_listed_worktree_on_the_card_branch_and_excludes_it() {
         let Some(repo) = git_repo() else { return };
         let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
@@ -1638,7 +1664,7 @@ mod tests {
         assert!(status.is_empty(), "worktree dir must be ignored: {status}");
         // status probe: clean, 0/0
         assert_eq!(
-            worktree_status_now(repo.path(), &wt),
+            worktree_status_now(repo.path(), &wt).unwrap(),
             WorktreeStatus::default()
         );
     }
@@ -1682,7 +1708,7 @@ mod tests {
             std::fs::read_to_string(tree.join("f.txt")).unwrap(),
             "edited\n"
         );
-        assert!(worktree_status_now(repo.path(), &wt).dirty);
+        assert!(worktree_status_now(repo.path(), &wt).unwrap().dirty);
         // branch left behind by an unmerged teardown: re-add on the branch
         git_in(tree, &["checkout", "-q", "--", "f.txt"]);
         git_in(repo.path(), &["worktree", "remove", &wt.path]);
@@ -1708,7 +1734,7 @@ mod tests {
         let tree = std::path::Path::new(&wt.path);
         std::fs::write(tree.join("f.txt"), "two\n").unwrap();
         git_in(tree, &["commit", "-q", "-am", "work"]);
-        assert_eq!(worktree_status_now(repo.path(), &wt).ahead, 1);
+        assert_eq!(worktree_status_now(repo.path(), &wt).unwrap().ahead, 1);
         git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
         assert_eq!(
             teardown_worktree(repo.path(), &wt, false),
@@ -1759,7 +1785,7 @@ mod tests {
         assert!(!tree.exists(), "the clean tree itself is removed");
         assert!(!git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
         // the status probe survives a missing directory
-        let st = worktree_status_now(repo.path(), &wt);
+        let st = worktree_status_now(repo.path(), &wt).unwrap();
         assert!(st.missing);
         assert_eq!(st.ahead, 2);
     }

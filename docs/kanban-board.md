@@ -31,8 +31,10 @@ sibling — read those for *why*, this doc for *how*.
   (`worktree remove`, `branch -d`, `prune`) that runs on a background thread
   once the worker's terminal is gone; a dirty tree or an unmerged branch is
   kept and the card says so. `rm` refuses outright while the tree is dirty or
-  ahead of base. `block` and orphaned cards keep the tree so Restart resumes
-  in it. Outside a git repository dispatch runs in place silently; on a
+  ahead of base, and also when git cannot answer (fail closed: an
+  uninspectable worktree is never deleted). Re-dispatching a released card
+  cancels its still-queued teardown and refuses while one is mid-removal.
+  `block` and orphaned cards keep the tree so Restart resumes in it. Outside a git repository dispatch runs in place silently; on a
   detached HEAD it runs in place with a warning toast. **Discard worktree** on
   a Done, Blocked, or orphaned card's detail page is the only forcing path and
   is human-only (no wire verb), behind the standard confirm. Why this shape

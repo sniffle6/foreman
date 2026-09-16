@@ -546,6 +546,11 @@ pub struct WindowManager {
     /// Done cards whose leftover worktree this run already tried to tear
     /// down (one non-forcing attempt per run; see `drain_worktree_msgs`).
     teardown_attempted: std::collections::HashSet<String>,
+    /// Card ids whose teardown thread is running right now. `pending_teardowns`
+    /// drains an entry the moment its thread starts, so without this the
+    /// Done-leftover retry and a re-dispatch both saw "nothing queued" and
+    /// raced a second `git worktree remove` against the first.
+    teardowns_in_flight: std::collections::HashSet<String>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -634,6 +639,7 @@ impl WindowManager {
             worktree_rx,
             pending_teardowns: Vec::new(),
             teardown_attempted: std::collections::HashSet::new(),
+            teardowns_in_flight: std::collections::HashSet::new(),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -2222,6 +2228,21 @@ impl WindowManager {
                         );
                         continue;
                     };
+                    // A teardown left over from this card's previous run
+                    // (release, then re-dispatch) must not race the new
+                    // worker: a still-queued one is cancelled — the new
+                    // Session adopts the tree and its own close-out queues
+                    // teardown afresh — and a running one refuses dispatch,
+                    // because bring-up would reuse a tree mid-removal.
+                    if self.teardowns_in_flight.contains(&id) {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("card {id}: worktree teardown in progress; retry in a moment"),
+                        );
+                        continue;
+                    }
+                    self.cancel_pending_teardown(&id);
                     // Bring-up (spec: dispatch-worktrees). `record` is what
                     // the claim write stores; `card.worktree` only steers the
                     // prompt template. Any git failure aborts before the
@@ -2370,7 +2391,10 @@ impl WindowManager {
             .get(id)
             .and_then(|c| c.worktree.clone());
         if let (Some(wt), Some(cwd)) = (&wt, self.cwd.as_deref()) {
-            let st = crate::kanban::worktree_status_now(cwd, wt);
+            // Fail closed: if git cannot answer, the card stays.
+            let st = crate::kanban::worktree_status_now(cwd, wt).map_err(|e| {
+                format!("card {id}: cannot verify its worktree ({e}); retry or discard it first")
+            })?;
             if st.dirty || st.ahead > 0 {
                 return Err(format!(
                     "card {id} has unmerged work in its worktree; discard it first"
@@ -2393,10 +2417,29 @@ impl WindowManager {
     /// Spawn one queued teardown on a thread; the outcome lands in
     /// `worktree_rx`. Removing a tree that holds a `target/` dir deletes
     /// gigabytes — never on the UI thread.
-    fn start_teardown(&self, pending: PendingTeardown, ctx: &egui::Context) {
+    /// A teardown for `id` is queued or running.
+    fn teardown_busy(&self, id: &str) -> bool {
+        self.pending_teardowns.iter().any(|p| p.id == id) || self.teardowns_in_flight.contains(id)
+    }
+
+    /// Drop a queued (not yet started) teardown for `id`; true if one was.
+    fn cancel_pending_teardown(&mut self, id: &str) -> bool {
+        let before = self.pending_teardowns.len();
+        self.pending_teardowns.retain(|p| p.id != id);
+        self.pending_teardowns.len() != before
+    }
+
+    /// The Done-leftover retry gate: not while a teardown is queued or
+    /// running, and at most once per app run (marks the attempt).
+    fn leftover_teardown_due(&mut self, id: &str) -> bool {
+        !self.teardown_busy(id) && self.teardown_attempted.insert(id.to_string())
+    }
+
+    fn start_teardown(&mut self, pending: PendingTeardown, ctx: &egui::Context) {
         let Some(cwd) = self.cwd.clone() else {
             return;
         };
+        self.teardowns_in_flight.insert(pending.id.clone());
         let tx = self.worktree_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -2434,6 +2477,11 @@ impl WindowManager {
                 }
                 WorktreeMsg::Teardown { id, outcome } => {
                     use crate::kanban::TeardownOutcome::*;
+                    self.teardowns_in_flight.remove(&id);
+                    // Whatever the outcome, this run has had its attempt: the
+                    // leftover retry must not re-run a teardown that just
+                    // reported a kept tree.
+                    self.teardown_attempted.insert(id.clone());
                     match outcome {
                         Removed => {
                             // An rm'd card has nothing to clear — not an error.
@@ -2479,8 +2527,7 @@ impl WindowManager {
                     .borrow()
                     .get(id)
                     .is_some_and(|c| c.state == crate::kanban::CardState::Done);
-                let queued = self.pending_teardowns.iter().any(|p| &p.id == id);
-                if is_done && !queued && self.teardown_attempted.insert(id.clone()) {
+                if is_done && self.leftover_teardown_due(id) {
                     self.pending_teardowns.push(PendingTeardown {
                         id: id.clone(),
                         wt: wt.clone(),
@@ -2492,9 +2539,15 @@ impl WindowManager {
             let tx = self.worktree_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
+                // A card whose probe errored gets no entry this round: the
+                // badge shows the branch alone rather than a fake clean status.
                 let map = batch
                     .iter()
-                    .map(|(id, wt)| (id.clone(), crate::kanban::worktree_status_now(&cwd, wt)))
+                    .filter_map(|(id, wt)| {
+                        crate::kanban::worktree_status_now(&cwd, wt)
+                            .ok()
+                            .map(|st| (id.clone(), st))
+                    })
                     .collect();
                 let _ = tx.send(WorktreeMsg::Status(map));
                 ctx.request_repaint();
@@ -8328,6 +8381,60 @@ mod tests {
         assert_eq!(win.active, 1, "the target project tab is activated");
         assert!(!win.minimized, "spawning surfaces the project");
         assert_eq!(desk.focused, Some(w));
+    }
+
+    fn pending_teardown_for(id: &str) -> PendingTeardown {
+        PendingTeardown {
+            id: id.into(),
+            wt: crate::kanban::Worktree {
+                path: format!("/x/.foreman/worktrees/{id}"),
+                branch: format!("card/{id}"),
+                base: "main".into(),
+            },
+            held_by: None,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn teardown_busy_covers_queued_and_running_teardowns() {
+        let mut wm = WindowManager::new();
+        assert!(!wm.teardown_busy("a"));
+        wm.pending_teardowns.push(pending_teardown_for("a"));
+        assert!(wm.teardown_busy("a"), "queued counts as busy");
+        wm.pending_teardowns.clear();
+        wm.teardowns_in_flight.insert("a".into());
+        assert!(wm.teardown_busy("a"), "a running thread counts as busy");
+        assert!(!wm.teardown_busy("b"));
+    }
+
+    #[test]
+    fn leftover_retry_waits_for_a_running_teardown_and_fires_once_per_run() {
+        // The Done-leftover safety net must never queue a second
+        // `git worktree remove` against one already on a thread.
+        let mut wm = WindowManager::new();
+        wm.teardowns_in_flight.insert("a".into());
+        assert!(!wm.leftover_teardown_due("a"));
+        assert!(
+            !wm.teardown_attempted.contains("a"),
+            "a skipped round must not burn the run's single attempt"
+        );
+        wm.teardowns_in_flight.clear();
+        assert!(wm.leftover_teardown_due("a"), "first idle round fires");
+        assert!(!wm.leftover_teardown_due("a"), "second round does not");
+    }
+
+    #[test]
+    fn cancel_pending_teardown_drops_only_that_card() {
+        // Re-dispatch after release: the new worker adopts the tree, so the
+        // stale queued teardown for it must go — and nobody else's.
+        let mut wm = WindowManager::new();
+        wm.pending_teardowns.push(pending_teardown_for("a"));
+        wm.pending_teardowns.push(pending_teardown_for("b"));
+        assert!(wm.cancel_pending_teardown("a"));
+        assert!(!wm.cancel_pending_teardown("a"), "already gone");
+        assert_eq!(wm.pending_teardowns.len(), 1);
+        assert_eq!(wm.pending_teardowns[0].id, "b");
     }
 
     #[test]
