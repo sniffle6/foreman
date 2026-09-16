@@ -1473,6 +1473,7 @@ impl WindowManager {
                         let line = crate::kanban::CardLine {
                             card: c.clone(),
                             orphaned: crate::kanban::is_orphaned(c, run, &states),
+                            worktree_status: store.worktree_status(&c.id),
                         };
                         if req.json {
                             line.json_line()
@@ -2180,6 +2181,7 @@ impl WindowManager {
                                 &agent,
                                 run,
                                 existing_term,
+                                None,
                             );
                             if let Err(e) = claimed {
                                 crate::notify::queue(
@@ -8015,8 +8017,16 @@ mod tests {
             Content::Project(inner) => inner.windows.len(),
             _ => usize::MAX,
         };
-        assert_eq!(count(&win.tabs[0]), 0, "active tab must not receive the spawn");
-        assert_eq!(count(&win.tabs[1]), 1, "the named project tab gets the terminal");
+        assert_eq!(
+            count(&win.tabs[0]),
+            0,
+            "active tab must not receive the spawn"
+        );
+        assert_eq!(
+            count(&win.tabs[1]),
+            1,
+            "the named project tab gets the terminal"
+        );
         assert_eq!(win.active, 1, "the target project tab is activated");
         assert!(!win.minimized, "spawning surfaces the project");
         assert_eq!(desk.focused, Some(w));
@@ -13345,6 +13355,7 @@ mod tests {
                 "claude",
                 "STALE_RUN",
                 crate::kanban::TermState::Running,
+                None,
             )
             .unwrap();
 

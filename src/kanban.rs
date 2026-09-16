@@ -14,6 +14,10 @@ pub const CARD_V: u32 = 1;
 /// section, not a live-update mechanism.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How often a shown board re-derives every worktree card's git status on a
+/// background thread (spec: dispatch-worktrees §Status poll).
+pub const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardState {
@@ -33,6 +37,86 @@ pub struct Claim {
     pub at: String,
 }
 
+/// A card's private checkout (spec: dispatch-worktrees). Stored on the card
+/// so `block` and Restart keep it; status (dirty/ahead/behind/missing) is
+/// derived by the poll and never written to the file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Worktree {
+    /// Absolute worktree root, forward slashes: `<root>/.foreman/worktrees/<id>`.
+    pub path: String,
+    /// Always `card/<id>`.
+    pub branch: String,
+    /// The branch checked out in the main checkout at dispatch — the
+    /// integration target.
+    pub base: String,
+}
+
+impl Worktree {
+    /// The repository root the layout was derived from: `path` minus its
+    /// last three components (`.foreman/worktrees/<id>`).
+    pub fn root(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.path)
+            .ancestors()
+            .nth(3)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default()
+    }
+}
+
+/// Path and branch naming for a card's worktree. Forward slashes throughout
+/// so the stored string matches what `git rev-parse --show-toplevel` prints
+/// on Windows and the file is stable across re-saves.
+pub fn worktree_layout(root: &std::path::Path, id: &str, base: &str) -> Worktree {
+    let root = root.to_string_lossy().replace('\\', "/");
+    Worktree {
+        path: format!("{}/.foreman/worktrees/{id}", root.trim_end_matches('/')),
+        branch: format!("card/{id}"),
+        base: base.to_string(),
+    }
+}
+
+/// Derived worktree state, recomputed by the poll; lives in memory only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct WorktreeStatus {
+    pub dirty: bool,
+    pub ahead: u32,
+    pub behind: u32,
+    pub missing: bool,
+}
+
+/// `porcelain` is the output of `git status --porcelain --untracked-files=no`
+/// inside the tree (`None` = the directory is gone); `rev_list` is the
+/// output of `git rev-list --left-right --count <base>...<branch>`
+/// (`behind<TAB>ahead`). Unparseable counts read as zero.
+pub fn parse_status(porcelain: Option<&str>, rev_list: &str) -> WorktreeStatus {
+    let mut it = rev_list.split_whitespace();
+    let behind = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    WorktreeStatus {
+        dirty: porcelain.is_some_and(|p| !p.trim().is_empty()),
+        ahead,
+        behind,
+        missing: porcelain.is_none(),
+    }
+}
+
+/// The one-line worktree summary both the card face and `kanban list` show:
+/// branch, then `+ahead -behind`, then `dirty` / `missing` flags. No status
+/// yet (first poll round pending) renders the branch alone.
+pub fn worktree_summary(wt: &Worktree, st: Option<&WorktreeStatus>) -> String {
+    let Some(st) = st else {
+        return wt.branch.clone();
+    };
+    let mut s = format!("{} +{} -{}", wt.branch, st.ahead, st.behind);
+    if st.dirty {
+        s.push_str(" dirty");
+    }
+    if st.missing {
+        s.push_str(" missing");
+    }
+    s
+}
+
 /// One unit of work-in-flight on a project's board — a file in
 /// `.foreman/tasks/` owned by the app.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -47,6 +131,10 @@ pub struct Card {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
+    /// Absent unless the card was dispatched into a worktree (spec:
+    /// dispatch-worktrees). Survives `block`; cleared by teardown, not `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<Worktree>,
     pub created: String,
     pub updated: String,
 }
@@ -61,6 +149,7 @@ impl Card {
             state: CardState::Backlog,
             blocked_reason: None,
             claim: None,
+            worktree: None,
             created: now.clone(),
             updated: now,
         }
@@ -216,6 +305,11 @@ pub struct CardStore {
     last_poll: Option<std::time::Instant>,
     last_shown: Option<std::time::Instant>,
     orphans: std::collections::HashSet<String>,
+    /// Last poll round's derived worktree status per card id (spec:
+    /// dispatch-worktrees §Status poll). Memory only, replaced wholesale.
+    worktree_status: std::collections::HashMap<String, WorktreeStatus>,
+    last_status_poll: Option<std::time::Instant>,
+    status_inflight: bool,
 }
 
 impl CardStore {
@@ -300,6 +394,60 @@ impl CardStore {
 
     pub fn set_orphans(&mut self, o: std::collections::HashSet<String>) {
         self.orphans = o;
+    }
+
+    pub fn worktree_status(&self, id: &str) -> Option<WorktreeStatus> {
+        self.worktree_status.get(id).copied()
+    }
+
+    /// Replace the derived status map wholesale (one poll round) and release
+    /// the in-flight latch so the next round may start.
+    pub fn set_worktree_statuses(
+        &mut self,
+        map: std::collections::HashMap<String, WorktreeStatus>,
+    ) {
+        self.worktree_status = map;
+        self.status_inflight = false;
+    }
+
+    /// When a round is due — board shown, no round in flight, interval
+    /// elapsed, at least one card has a worktree — return the batch to poll
+    /// and latch in-flight. The caller runs git on a background thread and
+    /// answers with [`Self::set_worktree_statuses`].
+    pub fn take_status_poll(&mut self, now: std::time::Instant) -> Option<Vec<(String, Worktree)>> {
+        if !self.shown_recently(now) || self.status_inflight {
+            return None;
+        }
+        if let Some(last) = self.last_status_poll {
+            if now.duration_since(last) < STATUS_POLL_INTERVAL {
+                return None;
+            }
+        }
+        let batch: Vec<(String, Worktree)> = self
+            .cards
+            .iter()
+            .filter_map(|c| c.worktree.clone().map(|w| (c.id.clone(), w)))
+            .collect();
+        if batch.is_empty() {
+            self.worktree_status.clear();
+            return None;
+        }
+        self.last_status_poll = Some(now);
+        self.status_inflight = true;
+        Some(batch)
+    }
+
+    /// Drop the worktree field after a successful teardown. Missing card =
+    /// error (an `rm`'d card's teardown simply has nothing to clear).
+    pub fn clear_worktree(&mut self, id: &str) -> Result<(), String> {
+        let dir = self.dir_or_err()?.to_path_buf();
+        let mut card = self.read_one(id)?;
+        card.worktree = None;
+        card.updated = now_stamp();
+        self.write_card(&dir, &card)?;
+        self.replace_in_memory(card);
+        self.worktree_status.remove(id);
+        Ok(())
     }
 
     /// Stamped by the board view each rendered frame; see [`Self::shown_recently`].
@@ -392,6 +540,7 @@ impl CardStore {
         agent: Option<&str>,
         current_run: &str,
         term: TermState,
+        worktree: Option<Worktree>,
     ) -> Result<(), String> {
         let dir = self.dir_or_err()?.to_path_buf();
         let mut card = self.read_one(id)?;
@@ -412,6 +561,11 @@ impl CardStore {
             agent: agent.map(str::to_string),
             at: now_stamp(),
         });
+        // `Some` records a fresh bring-up; `None` leaves any recorded tree
+        // alone so a Restart or self-service `start` keeps it.
+        if let Some(wt) = worktree {
+            card.worktree = Some(wt);
+        }
         card.state = CardState::InProgress;
         card.blocked_reason = None;
         card.updated = now_stamp();
@@ -428,7 +582,7 @@ impl CardStore {
         current_run: &str,
         term: TermState,
     ) -> Result<(), String> {
-        self.claim_common(id, terminal, None, current_run, term)
+        self.claim_common(id, terminal, None, current_run, term, None)
     }
 
     /// Claim recorded by the board's dispatch drain after a successful spawn
@@ -440,8 +594,9 @@ impl CardStore {
         agent: &str,
         current_run: &str,
         term: TermState,
+        worktree: Option<Worktree>,
     ) -> Result<(), String> {
-        self.claim_common(id, terminal, Some(agent), current_run, term)
+        self.claim_common(id, terminal, Some(agent), current_run, term, worktree)
     }
 
     /// InProgress -> Done only; clears the claim. Missing card = error, never
@@ -592,6 +747,10 @@ pub struct CardLine {
     #[serde(flatten)]
     pub card: Card,
     pub orphaned: bool,
+    /// Derived from the store's last poll round; absent for cards without a
+    /// worktree and for cards not yet polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_status: Option<WorktreeStatus>,
 }
 
 impl CardLine {
@@ -616,6 +775,12 @@ impl CardLine {
                 Some(agent) => tail.push(format!("[{} {agent}]", claim.terminal)),
                 None => tail.push(format!("[{}]", claim.terminal)),
             }
+        }
+        if let Some(wt) = &self.card.worktree {
+            tail.push(format!(
+                "[wt {}]",
+                worktree_summary(wt, self.worktree_status.as_ref())
+            ));
         }
         if let Some(reason) = &self.card.blocked_reason {
             tail.push(format!("({reason})"));
@@ -1050,6 +1215,7 @@ mod tests {
         let line = CardLine {
             card: sample_card(None),
             orphaned: true,
+            worktree_status: None,
         };
         let j = line.json_line();
         assert!(j.contains("\"orphaned\":true"), "{j}");
@@ -1070,6 +1236,7 @@ mod tests {
         let line = CardLine {
             card,
             orphaned: true,
+            worktree_status: None,
         };
         assert_eq!(
             line.human_line(),
@@ -1082,6 +1249,7 @@ mod tests {
         let line = CardLine {
             card: blocked,
             orphaned: false,
+            worktree_status: None,
         };
         assert_eq!(
             line.human_line(),
@@ -1092,7 +1260,239 @@ mod tests {
     fn line_with_state(id: &str, state: CardState, orphaned: bool) -> CardLine {
         let mut card = Card::new(id.into(), "t".into(), None, "2026-08-28T00:00:00Z".into());
         card.state = state;
-        CardLine { card, orphaned }
+        CardLine {
+            card,
+            orphaned,
+            worktree_status: None,
+        }
+    }
+
+    // --- dispatch-worktrees: schema, naming, status, list lines ---
+
+    #[test]
+    fn worktree_layout_names_path_and_branch_with_forward_slashes() {
+        let wt = worktree_layout(
+            std::path::Path::new(r"H:\claude code\foreman"),
+            "etxvs5",
+            "main",
+        );
+        assert_eq!(wt.path, "H:/claude code/foreman/.foreman/worktrees/etxvs5");
+        assert_eq!(wt.branch, "card/etxvs5");
+        assert_eq!(wt.base, "main");
+        assert_eq!(
+            wt.root(),
+            std::path::PathBuf::from("H:/claude code/foreman")
+        );
+        // a trailing slash on root does not double up
+        let wt = worktree_layout(std::path::Path::new("C:/repo/"), "a1b2c3", "dev");
+        assert_eq!(wt.path, "C:/repo/.foreman/worktrees/a1b2c3");
+    }
+
+    #[test]
+    fn parse_status_reads_porcelain_and_left_right_counts() {
+        let s = parse_status(Some(""), "0\t0");
+        assert_eq!(s, WorktreeStatus::default());
+        let s = parse_status(Some(" M src/wm.rs\n"), "2\t3");
+        assert_eq!(
+            s,
+            WorktreeStatus {
+                dirty: true,
+                ahead: 3,
+                behind: 2,
+                missing: false
+            }
+        );
+        let s = parse_status(None, "1\t0");
+        assert!(s.missing);
+        assert!(!s.dirty);
+        assert_eq!((s.behind, s.ahead), (1, 0));
+        // garbage rev-list output degrades to zeros, never a panic
+        let s = parse_status(Some(""), "fatal: bad revision");
+        assert_eq!((s.behind, s.ahead), (0, 0));
+    }
+
+    fn sample_worktree() -> Worktree {
+        Worktree {
+            path: "H:/repo/.foreman/worktrees/a3f8k2".into(),
+            branch: "card/a3f8k2".into(),
+            base: "main".into(),
+        }
+    }
+
+    #[test]
+    fn worktree_summary_renders_branch_counts_and_flags() {
+        let wt = sample_worktree();
+        assert_eq!(worktree_summary(&wt, None), "card/a3f8k2");
+        let st = WorktreeStatus {
+            dirty: false,
+            ahead: 3,
+            behind: 1,
+            missing: false,
+        };
+        assert_eq!(worktree_summary(&wt, Some(&st)), "card/a3f8k2 +3 -1");
+        let st = WorktreeStatus { dirty: true, ..st };
+        assert_eq!(worktree_summary(&wt, Some(&st)), "card/a3f8k2 +3 -1 dirty");
+        let st = WorktreeStatus {
+            missing: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            worktree_summary(&wt, Some(&st)),
+            "card/a3f8k2 +0 -0 missing"
+        );
+    }
+
+    #[test]
+    fn v1_card_file_without_worktree_round_trips_unchanged() {
+        let j = r#"{"v":1,"id":"a3f8k2","title":"t","state":"backlog","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        let c: Card = serde_json::from_str(j).unwrap();
+        assert!(c.worktree.is_none());
+        assert_eq!(serde_json::to_string(&c).unwrap(), j);
+    }
+
+    #[test]
+    fn card_with_worktree_serializes_the_spec_object() {
+        let mut c = sample_card(None);
+        c.worktree = Some(sample_worktree());
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(
+            s.contains(
+                r#""worktree":{"path":"H:/repo/.foreman/worktrees/a3f8k2","branch":"card/a3f8k2","base":"main"}"#
+            ),
+            "{s}"
+        );
+        let back: Card = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn claim_for_dispatch_records_and_keeps_the_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let run = run_nonce();
+        let id = store.add("card", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                run,
+                TermState::Missing,
+                Some(sample_worktree()),
+            )
+            .unwrap();
+        assert_eq!(store.get(&id).unwrap().worktree, Some(sample_worktree()));
+        // done keeps the field: only teardown clears it
+        store.done(&id).unwrap();
+        assert_eq!(store.get(&id).unwrap().worktree, Some(sample_worktree()));
+        // a later claim with None leaves it alone (Restart reuses the tree)
+        let id2 = store.add("card two", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &id2,
+                "t1",
+                "claude",
+                run,
+                TermState::Missing,
+                Some(sample_worktree()),
+            )
+            .unwrap();
+        store.block(&id2, "reason").unwrap();
+        store.start(&id2, "t2", run, TermState::Missing).unwrap();
+        assert_eq!(store.get(&id2).unwrap().worktree, Some(sample_worktree()));
+        store.clear_worktree(&id2).unwrap();
+        assert!(store.get(&id2).unwrap().worktree.is_none());
+        assert!(store.clear_worktree("nope00").is_err());
+    }
+
+    #[test]
+    fn status_poll_batches_only_worktree_cards_when_due_and_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let run = run_nonce();
+        let plain = store.add("plain", None).unwrap();
+        let with = store.add("with", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &with,
+                "t1",
+                "claude",
+                run,
+                TermState::Missing,
+                Some(sample_worktree()),
+            )
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        // hidden board: nothing
+        assert!(store.take_status_poll(t0).is_none());
+        store.mark_shown(t0);
+        let batch = store.take_status_poll(t0).unwrap();
+        assert_eq!(batch, vec![(with.clone(), sample_worktree())]);
+        assert!(!batch.iter().any(|(id, _)| id == &plain));
+        // in flight: no second batch until results land
+        assert!(
+            store
+                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .is_none()
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            with.clone(),
+            WorktreeStatus {
+                ahead: 2,
+                ..Default::default()
+            },
+        );
+        store.set_worktree_statuses(map);
+        assert_eq!(store.worktree_status(&with).unwrap().ahead, 2);
+        // interval not elapsed since the last kick
+        assert!(
+            store
+                .take_status_poll(t0 + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+        store.mark_shown(t0 + STATUS_POLL_INTERVAL * 2);
+        assert!(
+            store
+                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn card_line_carries_worktree_fields_only_when_present() {
+        let line = CardLine {
+            card: sample_card(None),
+            orphaned: false,
+            worktree_status: None,
+        };
+        let j = line.json_line();
+        assert!(!j.contains("worktree"), "{j}");
+        let mut card = sample_card(None);
+        card.worktree = Some(sample_worktree());
+        let st = WorktreeStatus {
+            dirty: true,
+            ahead: 3,
+            behind: 1,
+            missing: false,
+        };
+        let line = CardLine {
+            card,
+            orphaned: false,
+            worktree_status: Some(st),
+        };
+        let j = line.json_line();
+        assert!(j.contains(r#""worktree":{"#), "{j}");
+        assert!(
+            j.contains(r#""worktree_status":{"dirty":true,"ahead":3,"behind":1,"missing":false}"#),
+            "{j}"
+        );
+        let back: CardLine = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, line);
+        assert_eq!(
+            line.human_line(),
+            "a3f8k2  backlog  Fix resize flicker  [wt card/a3f8k2 +3 -1 dirty]"
+        );
     }
 
     #[test]
