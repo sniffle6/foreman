@@ -404,8 +404,17 @@ impl CardStore {
     /// the in-flight latch so the next round may start.
     pub fn set_worktree_statuses(
         &mut self,
-        map: std::collections::HashMap<String, WorktreeStatus>,
+        mut map: std::collections::HashMap<String, WorktreeStatus>,
     ) {
+        // The round was snapshotted before it ran; a card whose worktree
+        // was cleared (teardown) or removed meanwhile must not get a status
+        // back, or `list --json` would print `worktree_status` without
+        // `worktree` until the next round.
+        map.retain(|id, _| {
+            self.cards
+                .iter()
+                .any(|c| c.id == *id && c.worktree.is_some())
+        });
         self.worktree_status = map;
         self.status_inflight = false;
     }
@@ -1022,7 +1031,10 @@ pub fn worktree_status_now(
 ) -> Result<WorktreeStatus, String> {
     let tree = std::path::Path::new(&wt.path);
     let porcelain = if tree.is_dir() {
-        Some(git(tree, &["status", "--porcelain", "--untracked-files=no"])?)
+        Some(git(
+            tree,
+            &["status", "--porcelain", "--untracked-files=no"],
+        )?)
     } else {
         None
     };
@@ -2025,6 +2037,16 @@ mod tests {
                 .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
                 .is_some()
         );
+        // A round that started before a teardown cleared a card's field
+        // must not resurrect a status for it: `list --json` would then
+        // print `worktree_status` with no `worktree`.
+        store.clear_worktree(&with).unwrap();
+        let mut stale = std::collections::HashMap::new();
+        stale.insert(with.clone(), WorktreeStatus::default());
+        stale.insert(plain.clone(), WorktreeStatus::default());
+        store.set_worktree_statuses(stale);
+        assert!(store.worktree_status(&with).is_none());
+        assert!(store.worktree_status(&plain).is_none());
     }
 
     #[test]

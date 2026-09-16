@@ -2375,7 +2375,7 @@ impl WindowManager {
             .get(id)
             .and_then(|c| c.worktree.clone());
         if let Some(wt) = wt {
-            self.pending_teardowns.push(PendingTeardown {
+            self.queue_teardown(PendingTeardown {
                 id: id.to_string(),
                 wt,
                 held_by,
@@ -2409,7 +2409,7 @@ impl WindowManager {
         let held = self.claim_terminal(id);
         self.kanban.borrow_mut().rm(id)?;
         if let Some(wt) = wt {
-            self.pending_teardowns.push(PendingTeardown {
+            self.queue_teardown(PendingTeardown {
                 id: id.to_string(),
                 wt,
                 held_by: held,
@@ -2425,6 +2425,28 @@ impl WindowManager {
     /// A teardown for `id` is queued or running.
     fn teardown_busy(&self, id: &str) -> bool {
         self.pending_teardowns.iter().any(|p| p.id == id) || self.teardowns_in_flight.contains(id)
+    }
+
+    /// Queue a teardown with one entry per card: a newer request replaces a
+    /// queued one for the same id, and a forcing request (Discard) is never
+    /// downgraded by a later non-forcing one. Without this, `done` from the
+    /// worker's open pane (queued, held by that pane) followed by Discard on
+    /// the Done card ran two `git worktree remove`s against one tree.
+    fn queue_teardown(&mut self, mut pending: PendingTeardown) {
+        if let Some(pos) = self
+            .pending_teardowns
+            .iter()
+            .position(|p| p.id == pending.id)
+        {
+            let old = self.pending_teardowns.remove(pos);
+            pending.force |= old.force;
+        }
+        if pending.force {
+            // The human asked for it now; a held directory surfaces as
+            // git's own failure toast rather than a silent wait.
+            pending.held_by = None;
+        }
+        self.pending_teardowns.push(pending);
     }
 
     /// Drop a queued (not yet started) teardown for `id`; true if one was.
@@ -2465,10 +2487,14 @@ impl WindowManager {
     fn drain_worktree_msgs(&mut self, ctx: &egui::Context) {
         if !self.pending_teardowns.is_empty() {
             let states = self.term_states();
-            let (ready, wait): (Vec<_>, Vec<_>) = self.pending_teardowns.drain(..).partition(|p| {
-                p.held_by.as_ref().is_none_or(|tag| {
-                    states.get(tag).copied() != Some(crate::kanban::TermState::Running)
-                })
+            let queued = std::mem::take(&mut self.pending_teardowns);
+            // Ready = its holding terminal is gone AND no thread is already
+            // removing this card's tree (a queued entry waits its turn).
+            let (ready, wait): (Vec<_>, Vec<_>) = queued.into_iter().partition(|p| {
+                !self.teardowns_in_flight.contains(&p.id)
+                    && p.held_by.as_ref().is_none_or(|tag| {
+                        states.get(tag).copied() != Some(crate::kanban::TermState::Running)
+                    })
             });
             self.pending_teardowns = wait;
             for p in ready {
@@ -2533,7 +2559,7 @@ impl WindowManager {
                     .get(id)
                     .is_some_and(|c| c.state == crate::kanban::CardState::Done);
                 if is_done && self.leftover_teardown_due(id) {
-                    self.pending_teardowns.push(PendingTeardown {
+                    self.queue_teardown(PendingTeardown {
                         id: id.clone(),
                         wt: wt.clone(),
                         held_by: None,
@@ -4041,7 +4067,7 @@ impl WindowManager {
                             .get(&id)
                             .and_then(|c| c.worktree.clone());
                         if let Some(wt) = wt {
-                            self.pending_teardowns.push(PendingTeardown {
+                            self.queue_teardown(PendingTeardown {
                                 id,
                                 wt,
                                 held_by: None,
@@ -8440,6 +8466,91 @@ mod tests {
         assert!(!wm.cancel_pending_teardown("a"), "already gone");
         assert_eq!(wm.pending_teardowns.len(), 1);
         assert_eq!(wm.pending_teardowns[0].id, "b");
+    }
+
+    #[test]
+    fn queue_teardown_coalesces_one_entry_per_card_and_force_wins() {
+        // done (held by the worker's pane) then Discard before that pane
+        // closes: one forcing entry, never two git removals on one tree.
+        let mut wm = WindowManager::new();
+        let mut held = pending_teardown_for("a");
+        held.held_by = Some("t1".into());
+        wm.queue_teardown(held);
+        let mut discard = pending_teardown_for("a");
+        discard.force = true;
+        wm.queue_teardown(discard);
+        assert_eq!(wm.pending_teardowns.len(), 1);
+        assert!(wm.pending_teardowns[0].force);
+        assert!(wm.pending_teardowns[0].held_by.is_none());
+        // a later non-forcing request never downgrades a queued Discard
+        let mut again = pending_teardown_for("a");
+        again.held_by = Some("t1".into());
+        wm.queue_teardown(again);
+        assert_eq!(wm.pending_teardowns.len(), 1);
+        assert!(wm.pending_teardowns[0].force);
+        assert!(wm.pending_teardowns[0].held_by.is_none());
+        // other cards are untouched
+        wm.queue_teardown(pending_teardown_for("b"));
+        assert_eq!(wm.pending_teardowns.len(), 2);
+    }
+
+    #[test]
+    fn ready_partition_holds_a_card_whose_teardown_is_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.cwd = Some(tmp.path().to_path_buf());
+        wm.teardowns_in_flight.insert("a".into());
+        wm.pending_teardowns.push(pending_teardown_for("a"));
+        wm.drain_worktree_msgs(&ctx);
+        assert_eq!(
+            wm.pending_teardowns.len(),
+            1,
+            "a queued teardown waits while the same card's thread runs"
+        );
+        wm.teardowns_in_flight.clear();
+        wm.drain_worktree_msgs(&ctx);
+        assert!(
+            wm.pending_teardowns.is_empty(),
+            "starts once the card is free"
+        );
+        assert!(wm.teardowns_in_flight.contains("a"));
+    }
+
+    #[test]
+    fn discard_confirm_replaces_a_queued_done_teardown_with_one_forcing_entry() {
+        // The reviewer's sequence: worker runs `done` from its open pane
+        // (teardown queued, held by that pane), the human clicks Discard on
+        // the Done card before the pane closes.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut wm = WindowManager::new();
+        wm.cwd = Some(tmp.path().to_path_buf());
+        wm.kanban.borrow_mut().set_dir(Some(tmp.path()));
+        let id = wm.kanban.borrow_mut().add("card", None).unwrap();
+        wm.kanban
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                Some(pending_teardown_for(&id).wt),
+            )
+            .unwrap();
+        wm.kanban.borrow_mut().done(&id).unwrap();
+        wm.teardown_after(&id, Some("t1".into()));
+        assert_eq!(wm.pending_teardowns.len(), 1);
+        assert!(!wm.pending_teardowns[0].force);
+
+        wm.pending_close = Some(PendingClose {
+            target: CloseTarget::DiscardWorktree(id.clone()),
+            view: crate::confirm::ConfirmClose::new("t", "l", "Discard", vec![]),
+        });
+        wm.resolve_pending(crate::confirm::ConfirmOutcome::Confirmed);
+        assert_eq!(wm.pending_teardowns.len(), 1, "coalesced, not duplicated");
+        assert!(wm.pending_teardowns[0].force);
+        assert!(wm.pending_teardowns[0].held_by.is_none());
     }
 
     #[test]
