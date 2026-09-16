@@ -706,10 +706,13 @@ pub fn closeout_style() -> CloseoutStyle {
 }
 
 /// Renders the spec's dispatch-prompt template verbatim: fixed text, card
-/// fields interpolated, nothing else. The close-out block is the only part
-/// that varies, by [`CloseoutStyle`] (installed-on-PATH vs. dev-fleet).
+/// fields interpolated, nothing else. Two things vary: the close-out CLI
+/// form, by [`CloseoutStyle`] (installed-on-PATH vs. dev-fleet), and — only
+/// when the card carries a worktree — a `# Workspace` section plus the
+/// style-independent integration lines (spec: dispatch-worktrees). A card
+/// without a worktree renders exactly the pre-worktree text.
 pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
-    let header = format!(
+    let mut out = format!(
         "You are a worker Session dispatched from card {id} on this project's board.\n\
          \n\
          # Task: {title}\n\
@@ -720,24 +723,49 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         title = card.title,
         body = card.body.as_deref().unwrap_or(""),
     );
+    if let Some(wt) = &card.worktree {
+        out.push_str(&format!(
+            "# Workspace\n\
+             You are in a git worktree at {path}, on branch {branch}, based on {base}.\n\
+             The main checkout at {root} is shared with other workers: never edit files there.\n\
+             Leave .foreman/ untouched and never stage it.\n\
+             \n",
+            path = wt.path,
+            branch = wt.branch,
+            base = wt.base,
+            root = wt.root().display(),
+        ));
+    }
+    out.push_str("# Close-out (required)\n");
+    if let Some(wt) = &card.worktree {
+        // `{root}` is quoted: this repo's own path has a space in it.
+        out.push_str(&format!(
+            "Integrate first, from inside your worktree:\n\
+             \x20   git rebase {base}\n\
+             \x20   git -C \"{root}\" merge --ff-only {branch}\n\
+             Resolve rebase conflicts yourself. If the fast-forward is refused, rebase again and retry.\n\
+             If git refuses because the main checkout has uncommitted changes in files you touched, block instead of forcing.\n",
+            base = wt.base,
+            root = wt.root().display(),
+            branch = wt.branch,
+        ));
+    }
     let closeout = match style {
         CloseoutStyle::Path => format!(
-            "# Close-out (required)\n\
-             When the work is complete, run:    foreman kanban done {id}\n\
+            "When the work is complete, run:    foreman kanban done {id}\n\
              If you are stuck and need a human: foreman kanban block {id} --reason \"<one line>\"\n\
              Do not end the session without running one of these.",
             id = card.id,
         ),
         CloseoutStyle::EnvVar => format!(
-            "# Close-out (required)\n\
-             When the work is complete, run:    & $env:FOREMAN_EXE kanban done {id}\n\
+            "When the work is complete, run:    & $env:FOREMAN_EXE kanban done {id}\n\
              If you are stuck and need a human: & $env:FOREMAN_EXE kanban block {id} --reason \"<one line>\"\n\
              (bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n\
              Do not end the session without running one of these.",
             id = card.id,
         ),
     };
-    header + &closeout
+    out + &closeout
 }
 
 /// A card plus the derived `orphaned` flag (never stored in the card file
@@ -1268,6 +1296,51 @@ mod tests {
     }
 
     // --- dispatch-worktrees: schema, naming, status, list lines ---
+
+    #[test]
+    fn dispatch_prompt_with_worktree_renders_workspace_and_integration_lines() {
+        let mut card = sample_card(Some("Resize flickers on Up-arrow."));
+        card.worktree = Some(sample_worktree());
+        let s = dispatch_prompt(&card, CloseoutStyle::Path);
+        assert_eq!(
+            s,
+            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+             \n\
+             # Task: Fix resize flicker\n\
+             \n\
+             Resize flickers on Up-arrow.\n\
+             \n\
+             # Workspace\n\
+             You are in a git worktree at H:/repo/.foreman/worktrees/a3f8k2, on branch card/a3f8k2, based on main.\n\
+             The main checkout at H:/repo is shared with other workers: never edit files there.\n\
+             Leave .foreman/ untouched and never stage it.\n\
+             \n\
+             # Close-out (required)\n\
+             Integrate first, from inside your worktree:\n\
+             \x20   git rebase main\n\
+             \x20   git -C \"H:/repo\" merge --ff-only card/a3f8k2\n\
+             Resolve rebase conflicts yourself. If the fast-forward is refused, rebase again and retry.\n\
+             If git refuses because the main checkout has uncommitted changes in files you touched, block instead of forcing.\n\
+             When the work is complete, run:    foreman kanban done a3f8k2\n\
+             If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
+             Do not end the session without running one of these."
+        );
+    }
+
+    #[test]
+    fn dispatch_prompt_with_worktree_envvar_style_keeps_git_lines_style_independent() {
+        let mut card = sample_card(None);
+        card.worktree = Some(sample_worktree());
+        let s = dispatch_prompt(&card, CloseoutStyle::EnvVar);
+        assert!(s.contains("# Workspace\n"));
+        assert!(
+            s.contains("    git rebase main\n    git -C \"H:/repo\" merge --ff-only card/a3f8k2\n")
+        );
+        assert!(s.contains(
+            "When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n"
+        ));
+        assert!(s.contains("(bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n"));
+    }
 
     #[test]
     fn worktree_layout_names_path_and_branch_with_forward_slashes() {
