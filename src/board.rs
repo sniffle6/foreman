@@ -24,6 +24,8 @@ const PAD: f32 = 6.0;
 const BTN_W: f32 = 46.0;
 const BTN_H: f32 = 22.0;
 const BTN_GAP: f32 = 4.0;
+/// The inline picker's "wt on/off" chip, left of the agent buttons.
+const WT_CHIP_W: f32 = 36.0;
 
 /// Draw the disclosure marker rather than depending on font glyph coverage.
 fn disclosure(
@@ -118,9 +120,12 @@ fn gated_by_pointer(over: bool, pointer: Option<egui::Pos2>, sub_rect: egui::Rec
 /// after `apply_acts` (content cannot mutate the manager mid-loop).
 pub enum BoardAct {
     QuickAdd(String),
+    /// `worktree` is the per-dispatch choice (spec: dispatch-worktrees; the
+    /// global setting is only its default): true = bring up a worktree.
     Dispatch {
         id: String,
         agent: String,
+        worktree: bool,
     },
     Done(String),
     Release(String),
@@ -135,6 +140,10 @@ pub struct BoardView {
     store: std::rc::Rc<std::cell::RefCell<crate::kanban::CardStore>>,
     quick_add: String,
     picker: Option<String>,
+    /// The per-dispatch "into a worktree?" choice as (card id, value). Seeded
+    /// from the global setting the first time a card's picker or detail page
+    /// asks, so one card's override never leaks onto the next card.
+    worktree_choice: Option<(String, bool)>,
     scroll: [f32; 4],
     collapsed: [bool; 4],
     selected: Option<String>,
@@ -152,6 +161,7 @@ impl BoardView {
             store,
             quick_add: String::new(),
             picker: None,
+            worktree_choice: None,
             scroll: [0.0; 4],
             collapsed: [false; 4],
             selected: None,
@@ -167,6 +177,23 @@ impl BoardView {
     #[cfg(test)]
     pub(crate) fn store(&self) -> &std::rc::Rc<std::cell::RefCell<crate::kanban::CardStore>> {
         &self.store
+    }
+
+    /// The dispatch-time worktree choice for `card`: forced on for a card
+    /// that already carries a worktree (Restart resumes in it), otherwise
+    /// the remembered per-card toggle, seeded from the global setting.
+    fn worktree_choice_for(&mut self, ctx: &egui::Context, card: &crate::kanban::Card) -> bool {
+        if card.worktree.is_some() {
+            return true;
+        }
+        match &self.worktree_choice {
+            Some((id, v)) if *id == card.id => *v,
+            _ => {
+                let v = crate::config::live(ctx).dispatch_worktrees;
+                self.worktree_choice = Some((card.id.clone(), v));
+                v
+            }
+        }
     }
 
     /// Paint the board into `rect` (screen coordinates — same space `resp`
@@ -770,6 +797,15 @@ impl BoardView {
                         crate::kanban::CardState::Backlog | crate::kanban::CardState::Blocked
                     )
                 {
+                    let mut use_worktree = self.worktree_choice_for(ui.ctx(), card);
+                    if card.worktree.is_none() {
+                        if ui
+                            .checkbox(&mut use_worktree, "Dispatch into a git worktree")
+                            .changed()
+                        {
+                            self.worktree_choice = Some((card.id.clone(), use_worktree));
+                        }
+                    }
                     ui.label(if orphaned {
                         "Restart with"
                     } else {
@@ -781,6 +817,7 @@ impl BoardView {
                                 self.acts.push(BoardAct::Dispatch {
                                     id: card.id.clone(),
                                     agent: (*agent).to_owned(),
+                                    worktree: use_worktree,
                                 });
                             }
                         }
@@ -820,6 +857,7 @@ impl BoardView {
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
     ) {
+        let use_worktree = self.worktree_choice_for(ui.ctx(), card);
         let mut bx = card_rect.max.x - PAD * self.scale;
         for agent in AGENTS.iter().rev() {
             let btn_rect = egui::Rect::from_min_size(
@@ -849,10 +887,59 @@ impl BoardView {
                 self.acts.push(BoardAct::Dispatch {
                     id: card.id.clone(),
                     agent: agent.to_string(),
+                    worktree: use_worktree,
                 });
                 self.picker = None;
             }
             bx -= BTN_W * self.scale + BTN_GAP * self.scale;
+        }
+        // The worktree chip: only for a card without a worktree (one that
+        // has one always restarts in it), and only when the card is wide
+        // enough — a narrow card still dispatches with the default, and the
+        // detail page always offers the checkbox.
+        if card.worktree.is_some() {
+            return;
+        }
+        let chip_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                bx - WT_CHIP_W * self.scale,
+                card_rect.max.y - BTN_H * self.scale - 4.0 * self.scale,
+            ),
+            egui::vec2(WT_CHIP_W * self.scale, BTN_H * self.scale),
+        );
+        if chip_rect.min.x < card_rect.min.x + PAD * self.scale {
+            return;
+        }
+        let chip_resp = ui
+            .interact(
+                chip_rect.intersect(cp.clip_rect()),
+                base.with((card.id.as_str(), "pick", "worktree")),
+                egui::Sense::click(),
+            )
+            .on_hover_text(if use_worktree {
+                "Dispatch into a git worktree (click for the project cwd)"
+            } else {
+                "Dispatch in the project cwd (click for a git worktree)"
+            });
+        cp.rect_filled(
+            chip_rect,
+            2.0,
+            if chip_resp.hovered() {
+                th.sel_bg
+            } else {
+                th.bg
+            },
+        );
+        cp.text(
+            chip_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if use_worktree { "wt on" } else { "wt off" },
+            egui::FontId::proportional(9.0 * self.scale),
+            if use_worktree { th.text } else { th.dim },
+        );
+        if chip_resp.clicked() {
+            *picker_click_consumed = true;
+            self.worktree_choice = Some((card.id.clone(), !use_worktree));
         }
     }
 }
@@ -953,6 +1040,124 @@ mod tests {
         let mut s = crate::kanban::CardStore::default();
         s.set_dir(Some(dir));
         Rc::new(RefCell::new(s))
+    }
+
+    /// Footer-row geometry for the sole card in Backlog (column 0) at scale
+    /// 1: the worktree chip sits left of the three agent buttons, the
+    /// rightmost agent button is the last entry of `AGENTS`.
+    fn picker_points(rect: egui::Rect) -> (egui::Pos2, egui::Pos2) {
+        let col_w = rect.width() / COLUMNS.len() as f32;
+        let card_max_x = rect.min.x + col_w - PAD;
+        let y = rect.min.y + HEADER_H + QUICK_ADD_H + CARD_H - BTN_H / 2.0 - 4.0;
+        let chip_x = card_max_x - PAD - BTN_W * 3.0 - BTN_GAP * 3.0 - WT_CHIP_W / 2.0;
+        let agent_x = card_max_x - PAD - BTN_W / 2.0;
+        (egui::pos2(chip_x, y), egui::pos2(agent_x, y))
+    }
+
+    fn click_at(
+        ctx: &egui::Context,
+        board: &mut BoardView,
+        rect: egui::Rect,
+        base: egui::Id,
+        pos: egui::Pos2,
+    ) {
+        run_frame(ctx, board, rect, base, vec![moved(pos)]);
+        run_frame(ctx, board, rect, base, vec![moved(pos)]);
+        run_frame(ctx, board, rect, base, vec![button(pos, true)]);
+        run_frame(ctx, board, rect, base, vec![button(pos, false)]);
+    }
+
+    #[test]
+    fn picker_worktree_chip_flips_the_choice_and_the_dispatch_act_carries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store.borrow_mut().add("card", None).unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default(); // unseeded settings: default is worktree on
+        let base = egui::Id::new("wt-chip");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0));
+        let (chip, agent) = picker_points(rect);
+        board.picker = Some(id.clone());
+        run_frame(&ctx, &mut board, rect, base, vec![moved(chip)]);
+
+        click_at(&ctx, &mut board, rect, base, chip);
+        assert_eq!(
+            board.worktree_choice,
+            Some((id.clone(), false)),
+            "one click flips the default (on) to off"
+        );
+        assert_eq!(
+            board.picker.as_deref(),
+            Some(id.as_str()),
+            "the chip is a picker click, not a dismiss"
+        );
+
+        click_at(&ctx, &mut board, rect, base, agent);
+        match board.acts.pop() {
+            Some(BoardAct::Dispatch {
+                id: aid,
+                agent,
+                worktree,
+            }) => {
+                assert_eq!(aid, id);
+                assert_eq!(agent, *AGENTS.last().unwrap());
+                assert!(!worktree, "the act carries the flipped choice");
+            }
+            _ => panic!("agent click must record a Dispatch act"),
+        }
+        assert!(board.picker.is_none());
+    }
+
+    #[test]
+    fn picker_hides_the_chip_and_forces_worktree_on_for_a_card_that_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store.borrow_mut().add("card", None).unwrap();
+        let wt = crate::kanban::Worktree {
+            path: "H:/repo/.foreman/worktrees/x".into(),
+            branch: "card/x".into(),
+            base: "main".into(),
+        };
+        store
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                Some(wt),
+            )
+            .unwrap();
+        store.borrow_mut().block(&id, "paused").unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("wt-chip-hidden");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 400.0));
+        // Blocked cards live in column 2: shift the column-0 geometry over.
+        let col_w = rect.width() / COLUMNS.len() as f32;
+        let (chip, agent) = picker_points(rect);
+        let chip = chip + egui::vec2(col_w * 2.0, -QUICK_ADD_H); // no quick-add row outside Backlog
+        let agent = agent + egui::vec2(col_w * 2.0, -QUICK_ADD_H);
+        board.picker = Some(id.clone());
+        run_frame(&ctx, &mut board, rect, base, vec![moved(chip)]);
+
+        click_at(&ctx, &mut board, rect, base, chip);
+        assert!(
+            board.worktree_choice.is_none(),
+            "no chip: a card that already has a worktree always restarts in it"
+        );
+        assert!(
+            board.picker.is_none(),
+            "with no chip there, the click is 'elsewhere' and dismisses the picker"
+        );
+        board.picker = Some(id.clone());
+        run_frame(&ctx, &mut board, rect, base, vec![moved(agent)]);
+        click_at(&ctx, &mut board, rect, base, agent);
+        match board.acts.pop() {
+            Some(BoardAct::Dispatch { worktree, .. }) => assert!(worktree),
+            _ => panic!("agent click must record a Dispatch act"),
+        }
     }
 
     #[test]

@@ -21,8 +21,13 @@ sibling — read those for *why*, this doc for *how*.
   unchanged; if claiming fails after spawning, Foreman closes the new Session.
   Command shims that cannot accept the multiline card prompt report that
   limitation and suggest installing a native executable.
-- **Per-card worktrees**: with `dispatch_worktrees` on (the default; Agents
-  pane), Start creates `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
+- **Per-card worktrees**: the choice is made per dispatch. The inline agent
+  picker carries a `wt on/off` chip and the detail page a checkbox, both
+  seeded from `dispatch_worktrees` (default on; Agents pane) and reset per
+  card, so one card's override never leaks onto the next. A card that already
+  has a worktree hides the toggle and always restarts in it. There is no CLI
+  flag: the choice lives on the board. With the toggle on, Start creates
+  `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
   and spawns the worker there, so no two workers share a checkout. The card
   records `worktree` (path, branch, and `base` — the branch the main checkout
   had at dispatch). The prompt's Workspace section tells the worker to

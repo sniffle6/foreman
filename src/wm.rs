@@ -2219,7 +2219,11 @@ impl WindowManager {
                         });
                     }
                 }
-                crate::board::BoardAct::Dispatch { id, agent } => {
+                crate::board::BoardAct::Dispatch {
+                    id,
+                    agent,
+                    worktree,
+                } => {
                     let Some(mut card) = self.kanban.borrow().get(&id).cloned() else {
                         crate::notify::queue(
                             ctx,
@@ -2243,12 +2247,13 @@ impl WindowManager {
                         continue;
                     }
                     self.cancel_pending_teardown(&id);
-                    // Bring-up (spec: dispatch-worktrees). `record` is what
-                    // the claim write stores; `card.worktree` only steers the
-                    // prompt template. Any git failure aborts before the
-                    // spawn with the card untouched.
+                    // Bring-up (spec: dispatch-worktrees). The act carries the
+                    // per-dispatch choice (the board seeds it from the global
+                    // setting). `record` is what the claim write stores;
+                    // `card.worktree` only steers the prompt template. Any git
+                    // failure aborts before the spawn with the card untouched.
                     let mut record: Option<crate::kanban::Worktree> = None;
-                    if crate::config::live(ctx).dispatch_worktrees {
+                    if worktree {
                         if let Some(cwd) = self.cwd.clone() {
                             match crate::kanban::bring_up_worktree(&cwd, &card) {
                                 Ok(crate::kanban::BringUp::Worktree(wt)) => {
@@ -13654,6 +13659,7 @@ mod tests {
                     .join("missing-agent.exe")
                     .to_string_lossy()
                     .into_owned(),
+                worktree: true,
             },
         );
         let before = child.windows.len();
@@ -13691,6 +13697,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: id.clone(),
                 agent: agent.clone(),
+                worktree: true,
             },
         );
 
@@ -13770,6 +13777,7 @@ mod tests {
     fn dispatch_from_board(
         child: &mut WindowManager,
         id: &str,
+        worktree: bool,
         ctx: &egui::Context,
     ) -> (WinId, usize) {
         push_board_act(
@@ -13777,6 +13785,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: id.to_string(),
                 agent: pause_argv()[0].clone(),
+                worktree,
             },
         );
         child.drain_board_acts(ctx);
@@ -13813,7 +13822,7 @@ mod tests {
         add.title = Some("wt card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
         let child = m.project_child_mut(pid).unwrap();
-        let (win, tab) = dispatch_from_board(child, &id, &ctx);
+        let (win, tab) = dispatch_from_board(child, &id, true, &ctx);
 
         let wt = child
             .kanban
@@ -13908,13 +13917,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_with_the_setting_off_records_no_worktree() {
+    fn dispatch_with_worktree_false_records_no_worktree_even_with_the_setting_on() {
+        // The act's per-dispatch choice decides; the global setting is only
+        // the board's default for that toggle.
         let Some(repo) = kanban_git_repo() else {
             return;
         };
         let ctx = egui::Context::default();
         let mut settings = crate::config::Settings::default();
-        settings.dispatch_worktrees = false;
+        settings.dispatch_worktrees = true;
         crate::config::seed_live(&ctx, &settings);
         let mut m = kanban_desktop(repo.path().to_path_buf());
         let pid = m.resolve_project(None).unwrap();
@@ -13922,7 +13933,7 @@ mod tests {
         add.title = Some("plain card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
         let child = m.project_child_mut(pid).unwrap();
-        dispatch_from_board(child, &id, &ctx);
+        dispatch_from_board(child, &id, false, &ctx);
         let card = child.kanban.borrow().get(&id).unwrap().clone();
         assert!(card.claim.is_some());
         assert!(card.worktree.is_none());
@@ -13941,7 +13952,7 @@ mod tests {
         let mut add = kanban_req("add");
         add.title = Some("dirty card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
-        dispatch_from_board(m.project_child_mut(pid).unwrap(), &id, &ctx);
+        dispatch_from_board(m.project_child_mut(pid).unwrap(), &id, true, &ctx);
         let wt = m
             .project_child_mut(pid)
             .unwrap()
@@ -13980,6 +13991,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: "no0000".into(),
                 agent: pause_argv()[0].clone(),
+                worktree: true,
             },
         );
         m.project_child_mut(pid).unwrap().drain_board_acts(&ctx);

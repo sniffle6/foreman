@@ -75,3 +75,31 @@ the detail itself.
 
 Body convention: a few lines of task statement plus the paths or issue
 numbers a worker needs to start — not a full brief crammed into the card.
+
+## Worktrees: where a dispatched card runs
+
+A card started from the board may run in its own git worktree —
+`<repo>/.foreman/worktrees/<id>` on branch `card/<id>` — so no two workers
+share a checkout. The choice is made on the board at dispatch time (a
+`wt on/off` chip beside the agent picker, defaulting to the app setting);
+there is no CLI flag, and a card that already has a worktree always restarts
+in it. If you were dispatched into one, your prompt has a `# Workspace`
+section saying so; if it does not, you are in the project cwd.
+
+What that changes for you:
+
+- **Integrate before `done`.** From inside your worktree: `git rebase <base>`
+  then `git -C "<main checkout>" merge --ff-only card/<id>` (both lines are
+  in your prompt). If the fast-forward is refused, rebase and retry; if the
+  main checkout has uncommitted edits in files you touched, `block` instead
+  of forcing.
+- **Never stage `.foreman/`.** The worktree carries a stale copy of the
+  board's card files; `git add -A` would commit them.
+- **`done` queues a non-forcing teardown** that waits until your terminal
+  pane is closed (a directory in use cannot be deleted). A Done card still
+  showing its branch until then is normal. A dirty tree or an unmerged branch
+  is kept, never deleted — the board shows it, and only a human can discard.
+- **`rm` refuses** a card whose tree is dirty or ahead of base.
+- **`list`** appends `[wt card/<id> +ahead -behind dirty|missing]` to a
+  worktree card's line; `--json` adds `worktree` (path, branch, base) and a
+  derived `worktree_status`, both absent for cards without one.
