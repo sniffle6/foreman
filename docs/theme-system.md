@@ -91,6 +91,12 @@ controls too, one frame behind — the same lag every terminal repaint already h
   `Settings` field, not a theme token) — it persists in `settings.json`, not the
   theme file. Changing it resizes the grid (cols/rows change), with the same
   ConPTY reflow caveat as zoom (`Ctrl+L` heals residuals).
+- **Window chrome tokens are file-only.** The tab chips (`tab_bg`,
+  `tab_bg_hover`), title-bar control hovers (`win_btn_hover`,
+  `win_btn_danger_hover`) and the help-sheet `scrim` are theme tokens like any
+  other, but the Appearance pane does not expose them — edit them in the theme
+  JSON. The hover-revealed OS bar keeps its own neutral `chrome_*` tokens; the
+  in-window chrome is warm by default and deliberately separate.
 - **Colors-first scope:** font family, line spacing, and cursor shape/blink are
   deliberately NOT here (they are separate subsystems — a later phase).
 

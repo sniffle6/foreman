@@ -5351,9 +5351,9 @@ impl WindowManager {
                         let bg = if is_active_tab {
                             th.bg
                         } else if chip_resp.hovered() {
-                            egui::Color32::from_rgb(50, 45, 35)
+                            th.tab_bg_hover
                         } else {
-                            egui::Color32::from_rgb(38, 34, 27)
+                            th.tab_bg
                         };
                         // Rounded on top, flat on the bottom so the active tab reads as
                         // joined to the content area below it (classic browser tabs).
@@ -5443,11 +5443,7 @@ impl WindowManager {
                                 ui.interact(xr, base.with((id, "tabx", ti)), egui::Sense::click());
                             let xc = xr.center();
                             let xs = 3.0;
-                            let xcol = if r.hovered() {
-                                egui::Color32::from_rgb(220, 120, 100)
-                            } else {
-                                txt_col
-                            };
+                            let xcol = if r.hovered() { th.danger } else { txt_col };
                             let xstroke = egui::Stroke::new(1.2, xcol);
                             p.line_segment(
                                 [
@@ -5565,11 +5561,8 @@ impl WindowManager {
                     let resp =
                         ui.interact(br, base.with((id, "panel-collapse")), egui::Sense::click());
                     if resp.hovered() {
-                        ui.painter().rect_filled(
-                            br,
-                            egui::CornerRadius::same(4),
-                            egui::Color32::from_rgb(72, 64, 50),
-                        );
+                        ui.painter()
+                            .rect_filled(br, egui::CornerRadius::same(4), th.win_btn_hover);
                     }
                     let collapsed = matches!(
                         &self.windows[i].tabs[self.windows[i].active].content,
@@ -5608,9 +5601,9 @@ impl WindowManager {
                             ui.interact(r, base.with((id, role.id_str())), egui::Sense::click());
                         let bg = if resp.hovered() {
                             if role.danger() {
-                                egui::Color32::from_rgb(120, 45, 36)
+                                th.win_btn_danger_hover
                             } else {
-                                egui::Color32::from_rgb(72, 64, 50)
+                                th.win_btn_hover
                             }
                         } else {
                             egui::Color32::TRANSPARENT
@@ -5721,7 +5714,7 @@ impl WindowManager {
                     if let Some(pr) = hl.plus {
                         let presp = ui.interact(pr, base.with((id, "plus")), egui::Sense::click());
                         let pbg = if presp.hovered() {
-                            egui::Color32::from_rgb(72, 64, 50)
+                            th.win_btn_hover
                         } else {
                             egui::Color32::TRANSPARENT
                         };
@@ -6352,7 +6345,7 @@ impl WindowManager {
             egui::Align2::CENTER_CENTER,
             text,
             font,
-            egui::Color32::from_rgb(25, 23, 19),
+            th.desk_bg,
         );
     }
 
@@ -6363,8 +6356,7 @@ impl WindowManager {
     fn paint_help(&self, ui: &mut egui::Ui, area: egui::Rect) {
         let th = crate::theme::live(ui.ctx());
         use crate::keymap::{Command, Group};
-        ui.painter_at(area)
-            .rect_filled(area, 0.0, egui::Color32::from_black_alpha(170));
+        ui.painter_at(area).rect_filled(area, 0.0, th.scrim);
 
         // (key, value). Empty value = section header; empty both = spacer.
         let mut rows: Vec<(String, String)> = Vec::new();

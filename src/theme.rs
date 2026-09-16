@@ -29,6 +29,20 @@ const WIN_BG: egui::Color32 = egui::Color32::from_rgb(33, 30, 24);
 const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(43, 39, 31);
 const TITLE_BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(56, 49, 36);
 
+// ---- window chrome (title-band tabs, controls, help scrim) ----
+/// Inactive tab chip: a step darker than the title band it sits in.
+const TAB_BG: egui::Color32 = egui::Color32::from_rgb(38, 34, 27);
+/// Inactive tab chip under the pointer: a step lighter than the band.
+const TAB_BG_HOVER: egui::Color32 = egui::Color32::from_rgb(50, 45, 35);
+/// Hover fill behind a title-bar control (float/zoom/close, panel collapse,
+/// the project +). Warm, unlike the neutral `CHROME_BTN_HOVER` of the OS bar.
+const WIN_BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(72, 64, 50);
+/// Hover fill behind a destructive title-bar control (close).
+const WIN_BTN_DANGER_HOVER: egui::Color32 = egui::Color32::from_rgb(120, 45, 36);
+/// Scrim over the desktop behind the help sheet (`paint_help`). Other modals
+/// (confirm, dirpicker) still carry their own alpha.
+const SCRIM: egui::Color32 = egui::Color32::from_black_alpha(170);
+
 // ---- text ----
 const TEXT: egui::Color32 = egui::Color32::from_rgb(222, 222, 212);
 const DIM: egui::Color32 = egui::Color32::from_rgb(150, 143, 125);
@@ -203,6 +217,9 @@ mod tests {
         assert_eq!(t.palette, PALETTE);
         assert_eq!(t.chat_colors, CHAT_COLORS);
         assert_eq!(t.snap_fill, SNAP_FILL);
+        assert_eq!(t.tab_bg, TAB_BG);
+        assert_eq!(t.win_btn_hover, WIN_BTN_HOVER);
+        assert_eq!(t.scrim, SCRIM);
         assert_eq!(t.app_border(), CHROME_BG); // APP_BORDER derivation preserved
         assert_eq!(Theme::default(), Theme::foreman_warm());
     }
@@ -467,6 +484,16 @@ pub struct Theme {
     #[serde(with = "color_hex")]
     pub title_bg_focus: egui::Color32,
     #[serde(with = "color_hex")]
+    pub tab_bg: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub tab_bg_hover: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub win_btn_hover: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub win_btn_danger_hover: egui::Color32,
+    #[serde(with = "color_hex")]
+    pub scrim: egui::Color32,
+    #[serde(with = "color_hex")]
     pub text: egui::Color32,
     #[serde(with = "color_hex")]
     pub dim: egui::Color32,
@@ -541,6 +568,11 @@ impl Theme {
             win_bg: WIN_BG,
             title_bg: TITLE_BG,
             title_bg_focus: TITLE_BG_FOCUS,
+            tab_bg: TAB_BG,
+            tab_bg_hover: TAB_BG_HOVER,
+            win_btn_hover: WIN_BTN_HOVER,
+            win_btn_danger_hover: WIN_BTN_DANGER_HOVER,
+            scrim: SCRIM,
             text: TEXT,
             dim: DIM,
             fg: FG,
