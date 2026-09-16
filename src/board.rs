@@ -102,17 +102,6 @@ fn column_title(state: crate::kanban::CardState) -> &'static str {
     }
 }
 
-/// The detail page's subtitle: `#12 · a3f8k2 · Backlog` — number first (the
-/// handle people quote), then the id (what the branch and the files are
-/// named after), then the column. An unnumbered card drops the number.
-fn card_handle(card: &crate::kanban::Card, column: &str) -> String {
-    if card.num > 0 {
-        format!("#{} · {} · {column}", card.num, card.id)
-    } else {
-        format!("{} · {column}", card.id)
-    }
-}
-
 /// Pointer-in-sub-rect gate for a nested region (a column body, a card).
 /// `over` must be `resp.hovered() || resp.contains_pointer()`, never
 /// `hovered()` alone: same-layer children registered later in the same draw
@@ -530,33 +519,14 @@ impl BoardView {
             self.selected = Some(card.id.clone());
             self.picker = None;
         }
-        // `#12` leads the title in monospace so the number reads as a
-        // handle, not a word of the title; an unnumbered card (only before
-        // its first reload) shows the title alone.
-        let mut job = egui::text::LayoutJob::default();
-        job.wrap.max_width = text_w;
+        let mut job = egui::text::LayoutJob::simple(
+            card.title.clone(),
+            egui::FontId::proportional(12.0 * self.scale),
+            th.text,
+            text_w,
+        );
         job.wrap.max_rows = 2;
         job.wrap.break_anywhere = false;
-        if card.num > 0 {
-            job.append(
-                &format!("#{}  ", card.num),
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::monospace(12.0 * self.scale),
-                    color: th.text,
-                    ..Default::default()
-                },
-            );
-        }
-        job.append(
-            &card.title,
-            0.0,
-            egui::TextFormat {
-                font_id: egui::FontId::proportional(12.0 * self.scale),
-                color: th.text,
-                ..Default::default()
-            },
-        );
         let title = cp.layout_job(job);
         cp.galley(
             card_rect.min + egui::vec2(PAD * self.scale, PAD * self.scale),
@@ -734,7 +704,8 @@ impl BoardView {
                         .wrap(),
                 );
                 ui.label(
-                    egui::RichText::new(card_handle(card, column_title(card.state))).color(th.dim),
+                    egui::RichText::new(format!("{} · {}", card.id, column_title(card.state)))
+                        .color(th.dim),
                 );
                 if orphaned {
                     ui.colored_label(th.danger, "Session ended");
@@ -978,15 +949,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    #[test]
-    fn card_handle_leads_with_the_number_when_there_is_one() {
-        let mut card =
-            crate::kanban::Card::new(12, "a3f8k2".into(), "t".into(), None, String::new());
-        assert_eq!(card_handle(&card, "Backlog"), "#12 · a3f8k2 · Backlog");
-        card.num = 0;
-        assert_eq!(card_handle(&card, "Done"), "a3f8k2 · Done");
-    }
 
     #[test]
     fn live_font_changes_scale_card_action_hit_regions() {
