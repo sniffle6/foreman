@@ -21,6 +21,28 @@ sibling — read those for *why*, this doc for *how*.
   unchanged; if claiming fails after spawning, Foreman closes the new Session.
   Command shims that cannot accept the multiline card prompt report that
   limitation and suggest installing a native executable.
+- **Per-card worktrees**: with `dispatch_worktrees` on (the default; Agents
+  pane), Start creates `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
+  and spawns the worker there, so no two workers share a checkout. The card
+  records `worktree` (path, branch, and `base` — the branch the main checkout
+  had at dispatch). The prompt's Workspace section tells the worker to
+  `git rebase <base>` and fast-forward `<base>` from the worktree before
+  `done`. `done`, board Release, and `rm` queue a non-forcing teardown
+  (`worktree remove`, `branch -d`, `prune`) that runs on a background thread
+  once the worker's terminal is gone; a dirty tree or an unmerged branch is
+  kept and the card says so. `rm` refuses outright while the tree is dirty or
+  ahead of base. `block` and orphaned cards keep the tree so Restart resumes
+  in it. Outside a git repository dispatch runs in place silently; on a
+  detached HEAD it runs in place with a warning toast. **Discard worktree** on
+  a Done, Blocked, or orphaned card's detail page is the only forcing path and
+  is human-only (no wire verb), behind the standard confirm. Why this shape
+  and what was rejected: `docs/superpowers/specs/2026-09-15-dispatch-worktrees-design.md`.
+- **Worktree status is derived**: while a board is shown, every worktree card
+  is probed every few seconds on a background thread (dirty, ahead, behind,
+  missing) and the result is shown on the card face and by
+  `foreman kanban list` (`[wt card/<id> +A -B dirty]`; `--json` adds
+  `worktree` and `worktree_status`). Nothing about status is written to a
+  card file; a hidden board polls nothing.
 - **Derived orphan detection**: a card is orphaned when it is In Progress but
   its claim no longer checks out — wrong app run, or the claimed terminal is
   gone or exited. Orphan state is recomputed every frame and exists nowhere in
@@ -107,19 +129,45 @@ Backlog; Done is terminal — delete or promote to a GitHub issue.
   changes (branch switch, pull) appear within seconds on a shown board; a
   hidden board catches up when next rendered. The app's own writes repaint
   immediately.
+- **Teardown waits for the worker's pane to close.** On Windows a directory
+  that is some process's cwd cannot be deleted, and the worker's shell sits
+  in the worktree when it runs `done`. The teardown is queued and starts
+  once the claiming terminal is no longer running — close the pane and the
+  tree goes away. A Done card still showing its branch means the pane is
+  still open (or the tree was kept: see the toast).
+- **Each worktree cold-builds.** It has its own `target/`; the first build
+  costs minutes (`docs/dev-launcher.md` forbids sharing a target dir). Minutes
+  of compile beat corrupted commits.
+- **The worktree carries a stale `.foreman/tasks/`.** Close-out reaches the
+  project's board through the pipe, so the board is unaffected — but a worker
+  that runs `git add -A` commits stale card files and the fast-forward
+  carries them into base. The prompt says never to stage `.foreman/`; review
+  for it anyway.
+- **`kanban list` worktree status comes from the last poll round.** A board
+  that has not been shown since the card was dispatched prints the branch
+  with no counts.
+- **Ignore is per-clone.** Bring-up appends `.foreman/worktrees/` to
+  `.git/info/exclude`, never to `.gitignore`.
 
 ## Key files
 
 - `src/kanban.rs` — the pure domain: `Card`/`Claim`/`CardState`, `CardStore`
   (file-per-card load/save, transition verbs, staleness poll), `claim_is_dead`
   / `is_orphaned` (derived orphan rule), `run_nonce`, `dispatch_prompt` +
-  `CloseoutStyle`, `CardLine`, `wait_verdict`.
+  `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
+  `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
+  `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` +
+  `teardown_verdict`, `CardStore::take_status_poll`.
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
-  intents it records for the manager to drain).
+  intents it records for the manager to drain), including the card-face
+  worktree line and the detail page's Discard action.
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
   reload), `kanban_dispatch` (the control-pipe verb table), `drain_board_acts`
-  (applies board intents: store writes, jump-to-terminal, dispatch-from-card),
-  `open_board_window` (per-project singleton), `term_states`.
+  (applies board intents: store writes, jump-to-terminal, dispatch-from-card
+  with bring-up), `drain_worktree_msgs` (queued teardowns, thread results,
+  status poll kick), `kanban_rm` (the `rm` pre-check), `open_board_window`
+  (per-project singleton), `term_states`.
+- `src/config.rs` — `Settings::dispatch_worktrees`.
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
   `kanban_main`, `kanban_wait` (client-side poll loop), `HELP_KANBAN`.
 - `src/workspace.rs` — `ContentSnap::Board` persistence variant.

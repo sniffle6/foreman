@@ -165,6 +165,29 @@ The card↔Session link recorded at dispatch or `start`: terminal id, app run
 nonce, agent, timestamp. Dead claims are derived (orphan), never stored.
 _Avoid_: assignment, lock.
 
+**Worktree**:
+A Card's private checkout under `.foreman/worktrees/<id>`, on branch
+`card/<id>`, created at dispatch and recorded on the Card.
+_Avoid_: sandbox, checkout (ambiguous with the main checkout).
+
+**Base**:
+The branch the main checkout had at dispatch; the Worktree's integration
+target.
+_Avoid_: main, trunk (it may be a feature branch).
+
+**Integrate**:
+The Worker's rebase onto Base plus fast-forward of Base, done before `done`.
+_Avoid_: merge (implies a merge commit).
+
+**Teardown**:
+The non-forcing remove-and-delete queued by `done`, Release, and `rm`; keeps
+a dirty tree or an unmerged branch.
+_Avoid_: cleanup, delete.
+
+**Discard**:
+The human-only forcing Teardown offered on a Done, Blocked, or orphaned Card.
+_Avoid_: force-delete, purge.
+
 **Board**:
 The per-project kanban surface (a window content variant) — shows Cards in
 four fixed columns (Backlog / In Progress / Blocked / Done) and dispatches a
