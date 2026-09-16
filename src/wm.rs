@@ -7984,6 +7984,45 @@ mod tests {
     }
 
     #[test]
+    fn add_term_path_targets_the_named_project_tab_and_surfaces_it() {
+        // Sessions-panel `+` on a *background* project tab of a minimized
+        // window: the terminal must land in that tab (not the active one),
+        // the tab must become active, and the window must come back.
+        let ctx = egui::Context::default();
+        let mut desk = WindowManager::new();
+        desk.last_area = egui::vec2(1000.0, 600.0);
+        let w = push(&mut desk, "a");
+        let win = desk.windows.iter_mut().find(|x| x.id == w).unwrap();
+        win.tabs = vec![
+            Tab::fixed("a", Content::Project(Box::new(WindowManager::new()))),
+            Tab::fixed("b", Content::Project(Box::new(WindowManager::new()))),
+        ];
+        win.active = 0;
+        desk.minimize(w);
+        desk.apply_acts(
+            vec![Act::AddTermPath(crate::panel::TargetPath {
+                project: w,
+                ptab: None,
+                window: None,
+                tab: Some(1),
+            })],
+            egui::vec2(0.0, 0.0),
+            egui::Id::new("t"),
+            &ctx,
+        );
+        let win = desk.windows.iter().find(|x| x.id == w).unwrap();
+        let count = |t: &Tab| match &t.content {
+            Content::Project(inner) => inner.windows.len(),
+            _ => usize::MAX,
+        };
+        assert_eq!(count(&win.tabs[0]), 0, "active tab must not receive the spawn");
+        assert_eq!(count(&win.tabs[1]), 1, "the named project tab gets the terminal");
+        assert_eq!(win.active, 1, "the target project tab is activated");
+        assert!(!win.minimized, "spawning surfaces the project");
+        assert_eq!(desk.focused, Some(w));
+    }
+
+    #[test]
     fn closing_last_tab_removes_the_window() {
         let mut wm = WindowManager::new();
         let a = push(&mut wm, "A");

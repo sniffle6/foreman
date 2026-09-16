@@ -46,6 +46,17 @@ and the landing site for future agent-state badges.
   expanded. Collapsed rails already show only project icons, so a rail click
   still surfaces rather than folding. A latched Bell on a hidden child
   promotes to the project row/chip so the ring is not lost.
+- **Project rows have a hover `+`:** left of the min/close buttons on a
+  project row (expanded vertical and Columns modes). Click spawns a
+  default-shell terminal into *that* project through `PanelBtn::AddTerm` →
+  `Act::AddTermPath(TargetPath)` → `WindowManager::add_terminal` — the same
+  spawn path as the project titlebar `+` and `Command::NewTerm`, so placement
+  and `new_windows_float` behave identically. The path's `tab` names the
+  project tab, so a background tab of a tabbed-projects window is activated
+  first, and the project is surfaced (unminimized, focused) so the new
+  terminal is visible. Unlike the titlebar `+`, there is no shell menu: it
+  always uses `Settings::default_shell`. Strip and rail modes have no `+`
+  (expand to manage).
 - **Elided titles get a hover tooltip:** rows (expanded modes) and strip chips
   attach egui's `on_hover_text` with the full title only when the `…`
   truncation actually kicked in (`Galley::elided`), and never while a reorder

@@ -302,6 +302,8 @@ pub struct PanelModel {
 pub enum PanelBtn {
     Min,
     Close,
+    /// Project rows only: spawn a default-shell terminal into that project.
+    AddTerm,
 }
 
 #[derive(Clone, Copy)]
@@ -1738,7 +1740,9 @@ impl PanelView {
         // Title, truncated with … to the space left of the buttons/labels.
         let font = egui::FontId::proportional(if rp.project_row { 12.5 } else { 12.0 });
         let text_x = row.min.x + 20.0;
-        let reserve = if over {
+        let reserve = if over && rp.project_row {
+            54.0 // add + min + close buttons
+        } else if over {
             38.0 // min + close buttons
         } else if rp.bell {
             20.0 // pulsing bell dot
@@ -1818,6 +1822,39 @@ impl PanelView {
             if close_resp.clicked() {
                 self.hover_act = Some((rp.path, PanelBtn::Close));
                 btn_hit = true;
+            }
+            // Project rows get a `+` left of min/close: spawn a terminal into
+            // this project without going through its titlebar. Drawn as
+            // strokes like the wm header `+` (same glyph, smaller).
+            if rp.project_row {
+                let add_c = egui::pos2(row.max.x - 42.0, btn_y);
+                let add_r = egui::Rect::from_center_size(add_c, egui::vec2(16.0, 16.0));
+                let add_resp = ui
+                    .interact(add_r.intersect(clip), id.with("add"), egui::Sense::click())
+                    .on_hover_text("New terminal");
+                let s = 3.5;
+                let stroke = egui::Stroke::new(
+                    1.3,
+                    if add_resp.hovered() { th.text } else { th.dim },
+                );
+                p.line_segment(
+                    [
+                        egui::pos2(add_c.x - s, add_c.y),
+                        egui::pos2(add_c.x + s, add_c.y),
+                    ],
+                    stroke,
+                );
+                p.line_segment(
+                    [
+                        egui::pos2(add_c.x, add_c.y - s),
+                        egui::pos2(add_c.x, add_c.y + s),
+                    ],
+                    stroke,
+                );
+                if add_resp.clicked() {
+                    self.hover_act = Some((rp.path, PanelBtn::AddTerm));
+                    btn_hit = true;
+                }
             }
         } else if rp.bell {
             // Latched Bell: pulsing amber dot in the right-edge slot — the
