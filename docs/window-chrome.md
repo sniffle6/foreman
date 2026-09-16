@@ -1,7 +1,7 @@
 # Window chrome: always-on quiet headers and the project menus
 
 Every non-bare window shows its chrome unconditionally — there is no
-hover-reveal and no fade. **Projects**: `[icon] [name] [+] [tab chips] …
+hover-reveal animation. **Projects**: `[icon] [name] [+] [tab chips] …
 [⋯] [✕]`. **Terminals**: `[icon] [title] [tab chips] … [grid/min/max/✕]`.
 The single exception is the pre-existing **bare** rule (`src/wm.rs` "bare"
 path): a lone, tiled, single-tab non-project window draws no chrome at all —
@@ -28,11 +28,17 @@ first-class. The `+` anchor is clamped against the reserved control zone
 (`ctl_w`) so packed tab chips or a long project name can never push it into
 overlap with `⋯` (which would open both hover menus at once).
 
+Single-tab titles are clipped to a text-only slot before the control zone (and
+before the `+` on projects). Overflow fades into the surface color with the same
+paint helper as tab labels; fitting titles remain fully visible without a fade.
+When no text space remains, the label paints nothing. Icons and control hit
+regions are unchanged. The collapsed Sessions rail still omits its label.
+
 ## Key files
 
 - `src/wm.rs` — the `bare` rule, `header_layout` (the pure geometry module:
   chip packing, the control-zone fence, the `+` clamp — contract-tested),
-  the header paint branch that consumes it, `hover_menu`, the `+`/`⋯` menu
+  `paint_header_label` (shared clipped text and overflow fade), the header paint branch, `hover_menu`, the `+`/`⋯` menu
   wiring.
 - `src/theme.rs` — every color token in one place (`bg` the shared surface
   color, the border/focus ladder, selection whites, app chrome greys, chat and

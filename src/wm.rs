@@ -432,6 +432,12 @@ enum Act {
     MinPath(crate::panel::TargetPath),
     /// Close a panel row target (routes through the close-confirm path).
     ClosePath(crate::panel::TargetPath),
+    /// Spawn a default-shell terminal into the project a panel row names —
+    /// the sessions-panel `+`. Same spawn path as the header `+` and
+    /// `Command::NewTerm` (`add_terminal`), but addressed by `TargetPath` so
+    /// a background project *tab* is activated first and the project is
+    /// surfaced (unminimized, focused) so the new terminal is visible.
+    AddTermPath(crate::panel::TargetPath),
     /// Panel drag-drop reorder: presentation-only rank rewrite. Never touches
     /// the tree, z-order, tab-strip order, focus, or active tabs. Deferred:
     /// renumbering needs `&mut` across windows while the panel view's render
@@ -2816,6 +2822,7 @@ impl WindowManager {
             acts.push(match b {
                 crate::panel::PanelBtn::Min => Act::MinPath(p),
                 crate::panel::PanelBtn::Close => Act::ClosePath(p),
+                crate::panel::PanelBtn::AddTerm => Act::AddTermPath(p),
             });
         }
         if let Some(r) = reorder {
@@ -2872,6 +2879,33 @@ impl WindowManager {
                 }
             }
         }
+    }
+
+    /// Sessions-panel `+`: add a default-shell terminal to the project tab a
+    /// panel row names, then surface that project. Project rows carry the
+    /// project-tab index in `tab`; anything else (a stale or child path) falls
+    /// back to the window's active project tab. No-op if the window is gone or
+    /// the tab is not a project.
+    fn apply_add_term_path(&mut self, p: crate::panel::TargetPath, ctx: &egui::Context) {
+        let Some(pidx) = self.windows.iter().position(|w| w.id == p.project) else {
+            return;
+        };
+        let pi = match p.tab {
+            Some(t) if p.window.is_none() && t < self.windows[pidx].tabs.len() => t,
+            _ => self.windows[pidx].active,
+        };
+        let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content else {
+            return;
+        };
+        // `add_terminal` handles default placement (and `new_windows_float`)
+        // itself; it also focuses the new terminal inside the project.
+        inner.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx);
+        self.surface_target(crate::panel::TargetPath {
+            project: p.project,
+            ptab: None,
+            window: None,
+            tab: Some(pi),
+        });
     }
 
     /// Index of the project tab on `self.windows[pidx]` that owns child window
@@ -5000,33 +5034,14 @@ impl WindowManager {
                                 tint,
                             );
                         }
-                        let galley = p.layout_no_wrap(label.clone(), tab_font.clone(), txt_col);
-                        let overflowing = galley.size().x > ch.label_rect.width();
-                        let label_painter = p.with_clip_rect(ch.label_rect);
-                        let text_pos = egui::pos2(
-                            ch.label_rect.min.x,
-                            ch.label_rect.center().y - galley.size().y / 2.0,
+                        let overflowing = paint_header_label(
+                            &p,
+                            label.clone(),
+                            tab_font.clone(),
+                            txt_col,
+                            bg,
+                            ch.label_rect,
                         );
-                        // Clip only the label; the icon, border and close affordance
-                        // keep their own paint and hit regions.
-                        label_painter.galley(text_pos, galley, txt_col);
-                        if overflowing {
-                            let fade = egui::Rect::from_min_max(
-                                egui::pos2(
-                                    (ch.label_rect.max.x - 12.0).max(ch.label_rect.min.x),
-                                    ch.label_rect.min.y + 1.0,
-                                ),
-                                egui::pos2(ch.label_rect.max.x, ch.label_rect.max.y - 1.0),
-                            );
-                            let mut mesh = egui::Mesh::default();
-                            mesh.colored_vertex(fade.left_top(), egui::Color32::TRANSPARENT);
-                            mesh.colored_vertex(fade.right_top(), bg);
-                            mesh.colored_vertex(fade.left_bottom(), egui::Color32::TRANSPARENT);
-                            mesh.colored_vertex(fade.right_bottom(), bg);
-                            mesh.add_triangle(0, 1, 2);
-                            mesh.add_triangle(2, 1, 3);
-                            label_painter.add(egui::Shape::mesh(mesh));
-                        }
                         // Reuse the chip response so a tooltip cannot steal tab
                         // clicks or drag-out. The close button has its own response.
                         let chip_resp = if overflowing {
@@ -5108,7 +5123,7 @@ impl WindowManager {
                             }
                         }
                     }
-                } else if let HeaderContentLayout::Title { icon, text_pos } = &hl.content {
+                } else if let HeaderContentLayout::Title { icon, label_rect } = &hl.content {
                     // Leading icon, mirroring the tab chips so a single-window header
                     // reads consistently (agent logo / shell glyph / project folder).
                     if let (Some(kind), Some(icon_rect)) = (
@@ -5141,12 +5156,13 @@ impl WindowManager {
                         Content::TaskManager(v) if v.collapsed
                     );
                     if !collapsed_panel {
-                        p.text(
-                            *text_pos,
-                            egui::Align2::LEFT_CENTER,
-                            self.windows[i].title(),
+                        paint_header_label(
+                            &p,
+                            self.windows[i].title().to_owned(),
                             title_font.clone(),
                             if is_focus { th.text } else { th.dim },
+                            th.bg,
+                            *label_rect,
                         );
                     }
                 }
@@ -5877,6 +5893,7 @@ impl WindowManager {
                 Act::FocusPath(p) => self.toggle_surface_target(p),
                 Act::MinPath(p) => self.apply_min_path(p),
                 Act::ClosePath(p) => self.apply_close_path(p),
+                Act::AddTermPath(p) => self.apply_add_term_path(p, ctx),
                 Act::ReorderPanel(r) => {
                     // Rejects are no-ops; the trailing mark_workspace_dirty()
                     // over-dirties by design (see the comment below the loop).
@@ -6294,7 +6311,7 @@ enum HeaderContentLayout {
     },
     Title {
         icon: Option<egui::Rect>,
-        text_pos: egui::Pos2,
+        label_rect: egui::Rect,
     },
 }
 
@@ -6327,7 +6344,7 @@ fn header_layout(
     let avail_end = scr.max.x - ctl_w;
 
     // (content, unclamped x where the `+` would anchor; None while renaming)
-    let (content, plus_x) = match spec {
+    let (mut content, plus_x) = match spec {
         HeaderSpec::Rename => {
             let te_h = TITLE_H - 8.0;
             let field = egui::Rect::from_min_size(
@@ -6398,9 +6415,12 @@ fn header_layout(
             if has_icon {
                 tx += icon_disp + 7.0;
             }
-            let text_pos = egui::pos2(tx, scr.min.y + TITLE_H / 2.0);
+            let label_rect = egui::Rect::from_min_max(
+                egui::pos2(tx.min(avail_end), scr.min.y),
+                egui::pos2(avail_end, scr.min.y + TITLE_H),
+            );
             (
-                HeaderContentLayout::Title { icon, text_pos },
+                HeaderContentLayout::Title { icon, label_rect },
                 Some(tx + title_w + 14.0),
             )
         }
@@ -6416,6 +6436,12 @@ fn header_layout(
     } else {
         None
     };
+
+    // The project add button occupies part of the space before the control fence.
+    if let (HeaderContentLayout::Title { label_rect, .. }, Some(plus)) = (&mut content, plus) {
+        label_rect.max.x = label_rect.max.x.min(plus.min.x);
+        label_rect.min.x = label_rect.min.x.min(label_rect.max.x);
+    }
 
     let roles: &[CtlRole] = if is_project {
         &[CtlRole::Close, CtlRole::Ovf]
@@ -6440,6 +6466,41 @@ fn header_layout(
         plus,
         controls,
     }
+}
+
+/// Paint only within the text slot; icons and controls retain their own regions.
+/// Returns overflow so tab chips can offer their existing full-title tooltip.
+fn paint_header_label(
+    painter: &egui::Painter,
+    label: String,
+    font: egui::FontId,
+    color: egui::Color32,
+    fill: egui::Color32,
+    slot: egui::Rect,
+) -> bool {
+    if slot.width() <= 0.0 || slot.height() <= 0.0 {
+        return !label.is_empty();
+    }
+    let galley = painter.layout_no_wrap(label, font, color);
+    let overflowing = galley.size().x > slot.width();
+    let label_painter = painter.with_clip_rect(slot);
+    let text_pos = egui::pos2(slot.min.x, slot.center().y - galley.size().y / 2.0);
+    label_painter.galley(text_pos, galley, color);
+    if overflowing {
+        let fade = egui::Rect::from_min_max(
+            egui::pos2((slot.max.x - 12.0).max(slot.min.x), slot.min.y + 1.0),
+            egui::pos2(slot.max.x, slot.max.y - 1.0),
+        );
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(fade.left_top(), egui::Color32::TRANSPARENT);
+        mesh.colored_vertex(fade.right_top(), fill);
+        mesh.colored_vertex(fade.left_bottom(), egui::Color32::TRANSPARENT);
+        mesh.colored_vertex(fade.right_bottom(), fill);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(2, 1, 3);
+        label_painter.add(egui::Shape::mesh(mesh));
+    }
+    overflowing
 }
 
 /// A tab's display name for chat purposes: the title minus the one-shot
@@ -8694,6 +8755,88 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn single_title_slot_stays_clear_of_controls_and_project_add() {
+        for is_project in [false, true] {
+            for has_icon in [false, true] {
+                for width in [0.0, 54.0, 113.0, 145.0, 220.0, 800.0] {
+                    for title_w in [0.0, 40.0, 5000.0] {
+                        let scr = egui::Rect::from_min_size(
+                            egui::pos2(80.0, 40.0),
+                            egui::vec2(width, 300.0),
+                        );
+                        let hl = header_layout(
+                            scr,
+                            is_project,
+                            false,
+                            HeaderSpec::Title { title_w, has_icon },
+                        );
+                        let HeaderContentLayout::Title { icon, label_rect } = hl.content else {
+                            panic!("expected title layout");
+                        };
+                        assert!(label_rect.width() >= 0.0);
+                        assert!(label_rect.max.x <= hl.avail_end);
+                        if let Some(plus) = hl.plus {
+                            assert!(label_rect.max.x <= plus.min.x);
+                        }
+                        for (_, control) in &hl.controls {
+                            assert!(label_rect.max.x <= control.min.x);
+                        }
+                        if label_rect.width() > 0.0 {
+                            let expected_start = scr.min.x + if has_icon { 32.0 } else { 11.0 };
+                            assert_eq!(label_rect.min.x, expected_start);
+                            if let Some(icon) = icon {
+                                assert!(icon.max.x < label_rect.min.x);
+                            }
+                        }
+                        if width == 800.0 && title_w == 40.0 {
+                            assert!(label_rect.width() >= title_w, "fitting titles remain whole");
+                        }
+                        if width <= header_ctl_w(is_project, false) {
+                            assert_eq!(label_rect.width(), 0.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_label_fades_only_overflow_and_skips_empty_slots() {
+        let ctx = egui::Context::default();
+        for (width, expected_shapes, expected_overflow) in
+            [(400.0, 1, false), (20.0, 2, true), (0.0, 0, true)]
+        {
+            let slot =
+                egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(width, TITLE_H));
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("header-test"),
+                ));
+                assert_eq!(
+                    paint_header_label(
+                        &painter,
+                        "Terminal title #12".into(),
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                        egui::Color32::BLACK,
+                        slot
+                    ),
+                    expected_overflow
+                );
+            });
+            assert_eq!(output.shapes.len(), expected_shapes);
+            for shape in &output.shapes {
+                assert_eq!(shape.clip_rect, slot);
+            }
+            if expected_shapes == 2 {
+                assert!(matches!(output.shapes[0].shape, egui::Shape::Text(_)));
+                assert!(matches!(output.shapes[1].shape, egui::Shape::Mesh(_)));
             }
         }
     }

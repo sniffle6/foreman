@@ -17,8 +17,8 @@ glyph) and the tab chips are styled like classic browser tabs.
   active or hovered tab.
 - Overflowing tab names fade at the right edge before the close button. Hover
   the tab to read its complete name in a tooltip. Short names remain fully
-  visible without a fade or tooltip. Chip packing and single-window titles
-  retain their existing behavior.
+  visible without a fade or tooltip. Chip packing is unchanged. Single-window titles use the
+  same fade before their header controls; see `docs/window-chrome.md`.
 
 ## Why it exists
 
