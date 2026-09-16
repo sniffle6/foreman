@@ -140,6 +140,10 @@ pub struct BoardView {
     selected: Option<String>,
     scale: f32,
     pub acts: Vec<BoardAct>,
+    /// Test probe: true when the last `show_details` frame drew the Discard
+    /// button (Done/Blocked/orphaned card with a worktree).
+    #[cfg(test)]
+    pub(crate) offered_discard: bool,
 }
 
 impl BoardView {
@@ -153,6 +157,8 @@ impl BoardView {
             selected: None,
             scale: 1.0,
             acts: Vec::new(),
+            #[cfg(test)]
+            offered_discard: false,
         }
     }
 
@@ -519,19 +525,50 @@ impl BoardView {
         } else {
             th.dim
         };
+        // A worktree card keeps one row for the status and one for the
+        // worktree line; the card's height never changes (spec: nothing on
+        // cards without a worktree).
         let mut job = egui::text::LayoutJob::simple(
             status,
             egui::FontId::proportional(10.5 * self.scale),
             status_color,
             text_w,
         );
-        job.wrap.max_rows = 2;
+        job.wrap.max_rows = if card.worktree.is_some() { 1 } else { 2 };
         job.wrap.break_anywhere = false;
         cp.galley(
             card_rect.min + egui::vec2(PAD * self.scale, 40.0 * self.scale),
             cp.layout_job(job),
             status_color,
         );
+        if let Some(wt) = &card.worktree {
+            let st = self.store.borrow().worktree_status(&card.id);
+            // Ahead of base is normal while the worker is still going; it
+            // is attention once the card has left In Progress.
+            let attention = st.is_some_and(|s| {
+                s.dirty || (s.ahead > 0 && card.state != crate::kanban::CardState::InProgress)
+            });
+            let color = if st.is_some_and(|s| s.missing) {
+                th.dim
+            } else if attention {
+                th.danger
+            } else {
+                th.text
+            };
+            let mut job = egui::text::LayoutJob::simple(
+                crate::kanban::worktree_summary(wt, st.as_ref()),
+                egui::FontId::monospace(10.0 * self.scale),
+                color,
+                text_w,
+            );
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            cp.galley(
+                card_rect.min + egui::vec2(PAD * self.scale, 54.0 * self.scale),
+                cp.layout_job(job),
+                color,
+            );
+        }
 
         if is_picked {
             if card_rect.width() < (PAD * 2.0 + BTN_W * 3.0 + BTN_GAP * 2.0) * self.scale {
@@ -609,6 +646,10 @@ impl BoardView {
         orphaned: bool,
         th: &crate::theme::Theme,
     ) {
+        #[cfg(test)]
+        {
+            self.offered_discard = false;
+        }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(base.with("detail-page"))
@@ -650,6 +691,57 @@ impl BoardView {
                     ui.label(format!("Terminal: {}", claim.terminal));
                     if !orphaned && ui.button("Open terminal").clicked() {
                         self.acts.push(BoardAct::JumpTo(claim.terminal.clone()));
+                    }
+                }
+                if let Some(wt) = &card.worktree {
+                    ui.add_space(12.0 * self.scale);
+                    ui.strong("Worktree");
+                    ui.add(
+                        egui::Label::new(format!("Path: {}", wt.path))
+                            .wrap()
+                            .selectable(true),
+                    );
+                    ui.label(format!("Branch: {}   base: {}", wt.branch, wt.base));
+                    let st = self.store.borrow().worktree_status(&card.id);
+                    let line = match st {
+                        None => "Status: not polled yet".to_owned(),
+                        Some(s) if s.missing => {
+                            format!("Status: directory missing · +{} -{}", s.ahead, s.behind)
+                        }
+                        Some(s) => format!(
+                            "Status: +{} ahead, -{} behind{}",
+                            s.ahead,
+                            s.behind,
+                            if s.dirty { ", uncommitted changes" } else { "" }
+                        ),
+                    };
+                    let attention = st.is_some_and(|s| s.dirty || s.ahead > 0);
+                    ui.label(egui::RichText::new(line).color(if attention {
+                        th.danger
+                    } else {
+                        th.dim
+                    }));
+                    // Discard is human-only and only where no live worker
+                    // could be mid-write: Done, Blocked, or orphaned.
+                    let discardable = orphaned
+                        || matches!(
+                            card.state,
+                            crate::kanban::CardState::Done | crate::kanban::CardState::Blocked
+                        );
+                    if discardable {
+                        #[cfg(test)]
+                        {
+                            self.offered_discard = true;
+                        }
+                        if ui
+                            .button(egui::RichText::new("Discard worktree").color(th.danger))
+                            .on_hover_text(
+                                "Force-removes the tree and branch, including unmerged work",
+                            )
+                            .clicked()
+                        {
+                            self.acts.push(BoardAct::DiscardWorktree(card.id.clone()));
+                        }
                     }
                 }
                 ui.add_space(12.0 * self.scale);
@@ -861,6 +953,45 @@ mod tests {
         let mut s = crate::kanban::CardStore::default();
         s.set_dir(Some(dir));
         Rc::new(RefCell::new(s))
+    }
+
+    #[test]
+    fn detail_page_offers_discard_only_for_done_blocked_or_orphaned_worktree_cards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store.borrow_mut().add("card", None).unwrap();
+        let wt = crate::kanban::Worktree {
+            path: "H:/repo/.foreman/worktrees/x".into(),
+            branch: "card/x".into(),
+            base: "main".into(),
+        };
+        store
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                Some(wt),
+            )
+            .unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.selected = Some(id.clone());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("discard");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        // In Progress with a live claim: no Discard button rendered.
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(!board.offered_discard);
+        store.borrow_mut().done(&id).unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_discard, "Done + worktree must offer Discard");
+        // Back on the board, the card face renders the summary line (no
+        // status polled yet) without recording any act.
+        board.selected = None;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.acts.is_empty());
     }
 
     #[test]
