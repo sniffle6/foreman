@@ -875,6 +875,220 @@ pub fn wait_verdict(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Git plumbing for per-card worktrees (spec: dispatch-worktrees). Every call
+// is a short-lived `git` subprocess with no console window. Bring-up runs
+// synchronously in the dispatch drain; teardown and the status poll run on
+// background threads (wm.rs owns the threads and the channel).
+// ---------------------------------------------------------------------------
+
+/// Run `git -C <cwd> <args>`; `Ok(stdout trimmed)` on exit 0, otherwise
+/// `Err(first stderr line)` (or a spawn error). Never opens a console window.
+fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(args);
+    cmd.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        if first.is_empty() {
+            Err(format!(
+                "git {} failed ({})",
+                args.first().unwrap_or(&""),
+                out.status
+            ))
+        } else {
+            Err(first.to_string())
+        }
+    }
+}
+
+/// True when `git` answers `--version` — the skip gate for git-backed tests
+/// and the "not installed" branch of every caller.
+pub fn git_available() -> bool {
+    git(std::path::Path::new("."), &["--version"]).is_ok()
+}
+
+/// What bring-up decided for one dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BringUp {
+    /// Spawn the worker with this worktree as its cwd and record it.
+    Worktree(Worktree),
+    /// Not a git repository: dispatch in the project cwd, no toast.
+    InPlace,
+    /// Detached HEAD: dispatch in the project cwd with a warning toast.
+    Detached,
+}
+
+/// Case-insensitive on Windows (drive letters and user dirs vary in case
+/// between `rev-parse` and the porcelain listing), exact elsewhere.
+pub(crate) fn same_path(a: &str, b: &str) -> bool {
+    let a = a.replace('\\', "/");
+    let b = b.replace('\\', "/");
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
+/// Spec §Bring-up, steps 1–5. Any git failure is `Err` with git's first
+/// stderr line; the caller aborts before spawning. Reuse is decided by
+/// `git worktree list`, not by the card's field, so a claim that failed
+/// after a successful bring-up cannot strand a tree.
+pub fn bring_up_worktree(project_cwd: &std::path::Path, card: &Card) -> Result<BringUp, String> {
+    // 1. repo root (not a repo → in place, silently)
+    let Ok(root) = git(project_cwd, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(BringUp::InPlace);
+    };
+    let root = std::path::PathBuf::from(root);
+    // 2. base branch (detached → in place, with a warning upstream)
+    let Ok(base) = git(&root, &["symbolic-ref", "--short", "HEAD"]) else {
+        return Ok(BringUp::Detached);
+    };
+    // 3. naming; a card that already carries this worktree keeps its base
+    let mut wt = worktree_layout(&root, &card.id, &base);
+    if let Some(prev) = &card.worktree {
+        if same_path(&prev.path, &wt.path) {
+            wt.base = prev.base.clone();
+        }
+    }
+    // 4. ignore the directory per-clone (info/exclude), never via .gitignore
+    if git(&root, &["check-ignore", "-q", &wt.path]).is_err() {
+        let exclude = git(&root, &["rev-parse", "--git-path", "info/exclude"])?;
+        let exclude = std::path::PathBuf::from(exclude);
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            root.join(exclude)
+        };
+        if let Some(parent) = exclude.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(".foreman/worktrees/\n");
+        std::fs::write(&exclude, text)
+            .map_err(|e| format!("cannot write {}: {e}", exclude.display()))?;
+    }
+    // 5. reuse or create
+    let listed = git(&root, &["worktree", "list", "--porcelain"])?;
+    let already = listed
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| same_path(p, &wt.path));
+    if already {
+        return Ok(BringUp::Worktree(wt));
+    }
+    let branch_ref = format!("refs/heads/{}", wt.branch);
+    if git(&root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok() {
+        git(&root, &["worktree", "add", &wt.path, &wt.branch])?;
+    } else {
+        git(
+            &root,
+            &["worktree", "add", "-b", &wt.branch, &wt.path, "HEAD"],
+        )?;
+    }
+    Ok(BringUp::Worktree(wt))
+}
+
+/// Live status probe (spec §Status poll): dirty from inside the tree,
+/// ahead/behind from any checkout of the repo. Also the synchronous `rm`
+/// pre-check. A vanished directory reads as `missing` with counts intact.
+pub fn worktree_status_now(project_cwd: &std::path::Path, wt: &Worktree) -> WorktreeStatus {
+    let tree = std::path::Path::new(&wt.path);
+    let porcelain = if tree.is_dir() {
+        Some(git(tree, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default())
+    } else {
+        None
+    };
+    let range = format!("{}...{}", wt.base, wt.branch);
+    let rev_list = git(
+        project_cwd,
+        &["rev-list", "--left-right", "--count", &range],
+    )
+    .unwrap_or_default();
+    parse_status(porcelain.as_deref(), &rev_list)
+}
+
+/// Spec §Teardown outcome table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeardownOutcome {
+    /// Tree and branch both gone; clear the card's `worktree` field.
+    Removed,
+    /// `worktree remove` refused: uncommitted changes. Everything kept.
+    Dirty,
+    /// `branch -d` refused: commits not on base. Tree removed, branch kept.
+    Unmerged { ahead: u32 },
+    /// git missing or an unexpected error; everything kept.
+    Failed(String),
+}
+
+/// Pure classification of the two git results. `branch` is `None` when the
+/// branch step never ran (the remove failed first). `ahead` is the count
+/// reported for the Unmerged row.
+pub fn teardown_verdict(
+    remove: Result<(), String>,
+    branch: Option<Result<(), String>>,
+    ahead: u32,
+) -> TeardownOutcome {
+    match remove {
+        Err(e) if e.to_lowercase().contains("modified or untracked") => TeardownOutcome::Dirty,
+        Err(e) => TeardownOutcome::Failed(e),
+        Ok(()) => match branch {
+            None => TeardownOutcome::Failed("branch step did not run".into()),
+            Some(Ok(())) => TeardownOutcome::Removed,
+            Some(Err(e)) if e.to_lowercase().contains("not fully merged") => {
+                TeardownOutcome::Unmerged { ahead }
+            }
+            Some(Err(e)) => TeardownOutcome::Failed(e),
+        },
+    }
+}
+
+/// Spec §Teardown: remove the tree, delete the branch, prune. `force` is the
+/// human-only Discard path (`remove --force`, `branch -D`). A directory that
+/// is already gone is pruned instead of removed so the branch is no longer
+/// "checked out" and `branch -d` can judge it.
+pub fn teardown_worktree(
+    project_cwd: &std::path::Path,
+    wt: &Worktree,
+    force: bool,
+) -> TeardownOutcome {
+    let ahead = worktree_status_now(project_cwd, wt).ahead;
+    let remove = if std::path::Path::new(&wt.path).is_dir() {
+        let args: &[&str] = if force {
+            &["worktree", "remove", "--force", &wt.path]
+        } else {
+            &["worktree", "remove", &wt.path]
+        };
+        git(project_cwd, args).map(|_| ())
+    } else {
+        git(project_cwd, &["worktree", "prune"]).map(|_| ())
+    };
+    let branch = remove.is_ok().then(|| {
+        let flag = if force { "-D" } else { "-d" };
+        git(project_cwd, &["branch", flag, &wt.branch]).map(|_| ())
+    });
+    let _ = git(project_cwd, &["worktree", "prune"]);
+    teardown_verdict(remove, branch, ahead)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,6 +1507,242 @@ mod tests {
             orphaned,
             worktree_status: None,
         }
+    }
+
+    // --- dispatch-worktrees: git plumbing (skipped without git on PATH) ---
+
+    #[test]
+    fn teardown_verdict_covers_the_four_row_table() {
+        let dirty = Err(
+            "fatal: 'x' contains modified or untracked files, use --force to delete it".to_string(),
+        );
+        let unmerged = Err("error: the branch 'card/a' is not fully merged".to_string());
+        let other = Err("fatal: something else".to_string());
+        assert_eq!(
+            teardown_verdict(Ok(()), Some(Ok(())), 0),
+            TeardownOutcome::Removed
+        );
+        assert_eq!(
+            teardown_verdict(dirty.clone(), None, 0),
+            TeardownOutcome::Dirty
+        );
+        assert_eq!(
+            teardown_verdict(Ok(()), Some(unmerged.clone()), 2),
+            TeardownOutcome::Unmerged { ahead: 2 }
+        );
+        assert_eq!(
+            teardown_verdict(other.clone(), None, 0),
+            TeardownOutcome::Failed("fatal: something else".into())
+        );
+        assert_eq!(
+            teardown_verdict(Ok(()), Some(other), 0),
+            TeardownOutcome::Failed("fatal: something else".into())
+        );
+        // a remove failure decides regardless of a (never-run) branch step
+        assert_eq!(
+            teardown_verdict(dirty, Some(Ok(())), 0),
+            TeardownOutcome::Dirty
+        );
+        assert!(matches!(
+            teardown_verdict(Ok(()), None, 0),
+            TeardownOutcome::Failed(_)
+        ));
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `git init -b main` + one tracked file, identity passed inline so the
+    /// test never depends on the machine's git config. `None` = no git.
+    fn git_repo() -> Option<tempfile::TempDir> {
+        if !git_available() {
+            eprintln!("git not on PATH; skipping");
+            return None;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        git_in(tmp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+        git_in(tmp.path(), &["add", "f.txt"]);
+        git_in(tmp.path(), &["commit", "-q", "-m", "init"]);
+        Some(tmp)
+    }
+
+    #[test]
+    fn bring_up_creates_a_listed_worktree_on_the_card_branch_and_excludes_it() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!("expected a worktree");
+        };
+        assert_eq!(wt.branch, "card/a1b2c3");
+        assert_eq!(wt.base, "main");
+        assert!(
+            wt.path.ends_with("/.foreman/worktrees/a1b2c3"),
+            "{}",
+            wt.path
+        );
+        assert!(std::path::Path::new(&wt.path).join("f.txt").exists());
+        let listed = git_in(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert!(
+            listed.to_lowercase().contains(&wt.path.to_lowercase()),
+            "{listed}"
+        );
+        assert_eq!(
+            git_in(
+                std::path::Path::new(&wt.path),
+                &["symbolic-ref", "--short", "HEAD"]
+            ),
+            "card/a1b2c3"
+        );
+        // ignored locally via info/exclude, never via .gitignore
+        assert!(!repo.path().join(".gitignore").exists());
+        let status = git_in(repo.path(), &["status", "--porcelain"]);
+        assert!(status.is_empty(), "worktree dir must be ignored: {status}");
+        // status probe: clean, 0/0
+        assert_eq!(
+            worktree_status_now(repo.path(), &wt),
+            WorktreeStatus::default()
+        );
+    }
+
+    #[test]
+    fn bring_up_is_in_place_outside_a_repo_and_detached_without_a_branch() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        assert!(matches!(
+            bring_up_worktree(tmp.path(), &card).unwrap(),
+            BringUp::InPlace
+        ));
+        let Some(repo) = git_repo() else { return };
+        let head = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        git_in(repo.path(), &["checkout", "-q", "--detach", &head]);
+        assert!(matches!(
+            bring_up_worktree(repo.path(), &card).unwrap(),
+            BringUp::Detached
+        ));
+    }
+
+    #[test]
+    fn bring_up_reuses_an_existing_tree_and_readds_a_leftover_branch() {
+        let Some(repo) = git_repo() else { return };
+        let mut card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        card.worktree = Some(wt.clone());
+        let tree = std::path::Path::new(&wt.path);
+        // Restart: same tree, uncommitted state intact
+        std::fs::write(tree.join("f.txt"), "edited\n").unwrap();
+        let BringUp::Worktree(again) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        assert_eq!(again, wt);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("f.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(worktree_status_now(repo.path(), &wt).dirty);
+        // branch left behind by an unmerged teardown: re-add on the branch
+        git_in(tree, &["checkout", "-q", "--", "f.txt"]);
+        git_in(repo.path(), &["worktree", "remove", &wt.path]);
+        assert!(!tree.exists());
+        let BringUp::Worktree(third) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        assert_eq!(third.path, wt.path);
+        assert!(tree.exists());
+        assert_eq!(
+            git_in(tree, &["symbolic-ref", "--short", "HEAD"]),
+            "card/a1b2c3"
+        );
+    }
+
+    #[test]
+    fn teardown_after_merge_leaves_nothing() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        git_in(tree, &["commit", "-q", "-am", "work"]);
+        assert_eq!(worktree_status_now(repo.path(), &wt).ahead, 1);
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    #[test]
+    fn teardown_keeps_a_dirty_tree() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Dirty
+        );
+        assert!(tree.exists());
+        assert!(!git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+        // Discard is the only forcing path
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    #[test]
+    fn teardown_keeps_an_unmerged_branch_and_reports_the_count() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        git_in(tree, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(tree, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Unmerged { ahead: 2 }
+        );
+        assert!(!tree.exists(), "the clean tree itself is removed");
+        assert!(!git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+        // the status probe survives a missing directory
+        let st = worktree_status_now(repo.path(), &wt);
+        assert!(st.missing);
+        assert_eq!(st.ahead, 2);
     }
 
     // --- dispatch-worktrees: schema, naming, status, list lines ---
