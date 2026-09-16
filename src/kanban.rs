@@ -915,8 +915,10 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// True when `git` answers `--version` — the skip gate for git-backed tests
-/// and the "not installed" branch of every caller.
+/// True when `git` answers `--version` — the skip gate for git-backed tests.
+/// Production never asks: a missing git makes `rev-parse` fail, which
+/// `bring_up_worktree` already reads as "dispatch in place".
+#[cfg(test)]
 pub fn git_available() -> bool {
     git(std::path::Path::new("."), &["--version"]).is_ok()
 }
