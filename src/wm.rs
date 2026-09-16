@@ -543,6 +543,9 @@ pub struct WindowManager {
     /// Teardowns queued by `done`/release/`rm`/Discard, started by
     /// `drain_worktree_msgs` once their holding terminal is gone.
     pending_teardowns: Vec<PendingTeardown>,
+    /// Done cards whose leftover worktree this run already tried to tear
+    /// down (one non-forcing attempt per run; see `drain_worktree_msgs`).
+    teardown_attempted: std::collections::HashSet<String>,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -630,6 +633,7 @@ impl WindowManager {
             worktree_tx,
             worktree_rx,
             pending_teardowns: Vec::new(),
+            teardown_attempted: std::collections::HashSet::new(),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -2465,6 +2469,26 @@ impl WindowManager {
         let now = std::time::Instant::now();
         let batch = self.kanban.borrow_mut().take_status_poll(now);
         if let (Some(batch), Some(cwd)) = (batch, self.cwd.clone()) {
+            // A Done card still carrying a worktree is a leftover — the
+            // queued teardown died with the previous app run, or the tree
+            // was kept and the human has since integrated it. Attempt the
+            // non-forcing teardown once per run; it is safe to fail.
+            for (id, wt) in &batch {
+                let is_done = self
+                    .kanban
+                    .borrow()
+                    .get(id)
+                    .is_some_and(|c| c.state == crate::kanban::CardState::Done);
+                let queued = self.pending_teardowns.iter().any(|p| &p.id == id);
+                if is_done && !queued && self.teardown_attempted.insert(id.clone()) {
+                    self.pending_teardowns.push(PendingTeardown {
+                        id: id.clone(),
+                        wt: wt.clone(),
+                        held_by: None,
+                        force: false,
+                    });
+                }
+            }
             let tx = self.worktree_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
@@ -13722,6 +13746,58 @@ mod tests {
             !notifications.contains_text("teardown failed"),
             "a clean merged tree must tear down silently"
         );
+    }
+
+    #[test]
+    fn a_shown_board_tears_down_a_done_cards_leftover_worktree_once_per_run() {
+        // The queued-teardown list does not survive an app restart, so a
+        // Done card can come back with its worktree still recorded. The
+        // first status round a shown board takes attempts the non-forcing
+        // teardown once.
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut child = WindowManager::new();
+        child.tag = Some("p1".into());
+        child.cwd = Some(repo.path().to_path_buf());
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = child.kanban.borrow_mut().add("leftover", None).unwrap();
+        let card = child.kanban.borrow().get(&id).unwrap().clone();
+        let crate::kanban::BringUp::Worktree(wt) =
+            crate::kanban::bring_up_worktree(repo.path(), &card).unwrap()
+        else {
+            panic!()
+        };
+        child
+            .kanban
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                "OLD_RUN",
+                crate::kanban::TermState::Missing,
+                Some(wt.clone()),
+            )
+            .unwrap();
+        child.kanban.borrow_mut().done(&id).unwrap();
+        assert!(child.kanban.borrow().get(&id).unwrap().worktree.is_some());
+
+        // hidden board: nothing happens
+        child.drain_worktree_msgs(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        child.drain_worktree_msgs(&ctx);
+        assert!(child.kanban.borrow().get(&id).unwrap().worktree.is_some());
+
+        child
+            .kanban
+            .borrow_mut()
+            .mark_shown(std::time::Instant::now());
+        drain_until(&mut child, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().worktree.is_none()
+        });
+        assert!(!std::path::Path::new(&wt.path).exists());
     }
 
     #[test]

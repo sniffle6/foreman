@@ -1287,10 +1287,13 @@ focused project).
   add     positional words join into the title; --body attaches a longer
           description. Reply: {\"ok\":true,\"id\":\"a3f8k2\"}.
   list    line per card by default (id, state, title, then a context tail —
-          claim/blocked-reason/orphan marker). --json emits one JSON card
-          object per line instead, each carrying a derived \"orphaned\" flag
-          (true when the card's claim points at a Session that is gone —
-          this flag is never stored in the card file itself).
+          claim/blocked-reason/orphan marker; a card dispatched into a git
+          worktree appends [wt card/<id> +ahead -behind dirty|missing]).
+          --json emits one JSON card object per line instead, each carrying
+          a derived \"orphaned\" flag (true when the card's claim points at
+          a Session that is gone) and, for worktree cards, the stored
+          \"worktree\" object plus a derived \"worktree_status\" — neither
+          derived field is ever stored in the card file itself.
   start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
