@@ -13991,6 +13991,94 @@ mod tests {
         assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
     }
 
+    /// The other half of the hold-back rule: a Done card whose kept worktree
+    /// is AHEAD of base stays in Current, unstamped, so a Version never
+    /// claims work that was never merged.
+    /// `kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed` covers
+    /// the `Err` arm; this one covers `Ok(st)` with `st.ahead > 0`, against a
+    /// real repo and a real worktree.
+    #[test]
+    fn kanban_cut_holds_back_a_card_whose_worktree_is_ahead_of_base() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+
+        // A card with a real worktree carrying one unmerged commit.
+        let ahead = child
+            .kanban
+            .borrow_mut()
+            .add("unmerged work", None)
+            .unwrap();
+        let card = child.kanban.borrow().get(&ahead).unwrap().clone();
+        let crate::kanban::BringUp::Worktree(wt) =
+            crate::kanban::bring_up_worktree(repo.path(), &card).unwrap()
+        else {
+            panic!("a fresh card in a real repo gets a worktree");
+        };
+        let tree = std::path::PathBuf::from(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        git_in(&tree, &["commit", "-q", "-am", "work"]);
+        let st = crate::kanban::worktree_status_now(repo.path(), &wt).unwrap();
+        assert_eq!((st.ahead, st.dirty), (1, false), "ahead, and NOT dirty");
+
+        // No worktree: never probed, always a candidate.
+        let clean = child
+            .kanban
+            .borrow_mut()
+            .add("worked in the main checkout", None)
+            .unwrap();
+        {
+            let mut s = child.kanban.borrow_mut();
+            let mut done = |id: &str, wt: Option<crate::kanban::Worktree>| {
+                s.claim_for_dispatch(
+                    id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    wt,
+                )
+                .unwrap();
+                s.done(id).unwrap();
+            };
+            done(&ahead, Some(wt.clone()));
+            done(&clean, None);
+        }
+
+        let out = child.kanban_cut("v1").unwrap();
+        assert_eq!(out.shipped, vec![clean.clone()]);
+        assert_eq!(out.held_back.len(), 1, "{out:?}");
+        assert_eq!(out.held_back[0].0, ahead);
+        assert_eq!(
+            out.held_back[0].1,
+            format!("unmerged card/{ahead}"),
+            "{out:?}"
+        );
+        let s = child.kanban.borrow();
+        assert!(
+            s.get(&ahead).unwrap().shipped.is_none(),
+            "an unmerged card stays in Current, unstamped"
+        );
+        assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
+    }
+
     /// The trailer walk's `--since` bound is the EARLIEST candidate's
     /// `created` — a `max` here would silently drop the older card's
     /// commits from its Version.
