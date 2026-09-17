@@ -27,6 +27,11 @@ const BTN_GAP: f32 = 4.0;
 /// The inline picker's "wt on/off" chip, left of the agent buttons.
 const WT_CHIP_W: f32 = 36.0;
 
+/// Done header controls (spec: kanban-cut §Board UI): the version dropdown
+/// and, in Current, the Cut button — right-anchored, own hit regions.
+const DD_W: f32 = 120.0;
+const CUT_W: f32 = 40.0;
+
 /// Draw the disclosure marker rather than depending on font glyph coverage.
 fn disclosure(
     p: &egui::Painter,
@@ -156,6 +161,26 @@ pub struct BoardView {
     collapsed: [bool; 4],
     selected: Option<String>,
     scale: f32,
+    /// Which Done view is showing: `None` = Current, `Some(name)` = that
+    /// Version (spec §Board UI). View state, never persisted — same rule as
+    /// `collapsed`.
+    pub(crate) version: Option<String>,
+    /// The open Cut name field's buffer; `None` = closed.
+    pub(crate) cut_field: Option<String>,
+    /// True once the human typed into the field, so a late prefill never
+    /// overwrites text.
+    cut_touched: bool,
+    /// Focus the Cut field on the first frame after it opens.
+    cut_focus_pending: bool,
+    /// Test probes: what the last frame drew for Done.
+    #[cfg(test)]
+    pub(crate) offered_cut: bool,
+    #[cfg(test)]
+    pub(crate) drew_banner: bool,
+    #[cfg(test)]
+    pub(crate) done_listed: Vec<String>,
+    #[cfg(test)]
+    pub(crate) detail_commits: Vec<String>,
     pub acts: Vec<BoardAct>,
     /// Test probe: true when the last `show_details` frame drew the Discard
     /// button (Done/Blocked/orphaned card with a worktree).
@@ -175,6 +200,18 @@ impl BoardView {
             selected: None,
             scale: 1.0,
             acts: Vec::new(),
+            version: None,
+            cut_field: None,
+            cut_touched: false,
+            cut_focus_pending: false,
+            #[cfg(test)]
+            offered_cut: false,
+            #[cfg(test)]
+            drew_banner: false,
+            #[cfg(test)]
+            done_listed: Vec::new(),
+            #[cfg(test)]
+            detail_commits: Vec::new(),
             #[cfg(test)]
             offered_discard: false,
         }
@@ -182,7 +219,16 @@ impl BoardView {
 
     /// Manager's answer to `BoardAct::CutPrefill`. Fills the open Cut field
     /// only while it is still empty and untouched.
-    pub fn prefill_cut(&mut self, _name: &str) {}
+    pub fn prefill_cut(&mut self, name: &str) {
+        if self.cut_touched {
+            return;
+        }
+        if let Some(buf) = &mut self.cut_field
+            && buf.is_empty()
+        {
+            *buf = name.to_string();
+        }
+    }
 
     /// Test-only identity accessor: confirms a restored/opened view shares
     /// the project's own `CardStore` Rc rather than a fresh one.
@@ -244,6 +290,21 @@ impl BoardView {
             let store = self.store.borrow();
             (store.cards().to_vec(), store.orphans().clone())
         };
+        // A selected Version that no longer exists (Uncut, `rm` of its last
+        // card, a pull) snaps back to Current (spec §Uncut).
+        if let Some(v) = self.version.clone()
+            && !crate::kanban::versions(&cards)
+                .iter()
+                .any(|x| crate::kanban::same_name(&x.name, &v))
+        {
+            self.version = None;
+        }
+        #[cfg(test)]
+        {
+            self.offered_cut = false;
+            self.drew_banner = false;
+            self.done_listed.clear();
+        }
 
         if let Some(id) = self.selected.clone() {
             if let Some(card) = cards.iter().find(|c| c.id == id) {
@@ -318,8 +379,25 @@ impl BoardView {
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
     ) {
-        let matching: Vec<&crate::kanban::Card> =
-            cards.iter().filter(|c| c.state == state).collect();
+        let is_done = state == crate::kanban::CardState::Done;
+        let matching: Vec<&crate::kanban::Card> = cards
+            .iter()
+            .filter(|c| {
+                c.state == state
+                    && (!is_done
+                        || match &self.version {
+                            None => c.shipped.is_none(),
+                            Some(v) => c
+                                .shipped
+                                .as_ref()
+                                .is_some_and(|s| crate::kanban::same_name(&s.name, v)),
+                        })
+            })
+            .collect();
+        #[cfg(test)]
+        if is_done {
+            self.done_listed = matching.iter().map(|c| c.id.clone()).collect();
+        }
 
         if self.collapsed[col_idx] {
             let rail = ui.interact(
@@ -343,11 +421,14 @@ impl BoardView {
                 true,
                 th.dim,
             );
-            let text = format!(
-                "{}\n{}",
-                column_title(state).replace(' ', "\n"),
-                matching.len()
-            );
+            let text = match (&self.version, is_done) {
+                (Some(v), true) => format!("Done\n{v}\n{}", matching.len()),
+                _ => format!(
+                    "{}\n{}",
+                    column_title(state).replace(' ', "\n"),
+                    matching.len()
+                ),
+            };
             let galley = p.layout(
                 text,
                 egui::FontId::proportional(11.5 * self.scale),
@@ -372,21 +453,40 @@ impl BoardView {
             col_rect.min,
             egui::vec2(col_rect.width(), HEADER_H * self.scale),
         );
+        // Done carries right-anchored controls; the collapse click target is
+        // only the title to their left (spec §Board UI).
+        let mut title_rect = header_rect;
+        let mut dd_rect = None;
+        let mut cut_rect = None;
+        if is_done {
+            let inset = 4.0 * self.scale;
+            let cut = egui::Rect::from_min_size(
+                egui::pos2(
+                    header_rect.max.x - PAD * self.scale - CUT_W * self.scale,
+                    header_rect.min.y + inset,
+                ),
+                egui::vec2(CUT_W * self.scale, header_rect.height() - inset * 2.0),
+            );
+            let dd = egui::Rect::from_min_size(
+                egui::pos2(
+                    cut.min.x - BTN_GAP * self.scale - DD_W * self.scale,
+                    cut.min.y,
+                ),
+                egui::vec2(DD_W * self.scale, cut.height()),
+            );
+            title_rect.max.x = dd.min.x - BTN_GAP * self.scale;
+            dd_rect = Some(dd);
+            cut_rect = Some(cut);
+        }
         disclosure(
-            &p.with_clip_rect(header_rect),
-            egui::pos2(
-                header_rect.min.x + 10.0 * self.scale,
-                header_rect.center().y,
-            ),
+            &p.with_clip_rect(title_rect),
+            egui::pos2(title_rect.min.x + 10.0 * self.scale, title_rect.center().y),
             self.scale,
             false,
             th.dim,
         );
-        p.with_clip_rect(header_rect).text(
-            egui::pos2(
-                header_rect.min.x + 20.0 * self.scale,
-                header_rect.center().y,
-            ),
+        p.with_clip_rect(title_rect).text(
+            egui::pos2(title_rect.min.x + 20.0 * self.scale, title_rect.center().y),
             egui::Align2::LEFT_CENTER,
             format!("{}  ({})", column_title(state), matching.len()),
             egui::FontId::proportional(11.5 * self.scale),
@@ -394,7 +494,7 @@ impl BoardView {
         );
         if ui
             .interact(
-                header_rect,
+                title_rect,
                 base.with((col_idx, "collapse")),
                 egui::Sense::click(),
             )
@@ -403,6 +503,97 @@ impl BoardView {
         {
             self.collapsed[col_idx] = true;
             self.picker = None;
+        }
+
+        if let Some(dd) = dd_rect {
+            // Version dropdown: Current pinned, then Versions newest first.
+            let versions = crate::kanban::versions(cards);
+            let selected_text = self
+                .version
+                .clone()
+                .unwrap_or_else(|| crate::kanban::CURRENT.to_string());
+            let mut pick: Option<Option<String>> = None;
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(base.with((col_idx, "version-ui")))
+                    .max_rect(dd),
+            );
+            egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
+                .width(dd.width())
+                .selected_text(selected_text)
+                .show_ui(&mut child, |ui| {
+                    if ui
+                        .selectable_label(self.version.is_none(), crate::kanban::CURRENT)
+                        .clicked()
+                    {
+                        pick = Some(None);
+                    }
+                    for v in &versions {
+                        let on = self
+                            .version
+                            .as_deref()
+                            .is_some_and(|s| crate::kanban::same_name(s, &v.name));
+                        if ui
+                            .selectable_label(on, format!("{} ({})", v.name, v.count))
+                            .clicked()
+                        {
+                            pick = Some(Some(v.name.clone()));
+                        }
+                    }
+                });
+            if let Some(p) = pick {
+                self.version = p;
+                self.cut_field = None;
+                self.picker = None;
+            }
+        }
+        if let Some(cut) = cut_rect {
+            if self.version.is_none() {
+                let enabled = !matching.is_empty();
+                #[cfg(test)]
+                {
+                    self.offered_cut = enabled;
+                }
+                let sense = if enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                };
+                let r = ui.interact(cut, base.with((col_idx, "cut")), sense);
+                p.rect_filled(
+                    cut,
+                    3.0,
+                    if enabled && r.hovered() {
+                        th.sel_bg
+                    } else {
+                        th.bg
+                    },
+                );
+                p.rect_stroke(
+                    cut,
+                    3.0,
+                    egui::Stroke::new(1.0, th.border),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    cut.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Cut",
+                    egui::FontId::proportional(10.5 * self.scale),
+                    if enabled { th.text } else { th.dim },
+                );
+                let r = r.on_hover_text(if enabled {
+                    "Cut Done into a named Version"
+                } else {
+                    "Nothing in Done to cut"
+                });
+                if enabled && r.clicked() && self.cut_field.is_none() {
+                    self.cut_field = Some(String::new());
+                    self.cut_touched = false;
+                    self.cut_focus_pending = true;
+                    self.acts.push(BoardAct::CutPrefill);
+                }
+            }
         }
 
         let mut body_top = header_rect.max.y;
@@ -434,6 +625,96 @@ impl BoardView {
                     self.acts.push(BoardAct::QuickAdd(title));
                 }
                 te.request_focus(); // keep typing; multi-add is the norm
+            }
+            body_top += QUICK_ADD_H * self.scale;
+        }
+
+        if is_done && self.version.is_none() && self.cut_field.is_some() {
+            // The Cut name field: same inline shape as quick-add, no modal.
+            let field_rect = egui::Rect::from_min_size(
+                egui::pos2(col_rect.min.x + PAD * self.scale, body_top),
+                egui::vec2(
+                    (col_rect.width() - PAD * self.scale * 2.0).max(0.0),
+                    QUICK_ADD_H * self.scale - 4.0 * self.scale,
+                ),
+            );
+            ui.visuals_mut().selection.bg_fill = th.selection_text_bg;
+            let buf = self.cut_field.as_mut().expect("checked above");
+            let te = ui.put(
+                field_rect,
+                egui::TextEdit::singleline(buf)
+                    .id(base.with((col_idx, "cut-name")))
+                    .font(egui::FontId::proportional(11.5 * self.scale))
+                    .text_color(th.text)
+                    .hint_text("version name…  Enter cuts, Esc cancels")
+                    .vertical_align(egui::Align::Center)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::symmetric(4, 0))
+                    .desired_width(field_rect.width()),
+            );
+            if std::mem::take(&mut self.cut_focus_pending) {
+                te.request_focus();
+            }
+            if te.changed() {
+                self.cut_touched = true;
+            }
+            let (enter, esc) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if te.lost_focus() && esc {
+                self.cut_field = None;
+            } else if te.lost_focus() && enter {
+                let name = self.cut_field.take().unwrap_or_default();
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    // Empty is a no-op, not a toast: nothing was asked for.
+                } else {
+                    self.acts.push(BoardAct::Cut(name));
+                }
+            }
+            body_top += QUICK_ADD_H * self.scale;
+        }
+        if is_done && let Some(v) = self.version.clone() {
+            // Archive banner: the signal that Done is not Current.
+            #[cfg(test)]
+            {
+                self.drew_banner = true;
+            }
+            let banner = egui::Rect::from_min_size(
+                egui::pos2(col_rect.min.x, body_top),
+                egui::vec2(col_rect.width(), QUICK_ADD_H * self.scale),
+            );
+            p.rect_filled(banner, 0.0, th.title_bg);
+            p.with_clip_rect(banner).text(
+                egui::pos2(banner.min.x + PAD * self.scale, banner.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("Archived · {v}"),
+                egui::FontId::proportional(11.0 * self.scale),
+                th.dim,
+            );
+            let uncut = egui::Rect::from_min_size(
+                egui::pos2(
+                    banner.max.x - PAD * self.scale - BTN_W * self.scale,
+                    banner.min.y + 2.0 * self.scale,
+                ),
+                egui::vec2(BTN_W * self.scale, banner.height() - 4.0 * self.scale),
+            );
+            let r = ui.interact(uncut, base.with((col_idx, "uncut")), egui::Sense::click());
+            p.rect_filled(uncut, 3.0, if r.hovered() { th.sel_bg } else { th.bg });
+            p.text(
+                uncut.center(),
+                egui::Align2::CENTER_CENTER,
+                "Uncut",
+                egui::FontId::proportional(10.5 * self.scale),
+                th.text,
+            );
+            if r.on_hover_text("Return these cards to Current Done")
+                .clicked()
+            {
+                self.acts.push(BoardAct::Uncut(v));
             }
             body_top += QUICK_ADD_H * self.scale;
         }
@@ -719,6 +1000,20 @@ impl BoardView {
                     egui::RichText::new(format!("{} · {}", card.id, column_title(card.state)))
                         .color(th.dim),
                 );
+                #[cfg(test)]
+                {
+                    self.detail_commits = card
+                        .shipped
+                        .as_ref()
+                        .map(|s| s.commits.clone())
+                        .unwrap_or_default();
+                }
+                if let Some(s) = &card.shipped {
+                    ui.label(
+                        egui::RichText::new(format!("Version: {} · cut {}", s.name, s.at))
+                            .color(th.dim),
+                    );
+                }
                 if orphaned {
                     ui.colored_label(th.danger, "Session ended");
                 }
@@ -789,6 +1084,17 @@ impl BoardView {
                     ui,
                     card.body.as_deref().unwrap_or("No description provided."),
                 );
+                if let Some(s) = &card.shipped
+                    && !s.commits.is_empty()
+                {
+                    ui.add_space(12.0 * self.scale);
+                    ui.strong("Commits");
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(s.commits.join("  ")).monospace())
+                            .wrap()
+                            .selectable(true),
+                    );
+                }
                 if let Some(reason) = &card.blocked_reason {
                     ui.add_space(12.0 * self.scale);
                     ui.colored_label(th.danger, "Blocker");
@@ -1209,6 +1515,172 @@ mod tests {
         board.selected = None;
         run_frame(&ctx, &mut board, rect, base, vec![]);
         assert!(board.acts.is_empty());
+    }
+
+    /// Add a card, claim it as if dispatched, close it out.
+    fn add_done(store: &Rc<RefCell<crate::kanban::CardStore>>, title: &str) -> String {
+        let mut s = store.borrow_mut();
+        let id = s.add(title, None).unwrap();
+        s.claim_for_dispatch(
+            &id,
+            "t1",
+            "claude",
+            crate::kanban::run_nonce(),
+            crate::kanban::TermState::Missing,
+            None,
+        )
+        .unwrap();
+        s.done(&id).unwrap();
+        id
+    }
+
+    fn cut(store: &Rc<RefCell<crate::kanban::CardStore>>, name: &str) {
+        store
+            .borrow_mut()
+            .cut(name, |_| None, |_| Default::default())
+            .unwrap();
+    }
+
+    /// Centre of the Done header's Cut button at scale 1 (rightmost control).
+    fn cut_button_pos(rect: egui::Rect) -> egui::Pos2 {
+        egui::pos2(rect.max.x - PAD - CUT_W / 2.0, rect.min.y + HEADER_H / 2.0)
+    }
+
+    /// Centre of the Done header's version dropdown at scale 1.
+    fn dropdown_pos(rect: egui::Rect) -> egui::Pos2 {
+        egui::pos2(
+            rect.max.x - PAD - CUT_W - BTN_GAP - DD_W / 2.0,
+            rect.min.y + HEADER_H / 2.0,
+        )
+    }
+
+    #[test]
+    fn done_header_offers_cut_only_in_current_with_ungrouped_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("cut-gating");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(!board.offered_cut, "empty Done: Cut disabled");
+        assert!(!board.drew_banner);
+
+        let a = add_done(&store, "a");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_cut);
+        assert_eq!(board.done_listed, vec![a.clone()]);
+
+        cut(&store, "v1");
+        let b = add_done(&store, "b");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.done_listed,
+            vec![b.clone()],
+            "Current hides shipped cards"
+        );
+
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(!board.offered_cut, "no Cut inside a Version");
+        assert!(board.drew_banner);
+        assert_eq!(board.done_listed, vec![a.clone()]);
+
+        // Collapsing Done keeps the selection.
+        board.collapsed[3] = true;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        board.collapsed[3] = false;
+
+        // The Version vanishing (uncut) snaps the dropdown back to Current.
+        store.borrow_mut().uncut("v1").unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.version.is_none());
+        assert!(!board.drew_banner);
+        let mut listed = board.done_listed.clone();
+        listed.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(listed, want);
+    }
+
+    #[test]
+    fn cut_button_opens_the_field_prefill_lands_and_enter_records_the_act() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("cut-field");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, cut_button_pos(rect));
+        assert_eq!(board.cut_field.as_deref(), Some(""));
+        assert!(matches!(board.acts.pop(), Some(BoardAct::CutPrefill)));
+        assert_eq!(
+            board.collapsed, [false; 4],
+            "the button must not collapse Done"
+        );
+        board.prefill_cut("v0.5.0");
+        assert_eq!(board.cut_field.as_deref(), Some("v0.5.0"));
+        // A late prefill never overwrites text.
+        board.prefill_cut("v9.9.9");
+        assert_eq!(board.cut_field.as_deref(), Some("v0.5.0"));
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&ctx, &mut board, rect, base, vec![enter]);
+        assert!(
+            matches!(board.acts.as_slice(), [BoardAct::Cut(n)] if n == "v0.5.0"),
+            "{:?}",
+            board.acts.len()
+        );
+        assert!(board.cut_field.is_none(), "Enter closes the field");
+    }
+
+    #[test]
+    fn dropdown_click_does_not_collapse_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("dd-click");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect));
+        assert_eq!(board.collapsed, [false; 4]);
+        assert!(board.acts.is_empty());
+    }
+
+    #[test]
+    fn detail_page_shows_version_and_commits_for_a_shipped_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = add_done(&store, "a");
+        let id2 = id.clone();
+        store
+            .borrow_mut()
+            .cut(
+                "v1",
+                |_| None,
+                move |_| {
+                    let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
+                    m.insert(id2.clone(), vec!["abc1234".into()]);
+                    m
+                },
+            )
+            .unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.selected = Some(id);
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("detail-shipped");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.detail_commits, vec!["abc1234".to_string()]);
     }
 
     #[test]
