@@ -1,6 +1,6 @@
 ---
 name: foreman-kanban
-description: Use when running inside foreman (the FOREMAN env var is 1) and coordinating work through the project's kanban board — picking up a card, creating cards, closing out with done/block, or waiting on workers.
+description: Use when running inside foreman (the FOREMAN env var is 1) and coordinating work through the project's kanban board — picking up a card, creating cards, editing title/body, closing out with done/block, or waiting on workers.
 ---
 
 # The foreman project kanban board
@@ -21,6 +21,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 ## Verbs
 
     & $env:FOREMAN_EXE kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
+    & $env:FOREMAN_EXE kanban edit a3f8k2 --title "new title" --body "new body"
     & $env:FOREMAN_EXE kanban list --state backlog
     & $env:FOREMAN_EXE kanban start a3f8k2
     & $env:FOREMAN_EXE kanban done a3f8k2
@@ -34,6 +35,10 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 
 - `add` — positional words join into the title; `--body` attaches a longer
   description. Reply carries the new card's id.
+- `edit` — replace title and/or body after add. At least one of `--title`/
+  `--body` is required; title is trimmed and must be non-empty; body
+  replaces (does not append). Allowed in any state; does not claim or
+  change state.
 - `list` — one line per card by default (id, state, title, context tail);
   `--json` emits full card objects, one per line, including a derived
   `orphaned` flag (claim points at a Session that's gone). Bare `list` is
@@ -79,8 +84,8 @@ check `list` for what's actually free.
 
 ## Routing: kanban vs chat vs elsewhere
 
-If it changes a card's column, it is a kanban verb. If it needs a reply from
-someone, it is chat — see the foreman-chat skill. Durable content (specs,
+If it changes a card's column, title, or body, it is a kanban verb. If it
+needs a reply from someone, it is chat — see the foreman-chat skill. Durable content (specs,
 decisions, long writeups) belongs in GitHub Issues or `docs/`, not in the
 card body; the card body is a pointer to where the real detail lives, not
 the detail itself.

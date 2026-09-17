@@ -652,6 +652,44 @@ impl CardStore {
         Ok(id)
     }
 
+    /// Replace title and/or body on an existing card. Allowed in any
+    /// state; does not touch claim or column. Body is a full replace,
+    /// not an append. At least one of title/body must be `Some`; a
+    /// provided title is trimmed and must be non-empty. Missing card
+    /// = error (never created).
+    pub fn edit(
+        &mut self,
+        id: &str,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<(), String> {
+        if title.is_none() && body.is_none() {
+            return Err("edit requires --title and/or --body".into());
+        }
+        let title = match title {
+            Some(t) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    return Err("title cannot be empty".into());
+                }
+                Some(t)
+            }
+            None => None,
+        };
+        let dir = self.dir_or_err()?.to_path_buf();
+        let mut card = self.read_one(id)?;
+        if let Some(t) = title {
+            card.title = t.to_string();
+        }
+        if let Some(b) = body {
+            card.body = Some(b.to_string());
+        }
+        card.updated = now_stamp();
+        self.write_card(&dir, &card)?;
+        self.replace_in_memory(card);
+        Ok(())
+    }
+
     /// Shared claim transition for `start` (self-service pickup, no agent)
     /// and `claim_for_dispatch` (records the dispatched agent). Allowed from
     /// Backlog, Blocked, or InProgress-with-a-dead-claim (seize); rejected
@@ -1607,6 +1645,55 @@ mod tests {
         let card = store2.get(&id).unwrap();
         assert_eq!(card.title, "Fix resize flicker");
         assert_eq!(card.state, CardState::Backlog);
+    }
+
+    #[test]
+    fn edit_replaces_title_and_or_body_without_touching_state_or_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let id = store.add("old title", Some("old body")).unwrap();
+
+        // Prove `updated` actually moves: stamp the file in the past, then edit.
+        let path = tmp
+            .path()
+            .join(".foreman")
+            .join("tasks")
+            .join(format!("{id}.json"));
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["updated"] = "2020-01-01T00:00:00Z".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+        store.reload();
+
+        store.edit(&id, Some("  new title  "), None).unwrap();
+        let card = store.get(&id).unwrap();
+        assert_eq!(card.title, "new title");
+        assert_eq!(card.body.as_deref(), Some("old body"));
+        assert_eq!(card.state, CardState::Backlog);
+        assert!(card.claim.is_none());
+        assert_ne!(card.updated, "2020-01-01T00:00:00Z");
+
+        store.edit(&id, None, Some("replacement")).unwrap();
+        let card = store.get(&id).unwrap();
+        assert_eq!(card.title, "new title");
+        assert_eq!(card.body.as_deref(), Some("replacement"));
+
+        let run = run_nonce();
+        store.start(&id, "t1", run, TermState::Running).unwrap();
+        let claim = store.get(&id).unwrap().claim.clone();
+        store
+            .edit(&id, Some("still in progress"), Some("both"))
+            .unwrap();
+        let card = store.get(&id).unwrap();
+        assert_eq!(card.title, "still in progress");
+        assert_eq!(card.body.as_deref(), Some("both"));
+        assert_eq!(card.state, CardState::InProgress);
+        assert_eq!(card.claim, claim);
+
+        assert!(store.edit(&id, None, None).is_err());
+        assert!(store.edit(&id, Some("   "), None).is_err());
+        assert_eq!(store.get(&id).unwrap().title, "still in progress");
+        assert!(store.edit("nope00", Some("x"), None).is_err());
     }
 
     #[test]

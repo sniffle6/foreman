@@ -1496,6 +1496,17 @@ impl WindowManager {
                     ..Default::default()
                 })
             }
+            "edit" => {
+                let id = req.id.as_deref().ok_or("missing id")?;
+                child
+                    .kanban
+                    .borrow_mut()
+                    .edit(id, req.title.as_deref(), req.body.as_deref())?;
+                Ok(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                })
+            }
             "list" => {
                 // Files are authoritative: a CLI list must never serve a
                 // stale in-memory copy, even though `set_dir` above may have
@@ -13664,6 +13675,34 @@ mod tests {
         assert_eq!(line.card.id, id);
         assert_eq!(line.card.state, crate::kanban::CardState::Backlog);
         assert!(!line.orphaned);
+    }
+
+    #[test]
+    fn kanban_edit_replaces_title_and_body_on_the_wire_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+
+        let mut add = kanban_req("add");
+        add.title = Some("old title".into());
+        add.body = Some("old body".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        let mut edit = kanban_req("edit");
+        edit.id = Some(id.clone());
+        edit.title = Some("new title".into());
+        edit.body = Some("new body".into());
+        assert!(m.kanban_dispatch(&edit).unwrap().ok);
+
+        let mut list = kanban_req("list");
+        list.json = true;
+        let lines = m.kanban_dispatch(&list).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1);
+        let line: crate::kanban::CardLine = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(line.card.id, id);
+        assert_eq!(line.card.title, "new title");
+        assert_eq!(line.card.body.as_deref(), Some("new body"));
+        assert_eq!(line.card.state, crate::kanban::CardState::Backlog);
+        assert!(line.card.claim.is_none());
     }
 
     #[test]

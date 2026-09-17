@@ -111,6 +111,7 @@ installed exe is also on PATH as `foreman`):
 
 ```
 foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
+foreman kanban edit <id> [--title T] [--body B]   # at least one of --title/--body
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
 foreman kanban start <id>                 # claim a card yourself
 foreman kanban done <id>                  # close out: In Progress -> Done
@@ -135,7 +136,8 @@ Backlog/Blocked cards to In Progress; `start` on a card with a live claim is
 rejected (the two-agents-one-card guard) but seizes a dead one; `done`/`block`
 only from In Progress; release (board-only) returns In Progress or Blocked to
 Backlog; Done is terminal for state; Cut and Uncut group and ungroup Done
-cards without changing it.
+cards without changing it. `edit` replaces title and/or body in any state
+and does not claim or move the card; body is a full replace, not an append.
 
 ## Gotchas
 
@@ -202,7 +204,8 @@ cards without changing it.
 ## Key files
 
 - `src/kanban.rs` — the pure domain: `Card`/`Claim`/`CardState`, `CardStore`
-  (file-per-card load/save, transition verbs, staleness poll), `claim_is_dead`
+  (file-per-card load/save, transition verbs including `CardStore::edit`,
+  staleness poll), `claim_is_dead`
   / `is_orphaned` (derived orphan rule), `run_nonce`, `dispatch_prompt` +
   `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
@@ -224,7 +227,8 @@ cards without changing it.
   and trailer walk injected into the store).
 - `src/config.rs` — `Settings::dispatch_worktrees`.
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
-  `kanban_main`, `kanban_wait` (client-side poll loop), `HELP_KANBAN`.
+  `parse_kanban_edit`, `kanban_main`, `kanban_wait` (client-side poll loop),
+  `HELP_KANBAN`.
 - `src/workspace.rs` — `ContentSnap::Board` persistence variant.
 - `src/keymap.rs` — `Command::OpenBoard` and its default binding.
 - `src/skills_install.rs` — embeds the foreman-kanban skill (Claude + Codex

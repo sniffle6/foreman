@@ -226,7 +226,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KanbanRequest {
     pub cmd: String,    // always "kanban"
-    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -898,6 +898,7 @@ pub fn parse_kanban_args(
         "start" => parse_kanban_start(rest, default_project, self_terminal),
         "done" => parse_kanban_simple(rest, default_project, "done"),
         "rm" => parse_kanban_simple(rest, default_project, "rm"),
+        "edit" => parse_kanban_edit(rest, default_project),
         "block" => parse_kanban_block(rest, default_project),
         "wait" => parse_kanban_wait(rest, default_project),
         "cut" => parse_kanban_named(rest, default_project, "cut"),
@@ -942,6 +943,60 @@ fn parse_kanban_add(
         action: "add".into(),
         project,
         title: Some(title),
+        body,
+        ..Default::default()
+    }))
+}
+
+/// `edit <id> [--title T] [--body B] [--project P]` — at least one of
+/// `--title`/`--body`; a provided title is trimmed and must be non-empty.
+/// Body is a full replace, not an append. No claim or state change.
+fn parse_kanban_edit(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--title" => {
+                title = Some(args.get(i + 1).ok_or("--title needs a value")?.clone());
+                i += 2;
+            }
+            "--body" => {
+                body = Some(args.get(i + 1).ok_or("--body needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("missing <id>")?;
+    if title.is_none() && body.is_none() {
+        return Err("edit requires --title and/or --body".into());
+    }
+    if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        return Err("title cannot be empty".into());
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "edit".into(),
+        project,
+        id: Some(id),
+        title,
         body,
         ..Default::default()
     }))
@@ -1205,7 +1260,7 @@ USAGE
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
-  foreman kanban <action> ...                add/list/start/done/block/rm/wait a card
+  foreman kanban <action> ...                add/list/start/edit/done/block/rm/wait a card
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help, view --help, kanban --help)
@@ -1321,6 +1376,7 @@ non-.png extension fail here, before touching the pipe).";
 
 const HELP_KANBAN: &str = "\
 foreman kanban add <title words...> [--body B] [--project P]
+foreman kanban edit <id> [--title T] [--body B] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
 foreman kanban start <id> [--project P]
 foreman kanban done <id> [--project P]
@@ -1335,6 +1391,10 @@ Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
   add     positional words join into the title; --body attaches a longer
           description. Reply: {\"ok\":true,\"id\":\"a3f8k2\"}.
+  edit    replace title and/or body; at least one of --title/--body is
+          required. Title is trimmed and must be non-empty. Body is a
+          full replace, not an append. Allowed in any state; does not
+          claim or change state. Reply: {\"ok\":true}.
   list    line per card by default (id, state, title, then a context tail —
           claim/blocked-reason/orphan marker; a card dispatched into a git
           worktree appends [wt card/<id> +ahead -behind dirty|missing]).
@@ -1366,7 +1426,7 @@ focused project).
   wait    poll (client-side, no pipe verb) until the card (or, with --any,
           any card seen InProgress) reaches Done, Blocked, or orphaned, or
           is removed. --timeout SECS bounds the wait.
-Exit codes for add/list/start/done/block/rm/cut/uncut: 0 ok, 1 refused/unreachable,
+Exit codes for add/list/start/edit/done/block/rm/cut/uncut: 0 ok, 1 refused/unreachable,
 2 bad arguments.
 Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
 (Blocked, orphaned, or removed), 2 timeout or foreman unreachable — a
@@ -1905,6 +1965,39 @@ mod tests {
     fn parse_kanban_args_add_rejects_empty_title() {
         assert!(parse_kanban_args(&s(&["add"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["add", "--body", "x"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_edit_takes_title_and_or_body() {
+        let req = match parse_kanban_args(
+            &s(&["edit", "a1", "--title", "new title", "--body", "new body"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.action, "edit");
+        assert_eq!(req.id.as_deref(), Some("a1"));
+        assert_eq!(req.title.as_deref(), Some("new title"));
+        assert_eq!(req.body.as_deref(), Some("new body"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+
+        let req =
+            match parse_kanban_args(&s(&["edit", "a1", "--title", "only"]), None, None).unwrap() {
+                KanbanAction::Request(r) => r,
+                _ => panic!("expected a request"),
+            };
+        assert_eq!(req.title.as_deref(), Some("only"));
+        assert!(req.body.is_none());
+
+        let e = parse_kanban_args(&s(&["edit", "a1"]), None, None).unwrap_err();
+        assert!(e.contains("--title") && e.contains("--body"), "{e}");
+        let e = parse_kanban_args(&s(&["edit", "a1", "--title", "  "]), None, None).unwrap_err();
+        assert!(e.contains("title"), "{e}");
+        assert!(parse_kanban_args(&s(&["edit", "--title", "x"]), None, None).is_err());
     }
 
     #[test]
