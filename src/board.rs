@@ -134,6 +134,14 @@ pub enum BoardAct {
     /// Human-only forcing teardown of a card's worktree (spec:
     /// dispatch-worktrees §Teardown). The manager opens a confirm first.
     DiscardWorktree(String),
+    /// Cut the ungrouped Done cards into a Version (spec: kanban-cut §Cut).
+    /// The manager owns the worktree probe and the trailer walk.
+    Cut(String),
+    /// Return a Version's cards to Current Done (spec §Uncut).
+    Uncut(String),
+    /// The Cut field just opened empty; the manager answers with the latest
+    /// unused `v*` tag via `BoardView::prefill_cut`, or with nothing.
+    CutPrefill,
 }
 
 pub struct BoardView {
@@ -171,6 +179,10 @@ impl BoardView {
             offered_discard: false,
         }
     }
+
+    /// Manager's answer to `BoardAct::CutPrefill`. Fills the open Cut field
+    /// only while it is still empty and untouched.
+    pub fn prefill_cut(&mut self, _name: &str) {}
 
     /// Test-only identity accessor: confirms a restored/opened view shares
     /// the project's own `CardStore` Rc rather than a fresh one.
