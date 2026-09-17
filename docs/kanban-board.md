@@ -57,8 +57,9 @@ sibling — read those for *why*, this doc for *how*.
   header's dropdown switches between Current and any Version, newest Cut
   first; a Version shows an `Archived · <name>` banner with Uncut, hides
   Cut, and leaves the other three columns live. A Done card whose kept
-  worktree is still ahead of base is not in the tip, so Cut leaves it in
-  Current and says so; merge or Discard it and it goes into the next Cut.
+  worktree is dirty, is ahead of base, or cannot be probed at all is not
+  provably in the tip, so Cut leaves it in Current and says so; commit and
+  merge it, or Discard it, and it goes into the next Cut.
   Duplicate names (case-insensitive) and `Current` are refused. The
   selection is view state and resets to Current on restart. Why this shape
   and what was rejected: `docs/superpowers/specs/2026-09-16-kanban-cut-design.md`.

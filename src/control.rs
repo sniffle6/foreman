@@ -1357,8 +1357,9 @@ focused project).
   cut     stamp every ungrouped Done card as shipped in Version <name>: the
           ship ritual, run after tagging. Refuses a blank, duplicate, or
           \"Current\" name, an empty Done, or a Done with no merged card. A
-          Done card whose worktree is still ahead of base stays in Current
-          and is named in the reply. Each shipped card records the commits
+          Done card whose kept worktree is dirty, is ahead of base, or
+          cannot be probed stays in Current and is named in the reply.
+          Each shipped card records the commits
           whose \"Card: <id>\" trailer named it.
   uncut   clear <name> from every card in that Version; they return to
           Current Done. Errors on an unknown name.
