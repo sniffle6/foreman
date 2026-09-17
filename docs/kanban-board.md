@@ -19,7 +19,9 @@ sibling — read those for *why*, this doc for *how*.
   action — a card-spawned agent never runs `start` itself.
   Failed board actions show an error toast. A failed spawn leaves the card
   unchanged; if claiming fails after spawning, Foreman closes the new Session.
-  Command shims that cannot accept the multiline card prompt report that
+  npm-installed Codex launches through Node and its package entry point, preserving
+  multiline prompts and quotes without passing them through a command shell.
+  Other command shims that cannot accept the multiline card prompt report that
   limitation and suggest installing a native executable.
 - **Per-card worktrees**: the choice is made per dispatch. The inline agent
   picker carries a `wt on/off` chip and the detail page a checkbox, both

@@ -848,9 +848,9 @@ impl Session {
         Self::spawn_with(cmd, shell, ctx)
     }
 
-    /// Spawn an explicit argv (an agent command, not a shell). npm shims like
-    /// `claude` are `.cmd` files CreateProcess can't run directly — if the
-    /// direct spawn fails, retry once through `cmd /c`.
+    /// Spawn an explicit argv (an agent command, not a shell).
+    /// npm Codex is resolved through Node before spawning; otherwise, if a
+    /// direct spawn fails, retry through `cmd /c` only for shell-safe arguments.
     pub fn spawn_argv(
         argv: &[String],
         cwd: Option<&Path>,
@@ -898,6 +898,23 @@ impl Session {
         let is_batch = std::path::Path::new(&argv[0])
             .extension()
             .is_some_and(|x| x.eq_ignore_ascii_case("cmd") || x.eq_ignore_ascii_case("bat"));
+        let npm_codex = || {
+            let cwd = cwd
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::current_dir().ok())?;
+            let path = env
+                .iter()
+                .rev()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map(|(_, v)| std::ffi::OsString::from(v))
+                .or_else(|| std::env::var_os("PATH"))?;
+            crate::agent_command::npm_codex(argv, &cwd, &path)
+        };
+        if let Some(resolved) = npm_codex() {
+            let mut session = Self::spawn_with(build(&resolved), Shell::Cmd, ctx)?;
+            session.dispatch_argv = Some(argv.to_vec());
+            return Ok(session);
+        }
         if unsafe_for_cmd && is_batch {
             return Err(refuse("batch file".into()));
         }
@@ -4075,6 +4092,63 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn spawn_argv_npm_codex_preserves_card_prompt_through_pty() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(node) = std::env::split_paths(&path)
+            .map(|dir| dir.join("node.exe"))
+            .find(|p| p.is_file())
+        else {
+            eprintln!("node.exe not installed; skipping npm PTY test");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let npm = dir.path().join("npm with spaces");
+        let bin = npm.join("node_modules/@openai/codex/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            npm.join("codex.cmd"),
+            "@echo WRONG_BATCH_WRAPPER\r\n@exit 99\r\n",
+        )
+        .unwrap();
+        let prompt = "# Task\r\nPreserve \"quotes\", %PATH%, & | < > ^, café and trailing \\";
+        std::fs::write(bin.join("codex.js"), format!(
+            "const expected = {}; if (process.argv.length !== 3 || process.argv[2] !== expected) {{ console.log('BAD_ARGV'); process.exitCode = 1; }} else {{ console.log('NPM_PROMPT_PRESERVED'); }}",
+            serde_json::to_string(prompt).unwrap()
+        )).unwrap();
+        let env = vec![(
+            "PATH".into(),
+            std::env::join_paths([npm.as_path(), node.parent().unwrap()])
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .into(),
+        )];
+        // Exercise both the board's bare command and an explicit npm shim.
+        for program in [
+            "codex".to_string(),
+            npm.join("codex.cmd").to_str().unwrap().into(),
+        ] {
+            let argv = vec![program, prompt.into()];
+            let mut s =
+                Session::spawn_argv(&argv, Some(dir.path()), &env, egui::Context::default())
+                    .unwrap();
+            assert_eq!(s.dispatch_argv.as_ref(), Some(&argv));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let snapshot = s.snapshot_text(None).join("\n");
+                if snapshot.contains("NPM_PROMPT_PRESERVED") && s.exited() == Some(0) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "npm launch failed: {snapshot}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

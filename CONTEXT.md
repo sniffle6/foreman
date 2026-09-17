@@ -308,6 +308,11 @@ nothing behind it.
 _Avoid_: palette (that's the ANSI 16-color table, one token among many),
 stylesheet, skin.
 
+**Agent command resolution**:
+Converts a known npm Codex launcher into a shell-free Node argv while preserving
+the original command identity and prompt. Owned by `src/agent_command.rs`;
+Session spawning keeps native executables first and guards other batch shims.
+
 **Drop proposal**:
 An accepted window drop and its predicted layout rectangle, resolved from the
 current manager state for both preview and release.
