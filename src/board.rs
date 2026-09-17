@@ -252,6 +252,17 @@ pub struct BoardView {
     /// instead of guessing where egui put the popup.
     #[cfg(test)]
     pub(crate) dropdown_rows: Vec<(String, egui::Rect)>,
+    /// Test probe: the version dropdown's own button rect, for the
+    /// does-it-fit-its-slot assertions at other font scales.
+    #[cfg(test)]
+    pub(crate) dropdown_btn: Option<egui::Rect>,
+    /// Test probe: the archive banner's Uncut rect as actually drawn, after
+    /// the clamp to the column.
+    #[cfg(test)]
+    pub(crate) uncut_rect: Option<egui::Rect>,
+    /// Test probe: the text last painted on a collapsed Done rail.
+    #[cfg(test)]
+    pub(crate) rail_text: Option<String>,
     pub acts: Vec<BoardAct>,
     /// Test probe: true when the last `show_details` frame drew the Discard
     /// button (Done/Blocked/orphaned card with a worktree).
@@ -285,6 +296,12 @@ impl BoardView {
             detail_commits: Vec::new(),
             #[cfg(test)]
             dropdown_rows: Vec::new(),
+            #[cfg(test)]
+            dropdown_btn: None,
+            #[cfg(test)]
+            uncut_rect: None,
+            #[cfg(test)]
+            rail_text: None,
             #[cfg(test)]
             offered_discard: false,
         }
@@ -379,6 +396,9 @@ impl BoardView {
             self.done_listed.clear();
             self.detail_commits.clear();
             self.dropdown_rows.clear();
+            self.dropdown_btn = None;
+            self.uncut_rect = None;
+            self.rail_text = None;
         }
 
         if let Some(id) = self.selected.clone() {
@@ -504,6 +524,10 @@ impl BoardView {
                     matching.len()
                 ),
             };
+            #[cfg(test)]
+            if is_done {
+                self.rail_text = Some(text.clone());
+            }
             let galley = p.layout(
                 text,
                 egui::FontId::proportional(11.5 * self.scale),
@@ -582,7 +606,17 @@ impl BoardView {
                     .id_salt(base.with((col_idx, "version-ui")))
                     .max_rect(dd),
             );
-            egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
+            // The combo sizes itself from the style, which is in unscaled
+            // px: without this it keeps its default height and overflows the
+            // slot into the first card row whenever the font is zoomed out.
+            child.spacing_mut().interact_size.y = dd.height();
+            child.spacing_mut().button_padding *= self.scale;
+            child.spacing_mut().icon_width *= self.scale;
+            child.spacing_mut().icon_width_inner *= self.scale;
+            for font in child.style_mut().text_styles.values_mut() {
+                font.size *= self.scale;
+            }
+            let combo = egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
                 .width(dd.width())
                 .selected_text(selected_text)
                 .show_ui(&mut child, |ui| {
@@ -606,6 +640,12 @@ impl BoardView {
                         }
                     }
                 });
+            #[cfg(test)]
+            {
+                self.dropdown_btn = Some(combo.response.rect);
+            }
+            #[cfg(not(test))]
+            let _ = combo;
             if let Some(choice) = pick {
                 self.version = choice;
                 self.cut_field = None;
@@ -760,26 +800,44 @@ impl BoardView {
                 egui::FontId::proportional(11.0 * self.scale),
                 th.dim,
             );
+            // Clamped to the column for the same reason the header controls
+            // are: `BTN_W + PAD` is a fixed cost, so in a narrow Done (a
+            // small pane, or a zoomed font) the unclamped rect starts left of
+            // the column, paints over Blocked and — Done interacting after
+            // Blocked's cards on one board-wide painter — takes its clicks.
             let uncut = egui::Rect::from_min_size(
                 egui::pos2(
                     banner.max.x - PAD * self.scale - BTN_W * self.scale,
                     banner.min.y + 2.0 * self.scale,
                 ),
                 egui::vec2(BTN_W * self.scale, banner.height() - 4.0 * self.scale),
-            );
-            let r = ui.interact(uncut, base.with((col_idx, "uncut")), egui::Sense::click());
-            p.rect_filled(uncut, 3.0, if r.hovered() { th.sel_bg } else { th.bg });
-            p.text(
-                uncut.center(),
-                egui::Align2::CENTER_CENTER,
-                "Uncut",
-                egui::FontId::proportional(10.5 * self.scale),
-                th.text,
-            );
-            if r.on_hover_text("Return these cards to Current Done")
-                .clicked()
+            )
+            .intersect(col_rect);
+            #[cfg(test)]
             {
-                self.acts.push(BoardAct::Uncut(v));
+                self.uncut_rect = uncut.is_positive().then_some(uncut);
+            }
+            if uncut.is_positive() {
+                let r = ui.interact(uncut, base.with((col_idx, "uncut")), egui::Sense::click());
+                p.rect_filled(uncut, 3.0, if r.hovered() { th.sel_bg } else { th.bg });
+                p.rect_stroke(
+                    uncut,
+                    3.0,
+                    egui::Stroke::new(1.0, th.border),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    uncut.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Uncut",
+                    egui::FontId::proportional(10.5 * self.scale),
+                    th.text,
+                );
+                if r.on_hover_text("Return these cards to Current Done")
+                    .clicked()
+                {
+                    self.acts.push(BoardAct::Uncut(v));
+                }
             }
             body_top += QUICK_ADD_H * self.scale;
         }
@@ -1705,6 +1763,124 @@ mod tests {
         );
         assert!(dd.is_none() && cut.is_none());
         assert!(title.width() > 0.0);
+    }
+
+    /// Spec §Tests: the Version's last card being removed (an `rm`, a pull)
+    /// is the other way a Version can vanish under a selection — the
+    /// dropdown snaps back to Current exactly as it does for Uncut.
+    #[test]
+    fn rm_of_a_versions_last_card_snaps_the_dropdown_back_to_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.version = Some("v1".into());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("rm-snap-back");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.drew_banner);
+        assert_eq!(board.done_listed, vec![id.clone()]);
+
+        store.borrow_mut().rm(&id).unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.version.is_none(), "the Version no longer exists");
+        assert!(!board.drew_banner);
+        assert!(board.done_listed.is_empty());
+        assert!(board.acts.is_empty(), "snapping back is not a user act");
+    }
+
+    /// Spec §Tests: a collapsed Done inside a Version says which Version it
+    /// is showing and how many cards that is — otherwise the rail reads
+    /// "Done 0" and looks like lost work.
+    #[test]
+    fn collapsed_done_rail_names_the_version_and_its_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        add_done(&store, "b");
+        cut(&store, "v1");
+        add_done(&store, "c");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("rail-text");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        board.collapsed[3] = true;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.rail_text.as_deref(),
+            Some("Done\n1"),
+            "Current counts only the unshipped card"
+        );
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.rail_text.as_deref(), Some("Done\nv1\n2"));
+        // Expanding again keeps the Version (the rail never clears it).
+        board.collapsed[3] = false;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        assert!(board.drew_banner);
+    }
+
+    /// Nothing Done draws may reach into Blocked, at any pane width or font
+    /// zoom: the header controls are clamped by `done_header_rects` and the
+    /// banner's Uncut by an explicit intersect, and the version combo has to
+    /// fit the slot it was given rather than the unscaled default style.
+    #[test]
+    fn narrow_or_zoomed_done_controls_stay_inside_the_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("narrow-done");
+
+        // A pane so narrow that an unclamped Uncut would start two columns
+        // to the left of Done.
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 400.0));
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, narrow, base, vec![]);
+        let done_col = egui::Rect::from_min_size(
+            egui::pos2(
+                narrow.max.x - narrow.width() / COLUMNS.len() as f32,
+                narrow.min.y,
+            ),
+            egui::vec2(narrow.width() / COLUMNS.len() as f32, narrow.height()),
+        );
+        let uncut = board
+            .uncut_rect
+            .expect("Uncut is still drawn, just clipped");
+        assert!(
+            done_col.contains_rect(uncut),
+            "Uncut {uncut:?} escapes Done {done_col:?}"
+        );
+
+        // Zoomed out: the combo must shrink with the header, not keep the
+        // style's unscaled height and spill into the first card row.
+        crate::terminal::set_font_size(&ctx, crate::config::DEFAULT_FONT_SIZE * 0.5);
+        board.version = None;
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, wide, base, vec![]);
+        run_frame(&ctx, &mut board, wide, base, vec![]);
+        let header = egui::Rect::from_min_size(
+            egui::pos2(wide.max.x - wide.width() / COLUMNS.len() as f32, wide.min.y),
+            egui::vec2(wide.width() / COLUMNS.len() as f32, HEADER_H * 0.5),
+        );
+        let (_, dd, _) = done_header_rects(header, 0.5, true);
+        let slot = dd.expect("the dropdown fits");
+        let btn = board.dropdown_btn.expect("the dropdown was drawn");
+        assert!(
+            btn.height() <= slot.height() + 0.5,
+            "combo {} tall in a {} slot",
+            btn.height(),
+            slot.height()
+        );
+        assert!(
+            header.contains_rect(btn.intersect(header)) && btn.max.y <= header.max.y + 0.5,
+            "combo {btn:?} overflows the header {header:?}"
+        );
     }
 
     #[test]
