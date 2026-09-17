@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "vpf4t3",
+  "title": "Add kanban edit verb for card title and body",
+  "body": "There is no CLI way to change a card's title or body after add; today the only route is hand-editing the JSON in .foreman/tasks/ (done for jkf9d9 on 2026-09-17), which bypasses the app-is-the-single-writer rule in docs/kanban-board.md. Add foreman kanban edit <id> [--title T] [--body B] [--project P]: at least one of --title/--body required, title trimmed non-empty, body replaces (no append), bumps updated, allowed in any state, no claim or state change. Wire: KanbanRequest reuses title/body fields with action \"edit\" (additive, v1 requests unaffected). Follow the shape of parse_kanban_add / CardStore::add in src/control.rs and src/kanban.rs; add a store test, a parse test, and a wire-path test in src/wm.rs; update HELP_KANBAN, docs/kanban-board.md CLI block, and both foreman-kanban skill copies. Consider a matching Edit action on the board detail page only if it stays small.",
+  "state": "backlog",
+  "created": "2026-09-17T03:49:16Z",
+  "updated": "2026-09-17T03:49:16Z"
+}

@@ -1,9 +1,0 @@
-{
-  "v": 1,
-  "id": "5551lo",
-  "title": "Redesign the kanban board with minimal Foreman-native polish",
-  "body": "Improve the board's visual hierarchy, spacing, typography, state distinction, and action affordances while preserving Foreman's restrained, clean look. Board already reads theme::live (no colour literals in src/board.rs). Ranked after qn5tfb (stable card numbers) and etxvs5 (per-project + in the sessions panel) — those are smaller and unbuilt. Verify with screenshots.",
-  "state": "backlog",
-  "created": "2026-08-29T03:48:14Z",
-  "updated": "2026-08-29T03:48:14Z"
-}

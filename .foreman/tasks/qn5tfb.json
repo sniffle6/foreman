@@ -1,9 +1,0 @@
-{
-  "v": 1,
-  "id": "qn5tfb",
-  "title": "Add stable task numbers and numeric card references",
-  "body": "Assign each card a stable, project-local number and show it prominently as #12. Let users and agents use natural references such as 'start card 12' while retaining opaque storage IDs internally if useful. Define monotonic numbering, persistence, deletion, and invalid-reference behavior. Start with src/kanban.rs, src/board.rs, and src/control.rs.",
-  "state": "backlog",
-  "created": "2026-08-29T03:48:14Z",
-  "updated": "2026-08-29T03:48:14Z"
-}
