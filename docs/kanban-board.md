@@ -52,6 +52,25 @@ sibling — read those for *why*, this doc for *how*.
   `foreman kanban list` (`[wt card/<id> +A -B dirty]`; `--json` adds
   `worktree` and `worktree_status`). Nothing about status is written to a
   card file; a hidden board polls nothing.
+- **Cut and Versions**: Done is the live pile until you Cut it. Cut (a
+  button on the Done header, or `foreman kanban cut <name>`) stamps every
+  ungrouped Done card with `shipped` (`{name, at, commits}`), which moves
+  them out of Current into a named Version; `state` stays `done`. The Done
+  header's dropdown switches between Current and any Version, newest Cut
+  first; a Version shows an `Archived · <name>` banner with Uncut, hides
+  Cut, and leaves the other three columns live. A Done card whose kept
+  worktree is dirty, is ahead of base, or cannot be probed at all is not
+  provably in the tip, so Cut leaves it in Current and says so; commit and
+  merge it, or Discard it, and it goes into the next Cut.
+  Duplicate names (case-insensitive) and `Current` are refused. The
+  selection is view state and resets to Current on restart. Why this shape
+  and what was rejected: `docs/superpowers/specs/2026-09-16-kanban-cut-design.md`.
+- **Commits attach at Cut through the card trailer.** Every dispatch prompt
+  tells the worker to end each commit message with `Card: <id>`. Cut walks
+  `git log` once (bounded by the oldest card's creation date) and stores
+  each card's trailer commits in `shipped.commits`, shown on the detail
+  page and in `list --json`. A card whose commits lack the trailer ships
+  with none; nothing is ever refreshed after Cut.
 - **Derived orphan detection**: a card is orphaned when it is In Progress but
   its claim no longer checks out — wrong app run, or the claimed terminal is
   gone or exited. Orphan state is recomputed every frame and exists nowhere in
@@ -92,11 +111,13 @@ installed exe is also on PATH as `foreman`):
 
 ```
 foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
-foreman kanban list [--state backlog|in_progress|blocked|done] [--json]
+foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
 foreman kanban start <id>                 # claim a card yourself
 foreman kanban done <id>                  # close out: In Progress -> Done
 foreman kanban block <id> --reason "..."  # close out: needs a human
 foreman kanban rm <id>                    # delete the card file, any state
+foreman kanban cut <name>                 # ship ritual: Done -> Version <name>
+foreman kanban uncut <name>               # Version <name> -> Current Done
 foreman kanban wait <id> | --any [--timeout SECS]
 ```
 
@@ -113,7 +134,8 @@ exit `1`, so temporary host load does not masquerade as a blocked Card.
 Backlog/Blocked cards to In Progress; `start` on a card with a live claim is
 rejected (the two-agents-one-card guard) but seizes a dead one; `done`/`block`
 only from In Progress; release (board-only) returns In Progress or Blocked to
-Backlog; Done is terminal — delete or promote to a GitHub issue.
+Backlog; Done is terminal for state; Cut and Uncut group and ungroup Done
+cards without changing it.
 
 ## Gotchas
 
@@ -157,6 +179,14 @@ Backlog; Done is terminal — delete or promote to a GitHub issue.
   with no counts.
 - **Ignore is per-clone.** Bring-up appends `.foreman/worktrees/` to
   `.git/info/exclude`, never to `.gitignore`.
+- **Cut on the branch you ship from.** A Cut rewrites every ungrouped Done
+  card file at once; two branches each cutting overlapping cards conflict
+  per file on merge, like any two transitions on one card would.
+- **A Cut with no git, or before any trailer commit, still ships.** It just
+  records no commits. The trailer is a convention the prompt teaches, not a
+  gate `done` enforces.
+- **Bare `list` hides shipped cards.** Scripts that dumped every card need
+  `--all`; `--state done` is Current Done only.
 
 ## Key files
 
@@ -166,16 +196,20 @@ Backlog; Done is terminal — delete or promote to a GitHub issue.
   `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
   `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` +
-  `teardown_verdict`, `CardStore::take_status_poll`.
+  `teardown_verdict`, `CardStore::take_status_poll`; the Cut half: `Shipped`,
+  `same_name`, `versions`, `CardStore::cut` / `uncut` (batch write, revert),
+  `parse_trailer_log` + `trailer_commits`, `latest_v_tag`.
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
   intents it records for the manager to drain), including the card-face
-  worktree line and the detail page's Discard action.
+  worktree line and the detail page's Discard action, the Done header's
+  version dropdown and Cut field, the archive banner.
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
   reload), `kanban_dispatch` (the control-pipe verb table), `drain_board_acts`
   (applies board intents: store writes, jump-to-terminal, dispatch-from-card
   with bring-up), `drain_worktree_msgs` (queued teardowns, thread results,
   status poll kick), `kanban_rm` (the `rm` pre-check), `open_board_window`
-  (per-project singleton), `term_states`.
+  (per-project singleton), `term_states`, `kanban_cut` (the hold-back probe
+  and trailer walk injected into the store).
 - `src/config.rs` — `Settings::dispatch_worktrees`.
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
   `kanban_main`, `kanban_wait` (client-side poll loop), `HELP_KANBAN`.

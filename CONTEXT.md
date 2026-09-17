@@ -157,7 +157,7 @@ _Avoid_: roster, sidebar, presence list.
 
 **Card**:
 One unit of work-in-flight on a project's board; a file in `.foreman/tasks/`
-owned by the app.
+owned by the app. A Done Card may be grouped into a Version by a Cut.
 _Avoid_: task (taken), ticket, issue (GitHub's word).
 
 **Claim**:
@@ -193,6 +193,23 @@ The per-project kanban surface (a window content variant) — shows Cards in
 four fixed columns (Backlog / In Progress / Blocked / Done) and dispatches a
 Worker straight from a Card.
 _Avoid_: kanban window, task board, panel (taken).
+
+**Cut**:
+The explicit action (Board button, `foreman kanban cut`) that stamps every
+ungrouped Done Card as shipped in a named Version. Grouping, not a state
+change.
+_Avoid_: release (taken — that is In Progress/Blocked → Backlog), archive,
+milestone, sprint.
+
+**Version**:
+The named group a Cut creates; the Done column can show Current or any one
+Version. Exists only as the distinct `shipped.name` values on Cards.
+_Avoid_: changelog, milestone, ship (the event, not the group).
+
+**Card trailer**:
+The `Card: <id>` line a Worker ends each commit message with; how a Cut
+finds a Card's commits after rebase or squash.
+_Avoid_: tag, footer, reference.
 
 ### Seams & patterns
 

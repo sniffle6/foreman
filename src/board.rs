@@ -27,6 +27,77 @@ const BTN_GAP: f32 = 4.0;
 /// The inline picker's "wt on/off" chip, left of the agent buttons.
 const WT_CHIP_W: f32 = 36.0;
 
+/// Done header controls (spec: kanban-cut §Board UI): the version dropdown
+/// and, in Current, the Cut button — right-anchored, own hit regions.
+const DD_W: f32 = 120.0;
+const CUT_W: f32 = 40.0;
+/// Floors, in logical px. The title always wins the Done header: the
+/// controls shrink into their own floor and then drop out entirely rather
+/// than clip "Done  (NN)" to a sliver or spill left over Blocked.
+const TITLE_MIN_W: f32 = 80.0;
+const DD_MIN_W: f32 = 56.0;
+const CUT_MIN_W: f32 = 30.0;
+
+/// Lay a Done header out as `[title][gap][dropdown][gap][Cut][pad]`,
+/// right-anchored. Pure, and the single source of that geometry — the board
+/// draws through it and the tests aim clicks through it, so the two cannot
+/// drift.
+///
+/// The title keeps at least [`TITLE_MIN_W`]; whatever is left over goes to
+/// the controls, dropdown shrinking first, each dropped once it would fall
+/// under its own floor. Nothing is ever placed left of `header.min.x`: the
+/// board paints with one board-wide painter and Done registers its
+/// `interact` after Blocked's cards, so a control that spilled left would
+/// both paint over Blocked and swallow its clicks.
+///
+/// `want_cut` is false inside a Version, where no Cut button is drawn — the
+/// dropdown then gets that space back instead of a hole (and, in a narrow
+/// column, survives where it would otherwise have been dropped; it is the
+/// only way back to Current).
+fn done_header_rects(
+    header: egui::Rect,
+    scale: f32,
+    want_cut: bool,
+) -> (egui::Rect, Option<egui::Rect>, Option<egui::Rect>) {
+    let (pad, gap, inset) = (PAD * scale, BTN_GAP * scale, 4.0 * scale);
+    // What the controls may spend, once the title's floor and the right
+    // margin are taken out.
+    let room = (header.width() - TITLE_MIN_W * scale - pad).max(0.0);
+    let cost = |dd: f32, cut: f32| {
+        (if dd > 0.0 { gap + dd } else { 0.0 }) + (if cut > 0.0 { gap + cut } else { 0.0 })
+    };
+    let mut cut_w = if want_cut { CUT_W * scale } else { 0.0 };
+    let mut dd_w = DD_W * scale;
+    if cost(dd_w, cut_w) > room {
+        dd_w = (room - cost(0.0, cut_w) - gap).max(0.0);
+    }
+    if dd_w < DD_MIN_W * scale {
+        dd_w = 0.0;
+        if cost(0.0, cut_w) > room {
+            cut_w = (room - gap).max(0.0);
+        }
+        if cut_w < CUT_MIN_W * scale {
+            cut_w = 0.0;
+        }
+    }
+    let h = (header.height() - inset * 2.0).max(0.0);
+    let top = header.min.y + inset;
+    let mut right = header.max.x - pad;
+    let cut = (cut_w > 0.0).then(|| {
+        let r = egui::Rect::from_min_size(egui::pos2(right - cut_w, top), egui::vec2(cut_w, h));
+        right -= cut_w + gap;
+        r
+    });
+    let dd = (dd_w > 0.0).then(|| {
+        let r = egui::Rect::from_min_size(egui::pos2(right - dd_w, top), egui::vec2(dd_w, h));
+        right -= dd_w + gap;
+        r
+    });
+    let mut title = header;
+    title.max.x = right.max(header.min.x);
+    (title, dd, cut)
+}
+
 /// Draw the disclosure marker rather than depending on font glyph coverage.
 fn disclosure(
     p: &egui::Painter,
@@ -134,6 +205,14 @@ pub enum BoardAct {
     /// Human-only forcing teardown of a card's worktree (spec:
     /// dispatch-worktrees §Teardown). The manager opens a confirm first.
     DiscardWorktree(String),
+    /// Cut the ungrouped Done cards into a Version (spec: kanban-cut §Cut).
+    /// The manager owns the worktree probe and the trailer walk.
+    Cut(String),
+    /// Return a Version's cards to Current Done (spec §Uncut).
+    Uncut(String),
+    /// The Cut field just opened empty; the manager answers with the latest
+    /// unused `v*` tag via `BoardView::prefill_cut`, or with nothing.
+    CutPrefill,
 }
 
 pub struct BoardView {
@@ -148,6 +227,42 @@ pub struct BoardView {
     collapsed: [bool; 4],
     selected: Option<String>,
     scale: f32,
+    /// Which Done view is showing: `None` = Current, `Some(name)` = that
+    /// Version (spec §Board UI). View state, never persisted — same rule as
+    /// `collapsed`.
+    pub(crate) version: Option<String>,
+    /// The open Cut name field's buffer; `None` = closed.
+    pub(crate) cut_field: Option<String>,
+    /// True once the human typed into the field, so a late prefill never
+    /// overwrites text.
+    cut_touched: bool,
+    /// Focus the Cut field on the first frame after it opens.
+    cut_focus_pending: bool,
+    /// Test probes: what the last frame drew for Done.
+    #[cfg(test)]
+    pub(crate) offered_cut: bool,
+    #[cfg(test)]
+    pub(crate) drew_banner: bool,
+    #[cfg(test)]
+    pub(crate) done_listed: Vec<String>,
+    #[cfg(test)]
+    pub(crate) detail_commits: Vec<String>,
+    /// Test probe: `(version name, row rect)` for each row the version
+    /// dropdown's popup drew last frame, so a test can click a real row
+    /// instead of guessing where egui put the popup.
+    #[cfg(test)]
+    pub(crate) dropdown_rows: Vec<(String, egui::Rect)>,
+    /// Test probe: the version dropdown's own button rect, for the
+    /// does-it-fit-its-slot assertions at other font scales.
+    #[cfg(test)]
+    pub(crate) dropdown_btn: Option<egui::Rect>,
+    /// Test probe: the archive banner's Uncut rect as actually drawn, after
+    /// the clamp to the column.
+    #[cfg(test)]
+    pub(crate) uncut_rect: Option<egui::Rect>,
+    /// Test probe: the text last painted on a collapsed Done rail.
+    #[cfg(test)]
+    pub(crate) rail_text: Option<String>,
     pub acts: Vec<BoardAct>,
     /// Test probe: true when the last `show_details` frame drew the Discard
     /// button (Done/Blocked/orphaned card with a worktree).
@@ -167,8 +282,41 @@ impl BoardView {
             selected: None,
             scale: 1.0,
             acts: Vec::new(),
+            version: None,
+            cut_field: None,
+            cut_touched: false,
+            cut_focus_pending: false,
+            #[cfg(test)]
+            offered_cut: false,
+            #[cfg(test)]
+            drew_banner: false,
+            #[cfg(test)]
+            done_listed: Vec::new(),
+            #[cfg(test)]
+            detail_commits: Vec::new(),
+            #[cfg(test)]
+            dropdown_rows: Vec::new(),
+            #[cfg(test)]
+            dropdown_btn: None,
+            #[cfg(test)]
+            uncut_rect: None,
+            #[cfg(test)]
+            rail_text: None,
             #[cfg(test)]
             offered_discard: false,
+        }
+    }
+
+    /// Manager's answer to `BoardAct::CutPrefill`. Fills the open Cut field
+    /// only while it is still empty and untouched.
+    pub fn prefill_cut(&mut self, name: &str) {
+        if self.cut_touched {
+            return;
+        }
+        if let Some(buf) = &mut self.cut_field
+            && buf.is_empty()
+        {
+            *buf = name.to_string();
         }
     }
 
@@ -232,6 +380,26 @@ impl BoardView {
             let store = self.store.borrow();
             (store.cards().to_vec(), store.orphans().clone())
         };
+        // A selected Version that no longer exists (Uncut, `rm` of its last
+        // card, a pull) snaps back to Current (spec §Uncut).
+        if let Some(v) = self.version.clone()
+            && !crate::kanban::versions(&cards)
+                .iter()
+                .any(|x| crate::kanban::same_name(&x.name, &v))
+        {
+            self.version = None;
+        }
+        #[cfg(test)]
+        {
+            self.offered_cut = false;
+            self.drew_banner = false;
+            self.done_listed.clear();
+            self.detail_commits.clear();
+            self.dropdown_rows.clear();
+            self.dropdown_btn = None;
+            self.uncut_rect = None;
+            self.rail_text = None;
+        }
 
         if let Some(id) = self.selected.clone() {
             if let Some(card) = cards.iter().find(|c| c.id == id) {
@@ -306,8 +474,25 @@ impl BoardView {
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
     ) {
-        let matching: Vec<&crate::kanban::Card> =
-            cards.iter().filter(|c| c.state == state).collect();
+        let is_done = state == crate::kanban::CardState::Done;
+        let matching: Vec<&crate::kanban::Card> = cards
+            .iter()
+            .filter(|c| {
+                c.state == state
+                    && (!is_done
+                        || match &self.version {
+                            None => c.shipped.is_none(),
+                            Some(v) => c
+                                .shipped
+                                .as_ref()
+                                .is_some_and(|s| crate::kanban::same_name(&s.name, v)),
+                        })
+            })
+            .collect();
+        #[cfg(test)]
+        if is_done {
+            self.done_listed = matching.iter().map(|c| c.id.clone()).collect();
+        }
 
         if self.collapsed[col_idx] {
             let rail = ui.interact(
@@ -331,11 +516,18 @@ impl BoardView {
                 true,
                 th.dim,
             );
-            let text = format!(
-                "{}\n{}",
-                column_title(state).replace(' ', "\n"),
-                matching.len()
-            );
+            let text = match (&self.version, is_done) {
+                (Some(v), true) => format!("Done\n{v}\n{}", matching.len()),
+                _ => format!(
+                    "{}\n{}",
+                    column_title(state).replace(' ', "\n"),
+                    matching.len()
+                ),
+            };
+            #[cfg(test)]
+            if is_done {
+                self.rail_text = Some(text.clone());
+            }
             let galley = p.layout(
                 text,
                 egui::FontId::proportional(11.5 * self.scale),
@@ -360,21 +552,29 @@ impl BoardView {
             col_rect.min,
             egui::vec2(col_rect.width(), HEADER_H * self.scale),
         );
+        // Done carries right-anchored controls; the collapse click target is
+        // only the title to their left (spec §Board UI). Every rect comes
+        // from the one pure layout function, and is clipped to the column as
+        // a belt-and-braces guard against ever reaching into Blocked.
+        let (title_rect, dd_rect, cut_rect) = if is_done {
+            let (t, dd, cut) = done_header_rects(header_rect, self.scale, self.version.is_none());
+            (
+                t.intersect(col_rect),
+                dd.map(|r| r.intersect(col_rect)),
+                cut.map(|r| r.intersect(col_rect)),
+            )
+        } else {
+            (header_rect, None, None)
+        };
         disclosure(
-            &p.with_clip_rect(header_rect),
-            egui::pos2(
-                header_rect.min.x + 10.0 * self.scale,
-                header_rect.center().y,
-            ),
+            &p.with_clip_rect(title_rect),
+            egui::pos2(title_rect.min.x + 10.0 * self.scale, title_rect.center().y),
             self.scale,
             false,
             th.dim,
         );
-        p.with_clip_rect(header_rect).text(
-            egui::pos2(
-                header_rect.min.x + 20.0 * self.scale,
-                header_rect.center().y,
-            ),
+        p.with_clip_rect(title_rect).text(
+            egui::pos2(title_rect.min.x + 20.0 * self.scale, title_rect.center().y),
             egui::Align2::LEFT_CENTER,
             format!("{}  ({})", column_title(state), matching.len()),
             egui::FontId::proportional(11.5 * self.scale),
@@ -382,7 +582,7 @@ impl BoardView {
         );
         if ui
             .interact(
-                header_rect,
+                title_rect,
                 base.with((col_idx, "collapse")),
                 egui::Sense::click(),
             )
@@ -391,6 +591,115 @@ impl BoardView {
         {
             self.collapsed[col_idx] = true;
             self.picker = None;
+        }
+
+        if let Some(dd) = dd_rect {
+            // Version dropdown: Current pinned, then Versions newest first.
+            let versions = crate::kanban::versions(cards);
+            let selected_text = self
+                .version
+                .clone()
+                .unwrap_or_else(|| crate::kanban::CURRENT.to_string());
+            let mut pick: Option<Option<String>> = None;
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(base.with((col_idx, "version-ui")))
+                    .max_rect(dd),
+            );
+            // The combo sizes itself from the style, which is in unscaled
+            // px: without this it keeps its default height and overflows the
+            // slot into the first card row whenever the font is zoomed out.
+            child.spacing_mut().interact_size.y = dd.height();
+            child.spacing_mut().button_padding *= self.scale;
+            child.spacing_mut().icon_width *= self.scale;
+            child.spacing_mut().icon_width_inner *= self.scale;
+            for font in child.style_mut().text_styles.values_mut() {
+                font.size *= self.scale;
+            }
+            let combo = egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
+                .width(dd.width())
+                .truncate()
+                .selected_text(selected_text)
+                .show_ui(&mut child, |ui| {
+                    let r = ui.selectable_label(self.version.is_none(), crate::kanban::CURRENT);
+                    #[cfg(test)]
+                    self.dropdown_rows
+                        .push((crate::kanban::CURRENT.to_string(), r.rect));
+                    if r.clicked() {
+                        pick = Some(None);
+                    }
+                    for v in &versions {
+                        let on = self
+                            .version
+                            .as_deref()
+                            .is_some_and(|s| crate::kanban::same_name(s, &v.name));
+                        let r = ui.selectable_label(on, format!("{} ({})", v.name, v.count));
+                        #[cfg(test)]
+                        self.dropdown_rows.push((v.name.clone(), r.rect));
+                        if r.clicked() {
+                            pick = Some(Some(v.name.clone()));
+                        }
+                    }
+                });
+            #[cfg(test)]
+            {
+                self.dropdown_btn = Some(combo.response.rect);
+            }
+            #[cfg(not(test))]
+            let _ = combo;
+            if let Some(choice) = pick {
+                self.version = choice;
+                self.cut_field = None;
+                self.picker = None;
+            }
+        }
+        if let Some(cut) = cut_rect {
+            if self.version.is_none() {
+                let enabled = !matching.is_empty();
+                #[cfg(test)]
+                {
+                    self.offered_cut = enabled;
+                }
+                let sense = if enabled {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                };
+                let r = ui.interact(cut, base.with((col_idx, "cut")), sense);
+                p.rect_filled(
+                    cut,
+                    3.0,
+                    if enabled && r.hovered() {
+                        th.sel_bg
+                    } else {
+                        th.bg
+                    },
+                );
+                p.rect_stroke(
+                    cut,
+                    3.0,
+                    egui::Stroke::new(1.0, th.border),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    cut.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Cut",
+                    egui::FontId::proportional(10.5 * self.scale),
+                    if enabled { th.text } else { th.dim },
+                );
+                let r = r.on_hover_text(if enabled {
+                    "Cut Done into a named Version"
+                } else {
+                    "Nothing in Done to cut"
+                });
+                if enabled && r.clicked() && self.cut_field.is_none() {
+                    self.cut_field = Some(String::new());
+                    self.cut_touched = false;
+                    self.cut_focus_pending = true;
+                    self.acts.push(BoardAct::CutPrefill);
+                }
+            }
         }
 
         let mut body_top = header_rect.max.y;
@@ -422,6 +731,114 @@ impl BoardView {
                     self.acts.push(BoardAct::QuickAdd(title));
                 }
                 te.request_focus(); // keep typing; multi-add is the norm
+            }
+            body_top += QUICK_ADD_H * self.scale;
+        }
+
+        if is_done && self.version.is_none() && self.cut_field.is_some() {
+            // The Cut name field: same inline shape as quick-add, no modal.
+            let field_rect = egui::Rect::from_min_size(
+                egui::pos2(col_rect.min.x + PAD * self.scale, body_top),
+                egui::vec2(
+                    (col_rect.width() - PAD * self.scale * 2.0).max(0.0),
+                    QUICK_ADD_H * self.scale - 4.0 * self.scale,
+                ),
+            );
+            ui.visuals_mut().selection.bg_fill = th.selection_text_bg;
+            let buf = self.cut_field.as_mut().expect("checked above");
+            let te = ui.put(
+                field_rect,
+                egui::TextEdit::singleline(buf)
+                    .id(base.with((col_idx, "cut-name")))
+                    .font(egui::FontId::proportional(11.5 * self.scale))
+                    .text_color(th.text)
+                    .hint_text("version name…  Enter cuts, Esc cancels")
+                    .vertical_align(egui::Align::Center)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::symmetric(4, 0))
+                    .desired_width(field_rect.width()),
+            );
+            if std::mem::take(&mut self.cut_focus_pending) {
+                te.request_focus();
+            }
+            if te.changed() {
+                self.cut_touched = true;
+            }
+            let (enter, esc) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if te.lost_focus() && esc {
+                self.cut_field = None;
+            } else if te.lost_focus() && enter {
+                let name = self.cut_field.take().unwrap_or_default();
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    // Empty is a no-op, not a toast: nothing was asked for.
+                } else {
+                    self.acts.push(BoardAct::Cut(name));
+                }
+            }
+            body_top += QUICK_ADD_H * self.scale;
+        }
+        if is_done && let Some(v) = self.version.clone() {
+            // Archive banner: the signal that Done is not Current.
+            #[cfg(test)]
+            {
+                self.drew_banner = true;
+            }
+            let banner = egui::Rect::from_min_size(
+                egui::pos2(col_rect.min.x, body_top),
+                egui::vec2(col_rect.width(), QUICK_ADD_H * self.scale),
+            );
+            p.rect_filled(banner, 0.0, th.title_bg);
+            p.with_clip_rect(banner).text(
+                egui::pos2(banner.min.x + PAD * self.scale, banner.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("Archived · {v}"),
+                egui::FontId::proportional(11.0 * self.scale),
+                th.dim,
+            );
+            // Clamped to the column for the same reason the header controls
+            // are: `BTN_W + PAD` is a fixed cost, so in a narrow Done (a
+            // small pane, or a zoomed font) the unclamped rect starts left of
+            // the column, paints over Blocked and — Done interacting after
+            // Blocked's cards on one board-wide painter — takes its clicks.
+            let uncut = egui::Rect::from_min_size(
+                egui::pos2(
+                    banner.max.x - PAD * self.scale - BTN_W * self.scale,
+                    banner.min.y + 2.0 * self.scale,
+                ),
+                egui::vec2(BTN_W * self.scale, banner.height() - 4.0 * self.scale),
+            )
+            .intersect(col_rect);
+            #[cfg(test)]
+            {
+                self.uncut_rect = uncut.is_positive().then_some(uncut);
+            }
+            if uncut.is_positive() {
+                let r = ui.interact(uncut, base.with((col_idx, "uncut")), egui::Sense::click());
+                p.rect_filled(uncut, 3.0, if r.hovered() { th.sel_bg } else { th.bg });
+                p.rect_stroke(
+                    uncut,
+                    3.0,
+                    egui::Stroke::new(1.0, th.border),
+                    egui::StrokeKind::Inside,
+                );
+                p.text(
+                    uncut.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Uncut",
+                    egui::FontId::proportional(10.5 * self.scale),
+                    th.text,
+                );
+                if r.on_hover_text("Return these cards to Current Done")
+                    .clicked()
+                {
+                    self.acts.push(BoardAct::Uncut(v));
+                }
             }
             body_top += QUICK_ADD_H * self.scale;
         }
@@ -707,6 +1124,20 @@ impl BoardView {
                     egui::RichText::new(format!("{} · {}", card.id, column_title(card.state)))
                         .color(th.dim),
                 );
+                #[cfg(test)]
+                {
+                    self.detail_commits = card
+                        .shipped
+                        .as_ref()
+                        .map(|s| s.commits.clone())
+                        .unwrap_or_default();
+                }
+                if let Some(s) = &card.shipped {
+                    ui.label(
+                        egui::RichText::new(format!("Version: {} · cut {}", s.name, s.at))
+                            .color(th.dim),
+                    );
+                }
                 if orphaned {
                     ui.colored_label(th.danger, "Session ended");
                 }
@@ -777,6 +1208,17 @@ impl BoardView {
                     ui,
                     card.body.as_deref().unwrap_or("No description provided."),
                 );
+                if let Some(s) = &card.shipped
+                    && !s.commits.is_empty()
+                {
+                    ui.add_space(12.0 * self.scale);
+                    ui.strong("Commits");
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(s.commits.join("  ")).monospace())
+                            .wrap()
+                            .selectable(true),
+                    );
+                }
                 if let Some(reason) = &card.blocked_reason {
                     ui.add_space(12.0 * self.scale);
                     ui.colored_label(th.danger, "Blocker");
@@ -1197,6 +1639,468 @@ mod tests {
         board.selected = None;
         run_frame(&ctx, &mut board, rect, base, vec![]);
         assert!(board.acts.is_empty());
+    }
+
+    /// Add a card, claim it as if dispatched, close it out.
+    fn add_done(store: &Rc<RefCell<crate::kanban::CardStore>>, title: &str) -> String {
+        let mut s = store.borrow_mut();
+        let id = s.add(title, None).unwrap();
+        s.claim_for_dispatch(
+            &id,
+            "t1",
+            "claude",
+            crate::kanban::run_nonce(),
+            crate::kanban::TermState::Missing,
+            None,
+        )
+        .unwrap();
+        s.done(&id).unwrap();
+        id
+    }
+
+    fn cut(store: &Rc<RefCell<crate::kanban::CardStore>>, name: &str) {
+        store
+            .borrow_mut()
+            .cut(name, |_| None, |_| Default::default())
+            .unwrap();
+    }
+
+    /// The Done header rect at scale 1. Done is the last column and
+    /// `column_widths` gives every expanded column an equal share.
+    fn done_header(rect: egui::Rect) -> egui::Rect {
+        let col_w = rect.width() / COLUMNS.len() as f32;
+        egui::Rect::from_min_size(
+            egui::pos2(rect.max.x - col_w, rect.min.y),
+            egui::vec2(col_w, HEADER_H),
+        )
+    }
+
+    /// Centre of the Done header's Cut button at scale 1, read out of the
+    /// same layout function the board draws with so the two cannot drift.
+    fn cut_button_pos(rect: egui::Rect) -> egui::Pos2 {
+        done_header_rects(done_header(rect), 1.0, true)
+            .2
+            .expect("Cut fits at this width")
+            .center()
+    }
+
+    /// Centre of the Done header's version dropdown at scale 1.
+    /// `in_current` mirrors `version.is_none()`: inside a Version no Cut
+    /// button is reserved and the dropdown sits further right.
+    fn dropdown_pos(rect: egui::Rect, in_current: bool) -> egui::Pos2 {
+        done_header_rects(done_header(rect), 1.0, in_current)
+            .1
+            .expect("the dropdown fits at this width")
+            .center()
+    }
+
+    /// Centre of the archive banner's Uncut button at scale 1: the banner is
+    /// the first row under the Done header, Uncut right-anchored in it.
+    fn uncut_button_pos(rect: egui::Rect) -> egui::Pos2 {
+        egui::pos2(
+            rect.max.x - PAD - BTN_W / 2.0,
+            rect.min.y + HEADER_H + QUICK_ADD_H / 2.0,
+        )
+    }
+
+    #[test]
+    fn done_header_rects_floor_the_title_and_never_leave_the_column() {
+        for scale in [1.0_f32, 1.5, 0.5] {
+            for w in [40.0_f32, 80.0, 100.0, 120.0, 170.0, 200.0, 260.0, 400.0] {
+                for want_cut in [true, false] {
+                    let header = egui::Rect::from_min_size(
+                        egui::pos2(600.0, 0.0),
+                        egui::vec2(w * scale, HEADER_H * scale),
+                    );
+                    let (title, dd, cut) = done_header_rects(header, scale, want_cut);
+                    let what = format!("w={w} scale={scale} want_cut={want_cut}");
+                    assert_eq!(title.min.x, header.min.x, "{what}");
+                    assert!(title.max.x >= title.min.x, "title inverted: {what}");
+                    assert!(header.contains_rect(title), "title escapes: {what}");
+                    // Right to left: Cut, then the dropdown, then the title.
+                    let mut left = header.max.x;
+                    for r in [cut, dd].into_iter().flatten() {
+                        assert!(header.contains_rect(r), "control escapes: {what}");
+                        assert!(r.max.x <= left, "controls overlap: {what}");
+                        left = r.min.x;
+                    }
+                    assert!(title.max.x <= left, "title overlaps a control: {what}");
+                    if dd.is_some() || cut.is_some() {
+                        assert!(
+                            title.width() >= TITLE_MIN_W * scale - 0.01,
+                            "title under its floor: {what}"
+                        );
+                    }
+                    assert!(
+                        cut.is_none() || want_cut,
+                        "Cut reserved in a Version: {what}"
+                    );
+                }
+            }
+        }
+        // The nominal board: 800px over four columns is a 200px Done header.
+        // Both controls fit and the title still clears its floor.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_some() && cut.is_some());
+        assert!(title.width() >= TITLE_MIN_W, "{}", title.width());
+        // Narrow: the dropdown goes before the title gives up a pixel.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_none(), "no room for a legible dropdown at 120px");
+        assert!(cut.is_some());
+        assert!(title.width() >= TITLE_MIN_W);
+        // Narrower still: title only, and it never inverts.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(60.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_none() && cut.is_none());
+        assert!(title.width() > 0.0);
+    }
+
+    /// Spec §Tests: the Version's last card being removed (an `rm`, a pull)
+    /// is the other way a Version can vanish under a selection — the
+    /// dropdown snaps back to Current exactly as it does for Uncut.
+    #[test]
+    fn rm_of_a_versions_last_card_snaps_the_dropdown_back_to_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.version = Some("v1".into());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("rm-snap-back");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.drew_banner);
+        assert_eq!(board.done_listed, vec![id.clone()]);
+
+        store.borrow_mut().rm(&id).unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.version.is_none(), "the Version no longer exists");
+        assert!(!board.drew_banner);
+        assert!(board.done_listed.is_empty());
+        assert!(board.acts.is_empty(), "snapping back is not a user act");
+    }
+
+    /// Spec §Tests: a collapsed Done inside a Version says which Version it
+    /// is showing and how many cards that is — otherwise the rail reads
+    /// "Done 0" and looks like lost work.
+    #[test]
+    fn collapsed_done_rail_names_the_version_and_its_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        add_done(&store, "b");
+        cut(&store, "v1");
+        add_done(&store, "c");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("rail-text");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        board.collapsed[3] = true;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.rail_text.as_deref(),
+            Some("Done\n1"),
+            "Current counts only the unshipped card"
+        );
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.rail_text.as_deref(), Some("Done\nv1\n2"));
+        // Expanding again keeps the Version (the rail never clears it).
+        board.collapsed[3] = false;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        assert!(board.drew_banner);
+    }
+
+    /// Nothing Done draws may reach into Blocked, at any pane width or font
+    /// zoom: the header controls are clamped by `done_header_rects` and the
+    /// banner's Uncut by an explicit intersect, and the version combo has to
+    /// fit the slot it was given rather than the unscaled default style.
+    #[test]
+    fn narrow_or_zoomed_done_controls_stay_inside_the_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("narrow-done");
+
+        // A pane so narrow that an unclamped Uncut would start two columns
+        // to the left of Done.
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 400.0));
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, narrow, base, vec![]);
+        let done_col = egui::Rect::from_min_size(
+            egui::pos2(
+                narrow.max.x - narrow.width() / COLUMNS.len() as f32,
+                narrow.min.y,
+            ),
+            egui::vec2(narrow.width() / COLUMNS.len() as f32, narrow.height()),
+        );
+        let uncut = board
+            .uncut_rect
+            .expect("Uncut is still drawn, just clipped");
+        assert!(
+            done_col.contains_rect(uncut),
+            "Uncut {uncut:?} escapes Done {done_col:?}"
+        );
+
+        // Zoomed out: the combo must shrink with the header, not keep the
+        // style's unscaled height and spill into the first card row.
+        crate::terminal::set_font_size(&ctx, crate::config::DEFAULT_FONT_SIZE * 0.5);
+        board.version = None;
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, wide, base, vec![]);
+        run_frame(&ctx, &mut board, wide, base, vec![]);
+        let header = egui::Rect::from_min_size(
+            egui::pos2(wide.max.x - wide.width() / COLUMNS.len() as f32, wide.min.y),
+            egui::vec2(wide.width() / COLUMNS.len() as f32, HEADER_H * 0.5),
+        );
+        let (_, dd, _) = done_header_rects(header, 0.5, true);
+        let slot = dd.expect("the dropdown fits");
+        let btn = board.dropdown_btn.expect("the dropdown was drawn");
+        assert!(
+            btn.height() <= slot.height() + 0.5,
+            "combo {} tall in a {} slot",
+            btn.height(),
+            slot.height()
+        );
+        assert!(
+            header.contains_rect(btn.intersect(header)) && btn.max.y <= header.max.y + 0.5,
+            "combo {btn:?} overflows the header {header:?}"
+        );
+    }
+
+    #[test]
+    fn long_version_name_stays_inside_the_dropdown_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        let version = "release-with-a-very-long-name-that-must-not-expand-the-header";
+        cut(&store, version);
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.version = Some(version.into());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("long-version");
+        for width in [600.0, 800.0, 1200.0] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.0));
+            run_frame(&ctx, &mut board, rect, base, vec![]);
+            run_frame(&ctx, &mut board, rect, base, vec![]);
+            let header = egui::Rect::from_min_size(
+                egui::pos2(width * 0.75, 0.0),
+                egui::vec2(width * 0.25, HEADER_H),
+            );
+            let (_, slot, _) = done_header_rects(header, 1.0, false);
+            let slot = slot.expect("dropdown fits");
+            let button = board.dropdown_btn.expect("dropdown drawn");
+            assert!(
+                slot.expand(0.5).contains_rect(button),
+                "{button:?} escapes {slot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncut_from_the_archive_banner_records_the_act_without_collapsing_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.version = Some("v1".into());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("uncut-click");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, uncut_button_pos(rect));
+        assert!(board.drew_banner);
+        assert!(
+            matches!(board.acts.as_slice(), [BoardAct::Uncut(n)] if n == "v1"),
+            "{} acts recorded",
+            board.acts.len()
+        );
+        assert_eq!(board.collapsed, [false; 4]);
+        assert_eq!(
+            board.version.as_deref(),
+            Some("v1"),
+            "the view waits for wm"
+        );
+    }
+
+    #[test]
+    fn picking_a_version_in_the_dropdown_switches_the_done_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let a = add_done(&store, "a");
+        cut(&store, "v1");
+        let b = add_done(&store, "b");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("dd-pick");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.done_listed, vec![b], "Current first");
+        assert!(board.dropdown_rows.is_empty(), "the popup starts shut");
+        // Open the popup, then click the v1 row exactly where the board drew
+        // it last frame rather than guessing at egui's popup placement.
+        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect, true));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        let row = board
+            .dropdown_rows
+            .iter()
+            .find(|(n, _)| n == "v1")
+            .expect("the open popup lists the Version")
+            .1;
+        click_at(&ctx, &mut board, rect, base, row.center());
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        // The pick lands after that frame's column filter has already run, so
+        // the Version's cards appear on the next frame.
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.done_listed, vec![a], "Done now shows the Version");
+        assert!(board.drew_banner);
+        assert!(!board.offered_cut, "no Cut inside a Version");
+        assert!(board.acts.is_empty(), "switching views is not an act");
+    }
+
+    #[test]
+    fn done_header_offers_cut_only_in_current_with_ungrouped_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("cut-gating");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(!board.offered_cut, "empty Done: Cut disabled");
+        assert!(!board.drew_banner);
+
+        let a = add_done(&store, "a");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_cut);
+        assert_eq!(board.done_listed, vec![a.clone()]);
+
+        cut(&store, "v1");
+        let b = add_done(&store, "b");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.done_listed,
+            vec![b.clone()],
+            "Current hides shipped cards"
+        );
+
+        board.version = Some("v1".into());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(!board.offered_cut, "no Cut inside a Version");
+        assert!(board.drew_banner);
+        assert_eq!(board.done_listed, vec![a.clone()]);
+
+        // Collapsing Done keeps the selection.
+        board.collapsed[3] = true;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        board.collapsed[3] = false;
+
+        // The Version vanishing (uncut) snaps the dropdown back to Current.
+        store.borrow_mut().uncut("v1").unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.version.is_none());
+        assert!(!board.drew_banner);
+        let mut listed = board.done_listed.clone();
+        listed.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(listed, want);
+    }
+
+    #[test]
+    fn cut_button_opens_the_field_prefill_lands_and_enter_records_the_act() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("cut-field");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, cut_button_pos(rect));
+        assert_eq!(board.cut_field.as_deref(), Some(""));
+        assert!(matches!(board.acts.pop(), Some(BoardAct::CutPrefill)));
+        assert_eq!(
+            board.collapsed, [false; 4],
+            "the button must not collapse Done"
+        );
+        board.prefill_cut("v0.5.0");
+        assert_eq!(board.cut_field.as_deref(), Some("v0.5.0"));
+        // A late prefill never overwrites text.
+        board.prefill_cut("v9.9.9");
+        assert_eq!(board.cut_field.as_deref(), Some("v0.5.0"));
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        run_frame(&ctx, &mut board, rect, base, vec![enter]);
+        assert!(
+            matches!(board.acts.as_slice(), [BoardAct::Cut(n)] if n == "v0.5.0"),
+            "{:?}",
+            board.acts.len()
+        );
+        assert!(board.cut_field.is_none(), "Enter closes the field");
+    }
+
+    #[test]
+    fn dropdown_click_does_not_collapse_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("dd-click");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect, true));
+        assert_eq!(board.collapsed, [false; 4]);
+        assert!(board.acts.is_empty());
+    }
+
+    #[test]
+    fn detail_page_shows_version_and_commits_for_a_shipped_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = add_done(&store, "a");
+        let id2 = id.clone();
+        store
+            .borrow_mut()
+            .cut(
+                "v1",
+                |_| None,
+                move |_| {
+                    let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
+                    m.insert(id2.clone(), vec!["abc1234".into()]);
+                    m
+                },
+            )
+            .unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.selected = Some(id);
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("detail-shipped");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.detail_commits, vec!["abc1234".to_string()]);
     }
 
     #[test]

@@ -1514,7 +1514,19 @@ impl WindowManager {
                 let history: Vec<String> = store
                     .cards()
                     .iter()
-                    .filter(|c| filter.map(|f| c.state == f).unwrap_or(true))
+                    .filter(|c| match req.name.as_deref() {
+                        // --shipped NAME: that Version only, any state filter
+                        // was validated client-side to be `done` or absent.
+                        Some(v) => c
+                            .shipped
+                            .as_ref()
+                            .is_some_and(|s| crate::kanban::same_name(&s.name, v)),
+                        // bare / --state: the live board; --all: everything.
+                        None => {
+                            (req.all || c.shipped.is_none())
+                                && filter.map(|f| c.state == f).unwrap_or(true)
+                        }
+                    })
                     .map(|c| {
                         let line = crate::kanban::CardLine {
                             card: c.clone(),
@@ -1601,6 +1613,24 @@ impl WindowManager {
                 child.kanban_rm(id)?;
                 Ok(OpenReply {
                     ok: true,
+                    ..Default::default()
+                })
+            }
+            "cut" => {
+                let name = req.name.as_deref().ok_or("cut requires a version name")?;
+                let out = child.kanban_cut(name)?;
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(out.lines()),
+                    ..Default::default()
+                })
+            }
+            "uncut" => {
+                let name = req.name.as_deref().ok_or("uncut requires a version name")?;
+                let n = child.kanban.borrow_mut().uncut(name)?;
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(vec![format!("uncut {name}: {n} cards")]),
                     ..Default::default()
                 })
             }
@@ -2193,6 +2223,43 @@ impl WindowManager {
                         ),
                     });
                 }
+                crate::board::BoardAct::Cut(name) => match self.kanban_cut(&name) {
+                    Ok(out) => crate::notify::queue(
+                        ctx,
+                        if out.held_back.is_empty() {
+                            crate::notify::Level::Success
+                        } else {
+                            crate::notify::Level::Warning
+                        },
+                        out.lines().join("; "),
+                    ),
+                    Err(e) => crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Error,
+                        format!("board: cut failed: {e}"),
+                    ),
+                },
+                crate::board::BoardAct::Uncut(name) => {
+                    let res = self.kanban.borrow_mut().uncut(&name);
+                    if let Err(e) = res {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: uncut failed: {e}"),
+                        );
+                    }
+                }
+                crate::board::BoardAct::CutPrefill => {
+                    if let Some(tag) = self.cut_prefill() {
+                        for w in &mut self.windows {
+                            for t in &mut w.tabs {
+                                if let Content::Board(v) = &mut t.content {
+                                    v.prefill_cut(&tag);
+                                }
+                            }
+                        }
+                    }
+                }
                 crate::board::BoardAct::JumpTo(tag) => {
                     // Re-resolve the live terminal from the tag (same
                     // staleness family as `drain_chat_clicks`'s member click).
@@ -2417,6 +2484,42 @@ impl WindowManager {
             });
         }
         Ok(())
+    }
+
+    /// Cut (spec: kanban-cut §Cut). The store owns validation, the batch
+    /// write, and the revert; this seam supplies the two facts that need
+    /// the project: the worktree hold-back probe (the `rm` pre-check
+    /// verdict — fail closed, an unprobeable tree stays in Current) and the
+    /// trailer walk, bounded by the oldest candidate's `created`.
+    fn kanban_cut(&mut self, name: &str) -> Result<crate::kanban::CutOutcome, String> {
+        let cwd = self.cwd.clone().ok_or("project has no working directory")?;
+        let hold_cwd = cwd.clone();
+        let hold = move |c: &crate::kanban::Card| -> Option<String> {
+            let wt = c.worktree.as_ref()?;
+            match crate::kanban::worktree_status_now(&hold_cwd, wt) {
+                Err(e) => Some(format!("cannot verify worktree: {e}")),
+                Ok(st) if st.dirty || st.ahead > 0 => Some(format!("unmerged {}", wt.branch)),
+                Ok(_) => None,
+            }
+        };
+        let commits = move |cards: &[crate::kanban::Card]| {
+            // No candidates, no walk — see `oldest_created`.
+            let Some(since) = oldest_created(cards) else {
+                return Default::default();
+            };
+            crate::kanban::trailer_commits(&cwd, since)
+        };
+        self.kanban.borrow_mut().cut(name, hold, commits)
+    }
+
+    /// The Cut field's prefill (spec §Cut, Board): the newest `v*` tag,
+    /// only when that string is not already a Version. Fail-open.
+    fn cut_prefill(&self) -> Option<String> {
+        let tag = crate::kanban::latest_v_tag(self.cwd.as_deref()?)?;
+        let taken = crate::kanban::versions(self.kanban.borrow().cards())
+            .iter()
+            .any(|v| crate::kanban::same_name(&v.name, &tag));
+        (!taken).then_some(tag)
     }
 
     /// Spawn one queued teardown on a thread; the outcome lands in
@@ -6945,6 +7048,19 @@ fn source_matches_icon(
 ) -> bool {
     icon.agent_label()
         .is_none_or(|label| label == source.label())
+}
+
+/// The `--since` bound for a Cut's trailer walk: the OLDEST candidate's
+/// `created` (spec: kanban-cut §Cut step 6), so every commit that could
+/// carry any candidate's `Card:` trailer is in range. RFC3339 timestamps
+/// sort lexically, so `min` is the chronological oldest.
+///
+/// `None` for an empty set. There is no safe timestamp to fall back on: a
+/// sentinel like the epoch would walk the project's whole history to build
+/// a map for zero cards, which is the expensive wrong answer rather than a
+/// cautious one.
+fn oldest_created(cards: &[crate::kanban::Card]) -> Option<&str> {
+    cards.iter().map(|c| c.created.as_str()).min()
 }
 
 /// Parse a "p3"-style Project id.
@@ -13718,6 +13834,277 @@ mod tests {
         // done on a now-missing id: Err
         let e = m.kanban_dispatch(&done).unwrap_err();
         assert!(e.contains("no such card"), "{e}");
+    }
+
+    #[test]
+    fn kanban_cut_and_uncut_over_the_wire_path_and_list_hides_shipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        // Two Done cards and one Backlog card, made through the store (no
+        // PTY needed): add, dispatch-claim, done.
+        let (a, b, backlog) = {
+            let child = m.project_child_mut(pid).unwrap();
+            child.kanban.borrow_mut().set_dir(Some(tmp.path()));
+            let mut s = child.kanban.borrow_mut();
+            let mut done = |title: &str| {
+                let id = s.add(title, None).unwrap();
+                s.claim_for_dispatch(
+                    &id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    None,
+                )
+                .unwrap();
+                s.done(&id).unwrap();
+                id
+            };
+            let a = done("a");
+            let b = done("b");
+            let backlog = s.add("later", None).unwrap();
+            (a, b, backlog)
+        };
+
+        let mut cut = kanban_req("cut");
+        assert!(m.kanban_dispatch(&cut).unwrap_err().contains("name"));
+        cut.name = Some("v1".into());
+        let reply = m.kanban_dispatch(&cut).unwrap();
+        assert!(reply.ok);
+        assert_eq!(reply.history.unwrap(), vec!["cut v1: 2 cards".to_string()]);
+        assert!(
+            m.kanban_dispatch(&cut)
+                .unwrap_err()
+                .contains("already exists")
+        );
+
+        // bare list: the live board — backlog only
+        let list = kanban_req("list");
+        let lines = m.kanban_dispatch(&list).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(&backlog), "{lines:?}");
+        // --state done: Current Done — empty now
+        let mut done_only = kanban_req("list");
+        done_only.state = Some("done".into());
+        assert!(
+            m.kanban_dispatch(&done_only)
+                .unwrap()
+                .history
+                .unwrap()
+                .is_empty()
+        );
+        // --shipped V1: that Version, case-insensitive; --json carries shipped
+        let mut shipped = kanban_req("list");
+        shipped.name = Some("V1".into());
+        shipped.json = true;
+        let lines = m.kanban_dispatch(&shipped).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains(r#""shipped":{"name":"v1""#)),
+            "{lines:?}"
+        );
+        // --shipped unknown: empty, ok
+        shipped.name = Some("nope".into());
+        let reply = m.kanban_dispatch(&shipped).unwrap();
+        assert!(reply.ok && reply.history.unwrap().is_empty());
+        // --all: everything, human lines tagged
+        let mut all = kanban_req("list");
+        all.all = true;
+        let lines = m.kanban_dispatch(&all).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("[shipped v1]")).count(),
+            2
+        );
+
+        let mut uncut = kanban_req("uncut");
+        uncut.name = Some("v1".into());
+        assert_eq!(
+            m.kanban_dispatch(&uncut).unwrap().history.unwrap(),
+            vec!["uncut v1: 2 cards".to_string()]
+        );
+        assert!(
+            m.kanban_dispatch(&uncut)
+                .unwrap_err()
+                .contains("no version")
+        );
+        let lines = m.kanban_dispatch(&done_only).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let _ = (a, b);
+    }
+
+    /// The hold-back probe fails CLOSED: a Done card whose worktree git
+    /// cannot answer about stays in Current, unstamped, while its merged
+    /// neighbour ships. The tempdir is not a repo, so `worktree_status_now`
+    /// errors — the same verdict a lock, a missing git, or a bad ref gives.
+    #[test]
+    fn kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(tmp.path()));
+        let (unprobeable, clean) = {
+            let mut s = child.kanban.borrow_mut();
+            let mut done = |title: &str, wt: Option<crate::kanban::Worktree>| {
+                let id = s.add(title, None).unwrap();
+                s.claim_for_dispatch(
+                    &id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    wt,
+                )
+                .unwrap();
+                s.done(&id).unwrap();
+                id
+            };
+            let unprobeable = done(
+                "in a tree nobody can inspect",
+                Some(crate::kanban::Worktree {
+                    path: tmp.path().join("no-such-tree").to_string_lossy().into(),
+                    branch: "card/ghost".into(),
+                    base: "main".into(),
+                }),
+            );
+            // No worktree: never probed, always a candidate.
+            let clean = done("worked in the main checkout", None);
+            (unprobeable, clean)
+        };
+
+        let out = child.kanban_cut("v1").unwrap();
+        assert_eq!(out.shipped, vec![clean.clone()]);
+        assert_eq!(out.held_back.len(), 1, "{out:?}");
+        assert_eq!(out.held_back[0].0, unprobeable);
+        assert!(
+            out.held_back[0].1.starts_with("cannot verify worktree"),
+            "{out:?}"
+        );
+        assert_eq!(out.lines().len(), 2, "{out:?}");
+        // The held card is still in Current Done, unstamped; the other shipped.
+        let s = child.kanban.borrow();
+        assert!(s.get(&unprobeable).unwrap().shipped.is_none());
+        assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
+    }
+
+    /// The other half of the hold-back rule: a Done card whose kept worktree
+    /// is AHEAD of base stays in Current, unstamped, so a Version never
+    /// claims work that was never merged.
+    /// `kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed` covers
+    /// the `Err` arm; this one covers `Ok(st)` with `st.ahead > 0`, against a
+    /// real repo and a real worktree.
+    #[test]
+    fn kanban_cut_holds_back_a_card_whose_worktree_is_ahead_of_base() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+
+        // A card with a real worktree carrying one unmerged commit.
+        let ahead = child
+            .kanban
+            .borrow_mut()
+            .add("unmerged work", None)
+            .unwrap();
+        let card = child.kanban.borrow().get(&ahead).unwrap().clone();
+        let crate::kanban::BringUp::Worktree(wt) =
+            crate::kanban::bring_up_worktree(repo.path(), &card).unwrap()
+        else {
+            panic!("a fresh card in a real repo gets a worktree");
+        };
+        let tree = std::path::PathBuf::from(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        git_in(&tree, &["commit", "-q", "-am", "work"]);
+        let st = crate::kanban::worktree_status_now(repo.path(), &wt).unwrap();
+        assert_eq!((st.ahead, st.dirty), (1, false), "ahead, and NOT dirty");
+
+        // No worktree: never probed, always a candidate.
+        let clean = child
+            .kanban
+            .borrow_mut()
+            .add("worked in the main checkout", None)
+            .unwrap();
+        {
+            let mut s = child.kanban.borrow_mut();
+            let mut done = |id: &str, wt: Option<crate::kanban::Worktree>| {
+                s.claim_for_dispatch(
+                    id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    wt,
+                )
+                .unwrap();
+                s.done(id).unwrap();
+            };
+            done(&ahead, Some(wt.clone()));
+            done(&clean, None);
+        }
+
+        let out = child.kanban_cut("v1").unwrap();
+        assert_eq!(out.shipped, vec![clean.clone()]);
+        assert_eq!(out.held_back.len(), 1, "{out:?}");
+        assert_eq!(out.held_back[0].0, ahead);
+        assert_eq!(
+            out.held_back[0].1,
+            format!("unmerged card/{ahead}"),
+            "{out:?}"
+        );
+        let s = child.kanban.borrow();
+        assert!(
+            s.get(&ahead).unwrap().shipped.is_none(),
+            "an unmerged card stays in Current, unstamped"
+        );
+        assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
+    }
+
+    /// The trailer walk's `--since` bound is the EARLIEST candidate's
+    /// `created` — a `max` here would silently drop the older card's
+    /// commits from its Version.
+    #[test]
+    fn oldest_created_bounds_the_trailer_walk_at_the_earliest_card() {
+        let card = |created: &str| {
+            crate::kanban::Card::new(
+                format!("id{created}"),
+                "t".into(),
+                None,
+                created.to_string(),
+            )
+        };
+        let newer = card("2026-09-16T12:00:00Z");
+        let older = card("2026-09-14T03:00:00Z");
+        // Both orders: the answer is the timestamp, not the position.
+        assert_eq!(
+            oldest_created(&[newer.clone(), older.clone()]),
+            Some("2026-09-14T03:00:00Z")
+        );
+        assert_eq!(
+            oldest_created(&[older, newer]),
+            Some("2026-09-14T03:00:00Z")
+        );
+        // No candidates, no walk — the caller skips git entirely.
+        assert_eq!(oldest_created(&[]), None);
     }
 
     // --- board: view acts drained by the manager ---

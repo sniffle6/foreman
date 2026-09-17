@@ -226,7 +226,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KanbanRequest {
     pub cmd: String,    // always "kanban"
-    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +243,14 @@ pub struct KanbanRequest {
     pub state: Option<String>, // list filter
     #[serde(default, skip_serializing_if = "is_false")]
     pub json: bool, // list output mode
+    /// Version name for `cut`, `uncut`, and `list --shipped` (spec:
+    /// kanban-cut §List and wire). Skipped when unset so v1 requests stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `list --all`: include shipped cards (bare `list` is the live board).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -892,6 +900,8 @@ pub fn parse_kanban_args(
         "rm" => parse_kanban_simple(rest, default_project, "rm"),
         "block" => parse_kanban_block(rest, default_project),
         "wait" => parse_kanban_wait(rest, default_project),
+        "cut" => parse_kanban_named(rest, default_project, "cut"),
+        "uncut" => parse_kanban_named(rest, default_project, "uncut"),
         other => Err(format!("unknown kanban action: {other}")),
     }
 }
@@ -937,7 +947,7 @@ fn parse_kanban_add(
     }))
 }
 
-/// `list [--state backlog|in_progress|blocked|done] [--json] [--project P]`.
+/// `list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]`.
 fn parse_kanban_list(
     args: &[String],
     default_project: Option<String>,
@@ -945,6 +955,8 @@ fn parse_kanban_list(
     let mut project = default_project;
     let mut state: Option<String> = None;
     let mut json = false;
+    let mut shipped: Option<String> = None;
+    let mut all = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -966,9 +978,23 @@ fn parse_kanban_list(
                 json = true;
                 i += 1;
             }
+            "--shipped" => {
+                shipped = Some(args.get(i + 1).ok_or("--shipped needs a value")?.clone());
+                i += 2;
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => return Err(format!("unexpected argument: {other}")),
         }
+    }
+    if all && (shipped.is_some() || state.is_some()) {
+        return Err("--all lists every card; it cannot combine with --shipped or --state".into());
+    }
+    if shipped.is_some() && state.as_deref().is_some_and(|s| s != "done") {
+        return Err("--shipped lists Done cards; --state must be done or omitted".into());
     }
     Ok(KanbanAction::Request(KanbanRequest {
         cmd: "kanban".into(),
@@ -976,6 +1002,8 @@ fn parse_kanban_list(
         project,
         state,
         json,
+        name: shipped,
+        all,
         ..Default::default()
     }))
 }
@@ -1040,6 +1068,25 @@ fn parse_kanban_simple(
         action: action.into(),
         project,
         id: Some(id),
+        ..Default::default()
+    }))
+}
+
+/// `cut <name> [--project P]` / `uncut <name> [--project P]` — one
+/// positional, the Version name. The CLI never defaults it from git (spec:
+/// kanban-cut §Decisions); only the board prefills.
+fn parse_kanban_named(
+    args: &[String],
+    default_project: Option<String>,
+    action: &str,
+) -> Result<KanbanAction, String> {
+    let (name, project) = parse_kanban_id_and_project(args, default_project)
+        .map_err(|e| e.replace("<id>", "<name>"))?;
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: action.into(),
+        project,
+        name: Some(name),
         ..Default::default()
     }))
 }
@@ -1274,11 +1321,13 @@ non-.png extension fail here, before touching the pipe).";
 
 const HELP_KANBAN: &str = "\
 foreman kanban add <title words...> [--body B] [--project P]
-foreman kanban list [--state backlog|in_progress|blocked|done] [--json] [--project P]
+foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
 foreman kanban start <id> [--project P]
 foreman kanban done <id> [--project P]
 foreman kanban block <id> --reason R [--project P]
 foreman kanban rm <id> [--project P]
+foreman kanban cut <name> [--project P]
+foreman kanban uncut <name> [--project P]
 foreman kanban wait <id> [--timeout SECS] [--project P]
 foreman kanban wait --any [--timeout SECS] [--project P]
 
@@ -1294,6 +1343,10 @@ focused project).
           a Session that is gone) and, for worktree cards, the stored
           \"worktree\" object plus a derived \"worktree_status\" — neither
           derived field is ever stored in the card file itself.
+          Bare list is the live board: shipped cards (Cut into a Version)
+          are hidden, and a shipped card's line ends [shipped NAME].
+          --shipped NAME lists that Version only (case-insensitive; unknown
+          name = empty, exit 0). --all includes every shipped card.
   start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
@@ -1301,10 +1354,19 @@ focused project).
           (close-out never resurrects a card).
   block   InProgress -> Blocked; --reason is mandatory and non-empty.
   rm      delete the card's file, from any state.
+  cut     stamp every ungrouped Done card as shipped in Version <name>: the
+          ship ritual, run after tagging. Refuses a blank, duplicate, or
+          \"Current\" name, an empty Done, or a Done with no merged card. A
+          Done card whose kept worktree is dirty, is ahead of base, or
+          cannot be probed stays in Current and is named in the reply.
+          Each shipped card records the commits
+          whose \"Card: <id>\" trailer named it.
+  uncut   clear <name> from every card in that Version; they return to
+          Current Done. Errors on an unknown name.
   wait    poll (client-side, no pipe verb) until the card (or, with --any,
           any card seen InProgress) reaches Done, Blocked, or orphaned, or
           is removed. --timeout SECS bounds the wait.
-Exit codes for add/list/start/done/block/rm: 0 ok, 1 refused/unreachable,
+Exit codes for add/list/start/done/block/rm/cut/uncut: 0 ok, 1 refused/unreachable,
 2 bad arguments.
 Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
 (Blocked, orphaned, or removed), 2 timeout or foreman unreachable — a
@@ -1555,6 +1617,12 @@ fn kanban_wait_with(
             action: "list".into(),
             project: project.clone(),
             json: true,
+            // `all` because a bare `list` hides shipped cards: a watched card
+            // Cut into a Version between two polls would vanish from the
+            // reply, and `wait_verdict` reads an absent id as "removed under
+            // the waiter" (exit 1) rather than Done (exit 0). The waiter
+            // filters by state itself, so the extra cards cost nothing.
+            all: true,
             ..Default::default()
         };
         match poll(&req) {
@@ -1721,6 +1789,49 @@ mod tests {
     }
 
     #[test]
+    fn kanban_wait_asks_for_shipped_cards_so_a_cut_between_polls_still_reads_done() {
+        // Regression: a bare `list` hides shipped cards, so a card Cut while
+        // a waiter watched it disappeared from the reply and `wait_verdict`
+        // called it removed (exit 1) instead of Done (exit 0).
+        let mut card = crate::kanban::Card::new(
+            "abc123".into(),
+            "shipped between polls".into(),
+            None,
+            "2026-09-16T00:00:00Z".into(),
+        );
+        card.state = crate::kanban::CardState::Done;
+        card.shipped = Some(crate::kanban::Shipped {
+            name: "v1".into(),
+            at: "2026-09-16T01:00:00Z".into(),
+            commits: Vec::new(),
+        });
+        let line = crate::kanban::CardLine {
+            card,
+            orphaned: false,
+            worktree_status: None,
+        };
+        let mut polls = 0;
+        let code = kanban_wait_with(
+            None,
+            crate::kanban::WaitTarget::Id("abc123".into()),
+            None,
+            |req| {
+                polls += 1;
+                assert!(req.all, "the wait poll must include shipped cards");
+                assert!(req.json);
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(vec![line.json_line()]),
+                    ..Default::default()
+                })
+            },
+            |_| panic!("the first poll already decides"),
+        );
+        assert_eq!(polls, 1);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
     fn kanban_request_wire_roundtrips_and_omits_unset_fields() {
         let req = KanbanRequest {
             cmd: "kanban".into(),
@@ -1728,9 +1839,19 @@ mod tests {
             ..Default::default()
         };
         let j = serde_json::to_string(&req).unwrap();
-        assert!(!j.contains("\"id\"") && !j.contains("\"title\"") && !j.contains("\"json\""));
+        assert!(
+            !j.contains("\"id\"")
+                && !j.contains("\"title\"")
+                && !j.contains("\"json\"")
+                && !j.contains("\"name\"")
+                && !j.contains("\"all\"")
+        );
         let back: KanbanRequest = serde_json::from_str(&j).unwrap();
         assert_eq!(back, req);
+        // A v1 request (no `name`, no `all`) still parses.
+        let v1: KanbanRequest =
+            serde_json::from_str(r#"{"cmd":"kanban","action":"list"}"#).unwrap();
+        assert_eq!(v1, req);
     }
 
     #[test]
@@ -1799,6 +1920,65 @@ mod tests {
         assert!(req.json);
         let e = parse_kanban_args(&s(&["list", "--state", "bogus"]), None, None).unwrap_err();
         assert!(e.contains("bogus"), "{e}");
+    }
+
+    #[test]
+    fn parse_kanban_args_cut_and_uncut_take_one_name() {
+        for verb in ["cut", "uncut"] {
+            let req =
+                match parse_kanban_args(&s(&[verb, "v0.5.0"]), Some("p1".into()), None).unwrap() {
+                    KanbanAction::Request(r) => r,
+                    _ => panic!("expected a request"),
+                };
+            assert_eq!(req.action, verb);
+            assert_eq!(req.name.as_deref(), Some("v0.5.0"));
+            assert_eq!(req.project.as_deref(), Some("p1"));
+            let e = parse_kanban_args(&s(&[verb]), None, None).unwrap_err();
+            assert!(e.contains("<name>"), "{e}");
+            let e = parse_kanban_args(&s(&[verb, "a", "b"]), None, None).unwrap_err();
+            assert!(e.contains("unexpected"), "{e}");
+        }
+    }
+
+    #[test]
+    fn parse_kanban_args_list_shipped_and_all_rules() {
+        let req = match parse_kanban_args(&s(&["list", "--shipped", "v1", "--json"]), None, None)
+            .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.name.as_deref(), Some("v1"));
+        assert!(req.json && !req.all);
+        // --state done with --shipped is redundant but legal
+        assert!(
+            parse_kanban_args(
+                &s(&["list", "--shipped", "v1", "--state", "done"]),
+                None,
+                None
+            )
+            .is_ok()
+        );
+        let e = parse_kanban_args(
+            &s(&["list", "--shipped", "v1", "--state", "backlog"]),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("--shipped"), "{e}");
+        let req = match parse_kanban_args(&s(&["list", "--all"]), None, None).unwrap() {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert!(req.all && req.name.is_none());
+        let e =
+            parse_kanban_args(&s(&["list", "--all", "--shipped", "v1"]), None, None).unwrap_err();
+        assert!(e.contains("--all"), "{e}");
+        let e =
+            parse_kanban_args(&s(&["list", "--all", "--state", "done"]), None, None).unwrap_err();
+        assert!(e.contains("--all"), "{e}");
+        let e = parse_kanban_args(&s(&["list", "--shipped"]), None, None).unwrap_err();
+        assert!(e.contains("needs a value"), "{e}");
     }
 
     #[test]
