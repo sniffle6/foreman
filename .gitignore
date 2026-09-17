@@ -11,6 +11,7 @@ foreman_panic.log
 grep.exe.stackdump
 
 # IDE / tooling caches
+/.claude/settings.local.json
 /.idea/
 /.serena/
 /.superpowers/
