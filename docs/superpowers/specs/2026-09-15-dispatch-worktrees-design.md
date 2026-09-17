@@ -169,6 +169,22 @@ wm clears it on the next frame through a channel, with a store write. A Done
 card with a leftover worktree is therefore visible as such in the Done
 column — that is the point.
 
+**Retry-safe (amended 2026-09-17).** `git worktree remove` is not atomic: on
+Windows a directory that is some process's cwd survives the final rmdir
+after git has deleted its contents and its registration. Each step judges
+what is actually left rather than the previous step's assumed state:
+
+- Step 1 checks registration (`git worktree list --porcelain`) separately
+  from directory existence. Registered + present → `worktree remove`;
+  registered + gone → `prune`; unregistered → remove the directory only if
+  it is empty and its parent is `<root>/.foreman/worktrees/`. A nonempty
+  unregistered directory is kept and reported (git no longer tracks it, so
+  nothing inside is provably ours) — even under Discard.
+- Step 2 treats an already-missing branch as done; an existing branch keeps
+  git's own `-d` / `-D` protection.
+- Nothing left at all is `Both removed`, so a repeated teardown clears the
+  field instead of erroring.
+
 Which transitions tear down:
 
 - `done` → teardown.

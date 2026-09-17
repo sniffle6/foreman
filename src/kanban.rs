@@ -1278,8 +1278,11 @@ pub fn worktree_status_now(
     project_cwd: &std::path::Path,
     wt: &Worktree,
 ) -> Result<WorktreeStatus, String> {
+    // A checkout always has a `.git` entry. Without one (an empty leftover
+    // of a partial removal) `git status` run inside the directory would
+    // climb to the main repository and report ITS changes as the card's.
     let tree = std::path::Path::new(&wt.path);
-    let porcelain = if tree.is_dir() {
+    let porcelain = if tree.join(".git").exists() {
         Some(git(
             tree,
             &["status", "--porcelain", "--untracked-files=no"],
@@ -1366,9 +1369,10 @@ pub fn teardown_verdict(
 }
 
 /// Spec §Teardown: remove the tree, delete the branch, prune. `force` is the
-/// human-only Discard path (`remove --force`, `branch -D`). A directory that
-/// is already gone is pruned instead of removed so the branch is no longer
-/// "checked out" and `branch -d` can judge it.
+/// human-only Discard path (`remove --force`, `branch -D`). Safe to repeat
+/// after a partial earlier run: each step judges what is left rather than
+/// assuming the previous state, so a tree or branch that is already gone
+/// reads as that step completed.
 pub fn teardown_worktree(
     project_cwd: &std::path::Path,
     wt: &Worktree,
@@ -1379,39 +1383,158 @@ pub fn teardown_worktree(
     let ahead = worktree_status_now(project_cwd, wt)
         .map(|s| s.ahead)
         .unwrap_or(0);
-    let remove = if std::path::Path::new(&wt.path).is_dir() {
-        let args: &[&str] = if force {
-            &["worktree", "remove", "--force", &wt.path]
-        } else {
-            &["worktree", "remove", &wt.path]
-        };
-        // A process that just exited inside the tree (the worker's shell)
-        // can hold the directory for a moment on Windows; a refusal that is
-        // neither "dirty" nor a git usage error is retried briefly.
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match git(project_cwd, args) {
-                Ok(_) => break Ok(()),
-                Err(e) if attempt < 5 && !e.to_lowercase().contains("modified or untracked") => {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    if !std::path::Path::new(&wt.path).is_dir() {
-                        break Ok(());
-                    }
-                    continue;
-                }
-                Err(e) => break Err(e),
-            }
-        }
-    } else {
-        git(project_cwd, &["worktree", "prune"]).map(|_| ())
-    };
-    let branch = remove.is_ok().then(|| {
-        let flag = if force { "-D" } else { "-d" };
-        git(project_cwd, &["branch", flag, &wt.branch]).map(|_| ())
-    });
+    let remove = remove_tree(project_cwd, wt, force);
+    let branch = remove
+        .is_ok()
+        .then(|| delete_branch(project_cwd, &wt.branch, force));
     let _ = git(project_cwd, &["worktree", "prune"]);
     teardown_verdict(remove, branch, ahead)
+}
+
+/// Is `path` a working tree git still tracks? Fails closed: an `Err` when
+/// git cannot answer, never a guess from the filesystem.
+fn worktree_registered(project_cwd: &std::path::Path, path: &str) -> Result<bool, String> {
+    let listed = git(project_cwd, &["worktree", "list", "--porcelain"])?;
+    Ok(listed
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| same_path(p, path)))
+}
+
+/// Teardown step 1. Registration and the directory are judged separately
+/// because `git worktree remove` is not atomic: on Windows a directory that
+/// is some process's cwd survives the final rmdir after git has already
+/// deleted its contents AND its registration. Retrying git on that leftover
+/// fails forever ("not a working tree"), so:
+///
+/// - registered + directory present → `git worktree remove` (retried
+///   briefly for a transient hold; a refusal that leaves the path
+///   unregistered falls through to the leftover rule);
+/// - registered + directory gone → `git worktree prune`;
+/// - unregistered → the leftover rule: remove the directory only when it is
+///   EMPTY and sits under `<root>/.foreman/worktrees/`. Git no longer tracks
+///   it, so anything inside it is not ours to delete — a nonempty leftover
+///   is kept and reported, `--force` or not.
+fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Result<(), String> {
+    let tree = std::path::Path::new(&wt.path);
+    if worktree_registered(project_cwd, &wt.path)? {
+        if !tree.is_dir() {
+            return git(project_cwd, &["worktree", "prune"]).map(|_| ());
+        }
+        match git_worktree_remove(project_cwd, &wt.path, force) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_dirty_refusal(&e) => return Err(e),
+            Err(e) => {
+                // Git may have torn the tree down and only failed on the top
+                // directory; judge what is left rather than the exit code.
+                let _ = git(project_cwd, &["worktree", "prune"]);
+                if worktree_registered(project_cwd, &wt.path)? {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    remove_leftover_dir(project_cwd, tree)
+}
+
+fn is_dirty_refusal(err: &str) -> bool {
+    err.to_lowercase().contains("modified or untracked")
+}
+
+/// `git worktree remove [--force] <path>`. A process that just exited inside
+/// the tree (the worker's shell) can hold the directory for a moment on
+/// Windows; a refusal that is neither "dirty" nor a partial removal (path
+/// no longer registered) is retried briefly.
+fn git_worktree_remove(
+    project_cwd: &std::path::Path,
+    path: &str,
+    force: bool,
+) -> Result<(), String> {
+    let args: &[&str] = if force {
+        &["worktree", "remove", "--force", path]
+    } else {
+        &["worktree", "remove", path]
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match git(project_cwd, args) {
+            Ok(_) => break Ok(()),
+            Err(e) if attempt < 5 && !is_dirty_refusal(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                if !std::path::Path::new(path).is_dir() {
+                    break Ok(());
+                }
+                if !worktree_registered(project_cwd, path)? {
+                    break Err(e);
+                }
+                continue;
+            }
+            Err(e) => break Err(e),
+        }
+    }
+}
+
+/// The leftover rule (see `remove_tree`). Non-recursive on purpose: an
+/// unregistered directory with contents is never deleted, and the path must
+/// be the one bring-up would have chosen for this repository so a card file
+/// edited by hand cannot aim teardown at an arbitrary empty directory.
+fn remove_leftover_dir(
+    project_cwd: &std::path::Path,
+    tree: &std::path::Path,
+) -> Result<(), String> {
+    if !tree.exists() {
+        return Ok(());
+    }
+    let shown = tree.display();
+    let root = git(project_cwd, &["rev-parse", "--show-toplevel"])?;
+    let expected = std::path::Path::new(&root)
+        .join(".foreman")
+        .join("worktrees");
+    let in_place = tree
+        .parent()
+        .is_some_and(|p| same_path(&p.to_string_lossy(), &expected.to_string_lossy()));
+    if !in_place {
+        return Err(format!(
+            "leftover directory is outside {}; delete it by hand: {shown}",
+            expected.display()
+        ));
+    }
+    let nonempty = std::fs::read_dir(tree)
+        .map_err(|e| format!("cannot read leftover directory {shown}: {e}"))?
+        .next()
+        .is_some();
+    if nonempty {
+        return Err(format!(
+            "leftover directory is not empty and no longer a git worktree; inspect and delete it by hand: {shown}"
+        ));
+    }
+    // The same momentary cwd hold that stranded the directory can still be
+    // on it; give it the same brief grace as the git path.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::remove_dir(tree) {
+            Ok(()) => break Ok(()),
+            Err(_) if !tree.exists() => break Ok(()),
+            Err(_) if attempt < 5 => {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Err(e) => break Err(format!("cannot remove leftover directory {shown}: {e}")),
+        }
+    }
+}
+
+/// Teardown step 2. A branch that is already gone (an earlier run got this
+/// far, or the human deleted it) is a completed step, not an error. An
+/// existing branch keeps git's own merged-branch protection: `-d` refuses
+/// when it is not fully merged, `-D` (Discard) does not.
+fn delete_branch(project_cwd: &std::path::Path, branch: &str, force: bool) -> Result<(), String> {
+    if git(project_cwd, &["branch", "--list", branch])?.is_empty() {
+        return Ok(());
+    }
+    let flag = if force { "-D" } else { "-d" };
+    git(project_cwd, &["branch", flag, branch]).map(|_| ())
 }
 
 #[cfg(test)]
@@ -2088,6 +2211,139 @@ mod tests {
         let st = worktree_status_now(repo.path(), &wt).unwrap();
         assert!(st.missing);
         assert_eq!(st.ahead, 2);
+    }
+
+    /// The state a `git worktree remove` interrupted by a Windows cwd hold
+    /// leaves behind: contents and registration gone, the empty top
+    /// directory not, the branch untouched.
+    fn strand_empty_dir(repo: &std::path::Path, wt: &Worktree) {
+        git_in(repo, &["worktree", "remove", "--force", &wt.path]);
+        std::fs::create_dir(&wt.path).unwrap();
+        assert!(
+            !git_in(repo, &["worktree", "list", "--porcelain"]).contains(&wt.path),
+            "precondition: the directory is unregistered"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_an_empty_unregistered_leftover_and_the_merged_branch() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        git_in(tree, &["commit", "-q", "-am", "work"]);
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        strand_empty_dir(repo.path(), &wt);
+        // the probe must not read the main checkout's status as the card's
+        assert!(worktree_status_now(repo.path(), &wt).unwrap().missing);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    #[test]
+    fn teardown_with_nothing_left_is_a_completed_cleanup() {
+        // Missing directory, unregistered, branch already deleted: a second
+        // run after a successful first one, or after cleanup by hand.
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed,
+            "repeating a finished teardown is not an error"
+        );
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn teardown_of_an_empty_leftover_still_keeps_an_unmerged_branch() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        git_in(tree, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        strand_empty_dir(repo.path(), &wt);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Unmerged { ahead: 1 }
+        );
+        assert!(!tree.exists(), "the empty leftover is gone");
+        assert!(!git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+        // and the branch-only state is retry-safe too
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Unmerged { ahead: 1 }
+        );
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Removed
+        );
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    #[test]
+    fn teardown_keeps_a_nonempty_unregistered_directory_and_its_branch() {
+        // Git no longer tracks it, so nothing inside is ours to delete —
+        // not even under --force.
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        strand_empty_dir(repo.path(), &wt);
+        std::fs::write(tree.join("notes.txt"), "keep me\n").unwrap();
+        for force in [false, true] {
+            match teardown_worktree(repo.path(), &wt, force) {
+                TeardownOutcome::Failed(e) => {
+                    assert!(e.contains("not empty"), "actionable message, got: {e}");
+                    assert!(e.contains(&wt.path), "names the directory, got: {e}");
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            assert!(tree.join("notes.txt").exists(), "contents preserved");
+            assert!(
+                !git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty(),
+                "the branch step does not run after a kept directory"
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_never_removes_an_empty_directory_outside_the_worktrees_dir() {
+        // A card file edited by hand must not point teardown at an arbitrary
+        // directory, even an empty one.
+        let Some(repo) = git_repo() else { return };
+        let stray = repo.path().join("stray");
+        std::fs::create_dir(&stray).unwrap();
+        let wt = Worktree {
+            path: stray.to_string_lossy().replace('\\', "/"),
+            branch: "card/a1b2c3".into(),
+            base: "main".into(),
+        };
+        assert!(matches!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Failed(_)
+        ));
+        assert!(stray.is_dir(), "kept");
     }
 
     #[test]

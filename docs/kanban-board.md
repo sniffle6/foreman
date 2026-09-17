@@ -166,6 +166,17 @@ cards without changing it.
   once the claiming terminal is no longer running — close the pane and the
   tree goes away. A Done card still showing its branch means the pane is
   still open (or the tree was kept: see the toast).
+- **`git worktree remove` is not atomic, so teardown judges what is left.**
+  When the cwd hold above bites mid-removal, git has already deleted the
+  tree's contents and its registration and only the empty top directory
+  survives — retrying git on it fails forever ("not a working tree").
+  Teardown therefore checks registration and the directory separately: a
+  registered tree goes through git; an unregistered leftover is removed only
+  if it is empty and sits under `<root>/.foreman/worktrees/`; a tree or
+  branch that is already gone counts as that step done, so repeating a
+  teardown is harmless. A nonempty unregistered directory is never deleted
+  (git no longer tracks it, so nothing in it is provably ours) — the error
+  toast names it; inspect and delete it by hand.
 - **Each worktree cold-builds.** It has its own `target/`; the first build
   costs minutes (`docs/dev-launcher.md` forbids sharing a target dir). Minutes
   of compile beat corrupted commits.
@@ -195,8 +206,9 @@ cards without changing it.
   / `is_orphaned` (derived orphan rule), `run_nonce`, `dispatch_prompt` +
   `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
-  `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` +
-  `teardown_verdict`, `CardStore::take_status_poll`; the Cut half: `Shipped`,
+  `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` (+
+  `remove_tree` / `delete_branch`, the retry-safe steps) + `teardown_verdict`,
+  `CardStore::take_status_poll`; the Cut half: `Shipped`,
   `same_name`, `versions`, `CardStore::cut` / `uncut` (batch write, revert),
   `parse_trailer_log` + `trailer_commits`, `latest_v_tag`.
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
