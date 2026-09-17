@@ -117,6 +117,81 @@ pub fn worktree_summary(wt: &Worktree, st: Option<&WorktreeStatus>) -> String {
     s
 }
 
+/// The Version a Done card was Cut into (spec: kanban-cut §Card schema).
+/// Set only by [`CardStore::cut`], cleared only by [`CardStore::uncut`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Shipped {
+    /// Free-form, stored as typed (trimmed). Compared only via [`same_name`].
+    pub name: String,
+    /// The Cut timestamp, shared by every card in the Cut — the Version's
+    /// only sort key. `updated` is NOT: a later Discard bumps `updated` and
+    /// must not reorder the Version.
+    pub at: String,
+    /// Abbreviated shas, oldest first, of commits whose `Card: <id>` trailer
+    /// named this card at Cut time. Frozen at Cut; omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<String>,
+}
+
+/// The pinned dropdown literal for the live Done column; refused as a
+/// Version name in any case.
+pub const CURRENT: &str = "Current";
+
+/// The one place Version names compare: trimmed, case-insensitive.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// One row of the Done dropdown (spec §Board UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub name: String,
+    pub at: String,
+    pub count: usize,
+}
+
+/// Distinct `shipped.name`s, newest Cut first (by `at`, then name). Two
+/// spellings that `same_name` equates are one row, spelled as first seen.
+pub fn versions(cards: &[Card]) -> Vec<Version> {
+    let mut out: Vec<Version> = Vec::new();
+    for s in cards.iter().filter_map(|c| c.shipped.as_ref()) {
+        match out.iter_mut().find(|v| same_name(&v.name, &s.name)) {
+            Some(v) => {
+                v.count += 1;
+                if s.at > v.at {
+                    v.at = s.at.clone();
+                }
+            }
+            None => out.push(Version {
+                name: s.name.clone(),
+                at: s.at.clone(),
+                count: 1,
+            }),
+        }
+    }
+    out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+/// Pure half of the trailer walk (spec §Cut step 6). Input is
+/// `git log --format=%h%x09%(trailers:key=Card,valueonly,separator=%x2C)`
+/// output, newest first; output is card id -> shas, oldest first. A commit
+/// with no trailer is skipped; one naming several cards lands in each.
+pub fn parse_trailer_log(text: &str) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for line in text.lines().rev() {
+        let Some((sha, ids)) = line.split_once('\t') else {
+            continue;
+        };
+        for id in ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            out.entry(id.to_string())
+                .or_default()
+                .push(sha.trim().to_string());
+        }
+    }
+    out
+}
+
 /// One unit of work-in-flight on a project's board — a file in
 /// `.foreman/tasks/` owned by the app.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -135,6 +210,10 @@ pub struct Card {
     /// dispatch-worktrees). Survives `block`; cleared by teardown, not `done`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
+    /// Absent until the card is Cut into a Version (spec: kanban-cut).
+    /// `state` stays `done`; this is grouping, not a column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped: Option<Shipped>,
     pub created: String,
     pub updated: String,
 }
@@ -150,9 +229,23 @@ impl Card {
             blocked_reason: None,
             claim: None,
             worktree: None,
+            shipped: None,
             created: now.clone(),
             updated: now,
         }
+    }
+
+    /// Load-time repair: a `shipped` whose name trims to empty (a hand
+    /// edit) is no Version at all.
+    fn normalize(mut self) -> Self {
+        if self
+            .shipped
+            .as_ref()
+            .is_some_and(|s| s.name.trim().is_empty())
+        {
+            self.shipped = None;
+        }
+        self
     }
 }
 
@@ -344,7 +437,7 @@ impl CardStore {
                     }
                     match std::fs::read_to_string(&path) {
                         Ok(text) => match serde_json::from_str::<Card>(&text) {
-                            Ok(card) => cards.push(card),
+                            Ok(card) => cards.push(card.normalize()),
                             Err(e) => eprintln!(
                                 "kanban: skipping unparseable card {}: {e}",
                                 path.display()
@@ -483,7 +576,9 @@ impl CardStore {
         let dir = self.dir_or_err()?;
         let path = dir.join(format!("{id}.json"));
         let text = std::fs::read_to_string(&path).map_err(|_| format!("no such card: {id}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("card {id} is corrupt: {e}"))
+        serde_json::from_str::<Card>(&text)
+            .map(Card::normalize)
+            .map_err(|e| format!("card {id} is corrupt: {e}"))
     }
 
     /// Atomic write: temp file in the same dir, then rename — a reader (or a
@@ -818,6 +913,9 @@ impl CardLine {
                 "[wt {}]",
                 worktree_summary(wt, self.worktree_status.as_ref())
             ));
+        }
+        if let Some(s) = &self.card.shipped {
+            tail.push(format!("[shipped {}]", s.name));
         }
         if let Some(reason) = &self.card.blocked_reason {
             tail.push(format!("({reason})"));
@@ -1928,6 +2026,135 @@ mod tests {
         let c: Card = serde_json::from_str(j).unwrap();
         assert!(c.worktree.is_none());
         assert_eq!(serde_json::to_string(&c).unwrap(), j);
+    }
+
+    fn sample_shipped() -> Shipped {
+        Shipped {
+            name: "v0.4.9".into(),
+            at: "2026-09-16T23:10:00Z".into(),
+            commits: vec!["0ea479a".into(), "a52089e".into()],
+        }
+    }
+
+    #[test]
+    fn shipped_card_json_round_trips_the_object_and_omits_empty_commits() {
+        let mut c = sample_card(None);
+        c.state = CardState::Done;
+        c.shipped = Some(sample_shipped());
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains(
+            r#""shipped":{"name":"v0.4.9","at":"2026-09-16T23:10:00Z","commits":["0ea479a","a52089e"]}"#
+        ));
+        let back: Card = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+
+        c.shipped.as_mut().unwrap().commits.clear();
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(!s.contains("commits"), "{s}");
+        let back: Card = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn v1_card_file_without_shipped_round_trips_unchanged() {
+        let j = r#"{"v":1,"id":"a3f8k2","title":"t","state":"done","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        let c: Card = serde_json::from_str(j).unwrap();
+        assert!(c.shipped.is_none());
+        assert_eq!(serde_json::to_string(&c).unwrap(), j);
+    }
+
+    #[test]
+    fn shipped_with_an_empty_name_loads_as_unshipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".foreman").join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("zz0001.json"),
+            r#"{"v":1,"id":"zz0001","title":"t","state":"done","shipped":{"name":"  ","at":"2026-09-16T23:10:00Z"},"created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#,
+        )
+        .unwrap();
+        let mut s = store_at(tmp.path());
+        s.reload();
+        assert!(s.get("zz0001").unwrap().shipped.is_none());
+    }
+
+    #[test]
+    fn same_name_folds_case_and_whitespace() {
+        assert!(same_name("v1", "V1"));
+        assert!(same_name(" v1 ", "v1"));
+        assert!(same_name("current", CURRENT));
+        assert!(!same_name("v1", "v10"));
+    }
+
+    #[test]
+    fn versions_are_distinct_case_insensitive_and_newest_first() {
+        let mut a = sample_card(None);
+        a.id = "a".into();
+        a.shipped = Some(Shipped {
+            name: "v1".into(),
+            at: "2026-09-01T00:00:00Z".into(),
+            commits: vec![],
+        });
+        let mut b = a.clone();
+        b.id = "b".into();
+        b.shipped.as_mut().unwrap().name = "V1".into();
+        let mut c = a.clone();
+        c.id = "c".into();
+        c.shipped = Some(Shipped {
+            name: "v2".into(),
+            at: "2026-09-10T00:00:00Z".into(),
+            commits: vec![],
+        });
+        let mut d = a.clone();
+        d.id = "d".into();
+        d.shipped = None;
+        let v = versions(&[a, b, c, d]);
+        assert_eq!(
+            v,
+            vec![
+                Version {
+                    name: "v2".into(),
+                    at: "2026-09-10T00:00:00Z".into(),
+                    count: 1
+                },
+                Version {
+                    name: "v1".into(),
+                    at: "2026-09-01T00:00:00Z".into(),
+                    count: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn human_line_carries_the_version_tail() {
+        let mut card = sample_card(None);
+        card.state = CardState::Done;
+        card.shipped = Some(sample_shipped());
+        let line = CardLine {
+            card,
+            orphaned: false,
+            worktree_status: None,
+        };
+        assert_eq!(
+            line.human_line(),
+            "a3f8k2  done  Fix resize flicker  [shipped v0.4.9]"
+        );
+    }
+
+    #[test]
+    fn parse_trailer_log_buckets_by_id_oldest_first_and_skips_untagged() {
+        // git log order: newest first. `ccc` names x1; `bbb` has no
+        // trailer; `aaa` names x1 and x2.
+        let text = "ccc\tx1\nbbb\t\naaa\tx1, x2\n";
+        let m = parse_trailer_log(text);
+        assert_eq!(
+            m.get("x1").unwrap(),
+            &vec!["aaa".to_string(), "ccc".to_string()]
+        );
+        assert_eq!(m.get("x2").unwrap(), &vec!["aaa".to_string()]);
+        assert_eq!(m.len(), 2);
+        assert!(parse_trailer_log("").is_empty());
     }
 
     #[test]
