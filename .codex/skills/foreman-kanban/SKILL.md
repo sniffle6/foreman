@@ -35,13 +35,18 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 & $env:FOREMAN_EXE kanban rm a3f8k2
 & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 300
 & $env:FOREMAN_EXE kanban wait --any --timeout 300
+& $env:FOREMAN_EXE kanban list --shipped v0.5.0 --json
+& $env:FOREMAN_EXE kanban cut v0.5.0
+& $env:FOREMAN_EXE kanban uncut v0.5.0
 ```
 
 - `add` — positional words join into the title; `--body` attaches a longer
   description. Reply carries the new card's id.
 - `list` — one line per card by default (id, state, title, context tail);
   `--json` emits full card objects, one per line, including a derived
-  `orphaned` flag (claim points at a Session that's gone).
+  `orphaned` flag (claim points at a Session that's gone). Bare `list` is
+  the live board — cards Cut into a Version are hidden; `--shipped NAME`
+  lists one Version, `--all` everything.
 - `start` — self-service claim of a backlog card. Requires Codex to be
   inside a Foreman terminal (`FOREMAN_TERMINAL_ID` set).
 - `done` — closes a card you hold: in-progress -> done.
@@ -51,6 +56,9 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
   reaches done, blocked, orphaned, or removed. Exit codes: `0` done, `1`
   blocked/orphaned/removed (needs a human), `2` timeout or Foreman
   unreachable.
+- `cut NAME` / `uncut NAME` — the ship ritual, run by a human or a release
+  script after tagging: `cut` moves every ungrouped Done card into Version
+  NAME; `uncut` puts them back. Codex is not expected to Cut.
 
 ## Fast path: one command, trust the exit code
 
@@ -72,6 +80,10 @@ A card you claimed with `start` ends with `done` or `block --reason "..."` —
 never end a session holding a claimed card with neither. If Codex was
 spawned to work a specific card, the dispatch prompt already contains the
 exact close-out command; use it as given rather than reconstructing it.
+
+End every commit message with the trailer line `Card: <id>` (your dispatch
+prompt shows it). That line is how the board attaches your commits to the
+card when the release is Cut; a commit without it is simply not attached.
 
 `start` on a card another live Session already holds is **rejected by
 design** — that is the guard doing its job, not a transient error to retry.
