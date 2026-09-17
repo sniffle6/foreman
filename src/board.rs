@@ -31,6 +31,72 @@ const WT_CHIP_W: f32 = 36.0;
 /// and, in Current, the Cut button — right-anchored, own hit regions.
 const DD_W: f32 = 120.0;
 const CUT_W: f32 = 40.0;
+/// Floors, in logical px. The title always wins the Done header: the
+/// controls shrink into their own floor and then drop out entirely rather
+/// than clip "Done  (NN)" to a sliver or spill left over Blocked.
+const TITLE_MIN_W: f32 = 80.0;
+const DD_MIN_W: f32 = 56.0;
+const CUT_MIN_W: f32 = 30.0;
+
+/// Lay a Done header out as `[title][gap][dropdown][gap][Cut][pad]`,
+/// right-anchored. Pure, and the single source of that geometry — the board
+/// draws through it and the tests aim clicks through it, so the two cannot
+/// drift.
+///
+/// The title keeps at least [`TITLE_MIN_W`]; whatever is left over goes to
+/// the controls, dropdown shrinking first, each dropped once it would fall
+/// under its own floor. Nothing is ever placed left of `header.min.x`: the
+/// board paints with one board-wide painter and Done registers its
+/// `interact` after Blocked's cards, so a control that spilled left would
+/// both paint over Blocked and swallow its clicks.
+///
+/// `want_cut` is false inside a Version, where no Cut button is drawn — the
+/// dropdown then gets that space back instead of a hole (and, in a narrow
+/// column, survives where it would otherwise have been dropped; it is the
+/// only way back to Current).
+fn done_header_rects(
+    header: egui::Rect,
+    scale: f32,
+    want_cut: bool,
+) -> (egui::Rect, Option<egui::Rect>, Option<egui::Rect>) {
+    let (pad, gap, inset) = (PAD * scale, BTN_GAP * scale, 4.0 * scale);
+    // What the controls may spend, once the title's floor and the right
+    // margin are taken out.
+    let room = (header.width() - TITLE_MIN_W * scale - pad).max(0.0);
+    let cost = |dd: f32, cut: f32| {
+        (if dd > 0.0 { gap + dd } else { 0.0 }) + (if cut > 0.0 { gap + cut } else { 0.0 })
+    };
+    let mut cut_w = if want_cut { CUT_W * scale } else { 0.0 };
+    let mut dd_w = DD_W * scale;
+    if cost(dd_w, cut_w) > room {
+        dd_w = (room - cost(0.0, cut_w) - gap).max(0.0);
+    }
+    if dd_w < DD_MIN_W * scale {
+        dd_w = 0.0;
+        if cost(0.0, cut_w) > room {
+            cut_w = (room - gap).max(0.0);
+        }
+        if cut_w < CUT_MIN_W * scale {
+            cut_w = 0.0;
+        }
+    }
+    let h = (header.height() - inset * 2.0).max(0.0);
+    let top = header.min.y + inset;
+    let mut right = header.max.x - pad;
+    let cut = (cut_w > 0.0).then(|| {
+        let r = egui::Rect::from_min_size(egui::pos2(right - cut_w, top), egui::vec2(cut_w, h));
+        right -= cut_w + gap;
+        r
+    });
+    let dd = (dd_w > 0.0).then(|| {
+        let r = egui::Rect::from_min_size(egui::pos2(right - dd_w, top), egui::vec2(dd_w, h));
+        right -= dd_w + gap;
+        r
+    });
+    let mut title = header;
+    title.max.x = right.max(header.min.x);
+    (title, dd, cut)
+}
 
 /// Draw the disclosure marker rather than depending on font glyph coverage.
 fn disclosure(
@@ -181,6 +247,11 @@ pub struct BoardView {
     pub(crate) done_listed: Vec<String>,
     #[cfg(test)]
     pub(crate) detail_commits: Vec<String>,
+    /// Test probe: `(version name, row rect)` for each row the version
+    /// dropdown's popup drew last frame, so a test can click a real row
+    /// instead of guessing where egui put the popup.
+    #[cfg(test)]
+    pub(crate) dropdown_rows: Vec<(String, egui::Rect)>,
     pub acts: Vec<BoardAct>,
     /// Test probe: true when the last `show_details` frame drew the Discard
     /// button (Done/Blocked/orphaned card with a worktree).
@@ -212,6 +283,8 @@ impl BoardView {
             done_listed: Vec::new(),
             #[cfg(test)]
             detail_commits: Vec::new(),
+            #[cfg(test)]
+            dropdown_rows: Vec::new(),
             #[cfg(test)]
             offered_discard: false,
         }
@@ -304,6 +377,8 @@ impl BoardView {
             self.offered_cut = false;
             self.drew_banner = false;
             self.done_listed.clear();
+            self.detail_commits.clear();
+            self.dropdown_rows.clear();
         }
 
         if let Some(id) = self.selected.clone() {
@@ -454,30 +529,19 @@ impl BoardView {
             egui::vec2(col_rect.width(), HEADER_H * self.scale),
         );
         // Done carries right-anchored controls; the collapse click target is
-        // only the title to their left (spec §Board UI).
-        let mut title_rect = header_rect;
-        let mut dd_rect = None;
-        let mut cut_rect = None;
-        if is_done {
-            let inset = 4.0 * self.scale;
-            let cut = egui::Rect::from_min_size(
-                egui::pos2(
-                    header_rect.max.x - PAD * self.scale - CUT_W * self.scale,
-                    header_rect.min.y + inset,
-                ),
-                egui::vec2(CUT_W * self.scale, header_rect.height() - inset * 2.0),
-            );
-            let dd = egui::Rect::from_min_size(
-                egui::pos2(
-                    cut.min.x - BTN_GAP * self.scale - DD_W * self.scale,
-                    cut.min.y,
-                ),
-                egui::vec2(DD_W * self.scale, cut.height()),
-            );
-            title_rect.max.x = dd.min.x - BTN_GAP * self.scale;
-            dd_rect = Some(dd);
-            cut_rect = Some(cut);
-        }
+        // only the title to their left (spec §Board UI). Every rect comes
+        // from the one pure layout function, and is clipped to the column as
+        // a belt-and-braces guard against ever reaching into Blocked.
+        let (title_rect, dd_rect, cut_rect) = if is_done {
+            let (t, dd, cut) = done_header_rects(header_rect, self.scale, self.version.is_none());
+            (
+                t.intersect(col_rect),
+                dd.map(|r| r.intersect(col_rect)),
+                cut.map(|r| r.intersect(col_rect)),
+            )
+        } else {
+            (header_rect, None, None)
+        };
         disclosure(
             &p.with_clip_rect(title_rect),
             egui::pos2(title_rect.min.x + 10.0 * self.scale, title_rect.center().y),
@@ -522,10 +586,11 @@ impl BoardView {
                 .width(dd.width())
                 .selected_text(selected_text)
                 .show_ui(&mut child, |ui| {
-                    if ui
-                        .selectable_label(self.version.is_none(), crate::kanban::CURRENT)
-                        .clicked()
-                    {
+                    let r = ui.selectable_label(self.version.is_none(), crate::kanban::CURRENT);
+                    #[cfg(test)]
+                    self.dropdown_rows
+                        .push((crate::kanban::CURRENT.to_string(), r.rect));
+                    if r.clicked() {
                         pick = Some(None);
                     }
                     for v in &versions {
@@ -533,16 +598,16 @@ impl BoardView {
                             .version
                             .as_deref()
                             .is_some_and(|s| crate::kanban::same_name(s, &v.name));
-                        if ui
-                            .selectable_label(on, format!("{} ({})", v.name, v.count))
-                            .clicked()
-                        {
+                        let r = ui.selectable_label(on, format!("{} ({})", v.name, v.count));
+                        #[cfg(test)]
+                        self.dropdown_rows.push((v.name.clone(), r.rect));
+                        if r.clicked() {
                             pick = Some(Some(v.name.clone()));
                         }
                     }
                 });
-            if let Some(p) = pick {
-                self.version = p;
+            if let Some(choice) = pick {
+                self.version = choice;
                 self.cut_field = None;
                 self.picker = None;
             }
@@ -1541,17 +1606,166 @@ mod tests {
             .unwrap();
     }
 
-    /// Centre of the Done header's Cut button at scale 1 (rightmost control).
+    /// The Done header rect at scale 1. Done is the last column and
+    /// `column_widths` gives every expanded column an equal share.
+    fn done_header(rect: egui::Rect) -> egui::Rect {
+        let col_w = rect.width() / COLUMNS.len() as f32;
+        egui::Rect::from_min_size(
+            egui::pos2(rect.max.x - col_w, rect.min.y),
+            egui::vec2(col_w, HEADER_H),
+        )
+    }
+
+    /// Centre of the Done header's Cut button at scale 1, read out of the
+    /// same layout function the board draws with so the two cannot drift.
     fn cut_button_pos(rect: egui::Rect) -> egui::Pos2 {
-        egui::pos2(rect.max.x - PAD - CUT_W / 2.0, rect.min.y + HEADER_H / 2.0)
+        done_header_rects(done_header(rect), 1.0, true)
+            .2
+            .expect("Cut fits at this width")
+            .center()
     }
 
     /// Centre of the Done header's version dropdown at scale 1.
-    fn dropdown_pos(rect: egui::Rect) -> egui::Pos2 {
+    /// `in_current` mirrors `version.is_none()`: inside a Version no Cut
+    /// button is reserved and the dropdown sits further right.
+    fn dropdown_pos(rect: egui::Rect, in_current: bool) -> egui::Pos2 {
+        done_header_rects(done_header(rect), 1.0, in_current)
+            .1
+            .expect("the dropdown fits at this width")
+            .center()
+    }
+
+    /// Centre of the archive banner's Uncut button at scale 1: the banner is
+    /// the first row under the Done header, Uncut right-anchored in it.
+    fn uncut_button_pos(rect: egui::Rect) -> egui::Pos2 {
         egui::pos2(
-            rect.max.x - PAD - CUT_W - BTN_GAP - DD_W / 2.0,
-            rect.min.y + HEADER_H / 2.0,
+            rect.max.x - PAD - BTN_W / 2.0,
+            rect.min.y + HEADER_H + QUICK_ADD_H / 2.0,
         )
+    }
+
+    #[test]
+    fn done_header_rects_floor_the_title_and_never_leave_the_column() {
+        for scale in [1.0_f32, 1.5, 0.5] {
+            for w in [40.0_f32, 80.0, 100.0, 120.0, 170.0, 200.0, 260.0, 400.0] {
+                for want_cut in [true, false] {
+                    let header = egui::Rect::from_min_size(
+                        egui::pos2(600.0, 0.0),
+                        egui::vec2(w * scale, HEADER_H * scale),
+                    );
+                    let (title, dd, cut) = done_header_rects(header, scale, want_cut);
+                    let what = format!("w={w} scale={scale} want_cut={want_cut}");
+                    assert_eq!(title.min.x, header.min.x, "{what}");
+                    assert!(title.max.x >= title.min.x, "title inverted: {what}");
+                    assert!(header.contains_rect(title), "title escapes: {what}");
+                    // Right to left: Cut, then the dropdown, then the title.
+                    let mut left = header.max.x;
+                    for r in [cut, dd].into_iter().flatten() {
+                        assert!(header.contains_rect(r), "control escapes: {what}");
+                        assert!(r.max.x <= left, "controls overlap: {what}");
+                        left = r.min.x;
+                    }
+                    assert!(title.max.x <= left, "title overlaps a control: {what}");
+                    if dd.is_some() || cut.is_some() {
+                        assert!(
+                            title.width() >= TITLE_MIN_W * scale - 0.01,
+                            "title under its floor: {what}"
+                        );
+                    }
+                    assert!(
+                        cut.is_none() || want_cut,
+                        "Cut reserved in a Version: {what}"
+                    );
+                }
+            }
+        }
+        // The nominal board: 800px over four columns is a 200px Done header.
+        // Both controls fit and the title still clears its floor.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_some() && cut.is_some());
+        assert!(title.width() >= TITLE_MIN_W, "{}", title.width());
+        // Narrow: the dropdown goes before the title gives up a pixel.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_none(), "no room for a legible dropdown at 120px");
+        assert!(cut.is_some());
+        assert!(title.width() >= TITLE_MIN_W);
+        // Narrower still: title only, and it never inverts.
+        let (title, dd, cut) = done_header_rects(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(60.0, HEADER_H)),
+            1.0,
+            true,
+        );
+        assert!(dd.is_none() && cut.is_none());
+        assert!(title.width() > 0.0);
+    }
+
+    #[test]
+    fn uncut_from_the_archive_banner_records_the_act_without_collapsing_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        cut(&store, "v1");
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.version = Some("v1".into());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("uncut-click");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        click_at(&ctx, &mut board, rect, base, uncut_button_pos(rect));
+        assert!(board.drew_banner);
+        assert!(
+            matches!(board.acts.as_slice(), [BoardAct::Uncut(n)] if n == "v1"),
+            "{} acts recorded",
+            board.acts.len()
+        );
+        assert_eq!(board.collapsed, [false; 4]);
+        assert_eq!(
+            board.version.as_deref(),
+            Some("v1"),
+            "the view waits for wm"
+        );
+    }
+
+    #[test]
+    fn picking_a_version_in_the_dropdown_switches_the_done_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let a = add_done(&store, "a");
+        cut(&store, "v1");
+        let b = add_done(&store, "b");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("dd-pick");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.done_listed, vec![b], "Current first");
+        assert!(board.dropdown_rows.is_empty(), "the popup starts shut");
+        // Open the popup, then click the v1 row exactly where the board drew
+        // it last frame rather than guessing at egui's popup placement.
+        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect, true));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        let row = board
+            .dropdown_rows
+            .iter()
+            .find(|(n, _)| n == "v1")
+            .expect("the open popup lists the Version")
+            .1;
+        click_at(&ctx, &mut board, rect, base, row.center());
+        assert_eq!(board.version.as_deref(), Some("v1"));
+        // The pick lands after that frame's column filter has already run, so
+        // the Version's cards appear on the next frame.
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.done_listed, vec![a], "Done now shows the Version");
+        assert!(board.drew_banner);
+        assert!(!board.offered_cut, "no Cut inside a Version");
+        assert!(board.acts.is_empty(), "switching views is not an act");
     }
 
     #[test]
@@ -1651,7 +1865,7 @@ mod tests {
         let ctx = egui::Context::default();
         let base = egui::Id::new("dd-click");
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
-        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect));
+        click_at(&ctx, &mut board, rect, base, dropdown_pos(rect, true));
         assert_eq!(board.collapsed, [false; 4]);
         assert!(board.acts.is_empty());
     }
