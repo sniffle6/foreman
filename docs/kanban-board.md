@@ -52,6 +52,31 @@ sibling — read those for *why*, this doc for *how*.
   `foreman kanban list` (`[wt card/<id> +A -B dirty]`; `--json` adds
   `worktree` and `worktree_status`). Nothing about status is written to a
   card file; a hidden board polls nothing.
+- **Worktrees page**: every worktree foreman made for the project, in one
+  place. While at least one exists, the board shows a one-line strip along
+  its bottom (`N worktrees · D dirty · S no card`, zero segments omitted,
+  danger colour when D or S is non-zero); a project without any sees no
+  change. Clicking the strip swaps the Worktrees page in for the columns,
+  like the card detail page, with Back to board. Source of truth is
+  `git worktree list` filtered to `<root>/.foreman/worktrees/`, matched by
+  path to each card's stored worktree. A tree no card points at is a
+  **stray** (`no card`): the card was removed while its teardown could not
+  run, its file was deleted by hand, or the current branch does not carry
+  it (cards travel with the clone). Hand-made trees elsewhere are not
+  listed. Rows are card-owned first (Backlog, In Progress, Blocked, Done,
+  store order within a state), then strays by path; each shows the branch
+  (path on hover), the owner (card id, state, Version, title, or `no card`
+  plus the directory name), and the same counts, flags, and colour rules as
+  the card face. Card rows navigate only — Open card, and Open terminal
+  when the claim is live; Back from that detail page returns to the
+  Worktrees page, and Discard stays on the card. Stray rows clean up:
+  **Remove** queues the non-forcing teardown (git refuses a dirty or
+  unmerged tree and the toast says so), **Discard** the forcing one behind
+  the standard confirm. Stray status is measured against whatever branch
+  the main checkout has at poll time (`HEAD` when detached), since no card
+  remembers a base. Strays are found by the same status poll as card
+  status, so a hidden board lists nothing and the poll now runs on a shown
+  board even when no card has a worktree.
 - **Cut and Versions**: Done is the live pile until you Cut it. Cut (a
   button on the Done header, or `foreman kanban cut <name>`) stamps every
   ungrouped Done card with `shipped` (`{name, at, commits}`), which moves
@@ -190,6 +215,11 @@ and does not claim or move the card; body is a full replace, not an append.
 - **`kanban list` worktree status comes from the last poll round.** A board
   that has not been shown since the card was dispatched prints the branch
   with no counts.
+- **Strays never reach the CLI.** `kanban list` knows cards; a tree with no
+  card is visible only on the board's Worktrees page.
+- **A stray's Remove or Discard clicked twice is one teardown.** The queue
+  keeps one entry per directory name; a second click while the first runs
+  waits its turn and then finds nothing to remove.
 - **Ignore is per-clone.** Bring-up appends `.foreman/worktrees/` to
   `.git/info/exclude`, never to `.gitignore`.
 - **Cut on the branch you ship from.** A Cut rewrites every ungrouped Done
@@ -211,18 +241,24 @@ and does not claim or move the card; body is a full replace, not an append.
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
   `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` (+
   `remove_tree` / `delete_branch`, the retry-safe steps) + `teardown_verdict`,
-  `CardStore::take_status_poll`; the Cut half: `Shipped`,
+  `CardStore::take_status_poll`; the overview half:
+  `parse_worktree_list`, `foreman_worktrees_now`, `strays_among`,
+  `StrayWorktree`, `worktree_rows` / `WorktreeRow` / `RowOwner`,
+  `worktree_strip`, `CardStore::strays`; the Cut half: `Shipped`,
   `same_name`, `versions`, `CardStore::cut` / `uncut` (batch write, revert),
   `parse_trailer_log` + `trailer_commits`, `latest_v_tag`.
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
   intents it records for the manager to drain), including the card-face
   worktree line and the detail page's Discard action, the Done header's
-  version dropdown and Cut field, the archive banner.
+  version dropdown and Cut field, the archive banner, the worktree strip
+  (`show_strip`) and the Worktrees page (`show_worktrees`,
+  `show_worktree_row`, the `RemoveStray` / `DiscardStray` acts).
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
   reload), `kanban_dispatch` (the control-pipe verb table), `drain_board_acts`
   (applies board intents: store writes, jump-to-terminal, dispatch-from-card
   with bring-up), `drain_worktree_msgs` (queued teardowns, thread results,
-  status poll kick), `kanban_rm` (the `rm` pre-check), `open_board_window`
+  status poll kick including the stray listing), `CloseTarget::DiscardStray`,
+  `kanban_rm` (the `rm` pre-check), `open_board_window`
   (per-project singleton), `term_states`, `kanban_cut` (the hold-back probe
   and trailer walk injected into the store).
 - `src/config.rs` — `Settings::dispatch_worktrees`.

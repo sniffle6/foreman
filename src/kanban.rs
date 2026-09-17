@@ -117,6 +117,212 @@ pub fn worktree_summary(wt: &Worktree, st: Option<&WorktreeStatus>) -> String {
     s
 }
 
+/// A foreman-made worktree (under `<root>/.foreman/worktrees/`) that no
+/// card owns any more: the card was removed while its teardown could not
+/// run, its file was deleted by hand, or the current branch does not carry
+/// it. Derived by the status poll from `git worktree list`; memory only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrayWorktree {
+    pub wt: Worktree,
+    /// `None` when the probe errored this round (shown as branch alone).
+    pub status: Option<WorktreeStatus>,
+}
+
+/// The directory name of a foreman worktree — the id of the card it was
+/// made for, which is how the board and toasts name a stray.
+pub fn worktree_dir_name(wt: &Worktree) -> String {
+    wt.path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `(path, branch)` for every entry of `git worktree list --porcelain`
+/// whose path sits under `<root>/.foreman/worktrees/`. The main checkout
+/// and hand-made trees elsewhere are dropped. A detached entry reads as
+/// branch `HEAD`; a `prunable` entry (directory gone) is kept so the page
+/// can show it as missing. Paths are compared like [`same_path`].
+pub fn parse_worktree_list(porcelain: &str, root: &str) -> Vec<(String, String)> {
+    let prefix = format!(
+        "{}/.foreman/worktrees/",
+        root.replace('\\', "/").trim_end_matches('/')
+    );
+    let under = |p: &str| {
+        let p = p.replace('\\', "/");
+        let (p, prefix) = if cfg!(windows) {
+            (p.to_ascii_lowercase(), prefix.to_ascii_lowercase())
+        } else {
+            (p, prefix.clone())
+        };
+        p.starts_with(&prefix) && p.len() > prefix.len()
+    };
+    let mut out = Vec::new();
+    for block in porcelain.replace("\r\n", "\n").split("\n\n") {
+        let mut path = None;
+        let mut branch = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(p.trim().to_string());
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(
+                    b.trim()
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(b.trim())
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(p) = path
+            && under(&p)
+        {
+            out.push((p, branch.unwrap_or_else(|| "HEAD".into())));
+        }
+    }
+    out
+}
+
+/// The listed foreman worktrees that no card in `owned` points at.
+pub fn strays_among(listed: Vec<Worktree>, owned: &[(String, Worktree)]) -> Vec<Worktree> {
+    listed
+        .into_iter()
+        .filter(|wt| !owned.iter().any(|(_, o)| same_path(&o.path, &wt.path)))
+        .collect()
+}
+
+/// Who a row on the Worktrees page belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowOwner {
+    Card {
+        id: String,
+        state: CardState,
+        title: String,
+        /// The Version a shipped Done card sits in.
+        version: Option<String>,
+        /// The claimed terminal when the claim is live (Open terminal).
+        terminal: Option<String>,
+    },
+    /// No card owns the tree; the directory name is the former card id.
+    None,
+}
+
+/// One row of the Worktrees page (the board's worktree overview).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRow {
+    pub wt: Worktree,
+    pub status: Option<WorktreeStatus>,
+    pub owner: RowOwner,
+    /// Same rule as the card face: dirty always; ahead of base once the card
+    /// has left In Progress (a stray is never in progress).
+    pub attention: bool,
+}
+
+impl WorktreeRow {
+    /// The name the page and toasts use: the card id, or the directory name.
+    pub fn name(&self) -> String {
+        match &self.owner {
+            RowOwner::Card { id, .. } => id.clone(),
+            RowOwner::None => worktree_dir_name(&self.wt),
+        }
+    }
+}
+
+/// Column order for the page: live cards first (Backlog, In Progress,
+/// Blocked, Done — each in store order), then strays by path.
+fn state_rank(s: CardState) -> u8 {
+    match s {
+        CardState::Backlog => 0,
+        CardState::InProgress => 1,
+        CardState::Blocked => 2,
+        CardState::Done => 3,
+    }
+}
+
+/// Build the page's rows from the store's view of the world. Pure, so the
+/// ordering, labels, and attention rule are unit-tested without git.
+pub fn worktree_rows(
+    cards: &[Card],
+    orphans: &std::collections::HashSet<String>,
+    status_of: impl Fn(&str) -> Option<WorktreeStatus>,
+    strays: &[StrayWorktree],
+) -> Vec<WorktreeRow> {
+    let mut owned: Vec<(u8, WorktreeRow)> = cards
+        .iter()
+        .filter_map(|c| {
+            let wt = c.worktree.clone()?;
+            let st = status_of(&c.id);
+            let orphaned = orphans.contains(&c.id);
+            let terminal = c
+                .claim
+                .as_ref()
+                .filter(|_| c.state == CardState::InProgress && !orphaned)
+                .map(|cl| cl.terminal.clone());
+            let attention =
+                st.is_some_and(|s| s.dirty || (s.ahead > 0 && c.state != CardState::InProgress));
+            Some((
+                state_rank(c.state),
+                WorktreeRow {
+                    wt,
+                    status: st,
+                    owner: RowOwner::Card {
+                        id: c.id.clone(),
+                        state: c.state,
+                        title: c.title.clone(),
+                        version: c.shipped.as_ref().map(|s| s.name.clone()),
+                        terminal,
+                    },
+                    attention,
+                },
+            ))
+        })
+        .collect();
+    owned.sort_by_key(|(rank, _)| *rank);
+    let mut rows: Vec<WorktreeRow> = owned.into_iter().map(|(_, r)| r).collect();
+    let mut strays: Vec<WorktreeRow> = strays
+        .iter()
+        .map(|s| WorktreeRow {
+            wt: s.wt.clone(),
+            status: s.status,
+            owner: RowOwner::None,
+            attention: s.status.is_some_and(|st| st.dirty || st.ahead > 0),
+        })
+        .collect();
+    strays.sort_by(|a, b| a.wt.path.cmp(&b.wt.path));
+    rows.extend(strays);
+    rows
+}
+
+/// The board's bottom strip: `N worktrees · D dirty · S no card`, zero
+/// segments omitted; `None` when there is nothing to show. The bool is
+/// attention (any dirty or stray).
+pub fn worktree_strip(rows: &[WorktreeRow]) -> Option<(String, bool)> {
+    if rows.is_empty() {
+        return None;
+    }
+    let dirty = rows
+        .iter()
+        .filter(|r| r.status.is_some_and(|s| s.dirty))
+        .count();
+    let stray = rows.iter().filter(|r| r.owner == RowOwner::None).count();
+    let mut s = format!(
+        "{} {}",
+        rows.len(),
+        if rows.len() == 1 {
+            "worktree"
+        } else {
+            "worktrees"
+        }
+    );
+    if dirty > 0 {
+        s.push_str(&format!(" · {dirty} dirty"));
+    }
+    if stray > 0 {
+        s.push_str(&format!(" · {stray} no card"));
+    }
+    Some((s, dirty > 0 || stray > 0))
+}
+
 /// The Version a Done card was Cut into (spec: kanban-cut §Card schema).
 /// Set only by [`CardStore::cut`], cleared only by [`CardStore::uncut`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -401,6 +607,8 @@ pub struct CardStore {
     /// Last poll round's derived worktree status per card id (spec:
     /// dispatch-worktrees §Status poll). Memory only, replaced wholesale.
     worktree_status: std::collections::HashMap<String, WorktreeStatus>,
+    /// Last poll round's foreman worktrees that no card owns. Memory only.
+    strays: Vec<StrayWorktree>,
     last_status_poll: Option<std::time::Instant>,
     status_inflight: bool,
 }
@@ -518,6 +726,7 @@ impl CardStore {
     pub fn set_worktree_statuses(
         &mut self,
         mut map: std::collections::HashMap<String, WorktreeStatus>,
+        mut strays: Vec<StrayWorktree>,
     ) {
         // The round was snapshotted before it ran; a card whose worktree
         // was cleared (teardown) or removed meanwhile must not get a status
@@ -528,14 +737,28 @@ impl CardStore {
                 .iter()
                 .any(|c| c.id == *id && c.worktree.is_some())
         });
+        // Likewise a tree a card claimed since the snapshot is not a stray.
+        strays.retain(|s| {
+            !self.cards.iter().any(|c| {
+                c.worktree
+                    .as_ref()
+                    .is_some_and(|w| same_path(&w.path, &s.wt.path))
+            })
+        });
         self.worktree_status = map;
+        self.strays = strays;
         self.status_inflight = false;
     }
 
+    /// Foreman worktrees no card owns, from the last poll round.
+    pub fn strays(&self) -> &[StrayWorktree] {
+        &self.strays
+    }
+
     /// When a round is due — board shown, no round in flight, interval
-    /// elapsed, at least one card has a worktree — return the batch to poll
-    /// and latch in-flight. The caller runs git on a background thread and
-    /// answers with [`Self::set_worktree_statuses`].
+    /// elapsed — return the card batch to poll (possibly empty: the round
+    /// still lists strays) and latch in-flight. The caller runs git on a
+    /// background thread and answers with [`Self::set_worktree_statuses`].
     pub fn take_status_poll(&mut self, now: std::time::Instant) -> Option<Vec<(String, Worktree)>> {
         if !self.shown_recently(now) || self.status_inflight {
             return None;
@@ -552,7 +775,6 @@ impl CardStore {
             .collect();
         if batch.is_empty() {
             self.worktree_status.clear();
-            return None;
         }
         self.last_status_poll = Some(now);
         self.status_inflight = true;
@@ -1334,6 +1556,28 @@ pub fn worktree_status_now(
         &["rev-list", "--left-right", "--count", &range],
     )?;
     Ok(parse_status(porcelain.as_deref(), &rev_list))
+}
+
+/// Every foreman worktree git knows about, for the board's overview.
+/// `base` is whatever the main checkout has checked out now (`HEAD` when
+/// detached) — a stray has no card to remember its base. Not a repository,
+/// or any git failure, is `Err`; the poll then lists nothing.
+pub fn foreman_worktrees_now(project_cwd: &std::path::Path) -> Result<Vec<Worktree>, String> {
+    let root = git(project_cwd, &["rev-parse", "--show-toplevel"])?;
+    let base = git(
+        &std::path::PathBuf::from(&root),
+        &["symbolic-ref", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "HEAD".into());
+    let listed = git(project_cwd, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_list(&listed, &root)
+        .into_iter()
+        .map(|(path, branch)| Worktree {
+            path,
+            branch,
+            base: base.clone(),
+        })
+        .collect())
 }
 
 /// Commits reachable from HEAD, committed since `since` (RFC3339), carrying
@@ -3077,7 +3321,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        store.set_worktree_statuses(map);
+        store.set_worktree_statuses(map, Vec::new());
         assert_eq!(store.worktree_status(&with).unwrap().ahead, 2);
         // interval not elapsed since the last kick
         assert!(
@@ -3098,7 +3342,7 @@ mod tests {
         let mut stale = std::collections::HashMap::new();
         stale.insert(with.clone(), WorktreeStatus::default());
         stale.insert(plain.clone(), WorktreeStatus::default());
-        store.set_worktree_statuses(stale);
+        store.set_worktree_statuses(stale, Vec::new());
         assert!(store.worktree_status(&with).is_none());
         assert!(store.worktree_status(&plain).is_none());
     }
@@ -3196,5 +3440,220 @@ mod tests {
         wait_verdict(&target, &mut watched3, &cards);
         let cards: Vec<CardLine> = vec![];
         assert_eq!(wait_verdict(&target, &mut watched3, &cards), Some(1));
+    }
+
+    const PORCELAIN: &str = "worktree H:/repo\n\
+        HEAD 2494df8538bf5eb006053ceb6b191bd5639202d5\n\
+        branch refs/heads/main\n\
+        \n\
+        worktree H:/repo/.foreman/worktrees/plds8v\n\
+        HEAD a52089e76088264c03b9d793fd9d5765b4690ef3\n\
+        branch refs/heads/card/plds8v\n\
+        \n\
+        worktree H:/repo/.foreman/worktrees/gone11\n\
+        HEAD a52089e76088264c03b9d793fd9d5765b4690ef3\n\
+        detached\n\
+        prunable gitdir file points to non-existent location\n\
+        \n\
+        worktree H:/elsewhere/spike\n\
+        HEAD 3cabee1e4dcdf93c05657e4b50f5513f8e019d69\n\
+        branch refs/heads/spike/wgpu\n";
+
+    #[test]
+    fn parse_worktree_list_keeps_only_foreman_trees() {
+        let got = parse_worktree_list(PORCELAIN, "H:/repo");
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "H:/repo/.foreman/worktrees/plds8v".to_string(),
+                    "card/plds8v".to_string()
+                ),
+                (
+                    "H:/repo/.foreman/worktrees/gone11".to_string(),
+                    "HEAD".to_string()
+                ),
+            ],
+            "main checkout and hand-made trees are dropped; detached reads as HEAD; prunable kept"
+        );
+        // Backslash root and trailing slash normalise the same way.
+        assert_eq!(parse_worktree_list(PORCELAIN, "H:\\repo\\").len(), 2);
+        // CRLF output (git on Windows via some shells) parses identically.
+        assert_eq!(
+            parse_worktree_list(&PORCELAIN.replace('\n', "\r\n"), "H:/repo").len(),
+            2
+        );
+        assert!(parse_worktree_list("", "H:/repo").is_empty());
+    }
+
+    #[test]
+    fn strays_are_the_listed_trees_no_card_points_at() {
+        let owned = vec![("a3f8k2".to_string(), sample_worktree())];
+        let mut other = sample_worktree();
+        other.path = "H:/repo/.foreman/worktrees/zz9".into();
+        other.branch = "card/zz9".into();
+        // Case-insensitive on Windows, like `same_path`.
+        let mut cased = sample_worktree();
+        cased.path = "h:/REPO/.foreman/worktrees/A3F8K2".into();
+        let listed = vec![sample_worktree(), other.clone(), cased.clone()];
+        let got = strays_among(listed, &owned);
+        if cfg!(windows) {
+            assert_eq!(got, vec![other]);
+        } else {
+            assert_eq!(got, vec![other, cased]);
+        }
+        assert_eq!(worktree_dir_name(&sample_worktree()), "a3f8k2");
+    }
+
+    #[test]
+    fn worktree_rows_order_cards_by_column_then_strays_and_apply_the_attention_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let run = run_nonce();
+        let mut wt_for = |id: &str| Worktree {
+            path: format!("H:/repo/.foreman/worktrees/{id}"),
+            branch: format!("card/{id}"),
+            base: "main".into(),
+        };
+        let done = store.add("done card", None).unwrap();
+        let live = store.add("live card", None).unwrap();
+        let plain = store.add("no worktree", None).unwrap();
+        for id in [&done, &live] {
+            store
+                .claim_for_dispatch(
+                    id,
+                    "t1",
+                    "claude",
+                    run.clone(),
+                    TermState::Missing,
+                    Some(wt_for(id)),
+                )
+                .unwrap();
+        }
+        store.done(&done).unwrap();
+        let orphan = store.add("orphan card", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &orphan,
+                "t2",
+                "claude",
+                run.clone(),
+                TermState::Missing,
+                Some(wt_for(&orphan)),
+            )
+            .unwrap();
+        let mut orphans = std::collections::HashSet::new();
+        orphans.insert(orphan.clone());
+        let status = |id: &str| -> Option<WorktreeStatus> {
+            if id == done {
+                Some(WorktreeStatus {
+                    ahead: 2,
+                    ..Default::default()
+                })
+            } else if id == live {
+                Some(WorktreeStatus {
+                    ahead: 3,
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        };
+        let strays = vec![
+            StrayWorktree {
+                wt: wt_for("zzz999"),
+                status: Some(WorktreeStatus {
+                    dirty: true,
+                    ..Default::default()
+                }),
+            },
+            StrayWorktree {
+                wt: wt_for("aaa111"),
+                status: None,
+            },
+        ];
+        let rows = worktree_rows(store.cards(), &orphans, status, &strays);
+        let names: Vec<String> = rows.iter().map(WorktreeRow::name).collect();
+        // The two In Progress cards keep the store's order (created, then
+        // id — same second here, so by id); Done follows; strays last by
+        // path; no row for the card without a worktree.
+        let mut in_progress = vec![live.clone(), orphan.clone()];
+        in_progress.sort();
+        assert_eq!(
+            names,
+            vec![
+                in_progress[0].clone(),
+                in_progress[1].clone(),
+                done.clone(),
+                "aaa111".into(),
+                "zzz999".into()
+            ],
+            "no row for {plain}"
+        );
+        let by_name = |n: &str| rows.iter().find(|r| r.name() == n).unwrap();
+        // Live claim: Open terminal; orphaned: none; Done: none.
+        let term = |r: &WorktreeRow| match &r.owner {
+            RowOwner::Card { terminal, .. } => terminal.clone(),
+            RowOwner::None => None,
+        };
+        assert_eq!(term(by_name(&live)).as_deref(), Some("t1"));
+        assert_eq!(
+            term(by_name(&orphan)),
+            None,
+            "an orphaned claim offers no terminal"
+        );
+        assert_eq!(term(by_name(&done)), None);
+        // Attention: ahead is normal while In Progress, attention once Done;
+        // a dirty stray is attention, an unprobed one is not.
+        assert!(!by_name(&live).attention);
+        assert!(by_name(&done).attention);
+        assert!(!by_name("aaa111").attention);
+        assert!(by_name("zzz999").attention);
+        assert_eq!(by_name("aaa111").owner, RowOwner::None);
+
+        let (text, attention) = worktree_strip(&rows).unwrap();
+        assert_eq!(text, "5 worktrees · 1 dirty · 2 no card");
+        assert!(attention);
+        let (text, attention) = worktree_strip(&rows[..1]).unwrap();
+        assert_eq!(text, "1 worktree");
+        assert!(!attention);
+        assert!(worktree_strip(&[]).is_none());
+    }
+
+    #[test]
+    fn status_poll_runs_with_no_worktree_cards_and_keeps_strays_a_card_has_not_claimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let t0 = std::time::Instant::now();
+        store.mark_shown(t0);
+        // No card has a worktree: the round still runs (it lists strays).
+        let batch = store.take_status_poll(t0).unwrap();
+        assert!(batch.is_empty());
+        assert!(
+            store
+                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .is_none(),
+            "in flight"
+        );
+        let stray = StrayWorktree {
+            wt: sample_worktree(),
+            status: None,
+        };
+        store.set_worktree_statuses(Default::default(), vec![stray.clone()]);
+        assert_eq!(store.strays(), &[stray.clone()]);
+        // A card that claimed that path since the snapshot un-strays it.
+        let id = store.add("claims it", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                run_nonce(),
+                TermState::Missing,
+                Some(sample_worktree()),
+            )
+            .unwrap();
+        store.set_worktree_statuses(Default::default(), vec![stray]);
+        assert!(store.strays().is_empty());
     }
 }

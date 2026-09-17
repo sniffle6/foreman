@@ -26,6 +26,8 @@ const BTN_H: f32 = 22.0;
 const BTN_GAP: f32 = 4.0;
 /// The inline picker's "wt on/off" chip, left of the agent buttons.
 const WT_CHIP_W: f32 = 36.0;
+/// The worktree strip along the bottom of the board (logical px).
+const STRIP_H: f32 = 22.0;
 
 /// Done header controls (spec: kanban-cut §Board UI): the version dropdown
 /// and, in Current, the Cut button — right-anchored, own hit regions.
@@ -205,6 +207,11 @@ pub enum BoardAct {
     /// Human-only forcing teardown of a card's worktree (spec:
     /// dispatch-worktrees §Teardown). The manager opens a confirm first.
     DiscardWorktree(String),
+    /// Non-forcing teardown of a worktree no card owns (Worktrees page).
+    /// git refuses a dirty or unmerged tree; the manager toasts why.
+    RemoveStray(crate::kanban::Worktree),
+    /// Forcing teardown of a worktree no card owns; confirm first.
+    DiscardStray(crate::kanban::Worktree),
     /// Cut the ungrouped Done cards into a Version (spec: kanban-cut §Cut).
     /// The manager owns the worktree probe and the trailer walk.
     Cut(String),
@@ -226,6 +233,9 @@ pub struct BoardView {
     scroll: [f32; 4],
     collapsed: [bool; 4],
     selected: Option<String>,
+    /// The Worktrees page is showing (below `selected`: a card opened from
+    /// the page returns to it on Back). View state, never persisted.
+    worktrees_open: bool,
     scale: f32,
     /// Which Done view is showing: `None` = Current, `Some(name)` = that
     /// Version (spec §Board UI). View state, never persisted — same rule as
@@ -263,6 +273,16 @@ pub struct BoardView {
     /// Test probe: the text last painted on a collapsed Done rail.
     #[cfg(test)]
     pub(crate) rail_text: Option<String>,
+    /// Test probe: the worktree strip's text last frame (`None` = no strip).
+    #[cfg(test)]
+    pub(crate) strip_text: Option<String>,
+    /// Test probe: the row names the Worktrees page drew last frame.
+    #[cfg(test)]
+    pub(crate) wt_rows_drawn: Vec<String>,
+    /// Test probe: `(row name, button label, rect)` for each button the
+    /// Worktrees page drew last frame, so a test clicks the real thing.
+    #[cfg(test)]
+    pub(crate) wt_btn_rects: Vec<(String, &'static str, egui::Rect)>,
     pub acts: Vec<BoardAct>,
     /// Test probe: true when the last `show_details` frame drew the Discard
     /// button (Done/Blocked/orphaned card with a worktree).
@@ -280,6 +300,7 @@ impl BoardView {
             scroll: [0.0; 4],
             collapsed: [false; 4],
             selected: None,
+            worktrees_open: false,
             scale: 1.0,
             acts: Vec::new(),
             version: None,
@@ -302,6 +323,12 @@ impl BoardView {
             uncut_rect: None,
             #[cfg(test)]
             rail_text: None,
+            #[cfg(test)]
+            strip_text: None,
+            #[cfg(test)]
+            wt_rows_drawn: Vec::new(),
+            #[cfg(test)]
+            wt_btn_rects: Vec::new(),
             #[cfg(test)]
             offered_discard: false,
         }
@@ -376,9 +403,15 @@ impl BoardView {
 
         // Read seam: one borrow, into locals, dropped before any intent is
         // recorded below.
-        let (cards, orphans) = {
+        let (cards, orphans, rows) = {
             let store = self.store.borrow();
-            (store.cards().to_vec(), store.orphans().clone())
+            let rows = crate::kanban::worktree_rows(
+                store.cards(),
+                store.orphans(),
+                |id| store.worktree_status(id),
+                store.strays(),
+            );
+            (store.cards().to_vec(), store.orphans().clone(), rows)
         };
         // A selected Version that no longer exists (Uncut, `rm` of its last
         // card, a pull) snaps back to Current (spec §Uncut).
@@ -399,6 +432,9 @@ impl BoardView {
             self.dropdown_btn = None;
             self.uncut_rect = None;
             self.rail_text = None;
+            self.strip_text = None;
+            self.wt_rows_drawn.clear();
+            self.wt_btn_rects.clear();
         }
 
         if let Some(id) = self.selected.clone() {
@@ -407,6 +443,21 @@ impl BoardView {
                 return;
             }
             self.selected = None;
+        }
+        if self.worktrees_open {
+            self.show_worktrees(ui, rect, base, &rows, &th);
+            return;
+        }
+        // The worktree strip takes the bottom row only when there is
+        // something to show, so a project without worktrees sees no change.
+        let mut rect = rect;
+        if let Some((text, attention)) = crate::kanban::worktree_strip(&rows) {
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - STRIP_H * self.scale),
+                rect.max,
+            );
+            rect.max.y = strip.min.y;
+            self.show_strip(ui, &p, strip, base, &text, attention, &th);
         }
         // Focus belongs to the window frame, not column dividers.
         let border_col = th.border;
@@ -1081,6 +1132,210 @@ impl BoardView {
 
     /// A pane-local detail page: no modal can steal another terminal's focus.
     /// Read the current snapshot every frame, so close-out and external removal stay live.
+    /// The one-row summary along the bottom of the board; the whole row is
+    /// the button that opens the Worktrees page.
+    #[allow(clippy::too_many_arguments)]
+    fn show_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &egui::Painter,
+        strip: egui::Rect,
+        base: egui::Id,
+        text: &str,
+        attention: bool,
+        th: &crate::theme::Theme,
+    ) {
+        #[cfg(test)]
+        {
+            self.strip_text = Some(text.to_owned());
+        }
+        let r = ui.interact(strip, base.with("wt-strip"), egui::Sense::click());
+        p.rect_filled(strip, 0.0, if r.hovered() { th.sel_bg } else { th.bg });
+        p.line_segment(
+            [strip.min, egui::pos2(strip.max.x, strip.min.y)],
+            egui::Stroke::new(1.0, th.border),
+        );
+        p.text(
+            egui::pos2(strip.min.x + PAD * self.scale * 2.0, strip.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(10.5 * self.scale),
+            if attention { th.danger } else { th.dim },
+        );
+        p.text(
+            egui::pos2(strip.max.x - PAD * self.scale * 2.0, strip.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "Worktrees ›",
+            egui::FontId::proportional(10.5 * self.scale),
+            th.text,
+        );
+        if r.on_hover_text("Every worktree foreman made for this project")
+            .clicked()
+        {
+            self.worktrees_open = true;
+            self.picker = None;
+        }
+    }
+
+    /// The Worktrees page: one row per foreman worktree, card-owned rows
+    /// first. Card rows navigate (Open card, Open terminal); stray rows
+    /// clean up (Remove, Discard). Swaps in for the columns like the card
+    /// detail page.
+    fn show_worktrees(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        base: egui::Id,
+        rows: &[crate::kanban::WorktreeRow],
+        th: &crate::theme::Theme,
+    ) {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(base.with("worktrees-page"))
+                .max_rect(rect.shrink(12.0 * self.scale))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(rect);
+        for font in child.style_mut().text_styles.values_mut() {
+            font.size *= self.scale;
+        }
+        child.spacing_mut().interact_size *= self.scale;
+        child.spacing_mut().button_padding *= self.scale;
+        child.spacing_mut().item_spacing *= self.scale;
+        child.visuals_mut().override_text_color = Some(th.text);
+        if child.button("‹ Back to board").clicked() {
+            self.worktrees_open = false;
+        }
+        child.separator();
+        child.add(
+            egui::Label::new(
+                egui::RichText::new(format!("Worktrees ({})", rows.len())).size(18.0 * self.scale),
+            )
+            .wrap(),
+        );
+        if rows.is_empty() {
+            child.label(egui::RichText::new("No worktrees.").color(th.dim));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(base.with("worktrees-scroll"))
+            .show(&mut child, |ui| {
+                egui::Grid::new(base.with("worktrees-grid"))
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing(egui::vec2(16.0 * self.scale, 6.0 * self.scale))
+                    .show(ui, |ui| {
+                        for row in rows {
+                            self.show_worktree_row(ui, row, th);
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn show_worktree_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &crate::kanban::WorktreeRow,
+        th: &crate::theme::Theme,
+    ) {
+        use crate::kanban::RowOwner;
+        #[cfg(test)]
+        {
+            self.wt_rows_drawn.push(row.name());
+        }
+        let missing = row.status.is_some_and(|s| s.missing);
+        let color = if missing {
+            th.dim
+        } else if row.attention {
+            th.danger
+        } else {
+            th.text
+        };
+        ui.add(egui::Label::new(
+            egui::RichText::new(&row.wt.branch).monospace().color(color),
+        ))
+        .on_hover_text(&row.wt.path);
+        ui.vertical(|ui| match &row.owner {
+            RowOwner::Card {
+                id,
+                state,
+                title,
+                version,
+                ..
+            } => {
+                let mut head = format!("{id} · {}", column_title(*state));
+                if let Some(v) = version {
+                    head.push_str(&format!(" · {v}"));
+                }
+                ui.label(egui::RichText::new(head).color(th.dim));
+                ui.add(egui::Label::new(title.as_str()).truncate());
+            }
+            RowOwner::None => {
+                ui.label(egui::RichText::new("no card").color(th.danger));
+                ui.label(egui::RichText::new(row.name()).color(th.dim));
+            }
+        });
+        let line = match row.status {
+            None => "not polled yet".to_owned(),
+            Some(s) => {
+                let mut l = format!("+{} -{}", s.ahead, s.behind);
+                if s.dirty {
+                    l.push_str(" · uncommitted changes");
+                }
+                if s.missing {
+                    l.push_str(" · directory missing");
+                }
+                l
+            }
+        };
+        ui.label(
+            egui::RichText::new(line)
+                .monospace()
+                .color(if row.attention { th.danger } else { th.dim }),
+        );
+        let name = row.name();
+        #[cfg(test)]
+        let mut probe = |label: &'static str, r: &egui::Response| {
+            self.wt_btn_rects.push((name.clone(), label, r.rect));
+        };
+        #[cfg(not(test))]
+        let mut probe = |_: &'static str, _: &egui::Response| {};
+        ui.horizontal(|ui| match &row.owner {
+            RowOwner::Card { id, terminal, .. } => {
+                let r = ui.button("Open card");
+                probe("Open card", &r);
+                if r.clicked() {
+                    self.selected = Some(id.clone());
+                    self.picker = None;
+                }
+                if let Some(t) = terminal {
+                    let r = ui.button("Open terminal");
+                    probe("Open terminal", &r);
+                    if r.clicked() {
+                        self.acts.push(BoardAct::JumpTo(t.clone()));
+                    }
+                }
+            }
+            RowOwner::None => {
+                let r = ui
+                    .button("Remove")
+                    .on_hover_text("git worktree remove: refuses uncommitted or unmerged work");
+                probe("Remove", &r);
+                if r.clicked() {
+                    self.acts.push(BoardAct::RemoveStray(row.wt.clone()));
+                }
+                let r = ui
+                    .button(egui::RichText::new("Discard").color(th.danger))
+                    .on_hover_text("Force-removes the tree and branch, including unmerged work");
+                probe("Discard", &r);
+                if r.clicked() {
+                    self.acts.push(BoardAct::DiscardStray(row.wt.clone()));
+                }
+            }
+        });
+    }
+
     fn show_details(
         &mut self,
         ui: &mut egui::Ui,
@@ -2249,5 +2504,129 @@ mod tests {
             Some(id.as_str()),
             "the picker must survive into the next frame too"
         );
+    }
+
+    /// The strip exists only when a foreman worktree does; clicking it opens
+    /// the page; Open card opens the detail page; and once that page is
+    /// left (Back clears `selected`) the Worktrees page is what shows.
+    #[test]
+    fn worktree_strip_opens_the_page_and_a_card_opened_from_it_returns_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        store.borrow_mut().add("plain", None).unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("wt-strip");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.strip_text.is_none(), "no worktree: no strip");
+
+        let id = store.borrow_mut().add("with tree", None).unwrap();
+        let wt = crate::kanban::Worktree {
+            path: format!("H:/repo/.foreman/worktrees/{id}"),
+            branch: format!("card/{id}"),
+            base: "main".into(),
+        };
+        store
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Running,
+                Some(wt),
+            )
+            .unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.strip_text.as_deref(), Some("1 worktree"));
+        assert!(!board.worktrees_open);
+
+        let strip_pos = egui::pos2(rect.center().x, rect.max.y - STRIP_H / 2.0);
+        click_at(&ctx, &mut board, rect, base, strip_pos);
+        assert!(board.worktrees_open, "clicking the strip opens the page");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.wt_rows_drawn, vec![id.clone()]);
+        assert!(board.strip_text.is_none(), "the page draws no strip");
+
+        let open = board
+            .wt_btn_rects
+            .iter()
+            .find(|(n, l, _)| n == &id && *l == "Open card")
+            .map(|(_, _, r)| r.center())
+            .expect("Open card button drawn");
+        click_at(&ctx, &mut board, rect, base, open);
+        assert_eq!(board.selected.as_deref(), Some(id.as_str()));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(
+            board.wt_rows_drawn.is_empty(),
+            "the detail page wins over the page"
+        );
+        // What Back does: clear `selected`; the page is still open beneath.
+        board.selected = None;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.worktrees_open);
+        assert_eq!(board.wt_rows_drawn, vec![id.clone()]);
+        assert!(board.acts.is_empty());
+    }
+
+    /// A stray (no card) shows on the strip and the page, and its two
+    /// buttons record the two acts with the tree attached.
+    #[test]
+    fn stray_rows_offer_remove_and_discard_and_record_the_acts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let wt = crate::kanban::Worktree {
+            path: "H:/repo/.foreman/worktrees/qq1".into(),
+            branch: "card/qq1".into(),
+            base: "main".into(),
+        };
+        store.borrow_mut().set_worktree_statuses(
+            Default::default(),
+            vec![crate::kanban::StrayWorktree {
+                wt: wt.clone(),
+                status: Some(crate::kanban::WorktreeStatus {
+                    dirty: true,
+                    ..Default::default()
+                }),
+            }],
+        );
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("stray");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.strip_text.as_deref(),
+            Some("1 worktree · 1 dirty · 1 no card")
+        );
+        board.worktrees_open = true;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.wt_rows_drawn, vec!["qq1".to_string()]);
+        let btn = |board: &BoardView, label: &str| {
+            board
+                .wt_btn_rects
+                .iter()
+                .find(|(n, l, _)| n == "qq1" && *l == label)
+                .map(|(_, _, r)| r.center())
+                .unwrap_or_else(|| panic!("{label} drawn"))
+        };
+        assert!(
+            !board.wt_btn_rects.iter().any(|(_, l, _)| *l == "Open card"),
+            "a stray has no card to open"
+        );
+        let remove = btn(&board, "Remove");
+        click_at(&ctx, &mut board, rect, base, remove);
+        match board.acts.pop() {
+            Some(BoardAct::RemoveStray(got)) => assert_eq!(got, wt),
+            _ => panic!("Remove records RemoveStray"),
+        }
+        let discard = btn(&board, "Discard");
+        click_at(&ctx, &mut board, rect, base, discard);
+        match board.acts.pop() {
+            Some(BoardAct::DiscardStray(got)) => assert_eq!(got, wt),
+            _ => panic!("Discard records DiscardStray"),
+        }
+        assert!(board.acts.is_empty());
     }
 }

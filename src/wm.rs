@@ -485,6 +485,8 @@ enum CloseTarget {
     /// Force-remove card `id`'s worktree and branch (the human-only Discard
     /// action; spec: dispatch-worktrees §Teardown).
     DiscardWorktree(String),
+    /// Force-remove a worktree no card owns (Worktrees page Discard).
+    DiscardStray(crate::kanban::Worktree),
 }
 
 /// Results from the worktree background threads (teardown, status poll),
@@ -494,7 +496,10 @@ enum WorktreeMsg {
         id: String,
         outcome: crate::kanban::TeardownOutcome,
     },
-    Status(std::collections::HashMap<String, crate::kanban::WorktreeStatus>),
+    Status {
+        map: std::collections::HashMap<String, crate::kanban::WorktreeStatus>,
+        strays: Vec<crate::kanban::StrayWorktree>,
+    },
 }
 
 /// A teardown waiting for its moment. `held_by` names the terminal that
@@ -2234,6 +2239,34 @@ impl WindowManager {
                         ),
                     });
                 }
+                crate::board::BoardAct::RemoveStray(wt) => {
+                    // No card, so no holding terminal to wait for; git's
+                    // own refusal (dirty, unmerged, held directory) toasts.
+                    let id = crate::kanban::worktree_dir_name(&wt);
+                    self.queue_teardown(PendingTeardown {
+                        id,
+                        wt,
+                        held_by: None,
+                        force: false,
+                    });
+                }
+                crate::board::BoardAct::DiscardStray(wt) => {
+                    if self.overlay_blocks_close() {
+                        continue;
+                    }
+                    self.pending_close = Some(PendingClose {
+                        target: CloseTarget::DiscardStray(wt.clone()),
+                        view: crate::confirm::ConfirmClose::new(
+                            "Discard worktree?",
+                            format!(
+                                "Deletes {} and branch {}, including any uncommitted or unmerged work.",
+                                wt.path, wt.branch
+                            ),
+                            "Discard",
+                            Vec::new(),
+                        ),
+                    });
+                }
                 crate::board::BoardAct::Cut(name) => match self.kanban_cut(&name) {
                     Ok(out) => crate::notify::queue(
                         ctx,
@@ -2617,8 +2650,8 @@ impl WindowManager {
         }
         while let Ok(msg) = self.worktree_rx.try_recv() {
             match msg {
-                WorktreeMsg::Status(map) => {
-                    self.kanban.borrow_mut().set_worktree_statuses(map);
+                WorktreeMsg::Status { map, strays } => {
+                    self.kanban.borrow_mut().set_worktree_statuses(map, strays);
                 }
                 WorktreeMsg::Teardown { id, outcome } => {
                     use crate::kanban::TeardownOutcome::*;
@@ -2694,7 +2727,19 @@ impl WindowManager {
                             .map(|st| (id.clone(), st))
                     })
                     .collect();
-                let _ = tx.send(WorktreeMsg::Status(map));
+                // Foreman trees no card in the snapshot owns (Worktrees
+                // page). Not a repository = none; a stray whose probe
+                // errored shows its branch alone.
+                let strays = crate::kanban::foreman_worktrees_now(&cwd)
+                    .map(|listed| crate::kanban::strays_among(listed, &batch))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|wt| {
+                        let status = crate::kanban::worktree_status_now(&cwd, &wt).ok();
+                        crate::kanban::StrayWorktree { wt, status }
+                    })
+                    .collect();
+                let _ = tx.send(WorktreeMsg::Status { map, strays });
                 ctx.request_repaint();
             });
         }
@@ -4188,6 +4233,15 @@ impl WindowManager {
                                 force: true,
                             });
                         }
+                    }
+                    CloseTarget::DiscardStray(wt) => {
+                        let id = crate::kanban::worktree_dir_name(&wt);
+                        self.queue_teardown(PendingTeardown {
+                            id,
+                            wt,
+                            held_by: None,
+                            force: true,
+                        });
                     }
                 }
                 // Close (and quit-accept) are structural; empty desktop after
@@ -14581,5 +14635,46 @@ mod tests {
             .clone();
         assert_eq!(card.state, crate::kanban::CardState::Backlog);
         assert!(card.claim.is_none());
+    }
+
+    /// Worktrees page cleanup for a tree no card owns: Remove queues the
+    /// non-forcing teardown straight away (nothing holds it); Discard goes
+    /// through the confirm and coalesces into one forcing entry.
+    #[test]
+    fn stray_remove_queues_a_plain_teardown_and_discard_confirms_into_a_forcing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let ctx = egui::Context::default();
+        let child = m.project_child_mut(pid).unwrap();
+        let wt = crate::kanban::Worktree {
+            path: "/x/.foreman/worktrees/qq1".into(),
+            branch: "card/qq1".into(),
+            base: "main".into(),
+        };
+        push_board_act(child, crate::board::BoardAct::RemoveStray(wt.clone()));
+        child.drain_board_acts(&ctx);
+        assert_eq!(child.pending_teardowns.len(), 1);
+        assert_eq!(child.pending_teardowns[0].id, "qq1");
+        assert_eq!(child.pending_teardowns[0].wt, wt);
+        assert!(!child.pending_teardowns[0].force);
+        assert!(child.pending_teardowns[0].held_by.is_none());
+
+        push_board_act(child, crate::board::BoardAct::DiscardStray(wt.clone()));
+        child.drain_board_acts(&ctx);
+        assert!(
+            matches!(
+                child.pending_close.as_ref().map(|p| &p.target),
+                Some(CloseTarget::DiscardStray(w)) if *w == wt
+            ),
+            "Discard asks first"
+        );
+        child.resolve_pending(crate::confirm::ConfirmOutcome::Confirmed);
+        assert_eq!(
+            child.pending_teardowns.len(),
+            1,
+            "coalesced, not duplicated"
+        );
+        assert!(child.pending_teardowns[0].force);
     }
 }
