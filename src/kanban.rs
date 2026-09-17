@@ -986,6 +986,12 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         ));
     }
     out.push_str("# Close-out (required)\n");
+    // The card trailer (spec: kanban-cut §The card trailer): the only
+    // per-commit signal that survives rebase and squash, read back at Cut.
+    out.push_str(&format!(
+        "End every commit message with the trailer line:    Card: {id}\n",
+        id = card.id
+    ));
     if let Some(wt) = &card.worktree {
         // `{root}` is quoted: this repo's own path has a space in it.
         out.push_str(&format!(
@@ -1287,6 +1293,41 @@ pub fn worktree_status_now(
         &["rev-list", "--left-right", "--count", &range],
     )?;
     Ok(parse_status(porcelain.as_deref(), &rev_list))
+}
+
+/// Commits reachable from HEAD, committed since `since` (RFC3339), carrying
+/// a `Card:` trailer — bucketed by card id, oldest first (spec §Cut step 6).
+/// Fail-open: any git failure (no git, not a repo, no commits) is an empty
+/// map, never an error. A project without git still Cuts, just without
+/// commits.
+pub fn trailer_commits(
+    cwd: &std::path::Path,
+    since: &str,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let since = format!("--since={since}");
+    match git(
+        cwd,
+        &[
+            "log",
+            "HEAD",
+            &since,
+            "--format=%h%x09%(trailers:key=Card,valueonly,separator=%x2C)",
+        ],
+    ) {
+        Ok(text) => parse_trailer_log(&text),
+        Err(_) => Default::default(),
+    }
+}
+
+/// Newest `v*` tag by version order, for the Cut field's prefill (spec
+/// §Cut, Board). Fail-open: no git, no repo, or no tags is `None`.
+pub fn latest_v_tag(cwd: &std::path::Path) -> Option<String> {
+    git(cwd, &["tag", "-l", "v*", "--sort=-v:refname"])
+        .ok()?
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Spec §Teardown outcome table.
@@ -1671,6 +1712,7 @@ mod tests {
              Resize flickers on Up-arrow.\n\
              \n\
              # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    foreman kanban done a3f8k2\n\
              If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
              Do not end the session without running one of these."
@@ -1690,6 +1732,7 @@ mod tests {
              \n\
              \n\
              # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    foreman kanban done a3f8k2\n\
              If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
              Do not end the session without running one of these."
@@ -1709,6 +1752,7 @@ mod tests {
              Resize flickers on Up-arrow.\n\
              \n\
              # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n\
              If you are stuck and need a human: & $env:FOREMAN_EXE kanban block a3f8k2 --reason \"<one line>\"\n\
              (bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n\
@@ -1729,6 +1773,7 @@ mod tests {
              \n\
              \n\
              # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n\
              If you are stuck and need a human: & $env:FOREMAN_EXE kanban block a3f8k2 --reason \"<one line>\"\n\
              (bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n\
@@ -2045,6 +2090,55 @@ mod tests {
         assert_eq!(st.ahead, 2);
     }
 
+    #[test]
+    fn trailer_commits_reads_real_trailers_oldest_first() {
+        let Some(repo) = git_repo() else { return };
+        git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "one\n\nCard: a1b2c3"],
+        );
+        let one = git_in(repo.path(), &["rev-parse", "--short", "HEAD"]);
+        git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "two, no trailer"],
+        );
+        git_in(
+            repo.path(),
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "three\n\nCard: a1b2c3\nCard: d4e5f6",
+            ],
+        );
+        let three = git_in(repo.path(), &["rev-parse", "--short", "HEAD"]);
+        let m = trailer_commits(repo.path(), "2000-01-01T00:00:00Z");
+        assert_eq!(m.get("a1b2c3").unwrap(), &vec![one, three.clone()]);
+        assert_eq!(m.get("d4e5f6").unwrap(), &vec![three]);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn trailer_commits_and_latest_tag_fail_open_outside_a_repo() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(trailer_commits(tmp.path(), "2000-01-01T00:00:00Z").is_empty());
+        assert_eq!(latest_v_tag(tmp.path()), None);
+    }
+
+    #[test]
+    fn latest_v_tag_picks_the_highest_version() {
+        let Some(repo) = git_repo() else { return };
+        assert_eq!(latest_v_tag(repo.path()), None);
+        git_in(repo.path(), &["tag", "v0.9.0"]);
+        git_in(repo.path(), &["tag", "v0.10.0"]);
+        git_in(repo.path(), &["tag", "release-1"]);
+        assert_eq!(latest_v_tag(repo.path()).as_deref(), Some("v0.10.0"));
+    }
+
     // --- dispatch-worktrees: schema, naming, status, list lines ---
 
     #[test]
@@ -2066,6 +2160,7 @@ mod tests {
              Leave .foreman/ untouched and never stage it.\n\
              \n\
              # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
              Integrate first, from inside your worktree:\n\
              \x20   git rebase main\n\
              \x20   git -C \"H:/repo\" merge --ff-only card/a3f8k2\n\
