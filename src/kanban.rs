@@ -405,6 +405,26 @@ pub struct CardStore {
     status_inflight: bool,
 }
 
+/// What one Cut did (spec §Cut step 9). `held_back` is `(id, reason)` for
+/// candidates left in Current.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CutOutcome {
+    pub name: String,
+    pub shipped: Vec<String>,
+    pub held_back: Vec<(String, String)>,
+}
+
+impl CutOutcome {
+    /// The reply/toast lines: the summary, then one line per held-back card.
+    pub fn lines(&self) -> Vec<String> {
+        let mut v = vec![format!("cut {}: {} cards", self.name, self.shipped.len())];
+        for (id, why) in &self.held_back {
+            v.push(format!("{id} stayed in Current ({why})"));
+        }
+        v
+    }
+}
+
 impl CardStore {
     /// Point the store at `<project_cwd>/.foreman/tasks` (or clear it).
     /// Idempotent — safe to call every tick; only reloads when the resolved
@@ -769,6 +789,131 @@ impl CardStore {
         std::fs::remove_file(&path).map_err(|_| format!("no such card: {id}"))?;
         self.cards.retain(|c| c.id != id);
         self.fingerprint = fingerprint_of(Some(&dir));
+        Ok(())
+    }
+
+    /// Cut (spec §Cut). Everything is judged against the files (`reload`
+    /// first, like `add`), all validation runs before the first write, and a
+    /// failed write reverts the cards already stamped. The two facts that
+    /// need the project are injected so this store never runs git:
+    /// `hold` is asked about each candidate that still carries a worktree
+    /// and answers `Some(reason)` to leave it in Current; `commits` maps
+    /// the surviving candidates' ids to their trailer shas.
+    pub fn cut(
+        &mut self,
+        name: &str,
+        hold: impl Fn(&Card) -> Option<String>,
+        commits: impl FnOnce(&[Card]) -> std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<CutOutcome, String> {
+        let dir = self.dir_or_err()?.to_path_buf();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("cut needs a version name".into());
+        }
+        if same_name(name, CURRENT) {
+            return Err(format!(
+                "{CURRENT} is the live Done column, not a version name"
+            ));
+        }
+        self.reload();
+        if self
+            .cards
+            .iter()
+            .any(|c| c.shipped.as_ref().is_some_and(|s| same_name(&s.name, name)))
+        {
+            return Err(format!(
+                "version {name} already exists; uncut it first or pick a new name"
+            ));
+        }
+        let candidates: Vec<Card> = self
+            .cards
+            .iter()
+            .filter(|c| c.state == CardState::Done && c.shipped.is_none())
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Err("nothing in Done to cut".into());
+        }
+        let mut held_back = Vec::new();
+        let mut keep: Vec<Card> = Vec::new();
+        for c in candidates {
+            // Only a card with a worktree can be provably unmerged; one
+            // worked in the main checkout is always a candidate.
+            let why = if c.worktree.is_some() { hold(&c) } else { None };
+            match why {
+                Some(why) => held_back.push((c.id.clone(), why)),
+                None => keep.push(c),
+            }
+        }
+        if keep.is_empty() {
+            return Err("no card in Done is merged; nothing to cut".into());
+        }
+        let mut by_id = commits(&keep);
+        let at = now_stamp();
+        let originals = keep.clone();
+        for c in &mut keep {
+            c.shipped = Some(Shipped {
+                name: name.to_string(),
+                at: at.clone(),
+                commits: by_id.remove(&c.id).unwrap_or_default(),
+            });
+            c.updated = at.clone();
+        }
+        if let Err((i, e)) = self.write_batch(&dir, &keep) {
+            // `originals[..i]` were rewritten with the stamp; put them back.
+            // `keep[i]` never landed (tmp write or rename failed).
+            let revert = self.write_batch(&dir, &originals[..i]);
+            self.reload();
+            let failed = &keep[i].id;
+            return Err(match revert {
+                Ok(()) => format!("cut {name} failed on {failed}: {e}; nothing shipped"),
+                Err((j, e2)) => format!(
+                    "cut {name} failed on {failed}: {e}; revert also failed on {}: {e2}; run uncut {name}",
+                    originals[j].id
+                ),
+            });
+        }
+        self.reload();
+        Ok(CutOutcome {
+            name: name.to_string(),
+            shipped: keep.iter().map(|c| c.id.clone()).collect(),
+            held_back,
+        })
+    }
+
+    /// Uncut (spec §Uncut): clear `shipped` on every card in the Version,
+    /// case-insensitively. They reappear in Current Done.
+    pub fn uncut(&mut self, name: &str) -> Result<usize, String> {
+        let dir = self.dir_or_err()?.to_path_buf();
+        self.reload();
+        let mut cards: Vec<Card> = self
+            .cards
+            .iter()
+            .filter(|c| c.shipped.as_ref().is_some_and(|s| same_name(&s.name, name)))
+            .cloned()
+            .collect();
+        if cards.is_empty() {
+            return Err(format!("no version named {name}"));
+        }
+        let now = now_stamp();
+        for c in &mut cards {
+            c.shipped = None;
+            c.updated = now.clone();
+        }
+        let n = cards.len();
+        let res = self.write_batch(&dir, &cards);
+        self.reload();
+        res.map_err(|(i, e)| format!("uncut {name} failed on {}: {e}", cards[i].id))?;
+        Ok(n)
+    }
+
+    /// Write cards in order; stop at the first failure and say which index.
+    /// One `reload` afterwards (the callers') replaces N per-card
+    /// fingerprint scans.
+    fn write_batch(&self, dir: &std::path::Path, cards: &[Card]) -> Result<(), (usize, String)> {
+        for (i, c) in cards.iter().enumerate() {
+            self.write_card(dir, c).map_err(|e| (i, e))?;
+        }
         Ok(())
     }
 }
@@ -2155,6 +2300,250 @@ mod tests {
         assert_eq!(m.get("x2").unwrap(), &vec!["aaa".to_string()]);
         assert_eq!(m.len(), 2);
         assert!(parse_trailer_log("").is_empty());
+    }
+
+    /// Add a card, claim it as if dispatched (no live terminal needed), and
+    /// close it out — the only legal road to Done.
+    fn add_done(s: &mut CardStore, title: &str, wt: Option<Worktree>) -> String {
+        let id = s.add(title, None).unwrap();
+        s.claim_for_dispatch(&id, "t1", "claude", run_nonce(), TermState::Missing, wt)
+            .unwrap();
+        s.done(&id).unwrap();
+        id
+    }
+
+    fn no_hold(_: &Card) -> Option<String> {
+        None
+    }
+
+    fn no_commits(_: &[Card]) -> std::collections::HashMap<String, Vec<String>> {
+        Default::default()
+    }
+
+    #[test]
+    fn cut_stamps_every_ungrouped_done_card_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let backlog = s.add("stays", None).unwrap();
+        let a = add_done(&mut s, "a", None);
+        let b = add_done(&mut s, "b", None);
+        let out = s.cut(" v1 ", no_hold, no_commits).unwrap();
+        assert_eq!(out.name, "v1");
+        let mut shipped = out.shipped.clone();
+        shipped.sort();
+        let mut want = vec![a.clone(), b.clone()];
+        want.sort();
+        assert_eq!(shipped, want);
+        assert!(out.held_back.is_empty());
+        assert_eq!(out.lines(), vec!["cut v1: 2 cards".to_string()]);
+
+        let sa = s.get(&a).unwrap().shipped.clone().unwrap();
+        let sb = s.get(&b).unwrap().shipped.clone().unwrap();
+        assert_eq!(sa.name, "v1");
+        assert_eq!(sa.at, sb.at, "one stamp for the whole Cut");
+        assert_eq!(s.get(&a).unwrap().updated, sa.at);
+        assert_eq!(s.get(&a).unwrap().state, CardState::Done);
+        assert!(s.get(&backlog).unwrap().shipped.is_none());
+        // the files agree with memory
+        let mut fresh = store_at(tmp.path());
+        fresh.reload();
+        assert_eq!(fresh.get(&a).unwrap().shipped, Some(sa));
+    }
+
+    #[test]
+    fn cut_refuses_empty_done_blank_current_and_duplicate_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let e = s.cut("v1", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("nothing in Done"), "{e}");
+        add_done(&mut s, "a", None);
+        let e = s.cut("   ", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("name"), "{e}");
+        let e = s.cut("current", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("Current"), "{e}");
+        s.cut("v1", no_hold, no_commits).unwrap();
+        add_done(&mut s, "b", None);
+        let e = s.cut("V1", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn cut_holds_back_unmerged_worktree_cards_and_reports_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let a = add_done(&mut s, "merged", None);
+        let b = add_done(&mut s, "stranded", Some(sample_worktree()));
+        let hold = |c: &Card| Some(format!("unmerged {}", c.worktree.as_ref().unwrap().branch));
+        let out = s.cut("v1", hold, no_commits).unwrap();
+        assert_eq!(out.shipped, vec![a.clone()]);
+        assert_eq!(
+            out.held_back,
+            vec![(b.clone(), "unmerged card/a3f8k2".to_string())]
+        );
+        assert_eq!(
+            out.lines(),
+            vec![
+                "cut v1: 1 cards".to_string(),
+                format!("{b} stayed in Current (unmerged card/a3f8k2)"),
+            ]
+        );
+        assert!(s.get(&b).unwrap().shipped.is_none());
+        assert!(s.get(&a).unwrap().shipped.is_some());
+    }
+
+    #[test]
+    fn cut_with_every_candidate_held_back_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let b = add_done(&mut s, "stranded", Some(sample_worktree()));
+        let card_path = tmp
+            .path()
+            .join(".foreman")
+            .join("tasks")
+            .join(format!("{b}.json"));
+        let before = std::fs::read_to_string(&card_path).unwrap();
+        let e = s
+            .cut("v1", |_| Some("unmerged".into()), no_commits)
+            .unwrap_err();
+        assert!(e.contains("nothing to cut"), "{e}");
+        let after = std::fs::read_to_string(&card_path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn cut_attaches_commits_from_the_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let a = add_done(&mut s, "a", None);
+        let b = add_done(&mut s, "b", None);
+        let a2 = a.clone();
+        let commits = move |cards: &[Card]| {
+            assert_eq!(cards.len(), 2, "the lookup sees the surviving candidates");
+            let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
+            m.insert(a2.clone(), vec!["abc1234".into(), "def5678".into()]);
+            m
+        };
+        s.cut("v1", no_hold, commits).unwrap();
+        assert_eq!(
+            s.get(&a).unwrap().shipped.as_ref().unwrap().commits,
+            vec!["abc1234".to_string(), "def5678".to_string()]
+        );
+        assert!(
+            s.get(&b)
+                .unwrap()
+                .shipped
+                .as_ref()
+                .unwrap()
+                .commits
+                .is_empty()
+        );
+        let text = std::fs::read_to_string(
+            tmp.path()
+                .join(".foreman")
+                .join("tasks")
+                .join(format!("{b}.json")),
+        )
+        .unwrap();
+        assert!(!text.contains("commits"), "{text}");
+    }
+
+    #[test]
+    fn cut_reverts_when_a_write_fails_midway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        add_done(&mut s, "a", None);
+        add_done(&mut s, "b", None);
+        add_done(&mut s, "c", None);
+        // `write_card` stages `<id>.json.tmp`; a DIRECTORY at that path makes
+        // the second candidate's write fail after the first succeeded.
+        let victim = s.cards()[1].id.clone();
+        std::fs::create_dir(
+            tmp.path()
+                .join(".foreman")
+                .join("tasks")
+                .join(format!("{victim}.json.tmp")),
+        )
+        .unwrap();
+        let e = s.cut("v1", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("nothing shipped"), "{e}");
+        assert!(e.contains(&victim), "{e}");
+        let mut fresh = store_at(tmp.path());
+        fresh.reload();
+        assert!(
+            fresh.cards().iter().all(|c| c.shipped.is_none()),
+            "no card may be left stamped"
+        );
+        assert!(s.cards().iter().all(|c| c.shipped.is_none()));
+    }
+
+    #[test]
+    fn cut_reloads_before_judging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let a = add_done(&mut s, "a", None);
+        // Dropped on disk behind the store's back (a pull, another writer).
+        let dir = tmp.path().join(".foreman").join("tasks");
+        std::fs::write(
+            dir.join("zz0002.json"),
+            r#"{"v":1,"id":"zz0002","title":"t","state":"done","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("zz0003.json"),
+            r#"{"v":1,"id":"zz0003","title":"t","state":"done","shipped":{"name":"v2","at":"2026-09-01T00:00:00Z"},"created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#,
+        )
+        .unwrap();
+        let e = s.cut("V2", no_hold, no_commits).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        let out = s.cut("v3", no_hold, no_commits).unwrap();
+        let mut got = out.shipped.clone();
+        got.sort();
+        let mut want = vec![a, "zz0002".to_string()];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn uncut_clears_the_version_case_insensitively_and_refuses_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let a = add_done(&mut s, "a", None);
+        let b = add_done(&mut s, "b", None);
+        s.cut("v1", no_hold, no_commits).unwrap();
+        let at = s.get(&a).unwrap().shipped.as_ref().unwrap().at.clone();
+        assert_eq!(s.uncut("V1").unwrap(), 2);
+        assert!(s.get(&a).unwrap().shipped.is_none());
+        assert!(s.get(&b).unwrap().shipped.is_none());
+        assert!(s.get(&a).unwrap().updated >= at);
+        assert_eq!(s.get(&a).unwrap().state, CardState::Done);
+        let e = s.uncut("v1").unwrap_err();
+        assert!(e.contains("no version"), "{e}");
+    }
+
+    #[test]
+    fn already_shipped_cards_survive_a_later_cut() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let a = add_done(&mut s, "a", None);
+        s.cut("v1", no_hold, no_commits).unwrap();
+        let c = add_done(&mut s, "c", None);
+        let out = s.cut("v2", no_hold, no_commits).unwrap();
+        assert_eq!(out.shipped, vec![c.clone()]);
+        assert_eq!(s.get(&a).unwrap().shipped.as_ref().unwrap().name, "v1");
+        assert_eq!(s.get(&c).unwrap().shipped.as_ref().unwrap().name, "v2");
+    }
+
+    #[test]
+    fn clear_worktree_on_a_shipped_card_keeps_shipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store_at(tmp.path());
+        let b = add_done(&mut s, "b", Some(sample_worktree()));
+        s.cut("v1", no_hold, no_commits).unwrap();
+        let before = s.get(&b).unwrap().shipped.clone().unwrap();
+        s.clear_worktree(&b).unwrap();
+        let card = s.get(&b).unwrap();
+        assert!(card.worktree.is_none());
+        assert_eq!(card.shipped.as_ref(), Some(&before));
     }
 
     #[test]
