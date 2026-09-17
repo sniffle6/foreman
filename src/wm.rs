@@ -2503,11 +2503,10 @@ impl WindowManager {
             }
         };
         let commits = move |cards: &[crate::kanban::Card]| {
-            let since = cards
-                .iter()
-                .map(|c| c.created.as_str())
-                .min()
-                .unwrap_or("1970-01-01T00:00:00Z");
+            // No candidates, no walk — see `oldest_created`.
+            let Some(since) = oldest_created(cards) else {
+                return Default::default();
+            };
             crate::kanban::trailer_commits(&cwd, since)
         };
         self.kanban.borrow_mut().cut(name, hold, commits)
@@ -7049,6 +7048,19 @@ fn source_matches_icon(
 ) -> bool {
     icon.agent_label()
         .is_none_or(|label| label == source.label())
+}
+
+/// The `--since` bound for a Cut's trailer walk: the OLDEST candidate's
+/// `created` (spec: kanban-cut §Cut step 6), so every commit that could
+/// carry any candidate's `Card:` trailer is in range. RFC3339 timestamps
+/// sort lexically, so `min` is the chronological oldest.
+///
+/// `None` for an empty set. There is no safe timestamp to fall back on: a
+/// sentinel like the epoch would walk the project's whole history to build
+/// a map for zero cards, which is the expensive wrong answer rather than a
+/// cautious one.
+fn oldest_created(cards: &[crate::kanban::Card]) -> Option<&str> {
+    cards.iter().map(|c| c.created.as_str()).min()
 }
 
 /// Parse a "p3"-style Project id.
@@ -13922,6 +13934,89 @@ mod tests {
         let lines = m.kanban_dispatch(&done_only).unwrap().history.unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
         let _ = (a, b);
+    }
+
+    /// The hold-back probe fails CLOSED: a Done card whose worktree git
+    /// cannot answer about stays in Current, unstamped, while its merged
+    /// neighbour ships. The tempdir is not a repo, so `worktree_status_now`
+    /// errors — the same verdict a lock, a missing git, or a bad ref gives.
+    #[test]
+    fn kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(tmp.path()));
+        let (unprobeable, clean) = {
+            let mut s = child.kanban.borrow_mut();
+            let mut done = |title: &str, wt: Option<crate::kanban::Worktree>| {
+                let id = s.add(title, None).unwrap();
+                s.claim_for_dispatch(
+                    &id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    wt,
+                )
+                .unwrap();
+                s.done(&id).unwrap();
+                id
+            };
+            let unprobeable = done(
+                "in a tree nobody can inspect",
+                Some(crate::kanban::Worktree {
+                    path: tmp.path().join("no-such-tree").to_string_lossy().into(),
+                    branch: "card/ghost".into(),
+                    base: "main".into(),
+                }),
+            );
+            // No worktree: never probed, always a candidate.
+            let clean = done("worked in the main checkout", None);
+            (unprobeable, clean)
+        };
+
+        let out = child.kanban_cut("v1").unwrap();
+        assert_eq!(out.shipped, vec![clean.clone()]);
+        assert_eq!(out.held_back.len(), 1, "{out:?}");
+        assert_eq!(out.held_back[0].0, unprobeable);
+        assert!(
+            out.held_back[0].1.starts_with("cannot verify worktree"),
+            "{out:?}"
+        );
+        assert_eq!(out.lines().len(), 2, "{out:?}");
+        // The held card is still in Current Done, unstamped; the other shipped.
+        let s = child.kanban.borrow();
+        assert!(s.get(&unprobeable).unwrap().shipped.is_none());
+        assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
+    }
+
+    /// The trailer walk's `--since` bound is the EARLIEST candidate's
+    /// `created` — a `max` here would silently drop the older card's
+    /// commits from its Version.
+    #[test]
+    fn oldest_created_bounds_the_trailer_walk_at_the_earliest_card() {
+        let card = |created: &str| {
+            crate::kanban::Card::new(
+                format!("id{created}"),
+                "t".into(),
+                None,
+                created.to_string(),
+            )
+        };
+        let newer = card("2026-09-16T12:00:00Z");
+        let older = card("2026-09-14T03:00:00Z");
+        // Both orders: the answer is the timestamp, not the position.
+        assert_eq!(
+            oldest_created(&[newer.clone(), older.clone()]),
+            Some("2026-09-14T03:00:00Z")
+        );
+        assert_eq!(
+            oldest_created(&[older, newer]),
+            Some("2026-09-14T03:00:00Z")
+        );
+        // No candidates, no walk — the caller skips git entirely.
+        assert_eq!(oldest_created(&[]), None);
     }
 
     // --- board: view acts drained by the manager ---

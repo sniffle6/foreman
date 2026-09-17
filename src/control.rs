@@ -1616,6 +1616,12 @@ fn kanban_wait_with(
             action: "list".into(),
             project: project.clone(),
             json: true,
+            // `all` because a bare `list` hides shipped cards: a watched card
+            // Cut into a Version between two polls would vanish from the
+            // reply, and `wait_verdict` reads an absent id as "removed under
+            // the waiter" (exit 1) rather than Done (exit 0). The waiter
+            // filters by state itself, so the extra cards cost nothing.
+            all: true,
             ..Default::default()
         };
         match poll(&req) {
@@ -1779,6 +1785,49 @@ mod tests {
             assert_eq!(polls, 2, "{error}");
             assert_eq!(code, 2);
         }
+    }
+
+    #[test]
+    fn kanban_wait_asks_for_shipped_cards_so_a_cut_between_polls_still_reads_done() {
+        // Regression: a bare `list` hides shipped cards, so a card Cut while
+        // a waiter watched it disappeared from the reply and `wait_verdict`
+        // called it removed (exit 1) instead of Done (exit 0).
+        let mut card = crate::kanban::Card::new(
+            "abc123".into(),
+            "shipped between polls".into(),
+            None,
+            "2026-09-16T00:00:00Z".into(),
+        );
+        card.state = crate::kanban::CardState::Done;
+        card.shipped = Some(crate::kanban::Shipped {
+            name: "v1".into(),
+            at: "2026-09-16T01:00:00Z".into(),
+            commits: Vec::new(),
+        });
+        let line = crate::kanban::CardLine {
+            card,
+            orphaned: false,
+            worktree_status: None,
+        };
+        let mut polls = 0;
+        let code = kanban_wait_with(
+            None,
+            crate::kanban::WaitTarget::Id("abc123".into()),
+            None,
+            |req| {
+                polls += 1;
+                assert!(req.all, "the wait poll must include shipped cards");
+                assert!(req.json);
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(vec![line.json_line()]),
+                    ..Default::default()
+                })
+            },
+            |_| panic!("the first poll already decides"),
+        );
+        assert_eq!(polls, 1);
+        assert_eq!(code, 0);
     }
 
     #[test]
