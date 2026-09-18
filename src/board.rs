@@ -216,6 +216,11 @@ pub enum BoardAct {
     RemoveStray(crate::kanban::Worktree),
     /// Forcing teardown of a worktree no card owns; confirm first.
     DiscardStray(crate::kanban::Worktree),
+    /// Submit (or resubmit) a card's committed worktree to the repository
+    /// integration queue (spec: worktree-integration-queue).
+    Integrate(String),
+    /// Withdraw a card's integration request.
+    CancelIntegration(String),
     /// Cut the ungrouped Done cards into a Version (spec: kanban-cut §Cut).
     /// The manager owns the worktree probe and the trailer walk.
     Cut(String),
@@ -292,6 +297,10 @@ pub struct BoardView {
     /// button (Done/Blocked/orphaned card with a worktree).
     #[cfg(test)]
     pub(crate) offered_discard: bool,
+    /// Test probe: the integration buttons the last `show_details` frame
+    /// drew (`submit`, `resubmit`, `cancel`).
+    #[cfg(test)]
+    pub(crate) offered_integration: Vec<&'static str>,
 }
 
 impl BoardView {
@@ -335,6 +344,8 @@ impl BoardView {
             wt_btn_rects: Vec::new(),
             #[cfg(test)]
             offered_discard: false,
+            #[cfg(test)]
+            offered_integration: Vec::new(),
         }
     }
 
@@ -1005,22 +1016,45 @@ impl BoardView {
             title,
             th.text,
         );
-        let status = if orphaned {
-            "Session ended — restart or return to backlog".to_owned()
-        } else if let Some(reason) = &card.blocked_reason {
-            reason.clone()
-        } else if let Some(claim) = &card.claim {
-            match &claim.agent {
-                Some(agent) => format!("{agent} · {}", claim.terminal),
-                None => claim.terminal.clone(),
+        // The integration substate (spec: worktree-integration-queue) is
+        // the card's status while a request stands — queued, integrating,
+        // and needs resolution are what the human wants to see, not the
+        // claim. An ended Session is still said first: a submitted request
+        // survives its worker, and the human should know both.
+        let integration = self.store.borrow().integration(&card.id);
+        let status = match (&integration, orphaned) {
+            (Some(v), true) => format!("Session ended · integration {}", v.summary()),
+            (Some(v), false) => {
+                let s = v.summary();
+                let mut c = s.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => s,
+                }
             }
-        } else if card.state == crate::kanban::CardState::Done {
-            "Completed".to_owned()
-        } else {
-            "Ready to start".to_owned()
+            (None, true) => "Session ended — restart or return to backlog".to_owned(),
+            (None, false) => {
+                if let Some(reason) = &card.blocked_reason {
+                    reason.clone()
+                } else if let Some(claim) = &card.claim {
+                    match &claim.agent {
+                        Some(agent) => format!("{agent} · {}", claim.terminal),
+                        None => claim.terminal.clone(),
+                    }
+                } else if card.state == crate::kanban::CardState::Done {
+                    "Completed".to_owned()
+                } else {
+                    "Ready to start".to_owned()
+                }
+            }
         };
-        let status_color = if orphaned || card.blocked_reason.is_some() {
+        let needs_resolution = integration
+            .as_ref()
+            .is_some_and(|v| v.phase == crate::integrate::Phase::NeedsResolution);
+        let status_color = if orphaned || card.blocked_reason.is_some() || needs_resolution {
             th.danger
+        } else if integration.is_some() {
+            th.text
         } else {
             th.dim
         };
@@ -1358,6 +1392,7 @@ impl BoardView {
         #[cfg(test)]
         {
             self.offered_discard = false;
+            self.offered_integration.clear();
         }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -1444,13 +1479,96 @@ impl BoardView {
                     } else {
                         th.dim
                     }));
+                    // The integration queue (spec: worktree-integration-
+                    // queue): state, reason, next action, and the human's
+                    // two levers — submit/resubmit and cancel. Discard and
+                    // restart are refused by the manager while the queue
+                    // owns the tree, so the buttons are hidden then.
+                    let integration = self.store.borrow().integration(&card.id);
+                    let owned = integration.as_ref().is_some_and(|v| v.phase.owns_worktree());
+                    ui.add_space(12.0 * self.scale);
+                    ui.strong("Integration");
+                    match &integration {
+                        None => {
+                            ui.label(egui::RichText::new("Not submitted").color(th.dim));
+                        }
+                        Some(v) => {
+                            let bad = v.phase == crate::integrate::Phase::NeedsResolution;
+                            ui.label(
+                                egui::RichText::new(v.summary())
+                                    .color(if bad { th.danger } else { th.text }),
+                            );
+                            if let Some(d) = &v.detail {
+                                detail_text(ui, d);
+                            }
+                            if let Some(n) = &v.next {
+                                ui.label(
+                                    egui::RichText::new(format!("Next: {n}")).color(th.dim),
+                                );
+                            }
+                            if let Some(c) = &v.checks {
+                                ui.label(
+                                    egui::RichText::new(format!("Checks: {c}")).color(th.dim),
+                                );
+                            }
+                            if let Some(n) = &v.note {
+                                ui.label(egui::RichText::new(n.as_str()).color(th.dim));
+                            }
+                        }
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let submittable = card.state == crate::kanban::CardState::InProgress
+                            && integration.as_ref().is_none_or(|v| {
+                                v.phase == crate::integrate::Phase::NeedsResolution
+                            });
+                        if submittable {
+                            let label = if integration.is_some() {
+                                "Resubmit"
+                            } else {
+                                "Submit for integration"
+                            };
+                            #[cfg(test)]
+                            self.offered_integration.push(if integration.is_some() {
+                                "resubmit"
+                            } else {
+                                "submit"
+                            });
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Queue the committed worktree: Foreman rebases, checks, fast-forwards, and marks Done",
+                                )
+                                .clicked()
+                            {
+                                self.acts.push(BoardAct::Integrate(card.id.clone()));
+                            }
+                        }
+                        let cancellable = integration.as_ref().is_some_and(|v| {
+                            v.phase != crate::integrate::Phase::Integrated
+                        });
+                        if cancellable {
+                            #[cfg(test)]
+                            self.offered_integration.push("cancel");
+                            if ui
+                                .button("Cancel integration")
+                                .on_hover_text(
+                                    "Withdraw the request; a running turn stops at its next checkpoint",
+                                )
+                                .clicked()
+                            {
+                                self.acts.push(BoardAct::CancelIntegration(card.id.clone()));
+                            }
+                        }
+                    });
                     // Discard is human-only and only where no live worker
-                    // could be mid-write: Done, Blocked, or orphaned.
-                    let discardable = orphaned
-                        || matches!(
-                            card.state,
-                            crate::kanban::CardState::Done | crate::kanban::CardState::Blocked
-                        );
+                    // could be mid-write: Done, Blocked, or orphaned — and
+                    // never while the queue owns the tree.
+                    let discardable = !owned
+                        && (orphaned
+                            || matches!(
+                                card.state,
+                                crate::kanban::CardState::Done | crate::kanban::CardState::Blocked
+                            ));
                     if discardable {
                         #[cfg(test)]
                         {
@@ -1901,6 +2019,89 @@ mod tests {
         assert!(board.offered_discard, "Done + worktree must offer Discard");
         // Back on the board, the card face renders the summary line (no
         // status polled yet) without recording any act.
+        board.selected = None;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.acts.is_empty());
+    }
+
+    fn integration_view(phase: crate::integrate::Phase) -> crate::integrate::IntegrationView {
+        crate::integrate::IntegrationView {
+            phase,
+            commit: "c".into(),
+            position: Some(1),
+            stage: None,
+            reason: Some(crate::integrate::Reason::Conflict),
+            detail: Some("conflicts in: f.txt".into()),
+            next: Some("resolve".into()),
+            hold: None,
+            prepared: None,
+            checks: None,
+            note: None,
+            cancel_requested: false,
+        }
+    }
+
+    #[test]
+    fn detail_page_offers_submit_resubmit_and_cancel_by_integration_phase() {
+        use crate::integrate::Phase;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store.borrow_mut().add("card", None).unwrap();
+        let wt = crate::kanban::Worktree {
+            path: "H:/repo/.foreman/worktrees/x".into(),
+            branch: "card/x".into(),
+            base: "main".into(),
+        };
+        store
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                Some(wt),
+            )
+            .unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        board.selected = Some(id.clone());
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("integration");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let set = |phase: Option<Phase>| {
+            let mut map = std::collections::HashMap::new();
+            if let Some(p) = phase {
+                map.insert(id.clone(), integration_view(p));
+            }
+            store.borrow_mut().set_integration(map);
+        };
+        // In Progress, nothing submitted: Submit only
+        set(None);
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.offered_integration, vec!["submit"]);
+        // queued / integrating: Cancel only (the queue owns the tree)
+        for p in [Phase::Queued, Phase::Integrating] {
+            set(Some(p));
+            run_frame(&ctx, &mut board, rect, base, vec![]);
+            assert_eq!(board.offered_integration, vec!["cancel"], "{p:?}");
+            assert!(!board.offered_discard, "{p:?}: no Discard while owned");
+        }
+        // handed back: Resubmit and Cancel
+        set(Some(Phase::NeedsResolution));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.offered_integration, vec!["resubmit", "cancel"]);
+        // integrated (bookkeeping pending): nothing to press
+        set(Some(Phase::Integrated));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_integration.is_empty());
+        // Done: no submit either
+        set(None);
+        store.borrow_mut().done(&id).unwrap();
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_integration.is_empty());
+        assert!(board.offered_discard);
+        // the card face paints the substate without recording any act
+        set(Some(Phase::Queued));
         board.selected = None;
         run_frame(&ctx, &mut board, rect, base, vec![]);
         assert!(board.acts.is_empty());

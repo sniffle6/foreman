@@ -226,7 +226,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KanbanRequest {
     pub cmd: String,    // always "kanban"
-    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit" | "worktrees"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit" | "worktrees" | "integrate"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +255,10 @@ pub struct KanbanRequest {
     /// v1 requests stay byte-identical.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stray: bool,
+    /// `integrate --cancel`: withdraw the card's integration request
+    /// instead of submitting one. Skipped when false (wire compat v1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancel: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -908,8 +912,58 @@ pub fn parse_kanban_args(
         "cut" => parse_kanban_named(rest, default_project, "cut"),
         "uncut" => parse_kanban_named(rest, default_project, "uncut"),
         "worktrees" => parse_kanban_worktrees(rest, default_project),
+        "integrate" => parse_kanban_integrate(rest, default_project),
         other => Err(format!("unknown kanban action: {other}")),
     }
+}
+
+/// `integrate <id> [--cancel] [--json] [--project P]` — submit the card's
+/// committed worktree to the repository's integration queue (spec:
+/// worktree-integration-queue), or withdraw it with `--cancel`. The reply
+/// carries the request's current state; `wait <id>` follows it.
+fn parse_kanban_integrate(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut json = false;
+    let mut cancel = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--cancel" => {
+                cancel = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("missing <id>")?;
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "integrate".into(),
+        project,
+        id: Some(id),
+        json,
+        cancel,
+        ..Default::default()
+    }))
 }
 
 /// `worktrees [--stray] [--json] [--project P]` — every foreman worktree
@@ -1430,6 +1484,7 @@ foreman kanban uncut <name> [--project P]
 foreman kanban wait <id> [--timeout SECS] [--project P]
 foreman kanban wait --any [--timeout SECS] [--project P]
 foreman kanban worktrees [--stray] [--json] [--project P]
+foreman kanban integrate <id> [--cancel] [--json] [--project P]
 
 Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
@@ -1465,7 +1520,28 @@ focused project).
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
   done    InProgress -> Done. Errors on any other state or a missing card
-          (close-out never resurrects a card).
+          (close-out never resurrects a card). A worktree card whose branch
+          has commits not yet on its base is refused: submit it with
+          integrate instead (done follows confirmed integration). A card
+          integrated by hand (branch already on base) is accepted.
+  integrate
+          submit a worktree card's committed work to the repository's
+          integration queue. Foreman takes one turn per repository at a
+          time: rebase the worktree onto the card's base, run the project's
+          checks (.foreman/integrate.json: {\"check\":[argv...],
+          \"timeout_secs\":N}; none configured is recorded as such),
+          fast-forward the base, mark the card Done, queue teardown.
+          Requires a clean worktree on its branch with no git operation in
+          progress; the reply is the request's state (queued #N,
+          integrating, needs resolution, integrated). Resubmitting the same
+          commit returns the existing request; a conflict or failed check
+          hands the request back (needs resolution) with the reason and the
+          worktree left as git stopped it — resolve, commit, resubmit (a
+          resubmission joins the tail). Stop touching the worktree while
+          queued or integrating. --cancel withdraws a queued or handed-back
+          request at once, or stops an integrating one at its next
+          checkpoint. --json prints the integration object instead.
+          list --json shows the same object as \"integration\" on the card.
   block   InProgress -> Blocked; --reason is mandatory and non-empty.
   rm      delete the card's file, from any state.
   cut     stamp every ungrouped Done card as shipped in Version <name>: the
@@ -1479,13 +1555,17 @@ focused project).
           Current Done. Errors on an unknown name.
   wait    poll (client-side, no pipe verb) until the card (or, with --any,
           any card seen InProgress) reaches Done, Blocked, or orphaned, or
-          is removed. --timeout SECS bounds the wait.
-Exit codes for add/list/start/edit/done/block/rm/cut/uncut: 0 ok, 1 refused/unreachable,
-2 bad arguments.
+          is removed — or, for wait <id>, until its integration is handed
+          back. --timeout SECS bounds the wait; queued and integrating are
+          still pending.
+Exit codes for add/list/start/edit/done/block/rm/cut/uncut/integrate: 0 ok,
+1 refused/unreachable, 2 bad arguments.
 Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
 (Blocked, orphaned, or removed), 2 timeout or foreman unreachable — a
 different unreachable code than the other verbs, since a stuck wait must be
-distinguishable from a stuck board.";
+distinguishable from a stuck board — and, for wait <id> only, 3 its
+integration needs resolution (resolve in the worktree, then integrate and
+wait again).";
 
 /// Subcommand entry point (no GUI). Returns the process exit code.
 pub fn client_main(args: &[String]) -> i32 {
@@ -1923,6 +2003,7 @@ mod tests {
             card,
             orphaned: false,
             worktree_status: None,
+            integration: None,
         };
         let mut polls = 0;
         let code = kanban_wait_with(
@@ -3571,6 +3652,52 @@ mod tests {
         assert_eq!(req.project.as_deref(), Some("p2"));
         assert!(parse_kanban_args(&s(&["worktrees", "x"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["worktrees", "--all"]), None, None).is_err());
+    }
+
+    #[test]
+    fn kanban_request_cancel_is_wire_compatible_with_v1() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "integrate".into(),
+            id: Some("a1".into()),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&req).unwrap().contains("\"cancel\""));
+        let r: KanbanRequest =
+            serde_json::from_str(r#"{"cmd":"kanban","action":"integrate","id":"a1"}"#).unwrap();
+        assert!(!r.cancel);
+        let r: KanbanRequest = serde_json::from_str(
+            r#"{"cmd":"kanban","action":"integrate","id":"a1","cancel":true}"#,
+        )
+        .unwrap();
+        assert!(r.cancel);
+    }
+
+    #[test]
+    fn parse_kanban_integrate_takes_id_cancel_json_and_project() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let KanbanAction::Request(r) =
+            parse_kanban_args(&s(&["integrate", "a1"]), Some("p2".into()), None).unwrap()
+        else {
+            panic!("integrate is a wire request");
+        };
+        assert_eq!(r.action, "integrate");
+        assert_eq!(r.id.as_deref(), Some("a1"));
+        assert_eq!(r.project.as_deref(), Some("p2"));
+        assert!(!r.cancel && !r.json);
+        let KanbanAction::Request(r) = parse_kanban_args(
+            &s(&["integrate", "a1", "--cancel", "--json", "--project", "p9"]),
+            None,
+            None,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(r.cancel && r.json);
+        assert_eq!(r.project.as_deref(), Some("p9"));
+        assert!(parse_kanban_args(&s(&["integrate"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["integrate", "a1", "b2"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["integrate", "a1", "--nope"]), None, None).is_err());
     }
 
     #[test]

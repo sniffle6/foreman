@@ -719,6 +719,11 @@ pub struct CardStore {
     strays: Vec<StrayWorktree>,
     last_status_poll: Option<std::time::Instant>,
     status_inflight: bool,
+    /// The integration queue's view of each card (spec:
+    /// worktree-integration-queue), refreshed by the project's coordinator
+    /// tick from the repository's request files. Memory only, replaced
+    /// wholesale; never written to a card file.
+    integration: std::collections::HashMap<String, crate::integrate::IntegrationView>,
 }
 
 /// What one Cut did (spec §Cut step 9). `held_back` is `(id, reason)` for
@@ -861,6 +866,19 @@ impl CardStore {
     /// Foreman worktrees no card owns, from the last poll round.
     pub fn strays(&self) -> &[StrayWorktree] {
         &self.strays
+    }
+
+    /// The queue's current view of `id`'s integration request, if any.
+    pub fn integration(&self, id: &str) -> Option<crate::integrate::IntegrationView> {
+        self.integration.get(id).cloned()
+    }
+
+    /// Replace the integration views wholesale (one coordinator read).
+    pub fn set_integration(
+        &mut self,
+        map: std::collections::HashMap<String, crate::integrate::IntegrationView>,
+    ) {
+        self.integration = map;
     }
 
     /// When a round is due — board shown, no round in flight, interval
@@ -1360,35 +1378,44 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         "End every commit message with the trailer line:    Card: {id}\n",
         id = card.id
     ));
+    let cli = match style {
+        CloseoutStyle::Path => "foreman",
+        CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
+    };
     if let Some(wt) = &card.worktree {
-        // `{root}` is quoted: this repo's own path has a space in it.
+        // The integration queue (spec: worktree-integration-queue): the
+        // worker submits and waits; Foreman rebases, checks, fast-forwards,
+        // and marks the card Done. The worker never merges into the shared
+        // checkout, and queued is not Done.
         out.push_str(&format!(
-            "Integrate first, from inside your worktree:\n\
-             \x20   git rebase {base}\n\
-             \x20   git -C \"{root}\" merge --ff-only {branch}\n\
-             Resolve rebase conflicts yourself. If the fast-forward is refused, rebase again and retry.\n\
-             If git refuses because the main checkout has uncommitted changes in files you touched, block instead of forcing.\n",
+            "Commit everything in your worktree, then hand integration to Foreman's queue (never merge into the main checkout yourself):\n\
+             \x20   {cli} kanban integrate {id}\n\
+             \x20   {cli} kanban wait {id} --timeout 1800\n\
+             wait exit 0: Foreman rebased onto {base}, ran the project checks, fast-forwarded {base}, and marked the card Done. You are finished; do not run done yourself.\n\
+             wait exit 3: the rebase conflicted or a check failed. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 2: still queued or checking; run wait again.\n",
+            id = card.id,
             base = wt.base,
-            root = wt.root().display(),
-            branch = wt.branch,
+        ));
+    } else {
+        out.push_str(&format!(
+            "When the work is complete, run:    {cli} kanban done {id}\n",
+            id = card.id
         ));
     }
-    let closeout = match style {
-        CloseoutStyle::Path => format!(
-            "When the work is complete, run:    foreman kanban done {id}\n\
-             If you are stuck and need a human: foreman kanban block {id} --reason \"<one line>\"\n\
-             Do not end the session without running one of these.",
-            id = card.id,
-        ),
-        CloseoutStyle::EnvVar => format!(
-            "When the work is complete, run:    & $env:FOREMAN_EXE kanban done {id}\n\
-             If you are stuck and need a human: & $env:FOREMAN_EXE kanban block {id} --reason \"<one line>\"\n\
-             (bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n\
-             Do not end the session without running one of these.",
-            id = card.id,
-        ),
-    };
-    out + &closeout
+    out.push_str(&format!(
+        "If you are stuck and need a human: {cli} kanban block {id} --reason \"<one line>\"\n",
+        id = card.id
+    ));
+    if style == CloseoutStyle::EnvVar {
+        out.push_str("(bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n");
+    }
+    out.push_str(if card.worktree.is_some() {
+        "Do not end the session without the card Done (by the queue) or blocked."
+    } else {
+        "Do not end the session without running one of these."
+    });
+    out
 }
 
 /// A card plus the derived `orphaned` flag (never stored in the card file
@@ -1402,6 +1429,10 @@ pub struct CardLine {
     /// worktree and for cards not yet polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_status: Option<WorktreeStatus>,
+    /// The integration queue's view of the card (spec:
+    /// worktree-integration-queue); absent when no request stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::integrate::IntegrationView>,
 }
 
 impl CardLine {
@@ -1433,6 +1464,9 @@ impl CardLine {
                 worktree_summary(wt, self.worktree_status.as_ref())
             ));
         }
+        if let Some(i) = &self.integration {
+            tail.push(i.tail());
+        }
         if let Some(s) = &self.card.shipped {
             tail.push(format!("[shipped {}]", s.name));
         }
@@ -1458,12 +1492,20 @@ pub enum WaitTarget {
     Any,
 }
 
+/// Exit code of `foreman kanban wait <id>` when the card's integration was
+/// handed back (spec: worktree-integration-queue): the worker must resolve
+/// and resubmit. Distinct from `1` (needs a human) so a worker waiting on
+/// its own card can branch on it.
+pub const WAIT_NEEDS_RESOLUTION: i32 = 3;
+
 /// Pure verdict function the CLI wait loop (Task 2) drives on every poll.
 /// `Id`: Done -> exit 0; Blocked/orphaned/missing -> exit 1 (something needs
-/// a human); Backlog or live InProgress -> keep waiting.
+/// a human); integration handed back -> exit [`WAIT_NEEDS_RESOLUTION`];
+/// Backlog, live InProgress, queued, or integrating -> keep waiting.
 /// `Any`: every live (non-orphaned) InProgress card is added to `watched` on
 /// sight, then each watched id is checked the same way — a card sitting in
-/// Backlog is never watched and so never triggers.
+/// Backlog is never watched and so never triggers. `Any` ignores handed-back
+/// integrations: that is the live worker's job, not the orchestrator's.
 pub fn wait_verdict(
     target: &WaitTarget,
     watched: &mut std::collections::HashSet<String>,
@@ -1476,6 +1518,13 @@ pub fn wait_verdict(
                 CardState::Done => Some(0),
                 CardState::Blocked => Some(1),
                 _ if c.orphaned => Some(1),
+                _ if c
+                    .integration
+                    .as_ref()
+                    .is_some_and(|i| i.phase == crate::integrate::Phase::NeedsResolution) =>
+                {
+                    Some(WAIT_NEEDS_RESOLUTION)
+                }
                 CardState::Backlog | CardState::InProgress => None,
             },
         },
@@ -2363,6 +2412,7 @@ mod tests {
             card: sample_card(None),
             orphaned: true,
             worktree_status: None,
+            integration: None,
         };
         let j = line.json_line();
         assert!(j.contains("\"orphaned\":true"), "{j}");
@@ -2384,6 +2434,7 @@ mod tests {
             card,
             orphaned: true,
             worktree_status: None,
+            integration: None,
         };
         assert_eq!(
             line.human_line(),
@@ -2397,6 +2448,7 @@ mod tests {
             card: blocked,
             orphaned: false,
             worktree_status: None,
+            integration: None,
         };
         assert_eq!(
             line.human_line(),
@@ -2411,6 +2463,7 @@ mod tests {
             card,
             orphaned,
             worktree_status: None,
+            integration: None,
         }
     }
 
@@ -2870,14 +2923,18 @@ mod tests {
              \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
-             Integrate first, from inside your worktree:\n\
-             \x20   git rebase main\n\
-             \x20   git -C \"H:/repo\" merge --ff-only card/a3f8k2\n\
-             Resolve rebase conflicts yourself. If the fast-forward is refused, rebase again and retry.\n\
-             If git refuses because the main checkout has uncommitted changes in files you touched, block instead of forcing.\n\
-             When the work is complete, run:    foreman kanban done a3f8k2\n\
+             Commit everything in your worktree, then hand integration to Foreman's queue (never merge into the main checkout yourself):\n\
+             \x20   foreman kanban integrate a3f8k2\n\
+             \x20   foreman kanban wait a3f8k2 --timeout 1800\n\
+             wait exit 0: Foreman rebased onto main, ran the project checks, fast-forwarded main, and marked the card Done. You are finished; do not run done yourself.\n\
+             wait exit 3: the rebase conflicted or a check failed. Read the reason with foreman kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 2: still queued or checking; run wait again.\n\
              If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
-             Do not end the session without running one of these."
+             Do not end the session without the card Done (by the queue) or blocked."
+        );
+        assert!(
+            !s.contains("merge --ff-only") && !s.contains("kanban done"),
+            "a worktree worker never merges or marks done itself: {s}"
         );
     }
 
@@ -2887,13 +2944,15 @@ mod tests {
         card.worktree = Some(sample_worktree());
         let s = dispatch_prompt(&card, CloseoutStyle::EnvVar);
         assert!(s.contains("# Workspace\n"));
-        assert!(
-            s.contains("    git rebase main\n    git -C \"H:/repo\" merge --ff-only card/a3f8k2\n")
-        );
         assert!(s.contains(
-            "When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n"
+            "    & $env:FOREMAN_EXE kanban integrate a3f8k2\n    & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 1800\n"
+        ));
+        assert!(s.contains("Read the reason with & $env:FOREMAN_EXE kanban list --json"));
+        assert!(s.contains(
+            "If you are stuck and need a human: & $env:FOREMAN_EXE kanban block a3f8k2 --reason \"<one line>\"\n"
         ));
         assert!(s.contains("(bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n"));
+        assert!(!s.contains("kanban done"));
     }
 
     #[test]
@@ -3100,6 +3159,7 @@ mod tests {
             card,
             orphaned: false,
             worktree_status: None,
+            integration: None,
         };
         assert_eq!(
             line.human_line(),
@@ -3491,6 +3551,7 @@ mod tests {
             card: sample_card(None),
             orphaned: false,
             worktree_status: None,
+            integration: None,
         };
         let j = line.json_line();
         assert!(!j.contains("worktree"), "{j}");
@@ -3506,6 +3567,7 @@ mod tests {
             card,
             orphaned: false,
             worktree_status: Some(st),
+            integration: None,
         };
         let j = line.json_line();
         assert!(j.contains(r#""worktree":{"#), "{j}");
@@ -3543,6 +3605,75 @@ mod tests {
 
         let cards = vec![line_with_state("a1", CardState::InProgress, false)];
         assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+    }
+
+    fn line_integrating(id: &str, phase: crate::integrate::Phase) -> CardLine {
+        let mut line = line_with_state(id, CardState::InProgress, false);
+        line.integration = Some(crate::integrate::IntegrationView {
+            phase,
+            commit: "c".into(),
+            position: None,
+            stage: None,
+            reason: None,
+            detail: None,
+            next: None,
+            hold: None,
+            prepared: None,
+            checks: None,
+            note: None,
+            cancel_requested: false,
+        });
+        line
+    }
+
+    #[test]
+    fn wait_verdict_surfaces_a_handed_back_integration_only_to_the_cards_own_waiter() {
+        use crate::integrate::Phase;
+        let target = WaitTarget::Id("a1".into());
+        let mut watched = std::collections::HashSet::new();
+        // queued / integrating: still pending
+        for phase in [Phase::Queued, Phase::Integrating, Phase::Integrated] {
+            let cards = vec![line_integrating("a1", phase)];
+            assert_eq!(
+                wait_verdict(&target, &mut watched, &cards),
+                None,
+                "{phase:?}"
+            );
+        }
+        let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
+        assert_eq!(
+            wait_verdict(&target, &mut watched, &cards),
+            Some(WAIT_NEEDS_RESOLUTION)
+        );
+        // an orphaned worker outranks its handed-back integration
+        let mut orphaned = line_integrating("a1", Phase::NeedsResolution);
+        orphaned.orphaned = true;
+        assert_eq!(wait_verdict(&target, &mut watched, &[orphaned]), Some(1));
+        // --any leaves resolution to the live worker
+        let any = WaitTarget::Any;
+        let mut watched = std::collections::HashSet::new();
+        let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
+        assert_eq!(wait_verdict(&any, &mut watched, &cards), None);
+        assert!(watched.contains("a1"));
+    }
+
+    #[test]
+    fn card_line_carries_the_integration_view_only_when_present() {
+        let line = line_with_state("a1", CardState::InProgress, false);
+        assert!(!line.json_line().contains("integration"));
+        let line = line_integrating("a1", crate::integrate::Phase::Queued);
+        let j = line.json_line();
+        assert!(
+            j.contains(r#""integration":{"phase":"queued","commit":"c"}"#),
+            "{j}"
+        );
+        let back: CardLine = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, line);
+        assert!(
+            line.human_line().ends_with("[integrate queued]"),
+            "{}",
+            line.human_line()
+        );
     }
 
     #[test]

@@ -502,6 +502,52 @@ enum WorktreeMsg {
     },
 }
 
+/// The result of one coordinator thread run (`integrate::run_turn`) for
+/// this project's repository.
+enum IntegrationMsg {
+    Turn(Result<Option<Vec<crate::integrate::TurnEvent>>, String>),
+}
+
+/// Per-project coordinator state for the repository integration queue
+/// (spec: worktree-integration-queue). The queue itself lives on disk under
+/// the repository's git common dir and is shared across projects, windows,
+/// and app instances; this is only the driver: when to re-read it, whether
+/// a turn thread is running, and what the repository is.
+struct IntegrationDriver {
+    tx: std::sync::mpsc::Sender<IntegrationMsg>,
+    rx: std::sync::mpsc::Receiver<IntegrationMsg>,
+    /// A turn thread is running for this project right now.
+    in_flight: bool,
+    last_poll: Option<std::time::Instant>,
+    /// Re-read the queue on the next tick regardless of the interval (a
+    /// submission, a cancel, a finished turn).
+    kick: bool,
+    /// After a held turn (destination dirty / wrong branch / busy) no new
+    /// turn starts before this; a kick clears it.
+    held_until: Option<std::time::Instant>,
+    /// The last hold detail toasted, so a standing hold toasts once.
+    last_hold: Option<String>,
+    /// The repository identity of `cwd`: `None` = not resolved yet;
+    /// `Some(None)` = not a git repository (the driver stays inert).
+    repo: Option<Option<PathBuf>>,
+}
+
+impl IntegrationDriver {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        IntegrationDriver {
+            tx,
+            rx,
+            in_flight: false,
+            last_poll: None,
+            kick: false,
+            held_until: None,
+            last_hold: None,
+            repo: None,
+        }
+    }
+}
+
 /// A teardown waiting for its moment. `held_by` names the terminal that
 /// claimed the card when the transition happened: on Windows a directory
 /// that is some process's cwd cannot be deleted, and the worker's shell sits
@@ -556,6 +602,8 @@ pub struct WindowManager {
     /// Done-leftover retry and a re-dispatch both saw "nothing queued" and
     /// raced a second `git worktree remove` against the first.
     teardowns_in_flight: std::collections::HashSet<String>,
+    /// The integration queue coordinator for this project's repository.
+    integration: IntegrationDriver,
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
@@ -645,6 +693,7 @@ impl WindowManager {
             pending_teardowns: Vec::new(),
             teardown_attempted: std::collections::HashSet::new(),
             teardowns_in_flight: std::collections::HashSet::new(),
+            integration: IntegrationDriver::new(),
             picker: None,
             renaming: None,
             rename_buf: String::new(),
@@ -1393,6 +1442,9 @@ impl WindowManager {
                 // to the app's own change; a `list` read changes nothing.
                 let is_write = req.action != "list";
                 let res = self.kanban_dispatch(&req);
+                // A submission or cancel changes the queue on disk; the
+                // owning project's coordinator re-reads it on its next tick
+                // (`kanban_dispatch` kicks it). Nothing to do here.
                 if is_write && res.is_ok() {
                     ctx.request_repaint();
                 }
@@ -1548,6 +1600,7 @@ impl WindowManager {
                             card: c.clone(),
                             orphaned: crate::kanban::is_orphaned(c, run, &states),
                             worktree_status: store.worktree_status(&c.id),
+                            integration: store.integration(&c.id),
                         };
                         if req.json {
                             line.json_line()
@@ -1604,11 +1657,21 @@ impl WindowManager {
             }
             "done" => {
                 let id = req.id.as_deref().ok_or("missing id")?;
+                child.done_guard(id)?;
                 let held = child.claim_terminal(id);
                 child.kanban.borrow_mut().done(id)?;
                 child.teardown_after(id, held);
                 Ok(OpenReply {
                     ok: true,
+                    ..Default::default()
+                })
+            }
+            "integrate" => {
+                let id = req.id.as_deref().ok_or("missing id")?;
+                let line = child.kanban_integrate(id, req.cancel, req.json)?;
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(vec![line]),
                     ..Default::default()
                 })
             }
@@ -2220,7 +2283,9 @@ impl WindowManager {
                 }
                 crate::board::BoardAct::Done(id) => {
                     let held = self.claim_terminal(&id);
-                    let done = self.kanban.borrow_mut().done(&id);
+                    let done = self
+                        .done_guard(&id)
+                        .and_then(|()| self.kanban.borrow_mut().done(&id));
                     match done {
                         Ok(()) => self.teardown_after(&id, held),
                         Err(e) => crate::notify::queue(
@@ -2251,8 +2316,39 @@ impl WindowManager {
                         );
                     }
                 }
+                crate::board::BoardAct::Integrate(id) => {
+                    match self.kanban_integrate(&id, false, false) {
+                        Ok(line) => crate::notify::queue(ctx, crate::notify::Level::Info, line),
+                        Err(e) => crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: integrate failed for {id}: {e}"),
+                        ),
+                    }
+                }
+                crate::board::BoardAct::CancelIntegration(id) => {
+                    match self.kanban_integrate(&id, true, false) {
+                        Ok(line) => crate::notify::queue(ctx, crate::notify::Level::Info, line),
+                        Err(e) => crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("board: cancel integration failed for {id}: {e}"),
+                        ),
+                    }
+                }
                 crate::board::BoardAct::DiscardWorktree(id) => {
                     if self.overlay_blocks_close() {
+                        continue;
+                    }
+                    if let Some(phase) = self.integration_owns(&id) {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!(
+                                "card {id}: integration is {}; cancel it before discarding",
+                                phase.label()
+                            ),
+                        );
                         continue;
                     }
                     let wt = self
@@ -2391,6 +2487,19 @@ impl WindowManager {
                             ctx,
                             crate::notify::Level::Error,
                             format!("card {id}: worktree teardown in progress; retry in a moment"),
+                        );
+                        continue;
+                    }
+                    // The queue owns the worktree while a request is queued
+                    // or integrating: a new worker would race the rebase.
+                    if let Some(phase) = self.integration_owns(&id) {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!(
+                                "card {id}: integration is {}; wait for it or cancel it first",
+                                phase.label()
+                            ),
                         );
                         continue;
                     }
@@ -2538,6 +2647,12 @@ impl WindowManager {
     /// synchronous (the status-probe commands, ~100 ms) because the card
     /// file is gone before the asynchronous teardown reports.
     fn kanban_rm(&mut self, id: &str) -> Result<(), String> {
+        if let Some(phase) = self.integration_owns(id) {
+            return Err(format!(
+                "card {id}: integration is {}; cancel it first (integrate {id} --cancel)",
+                phase.label()
+            ));
+        }
         let wt = self
             .kanban
             .borrow()
@@ -2673,9 +2788,12 @@ impl WindowManager {
             let states = self.term_states();
             let queued = std::mem::take(&mut self.pending_teardowns);
             // Ready = its holding terminal is gone AND no thread is already
-            // removing this card's tree (a queued entry waits its turn).
+            // removing this card's tree (a queued entry waits its turn) AND
+            // the integration queue does not own the tree (never a Foreman
+            // git operation concurrent with the turn's rebase).
             let (ready, wait): (Vec<_>, Vec<_>) = queued.into_iter().partition(|p| {
                 !self.teardowns_in_flight.contains(&p.id)
+                    && self.integration_owns(&p.id).is_none()
                     && p.held_by.as_ref().is_none_or(|tag| {
                         states.get(tag).copied() != Some(crate::kanban::TermState::Running)
                     })
@@ -3643,11 +3761,11 @@ impl WindowManager {
     /// stamped `shown_recently` this frame, so a minimized or background
     /// board costs nothing (the spec's "nothing while hidden") with zero
     /// window-state plumbing here.
-    pub fn kanban_tick(&mut self) {
+    pub fn kanban_tick(&mut self, ctx: &egui::Context) {
         for w in self.windows.iter_mut() {
             for tab in w.tabs.iter_mut() {
                 if let Content::Project(child) = &mut tab.content {
-                    child.kanban_tick();
+                    child.kanban_tick(ctx);
                 }
             }
         }
@@ -3670,6 +3788,299 @@ impl WindowManager {
             .map(|c| c.id.clone())
             .collect();
         self.kanban.borrow_mut().set_orphans(orphans);
+        // The integration coordinator runs whether or not a board is shown:
+        // a queued card must land while the window is minimized too.
+        self.integration_tick(ctx);
+    }
+
+    /// The repository queue for this project's cwd, resolved once (a
+    /// project outside a git repository has no queue and stays inert).
+    fn integration_queue(&mut self) -> Option<crate::integrate::Queue> {
+        let cwd = self.cwd.clone()?;
+        if self.integration.repo.is_none() {
+            self.integration.repo = Some(crate::integrate::repo_identity(&cwd).ok());
+        }
+        self.integration
+            .repo
+            .clone()
+            .flatten()
+            .map(|r| crate::integrate::Queue::for_repo(&r))
+    }
+
+    /// The phase when the integration queue owns `id`'s worktree (queued or
+    /// integrating): no teardown, restart, rm, or discard may touch it.
+    fn integration_owns(&self, id: &str) -> Option<crate::integrate::Phase> {
+        self.kanban
+            .borrow()
+            .integration(id)
+            .map(|v| v.phase)
+            .filter(|p| p.owns_worktree())
+    }
+
+    /// `done` follows confirmed integration (spec: worktree-integration-
+    /// queue): a worktree card is refused while the queue owns it, or while
+    /// its branch carries commits not on its base — with the command to run
+    /// instead. A branch already on base (integrated by hand, or by the
+    /// queue) passes: ancestry, not bookkeeping, is the proof. Fails closed
+    /// when git cannot answer. Cards without a worktree are untouched.
+    fn done_guard(&self, id: &str) -> Result<(), String> {
+        let card = self.kanban.borrow().get(id).cloned();
+        let Some(card) = card else {
+            return Ok(()); // the store's own missing-card error follows
+        };
+        let Some(wt) = &card.worktree else {
+            return Ok(());
+        };
+        if let Some(phase) = self.integration_owns(id) {
+            return Err(format!(
+                "card {id} is {} for integration; wait for it (foreman kanban wait {id}) or cancel it first",
+                phase.label()
+            ));
+        }
+        let cwd = self
+            .cwd
+            .as_deref()
+            .ok_or("project has no working directory")?;
+        let st = crate::kanban::worktree_status_now(cwd, wt)
+            .map_err(|e| format!("card {id}: cannot verify its worktree ({e}); retry"))?;
+        if st.ahead > 0 {
+            return Err(format!(
+                "card {id} has {} commit{} on {} not yet on {}; run foreman kanban integrate {id} and wait for it — done follows integration",
+                st.ahead,
+                if st.ahead == 1 { "" } else { "s" },
+                wt.branch,
+                wt.base
+            ));
+        }
+        Ok(())
+    }
+
+    /// The `integrate` verb and the board's Submit / Cancel: submit `id`'s
+    /// committed worktree to the repository queue (or withdraw it), refresh
+    /// the store's view, kick the coordinator, and return the one reply
+    /// line (`--json`: the integration object).
+    fn kanban_integrate(&mut self, id: &str, cancel: bool, json: bool) -> Result<String, String> {
+        let cwd = self.cwd.clone().ok_or("project has no working directory")?;
+        let card = self
+            .kanban
+            .borrow()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("no such card: {id}"))?;
+        if cancel {
+            let queue = self
+                .integration_queue()
+                .ok_or_else(|| format!("card {id}: project is not a git repository"))?;
+            let what = queue.cancel(id)?;
+            self.integration.kick = true;
+            let views = queue.views();
+            self.kanban.borrow_mut().set_integration(views);
+            let line = match what {
+                crate::integrate::Cancelled::Removed => {
+                    format!("{id}  integration cancelled; worktree untouched")
+                }
+                crate::integrate::Cancelled::Requested => format!(
+                    "{id}  integration cancel requested; the owner stops at its next checkpoint"
+                ),
+            };
+            return Ok(if json {
+                serde_json::json!({ "id": id, "cancelled": true }).to_string()
+            } else {
+                line
+            });
+        }
+        if card.state != crate::kanban::CardState::InProgress {
+            return Err(format!("card {id} is not in progress"));
+        }
+        let wt = card
+            .worktree
+            .as_ref()
+            .ok_or_else(|| format!("card {id} has no worktree; finish it with done"))?;
+        let worker = card.claim.as_ref().map(|c| c.terminal.clone());
+        let sub = crate::integrate::prepare_submission(&cwd, id, wt, worker)?;
+        let repo = PathBuf::from(&sub.repo);
+        let queue = crate::integrate::Queue::for_repo(&repo);
+        self.integration.repo = Some(Some(repo));
+        let submitted = queue.submit(sub)?;
+        self.integration.kick = true;
+        self.integration.held_until = None;
+        let views = queue.views();
+        let view = views.get(id).cloned();
+        self.kanban.borrow_mut().set_integration(views);
+        let Some(view) = view else {
+            return Err(format!("card {id}: submission vanished"));
+        };
+        if json {
+            return Ok(serde_json::to_string(&view).unwrap_or_default());
+        }
+        Ok(format!(
+            "{id}  {}{}",
+            view.summary(),
+            if submitted.existing {
+                " (already submitted)"
+            } else {
+                ""
+            }
+        ))
+    }
+
+    /// Per-tick coordinator (spec: worktree-integration-queue §ownership):
+    /// apply a finished turn, re-read the queue when due, complete the
+    /// bookkeeping of integrated requests whose card is on this board
+    /// (Done, then the ordinary held teardown), and start a turn thread
+    /// when something is queued and no thread of ours is running. The
+    /// thread takes the repository's OS-level turn or returns at once.
+    fn integration_tick(&mut self, ctx: &egui::Context) {
+        while let Ok(IntegrationMsg::Turn(res)) = self.integration.rx.try_recv() {
+            self.integration.in_flight = false;
+            self.integration.kick = true;
+            match res {
+                Ok(Some(events)) => self.report_integration(events, ctx),
+                Ok(None) => {} // another owner holds the turn; re-read later
+                Err(e) => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Error,
+                    format!("integration queue: {e}"),
+                ),
+            }
+        }
+        let now = std::time::Instant::now();
+        let due = self.integration.kick
+            || self
+                .integration
+                .last_poll
+                .is_none_or(|t| now.duration_since(t) >= crate::integrate::POLL_INTERVAL);
+        if !due {
+            return;
+        }
+        let kicked = std::mem::take(&mut self.integration.kick);
+        self.integration.last_poll = Some(now);
+        let Some(queue) = self.integration_queue() else {
+            return;
+        };
+        let requests = queue.requests();
+        let views = crate::integrate::views(&requests);
+        self.kanban.borrow_mut().set_integration(views);
+        for r in requests
+            .iter()
+            .filter(|r| r.phase == crate::integrate::Phase::Integrated)
+        {
+            if self.kanban.borrow().get(&r.card).is_none() {
+                continue; // another project's card, or a removed one
+            }
+            let held = self.claim_terminal(&r.card);
+            let prepared = r
+                .attempt
+                .as_ref()
+                .and_then(|a| a.prepared.as_deref())
+                .map(|p| p.get(..8).unwrap_or(p).to_string())
+                .unwrap_or_default();
+            // Bind before matching: a `RefMut` temporary inside the match
+            // scrutinee would outlive the arm that needs `&mut self`.
+            let done = self.kanban.borrow_mut().done(&r.card);
+            match done {
+                Ok(()) => {
+                    crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Info,
+                        format!(
+                            "card {}: integrated into {} at {prepared} → Done",
+                            r.card, r.target
+                        ),
+                    );
+                    self.teardown_after(&r.card, held);
+                }
+                // Already Done (a second instance got here first, or the
+                // human marked it): the request is still finished.
+                Err(_) => {}
+            }
+            if let Err(e) = queue.remove(&r.card) {
+                crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Error,
+                    format!(
+                        "card {}: cannot finish its integration request: {e}",
+                        r.card
+                    ),
+                );
+            }
+            self.integration.kick = true;
+            ctx.request_repaint();
+        }
+        let pending = requests.iter().any(|r| {
+            matches!(
+                r.phase,
+                crate::integrate::Phase::Queued | crate::integrate::Phase::Integrating
+            )
+        });
+        let held_back = !kicked && self.integration.held_until.is_some_and(|t| now < t);
+        if pending && !self.integration.in_flight && !held_back {
+            self.integration.in_flight = true;
+            let tx = self.integration.tx.clone();
+            let ctx = ctx.clone();
+            let owner = crate::integrate::Owner::this_process();
+            std::thread::spawn(move || {
+                let res = crate::integrate::run_turn(&queue, &owner, &crate::integrate::NoHooks);
+                let _ = tx.send(IntegrationMsg::Turn(res));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Toast what a turn did. Integrated requests are not toasted here —
+    /// their bookkeeping (Done) reports on the next tick, from disk, so a
+    /// crash between the two still lands the same message.
+    fn report_integration(
+        &mut self,
+        events: Vec<crate::integrate::TurnEvent>,
+        ctx: &egui::Context,
+    ) {
+        use crate::integrate::TurnEvent::*;
+        for ev in events {
+            match ev {
+                Integrated { .. } => {}
+                NeedsResolution {
+                    card,
+                    reason,
+                    detail,
+                } => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Warning,
+                    format!(
+                        "card {card}: integration needs resolution — {}: {}",
+                        reason.label(),
+                        detail.lines().next().unwrap_or("")
+                    ),
+                ),
+                Held { card, detail } => {
+                    self.integration.held_until =
+                        Some(std::time::Instant::now() + crate::integrate::HOLD_BACKOFF);
+                    if self.integration.last_hold.as_deref() != Some(detail.as_str()) {
+                        self.integration.last_hold = Some(detail.clone());
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Warning,
+                            format!("card {card}: integration held — {detail}"),
+                        );
+                    }
+                }
+                Cancelled { card, note } => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Info,
+                    format!("card {card}: integration {note}"),
+                ),
+                Requeued { card, note } => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Warning,
+                    format!("card {card}: {note}"),
+                ),
+                Recovered { card, note } => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Info,
+                    format!("card {card}: integration {note}"),
+                ),
+            }
+        }
     }
 
     /// Last `n` chat lines (the `--history` verb; reading does not join).
@@ -13875,7 +14286,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        m.kanban_tick();
+        m.kanban_tick(&egui::Context::default());
 
         // Exercise `kanban_tick`'s own derivation directly — recursion into
         // the nested project, the orphan recompute, and `set_orphans` — via
@@ -13914,7 +14325,7 @@ mod tests {
         // empty no matter what its children just did.
         let tmp = tempfile::tempdir().unwrap();
         let mut m = kanban_desktop(tmp.path().to_path_buf());
-        m.kanban_tick();
+        m.kanban_tick(&egui::Context::default());
         assert!(m.kanban.borrow().cards().is_empty());
     }
 
@@ -14645,7 +15056,9 @@ mod tests {
             )
             .unwrap();
 
-        m.project_child_mut(pid).unwrap().kanban_tick();
+        m.project_child_mut(pid)
+            .unwrap()
+            .kanban_tick(&egui::Context::default());
         assert!(
             m.project_child_mut(pid)
                 .unwrap()
@@ -14804,5 +15217,366 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         let mut m2 = kanban_desktop(plain.path().to_path_buf());
         assert!(m2.kanban_dispatch(&kanban_req("worktrees")).is_err());
+    }
+
+    // -- integration queue (spec: worktree-integration-queue) -------------
+
+    fn git_q(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Dispatch a card into a worktree (pause Session) and commit one file
+    /// on its branch. Returns the card id, its worktree, and the commit.
+    fn worktree_card_with_a_commit(
+        m: &mut WindowManager,
+        pid: WinId,
+        ctx: &egui::Context,
+        title: &str,
+        file: &str,
+    ) -> (String, crate::kanban::Worktree, String) {
+        let mut add = kanban_req("add");
+        add.title = Some(title.into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        dispatch_from_board(child, &id, true, ctx);
+        let wt = child
+            .kanban
+            .borrow()
+            .get(&id)
+            .unwrap()
+            .worktree
+            .clone()
+            .expect("dispatched into a worktree");
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join(file), format!("{title}\n")).unwrap();
+        git_q(tree, &["add", file]);
+        git_q(tree, &["commit", "-q", "-m", title]);
+        let commit = git_q(tree, &["rev-parse", "HEAD"]);
+        (id, wt, commit)
+    }
+
+    /// Drive the project's coordinator (the same `kanban_tick` the frame
+    /// loop runs) until `pred` holds or 30 s pass.
+    fn tick_until(
+        m: &mut WindowManager,
+        pid: WinId,
+        ctx: &egui::Context,
+        mut pred: impl FnMut(&WindowManager) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            {
+                let child = m.project_child_mut(pid).unwrap();
+                child.integration.kick = true;
+                child.kanban_tick(ctx);
+                child.drain_worktree_msgs(ctx);
+                if pred(child) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting on the integration coordinator"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn integrate_req(id: &str) -> crate::control::KanbanRequest {
+        let mut r = kanban_req("integrate");
+        r.id = Some(id.to_string());
+        r
+    }
+
+    fn list_line(m: &mut WindowManager, id: &str) -> crate::kanban::CardLine {
+        let mut list = kanban_req("list");
+        list.json = true;
+        list.all = true;
+        m.kanban_dispatch(&list)
+            .unwrap()
+            .history
+            .unwrap()
+            .iter()
+            .filter_map(|l| serde_json::from_str::<crate::kanban::CardLine>(l).ok())
+            .find(|c| c.card.id == id)
+            .expect("card listed")
+    }
+
+    #[test]
+    fn integrate_verb_queues_the_card_and_the_coordinator_lands_it_and_marks_it_done() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (id, wt, commit) = worktree_card_with_a_commit(&mut m, pid, &ctx, "queued", "q.txt");
+        let main_before = git_q(repo.path(), &["rev-parse", "HEAD"]);
+
+        let reply = m.kanban_dispatch(&integrate_req(&id)).unwrap();
+        let line = reply.history.unwrap().remove(0);
+        assert_eq!(line, format!("{id}  queued #1"), "{line}");
+        // the store shows the substate right away, and list carries it
+        let listed = list_line(&mut m, &id);
+        let view = listed.integration.clone().expect("integration on the line");
+        assert_eq!(view.phase, crate::integrate::Phase::Queued);
+        assert_eq!(view.commit, commit);
+        assert!(listed.human_line().contains("[integrate queued #1]"));
+        // the same commit again is the same request
+        let again = m.kanban_dispatch(&integrate_req(&id)).unwrap();
+        assert!(again.history.unwrap()[0].ends_with("(already submitted)"));
+        // done is refused while the queue owns the tree
+        let mut done = kanban_req("done");
+        done.id = Some(id.clone());
+        let e = m.kanban_dispatch(&done).unwrap_err();
+        assert!(e.contains("queued for integration"), "{e}");
+        // and so is rm
+        let mut rm = kanban_req("rm");
+        rm.id = Some(id.clone());
+        let e = m.kanban_dispatch(&rm).unwrap_err();
+        assert!(e.contains("cancel it first"), "{e}");
+
+        // the coordinator takes the turn on its tick and lands the card
+        tick_until(&mut m, pid, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().state == crate::kanban::CardState::Done
+        });
+        assert_eq!(git_q(repo.path(), &["rev-parse", "HEAD"]), commit);
+        assert_ne!(commit, main_before);
+        let queue = crate::integrate::Queue::for_repo(
+            &crate::integrate::repo_identity(repo.path()).unwrap(),
+        );
+        // bookkeeping removed the request; the view clears on the next read
+        tick_until(&mut m, pid, &ctx, |c| {
+            c.kanban.borrow().integration(&id).is_none()
+        });
+        assert!(queue.get(&id).is_none());
+        // the ordinary teardown is queued, held by the worker's live pane
+        let child = m.project_child_mut(pid).unwrap();
+        assert!(child.kanban.borrow().get(&id).unwrap().worktree.is_some());
+        assert!(std::path::Path::new(&wt.path).is_dir());
+        assert!(child.teardown_busy(&id), "teardown waits on the pane");
+        // close the pane: the tree goes away, branch merged so nothing kept
+        let tag = child
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter().enumerate().map(move |(i, t)| (w.id, i, t)))
+            .find_map(|(w, i, t)| match &t.content {
+                Content::Terminal(_) => Some((w, i)),
+                _ => None,
+            })
+            .unwrap();
+        child.close_tab(tag.0, tag.1);
+        drain_until(child, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().worktree.is_none()
+        });
+        assert!(!std::path::Path::new(&wt.path).exists());
+    }
+
+    #[test]
+    fn done_refuses_unintegrated_worktree_work_and_accepts_a_hand_integrated_branch() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (id, wt, commit) = worktree_card_with_a_commit(&mut m, pid, &ctx, "manual", "m.txt");
+        let mut done = kanban_req("done");
+        done.id = Some(id.clone());
+        let e = m.kanban_dispatch(&done).unwrap_err();
+        assert!(
+            e.contains("1 commit on") && e.contains(&format!("foreman kanban integrate {id}")),
+            "{e}"
+        );
+        assert_eq!(
+            m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .get(&id)
+                .unwrap()
+                .state,
+            crate::kanban::CardState::InProgress
+        );
+        // the board's Mark done goes through the same guard
+        let child = m.project_child_mut(pid).unwrap();
+        push_board_act(child, crate::board::BoardAct::Done(id.clone()));
+        child.drain_board_acts(&ctx);
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::InProgress
+        );
+        // integrated by hand: ancestry is the proof, done passes
+        git_q(repo.path(), &["merge", "--ff-only", &wt.branch]);
+        assert_eq!(git_q(repo.path(), &["rev-parse", "HEAD"]), commit);
+        assert!(m.kanban_dispatch(&done).unwrap().ok);
+        // a card without a worktree is untouched by the guard
+        let mut add = kanban_req("add");
+        add.title = Some("plain".into());
+        let plain = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        dispatch_from_board(m.project_child_mut(pid).unwrap(), &plain, false, &ctx);
+        let mut done2 = kanban_req("done");
+        done2.id = Some(plain);
+        assert!(m.kanban_dispatch(&done2).unwrap().ok);
+    }
+
+    #[test]
+    fn the_cli_stays_responsive_while_a_check_runs_and_board_state_survives_a_restart() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (id, _wt, commit) = worktree_card_with_a_commit(&mut m, pid, &ctx, "slow", "s.txt");
+        // a check that takes a couple of seconds
+        std::fs::create_dir_all(repo.path().join(".foreman")).unwrap();
+        let policy = if cfg!(windows) {
+            r#"{"check":["ping","-n","3","127.0.0.1"],"timeout_secs":60}"#
+        } else {
+            r#"{"check":["sleep","2"],"timeout_secs":60}"#
+        };
+        std::fs::write(repo.path().join(crate::integrate::POLICY_FILE), policy).unwrap();
+        m.kanban_dispatch(&integrate_req(&id)).unwrap();
+        // a fresh manager on the same project sees the queued request from
+        // disk alone (restart survival), before any turn ran
+        let mut fresh = kanban_desktop(repo.path().to_path_buf());
+        let fpid = fresh.resolve_project(None).unwrap();
+        {
+            let child = fresh.project_child_mut(fpid).unwrap();
+            child.kanban.borrow_mut().set_dir(Some(repo.path()));
+            // A read-only observer: pretend its own turn thread is running
+            // so it re-reads the queue but never starts a turn of its own
+            // (which would race `m` for the repository's turn).
+            child.integration.in_flight = true;
+            child.integration.kick = true;
+            child.kanban_tick(&ctx);
+            let v = child
+                .kanban
+                .borrow()
+                .integration(&id)
+                .expect("restored from disk");
+            assert_eq!(v.phase, crate::integrate::Phase::Queued);
+            assert_eq!(v.position, Some(1));
+        }
+        // the real coordinator starts the turn; while the check runs the
+        // control verbs still answer, and the card reads "integrating"
+        tick_until(&mut m, pid, &ctx, |c| {
+            c.kanban
+                .borrow()
+                .integration(&id)
+                .is_some_and(|v| v.phase == crate::integrate::Phase::Integrating)
+        });
+        let t0 = std::time::Instant::now();
+        let listed = list_line(&mut m, &id);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "list must not wait on the check"
+        );
+        let v = listed.integration.clone().unwrap();
+        assert_eq!(v.phase, crate::integrate::Phase::Integrating);
+        assert!(
+            listed.human_line().contains("[integrate integrating"),
+            "{}",
+            listed.human_line()
+        );
+        tick_until(&mut m, pid, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().state == crate::kanban::CardState::Done
+        });
+        assert_eq!(git_q(repo.path(), &["rev-parse", "HEAD"]), commit);
+        // the observer's next read sees the card gone from the queue
+        let child = fresh.project_child_mut(fpid).unwrap();
+        child.integration.kick = true;
+        child.kanban_tick(&ctx);
+        assert!(child.kanban.borrow().integration(&id).is_none());
+    }
+
+    #[test]
+    fn a_handed_back_card_shows_the_reason_and_cancel_releases_the_worktree() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        // the card edits f.txt; then main moves on f.txt too: a conflict
+        let (id, wt, _) = worktree_card_with_a_commit(&mut m, pid, &ctx, "clash", "f.txt");
+        std::fs::write(repo.path().join("f.txt"), "main\n").unwrap();
+        git_q(repo.path(), &["commit", "-q", "-am", "main moves"]);
+        m.kanban_dispatch(&integrate_req(&id)).unwrap();
+        tick_until(&mut m, pid, &ctx, |c| {
+            c.kanban
+                .borrow()
+                .integration(&id)
+                .is_some_and(|v| v.phase == crate::integrate::Phase::NeedsResolution)
+        });
+        let listed = list_line(&mut m, &id);
+        let v = listed.integration.clone().unwrap();
+        assert_eq!(v.reason, Some(crate::integrate::Reason::Conflict));
+        assert!(v.detail.unwrap().contains("f.txt"));
+        assert!(v.next.unwrap().contains("rebase --continue"));
+        assert!(
+            listed
+                .human_line()
+                .contains("[integrate needs resolution · conflict"),
+            "{}",
+            listed.human_line()
+        );
+        // wait <id> reports it at once
+        let mut watched = std::collections::HashSet::new();
+        assert_eq!(
+            crate::kanban::wait_verdict(
+                &crate::kanban::WaitTarget::Id(id.clone()),
+                &mut watched,
+                &[listed]
+            ),
+            Some(crate::kanban::WAIT_NEEDS_RESOLUTION)
+        );
+        // the worktree is left mid-rebase for the worker; a resubmit while
+        // it is refuses with the reason
+        let e = m.kanban_dispatch(&integrate_req(&id)).unwrap_err();
+        assert!(e.contains("rebase is in progress"), "{e}");
+        // cancel from the CLI removes the request; the worktree is untouched
+        let mut cancel = integrate_req(&id);
+        cancel.cancel = true;
+        let line = m
+            .kanban_dispatch(&cancel)
+            .unwrap()
+            .history
+            .unwrap()
+            .remove(0);
+        assert!(line.contains("cancelled"), "{line}");
+        assert!(
+            m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .integration(&id)
+                .is_none()
+        );
+        assert!(std::path::Path::new(&wt.path).join("f.txt").exists());
+        // no request: the done guard falls through to the ahead check
+        let mut done = kanban_req("done");
+        done.id = Some(id.clone());
+        let e = m.kanban_dispatch(&done).unwrap_err();
+        assert!(
+            e.contains("cannot verify") || e.contains("not yet on"),
+            "{e}"
+        );
     }
 }
