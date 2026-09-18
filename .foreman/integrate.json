@@ -1,0 +1,5 @@
+{
+  "v": 1,
+  "check": ["cargo", "test", "--target-dir", "target/agent"],
+  "timeout_secs": 1800
+}
