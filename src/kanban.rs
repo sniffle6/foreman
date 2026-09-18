@@ -1560,15 +1560,29 @@ pub enum BringUp {
     Detached,
 }
 
-/// Case-insensitive on Windows (drive letters and user dirs vary in case
-/// between `rev-parse` and the porcelain listing), exact elsewhere.
+/// Two strings name the same place. Slash-normalized; case-insensitive on
+/// Windows (drive letters and user dirs vary in case between `rev-parse`
+/// and the porcelain listing). When both paths exist, filesystem identity
+/// wins: GitHub Actions Windows often has tempfile as `C:\Users\RUNNER~1\…`
+/// while `git worktree list` prints `C:/Users/runneradmin/…`, and a
+/// string compare would list an owned tree as a stray.
 pub(crate) fn same_path(a: &str, b: &str) -> bool {
-    let a = a.replace('\\', "/");
-    let b = b.replace('\\', "/");
-    if cfg!(windows) {
-        a.eq_ignore_ascii_case(&b)
+    let na = a.replace('\\', "/");
+    let nb = b.replace('\\', "/");
+    let strings_match = if cfg!(windows) {
+        na.eq_ignore_ascii_case(&nb)
     } else {
-        a == b
+        na == nb
+    };
+    if strings_match {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(std::path::Path::new(a)),
+        std::fs::canonicalize(std::path::Path::new(b)),
+    ) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
     }
 }
 
@@ -2880,6 +2894,22 @@ mod tests {
             "When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n"
         ));
         assert!(s.contains("(bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n"));
+    }
+
+    #[test]
+    fn same_path_follows_the_directory_when_string_forms_differ() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("wt");
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.to_string_lossy().replace('\\', "/");
+        let canon = std::fs::canonicalize(&dir).unwrap();
+        let canon_s = canon.to_string_lossy();
+        assert!(same_path(&raw, &canon_s), "raw={raw:?} canon={canon_s:?}");
+        assert!(same_path(&raw, &raw));
+        assert!(
+            !same_path(&raw, &format!("{raw}-nope")),
+            "a missing sibling is not the same place"
+        );
     }
 
     #[test]
