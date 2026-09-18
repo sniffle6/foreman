@@ -28,6 +28,10 @@ const BTN_GAP: f32 = 4.0;
 const WT_CHIP_W: f32 = 36.0;
 /// The worktree strip along the bottom of the board (logical px).
 const STRIP_H: f32 = 22.0;
+/// Width of the Worktrees page's owner column (logical px). Fixed because a
+/// `Grid` sizes a column from its first frame, when a wrapping label has no
+/// width to wrap at and folds a few characters per line.
+const OWNER_W: f32 = 260.0;
 
 /// Done header controls (spec: kanban-cut §Board UI): the version dropdown
 /// and, in Current, the Cut button — right-anchored, own hit regions.
@@ -1256,24 +1260,30 @@ impl BoardView {
             egui::RichText::new(&row.wt.branch).monospace().color(color),
         ))
         .on_hover_text(&row.wt.path);
-        ui.vertical(|ui| match &row.owner {
-            RowOwner::Card {
-                id,
-                state,
-                title,
-                version,
-                ..
-            } => {
-                let mut head = format!("{id} · {}", column_title(*state));
-                if let Some(v) = version {
-                    head.push_str(&format!(" · {v}"));
+        ui.vertical(|ui| {
+            ui.set_min_width(OWNER_W * self.scale);
+            ui.set_max_width(OWNER_W * self.scale);
+            match &row.owner {
+                RowOwner::Card {
+                    id,
+                    state,
+                    title,
+                    version,
+                    ..
+                } => {
+                    let mut head = format!("{id} · {}", column_title(*state));
+                    if let Some(v) = version {
+                        head.push_str(&format!(" · {v}"));
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(head).color(th.dim)).truncate());
+                    ui.add(egui::Label::new(title.as_str()).truncate());
                 }
-                ui.label(egui::RichText::new(head).color(th.dim));
-                ui.add(egui::Label::new(title.as_str()).truncate());
-            }
-            RowOwner::None => {
-                ui.label(egui::RichText::new("no card").color(th.danger));
-                ui.label(egui::RichText::new(row.name()).color(th.dim));
+                RowOwner::None => {
+                    ui.label(egui::RichText::new("no card").color(th.danger));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(row.name()).color(th.dim)).truncate(),
+                    );
+                }
             }
         });
         let line = match row.status {
