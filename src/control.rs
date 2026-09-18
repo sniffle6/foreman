@@ -226,7 +226,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KanbanRequest {
     pub cmd: String,    // always "kanban"
-    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit" | "worktrees"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +251,10 @@ pub struct KanbanRequest {
     /// `list --all`: include shipped cards (bare `list` is the live board).
     #[serde(default, skip_serializing_if = "is_false")]
     pub all: bool,
+    /// `worktrees --stray`: only trees no card owns. Skipped when false so
+    /// v1 requests stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stray: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -903,8 +907,47 @@ pub fn parse_kanban_args(
         "wait" => parse_kanban_wait(rest, default_project),
         "cut" => parse_kanban_named(rest, default_project, "cut"),
         "uncut" => parse_kanban_named(rest, default_project, "uncut"),
+        "worktrees" => parse_kanban_worktrees(rest, default_project),
         other => Err(format!("unknown kanban action: {other}")),
     }
+}
+
+/// `worktrees [--stray] [--json] [--project P]` — every foreman worktree
+/// of the project (card-owned and stray); `--stray` keeps the cardless ones.
+fn parse_kanban_worktrees(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut json = false;
+    let mut stray = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--stray" => {
+                stray = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "worktrees".into(),
+        project,
+        json,
+        stray,
+        ..Default::default()
+    }))
 }
 
 /// `add <title words...> [--body B] [--project P]` — positional words join
@@ -1386,6 +1429,7 @@ foreman kanban cut <name> [--project P]
 foreman kanban uncut <name> [--project P]
 foreman kanban wait <id> [--timeout SECS] [--project P]
 foreman kanban wait --any [--timeout SECS] [--project P]
+foreman kanban worktrees [--stray] [--json] [--project P]
 
 Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
@@ -1407,6 +1451,16 @@ focused project).
           are hidden, and a shipped card's line ends [shipped NAME].
           --shipped NAME lists that Version only (case-insensitive; unknown
           name = empty, exit 0). --all includes every shipped card.
+  worktrees
+          every worktree foreman made for the project (git's list filtered
+          to .foreman/worktrees/, plus any tree a card still points at),
+          probed live: one line per tree — <name> <state> <title> [wt ...]
+          for a card's tree, <name> no card [wt ...] for a stray (a tree no
+          card owns: card removed, file deleted, or not on this branch).
+          --stray keeps only strays. --json emits one object per line:
+          name, path, branch, base, card {id,state,title} (absent for a
+          stray), status {dirty,ahead,behind,missing} (absent when git
+          could not probe that tree). Errors outside a git repository.
   start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
@@ -3493,5 +3547,41 @@ mod tests {
         let r = reply.expect("no reply");
         assert!(r.ok);
         assert_eq!(r.terminal.as_deref(), Some("t4"));
+    }
+
+    #[test]
+    fn parse_kanban_args_worktrees_takes_stray_and_json() {
+        let r = parse_kanban_args(&s(&["worktrees"]), Some("p1".into()), None).unwrap();
+        let KanbanAction::Request(req) = r else {
+            panic!("request");
+        };
+        assert_eq!(req.action, "worktrees");
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        assert!(!req.json && !req.stray);
+        let r = parse_kanban_args(
+            &s(&["worktrees", "--stray", "--json", "--project", "p2"]),
+            None,
+            None,
+        )
+        .unwrap();
+        let KanbanAction::Request(req) = r else {
+            panic!("request");
+        };
+        assert!(req.json && req.stray);
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        assert!(parse_kanban_args(&s(&["worktrees", "x"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["worktrees", "--all"]), None, None).is_err());
+    }
+
+    #[test]
+    fn kanban_request_stray_is_wire_compatible_with_v1() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "list".into(),
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&req).unwrap().contains("\"stray\""));
+        let r: KanbanRequest = serde_json::from_str(r#"{"cmd":"kanban","action":"list"}"#).unwrap();
+        assert!(!r.stray);
     }
 }

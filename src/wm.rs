@@ -1632,6 +1632,43 @@ impl WindowManager {
                     ..Default::default()
                 })
             }
+            "worktrees" => {
+                // Files are authoritative (same rule as `list`), and the
+                // probe is live rather than the board's last poll round —
+                // synchronous git on the request path, like `rm` and `cut`.
+                child.kanban.borrow_mut().reload();
+                let states = child.term_states();
+                let run = crate::kanban::run_nonce();
+                let listed = crate::kanban::foreman_worktrees_now(&cwd)?;
+                let store = child.kanban.borrow();
+                let orphans: std::collections::HashSet<String> = store
+                    .cards()
+                    .iter()
+                    .filter(|c| crate::kanban::is_orphaned(c, run, &states))
+                    .map(|c| c.id.clone())
+                    .collect();
+                let rows =
+                    crate::kanban::live_worktree_rows(store.cards(), &orphans, listed, |wt| {
+                        crate::kanban::worktree_status_now(&cwd, wt).ok()
+                    });
+                let history: Vec<String> = rows
+                    .iter()
+                    .filter(|r| !req.stray || r.owner == crate::kanban::RowOwner::None)
+                    .map(|r| {
+                        let line = crate::kanban::WorktreeLine::from_row(r);
+                        if req.json {
+                            line.json_line()
+                        } else {
+                            line.human_line()
+                        }
+                    })
+                    .collect();
+                Ok(OpenReply {
+                    ok: true,
+                    history: Some(history),
+                    ..Default::default()
+                })
+            }
             "cut" => {
                 let name = req.name.as_deref().ok_or("cut requires a version name")?;
                 let out = child.kanban_cut(name)?;
@@ -14676,5 +14713,96 @@ mod tests {
             "coalesced, not duplicated"
         );
         assert!(child.pending_teardowns[0].force);
+    }
+
+    /// `foreman kanban worktrees` against a real repository: a card's tree
+    /// and a stray both list, `--stray` keeps the stray, `--json` carries
+    /// the card only where there is one.
+    #[test]
+    fn kanban_worktrees_lists_card_trees_and_strays_live() {
+        if !crate::kanban::git_available() {
+            eprintln!("git not on PATH; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let mut m = kanban_desktop(root.to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("Owned tree".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let wt = crate::kanban::worktree_layout(root, &id, "main");
+        let stray = crate::kanban::worktree_layout(root, "zz9zz9", "main");
+        git(&["worktree", "add", "-q", "-b", &wt.branch, &wt.path, "HEAD"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &stray.branch,
+            &stray.path,
+            "HEAD",
+        ]);
+        std::fs::write(std::path::Path::new(&stray.path).join("f.txt"), "dirty\n").unwrap();
+        m.project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                Some(wt.clone()),
+            )
+            .unwrap();
+
+        let lines = m
+            .kanban_dispatch(&kanban_req("worktrees"))
+            .unwrap()
+            .history
+            .unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!("{id}  in_progress  Owned tree  [wt card/{id} +0 -0]")
+        );
+        assert_eq!(lines[1], "zz9zz9  no card  [wt card/zz9zz9 +0 -0 dirty]");
+
+        let mut req = kanban_req("worktrees");
+        req.stray = true;
+        req.json = true;
+        let lines = m.kanban_dispatch(&req).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line: crate::kanban::WorktreeLine = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(line.name, "zz9zz9");
+        assert!(line.card.is_none());
+        assert!(line.status.unwrap().dirty);
+        assert!(crate::kanban::same_path(&line.path, &stray.path));
+
+        // Outside a repository the verb errors rather than listing nothing.
+        let plain = tempfile::tempdir().unwrap();
+        let mut m2 = kanban_desktop(plain.path().to_path_buf());
+        assert!(m2.kanban_dispatch(&kanban_req("worktrees")).is_err());
     }
 }

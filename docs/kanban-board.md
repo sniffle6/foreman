@@ -145,6 +145,7 @@ foreman kanban rm <id>                    # delete the card file, any state
 foreman kanban cut <name>                 # ship ritual: Done -> Version <name>
 foreman kanban uncut <name>               # Version <name> -> Current Done
 foreman kanban wait <id> | --any [--timeout SECS]
+foreman kanban worktrees [--stray] [--json]   # every foreman worktree, probed live
 ```
 
 `wait` exit codes: `0` Done, `1` Blocked / orphaned / removed (needs a
@@ -215,8 +216,13 @@ and does not claim or move the card; body is a full replace, not an append.
 - **`kanban list` worktree status comes from the last poll round.** A board
   that has not been shown since the card was dispatched prints the branch
   with no counts.
-- **Strays never reach the CLI.** `kanban list` knows cards; a tree with no
-  card is visible only on the board's Worktrees page.
+- **`kanban list` never shows a stray.** It knows cards. `kanban worktrees`
+  is the whole picture: it lists git's foreman trees plus any tree a card
+  still points at, probing each on the request (synchronous git, like `rm`
+  and `cut`), so its counts are live where the board's are the last poll
+  round. `--stray` keeps the cardless ones; `--json` is one object per line
+  with `card` and `status` absent when there is none. Outside a git
+  repository the verb errors. Cleanup of a stray stays board-only.
 - **A stray's Remove or Discard clicked twice is one teardown.** The queue
   keeps one entry per directory name; a second click while the first runs
   waits its turn and then finds nothing to remove.
@@ -244,7 +250,8 @@ and does not claim or move the card; body is a full replace, not an append.
   `CardStore::take_status_poll`; the overview half:
   `parse_worktree_list`, `foreman_worktrees_now`, `strays_among`,
   `StrayWorktree`, `worktree_rows` / `WorktreeRow` / `RowOwner`,
-  `worktree_strip`, `CardStore::strays`; the Cut half: `Shipped`,
+  `worktree_strip`, `CardStore::strays`, `live_worktree_rows`,
+  `WorktreeLine` (the `kanban worktrees` line); the Cut half: `Shipped`,
   `same_name`, `versions`, `CardStore::cut` / `uncut` (batch write, revert),
   `parse_trailer_log` + `trailer_commits`, `latest_v_tag`.
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the

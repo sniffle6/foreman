@@ -293,6 +293,114 @@ pub fn worktree_rows(
     rows
 }
 
+/// Rows for `foreman kanban worktrees`: every tree a card points at plus
+/// every foreman tree git lists, each probed once by `probe` (`None` = the
+/// probe errored; the line shows the branch alone). Pure apart from the
+/// injected probe, so the union and the stray split are unit-tested.
+pub fn live_worktree_rows(
+    cards: &[Card],
+    orphans: &std::collections::HashSet<String>,
+    listed: Vec<Worktree>,
+    probe: impl Fn(&Worktree) -> Option<WorktreeStatus>,
+) -> Vec<WorktreeRow> {
+    let owned: Vec<(String, Worktree)> = cards
+        .iter()
+        .filter_map(|c| c.worktree.clone().map(|w| (c.id.clone(), w)))
+        .collect();
+    let by_card: std::collections::HashMap<String, Option<WorktreeStatus>> = owned
+        .iter()
+        .map(|(id, wt)| (id.clone(), probe(wt)))
+        .collect();
+    let strays: Vec<StrayWorktree> = strays_among(listed, &owned)
+        .into_iter()
+        .map(|wt| StrayWorktree {
+            status: probe(&wt),
+            wt,
+        })
+        .collect();
+    worktree_rows(
+        cards,
+        orphans,
+        |id| by_card.get(id).copied().flatten(),
+        &strays,
+    )
+}
+
+/// The card a worktree line belongs to (`foreman kanban worktrees --json`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorktreeLineCard {
+    pub id: String,
+    pub state: CardState,
+    pub title: String,
+}
+
+/// One line of `foreman kanban worktrees`: the wire shape (`--json`, one
+/// object per line) and the human line. `card` is absent for a stray;
+/// `status` is absent when the probe errored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorktreeLine {
+    /// The directory name: the card id the tree was made for.
+    pub name: String,
+    pub path: String,
+    pub branch: String,
+    pub base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<WorktreeLineCard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorktreeStatus>,
+}
+
+impl WorktreeLine {
+    pub fn from_row(row: &WorktreeRow) -> Self {
+        let card = match &row.owner {
+            RowOwner::Card {
+                id, state, title, ..
+            } => Some(WorktreeLineCard {
+                id: id.clone(),
+                state: *state,
+                title: title.clone(),
+            }),
+            RowOwner::None => None,
+        };
+        Self {
+            name: worktree_dir_name(&row.wt),
+            path: row.wt.path.clone(),
+            branch: row.wt.branch.clone(),
+            base: row.wt.base.clone(),
+            card,
+            status: row.status,
+        }
+    }
+
+    pub fn json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// `<name>  <state>  <title>  [wt <summary>]` for a card's tree,
+    /// `<name>  no card  [wt <summary>]` for a stray — the same `[wt …]`
+    /// tail `kanban list` prints, so eyes and scripts learn one format.
+    pub fn human_line(&self) -> String {
+        let wt = Worktree {
+            path: self.path.clone(),
+            branch: self.branch.clone(),
+            base: self.base.clone(),
+        };
+        let tail = format!("[wt {}]", worktree_summary(&wt, self.status.as_ref()));
+        match &self.card {
+            Some(c) => {
+                let state = match c.state {
+                    CardState::Backlog => "backlog",
+                    CardState::InProgress => "in_progress",
+                    CardState::Blocked => "blocked",
+                    CardState::Done => "done",
+                };
+                format!("{}  {state}  {}  {tail}", self.name, c.title)
+            }
+            None => format!("{}  no card  {tail}", self.name),
+        }
+    }
+}
+
 /// The board's bottom strip: `N worktrees · D dirty · S no card`, zero
 /// segments omitted; `None` when there is nothing to show. The bool is
 /// attention (any dirty or stray).
@@ -3655,5 +3763,95 @@ mod tests {
             .unwrap();
         store.set_worktree_statuses(Default::default(), vec![stray]);
         assert!(store.strays().is_empty());
+    }
+
+    #[test]
+    fn live_worktree_rows_union_cards_and_listing_and_probe_each_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let wt_for = |id: &str| Worktree {
+            path: format!("H:/repo/.foreman/worktrees/{id}"),
+            branch: format!("card/{id}"),
+            base: "main".into(),
+        };
+        // A card whose tree git no longer lists (pruned) still gets a row.
+        let pruned = store.add("pruned", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &pruned,
+                "t1",
+                "claude",
+                run_nonce(),
+                TermState::Missing,
+                Some(wt_for(&pruned)),
+            )
+            .unwrap();
+        let live = store.add("live", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &live,
+                "t2",
+                "claude",
+                run_nonce(),
+                TermState::Missing,
+                Some(wt_for(&live)),
+            )
+            .unwrap();
+        let listed = vec![wt_for(&live), wt_for("stray1")];
+        let probed = std::cell::RefCell::new(Vec::new());
+        let rows = live_worktree_rows(store.cards(), &Default::default(), listed, |wt| {
+            probed.borrow_mut().push(wt.path.clone());
+            if wt.path.ends_with("stray1") {
+                None
+            } else {
+                Some(WorktreeStatus {
+                    missing: wt.path.ends_with(&pruned),
+                    ..Default::default()
+                })
+            }
+        });
+        let mut names: Vec<String> = rows.iter().map(WorktreeRow::name).collect();
+        let stray_pos = names.iter().position(|n| n == "stray1").unwrap();
+        assert_eq!(stray_pos, 2, "stray last");
+        names.sort();
+        let mut want = vec![pruned.clone(), live.clone(), "stray1".into()];
+        want.sort();
+        assert_eq!(names, want);
+        let mut p = probed.borrow().clone();
+        p.sort();
+        let mut want_p = vec![
+            wt_for(&pruned).path,
+            wt_for(&live).path,
+            wt_for("stray1").path,
+        ];
+        want_p.sort();
+        assert_eq!(p, want_p, "each tree probed exactly once");
+        let pruned_row = rows.iter().find(|r| r.name() == pruned).unwrap();
+        assert!(pruned_row.status.unwrap().missing);
+        let stray_row = &rows[2];
+        assert_eq!(stray_row.owner, RowOwner::None);
+        assert!(
+            stray_row.status.is_none(),
+            "an errored probe is absent, not zero"
+        );
+
+        // Lines: the wire shape omits absent card/status; humans get the
+        // same `[wt …]` tail as `list`.
+        let line = WorktreeLine::from_row(stray_row);
+        let j = line.json_line();
+        assert!(!j.contains("\"card\"") && !j.contains("\"status\""), "{j}");
+        assert_eq!(line.human_line(), "stray1  no card  [wt card/stray1]");
+        let back: WorktreeLine = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, line);
+        let line = WorktreeLine::from_row(rows.iter().find(|r| r.name() == live).unwrap());
+        assert_eq!(
+            line.human_line(),
+            format!("{live}  in_progress  live  [wt card/{live} +0 -0]")
+        );
+        let j = line.json_line();
+        assert!(
+            j.contains("\"card\":{\"id\":") && j.contains("\"state\":\"in_progress\""),
+            "{j}"
+        );
     }
 }

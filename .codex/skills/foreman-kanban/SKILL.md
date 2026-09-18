@@ -37,6 +37,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 300
 & $env:FOREMAN_EXE kanban wait --any --timeout 300
 & $env:FOREMAN_EXE kanban list --shipped v0.5.0 --json
+& $env:FOREMAN_EXE kanban worktrees --stray --json
 & $env:FOREMAN_EXE kanban cut v0.5.0
 & $env:FOREMAN_EXE kanban uncut v0.5.0
 ```
@@ -57,6 +58,10 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 - `done` — closes a card you hold: in-progress -> done.
 - `block --reason R` — in-progress -> blocked; the reason is mandatory.
 - `rm` — deletes the card's file outright, from any state.
+- `worktrees` — every worktree foreman made for the project, probed live:
+  `<name> <state> <title> [wt …]` for a card's tree, `<name> no card [wt …]`
+  for a stray (a tree no card owns). `--stray` keeps only strays; `--json`
+  emits one object per line (name, path, branch, base, card, status).
 - `wait` — polls until the card (or, with `--any`, any in-progress card)
   reaches done, blocked, orphaned, or removed. Exit codes: `0` done, `1`
   blocked/orphaned/removed (needs a human), `2` timeout or Foreman
@@ -133,3 +138,7 @@ What that changes for you:
 - **`list`** appends `[wt card/<id> +ahead -behind dirty|missing]` to a
   worktree card's line; `--json` adds `worktree` (path, branch, base) and a
   derived `worktree_status`, both absent for cards without one.
+- **`worktrees`** is the whole picture, cards or not: a tree whose card was
+  removed, deleted by hand, or left on another branch is a stray only this
+  verb (and the board's Worktrees page) can see. Cleanup of a stray is
+  human-only, on the board.
