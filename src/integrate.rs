@@ -940,11 +940,10 @@ fn run_child(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot run {program}: {e}"))?;
-    let _job = crate::job::Job::assign(child.id());
+    let mut job = crate::job::Job::assign(child.id());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_t = read_all(stdout);
-    let err_t = read_all(stderr);
+    let (out_rx, err_rx) = (read_all(stdout), read_all(stderr));
     let start = Instant::now();
     let mut timed_out = false;
     let mut was_cancelled = false;
@@ -958,6 +957,11 @@ fn run_child(
                     was_cancelled = true;
                 }
                 if timed_out || was_cancelled {
+                    // The whole tree first: a descendant of the check (a
+                    // test runner's workers, a shell wrapper's child) holds
+                    // the output pipes too, and killing only the immediate
+                    // process would leave the readers waiting on it.
+                    drop(job.take());
                     let _ = child.kill();
                     break child
                         .wait()
@@ -968,8 +972,12 @@ fn run_child(
             Err(e) => return Err(format!("cannot wait for {program}: {e}")),
         }
     };
-    let out = out_t.join().unwrap_or_default();
-    let err = err_t.join().unwrap_or_default();
+    // Bounded: a lingering descendant that kept a pipe open must not hold
+    // the repository's turn hostage. Whatever arrived is what we report;
+    // the Job drop at return kills the straggler.
+    let out = collect_output(&out_rx);
+    let err = collect_output(&err_rx);
+    drop(job);
     let mut combined = out;
     if !err.trim().is_empty() {
         if !combined.is_empty() && !combined.ends_with('\n') {
@@ -985,9 +993,18 @@ fn run_child(
     })
 }
 
+/// How long to wait for a finished child's output after it exited: only a
+/// descendant that outlived it can still be writing.
+const OUTPUT_GRACE: Duration = Duration::from_secs(5);
+
 /// Drain one captured pipe on its own thread (reading both pipes from one
-/// thread can deadlock once either buffer fills).
-fn read_all(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<String> {
+/// thread can deadlock once either buffer fills). The thread is never
+/// joined: it ends when the last holder of the pipe closes it, and the
+/// caller waits a bounded time on the channel instead.
+fn read_all(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = String::new();
         if let Some(mut p) = pipe {
@@ -995,8 +1012,13 @@ fn read_all(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::J
             let _ = std::io::Read::read_to_end(&mut p, &mut bytes);
             buf = String::from_utf8_lossy(&bytes).into_owned();
         }
-        buf
-    })
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+fn collect_output(rx: &std::sync::mpsc::Receiver<String>) -> String {
+    rx.recv_timeout(OUTPUT_GRACE).unwrap_or_default()
 }
 
 fn tail_lines(text: &str, n: usize) -> String {
@@ -1440,6 +1462,15 @@ fn integrate_one(queue: &Queue, mut req: Request, hooks: &dyn TurnHooks) -> (Req
         }
         save!();
         hooks.after_check(&card);
+        if is_cancelled() {
+            return cancelled(
+                req,
+                format!(
+                    "cancelled after the check; worktree is at {}",
+                    short(&prepared)
+                ),
+            );
+        }
         // Final preflight: same source, same target, clean destination.
         if let Err((reason, detail)) = source_preflight(&tree, &req.branch, Some(&prepared)) {
             return resolve(req, reason, detail);
@@ -1642,8 +1673,12 @@ pub fn run_turn(
         {
             let _m = queue.meta()?;
             // A cancel that landed between the read and the lock wins.
-            if queue.get(&req.card).is_none() {
-                continue;
+            // A cancel (file gone) or a resubmission (new seq/commit) that
+            // landed between the read and the lock wins: work from the
+            // file, never from the stale copy.
+            match queue.get(&req.card) {
+                Some(cur) if cur.phase == Phase::Queued => req = cur,
+                _ => continue,
             }
             req.phase = Phase::Integrating;
             req.attempt = Some(attempt_for(owner));
@@ -1653,11 +1688,29 @@ pub fn run_turn(
             req.touch();
             queue.write(&req)?;
         }
-        let (req, event) = integrate_one(queue, req, hooks);
+        let (req, mut event) = integrate_one(queue, req, hooks);
         {
             let _m = queue.meta()?;
             let mut req = req;
             req.touch();
+            // A cancel that arrived on disk after the last checkpoint (the
+            // final preflight has none) is honored here for anything that
+            // did not land: the request would otherwise survive as queued
+            // or handed back with the flag silently erased.
+            let cancel_on_disk = queue.get(&req.card).is_none_or(|r| r.cancel_requested);
+            let landed = req.phase == Phase::Integrated;
+            if cancel_on_disk && !landed && !matches!(event, TurnEvent::Cancelled { .. }) {
+                let prepared = req
+                    .attempt
+                    .as_ref()
+                    .and_then(|a| a.prepared.as_deref())
+                    .map(|p| format!("; worktree is at {}", short(p)))
+                    .unwrap_or_default();
+                event = TurnEvent::Cancelled {
+                    card: req.card.clone(),
+                    note: format!("cancelled while {}{prepared}", req.phase.label()),
+                };
+            }
             match &event {
                 TurnEvent::Cancelled { .. } => queue.remove_file(&req.card)?,
                 _ => {
@@ -2573,6 +2626,102 @@ mod tests {
             git_in(tree, &["symbolic-ref", "--short", "HEAD"]),
             "card/aa",
             "the worker's branch survives"
+        );
+    }
+
+    /// Cancels from inside the turn after the check, in the window before
+    /// the final preflight — and dirties the destination so that preflight
+    /// would otherwise hold the request with the flag erased.
+    struct CancelAfterCheck {
+        queue: Queue,
+        root: PathBuf,
+    }
+
+    impl TurnHooks for CancelAfterCheck {
+        fn after_check(&self, card: &str) {
+            assert_eq!(self.queue.cancel(card).unwrap(), Cancelled::Requested);
+            std::fs::write(self.root.join("f.txt"), "wip\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cancel_after_the_check_is_honored_and_never_erased_by_a_hold() {
+        let Some(r) = repo() else { return };
+        let a = bring_up(r.path(), "aa");
+        let tree = Path::new(&a.path);
+        commit_file(tree, "a.txt", "a\n", "a");
+        let (q, _) = submit(r.path(), "aa", &a);
+        let main_before = head(r.path());
+        let hooks = CancelAfterCheck {
+            queue: q.clone(),
+            root: r.path().to_path_buf(),
+        };
+        let events = run_turn(&q, &owner(), &hooks).unwrap().unwrap();
+        assert!(
+            matches!(&events[0], TurnEvent::Cancelled { note, .. } if note.contains("after the check")),
+            "{events:?}"
+        );
+        assert!(
+            q.get("aa").is_none(),
+            "a cancelled request leaves the queue"
+        );
+        assert_eq!(head(r.path()), main_before);
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("f.txt")).unwrap(),
+            "wip\n",
+            "the destination's edit is untouched"
+        );
+        assert!(git_op_in_progress(tree).is_none());
+    }
+
+    #[test]
+    fn a_resubmission_racing_the_dequeue_is_the_one_that_runs() {
+        // Model the race: the turn's unlocked read saw the old request, but
+        // by the time it takes the lock a newer submission (new seq, new
+        // commit) has replaced it. The fresh file must be what integrates.
+        let Some(r) = repo() else { return };
+        let a = bring_up(r.path(), "aa");
+        let tree = Path::new(&a.path);
+        let c1 = commit_file(tree, "a.txt", "a\n", "a");
+        let (q, _) = submit(r.path(), "aa", &a);
+        let c2 = commit_file(tree, "a2.txt", "a2\n", "a2");
+        let (_, resub) = submit(r.path(), "aa", &a);
+        assert!(!resub.existing);
+        assert_eq!(resub.request.commit, c2);
+        assert_ne!(c1, c2);
+        let events = turn(&q);
+        assert!(
+            matches!(&events[0], TurnEvent::Integrated { prepared, .. } if *prepared == c2),
+            "{events:?}"
+        );
+        assert_eq!(q.get("aa").unwrap().commit, c2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_finished_check_whose_descendant_keeps_the_pipe_open_does_not_hang_the_turn() {
+        let Some(r) = repo() else { return };
+        let a = bring_up(r.path(), "aa");
+        commit_file(Path::new(&a.path), "a.txt", "a\n", "a");
+        std::fs::create_dir_all(r.path().join(".foreman")).unwrap();
+        // cmd exits at once (success) but leaves a background ping that
+        // inherited the captured pipes and runs for ~30 s.
+        std::fs::write(
+            r.path().join(POLICY_FILE),
+            r#"{"check":["cmd","/c","start /b ping -n 30 127.0.0.1 & exit 0"],"timeout_secs":60}"#,
+        )
+        .unwrap();
+        let (q, _) = submit(r.path(), "aa", &a);
+        let start = Instant::now();
+        let events = turn(&q);
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "output collection must be bounded, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(&events[0], TurnEvent::Integrated { .. }),
+            "{events:?}"
         );
     }
 
