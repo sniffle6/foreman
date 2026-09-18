@@ -575,7 +575,7 @@ pub enum TermState {
 
 /// RFC3339 timestamp, seconds precision, always UTC (`Z` suffix) — the shape
 /// every card field and test fixture in this module uses.
-fn now_stamp() -> String {
+pub(crate) fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
@@ -1510,7 +1510,7 @@ pub fn wait_verdict(
 
 /// Run `git -C <cwd> <args>`; `Ok(stdout trimmed)` on exit 0, otherwise
 /// `Err(first stderr line)` (or a spawn error). Never opens a console window.
-fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());

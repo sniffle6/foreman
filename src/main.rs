@@ -24,6 +24,7 @@ mod icons;
 mod imageview;
 mod input;
 mod inspect;
+mod integrate;
 mod job;
 mod kanban;
 mod keymap;
