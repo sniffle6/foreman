@@ -38,6 +38,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 & $env:FOREMAN_EXE kanban wait --any --timeout 300
 & $env:FOREMAN_EXE kanban list --shipped v0.5.0 --json
 & $env:FOREMAN_EXE kanban worktrees --stray --json
+& $env:FOREMAN_EXE kanban integrate a3f8k2
 & $env:FOREMAN_EXE kanban cut v0.5.0
 & $env:FOREMAN_EXE kanban uncut v0.5.0
 ```
@@ -65,7 +66,12 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 - `wait` — polls until the card (or, with `--any`, any in-progress card)
   reaches done, blocked, orphaned, or removed. Exit codes: `0` done, `1`
   blocked/orphaned/removed (needs a human), `2` timeout or Foreman
-  unreachable.
+  unreachable, `3` (only `wait <id>`) the card's integration needs
+  resolution — resolve in the worktree, then `integrate` and `wait` again.
+  Queued and integrating are still pending.
+- `integrate` — submit a worktree card's committed work to the repository's
+  integration queue, or `--cancel` to withdraw it; `--json` prints the
+  integration object. See **Integration queue** below.
 - `cut NAME` / `uncut NAME` — the ship ritual, run by a human or a release
   script after tagging: `cut` moves every ungrouped Done card into Version
   NAME; `uncut` puts them back. Codex is not expected to Cut.
@@ -123,11 +129,12 @@ section saying so; if it does not, you are in the project cwd.
 
 What that changes for you:
 
-- **Integrate before `done`.** From inside your worktree: `git rebase <base>`
-  then `git -C "<main checkout>" merge --ff-only card/<id>` (both lines are
-  in your prompt). If the fast-forward is refused, rebase and retry; if the
-  main checkout has uncommitted edits in files you touched, `block` instead
-  of forcing.
+- **Never merge into the main checkout yourself, and never run `done` on
+  a worktree card.** Commit everything, then hand the card to the
+  integration queue (`integrate` + `wait`, both lines are in your prompt);
+  Foreman rebases, checks, fast-forwards, and marks the card Done. `done`
+  on a branch with commits not yet on its base is refused and points at
+  `integrate`. **Queued is not Done.** Details: **Integration queue** below.
 - **Never stage `.foreman/`.** The worktree carries a stale copy of the
   board's card files; `git add -A` would commit them.
 - **`done` queues a non-forcing teardown** that waits until your terminal
@@ -142,3 +149,43 @@ What that changes for you:
   removed, deleted by hand, or left on another branch is a stray only this
   verb (and the board's Worktrees page) can see. Cleanup of a stray is
   human-only, on the board.
+
+## Integration queue: how a worktree card lands
+
+Foreman owns one integration turn per repository at a time, so two workers
+can never race each other onto the shared checkout. The whole close-out
+for a worktree card is two commands, run from anywhere inside your
+Session:
+
+```powershell
+& $env:FOREMAN_EXE kanban integrate <id>
+& $env:FOREMAN_EXE kanban wait <id> --timeout 1800
+```
+
+`integrate` needs a clean worktree on `card/<id>` with no rebase or merge
+in progress; it replies with the request's state (`queued #N`) and returns
+at once. **Stop touching the worktree while it is queued or integrating**:
+Foreman rebases it onto the card's base, runs the project's checks
+(`.foreman/integrate.json`: `{"check": ["cargo","test"], "timeout_secs": 1800}`;
+no file means no checks, and the card says so), fast-forwards the base,
+and marks the card Done — teardown then waits for your pane as before.
+
+Then branch on `wait`'s exit code:
+
+- `0` — integrated and Done. You are finished; do not run `done`.
+- `3` — handed back: the rebase conflicted or a check failed. Read the
+  reason with `list --json` (the `integration` object: `reason`, `detail`,
+  `next`), fix it in your worktree — a conflict is left mid-rebase for you:
+  resolve, `git add`, `git rebase --continue` — commit, then run
+  `integrate` and `wait` again. A resubmission joins the tail of the queue.
+- `2` — timed out (still queued, or a long check): run `wait` again.
+- `1` — blocked, orphaned, or removed: a human is involved; stop.
+
+Resubmitting the same commit is harmless (you get the existing request
+back). Committing more after submitting makes the submission stale: it
+comes back as `needs resolution · source changed`; resubmit. A dirty main
+checkout or one on the wrong branch holds the whole queue (`queued · held:
+…`) until the human fixes it; nothing of yours is touched. `integrate <id>
+--cancel` withdraws your request. The board shows the same substates on
+the card (queued, integrating, needs resolution) and offers Submit /
+Resubmit / Cancel on the detail page.

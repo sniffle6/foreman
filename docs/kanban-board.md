@@ -32,9 +32,11 @@ sibling — read those for *why*, this doc for *how*.
   `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
   and spawns the worker there, so no two workers share a checkout. The card
   records `worktree` (path, branch, and `base` — the branch the main checkout
-  had at dispatch). The prompt's Workspace section tells the worker to
-  `git rebase <base>` and fast-forward `<base>` from the worktree before
-  `done`. `done`, board Release, and `rm` queue a non-forcing teardown
+  had at dispatch). The prompt's close-out hands the finished branch to the
+  repository's **integration queue** (`foreman kanban integrate`), which
+  rebases, checks, fast-forwards, and marks the card Done — the worker
+  never merges into the main checkout and never runs `done` on a worktree
+  card; see `docs/integration-queue.md`. `done`, board Release, and `rm` queue a non-forcing teardown
   (`worktree remove`, `branch -d`, `prune`) that runs on a background thread
   once the worker's terminal is gone; a dirty tree or an unmerged branch is
   kept and the card says so. `rm` refuses outright while the tree is dirty or
@@ -146,10 +148,12 @@ foreman kanban cut <name>                 # ship ritual: Done -> Version <name>
 foreman kanban uncut <name>               # Version <name> -> Current Done
 foreman kanban wait <id> | --any [--timeout SECS]
 foreman kanban worktrees [--stray] [--json]   # every foreman worktree, probed live
+foreman kanban integrate <id> [--cancel] [--json]   # submit a worktree card to the queue
 ```
 
 `wait` exit codes: `0` Done, `1` Blocked / orphaned / removed (needs a
-human), `2` timeout or foreman unreachable. `foreman kanban --help` is ground
+human), `2` timeout or foreman unreachable, `3` (`wait <id>` only) its
+integration needs resolution. `foreman kanban --help` is ground
 truth for flags. Agents not spawned from a card learn all of this from the
 embedded **foreman-kanban** skill.
 
@@ -164,6 +168,9 @@ only from In Progress; release (board-only) returns In Progress or Blocked to
 Backlog; Done is terminal for state; Cut and Uncut group and ungroup Done
 cards without changing it. `edit` replaces title and/or body in any state
 and does not claim or move the card; body is a full replace, not an append.
+A worktree card's `done` is additionally refused while its integration
+request is queued or integrating, and while its branch has commits not on
+its base (`docs/integration-queue.md`).
 
 ## Gotchas
 
@@ -239,6 +246,8 @@ and does not claim or move the card; body is a full replace, not an append.
 
 ## Key files
 
+- `src/integrate.rs` — the repository integration queue (own doc:
+  `docs/integration-queue.md`).
 - `src/kanban.rs` — the pure domain: `Card`/`Claim`/`CardState`, `CardStore`
   (file-per-card load/save, transition verbs including `CardStore::edit`,
   staleness poll), `claim_is_dead`

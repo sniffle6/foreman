@@ -176,8 +176,41 @@ target.
 _Avoid_: main, trunk (it may be a feature branch).
 
 **Integrate**:
-The Worker's rebase onto Base plus fast-forward of Base, done before `done`.
+Landing a Card's branch on Base: rebase onto Base, run the project's checks,
+fast-forward Base. Done by Foreman's Integration queue, not by the Worker.
 _Avoid_: merge (implies a merge commit).
+
+**Integration queue**:
+The per-repository, durable, ordered list of Submissions Foreman integrates
+one Turn at a time; files under the clone's git common dir.
+_Avoid_: merge queue (GitHub's remote thing), lock, pipeline.
+
+**Submission**:
+One request to integrate a Card's committed Worktree at a specific commit;
+the same Card and commit submitted twice is one Submission.
+_Avoid_: PR, job, ticket.
+
+**Turn**:
+The exclusive right to integrate for one repository, held by one owner process
+for as long as it works and released by the OS when it dies.
+_Avoid_: lease, lock (the lock is the mechanism; the Turn is what it grants),
+slot.
+
+**Prepared commit**:
+The Worktree's HEAD after a clean rebase onto the target: what the checks ran
+on and what the fast-forward advances Base to; persisted before the merge.
+_Avoid_: candidate, staged commit.
+
+**Needs resolution**:
+The Submission substate after Foreman hands a Card back — conflict, failed
+check, moved source — with the reason and next action; the Worker resolves
+and resubmits. A substate of In Progress, not a column.
+_Avoid_: failed, rejected, blocked (that is a column).
+
+**Held**:
+A queued Submission the destination refused (dirty, wrong branch, busy); the
+whole queue waits and retries, nothing is touched.
+_Avoid_: paused, stuck.
 
 **Teardown**:
 The non-forcing remove-and-delete queued by `done`, Release, and `rm`; keeps
