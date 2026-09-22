@@ -1,6 +1,6 @@
 ---
 name: foreman-failure-archaeology
-description: Use when tempted to re-diagnose or re-try a settled foreman battle, or when digging in this repo's git history - resize + Up-arrow prompt corruption, "double reflow", vsync-off latency theories, wgpu vs glow / GPU device loss, --await-ack, the 9-zone snap system / compose_zone, docs/snap-tiling.md describing a deleted zone system, the flaky human_post_appends chat test, blame pointing at daeda90 or 31a3db4, dangling stashes, the "@" commit subject, or the never-run chat A/B experiment.
+description: Use when tempted to re-diagnose or re-try a settled foreman battle, or when digging in this repo's git history - resize + Up-arrow prompt corruption, "double reflow", vsync-off latency theories, wgpu vs glow / GPU device loss, --await-ack, the 9-zone snap system / compose_zone, docs/snap-tiling.md describing a deleted zone system, the flaky human_post_appends chat test, blame pointing at daeda90 or 31a3db4, dangling stashes, the "@" commit subject, the never-run chat A/B experiment, or driving an agent CLI by injected keys (Pause/Stop/interrupt controls).
 ---
 
 # Foreman failure archaeology
@@ -33,6 +33,7 @@ behind those triage rows. Settled verdicts are enforced by
 | 7 | Chat-room A/B experiment | Planned in full, never executed | abandoned |
 | 8 | Eaten chat posts under the passthrough ConPTY host | `ready` redefined: DSR answered AND first child paint | 2026-07-03 |
 | 9 | GPU device loss aborting the whole app | Renderer switched wgpu → glow; wgpu FENCED | 2026-08-25 |
+| 10 | Driving agents by injected keys (Plan window Pause/Stop) | Cut; no agent-neutral interrupt exists and Esc at startup kills the process | 2026-09-18 |
 
 ---
 
@@ -358,6 +359,31 @@ child's device-status scan. Details: **terminal-emulation-reference**.
   no-op under wgpu, live under glow (see battle 6 before re-testing it).
 - **Evidence trail:** `docs/gpu-device-loss.md` (full record incl. the A/B and
   the rejected branch), commit `ba803ef`, GH #2.
+
+---
+
+## 10. Driving agents by injected keys — Plan window Pause/Stop (2026-09-18)
+
+**Symptom/proposal.** GitHub issue #7 wanted a Plan window that could Pause,
+Resume, and Stop the worker agents it dispatched. The assumption underneath
+was that an injected Esc interrupts an agent the way it does for a human.
+
+**Root cause of the cut.** It does not, and the failure mode is not a no-op.
+Live probes against Claude Code, Codex, Grok, and Gemini found that the
+interrupt key is per agent (Esc for Claude/Codex, Ctrl+C for Grok, Ctrl+C is
+*fatal* at an idle Codex prompt), that Esc on any startup trust dialog exits
+the process on all three verified agents, and that an interrupt is not durable
+— three separate paths resumed activity with no new user input. Cooperative
+pause by plain injected *text* does work on Claude and Codex.
+
+**Status.** Controls cut. The Plan feature was abandoned wholesale and rebuilt
+as a read-only view over card fields. Branch `card/ul4qs9` is unmerged and
+kept; `main` never carried any of it.
+
+**Evidence.** Full per-agent table, method, versions, and the four hard
+conclusions: `docs/2026-09-18-agent-control-probes.md`. Harness to re-run:
+`scripts/agent-probe.ps1`. Anyone proposing these controls again reads that
+doc first — the probes cost real experiment time and weekly usage budget.
 
 ---
 
