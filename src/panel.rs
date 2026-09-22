@@ -1833,10 +1833,8 @@ impl PanelView {
                     .interact(add_r.intersect(clip), id.with("add"), egui::Sense::click())
                     .on_hover_text("New terminal");
                 let s = 3.5;
-                let stroke = egui::Stroke::new(
-                    1.3,
-                    if add_resp.hovered() { th.text } else { th.dim },
-                );
+                let stroke =
+                    egui::Stroke::new(1.3, if add_resp.hovered() { th.text } else { th.dim });
                 p.line_segment(
                     [
                         egui::pos2(add_c.x - s, add_c.y),
