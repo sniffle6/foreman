@@ -259,6 +259,14 @@ pub struct KanbanRequest {
     /// instead of submitting one. Skipped when false (wire compat v1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub cancel: bool,
+    /// `edit --plan NAME` (spec: plan-view): an empty string clears the
+    /// card's plan. Skipped when unset so v1 requests stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// `edit --wave N`: the card's position within its plan, lower first.
+    /// Skipped when unset (wire compat v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave: Option<u32>,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -1056,6 +1064,8 @@ fn parse_kanban_edit(
     let mut id: Option<String> = None;
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
+    let mut plan: Option<String> = None;
+    let mut wave: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1071,6 +1081,18 @@ fn parse_kanban_edit(
                 body = Some(args.get(i + 1).ok_or("--body needs a value")?.clone());
                 i += 2;
             }
+            "--plan" => {
+                plan = Some(args.get(i + 1).ok_or("--plan needs a value")?.clone());
+                i += 2;
+            }
+            "--wave" => {
+                let v = args.get(i + 1).ok_or("--wave needs a value")?;
+                wave = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("--wave needs a whole number, got: {v}"))?,
+                );
+                i += 2;
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => {
                 if id.is_some() {
@@ -1082,11 +1104,16 @@ fn parse_kanban_edit(
         }
     }
     let id = id.ok_or("missing <id>")?;
-    if title.is_none() && body.is_none() {
-        return Err("edit requires --title and/or --body".into());
+    if title.is_none() && body.is_none() && plan.is_none() && wave.is_none() {
+        return Err("edit requires --title, --body, --plan and/or --wave".into());
     }
     if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
         return Err("title cannot be empty".into());
+    }
+    // Refused here as well as in the store so the CLI answers without a
+    // round trip; the store still owns the rule for every other caller.
+    if plan.as_deref().is_some_and(|p| p.trim().is_empty()) && wave.is_some() {
+        return Err("--plan \"\" clears the plan; --wave has nothing to set".into());
     }
     Ok(KanbanAction::Request(KanbanRequest {
         cmd: "kanban".into(),
@@ -1095,6 +1122,8 @@ fn parse_kanban_edit(
         id: Some(id),
         title,
         body,
+        plan,
+        wave,
         ..Default::default()
     }))
 }
@@ -1473,7 +1502,7 @@ non-.png extension fail here, before touching the pipe).";
 
 const HELP_KANBAN: &str = "\
 foreman kanban add <title words...> [--body B] [--project P]
-foreman kanban edit <id> [--title T] [--body B] [--project P]
+foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
 foreman kanban start <id> [--project P]
 foreman kanban done <id> [--project P]
@@ -1490,10 +1519,15 @@ Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
   add     positional words join into the title; --body attaches a longer
           description. Reply: {\"ok\":true,\"id\":\"a3f8k2\"}.
-  edit    replace title and/or body; at least one of --title/--body is
-          required. Title is trimmed and must be non-empty. Body is a
-          full replace, not an append. Allowed in any state; does not
-          claim or change state. Reply: {\"ok\":true}.
+  edit    replace title, body, and/or plan membership; at least one of
+          --title/--body/--plan/--wave is required. Title is trimmed and
+          must be non-empty. Body is a full replace, not an append.
+          --plan NAME tags the card into a plan (names fold case and outer
+          whitespace, like Version names) and --wave N orders it within
+          that plan, lower first. --plan alone starts at wave 1, --wave
+          alone renumbers a card that already has a plan, and --plan \"\"
+          clears it. Plans read back through list --json. Allowed in any
+          state; does not claim or change state. Reply: {\"ok\":true}.
   list    line per card by default (id, state, title, then a context tail —
           claim/blocked-reason/orphan marker; a card dispatched into a git
           worktree appends [wt card/<id> +ahead -behind dirty|missing]).
@@ -3698,6 +3732,62 @@ mod tests {
         assert!(parse_kanban_args(&s(&["integrate"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["integrate", "a1", "b2"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["integrate", "a1", "--nope"]), None, None).is_err());
+    }
+
+    #[test]
+    fn kanban_request_plan_and_wave_are_wire_compatible_with_v1() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "edit".into(),
+            id: Some("a1".into()),
+            title: Some("t".into()),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(!j.contains("\"plan\"") && !j.contains("\"wave\""), "{j}");
+        // A v1 edit request, from an older CLI, still parses.
+        let r: KanbanRequest =
+            serde_json::from_str(r#"{"cmd":"kanban","action":"edit","id":"a1","title":"t"}"#)
+                .unwrap();
+        assert!(r.plan.is_none() && r.wave.is_none());
+        let r: KanbanRequest = serde_json::from_str(
+            r#"{"cmd":"kanban","action":"edit","id":"a1","plan":"Terminal work","wave":2}"#,
+        )
+        .unwrap();
+        assert_eq!(r.plan.as_deref(), Some("Terminal work"));
+        assert_eq!(r.wave, Some(2));
+    }
+
+    #[test]
+    fn parse_kanban_edit_takes_plan_and_wave() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let KanbanAction::Request(r) = parse_kanban_args(
+            &s(&["edit", "a1", "--plan", "Terminal work", "--wave", "2"]),
+            None,
+            None,
+        )
+        .unwrap() else {
+            panic!("edit is a wire request");
+        };
+        assert_eq!(r.plan.as_deref(), Some("Terminal work"));
+        assert_eq!(r.wave, Some(2));
+        // --plan alone and --wave alone each satisfy the at-least-one rule.
+        let KanbanAction::Request(r) =
+            parse_kanban_args(&s(&["edit", "a1", "--plan", ""]), None, None).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(r.plan.as_deref(), Some(""));
+        assert!(r.wave.is_none());
+        assert!(parse_kanban_args(&s(&["edit", "a1", "--wave", "3"]), None, None).is_ok());
+        // A non-number wave, and clearing while numbering, are refused
+        // client-side rather than round-tripped.
+        assert!(parse_kanban_args(&s(&["edit", "a1", "--wave", "two"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["edit", "a1", "--wave"]), None, None).is_err());
+        assert!(
+            parse_kanban_args(&s(&["edit", "a1", "--plan", "", "--wave", "2"]), None, None)
+                .is_err()
+        );
     }
 
     #[test]

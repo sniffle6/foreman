@@ -37,6 +37,8 @@ pub enum Command {
     OpenChat,
     /// Open (or focus) the focused project's kanban board window.
     OpenBoard,
+    /// Open (or focus) the focused project's plan view window.
+    OpenPlan,
     /// Toggle the focused terminal between tiled (in the layout tree) and floating.
     TermFloat,
     // project (outer) level
@@ -100,6 +102,7 @@ impl Command {
             TabPrev,
             OpenChat,
             OpenBoard,
+            OpenPlan,
             TermFloat,
             // Actions
             Help,
@@ -115,7 +118,9 @@ impl Command {
             ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject
             | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
-            | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | TermFloat => Group::Terminals,
+            | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | OpenPlan | TermFloat => {
+                Group::Terminals
+            }
             Help | OpenSettings | ToggleTaskManager => Group::Actions,
         }
     }
@@ -169,6 +174,7 @@ impl Command {
             TabPrev => "Previous tab",
             OpenChat => "Open project chat",
             OpenBoard => "Open project board",
+            OpenPlan => "Open project plan view",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
             ToggleTaskManager => "Toggle task panel",
@@ -496,6 +502,11 @@ impl Default for Keymap {
         // --- project kanban board (kanban-board spec) ---
         t.insert(plain(K::K), OpenBoard);
 
+        // --- project plan view (plan-view spec) ---
+        // `L` because every letter with a better claim is taken: `P` is
+        // NewProject, `K` is the board. It at least sits beside `K`.
+        t.insert(plain(K::L), OpenPlan);
+
         // --- float toggle: tiled ⇄ floating ---
         t.insert(plain(K::F), TermFloat);
         t.insert(ctrl(K::F), ProjFloat);
@@ -735,14 +746,19 @@ mod tests {
             Some(Command::Help)
         );
         // vi keys are no longer bound by default (dropped in the §2 rebind);
-        // plain K was later reclaimed by OpenBoard (kanban-board spec) — the
-        // merge contract gives old keybindings.json files this default too.
+        // plain K was later reclaimed by OpenBoard (kanban-board spec) and
+        // plain L by OpenPlan (plan-view spec) — the merge contract gives old
+        // keybindings.json files these defaults too, and an explicit user
+        // binding still wins over both.
         assert_eq!(km.resolve(Chord::new(K::H, false, false, false)), None);
         assert_eq!(km.resolve(Chord::new(K::J, false, false, false)), None);
-        assert_eq!(km.resolve(Chord::new(K::L, false, false, false)), None);
         assert_eq!(
             km.resolve(Chord::new(K::K, false, false, false)),
             Some(Command::OpenBoard)
+        );
+        assert_eq!(
+            km.resolve(Chord::new(K::L, false, false, false)),
+            Some(Command::OpenPlan)
         );
     }
 

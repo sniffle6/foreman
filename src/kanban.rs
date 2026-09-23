@@ -487,6 +487,129 @@ pub fn versions(cards: &[Card]) -> Vec<Version> {
     out
 }
 
+/// The plan and wave a card belongs to (spec: plan-view §Data shape).
+/// One optional field, so a card is in at most one plan by construction —
+/// there is nothing to validate. Set only by `kanban edit --plan/--wave`;
+/// `--plan ""` clears it. The board and the card's `state` are untouched:
+/// this is ordering metadata, not a column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Planned {
+    /// Free-form, stored as typed (trimmed). Compared only via [`same_name`],
+    /// exactly like a Version name.
+    pub name: String,
+    /// Ordering only — lower runs earlier. Numbers need not be contiguous,
+    /// and a gap is just a gap. A hand-edited file that omits it reads as
+    /// wave 1, the same wave `--plan` alone assigns.
+    #[serde(default = "first_wave")]
+    pub wave: u32,
+}
+
+/// The wave `--plan` alone assigns, and what a `wave`-less file reads as.
+fn first_wave() -> u32 {
+    1
+}
+
+/// The slice of a [`Card`] the plan view reads. Whole `Card` clones would
+/// drag every card's `body` along once per frame for nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCard {
+    pub id: String,
+    pub title: String,
+    pub state: CardState,
+}
+
+/// One wave of a plan. Cards in a wave are a set, not a list — the order
+/// below is just `created`, the same order the board shows them in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wave {
+    pub number: u32,
+    pub cards: Vec<PlanCard>,
+}
+
+/// A plan, derived from card fields every time it is asked for. Nothing is
+/// stored: this rebuilds from [`Card::planned`] exactly the way [`versions`]
+/// rebuilds the Done dropdown from `Card::shipped`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// Spelled as first seen; two spellings [`same_name`] equates are one
+    /// plan.
+    pub name: String,
+    /// Ascending by number.
+    pub waves: Vec<Wave>,
+    /// The newest `created` among the plan's cards — the sort key, so the
+    /// plan you are still adding cards to stays on top.
+    pub at: String,
+}
+
+impl Plan {
+    /// The current wave: the lowest number still holding a non-Done card
+    /// (spec §The window). `None` once every card is Done — the plan is
+    /// finished, not stuck on its last wave.
+    pub fn current(&self) -> Option<u32> {
+        self.waves
+            .iter()
+            .find(|w| w.cards.iter().any(|c| c.state != CardState::Done))
+            .map(|w| w.number)
+    }
+
+    /// Total cards across every wave. A plan of one is almost always a
+    /// misspelled plan name (`same_name` folds case and outer whitespace
+    /// only), so the view says so rather than drawing it as a real plan.
+    pub fn card_count(&self) -> usize {
+        self.waves.iter().map(|w| w.cards.len()).sum()
+    }
+}
+
+/// Every plan the cards describe, newest activity first (by `at`, then
+/// name) — the sibling of [`versions`].
+///
+/// Cards keep the order they arrive in within a wave, which for
+/// [`CardStore::cards`] is `created` ascending (see `sort_cards`); this
+/// function does not re-sort them, the same contract the board relies on.
+pub fn plans(cards: &[Card]) -> Vec<Plan> {
+    let mut out: Vec<Plan> = Vec::new();
+    for c in cards {
+        let Some(p) = c.planned.as_ref() else {
+            continue;
+        };
+        let i = match out.iter().position(|x| same_name(&x.name, &p.name)) {
+            Some(i) => i,
+            None => {
+                out.push(Plan {
+                    name: p.name.clone(),
+                    waves: Vec::new(),
+                    at: c.created.clone(),
+                });
+                out.len() - 1
+            }
+        };
+        let plan = &mut out[i];
+        if c.created > plan.at {
+            plan.at = c.created.clone();
+        }
+        let w = match plan.waves.iter().position(|w| w.number == p.wave) {
+            Some(w) => w,
+            None => {
+                plan.waves.push(Wave {
+                    number: p.wave,
+                    cards: Vec::new(),
+                });
+                plan.waves.len() - 1
+            }
+        };
+        plan.waves[w].cards.push(PlanCard {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            state: c.state,
+        });
+    }
+    for p in &mut out {
+        p.waves.sort_by_key(|w| w.number);
+    }
+    out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
 /// Pure half of the trailer walk (spec §Cut step 6). Input is
 /// `git log --format=%h%x09%(trailers:key=Card,valueonly,separator=%x2C)`
 /// output, newest first; output is card id -> shas, oldest first. A commit
@@ -528,6 +651,10 @@ pub struct Card {
     /// `state` stays `done`; this is grouping, not a column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shipped: Option<Shipped>,
+    /// Absent unless the card was tagged into a plan (spec: plan-view).
+    /// Ordering metadata only — `state` and the board are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned: Option<Planned>,
     pub created: String,
     pub updated: String,
 }
@@ -544,13 +671,14 @@ impl Card {
             claim: None,
             worktree: None,
             shipped: None,
+            planned: None,
             created: now.clone(),
             updated: now,
         }
     }
 
-    /// Load-time repair: a `shipped` whose name trims to empty (a hand
-    /// edit) is no Version at all.
+    /// Load-time repair: a `shipped` or `planned` whose name trims to empty
+    /// (a hand edit) is no Version and no plan at all.
     fn normalize(mut self) -> Self {
         if self
             .shipped
@@ -558,6 +686,13 @@ impl Card {
             .is_some_and(|s| s.name.trim().is_empty())
         {
             self.shipped = None;
+        }
+        if self
+            .planned
+            .as_ref()
+            .is_some_and(|p| p.name.trim().is_empty())
+        {
+            self.planned = None;
         }
         self
     }
@@ -1000,19 +1135,26 @@ impl CardStore {
         Ok(id)
     }
 
-    /// Replace title and/or body on an existing card. Allowed in any
-    /// state; does not touch claim or column. Body is a full replace,
-    /// not an append. At least one of title/body must be `Some`; a
-    /// provided title is trimmed and must be non-empty. Missing card
-    /// = error (never created).
+    /// Replace title, body, and/or plan membership on an existing card.
+    /// Allowed in any state; does not touch claim or column. Body is a full
+    /// replace, not an append. At least one field must be `Some`; a provided
+    /// title is trimmed and must be non-empty. Missing card = error (never
+    /// created).
+    ///
+    /// Plan rules (spec: plan-view §Authoring): `plan` is trimmed and an
+    /// empty one clears the card's plan; `wave` alone re-numbers a card that
+    /// already has a plan and errors on one that does not, because a wave
+    /// with no plan orders nothing.
     pub fn edit(
         &mut self,
         id: &str,
         title: Option<&str>,
         body: Option<&str>,
+        plan: Option<&str>,
+        wave: Option<u32>,
     ) -> Result<(), String> {
-        if title.is_none() && body.is_none() {
-            return Err("edit requires --title and/or --body".into());
+        if title.is_none() && body.is_none() && plan.is_none() && wave.is_none() {
+            return Err("edit requires --title, --body, --plan and/or --wave".into());
         }
         let title = match title {
             Some(t) => {
@@ -1024,6 +1166,10 @@ impl CardStore {
             }
             None => None,
         };
+        let plan = plan.map(str::trim);
+        if plan.is_some_and(str::is_empty) && wave.is_some() {
+            return Err("--plan \"\" clears the plan; --wave has nothing to set".into());
+        }
         let dir = self.dir_or_err()?.to_path_buf();
         let mut card = self.read_one(id)?;
         if let Some(t) = title {
@@ -1031,6 +1177,24 @@ impl CardStore {
         }
         if let Some(b) = body {
             card.body = Some(b.to_string());
+        }
+        if let Some(name) = plan {
+            card.planned = if name.is_empty() {
+                None
+            } else {
+                Some(Planned {
+                    name: name.to_string(),
+                    // `--plan X --wave N` lands here with the wave already
+                    // known; `--plan X` alone starts at wave 1.
+                    wave: wave.unwrap_or_else(first_wave),
+                })
+            };
+        }
+        if let Some(w) = wave {
+            match &mut card.planned {
+                Some(pl) => pl.wave = w,
+                None => return Err("--wave needs a plan: set --plan first".into()),
+            }
         }
         card.updated = now_stamp();
         self.write_card(&dir, &card)?;
@@ -2080,7 +2244,9 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
         store.reload();
 
-        store.edit(&id, Some("  new title  "), None).unwrap();
+        store
+            .edit(&id, Some("  new title  "), None, None, None)
+            .unwrap();
         let card = store.get(&id).unwrap();
         assert_eq!(card.title, "new title");
         assert_eq!(card.body.as_deref(), Some("old body"));
@@ -2088,7 +2254,9 @@ mod tests {
         assert!(card.claim.is_none());
         assert_ne!(card.updated, "2020-01-01T00:00:00Z");
 
-        store.edit(&id, None, Some("replacement")).unwrap();
+        store
+            .edit(&id, None, Some("replacement"), None, None)
+            .unwrap();
         let card = store.get(&id).unwrap();
         assert_eq!(card.title, "new title");
         assert_eq!(card.body.as_deref(), Some("replacement"));
@@ -2097,7 +2265,7 @@ mod tests {
         store.start(&id, "t1", run, TermState::Running).unwrap();
         let claim = store.get(&id).unwrap().claim.clone();
         store
-            .edit(&id, Some("still in progress"), Some("both"))
+            .edit(&id, Some("still in progress"), Some("both"), None, None)
             .unwrap();
         let card = store.get(&id).unwrap();
         assert_eq!(card.title, "still in progress");
@@ -2105,10 +2273,10 @@ mod tests {
         assert_eq!(card.state, CardState::InProgress);
         assert_eq!(card.claim, claim);
 
-        assert!(store.edit(&id, None, None).is_err());
-        assert!(store.edit(&id, Some("   "), None).is_err());
+        assert!(store.edit(&id, None, None, None, None).is_err());
+        assert!(store.edit(&id, Some("   "), None, None, None).is_err());
         assert_eq!(store.get(&id).unwrap().title, "still in progress");
-        assert!(store.edit("nope00", Some("x"), None).is_err());
+        assert!(store.edit("nope00", Some("x"), None, None, None).is_err());
     }
 
     #[test]
@@ -3148,6 +3316,173 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn v1_card_file_without_planned_round_trips_unchanged() {
+        let j = r#"{"v":1,"id":"a3f8k2","title":"t","state":"backlog","created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        let c: Card = serde_json::from_str(j).unwrap();
+        assert!(c.planned.is_none());
+        assert_eq!(serde_json::to_string(&c).unwrap(), j);
+    }
+
+    #[test]
+    fn planned_card_json_round_trips_and_a_waveless_file_reads_as_wave_one() {
+        let mut c = sample_card(None);
+        c.planned = Some(Planned {
+            name: "Terminal work".into(),
+            wave: 2,
+        });
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(
+            s.contains(r#""planned":{"name":"Terminal work","wave":2}"#),
+            "{s}"
+        );
+        assert_eq!(serde_json::from_str::<Card>(&s).unwrap(), c);
+
+        let j = r#"{"v":1,"id":"a3f8k2","title":"t","state":"backlog","planned":{"name":"Terminal work"},"created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#;
+        let back: Card = serde_json::from_str(j).unwrap();
+        assert_eq!(back.planned.unwrap().wave, 1);
+    }
+
+    #[test]
+    fn planned_with_an_empty_name_loads_as_unplanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".foreman").join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("zz0002.json"),
+            r#"{"v":1,"id":"zz0002","title":"t","state":"backlog","planned":{"name":"  ","wave":3},"created":"2026-08-28T13:55:00Z","updated":"2026-08-28T13:55:00Z"}"#,
+        )
+        .unwrap();
+        let mut s = store_at(tmp.path());
+        s.reload();
+        assert!(s.get("zz0002").unwrap().planned.is_none());
+    }
+
+    fn planned_card(id: &str, name: &str, wave: u32, state: CardState, created: &str) -> Card {
+        let mut c = sample_card(None);
+        c.id = id.into();
+        c.title = format!("title {id}");
+        c.state = state;
+        c.created = created.into();
+        c.planned = Some(Planned {
+            name: name.into(),
+            wave,
+        });
+        c
+    }
+
+    #[test]
+    fn plans_fold_names_case_insensitively_and_order_waves_ascending() {
+        let cards = vec![
+            planned_card(
+                "a",
+                "Terminal work",
+                2,
+                CardState::Backlog,
+                "2026-09-01T00:00:00Z",
+            ),
+            planned_card(
+                "b",
+                "terminal WORK",
+                1,
+                CardState::Done,
+                "2026-09-02T00:00:00Z",
+            ),
+            planned_card("c", "Chat", 1, CardState::Backlog, "2026-09-05T00:00:00Z"),
+            sample_card(None),
+        ];
+        let p = plans(&cards);
+        // "Chat" has the newest card, so it sorts first; the folded plan is
+        // spelled the way it was first seen.
+        assert_eq!(
+            p.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+            vec!["Chat", "Terminal work"]
+        );
+        let tw = &p[1];
+        assert_eq!(tw.at, "2026-09-02T00:00:00Z");
+        assert_eq!(
+            tw.waves.iter().map(|w| w.number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(tw.waves[0].cards[0].id, "b");
+        assert_eq!(tw.waves[1].cards[0].title, "title a");
+        assert_eq!(tw.card_count(), 2);
+    }
+
+    #[test]
+    fn current_wave_is_the_lowest_holding_a_non_done_card() {
+        let done_first = vec![
+            planned_card("a", "P", 1, CardState::Done, "2026-09-01T00:00:00Z"),
+            planned_card("b", "P", 2, CardState::Done, "2026-09-02T00:00:00Z"),
+            planned_card("c", "P", 2, CardState::InProgress, "2026-09-03T00:00:00Z"),
+            planned_card("d", "P", 5, CardState::Backlog, "2026-09-04T00:00:00Z"),
+        ];
+        assert_eq!(plans(&done_first)[0].current(), Some(2));
+
+        // Blocked is not Done, so it still holds its wave.
+        let blocked = vec![planned_card(
+            "a",
+            "P",
+            7,
+            CardState::Blocked,
+            "2026-09-01T00:00:00Z",
+        )];
+        assert_eq!(plans(&blocked)[0].current(), Some(7));
+
+        // Every card Done = finished, not "stuck on the last wave".
+        let all_done = vec![planned_card(
+            "a",
+            "P",
+            1,
+            CardState::Done,
+            "2026-09-01T00:00:00Z",
+        )];
+        assert_eq!(plans(&all_done)[0].current(), None);
+
+        assert!(plans(&[sample_card(None)]).is_empty());
+    }
+
+    #[test]
+    fn edit_sets_clears_and_renumbers_a_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let id = store.add("card", None).unwrap();
+
+        store
+            .edit(&id, None, None, Some("  Terminal work  "), None)
+            .unwrap();
+        let pl = store.get(&id).unwrap().planned.clone().unwrap();
+        assert_eq!(pl.name, "Terminal work", "the name is stored trimmed");
+        assert_eq!(pl.wave, 1, "--plan alone starts at wave 1");
+
+        store.edit(&id, None, None, None, Some(3)).unwrap();
+        assert_eq!(store.get(&id).unwrap().planned.as_ref().unwrap().wave, 3);
+        assert_eq!(
+            store.get(&id).unwrap().planned.as_ref().unwrap().name,
+            "Terminal work",
+            "--wave alone keeps the plan"
+        );
+
+        store.edit(&id, Some("renamed"), None, None, None).unwrap();
+        assert!(
+            store.get(&id).unwrap().planned.is_some(),
+            "editing the title leaves the plan alone"
+        );
+
+        store.edit(&id, None, None, Some(""), None).unwrap();
+        assert!(
+            store.get(&id).unwrap().planned.is_none(),
+            "--plan \"\" clears"
+        );
+
+        // A wave with no plan orders nothing, and the refusal writes nothing.
+        let before = store.get(&id).unwrap().updated.clone();
+        assert!(store.edit(&id, None, None, None, Some(2)).is_err());
+        assert_eq!(store.get(&id).unwrap().updated, before);
+        // Clearing and numbering in one call contradict each other.
+        assert!(store.edit(&id, None, None, Some(""), Some(2)).is_err());
     }
 
     #[test]

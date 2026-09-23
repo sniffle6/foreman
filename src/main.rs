@@ -32,6 +32,7 @@ mod landing;
 mod layout;
 mod notify;
 mod panel;
+mod plan_view;
 mod proc;
 mod psreadline;
 mod ready;

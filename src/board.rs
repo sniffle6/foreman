@@ -349,6 +349,16 @@ impl BoardView {
         }
     }
 
+    /// Show `id`'s detail page. The plan view's click-through comes in this
+    /// way: the plan window records the intent, the manager opens or focuses
+    /// the board, then points it here. An id that names no live card is
+    /// dropped by `show`, which snaps back to the columns.
+    pub fn open_card(&mut self, id: &str) {
+        self.selected = Some(id.to_string());
+        self.worktrees_open = false;
+        self.picker = None;
+    }
+
     /// Manager's answer to `BoardAct::CutPrefill`. Fills the open Cut field
     /// only while it is still empty and untouched.
     pub fn prefill_cut(&mut self, name: &str) {
@@ -367,6 +377,13 @@ impl BoardView {
     #[cfg(test)]
     pub(crate) fn store(&self) -> &std::rc::Rc<std::cell::RefCell<crate::kanban::CardStore>> {
         &self.store
+    }
+
+    /// Test-only probe for the card whose detail page is showing, so the
+    /// manager's plan-view click-through can be asserted from `wm`.
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
     }
 
     /// The dispatch-time worktree choice for `card`: forced on for a card

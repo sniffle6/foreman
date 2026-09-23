@@ -115,6 +115,11 @@ pub enum ContentSnap {
     /// view against the project's own `CardStore`. Old workspace files simply
     /// lack this variant — no migration.
     Board,
+    /// Per-project plan view (`Content::Plan`). Unit variant for the same
+    /// reason `Board` is: plans are derived from the cards at
+    /// `.foreman/tasks`, so there is nothing to snapshot but the fact that
+    /// the window was open. Old workspace files simply lack this variant.
+    Plan,
     Project {
         child: ManagerSnap,
     },

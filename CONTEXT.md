@@ -239,6 +239,25 @@ The named group a Cut creates; the Done column can show Current or any one
 Version. Exists only as the distinct `shipped.name` values on Cards.
 _Avoid_: changelog, milestone, ship (the event, not the group).
 
+**Plan**:
+An ordered grouping of Cards, derived from their `planned.name` the way a
+Version is derived from `shipped.name` — there is no plan file and no plan
+store. A Card belongs to at most one Plan, and Plan names fold case and outer
+whitespace like Version names.
+_Avoid_: epic, milestone, project (taken), sprint, roadmap.
+
+**Wave**:
+A Plan's ordering rank, carried per Card as `planned.wave`; lower runs
+earlier and numbers need not be contiguous. The **current wave** is the
+lowest one still holding a non-Done Card.
+_Avoid_: phase, stage, step, batch, tier.
+
+**Plan view**:
+The per-project read-only window (leader `L`) that groups Cards by Plan then
+by Wave. It reads; it never dispatches — that stays on the Board.
+_Avoid_: plan window (the abandoned scheduler design used that name),
+timeline, roadmap.
+
 **Card trailer**:
 The `Card: <id>` line a Worker ends each commit message with; how a Cut
 finds a Card's commits after rebase or squash.

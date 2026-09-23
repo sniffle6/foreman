@@ -140,6 +140,11 @@ pub enum Content {
     /// state; shares the project's `CardStore` via `Rc` — no PTY, no
     /// membership, same shape as `Chat`.
     Board(crate::board::BoardView),
+    /// Per-project read-only plan view (spec: plan-view). Same shape as
+    /// `Board` - shares the project's `CardStore` via `Rc`, no PTY, no
+    /// membership - but derives plans from card fields instead of drawing
+    /// the columns.
+    Plan(crate::plan_view::PlanView),
     /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
     /// Floating/closable/tabbable/tileable like any normal window; restored
     /// across restarts by path only (see `ContentSnap::Image`).
@@ -186,6 +191,10 @@ impl Content {
             }
             Content::Board(view) => {
                 view.show(ui, rect, active, resp, base.with((win_id, "board")));
+                false
+            }
+            Content::Plan(view) => {
+                view.show(ui, rect, active, resp, base.with((win_id, "plan")));
                 false
             }
             Content::Image(view) => {
@@ -236,6 +245,7 @@ impl Content {
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
             Content::Board(_) => {} // no PTY; the store is shared state, nothing to pump
+            Content::Plan(_) => {} // ditto: a derived read of the same store
             Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
         }
@@ -249,6 +259,7 @@ impl Content {
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
             Content::Board(_) => None,
+            Content::Plan(_) => None,
             Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
@@ -767,6 +778,7 @@ impl WindowManager {
                     },
                     Content::Chat(_) => ContentSnap::Chat,
                     Content::Board(_) => ContentSnap::Board,
+                    Content::Plan(_) => ContentSnap::Plan,
                     Content::Image(view) => ContentSnap::Image {
                         path: view.path.clone(),
                     },
@@ -956,6 +968,9 @@ impl WindowManager {
                     }
                     ContentSnap::Board => {
                         Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban)))
+                    }
+                    ContentSnap::Plan => {
+                        Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban)))
                     }
                     ContentSnap::Image { path } => {
                         Content::Image(crate::imageview::ImageView::load(path.clone()))
@@ -1555,10 +1570,13 @@ impl WindowManager {
             }
             "edit" => {
                 let id = req.id.as_deref().ok_or("missing id")?;
-                child
-                    .kanban
-                    .borrow_mut()
-                    .edit(id, req.title.as_deref(), req.body.as_deref())?;
+                child.kanban.borrow_mut().edit(
+                    id,
+                    req.title.as_deref(),
+                    req.body.as_deref(),
+                    req.plan.as_deref(),
+                    req.wave,
+                )?;
                 Ok(OpenReply {
                     ok: true,
                     ..Default::default()
@@ -2209,6 +2227,68 @@ impl WindowManager {
             rect,
         );
         self.mark_workspace_dirty();
+    }
+
+    /// Open (or focus) this project's plan view - singleton per project,
+    /// same shape as `open_board_window`. No PTY, no membership; it reads
+    /// the same `CardStore`, so closing the window touches nothing.
+    fn open_plan_window(&mut self) {
+        if let Some((win, tab)) = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::Plan(_)))
+                .map(|i| (w.id, i))
+        }) {
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                ptab: None,
+                window: None,
+                tab: Some(tab),
+            });
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(460.0, 360.0));
+        self.push_win(
+            id,
+            Tab::fixed(
+                "plan",
+                Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban))),
+            ),
+            rect,
+        );
+        self.mark_workspace_dirty();
+    }
+
+    /// Apply plan-view intents recorded during the draw - same deferred
+    /// discipline as `drain_board_acts`, and it runs in THIS manager because
+    /// the plan view and the board window are siblings inside one project.
+    fn drain_plan_acts(&mut self) {
+        let mut acts = Vec::new();
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Plan(v) = &mut t.content {
+                    acts.append(&mut v.acts);
+                }
+            }
+        }
+        for act in acts {
+            match act {
+                crate::plan_view::PlanAct::OpenCard(id) => {
+                    // The card detail lives on the board, so open (or focus)
+                    // the board first and then point it at the card. A stale
+                    // id is dropped by the board itself, which snaps back to
+                    // the columns when `selected` names no live card.
+                    self.open_board_window();
+                    for w in &mut self.windows {
+                        for t in &mut w.tabs {
+                            if let Content::Board(v) = &mut t.content {
+                                v.open_card(&id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Apply crew-board clicks recorded during the draw (content cannot
@@ -3091,7 +3171,9 @@ impl WindowManager {
                             Content::Terminal(s) => RowKind::Terminal(s.icon_kind()),
                             // A board row surfaces like any auxiliary tab; a
                             // dedicated row kind is out of scope for v1.
-                            Content::Chat(_) | Content::Board(_) => RowKind::Chat,
+                            Content::Chat(_) | Content::Board(_) | Content::Plan(_) => {
+                                RowKind::Chat
+                            }
                             // Nested project content is not a product path today; tests
                             // use empty Project stubs as PTY-free tab stand-ins.
                             Content::Project(_) => {
@@ -3692,6 +3774,7 @@ impl WindowManager {
                     }),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {} // not members
@@ -4300,6 +4383,7 @@ impl WindowManager {
                         Command::TabPrev => child.cycle_tab(false),
                         Command::OpenChat => child.open_chat_window(),
                         Command::OpenBoard => child.open_board_window(),
+                        Command::OpenPlan => child.open_plan_window(),
                         // project-level handled above
                         _ => {}
                     }
@@ -5305,6 +5389,7 @@ impl WindowManager {
                     Content::Project(wm) => wm.refresh_exit_titles(),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {} // no process
@@ -5335,6 +5420,7 @@ impl WindowManager {
                     Content::Project(wm) => wm.refresh_auto_titles(),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
                     | Content::Settings(_) => {}
@@ -6639,6 +6725,7 @@ impl WindowManager {
         self.drain_chat_clicks();
         self.drain_chat_posts();
         self.drain_board_acts(&ctx);
+        self.drain_plan_acts();
         self.drain_worktree_msgs(&ctx);
         if self.drain_settings() {
             self.swallow_input(ui);
@@ -7637,6 +7724,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
         Content::Project(wm) => wm.terminal_groups(),
         Content::Chat(_)
         | Content::Board(_)
+        | Content::Plan(_)
         | Content::Image(_)
         | Content::TaskManager(_)
         | Content::Settings(_) => Vec::new(),
@@ -10598,6 +10686,85 @@ mod tests {
         wm.open_board_window();
         assert_eq!(board_wins(&wm), 1);
         assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn open_plan_window_is_a_per_project_singleton() {
+        let mut wm = WindowManager::new();
+        wm.open_plan_window();
+        let plan_wins = |wm: &WindowManager| {
+            wm.windows
+                .iter()
+                .filter(|w| w.tabs.iter().any(|t| matches!(t.content, Content::Plan(_))))
+                .count()
+        };
+        assert_eq!(plan_wins(&wm), 1);
+        let first = wm.windows.last().unwrap().id;
+        // focus something else, then reopen: focuses, does not duplicate
+        wm.focused = None;
+        wm.open_plan_window();
+        assert_eq!(plan_wins(&wm), 1);
+        assert_eq!(wm.focused, Some(first));
+        // The plan view reads the project's own store, not a fresh one.
+        let view = wm
+            .windows
+            .iter()
+            .find_map(|w| {
+                w.tabs.iter().find_map(|t| match &t.content {
+                    Content::Plan(v) => Some(v),
+                    _ => None,
+                })
+            })
+            .expect("a plan tab");
+        assert!(std::rc::Rc::ptr_eq(view.store(), &wm.kanban));
+    }
+
+    #[test]
+    fn a_plan_window_survives_a_workspace_round_trip_against_the_projects_store() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.windows[0].id;
+        m.project_child_mut(pid).unwrap().open_plan_window();
+
+        let snap = m.capture_workspace();
+        let crate::workspace::ContentSnap::Project { child } =
+            &snap.desktop.windows[0].tabs[0].content
+        else {
+            panic!("expected a Project tab");
+        };
+        assert!(
+            child.windows.iter().any(|w| w
+                .tabs
+                .iter()
+                .any(|t| matches!(t.content, crate::workspace::ContentSnap::Plan))),
+            "the plan window is captured as a unit variant: {child:?}"
+        );
+
+        let mut back = WindowManager::new().as_desktop();
+        back.apply_workspace(&snap, &ctx);
+        let restored = back
+            .windows
+            .iter()
+            .find(|w| w.is_project())
+            .expect("project window");
+        let Content::Project(child) = &restored.tabs[0].content else {
+            panic!("expected Project content");
+        };
+        let view = child
+            .windows
+            .iter()
+            .find_map(|cw| {
+                cw.tabs.iter().find_map(|t| match &t.content {
+                    Content::Plan(v) => Some(v),
+                    _ => None,
+                })
+            })
+            .expect("a restored plan tab");
+        assert!(
+            std::rc::Rc::ptr_eq(view.store(), &child.kanban),
+            "restore must rebuild the view against the project's own store"
+        );
     }
 
     #[test]
@@ -14208,6 +14375,54 @@ mod tests {
     }
 
     #[test]
+    fn kanban_edit_tags_a_plan_and_wave_on_the_wire_path_and_list_reads_it_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+
+        let mut add = kanban_req("add");
+        add.title = Some("a card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+
+        let mut edit = kanban_req("edit");
+        edit.id = Some(id.clone());
+        edit.plan = Some("Terminal work".into());
+        edit.wave = Some(2);
+        assert!(m.kanban_dispatch(&edit).unwrap().ok);
+
+        let read = |m: &mut WindowManager| -> crate::kanban::CardLine {
+            let mut list = kanban_req("list");
+            list.json = true;
+            let lines = m.kanban_dispatch(&list).unwrap().history.unwrap();
+            serde_json::from_str(&lines[0]).unwrap()
+        };
+        let planned = read(&mut m)
+            .card
+            .planned
+            .expect("the plan reached the card");
+        assert_eq!(planned.name, "Terminal work");
+        assert_eq!(planned.wave, 2);
+
+        // --wave alone renumbers; --plan "" clears. Both on the wire path.
+        let mut renumber = kanban_req("edit");
+        renumber.id = Some(id.clone());
+        renumber.wave = Some(5);
+        assert!(m.kanban_dispatch(&renumber).unwrap().ok);
+        assert_eq!(read(&mut m).card.planned.unwrap().wave, 5);
+
+        let mut clear = kanban_req("edit");
+        clear.id = Some(id.clone());
+        clear.plan = Some(String::new());
+        assert!(m.kanban_dispatch(&clear).unwrap().ok);
+        assert!(read(&mut m).card.planned.is_none());
+
+        // A wave with no plan orders nothing, and the error reaches the CLI.
+        let mut orphan_wave = kanban_req("edit");
+        orphan_wave.id = Some(id);
+        orphan_wave.wave = Some(1);
+        assert!(m.kanban_dispatch(&orphan_wave).is_err());
+    }
+
+    #[test]
     fn kanban_start_records_claim_and_second_start_is_rejected() {
         let ctx = egui::Context::default();
         let tmp = tempfile::tempdir().unwrap();
@@ -14669,6 +14884,69 @@ mod tests {
         };
         v.acts.push(act);
         bid
+    }
+
+    #[test]
+    fn a_plan_card_click_opens_the_board_and_shows_that_cards_detail() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.windows[0].id;
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(tmp.path()));
+        let id = child.kanban.borrow_mut().add("planned card", None).unwrap();
+
+        // No board window yet: the drain has to open one, not drop the click.
+        child.open_plan_window();
+        for w in &mut child.windows {
+            for t in &mut w.tabs {
+                if let Content::Plan(v) = &mut t.content {
+                    v.acts.push(crate::plan_view::PlanAct::OpenCard(id.clone()));
+                }
+            }
+        }
+        child.drain_plan_acts();
+
+        let boards: Vec<_> = child
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| match &t.content {
+                Content::Board(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boards.len(), 1, "one board window, opened by the drain");
+        assert_eq!(
+            boards[0].selected(),
+            Some(id.as_str()),
+            "the board is pointed at the clicked card"
+        );
+
+        // A second click, with the board already open, focuses it and
+        // repoints it rather than opening a second one.
+        let other = child.kanban.borrow_mut().add("another", None).unwrap();
+        for w in &mut child.windows {
+            for t in &mut w.tabs {
+                if let Content::Plan(v) = &mut t.content {
+                    v.acts
+                        .push(crate::plan_view::PlanAct::OpenCard(other.clone()));
+                }
+            }
+        }
+        child.drain_plan_acts();
+        let boards: Vec<_> = child
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| match &t.content {
+                Content::Board(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boards.len(), 1, "still one board window");
+        assert_eq!(boards[0].selected(), Some(other.as_str()));
+        let _ = ctx;
     }
 
     #[test]

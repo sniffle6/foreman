@@ -1,6 +1,6 @@
 ---
 name: foreman-kanban
-description: Use when running inside foreman (the FOREMAN env var is 1) and coordinating work through the project's kanban board — picking up a card, creating cards, editing title/body, closing out with done/block, or waiting on workers.
+description: Use when running inside foreman (the FOREMAN env var is 1) and coordinating work through the project's kanban board — picking up a card, creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
 ---
 
 # The foreman project kanban board
@@ -22,6 +22,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 
     & $env:FOREMAN_EXE kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
     & $env:FOREMAN_EXE kanban edit a3f8k2 --title "new title" --body "new body"
+    & $env:FOREMAN_EXE kanban edit a3f8k2 --plan "Terminal work" --wave 2
     & $env:FOREMAN_EXE kanban list --state backlog
     & $env:FOREMAN_EXE kanban start a3f8k2
     & $env:FOREMAN_EXE kanban done a3f8k2
@@ -37,10 +38,18 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 
 - `add` — positional words join into the title; `--body` attaches a longer
   description. Reply carries the new card's id.
-- `edit` — replace title and/or body after add. At least one of `--title`/
-  `--body` is required; title is trimmed and must be non-empty; body
-  replaces (does not append). Allowed in any state; does not claim or
-  change state.
+- `edit` — replace title, body, and/or plan membership after add. At least
+  one of `--title`/`--body`/`--plan`/`--wave` is required; title is trimmed
+  and must be non-empty; body replaces (does not append). Allowed in any
+  state; does not claim or change state.
+- `edit --plan NAME --wave N` — ordering, for the Plan view (leader `L`).
+  A plan is derived from the cards, not stored: tag each card as you create
+  it and the view groups them by plan, then by wave, lowest first. Names
+  fold case and outer whitespace like Version names, so `Terminal work` and
+  `terminal-work` are two different plans — copy the name from an existing
+  card rather than retyping it. `--plan` alone starts at wave 1, `--wave`
+  alone renumbers a card that already has a plan, and `--plan ""` clears it.
+  Read plans back with `list --json` (the `planned` field).
 - `list` — one line per card by default (id, state, title, context tail);
   `--json` emits full card objects, one per line, including a derived
   `orphaned` flag (claim points at a Session that's gone). Bare `list` is

@@ -103,6 +103,12 @@ sibling — read those for *why*, this doc for *how*.
   gone or exited. Orphan state is recomputed every frame and exists nowhere in
   the card files. Restart, crash, and branch-switch reconciliation all fall
   out of this rule with zero file writes.
+- **Plans order cards without a second store**: a card can carry a plan name
+  and a wave number (`kanban edit --plan/--wave`). A "plan" is then *derived*
+  from the cards the same way a Version is — group by folded name, then by
+  wave. The Plan view window reads it; nothing schedules or dispatches from
+  it. Design and the rejected alternatives:
+  `docs/superpowers/specs/2026-09-22-plan-view-design.md`.
 - **`wait` gives orchestrators a synchronous primitive**: block until a card
   (or any watched card) leaves In Progress, with exit codes scripts can
   branch on.
@@ -133,12 +139,25 @@ apply to the open board and its detail page on the next frame. There is
 deliberately no block button — blocking demands a typed reason, so it is the
 CLI's move.
 
+**Plan view**: leader then `L` (`Command::OpenPlan`) opens the project's plan
+view — one per project, same singleton rule as the board, and persisted as a
+unit `ContentSnap::Plan` (there is nothing to snapshot but the fact it was
+open). It is read-only: plans stack newest-activity-first, each showing its
+waves ascending, and only the **current wave** — the lowest wave still
+holding a non-Done card — is expanded by default. Click a wave header to
+open or shut it; click a card to jump to that card's detail page on the
+board, opening the board window if it is not already up. A plan holding a
+single card is drawn dimmed, labelled `1 card`, with no wave header at all
+— see the gotcha about plan-name typos below. Expanded/collapsed waves and
+scroll are view state, not persisted.
+
 **CLI** (inside a foreman terminal, address it as `& $env:FOREMAN_EXE`; the
 installed exe is also on PATH as `foreman`):
 
 ```
 foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
-foreman kanban edit <id> [--title T] [--body B]   # at least one of --title/--body
+foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N]
+                                          # at least one of the four; --plan "" clears
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
 foreman kanban start <id>                 # claim a card yourself
 foreman kanban done <id>                  # close out: In Progress -> Done
@@ -166,8 +185,13 @@ Backlog/Blocked cards to In Progress; `start` on a card with a live claim is
 rejected (the two-agents-one-card guard) but seizes a dead one; `done`/`block`
 only from In Progress; release (board-only) returns In Progress or Blocked to
 Backlog; Done is terminal for state; Cut and Uncut group and ungroup Done
-cards without changing it. `edit` replaces title and/or body in any state
-and does not claim or move the card; body is a full replace, not an append.
+cards without changing it. `edit` replaces title, body, and/or plan
+membership in any state and does not claim or move the card; body is a full
+replace, not an append.
+`--plan` alone starts the card at wave 1, `--wave` alone renumbers a card
+that already has a plan (and errors on one that does not), and `--plan ""`
+clears the plan. Plans read back through `list --json` as the card's
+`planned` object; there is no read verb and no new `cmd` on the wire.
 A worktree card's `done` is additionally refused while its integration
 request is queued or integrating, and while its branch has commits not on
 its base (`docs/integration-queue.md`).
@@ -241,6 +265,21 @@ its base (`docs/integration-queue.md`).
 - **A Cut with no git, or before any trailer commit, still ships.** It just
   records no commits. The trailer is a convention the prompt teaches, not a
   gate `done` enforces.
+- **Two spellings of a plan name are two plans, silently.** `same_name`
+  folds case and outer whitespace and nothing else, so `Terminal work` and
+  `terminal-work` are different plans and the second one renders as a
+  perfectly convincing plan of its own. There is deliberately no validation
+  and no name registry — that would be the second store the design exists to
+  avoid. The plan view's defence is visual: a one-card plan is dimmed and
+  labelled `1 card`. If you see one you did not mean, fix the card's
+  `--plan`, copying the name off a card already in the plan.
+- **A card is in at most one plan, by construction.** `planned` is one
+  optional field, not a list. Re-running `--plan` moves the card; it never
+  adds a second membership.
+- **Plans are derived per frame, never stored.** Nothing lives in
+  `.foreman/plans/`; deleting a card removes it from its plan, and the last
+  card leaving a plan makes the plan cease to exist. Waves need not be
+  contiguous — a gap is just a gap.
 - **Bare `list` hides shipped cards.** Scripts that dumped every card need
   `--all`; `--state done` is Current Done only.
 
@@ -262,7 +301,11 @@ its base (`docs/integration-queue.md`).
   `worktree_strip`, `CardStore::strays`, `live_worktree_rows`,
   `WorktreeLine` (the `kanban worktrees` line); the Cut half: `Shipped`,
   `same_name`, `versions`, `CardStore::cut` / `uncut` (batch write, revert),
-  `parse_trailer_log` + `trailer_commits`, `latest_v_tag`.
+  `parse_trailer_log` + `trailer_commits`, `latest_v_tag`; the plan half:
+  `Planned` (the card field), `plans` / `Plan` / `Wave` / `PlanCard` (the
+  derivation and `Plan::current`).
+- `src/plan_view.rs` — `PlanView` (the plan window's content) and `PlanAct`
+  (its one intent, `OpenCard`).
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
   intents it records for the manager to drain), including the card-face
   worktree line and the detail page's Discard action, the Done header's
@@ -274,14 +317,17 @@ its base (`docs/integration-queue.md`).
   (applies board intents: store writes, jump-to-terminal, dispatch-from-card
   with bring-up), `drain_worktree_msgs` (queued teardowns, thread results,
   status poll kick including the stray listing), `CloseTarget::DiscardStray`,
-  `kanban_rm` (the `rm` pre-check), `open_board_window`
-  (per-project singleton), `term_states`, `kanban_cut` (the hold-back probe
+  `kanban_rm` (the `rm` pre-check), `open_board_window` /
+  `open_plan_window` (per-project singletons), `drain_plan_acts` (opens or
+  focuses the board and points it at the clicked card), `term_states`, `kanban_cut` (the hold-back probe
   and trailer walk injected into the store).
 - `src/config.rs` — `Settings::dispatch_worktrees`.
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
   `parse_kanban_edit`, `kanban_main`, `kanban_wait` (client-side poll loop),
   `HELP_KANBAN`.
-- `src/workspace.rs` — `ContentSnap::Board` persistence variant.
-- `src/keymap.rs` — `Command::OpenBoard` and its default binding.
+- `src/workspace.rs` — `ContentSnap::Board` and `ContentSnap::Plan`
+  persistence variants.
+- `src/keymap.rs` — `Command::OpenBoard` / `Command::OpenPlan` and their
+  default bindings (`K` and `L`).
 - `src/skills_install.rs` — embeds the foreman-kanban skill (Claude + Codex
   twins).
