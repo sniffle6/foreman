@@ -1,5 +1,6 @@
 //! Read-only Git history: a demand-driven Git stream, pure lane layout, and virtualized native rows.
 use eframe::egui;
+mod details;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{
@@ -309,6 +310,7 @@ fn stream_history(
 }
 
 pub struct HistoryView {
+    details: details::DetailsView,
     cwd: Option<PathBuf>,
     stream: Option<Stream>,
     pages: Vec<Vec<Row>>,
@@ -344,6 +346,7 @@ impl Drop for HistoryView {
 impl HistoryView {
     pub fn new(cwd: Option<PathBuf>) -> Self {
         Self {
+            details: details::DetailsView::default(),
             cwd,
             stream: None,
             pages: Vec::new(),
@@ -458,6 +461,26 @@ impl HistoryView {
             child.label("No commits yet.");
             return;
         }
+        let body = child.available_rect_before_wrap();
+        let split = body.left() + body.width() * 0.55;
+        let timeline =
+            egui::Rect::from_min_max(body.min, egui::pos2(split - 5.0 * s, body.bottom()));
+        let detail_rect =
+            egui::Rect::from_min_max(egui::pos2(split + 8.0 * s, body.top()), body.max);
+        child.painter().line_segment(
+            [
+                egui::pos2(split, body.top()),
+                egui::pos2(split, body.bottom()),
+            ],
+            egui::Stroke::new(1.0, th.border),
+        );
+        let mut child = child.new_child(
+            egui::UiBuilder::new()
+                .id_salt("timeline")
+                .max_rect(timeline),
+        );
+        child.set_clip_rect(timeline.intersect(ui.clip_rect()));
+        let mut selected = None;
         let (row_h, lane_w) = (ROW_H * s, LANE_W * s);
         let graph_w = (self.width as f32 + 1.0) * lane_w;
         let total_w = (graph_w + 720.0 * s).max(child.available_width() - 12.0 * s);
@@ -483,12 +506,15 @@ impl HistoryView {
             for i in range {
                 let row = &self.pages[i / BATCH][i % BATCH];
                 let (r, response) =
-                    ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::click());
+                if response.clicked() {
+                    selected = Some(row.commit.hash.clone());
+                }
                 let painter = ui.painter_at(r.intersect(ui.clip_rect()));
                 if i % 2 == 0 {
                     painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
                 }
-                if response.hovered() {
+                if response.hovered() || self.details.selected() == Some(row.commit.hash.as_str()) {
                     painter.rect_filled(r, 0.0, th.sel_bg);
                 }
                 let x = |lane: usize| r.left() + (lane as f32 + 1.0) * lane_w;
@@ -576,6 +602,13 @@ impl HistoryView {
         if last + 64 >= self.count {
             self.request();
         }
+        if let Some(hash) = selected
+            && let Some(cwd) = &self.cwd
+        {
+            self.details.select(cwd.clone(), hash, ui.ctx().clone());
+        }
+        self.details
+            .show(ui, detail_rect, base.with(("details", self.generation)));
     }
 }
 
@@ -592,6 +625,54 @@ mod tests {
             subject: hash.into(),
         }
     }
+    #[test]
+    fn clicking_rows_changes_selection_and_refresh_clears_it() {
+        let mut view = HistoryView::new(Some(PathBuf::new()));
+        view.end = true;
+        let mut graph = Graph::default();
+        view.pages.push(vec![
+            graph.push(commit("first", &[])),
+            graph.push(commit("second", &[])),
+        ]);
+        view.count = 2;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let mut frame = |view: &mut HistoryView, events| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, egui::Id::new("click")),
+            );
+        };
+        frame(&mut view, vec![]);
+        let click = |view: &mut HistoryView,
+                     frame: &mut dyn FnMut(&mut HistoryView, Vec<egui::Event>),
+                     pos| {
+            frame(view, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    view,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+        };
+        click(&mut view, &mut frame, egui::pos2(250.0, 45.0));
+        assert_eq!(view.details.selected(), Some("first"));
+        click(&mut view, &mut frame, egui::pos2(250.0, 73.0));
+        assert_eq!(view.details.selected(), Some("second"));
+        click(&mut view, &mut frame, egui::pos2(180.0, 18.0));
+        assert_eq!(view.details.selected(), None);
+        assert_eq!(view.count, 0);
+    }
+
     #[test]
     fn linear_history_keeps_one_color_and_ends_at_root() {
         let mut g = Graph::default();
@@ -672,7 +753,7 @@ mod tests {
         assert!(read_commit(&mut r).unwrap().is_none());
         assert!(read_commit(&mut std::io::Cursor::new(b"truncated")).is_err());
     }
-    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    pub(super) fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
             .args(args)

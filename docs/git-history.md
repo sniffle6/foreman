@@ -21,6 +21,19 @@ Text and row geometry follow the theme font size (Appearance → Font size, or
 Ctrl+Scroll zoom), scaled from the 13px default the same way the board does.
 Zooming keeps the same rows in view by rescaling the scroll offset.
 
+Click a timeline row to select it. The right-hand details pane shows the full
+commit message, copyable object id, author name/email, author timestamp with
+timezone, and local/remote branches containing that commit. The branch list is
+an ancestry query, not just the decorations attached to the selected row.
+
+The changed-file tree groups paths into collapsible directories. Added files
+are green, modifications and type changes amber, deletions red, and renames or
+copies blue; status letters and a legend also identify each change. Hover a
+rename for both paths. Roots compare against the empty tree; merges compare
+against their first parent, as labeled in the pane. Empty changes have an
+explicit placeholder. Metadata/message and file-tree scrolling are independent.
+Selecting another row cancels the previous read. Refresh clears the selection.
+
 Branch selection and checkout/switching belong to the next task. Diffs, search,
 context menus, and other Git operations are outside this viewer's scope.
 
@@ -52,6 +65,12 @@ stream and discards its replies; there is no shared receiver for stale data.
 Loaded pages are also freed on a background thread. No repository writes,
 network fetches, or terminal Sessions are created by the viewer.
 
+Commit details use their own cancellable request and receiver so a late result
+cannot replace a newer selection. Git output is NUL-framed for changed paths,
+including rename pairs; control characters are escaped for display. Tree rows
+are built off-thread and only visible rows are painted. Detail queries time out
+and reject oversized output with an error instead of displaying partial data.
+
 The viewport requests more rows near the loaded end. There is no fixed history
 cutoff. Memory grows with the history actually visited, not the full repository
 at open; Git may itself traverse a large graph before returning the first row.
@@ -80,6 +99,8 @@ the user's mouse or keyboard.
 
 - `src/git_history.rs`: `HistoryView`, `Stream`, `stream_history`, `Graph`, and
   module-local tests.
+- `src/git_history/details.rs`: `DetailsView`, cancellable commit queries,
+  changed-file parsing, and the virtualized tree.
 - `src/wm.rs`: `Content::GitHistory`, `open_git_history_window`, snapshot capture
   and restore, and the Project-scoped command dispatch.
 - `src/keymap.rs`: `Command::OpenGitHistory` and its default binding.

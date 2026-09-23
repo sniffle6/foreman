@@ -386,3 +386,9 @@ Session spawning keeps native executables first and guards other batch shims.
 An accepted window drop and its predicted layout rectangle, resolved from the
 current manager state for both preview and release.
 _Avoid_: snap zone.
+
+**Commit details**:
+The selected Git History commit's message, identity, containing branches, and
+changed-file tree. Owned by `src/git_history/details.rs`; each selection has a
+cancellable background request and a private reply channel so stale results
+cannot replace the current selection. Merge changes use the first parent.
