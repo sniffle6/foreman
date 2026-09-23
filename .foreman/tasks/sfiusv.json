@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "sfiusv",
+  "title": "Plan and implement read-only Git history timeline",
+  "body": "Plan and implement a native Git History window inside each project, inspired by the JetBrains Rider log: scrollable commit rows with colored branch/merge graph lanes, commit messages, branch/tag labels, author, and date. Keep Git reads off the GUI thread and scrolling fast on large histories. Start from src/wm.rs and docs/HANDOFF.md; validate graph behavior with tests and GUI screenshots. Scope is viewing only: defer branch selector and checkout/switching to a second task; no diffs, search, context menus, or other Git operations.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.3",
+    "at": "2026-09-23T23:04:02Z",
+    "commits": [
+      "67a51e5"
+    ]
+  },
+  "created": "2026-09-23T22:15:32Z",
+  "updated": "2026-09-23T23:04:02Z"
+}
