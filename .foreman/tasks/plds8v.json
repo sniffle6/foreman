@@ -5,5 +5,5 @@
   "body": "Implement docs/superpowers/specs/2026-09-15-dispatch-worktrees-design.md (commit 748a74b). Read the spec first; it is the contract. Summary: card dispatch creates <repo>/.foreman/worktrees/<id> on branch card/<id> (base = branch checked out at dispatch) and spawns the worker there; the prompt template gains a Workspace section and integrate-before-close-out lines (git rebase base; git -C root merge --ff-only branch); done/release tear down without forcing (worktree remove, branch -d) on a background thread and keep leftovers visible; rm pre-checks and refuses on unmerged work; Discard is a human-only board action; derived WorktreeStatus (dirty/ahead/behind/missing) polls every 5s while a board is shown and renders on the card face, detail page, and kanban list; new setting dispatch_worktrees (default on). Card schema gains optional worktree {path, branch, base}, skipped when None so v1 files and list --json stay byte-identical. Start by writing the implementation plan from the spec (superpowers:writing-plans), then implement. Update docs/kanban-board.md, not a new doc.",
   "state": "done",
   "created": "2026-09-16T01:20:26Z",
-  "updated": "2026-09-16T02:45:50Z"
+  "updated": "2026-09-18T04:23:18Z"
 }

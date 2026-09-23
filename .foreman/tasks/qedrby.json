@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "qedrby",
+  "title": "Show all open worktrees in the kanban board",
+  "body": "Make all open worktrees for the project discoverable from the kanban board. Discuss and agree on the UX with the user before implementation: where the overview lives, how worktrees relate to cards (including those without a card), and which status details and actions it should show. Start from the existing per-card worktree display; do not assume a layout or cleanup behavior.",
+  "state": "done",
+  "created": "2026-09-17T21:20:34Z",
+  "updated": "2026-09-18T01:19:05Z"
+}

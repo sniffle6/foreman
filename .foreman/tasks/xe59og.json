@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "xe59og",
+  "title": "Serialize worktree integration with a repository merge queue",
+  "body": "Implement the plan in docs/superpowers/plans/2026-09-17-worktree-integration-queue.md. Foreman owns a durable per-repository queue covering rebase, validation, and fast-forward; conflicts return to workers without blocking ready cards. Include cross-instance locking, restart recovery, card/CLI progress, and updated paired worker instructions. Acceptance cases and implementation sequence are in the plan.",
+  "state": "done",
+  "created": "2026-09-18T01:16:22Z",
+  "updated": "2026-09-18T23:11:36Z"
+}
