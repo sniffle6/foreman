@@ -1764,6 +1764,15 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         git_in(tmp.path(), &["init", "-q", "-b", "main"]);
+        // In the repo's own config, not `-c`: the queue's own git calls
+        // (rebase) commit too, and a CI runner has no global identity.
+        for (k, v) in [
+            ("user.name", "t"),
+            ("user.email", "t@t"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git_in(tmp.path(), &["config", k, v]);
+        }
         std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
         git_in(tmp.path(), &["add", "f.txt"]);
         git_in(tmp.path(), &["commit", "-q", "-m", "init"]);
