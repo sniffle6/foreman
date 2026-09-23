@@ -594,6 +594,13 @@ struct PendingTeardown {
     force: bool,
 }
 
+/// The Cut release in flight or awaiting dismissal (`drain_release`).
+struct ReleaseRun {
+    /// `Some` until the thread reports its outcome.
+    rx: Option<std::sync::mpsc::Receiver<crate::release::ReleaseEvent>>,
+    progress: crate::release::Progress,
+}
+
 /// An in-flight close awaiting confirmation: the doomed target plus the modal
 /// view rendering the running-process list.
 struct PendingClose {
@@ -625,6 +632,10 @@ pub struct WindowManager {
     /// into each spawned thread; the receiver is drained per frame.
     worktree_tx: std::sync::mpsc::Sender<WorktreeMsg>,
     worktree_rx: std::sync::mpsc::Receiver<WorktreeMsg>,
+    /// The Cut release (see `release.rs`): one at a time. The receiver is
+    /// `Some` while the thread runs; the progress stays until the board
+    /// dismisses it.
+    release: Option<ReleaseRun>,
     /// Teardowns queued by `done`/release/`rm`/Discard, started by
     /// `drain_worktree_msgs` once their holding terminal is gone.
     pending_teardowns: Vec<PendingTeardown>,
@@ -724,6 +735,7 @@ impl WindowManager {
             kanban: Rc::new(RefCell::new(crate::kanban::CardStore::default())),
             worktree_tx,
             worktree_rx,
+            release: None,
             pending_teardowns: Vec::new(),
             teardown_attempted: std::collections::HashSet::new(),
             teardowns_in_flight: std::collections::HashSet::new(),
@@ -1775,10 +1787,23 @@ impl WindowManager {
             }
             "cut" => {
                 let name = req.name.as_deref().ok_or("cut requires a version name")?;
-                let out = child.kanban_cut(name)?;
+                if !req.release {
+                    let out = child.kanban_cut(name)?;
+                    return Ok(OpenReply {
+                        ok: true,
+                        history: Some(out.lines()),
+                        ..Default::default()
+                    });
+                }
+                // Reply at once: the release outlives REPLY_TIMEOUT; its
+                // outcome lands on the board and as a toast.
+                let mut lines = child.cut_and_release(name)?.lines();
+                if let Some(first) = lines.first_mut() {
+                    first.push_str("; release started");
+                }
                 Ok(OpenReply {
                     ok: true,
-                    history: Some(out.lines()),
+                    history: Some(lines),
                     ..Default::default()
                 })
             }
@@ -2503,22 +2528,27 @@ impl WindowManager {
                         ),
                     });
                 }
-                crate::board::BoardAct::Cut(name) => match self.kanban_cut(&name) {
-                    Ok(out) => crate::notify::queue(
+                crate::board::BoardAct::Cut(name) => match self.cut_and_release(&name) {
+                    // Held-back cards are worth a toast now; success waits
+                    // for the release's own outcome.
+                    Ok(out) if !out.held_back.is_empty() => crate::notify::queue(
                         ctx,
-                        if out.held_back.is_empty() {
-                            crate::notify::Level::Success
-                        } else {
-                            crate::notify::Level::Warning
-                        },
+                        crate::notify::Level::Warning,
                         out.lines().join("; "),
                     ),
+                    Ok(_) => {}
                     Err(e) => crate::notify::queue(
                         ctx,
                         crate::notify::Level::Error,
                         format!("board: cut failed: {e}"),
                     ),
                 },
+                crate::board::BoardAct::DismissRelease => {
+                    // Only a finished run; a running one keeps its list.
+                    if self.release.as_ref().is_some_and(|r| r.rx.is_none()) {
+                        self.release = None;
+                    }
+                }
                 crate::board::BoardAct::Uncut(name) => {
                     let res = self.kanban.borrow_mut().uncut(&name);
                     if let Err(e) = res {
@@ -2811,10 +2841,118 @@ impl WindowManager {
         self.kanban.borrow_mut().cut(name, hold, commits)
     }
 
-    /// The Cut field's prefill (spec §Cut, Board): the newest `v*` tag,
-    /// only when that string is not already a Version. Fail-open.
+    /// Cut = release (docs/kanban-board.md §Cut): stamp the cards here, on
+    /// the UI thread, then hand the git procedure to `release::spawn`. A
+    /// failed stamp spawns nothing; a second Cut while one runs is refused.
+    fn cut_and_release(&mut self, name: &str) -> Result<crate::kanban::CutOutcome, String> {
+        if self.release.as_ref().is_some_and(|r| r.rx.is_some()) {
+            return Err("a release is already running".into());
+        }
+        let cwd = self.cwd.clone().ok_or("project has no working directory")?;
+        let out = self.kanban_cut(name)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::release::spawn(cwd, out.name.clone(), tx);
+        self.release = Some(ReleaseRun {
+            rx: Some(rx),
+            progress: crate::release::Progress::new(&out.name),
+        });
+        Ok(out)
+    }
+
+    /// Per-frame: fold release events into the progress, act on the
+    /// outcome, and hand every board view in this manager a copy (or
+    /// `None` once dismissed).
+    fn drain_release(&mut self, ctx: &egui::Context) {
+        let mut outcome = None;
+        if let Some(run) = &mut self.release
+            && let Some(rx) = &run.rx
+        {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => {
+                        run.progress.apply(&ev);
+                        if matches!(
+                            ev,
+                            crate::release::ReleaseEvent::Failed { .. }
+                                | crate::release::ReleaseEvent::Done { .. }
+                        ) {
+                            outcome = Some(ev);
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still running: keep frames coming so the list moves.
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // The thread died without a verdict (a panic). Whether
+                        // it committed is unknown, so the cards stay put.
+                        let ev = crate::release::ReleaseEvent::Failed {
+                            step: crate::release::Step::Checks,
+                            error: "release thread stopped without a result".into(),
+                            committed: true,
+                            resume: None,
+                        };
+                        run.progress.apply(&ev);
+                        outcome = Some(ev);
+                        break;
+                    }
+                }
+            }
+            if outcome.is_some() {
+                run.rx = None;
+            }
+        }
+        let progress = self.release.as_ref().map(|r| r.progress.clone());
+        if let Some(p) = &progress {
+            let name = &p.name;
+            match outcome {
+                Some(crate::release::ReleaseEvent::Failed {
+                    step,
+                    error,
+                    committed,
+                    ..
+                }) => {
+                    // Nothing reached git: the cards go back to Current.
+                    if !committed && let Err(e) = self.kanban.borrow_mut().uncut(name) {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Error,
+                            format!("release {name}: uncut failed: {e}"),
+                        );
+                    }
+                    let first = error.lines().next().unwrap_or("").trim();
+                    crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Error,
+                        format!("release {name} failed at {}: {first}", step.label()),
+                    );
+                }
+                Some(crate::release::ReleaseEvent::Done { .. }) => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Success,
+                    format!("released {name}: tag pushed"),
+                ),
+                _ => {}
+            }
+        }
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Board(v) = &mut t.content
+                    && v.release != progress
+                {
+                    v.release = progress.clone();
+                }
+            }
+        }
+    }
+
+    /// The Cut field's prefill: the next patch version (`Cargo.toml`'s,
+    /// else the newest `v*` tag's), only when that string is not already a
+    /// Version. Fail-open.
     fn cut_prefill(&self) -> Option<String> {
-        let tag = crate::kanban::latest_v_tag(self.cwd.as_deref()?)?;
+        let tag = crate::release::prefill(self.cwd.as_deref()?)?;
         let taken = crate::kanban::versions(self.kanban.borrow().cards())
             .iter()
             .any(|v| crate::kanban::same_name(&v.name, &tag));
@@ -6750,6 +6888,7 @@ impl WindowManager {
         self.drain_board_acts(&ctx);
         self.drain_plan_acts();
         self.drain_worktree_msgs(&ctx);
+        self.drain_release(&ctx);
         if self.drain_settings() {
             self.swallow_input(ui);
         }
@@ -14713,6 +14852,185 @@ mod tests {
         let lines = m.kanban_dispatch(&done_only).unwrap().history.unwrap();
         assert_eq!(lines.len(), 2, "{lines:?}");
         let _ = (a, b);
+    }
+
+    /// A project manager at `dir` with two Done cards, ready to Cut.
+    fn cut_ready_project(dir: &std::path::Path) -> WindowManager {
+        let mut child = WindowManager::new();
+        child.cwd = Some(dir.to_path_buf());
+        child.kanban.borrow_mut().set_dir(Some(dir));
+        {
+            let mut s = child.kanban.borrow_mut();
+            for title in ["a", "b"] {
+                let id = s.add(title, None).unwrap();
+                s.claim_for_dispatch(
+                    &id,
+                    "t1",
+                    "claude",
+                    crate::kanban::run_nonce(),
+                    crate::kanban::TermState::Missing,
+                    None,
+                )
+                .unwrap();
+                s.done(&id).unwrap();
+            }
+        }
+        child
+    }
+
+    fn shipped_count(m: &WindowManager) -> usize {
+        m.kanban
+            .borrow()
+            .cards()
+            .iter()
+            .filter(|c| c.shipped.is_some())
+            .count()
+    }
+
+    /// Feed one release outcome through `drain_release` as if the thread
+    /// sent it.
+    fn finish_release(m: &mut WindowManager, ev: crate::release::ReleaseEvent) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.release = Some(ReleaseRun {
+            rx: Some(rx),
+            progress: crate::release::Progress::new("v1.0.1"),
+        });
+        tx.send(ev).unwrap();
+        m.drain_release(&egui::Context::default());
+    }
+
+    #[test]
+    fn release_failure_before_any_commit_returns_the_cards_to_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = cut_ready_project(tmp.path());
+        m.kanban_cut("v1.0.1").unwrap();
+        assert_eq!(shipped_count(&m), 2);
+        finish_release(
+            &mut m,
+            crate::release::ReleaseEvent::Failed {
+                step: crate::release::Step::Checks,
+                error: "behind origin".into(),
+                committed: false,
+                resume: None,
+            },
+        );
+        assert_eq!(shipped_count(&m), 0, "uncut: nothing reached git");
+        let run = m.release.as_ref().unwrap();
+        assert!(run.rx.is_none() && run.progress.finished);
+    }
+
+    #[test]
+    fn release_failure_after_a_commit_keeps_the_cards_shipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = cut_ready_project(tmp.path());
+        m.kanban_cut("v1.0.1").unwrap();
+        finish_release(
+            &mut m,
+            crate::release::ReleaseEvent::Failed {
+                step: crate::release::Step::PushTag,
+                error: "rejected".into(),
+                committed: true,
+                resume: Some("git push origin v1.0.1".into()),
+            },
+        );
+        assert_eq!(shipped_count(&m), 2, "the commit holds the stamp");
+    }
+
+    #[test]
+    fn release_progress_reaches_the_board_and_dismiss_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = cut_ready_project(tmp.path());
+        let (id, rect) = m.next_slot(egui::vec2(400.0, 300.0));
+        let view = crate::board::BoardView::new(m.kanban.clone());
+        m.push_win(id, Tab::fixed("board", Content::Board(view)), rect);
+        let board = |m: &WindowManager| {
+            m.windows.iter().find_map(|w| match &w.tabs[0].content {
+                Content::Board(v) => Some(v.release.clone()),
+                _ => None,
+            })
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.release = Some(ReleaseRun {
+            rx: Some(rx),
+            progress: crate::release::Progress::new("v1.0.1"),
+        });
+        tx.send(crate::release::ReleaseEvent::Step(
+            crate::release::Step::Checks,
+            crate::release::StepState::Running,
+        ))
+        .unwrap();
+        m.drain_release(&egui::Context::default());
+        let p = board(&m).flatten().expect("board got the progress");
+        assert!(!p.finished);
+        // A running release ignores dismiss.
+        m.windows.iter_mut().for_each(|w| {
+            if let Content::Board(v) = &mut w.tabs[0].content {
+                v.acts.push(crate::board::BoardAct::DismissRelease);
+            }
+        });
+        m.drain_board_acts(&egui::Context::default());
+        assert!(m.release.is_some());
+        tx.send(crate::release::ReleaseEvent::Done { actions_url: None })
+            .unwrap();
+        m.drain_release(&egui::Context::default());
+        m.windows.iter_mut().for_each(|w| {
+            if let Content::Board(v) = &mut w.tabs[0].content {
+                v.acts.push(crate::board::BoardAct::DismissRelease);
+            }
+        });
+        m.drain_board_acts(&egui::Context::default());
+        m.drain_release(&egui::Context::default());
+        assert!(m.release.is_none());
+        assert_eq!(board(&m), Some(None));
+    }
+
+    /// `cut --release` over the wire replies at once and the release runs
+    /// behind it. The project is a git repo with no `origin`, so the checks
+    /// refuse before any write and the cards come back to Current.
+    #[test]
+    fn kanban_cut_release_replies_at_once_and_a_refused_release_uncuts() {
+        if !crate::kanban::git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let mut m = WindowManager::new();
+        let (id, rect) = m.next_slot(egui::vec2(720.0, 480.0));
+        let mut child = cut_ready_project(tmp.path());
+        child.tag = Some(format!("p{id}"));
+        m.push_win(
+            id,
+            Tab::fixed("proj", Content::Project(Box::new(child))),
+            rect,
+        );
+        let pid = m.resolve_project(None).unwrap();
+        let mut cut = kanban_req("cut");
+        cut.name = Some("v1.0.1".into());
+        cut.release = true;
+        let reply = m.kanban_dispatch(&cut).unwrap();
+        assert_eq!(
+            reply.history.unwrap(),
+            vec!["cut v1.0.1: 2 cards; release started".to_string()]
+        );
+        let child = m.project_child_mut(pid).unwrap();
+        // One at a time.
+        let e = child.cut_and_release("v1.0.2").unwrap_err();
+        assert!(e.contains("already running"), "{e}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.release.as_ref().unwrap().rx.is_some() {
+            assert!(std::time::Instant::now() < deadline, "release never ended");
+            child.drain_release(&egui::Context::default());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let p = &child.release.as_ref().unwrap().progress;
+        assert!(p.error.as_deref().unwrap().contains("origin"), "{p:?}");
+        assert!(!p.committed);
+        assert_eq!(shipped_count(child), 0);
     }
 
     /// The hold-back probe fails CLOSED: a Done card whose worktree git

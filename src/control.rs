@@ -267,6 +267,11 @@ pub struct KanbanRequest {
     /// Skipped when unset (wire compat v1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wave: Option<u32>,
+    /// `cut --release`: after stamping, run the release (commit, bump,
+    /// push, tag) on a thread; the reply does not wait for it. Skipped when
+    /// false (wire compat v1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub release: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -1253,21 +1258,29 @@ fn parse_kanban_simple(
     }))
 }
 
-/// `cut <name> [--project P]` / `uncut <name> [--project P]` — one
-/// positional, the Version name. The CLI never defaults it from git (spec:
-/// kanban-cut §Decisions); only the board prefills.
+/// `cut <name> [--release] [--project P]` / `uncut <name> [--project P]` —
+/// one positional, the Version name. The CLI never defaults it from git
+/// (spec: kanban-cut §Decisions); only the board prefills. `--release` is
+/// cut-only.
 fn parse_kanban_named(
     args: &[String],
     default_project: Option<String>,
     action: &str,
 ) -> Result<KanbanAction, String> {
-    let (name, project) = parse_kanban_id_and_project(args, default_project)
+    let release = action == "cut" && args.iter().any(|a| a == "--release");
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|a| !(release && *a == "--release"))
+        .cloned()
+        .collect();
+    let (name, project) = parse_kanban_id_and_project(&rest, default_project)
         .map_err(|e| e.replace("<id>", "<name>"))?;
     Ok(KanbanAction::Request(KanbanRequest {
         cmd: "kanban".into(),
         action: action.into(),
         project,
         name: Some(name),
+        release,
         ..Default::default()
     }))
 }
@@ -1508,7 +1521,7 @@ foreman kanban start <id> [--project P]
 foreman kanban done <id> [--project P]
 foreman kanban block <id> --reason R [--project P]
 foreman kanban rm <id> [--project P]
-foreman kanban cut <name> [--project P]
+foreman kanban cut <name> [--release] [--project P]
 foreman kanban uncut <name> [--project P]
 foreman kanban wait <id> [--timeout SECS] [--project P]
 foreman kanban wait --any [--timeout SECS] [--project P]
@@ -1584,7 +1597,14 @@ focused project).
           Done card whose kept worktree is dirty, is ahead of base, or
           cannot be probed stays in Current and is named in the reply.
           Each shipped card records the commits
-          whose \"Card: <id>\" trailer named it.
+          whose \"Card: <id>\" trailer named it. With --release (what the
+          board's Cut does) it then releases vX.Y.Z on a background thread:
+          checks (release branch, clean tree outside .foreman/tasks, not
+          behind origin, tag free, newer version), commit the cards, bump
+          Cargo.toml if present, push the branch, tag, push the tag. The
+          reply comes at once (\"...; release started\"); progress and the
+          outcome show on the board. A failure before any commit returns
+          the cards to Current.
   uncut   clear <name> from every card in that Version; they return to
           Current Done. Errors on an unknown name.
   wait    poll (client-side, no pipe verb) until the card (or, with --any,
@@ -3800,5 +3820,48 @@ mod tests {
         assert!(!serde_json::to_string(&req).unwrap().contains("\"stray\""));
         let r: KanbanRequest = serde_json::from_str(r#"{"cmd":"kanban","action":"list"}"#).unwrap();
         assert!(!r.stray);
+    }
+
+    #[test]
+    fn kanban_request_release_is_wire_compatible_with_v1() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "cut".into(),
+            name: Some("v1.0.0".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"kanban","action":"cut","name":"v1.0.0"}"#
+        );
+        let r: KanbanRequest =
+            serde_json::from_str(r#"{"cmd":"kanban","action":"cut","name":"v1.0.0"}"#).unwrap();
+        assert!(!r.release);
+    }
+
+    #[test]
+    fn parse_kanban_args_cut_release_flag() {
+        let req = match parse_kanban_args(
+            &s(&["cut", "--release", "v0.5.1", "--project", "p2"]),
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert!(req.release);
+        assert_eq!(req.name.as_deref(), Some("v0.5.1"));
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""release":true"#), "{json}");
+        // Plain cut stays record-only; uncut has no such flag.
+        let plain = match parse_kanban_args(&s(&["cut", "v0.5.1"]), None, None).unwrap() {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert!(!plain.release);
+        assert!(parse_kanban_args(&s(&["uncut", "v0.5.1", "--release"]), None, None).is_err());
     }
 }

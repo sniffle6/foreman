@@ -72,6 +72,74 @@ pub enum ReleaseEvent {
     },
 }
 
+/// How one step stands, for the board's list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Pending,
+    Running,
+    Ok,
+    Failed,
+}
+
+/// The run as the board draws it, folded from the events. The manager owns
+/// the one copy and hands clones to its board views each frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub name: String,
+    /// Run order; a skipped step is removed.
+    pub steps: Vec<(Step, Mark)>,
+    pub error: Option<String>,
+    pub committed: bool,
+    pub resume: Option<String>,
+    pub finished: bool,
+    pub actions_url: Option<String>,
+}
+
+impl Progress {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            steps: Step::ALL.iter().map(|s| (*s, Mark::Pending)).collect(),
+            error: None,
+            committed: false,
+            resume: None,
+            finished: false,
+            actions_url: None,
+        }
+    }
+
+    pub fn apply(&mut self, ev: &ReleaseEvent) {
+        let mut mark = |step: Step, m: Mark| {
+            if let Some(e) = self.steps.iter_mut().find(|(s, _)| *s == step) {
+                e.1 = m;
+            }
+        };
+        match ev {
+            ReleaseEvent::Step(step, StepState::Skipped) => {
+                self.steps.retain(|(s, _)| s != step);
+            }
+            ReleaseEvent::Step(step, StepState::Running) => mark(*step, Mark::Running),
+            ReleaseEvent::Step(step, StepState::Ok) => mark(*step, Mark::Ok),
+            ReleaseEvent::Failed {
+                step,
+                error,
+                committed,
+                resume,
+            } => {
+                mark(*step, Mark::Failed);
+                self.error = Some(error.clone());
+                self.committed = *committed;
+                self.resume = resume.clone();
+                self.finished = true;
+            }
+            ReleaseEvent::Done { actions_url } => {
+                self.actions_url = actions_url.clone();
+                self.finished = true;
+            }
+        }
+    }
+}
+
 /// Run the release for version `name` on its own thread.
 /// The manager keeps the UI repainting while the receiver is live.
 pub fn spawn(cwd: PathBuf, name: String, tx: Sender<ReleaseEvent>) {
@@ -618,6 +686,26 @@ mod tests {
             resume_command(Step::PushTag, "main", "v1.0.1").as_deref(),
             Some("git push origin v1.0.1")
         );
+    }
+
+    #[test]
+    fn progress_folds_events_and_drops_skipped_steps() {
+        let mut p = Progress::new("v1.0.1");
+        assert!(!p.finished);
+        p.apply(&ReleaseEvent::Step(Step::Checks, StepState::Running));
+        assert_eq!(p.steps[0], (Step::Checks, Mark::Running));
+        p.apply(&ReleaseEvent::Step(Step::Checks, StepState::Ok));
+        p.apply(&ReleaseEvent::Step(Step::Bump, StepState::Skipped));
+        assert!(!p.steps.iter().any(|(s, _)| *s == Step::Bump));
+        p.apply(&ReleaseEvent::Failed {
+            step: Step::PushTag,
+            error: "denied".into(),
+            committed: true,
+            resume: Some("git push origin v1.0.1".into()),
+        });
+        assert!(p.finished && p.committed);
+        assert_eq!(p.steps.last(), Some(&(Step::PushTag, Mark::Failed)));
+        assert_eq!(p.error.as_deref(), Some("denied"));
     }
 
     // --- end to end against a local bare "origin" --------------------------

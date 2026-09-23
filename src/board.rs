@@ -229,6 +229,8 @@ pub enum BoardAct {
     /// The Cut field just opened empty; the manager answers with the latest
     /// unused `v*` tag via `BoardView::prefill_cut`, or with nothing.
     CutPrefill,
+    /// The ✕ on a finished release's step list.
+    DismissRelease,
 }
 
 pub struct BoardView {
@@ -257,9 +259,15 @@ pub struct BoardView {
     cut_touched: bool,
     /// Focus the Cut field on the first frame after it opens.
     cut_focus_pending: bool,
+    /// The Cut release's progress, copied in by the manager each frame
+    /// (`drain_release`); `None` = nothing to show.
+    pub(crate) release: Option<crate::release::Progress>,
     /// Test probes: what the last frame drew for Done.
     #[cfg(test)]
     pub(crate) offered_cut: bool,
+    /// Test probe: the step list's lines last frame (empty = not drawn).
+    #[cfg(test)]
+    pub(crate) release_lines: Vec<String>,
     #[cfg(test)]
     pub(crate) drew_banner: bool,
     #[cfg(test)]
@@ -320,8 +328,11 @@ impl BoardView {
             cut_field: None,
             cut_touched: false,
             cut_focus_pending: false,
+            release: None,
             #[cfg(test)]
             offered_cut: false,
+            #[cfg(test)]
+            release_lines: Vec::new(),
             #[cfg(test)]
             drew_banner: false,
             #[cfg(test)]
@@ -457,6 +468,7 @@ impl BoardView {
         #[cfg(test)]
         {
             self.offered_cut = false;
+            self.release_lines.clear();
             self.drew_banner = false;
             self.done_listed.clear();
             self.detail_commits.clear();
@@ -539,6 +551,130 @@ impl BoardView {
         if self.picker.is_some() && !picker_click_consumed && ui.input(|i| i.pointer.any_click()) {
             self.picker = None;
         }
+    }
+
+    /// The Cut release's step list, top-anchored in `area`; returns the
+    /// height it used. One line per step (✓ done, … running, ✗ failed,
+    /// · pending), then git's error and the hand finish on failure, or the
+    /// Actions link on success. ✕ dismisses a finished list.
+    fn show_release(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: egui::Rect,
+        id: egui::Id,
+        prog: &crate::release::Progress,
+        th: &crate::theme::Theme,
+    ) -> f32 {
+        use crate::release::Mark;
+        let s = self.scale;
+        let font = egui::FontId::proportional(11.0 * s);
+        let mono = egui::FontId::monospace(10.5 * s);
+        let mut lines = Vec::new();
+
+        // Header row: what is happening, and the ✕ once it is over.
+        let head_rect = egui::Rect::from_min_size(area.min, egui::vec2(area.width(), 18.0 * s));
+        let head = match (prog.finished, &prog.error) {
+            (false, _) => format!("Releasing {}", prog.name),
+            (true, Some(_)) => format!("Release {} failed", prog.name),
+            (true, None) => format!("Released {}", prog.name),
+        };
+        let p = ui.painter_at(area);
+        p.with_clip_rect(head_rect).text(
+            egui::pos2(head_rect.min.x + 4.0 * s, head_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &head,
+            font.clone(),
+            th.dim,
+        );
+        lines.push(head);
+        if prog.finished {
+            let x = egui::Rect::from_center_size(
+                egui::pos2(head_rect.max.x - 9.0 * s, head_rect.center().y),
+                egui::vec2(16.0 * s, 16.0 * s),
+            );
+            let r = ui.interact(x, id.with("dismiss"), egui::Sense::click());
+            if r.hovered() {
+                p.rect_filled(x, 3.0, th.sel_bg);
+            }
+            p.text(
+                x.center(),
+                egui::Align2::CENTER_CENTER,
+                "✕",
+                font.clone(),
+                th.dim,
+            );
+            if r.on_hover_text("Dismiss").clicked() {
+                self.acts.push(BoardAct::DismissRelease);
+            }
+        }
+
+        let body = egui::Rect::from_min_max(egui::pos2(area.min.x, head_rect.max.y), area.max);
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(id)
+                .max_rect(body.shrink2(egui::vec2(4.0 * s, 0.0)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        child.spacing_mut().item_spacing.y = 1.0 * s;
+        for (step, mark) in &prog.steps {
+            let (glyph, color) = match mark {
+                Mark::Pending => ("·", th.dim),
+                Mark::Running => ("…", th.text),
+                Mark::Ok => ("✓", th.text),
+                Mark::Failed => ("✗", th.danger),
+            };
+            let line = format!("{glyph} {}", step.label());
+            child.add(
+                egui::Label::new(egui::RichText::new(&line).font(font.clone()).color(color))
+                    .truncate(),
+            );
+            lines.push(line);
+        }
+        if let Some(err) = &prog.error {
+            // A push rejection runs long; its first lines carry the reason.
+            let short = err.lines().take(4).collect::<Vec<_>>().join("\n");
+            child.add(
+                egui::Label::new(
+                    egui::RichText::new(&short)
+                        .font(mono.clone())
+                        .color(th.danger),
+                )
+                .wrap()
+                .selectable(true),
+            );
+            lines.push(short);
+            if prog.committed {
+                let note = if prog.resume.is_some() {
+                    "Local commits kept. Finish by hand:"
+                } else {
+                    "Local commits kept; finish by hand (docs/installing-and-updating.md)."
+                };
+                child.add(
+                    egui::Label::new(egui::RichText::new(note).font(font.clone()).color(th.dim))
+                        .wrap(),
+                );
+                lines.push(note.to_string());
+                if let Some(cmd) = &prog.resume {
+                    child.add(
+                        egui::Label::new(egui::RichText::new(cmd).font(mono).color(th.text))
+                            .wrap()
+                            .selectable(true),
+                    );
+                    lines.push(cmd.clone());
+                }
+            }
+        } else if let Some(url) = &prog.actions_url {
+            child.hyperlink_to(egui::RichText::new(url).font(font), url);
+            lines.push(url.clone());
+        }
+        #[cfg(test)]
+        {
+            self.release_lines = lines;
+        }
+        #[cfg(not(test))]
+        let _ = lines;
+        head_rect.height() + child.min_rect().height() + 4.0 * s
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -738,7 +874,8 @@ impl BoardView {
         }
         if let Some(cut) = cut_rect {
             if self.version.is_none() {
-                let enabled = !matching.is_empty();
+                let releasing = self.release.as_ref().is_some_and(|p| !p.finished);
+                let enabled = !matching.is_empty() && !releasing;
                 #[cfg(test)]
                 {
                     self.offered_cut = enabled;
@@ -771,12 +908,18 @@ impl BoardView {
                     egui::FontId::proportional(10.5 * self.scale),
                     if enabled { th.text } else { th.dim },
                 );
-                let r = r.on_hover_text(if enabled {
-                    "Cut Done into a named Version"
+                let r = r.on_hover_text(if releasing {
+                    "A release is running"
+                } else if enabled {
+                    "Cut Done into a Version and release it (commit, bump, push, tag)"
                 } else {
                     "Nothing in Done to cut"
                 });
                 if enabled && r.clicked() && self.cut_field.is_none() {
+                    // A finished run's list gives its row back to the field.
+                    if self.release.take().is_some() {
+                        self.acts.push(BoardAct::DismissRelease);
+                    }
                     self.cut_field = Some(String::new());
                     self.cut_touched = false;
                     self.cut_focus_pending = true;
@@ -865,6 +1008,21 @@ impl BoardView {
                 }
             }
             body_top += QUICK_ADD_H * self.scale;
+        }
+        if is_done
+            && self.cut_field.is_none()
+            && let Some(prog) = self.release.clone()
+        {
+            // The release's step list takes the Cut field's row (docs:
+            // kanban-board §Cut). Any Done view shows it: the cards it
+            // shipped live in the new Version.
+            let area = egui::Rect::from_min_max(
+                egui::pos2(col_rect.min.x + PAD * self.scale, body_top),
+                egui::pos2(col_rect.max.x - PAD * self.scale, col_rect.max.y),
+            );
+            if area.is_positive() {
+                body_top += self.show_release(ui, area, base.with((col_idx, "release")), &prog, th);
+            }
         }
         if is_done && let Some(v) = self.version.clone() {
             // Archive banner: the signal that Done is not Current.
@@ -2554,6 +2712,59 @@ mod tests {
             board.acts.len()
         );
         assert!(board.cut_field.is_none(), "Enter closes the field");
+    }
+
+    #[test]
+    fn running_release_shows_its_steps_and_disables_cut() {
+        use crate::release::{Progress, ReleaseEvent, Step, StepState};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "a");
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("release-list");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        let mut p = Progress::new("v0.5.1");
+        p.apply(&ReleaseEvent::Step(Step::Checks, StepState::Ok));
+        p.apply(&ReleaseEvent::Step(Step::CommitCards, StepState::Running));
+        p.apply(&ReleaseEvent::Step(Step::Bump, StepState::Skipped));
+        board.release = Some(p.clone());
+        click_at(&ctx, &mut board, rect, base, cut_button_pos(rect));
+        assert!(!board.offered_cut, "Cut is disabled while a release runs");
+        assert!(board.cut_field.is_none(), "the click opened nothing");
+        assert_eq!(
+            board.release_lines,
+            [
+                "Releasing v0.5.1",
+                "✓ checks",
+                "… commit cards",
+                "· push branch",
+                "· tag",
+                "· push tag"
+            ],
+            "the skipped bump is omitted"
+        );
+
+        // Failed after a commit: the error and the hand finish show, and
+        // Cut is live again (the list stays until dismissed or replaced).
+        p.apply(&ReleaseEvent::Failed {
+            step: Step::PushBranch,
+            error: "! [rejected] main -> main (fetch first)".into(),
+            committed: true,
+            resume: Some("git tag v0.5.1 && git push origin main v0.5.1".into()),
+        });
+        board.release = Some(p);
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.offered_cut);
+        assert!(board.release_lines.contains(&"✗ push branch".to_string()));
+        assert!(
+            board
+                .release_lines
+                .contains(&"git tag v0.5.1 && git push origin main v0.5.1".to_string()),
+            "{:?}",
+            board.release_lines
+        );
+        assert!(board.acts.is_empty());
     }
 
     #[test]
