@@ -156,11 +156,37 @@ pub enum Content {
     /// Floating/closable/tabbable like Chat; not persisted (see capture_manager).
     Settings(crate::settings_menu::SettingsMenu),
 }
+
+/// Run `draw` and report whether this frame's click or drag-start landed on
+/// a widget it registered. Content widgets sit above the window's own
+/// `cresp` (egui gives a click to the last-registered widget under the
+/// pointer), so a click on a board button or text field never reaches
+/// `cresp.clicked()`. Without this the window is never focused, and with a
+/// terminal still focused `protect_terminal_keyboard` strips the field's
+/// egui focus every frame — Enter and Esc go nowhere.
+fn claims_click(ui: &mut egui::Ui, draw: impl FnOnce(&mut egui::Ui)) -> bool {
+    let layer = ui.layer_id();
+    let before = ui
+        .ctx()
+        .viewport(|v| v.this_pass.widgets.get_layer(layer).count());
+    draw(ui);
+    let Some(hit) = ui
+        .ctx()
+        .interaction_snapshot(|s| s.clicked.or(s.drag_started))
+    else {
+        return false;
+    };
+    ui.ctx()
+        .viewport(|v| v.this_pass.widgets.order(hit))
+        .is_some_and(|(l, i)| l == layer && i >= before)
+}
+
 impl Content {
     /// Returns whether a window in this content was interacted with this frame.
     /// Terminals are leaves (no child windows) so they always return false; a
     /// project returns whatever its nested manager reports, which lets the parent
     /// raise focus to a background project when one of its sub-windows is clicked.
+    /// Chat, board and plan report a click on their own widgets (`claims_click`).
     fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -183,20 +209,17 @@ impl Content {
             Content::Project(wm) => {
                 wm.show(ui, rect, active, base.with(("proj", win_id)), app_modal)
             }
-            Content::Chat(view) => {
-                // Paint lives in chat_view.rs; click/pending_post drained after
-                // apply_acts (see ChatView::show docs).
-                view.show(ui, rect, active, resp, base.with((win_id, "chat-input")));
-                false
-            }
-            Content::Board(view) => {
-                view.show(ui, rect, active, resp, base.with((win_id, "board")));
-                false
-            }
-            Content::Plan(view) => {
-                view.show(ui, rect, active, resp, base.with((win_id, "plan")));
-                false
-            }
+            // Paint lives in chat_view.rs; click/pending_post drained after
+            // apply_acts (see ChatView::show docs).
+            Content::Chat(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, active, resp, base.with((win_id, "chat-input")))
+            }),
+            Content::Board(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, active, resp, base.with((win_id, "board")))
+            }),
+            Content::Plan(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, active, resp, base.with((win_id, "plan")))
+            }),
             Content::Image(view) => {
                 view.show(ui, rect, active, resp);
                 false
@@ -14884,6 +14907,68 @@ mod tests {
         };
         v.acts.push(act);
         bid
+    }
+
+    // Regression: the Cut button sits above the window's own `cresp`, so the
+    // click never reached `cresp.clicked()` and the board window was never
+    // focused. With a terminal still focused, `protect_terminal_keyboard`
+    // then stripped the Cut field's egui focus every frame — Enter and Esc
+    // went nowhere. The content must report a click on its own widgets.
+    #[test]
+    fn a_click_on_a_board_widget_reports_the_window_interacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = crate::kanban::CardStore::default();
+        store.set_dir(Some(tmp.path()));
+        let id = store.add("a", None).unwrap();
+        store
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                None,
+            )
+            .unwrap();
+        store.done(&id).unwrap();
+        let mut content = Content::Board(crate::board::BoardView::new(Rc::new(
+            std::cell::RefCell::new(store),
+        )));
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        let mut frame = |pos: egui::Pos2, pressed: Option<bool>| {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(pos));
+            if let Some(pressed) = pressed {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut claimed = false;
+            let _ = ctx.run_ui(input, |ui| {
+                // Registered first, like the manager's `cresp`.
+                let resp = ui.interact(rect, egui::Id::new("content"), egui::Sense::click());
+                claimed = content.show(ui, rect, true, egui::Id::new("wm"), 7, &resp, false);
+            });
+            claimed
+        };
+        let cut = crate::board::cut_button_center(rect);
+        let mut claims = Vec::new();
+        for pressed in [None, None, Some(true), Some(false), None] {
+            claims.push(frame(cut, pressed));
+        }
+        assert_eq!(
+            claims,
+            [false, false, false, true, false],
+            "only the release frame's click on Cut claims the window"
+        );
+        let Content::Board(v) = &content else {
+            unreachable!()
+        };
+        assert!(v.cut_field.is_some(), "the click reached the Cut button");
     }
 
     #[test]

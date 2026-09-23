@@ -1786,6 +1786,21 @@ impl BoardView {
     }
 }
 
+/// Centre of the Done header's Cut button for a board drawn in `rect` at
+/// scale 1 — for tests outside this module that click it through a host.
+#[cfg(test)]
+pub(crate) fn cut_button_center(rect: egui::Rect) -> egui::Pos2 {
+    let col_w = rect.width() / COLUMNS.len() as f32;
+    let header = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - col_w, rect.min.y),
+        egui::vec2(col_w, HEADER_H),
+    );
+    done_header_rects(header, 1.0, true)
+        .2
+        .expect("Cut fits at this width")
+        .center()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2161,10 +2176,7 @@ mod tests {
     /// Centre of the Done header's Cut button at scale 1, read out of the
     /// same layout function the board draws with so the two cannot drift.
     fn cut_button_pos(rect: egui::Rect) -> egui::Pos2 {
-        done_header_rects(done_header(rect), 1.0, true)
-            .2
-            .expect("Cut fits at this width")
-            .center()
+        cut_button_center(rect)
     }
 
     /// Centre of the Done header's version dropdown at scale 1.
