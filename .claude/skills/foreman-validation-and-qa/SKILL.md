@@ -32,10 +32,10 @@ and "the code looks right" are never evidence (CLAUDE.md working agreement:
 ## Acceptance gates (in order)
 
 Run these before calling any change done. What CI does and does not gate is
-**foreman-build-and-env**'s; the short version is that nothing runs on an
-ordinary push, so these gates are enforced by discipline, the repo hooks, and
-the `foreman-reviewer` agent (`.claude/agents/foreman-reviewer.md`). Do not
-claim "CI will catch it".
+**foreman-build-and-env**'s; the short version is that `test.yml` runs
+`cargo test` on a clean runner after a push, but blocks nothing, so these gates are
+enforced by discipline, the repo hooks, and the `foreman-reviewer` agent
+(`.claude/agents/foreman-reviewer.md`). Do not claim "CI will catch it".
 
 1. **`cargo check` clean** modulo the known warning baseline (baseline and
    toolchain traps: **foreman-build-and-env**).

@@ -232,21 +232,28 @@ Select-String -Path "H:\claude code\foreman\Cargo.lock" -Pattern '^name = "(efra
 
 ## What CI gates (and what it does not)
 
-CI is release-gated only — `.github/workflows/release.yml` runs `cargo test` +
-`cargo build --release` on a `v*` tag push (it also installs the GNU toolchain
-to match local builds, and refuses to release if the tag and the `Cargo.toml`
-version disagree). It is the repo's **only** workflow, and its other two
-triggers do not widen that: `pull_request` is `paths`-restricted to
-`.github/workflows/release.yml` and `install.ps1`, plus manual
-`workflow_dispatch`. So **ordinary commits and ordinary PRs are entirely
-ungated** — nothing runs on them — and local `cargo test` remains the real
-correctness gate. But a knowingly-red WIP commit on main WILL fail the next
-release tag. Do not park a broken test on main and assume nothing will notice.
+Two workflows, both on `windows-latest` with the GNU toolchain:
 
-Re-derive the trigger set rather than trusting this paragraph:
+- `.github/workflows/test.yml` runs `cargo test` on every push to `main` and
+  every PR (docs-, `*.md`- and `.foreman/`-only changes skipped). It is a
+  signal, not a lock: nothing blocks a push, and a red run does not stop you
+  tagging. Look at it before you Cut.
+- `.github/workflows/release.yml` runs `cargo test` + `cargo build --release`
+  on a `v*` tag push and publishes, refusing if the tag and the `Cargo.toml`
+  version disagree.
+
+**The runner is a clean machine: no global git identity, no w64devkit, none
+of your config.** A test that shells out to git and commits must put
+`user.name`/`user.email` in the fixture repo's own config — `-c` on the
+test's own calls is not enough when the code under test runs git itself.
+That exact gap failed the v0.5.1 release build. Reproduce the runner
+locally with `GIT_CONFIG_GLOBAL` pointed at an empty file (bash:
+`GIT_CONFIG_GLOBAL=$(mktemp) GIT_CONFIG_NOSYSTEM=1 cargo test --target-dir target/agent`).
+
+Re-derive the trigger sets rather than trusting this paragraph:
 
 ```powershell
-Get-Content .github/workflows/release.yml -TotalCount 12
+Get-Content .github/workflows/test.yml, .github/workflows/release.yml -TotalCount 20
 ```
 
 ## When NOT to use this skill

@@ -1,0 +1,45 @@
+name: test
+
+# Run the suite on every push to main and every PR, so a test that only
+# passes on a dev machine (e.g. one leaning on a global git identity) fails
+# here, before a release tag, not inside release.yml after it.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - ".foreman/**"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - ".foreman/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes a run still in flight.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same toolchain as release.yml and local builds (GNU, not MSVC).
+      - name: Use GNU toolchain
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
+          rustc -vV
+
+      - name: Test
+        run: cargo test
