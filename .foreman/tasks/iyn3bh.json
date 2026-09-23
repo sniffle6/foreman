@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "iyn3bh",
+  "title": "Prototype a slim native Mermaid viewer and measure its cost",
+  "body": "Follow-up to investigation card 3j0qmz. Findings and proposed benchmark: docs/2026-09-22-native-mermaid-investigation.md. Start with mermaid-svg; compare mermaid-rs-renderer with default features disabled if fidelity fails. Reuse existing resvg/egui infrastructure and image-viewer pan/zoom patterns; SVG text/font support needs explicit work. Scope: open .mmd/.mermaid files, fit, zoom, pan, reload, readable errors. Load on demand, perform layout/raster work off the GUI thread, bound caches and output pixels, and do no rendering work while idle. Before adoption, measure incremental release executable size, CPU/GPU memory, cold/warm rendering, and terminal responsiveness; visually verify representative agent-generated diagrams. The investigation has proposed targets, not measured results or approved limits. Avoid a browser runtime, custom diagram engine, Markdown editor, or maintained renderer fork. Do not promise full Mermaid compatibility. Stop if ordinary diagrams require frequent custom fixes or the measured footprint is disproportionate. User priority: useful native viewing without bloating Foreman.",
+  "state": "backlog",
+  "created": "2026-09-23T03:03:38Z",
+  "updated": "2026-09-23T03:03:38Z"
+}

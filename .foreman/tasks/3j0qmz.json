@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "3j0qmz",
+  "title": "Investigate a slim, fast native Mermaid viewer",
+  "body": "Initial source investigation: docs/2026-09-22-native-mermaid-investigation.md. Recommend benchmarking mermaid-svg with the existing resvg/egui stack; compare mermaid-rs-renderer if fidelity fails. Font support needs explicit work. No performance or binary-size measurements yet. User priority: avoid bloat; keep an on-demand file viewer, and gate adoption on measured incremental size and terminal responsiveness.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.1",
+    "at": "2026-09-23T21:42:05Z"
+  },
+  "created": "2026-09-23T01:36:33Z",
+  "updated": "2026-09-23T21:42:05Z"
+}

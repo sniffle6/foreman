@@ -4,6 +4,10 @@
   "title": "Plan view: card-field ordering, read-only window",
   "body": "Implement docs/superpowers/specs/2026-09-22-plan-view-design.md. Read the spec first; it is the contract, and its 'do not reopen' list is binding. Background and why the first build was abandoned: GitHub issue #7 (https://github.com/sniffle6/foreman/issues/7), see the 2026-09-22 outcome comment.\n\nSummary: Card gains one optional field holding a plan name and a wave number, serialized like Shipped (serde default + skip_serializing_if) so v1 card files stay byte-identical. The plan list is derived by scanning cards and folding names with same_name(), the way versions() does. Authoring extends the existing kanban edit verb with --plan/--wave (no new cmd on the wire); add the optional fields to KanbanRequest and a compat test beside the existing ones in src/control.rs. A new read-only Content variant opens per project like the board, persisted as a unit ContentSnap: group by plan then wave, show board state, click opens the card detail, current wave = lowest wave holding a non-Done card, sort within a wave by created.\n\nOut of scope on purpose: Start button, engine, wave advancing, attempts, recovery, plan store, dispatch_card extraction.\n\nRead foreman-change-control before touching KanbanRequest. Visual reference only: git show archive/plan-window-ul4qs9:src/plan_view.rs. Ask the user for /build-screenshot with a seeded fixture; do not claim the window works without pixels. Never stage .foreman/.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.1",
+    "at": "2026-09-23T21:42:05Z"
+  },
   "created": "2026-09-22T11:15:50Z",
-  "updated": "2026-09-23T00:38:47Z"
+  "updated": "2026-09-23T21:42:05Z"
 }

@@ -4,6 +4,10 @@
   "title": "Fix worktree cleanup stuck on empty unregistered directory",
   "body": "Issue: Discard worktree gets stuck after partial cleanup. Observed on Done card jkf9d9 (Cut Done cards into named Versions): .foreman/worktrees/jkf9d9 exists but is empty with no .git; git worktree list no longer registers it; card/jkf9d9 still exists and main...card/jkf9d9 reports 0 ahead / 0 behind; the card retains its worktree field.\nCause: src/kanban.rs teardown_worktree uses directory existence to choose git worktree remove. An existing but unregistered directory repeatedly fails removal, so src/wm.rs drain_worktree_msgs never clears the card reference.\nFix: Make teardown retry-safe across partial cleanup. Check Git registration separately from filesystem existence. Safely remove an empty leftover directory within the expected project worktree path, handle an already-missing tree or branch as completed cleanup, retain normal merged-branch protection, and clear card.worktree only after successful cleanup. Preserve unexpected nonempty directories and surface actionable errors; do not recursively delete unregistered contents merely because Git no longer tracks the worktree.\nValidation: Add regression tests for empty unregistered directory plus merged branch, missing directory and branch, repeated teardown, and preservation of unmerged branches/nonempty unregistered directories. Keep dirty-worktree protection intact. Run relevant tests and build using target/agent inside Foreman. Once fixed, recover jkf9d9 through the normal cleanup path.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.1",
+    "at": "2026-09-23T21:42:05Z"
+  },
   "created": "2026-09-17T21:27:38Z",
-  "updated": "2026-09-17T21:51:32Z"
+  "updated": "2026-09-23T21:42:05Z"
 }

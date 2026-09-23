@@ -4,6 +4,10 @@
   "title": "Add '+' on each project in the sessions panel to spawn a terminal",
   "body": "Sessions panel (src/panel.rs) should have a per-project '+' that adds a terminal into that project the same way the project panel's '+' does. Reuse WindowManager::add_terminal / Command::NewTerm rather than a second spawn path. Goal: spawn into a project from the sessions list without going through the project panel.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.1",
+    "at": "2026-09-23T21:42:05Z"
+  },
   "created": "2026-09-12T03:14:29Z",
-  "updated": "2026-09-16T00:37:50Z"
+  "updated": "2026-09-23T21:42:05Z"
 }
