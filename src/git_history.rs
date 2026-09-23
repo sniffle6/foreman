@@ -318,6 +318,10 @@ pub struct HistoryView {
     error: Option<String>,
     width: usize,
     generation: u64,
+    /// Theme font size / default, applied to every px dimension below.
+    scale: f32,
+    /// Last vertical scroll offset, so a zoom keeps the same rows in view.
+    scroll_y: f32,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
 }
@@ -349,6 +353,8 @@ impl HistoryView {
             error: None,
             width: 1,
             generation: 0,
+            scale: 1.0,
+            scroll_y: 0.0,
             #[cfg(test)]
             drawn: 0..0,
         }
@@ -399,14 +405,23 @@ impl HistoryView {
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         self.poll(ui.ctx());
         let th = crate::theme::live(ui.ctx());
+        // Follow the theme font size (Appearance / Ctrl+Scroll), like the board.
+        let s = crate::terminal::font_size(ui.ctx()) / crate::config::DEFAULT_FONT_SIZE;
+        let rescroll = (s != self.scale).then(|| self.scroll_y * s / self.scale);
+        self.scale = s;
         ui.painter().rect_filled(rect, 0.0, th.bg);
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(base)
-                .max_rect(rect.shrink(8.0))
+                .max_rect(rect.shrink(8.0 * s))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        child.spacing_mut().button_padding *= s;
+        child.spacing_mut().interact_size *= s;
+        for font in child.style_mut().text_styles.values_mut() {
+            font.size *= s;
+        }
         let mut refresh = false;
         child.horizontal(|ui| {
             ui.label(egui::RichText::new("All branches").color(th.text).strong());
@@ -443,117 +458,121 @@ impl HistoryView {
             child.label("No commits yet.");
             return;
         }
-        let graph_w = (self.width as f32 + 1.0) * LANE_W;
-        let total_w = (graph_w + 720.0).max(child.available_width() - 12.0);
-        let author_x = total_w - 230.0;
-        let date_x = total_w - 90.0;
-        let font = egui::FontId::proportional(13.0);
+        let (row_h, lane_w) = (ROW_H * s, LANE_W * s);
+        let graph_w = (self.width as f32 + 1.0) * lane_w;
+        let total_w = (graph_w + 720.0 * s).max(child.available_width() - 12.0 * s);
+        let author_x = total_w - 230.0 * s;
+        let date_x = total_w - 90.0 * s;
+        let font = egui::FontId::proportional(13.0 * s);
         let mut last = 0;
         child.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::both()
+        let mut area = egui::ScrollArea::both()
             .id_salt((base, self.generation))
-            .auto_shrink([false, false])
-            .show_rows(&mut child, ROW_H, self.count, |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.set_min_width(total_w);
-                last = range.end;
-                #[cfg(test)]
-                {
-                    self.drawn = range.clone();
+            .auto_shrink([false, false]);
+        if let Some(y) = rescroll {
+            area = area.vertical_scroll_offset(y);
+        }
+        let out = area.show_rows(&mut child, row_h, self.count, |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.set_min_width(total_w);
+            last = range.end;
+            #[cfg(test)]
+            {
+                self.drawn = range.clone();
+            }
+            for i in range {
+                let row = &self.pages[i / BATCH][i % BATCH];
+                let (r, response) =
+                    ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::hover());
+                let painter = ui.painter_at(r.intersect(ui.clip_rect()));
+                if i % 2 == 0 {
+                    painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
                 }
-                for i in range {
-                    let row = &self.pages[i / BATCH][i % BATCH];
-                    let (r, response) =
-                        ui.allocate_exact_size(egui::vec2(total_w, ROW_H), egui::Sense::hover());
-                    let painter = ui.painter_at(r.intersect(ui.clip_rect()));
-                    if i % 2 == 0 {
-                        painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
-                    }
-                    if response.hovered() {
-                        painter.rect_filled(r, 0.0, th.sel_bg);
-                    }
-                    let x = |lane: usize| r.left() + (lane as f32 + 1.0) * LANE_W;
-                    for (lane, color) in &row.incoming {
-                        painter.line_segment(
-                            [
-                                egui::pos2(x(*lane), r.top()),
-                                egui::pos2(x(*lane), r.center().y),
-                            ],
-                            egui::Stroke::new(1.7, COLORS[*color % COLORS.len()]),
-                        );
-                    }
-                    for edge in &row.outgoing {
-                        painter.line_segment(
-                            [
-                                egui::pos2(x(edge.from), r.center().y),
-                                egui::pos2(x(edge.to), r.bottom()),
-                            ],
-                            egui::Stroke::new(1.7, COLORS[edge.color % COLORS.len()]),
-                        );
-                    }
-                    painter.circle_filled(
-                        egui::pos2(x(row.lane), r.center().y),
-                        4.0,
-                        COLORS[row.color % COLORS.len()],
+                if response.hovered() {
+                    painter.rect_filled(r, 0.0, th.sel_bg);
+                }
+                let x = |lane: usize| r.left() + (lane as f32 + 1.0) * lane_w;
+                for (lane, color) in &row.incoming {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x(*lane), r.top()),
+                            egui::pos2(x(*lane), r.center().y),
+                        ],
+                        egui::Stroke::new(1.7 * s, COLORS[*color % COLORS.len()]),
                     );
-                    let text_rect = egui::Rect::from_min_max(
-                        egui::pos2(r.left() + graph_w, r.top()),
-                        egui::pos2(r.left() + author_x - 12.0, r.bottom()),
+                }
+                for edge in &row.outgoing {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x(edge.from), r.center().y),
+                            egui::pos2(x(edge.to), r.bottom()),
+                        ],
+                        egui::Stroke::new(1.7 * s, COLORS[edge.color % COLORS.len()]),
                     );
-                    let p = painter.with_clip_rect(text_rect.intersect(ui.clip_rect()));
-                    let mut left = text_rect.left();
-                    if !row.commit.refs.is_empty() {
-                        let galley =
-                            p.layout_no_wrap(row.commit.refs.clone(), font.clone(), COLORS[0]);
-                        let w = galley.size().x.min((text_rect.width() * 0.5).max(0.0));
-                        let chip = egui::Rect::from_min_size(
-                            egui::pos2(left, r.top() + 4.0),
-                            egui::vec2(w + 10.0, 20.0),
-                        );
-                        p.rect_filled(chip, 3.0, th.sel_bg);
-                        p.with_clip_rect(chip.intersect(text_rect).intersect(ui.clip_rect()))
-                            .galley(chip.min + egui::vec2(5.0, 2.0), galley, COLORS[0]);
-                        left += w + 18.0;
-                    }
-                    p.text(
-                        egui::pos2(left, r.center().y),
+                }
+                painter.circle_filled(
+                    egui::pos2(x(row.lane), r.center().y),
+                    4.0 * s,
+                    COLORS[row.color % COLORS.len()],
+                );
+                let text_rect = egui::Rect::from_min_max(
+                    egui::pos2(r.left() + graph_w, r.top()),
+                    egui::pos2(r.left() + author_x - 12.0 * s, r.bottom()),
+                );
+                let p = painter.with_clip_rect(text_rect.intersect(ui.clip_rect()));
+                let mut left = text_rect.left();
+                if !row.commit.refs.is_empty() {
+                    let galley = p.layout_no_wrap(row.commit.refs.clone(), font.clone(), COLORS[0]);
+                    let w = galley.size().x.min((text_rect.width() * 0.5).max(0.0));
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(left, r.top() + 4.0 * s),
+                        egui::vec2(w + 10.0 * s, 20.0 * s),
+                    );
+                    p.rect_filled(chip, 3.0 * s, th.sel_bg);
+                    p.with_clip_rect(chip.intersect(text_rect).intersect(ui.clip_rect()))
+                        .galley(chip.min + egui::vec2(5.0, 2.0) * s, galley, COLORS[0]);
+                    left += w + 18.0 * s;
+                }
+                p.text(
+                    egui::pos2(left, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &row.commit.subject,
+                    font.clone(),
+                    th.text,
+                );
+                let author_rect = egui::Rect::from_min_max(
+                    egui::pos2(r.left() + author_x, r.top()),
+                    egui::pos2(r.left() + date_x - 10.0 * s, r.bottom()),
+                );
+                painter
+                    .with_clip_rect(author_rect.intersect(ui.clip_rect()))
+                    .text(
+                        author_rect.left_center(),
                         egui::Align2::LEFT_CENTER,
-                        &row.commit.subject,
-                        font.clone(),
-                        th.text,
-                    );
-                    let author_rect = egui::Rect::from_min_max(
-                        egui::pos2(r.left() + author_x, r.top()),
-                        egui::pos2(r.left() + date_x - 10.0, r.bottom()),
-                    );
-                    painter
-                        .with_clip_rect(author_rect.intersect(ui.clip_rect()))
-                        .text(
-                            author_rect.left_center(),
-                            egui::Align2::LEFT_CENTER,
-                            &row.commit.author,
-                            font.clone(),
-                            th.dim,
-                        );
-                    painter.text(
-                        egui::pos2(r.left() + date_x, r.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &row.commit.date,
+                        &row.commit.author,
                         font.clone(),
                         th.dim,
                     );
-                    response.on_hover_ui(|ui| {
-                        ui.label(format!(
-                            "{}\n{}\n{}\n{} · {}",
-                            row.commit.hash,
-                            row.commit.subject,
-                            row.commit.refs,
-                            row.commit.author,
-                            row.commit.date
-                        ));
-                    });
-                }
-            });
+                painter.text(
+                    egui::pos2(r.left() + date_x, r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &row.commit.date,
+                    font.clone(),
+                    th.dim,
+                );
+                response.on_hover_ui(|ui| {
+                    ui.label(format!(
+                        "{}\n{}\n{}\n{} · {}",
+                        row.commit.hash,
+                        row.commit.subject,
+                        row.commit.refs,
+                        row.commit.author,
+                        row.commit.date
+                    ));
+                });
+            }
+        });
+        self.scroll_y = out.state.offset.y;
         if last + 64 >= self.count {
             self.request();
         }
@@ -769,6 +788,38 @@ mod tests {
             start.elapsed(),
             view.drawn
         );
+    }
+
+    #[test]
+    fn rows_follow_theme_font_size() {
+        let mut view = HistoryView::new(None);
+        view.end = true;
+        let mut graph = Graph::default();
+        view.pages.push(
+            (0..BATCH)
+                .map(|i| graph.push(commit(&i.to_string(), &[&(i + 1).to_string()])))
+                .collect(),
+        );
+        view.count = BATCH;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 600.0));
+        let mut rows_at = |px: f32| {
+            crate::terminal::set_font_size(&ctx, px);
+            for _ in 0..2 {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        ..Default::default()
+                    },
+                    |ui| view.show(ui, rect, egui::Id::new("zoom")),
+                );
+            }
+            view.drawn.len()
+        };
+        let base = rows_at(crate::config::DEFAULT_FONT_SIZE);
+        let zoomed = rows_at(crate::config::DEFAULT_FONT_SIZE * 2.0);
+        assert_eq!(view.scale, 2.0);
+        assert!(zoomed * 2 <= base + 2, "base {base}, zoomed {zoomed}");
     }
 
     #[test]
