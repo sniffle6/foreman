@@ -17,6 +17,10 @@ repository state. An empty repository and a failed Git read have distinct states
 Git must be available on PATH. Linked worktrees and detached HEAD work through
 Git's own repository discovery.
 
+Text and row geometry follow the theme font size (Appearance → Font size, or
+Ctrl+Scroll zoom), scaled from the 13px default the same way the board does.
+Zooming keeps the same rows in view by rescaling the scroll offset.
+
 Branch selection and checkout/switching belong to the next task. Diffs, search,
 context menus, and other Git operations are outside this viewer's scope.
 
