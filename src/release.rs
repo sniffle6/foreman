@@ -346,14 +346,24 @@ fn checks(cwd: &Path, name: &str) -> Result<Plan, String> {
     if !git(&root, &["ls-remote", "--tags", "origin", &tag_ref])?.is_empty() {
         return Err(format!("tag {name} already exists on origin"));
     }
-    let cargo = std::fs::read_to_string(root.join("Cargo.toml")).ok();
+    let mut cargo = std::fs::read_to_string(root.join("Cargo.toml")).ok();
+    let latest_tag = crate::kanban::latest_v_tag(&root).and_then(|t| parse_tag(&t));
     let current = match &cargo {
-        Some(toml) => Some(
-            cargo_version(toml)
+        Some(toml) => {
+            let v = cargo_version(toml)
                 .and_then(|v| parse_version(&v))
-                .ok_or("cannot read the [package] version in Cargo.toml")?,
-        ),
-        None => crate::kanban::latest_v_tag(&root).and_then(|t| parse_tag(&t)),
+                .ok_or("cannot read the [package] version in Cargo.toml")?;
+            if v == new {
+                // Bumped by hand already (the old procedure's first step);
+                // the tag is free (checked above), so skip our bump. It must
+                // still beat the last release.
+                cargo = None;
+                latest_tag
+            } else {
+                Some(v)
+            }
+        }
+        None => latest_tag,
     };
     if let Some(cur) = current
         && new <= cur
@@ -446,17 +456,30 @@ pub fn next_patch((a, b, c): (u64, u64, u64)) -> String {
     format!("v{a}.{b}.{}", c + 1)
 }
 
-/// The Cut field's prefill: the patch after `Cargo.toml`'s version in
-/// `cwd`'s repository, else after the newest `v*` tag, else nothing.
+/// The Cut field's prefill: `Cargo.toml`'s version in `cwd`'s repository
+/// when it has no tag yet (bumped by hand, not released), else the patch
+/// after it; without `Cargo.toml`, the patch after the newest `v*` tag;
+/// else nothing.
 pub fn prefill(cwd: &Path) -> Option<String> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
         .unwrap_or_else(|_| cwd.to_path_buf());
-    let current = match std::fs::read_to_string(root.join("Cargo.toml")) {
-        Ok(toml) => parse_version(&cargo_version(&toml)?),
-        Err(_) => parse_tag(&crate::kanban::latest_v_tag(&root)?),
+    let Ok(toml) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return parse_tag(&crate::kanban::latest_v_tag(&root)?).map(next_patch);
     };
-    current.map(next_patch)
+    let v = parse_version(&cargo_version(&toml)?)?;
+    let tag = format!("v{}.{}.{}", v.0, v.1, v.2);
+    let tagged = git(
+        &root,
+        &["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")],
+    )
+    .is_ok();
+    let latest = crate::kanban::latest_v_tag(&root).and_then(|t| parse_tag(&t));
+    if !tagged && latest.is_none_or(|t| t < v) {
+        return Some(tag);
+    }
+    // Past whichever is newer, so the default always clears the checks.
+    Some(next_patch(latest.map_or(v, |t| t.max(v))))
 }
 
 /// Section header of a TOML line (`[package]`, `[[package]]`), if it is one.
@@ -779,6 +802,11 @@ mod tests {
         sh(&work, &["commit", "-q", "-m", "init"]);
         sh(&work, &["push", "-q", "-u", "origin", "main"]);
         sh(&work, &["remote", "set-head", "origin", "main"]);
+        if cargo {
+            // 0.5.0 is released: its tag exists, as in a real repo.
+            sh(&work, &["tag", "v0.5.0"]);
+            sh(&work, &["push", "-q", "origin", "v0.5.0"]);
+        }
         Some(Fixture {
             _tmp: tmp,
             bare,
@@ -968,6 +996,52 @@ mod tests {
         // With a tag in place, the next name must beat it.
         let (step, _, _) = failure(&release(&f.work, "v0.9.0")).unwrap();
         assert_eq!(step, Step::Checks);
+    }
+
+    /// Bump `Cargo.toml`/`Cargo.lock` to `version` by hand and commit it,
+    /// the first step of the old manual procedure.
+    fn bump_by_hand(f: &Fixture, version: &str) {
+        let toml = std::fs::read_to_string(f.work.join("Cargo.toml")).unwrap();
+        let (toml, pkg) = bump_cargo_toml(&toml, version).unwrap();
+        std::fs::write(f.work.join("Cargo.toml"), toml).unwrap();
+        let lock = std::fs::read_to_string(f.work.join("Cargo.lock")).unwrap();
+        let lock = bump_cargo_lock(&lock, &pkg, version).unwrap();
+        std::fs::write(f.work.join("Cargo.lock"), lock).unwrap();
+        sh(&f.work, &["add", "Cargo.toml", "Cargo.lock"]);
+        sh(&f.work, &["commit", "-q", "-m", "manual bump"]);
+    }
+
+    // Regression: bumping Cargo.toml by hand first (the old procedure's
+    // step 1) made Cut refuse `v0.5.1` as "not newer than 0.5.1".
+    #[test]
+    fn a_hand_bumped_cargo_toml_releases_without_a_second_bump() {
+        let Some(f) = fixture(true) else { return };
+        bump_by_hand(&f, "0.5.1");
+        assert_eq!(prefill(&f.work).as_deref(), Some("v0.5.1"), "untagged");
+        stamp(&f);
+        let ev = release(&f.work, "v0.5.1");
+        assert_eq!(failure(&ev), None, "{ev:?}");
+        assert!(ev.contains(&ReleaseEvent::Step(Step::Bump, StepState::Skipped)));
+        assert_eq!(
+            subjects(&f.work)[..3],
+            ["chore(kanban): cut v0.5.1", "manual bump", "init"]
+        );
+        let head = sh(&f.work, &["rev-parse", "HEAD"]);
+        assert_eq!(sh(&f.bare, &["rev-parse", "v0.5.1^{commit}"]), head);
+        assert_eq!(prefill(&f.work).as_deref(), Some("v0.5.2"), "now tagged");
+    }
+
+    #[test]
+    fn a_cargo_version_behind_the_latest_tag_is_still_refused() {
+        let Some(f) = fixture(true) else { return };
+        // Cargo.toml says 0.4.0 (untagged) but v0.5.0 is already out.
+        bump_by_hand(&f, "0.4.0");
+        assert_eq!(prefill(&f.work).as_deref(), Some("v0.5.1"), "past the tag");
+        stamp(&f);
+        let (step, err, committed) = failure(&release(&f.work, "v0.4.0")).unwrap();
+        assert_eq!(step, Step::Checks);
+        assert!(err.contains("not newer"), "{err}");
+        assert!(!committed);
     }
 
     #[test]

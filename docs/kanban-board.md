@@ -102,8 +102,11 @@ sibling — read those for *why*, this doc for *how*.
   on origin's default branch, nothing dirty outside `.foreman/tasks/`, not
   behind origin after a fetch, the tag free locally and on origin, and the
   name strictly `vX.Y.Z` and newer than `Cargo.toml`'s version (else the
-  newest `v*` tag). No `Cargo.toml` at the repo root means no bump step: the
-  release is tag-only. The Cut field prefills the next patch version. While
+  newest `v*` tag). A `Cargo.toml` already bumped by hand to the requested
+  version (untagged, newer than the newest `v*` tag) skips the bump instead
+  of refusing. No `Cargo.toml` at the repo root means no bump step: the
+  release is tag-only. The Cut field prefills `Cargo.toml`'s version when it
+  is not yet tagged, else the next patch past it and the newest tag. While
   it runs, the Done column shows one line per step in the Cut field's row
   and Cut is disabled; success shows the GitHub Actions link, failure shows
   git's error. A failure before any commit returns the cards to Current (an
@@ -333,7 +336,7 @@ its base (`docs/integration-queue.md`).
   push tag; sync so tests drive it) and `spawn` (the thread), the
   `ReleaseEvent` stream and the board's folded `Progress`, plus the pure
   helpers: `parse_tag` / `parse_version`, `bump_cargo_toml` /
-  `bump_cargo_lock`, `prefill` (next patch), `actions_url`.
+  `bump_cargo_lock`, `prefill` (untagged Cargo version, else next patch), `actions_url`.
 - `src/plan_view.rs` — `PlanView` (the plan window's content) and `PlanAct`
   (its one intent, `OpenCard`).
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
