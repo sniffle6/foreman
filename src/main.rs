@@ -37,6 +37,7 @@ mod proc;
 mod psreadline;
 mod ready;
 mod recents;
+mod release;
 mod search;
 mod settings;
 mod settings_menu;
