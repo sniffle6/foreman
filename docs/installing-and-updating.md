@@ -52,6 +52,14 @@ version exists. Spec with the full decision history:
 
 ## How to cut a release
 
+The board's **Cut** button (or `foreman kanban cut vX.Y.Z --release`) runs
+steps 1–2 for you after recording the Done cards: it checks the tree and
+origin first, commits the card files, makes the `chore(release)` bump
+commit, pushes main, then tags and pushes the tag. Its step list on the
+board says where it stopped and what to run by hand if it fails
+(`docs/kanban-board.md`, "Cut is the release"). The manual steps below
+remain the fallback.
+
 1. Bump `version` in `Cargo.toml` (strict `X.Y.Z`) in its own `chore(release)`
    commit, then push main.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.

@@ -92,6 +92,25 @@ sibling — read those for *why*, this doc for *how*.
   Duplicate names (case-insensitive) and `Current` are refused. The
   selection is view state and resets to Current on restart. Why this shape
   and what was rejected: `docs/superpowers/specs/2026-09-16-kanban-cut-design.md`.
+- **Cut is the release.** The board's Cut (and `foreman kanban cut vX.Y.Z
+  --release`) stamps the cards as above, then runs the documented release
+  procedure on a background thread (`src/release.rs`): checks, commit the
+  card files as `chore(kanban): cut vX.Y.Z`, bump `Cargo.toml` (and the
+  package's `Cargo.lock` entry) as `chore(release): bump version to X.Y.Z`,
+  push the branch, `git tag vX.Y.Z`, push the tag — which fires
+  `.github/workflows/release.yml`. The checks all run before any write:
+  on origin's default branch, nothing dirty outside `.foreman/tasks/`, not
+  behind origin after a fetch, the tag free locally and on origin, and the
+  name strictly `vX.Y.Z` and newer than `Cargo.toml`'s version (else the
+  newest `v*` tag). No `Cargo.toml` at the repo root means no bump step: the
+  release is tag-only. The Cut field prefills the next patch version. While
+  it runs, the Done column shows one line per step in the Cut field's row
+  and Cut is disabled; success shows the GitHub Actions link, failure shows
+  git's error. A failure before any commit returns the cards to Current (an
+  automatic `uncut`); after a commit everything stays, and the list shows
+  the one command that finishes by hand (e.g. `git push origin v0.5.1`).
+  Nothing is ever undone in git. ✕ dismisses a finished list. Plain
+  `foreman kanban cut <name>` stays record-only.
 - **Commits attach at Cut through the card trailer.** Every dispatch prompt
   tells the worker to end each commit message with `Card: <id>`. Cut walks
   `git log` once (bounded by the oldest card's creation date) and stores
@@ -163,7 +182,8 @@ foreman kanban start <id>                 # claim a card yourself
 foreman kanban done <id>                  # close out: In Progress -> Done
 foreman kanban block <id> --reason "..."  # close out: needs a human
 foreman kanban rm <id>                    # delete the card file, any state
-foreman kanban cut <name>                 # ship ritual: Done -> Version <name>
+foreman kanban cut <name>                 # record only: Done -> Version <name>
+foreman kanban cut vX.Y.Z --release       # the board's Cut: record + release (replies at once)
 foreman kanban uncut <name>               # Version <name> -> Current Done
 foreman kanban wait <id> | --any [--timeout SECS]
 foreman kanban worktrees [--stray] [--json]   # every foreman worktree, probed live
@@ -262,8 +282,13 @@ its base (`docs/integration-queue.md`).
 - **Cut on the branch you ship from.** A Cut rewrites every ungrouped Done
   card file at once; two branches each cutting overlapping cards conflict
   per file on merge, like any two transitions on one card would.
-- **A Cut with no git, or before any trailer commit, still ships.** It just
-  records no commits. The trailer is a convention the prompt teaches, not a
+- **A release refuses a dirty tree, but not your card files.** The stamp
+  itself rewrites `.foreman/tasks/`, so changes there are expected and go
+  into the cut commit; anything else uncommitted refuses the release (and
+  the cards return to Current). Pushes never prompt for credentials — a
+  push that needs a prompt fails with git's message instead of hanging.
+- **A record-only Cut with no git, or before any trailer commit, still
+  ships.** It just records no commits. The trailer is a convention the prompt teaches, not a
   gate `done` enforces.
 - **Two spellings of a plan name are two plans, silently.** `same_name`
   folds case and outer whitespace and nothing else, so `Terminal work` and
@@ -304,12 +329,18 @@ its base (`docs/integration-queue.md`).
   `parse_trailer_log` + `trailer_commits`, `latest_v_tag`; the plan half:
   `Planned` (the card field), `plans` / `Plan` / `Wave` / `PlanCard` (the
   derivation and `Plan::current`).
+- `src/release.rs` — Cut's release: `run` (checks, commit, bump, push, tag,
+  push tag; sync so tests drive it) and `spawn` (the thread), the
+  `ReleaseEvent` stream and the board's folded `Progress`, plus the pure
+  helpers: `parse_tag` / `parse_version`, `bump_cargo_toml` /
+  `bump_cargo_lock`, `prefill` (next patch), `actions_url`.
 - `src/plan_view.rs` — `PlanView` (the plan window's content) and `PlanAct`
   (its one intent, `OpenCard`).
 - `src/board.rs` — `BoardView` (the window content) and `BoardAct` (the
   intents it records for the manager to drain), including the card-face
   worktree line and the detail page's Discard action, the Done header's
-  version dropdown and Cut field, the archive banner, the worktree strip
+  version dropdown and Cut field, the release step list (`show_release`),
+  the archive banner, the worktree strip
   (`show_strip`) and the Worktrees page (`show_worktrees`,
   `show_worktree_row`, the `RemoveStray` / `DiscardStray` acts).
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
@@ -320,7 +351,9 @@ its base (`docs/integration-queue.md`).
   `kanban_rm` (the `rm` pre-check), `open_board_window` /
   `open_plan_window` (per-project singletons), `drain_plan_acts` (opens or
   focuses the board and points it at the clicked card), `term_states`, `kanban_cut` (the hold-back probe
-  and trailer walk injected into the store).
+  and trailer walk injected into the store), `cut_and_release` (stamp, then
+  spawn the release; one at a time) and `drain_release` (events → progress
+  → board views, uncut on an uncommitted failure, the outcome toast).
 - `src/config.rs` — `Settings::dispatch_worktrees`.
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
   `parse_kanban_edit`, `kanban_main`, `kanban_wait` (client-side poll loop),

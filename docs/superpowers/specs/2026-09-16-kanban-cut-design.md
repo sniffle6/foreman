@@ -117,6 +117,15 @@ targeting a card at a Version before it is Done; showing commits on a card
 before it is shipped; enforcing the trailer (a commit without it is simply
 not attached).
 
+> **Superseded 2026-09-23 (tagging):** this spec kept Cut record-only and
+> left the tag to a separate manual step. The board's Cut now performs the
+> release — commit the cards, bump `Cargo.toml`, push, tag, push the tag
+> (`src/release.rs`, `docs/kanban-board.md` "Cut is the release"). Reason:
+> the user's intent for Cut is "ship it", and a record-only Cut paired with
+> a manual tag was two rituals for one act. Tags are still created, never
+> watched; the auto-detect rejection above stands. The CLI keeps a
+> record-only `cut`; `cut --release` is the board's behavior.
+
 ## Card schema
 
 `Card` gains one optional field. Absent in the file and in `list --json`
