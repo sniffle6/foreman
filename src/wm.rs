@@ -145,6 +145,8 @@ pub enum Content {
     /// membership - but derives plans from card fields instead of drawing
     /// the columns.
     Plan(crate::plan_view::PlanView),
+    /// Read-only, asynchronously loaded project Git timeline.
+    GitHistory(crate::git_history::HistoryView),
     /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
     /// Floating/closable/tabbable/tileable like any normal window; restored
     /// across restarts by path only (see `ContentSnap::Image`).
@@ -220,6 +222,9 @@ impl Content {
             Content::Plan(view) => claims_click(ui, |ui| {
                 view.show(ui, rect, active, resp, base.with((win_id, "plan")))
             }),
+            Content::GitHistory(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, base.with((win_id, "git-history")))
+            }),
             Content::Image(view) => {
                 view.show(ui, rect, active, resp);
                 false
@@ -268,7 +273,8 @@ impl Content {
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
             Content::Board(_) => {} // no PTY; the store is shared state, nothing to pump
-            Content::Plan(_) => {} // ditto: a derived read of the same store
+            Content::GitHistory(_) => {}
+            Content::Plan(_) => {}  // ditto: a derived read of the same store
             Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
         }
@@ -282,7 +288,7 @@ impl Content {
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
             Content::Board(_) => None,
-            Content::Plan(_) => None,
+            Content::Plan(_) | Content::GitHistory(_) => None,
             Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
@@ -814,6 +820,7 @@ impl WindowManager {
                     Content::Chat(_) => ContentSnap::Chat,
                     Content::Board(_) => ContentSnap::Board,
                     Content::Plan(_) => ContentSnap::Plan,
+                    Content::GitHistory(_) => ContentSnap::GitHistory,
                     Content::Image(view) => ContentSnap::Image {
                         path: view.path.clone(),
                     },
@@ -1003,6 +1010,9 @@ impl WindowManager {
                     }
                     ContentSnap::Board => {
                         Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban)))
+                    }
+                    ContentSnap::GitHistory => {
+                        Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone()))
                     }
                     ContentSnap::Plan => {
                         Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban)))
@@ -2307,6 +2317,34 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// Open or surface the project's singleton read-only history viewer.
+    fn open_git_history_window(&mut self) {
+        if let Some((win, tab)) = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::GitHistory(_)))
+                .map(|i| (w.id, i))
+        }) {
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                ptab: None,
+                window: None,
+                tab: Some(tab),
+            });
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(940.0, 520.0));
+        self.push_win(
+            id,
+            Tab::fixed(
+                "Git History",
+                Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone())),
+            ),
+            rect,
+        );
+        self.mark_workspace_dirty();
+    }
+
     /// Apply plan-view intents recorded during the draw - same deferred
     /// discipline as `drain_board_acts`, and it runs in THIS manager because
     /// the plan view and the board window are siblings inside one project.
@@ -3332,9 +3370,10 @@ impl WindowManager {
                             Content::Terminal(s) => RowKind::Terminal(s.icon_kind()),
                             // A board row surfaces like any auxiliary tab; a
                             // dedicated row kind is out of scope for v1.
-                            Content::Chat(_) | Content::Board(_) | Content::Plan(_) => {
-                                RowKind::Chat
-                            }
+                            Content::Chat(_)
+                            | Content::Board(_)
+                            | Content::GitHistory(_)
+                            | Content::Plan(_) => RowKind::Chat,
                             // Nested project content is not a product path today; tests
                             // use empty Project stubs as PTY-free tab stand-ins.
                             Content::Project(_) => {
@@ -3935,6 +3974,7 @@ impl WindowManager {
                     }),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::GitHistory(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -4545,6 +4585,7 @@ impl WindowManager {
                         Command::OpenChat => child.open_chat_window(),
                         Command::OpenBoard => child.open_board_window(),
                         Command::OpenPlan => child.open_plan_window(),
+                        Command::OpenGitHistory => child.open_git_history_window(),
                         // project-level handled above
                         _ => {}
                     }
@@ -5550,6 +5591,7 @@ impl WindowManager {
                     Content::Project(wm) => wm.refresh_exit_titles(),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::GitHistory(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -5581,6 +5623,7 @@ impl WindowManager {
                     Content::Project(wm) => wm.refresh_auto_titles(),
                     Content::Chat(_)
                     | Content::Board(_)
+                    | Content::GitHistory(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -7886,6 +7929,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
         Content::Project(wm) => wm.terminal_groups(),
         Content::Chat(_)
         | Content::Board(_)
+        | Content::GitHistory(_)
         | Content::Plan(_)
         | Content::Image(_)
         | Content::TaskManager(_)
@@ -10848,6 +10892,50 @@ mod tests {
         wm.open_board_window();
         assert_eq!(board_wins(&wm), 1);
         assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn git_history_resurfaces_and_restores_in_its_own_project() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.windows[0].id;
+        let child = m.project_child_mut(pid).unwrap();
+        child.open_git_history_window();
+        let id = child.windows.last().unwrap().id;
+        assert!(!child.tree.contains(id));
+        child.windows.last_mut().unwrap().minimized = true;
+        child.focused = None;
+        child.open_git_history_window();
+        assert_eq!(child.focused, Some(id));
+        assert!(!child.windows.last().unwrap().minimized);
+        assert_eq!(
+            child
+                .windows
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .filter(|t| matches!(t.content, Content::GitHistory(_)))
+                .count(),
+            1
+        );
+        let snap = m.capture_workspace();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("GitHistory"));
+        let mut back = WindowManager::new().as_desktop();
+        back.apply_workspace(&serde_json::from_str(&json).unwrap(), &ctx);
+        let Content::Project(child) =
+            &back.windows.iter().find(|w| w.is_project()).unwrap().tabs[0].content
+        else {
+            panic!()
+        };
+        assert_eq!(child.cwd.as_deref(), Some(tmp.path()));
+        assert!(
+            child
+                .windows
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .any(|t| matches!(t.content, Content::GitHistory(_)))
+        );
     }
 
     #[test]

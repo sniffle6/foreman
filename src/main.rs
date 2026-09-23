@@ -18,6 +18,7 @@ mod dirpicker;
 mod emoji_raster;
 mod frame;
 mod geom;
+mod git_history;
 mod graphics;
 mod icat;
 mod icons;

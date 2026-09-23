@@ -39,6 +39,8 @@ pub enum Command {
     OpenBoard,
     /// Open (or focus) the focused project's plan view window.
     OpenPlan,
+    /// Open (or focus) the focused project's read-only Git history.
+    OpenGitHistory,
     /// Toggle the focused terminal between tiled (in the layout tree) and floating.
     TermFloat,
     // project (outer) level
@@ -103,6 +105,7 @@ impl Command {
             OpenChat,
             OpenBoard,
             OpenPlan,
+            OpenGitHistory,
             TermFloat,
             // Actions
             Help,
@@ -118,9 +121,8 @@ impl Command {
             ProjFocus(_) | ProjSnap(_) | ZoomProject | CloseProject | NewProject | LastProject
             | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
-            | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | OpenPlan | TermFloat => {
-                Group::Terminals
-            }
+            | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | OpenPlan | OpenGitHistory
+            | TermFloat => Group::Terminals,
             Help | OpenSettings | ToggleTaskManager => Group::Actions,
         }
     }
@@ -175,6 +177,7 @@ impl Command {
             OpenChat => "Open project chat",
             OpenBoard => "Open project board",
             OpenPlan => "Open project plan view",
+            OpenGitHistory => "Open project Git history",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
             ToggleTaskManager => "Toggle task panel",
@@ -506,6 +509,7 @@ impl Default for Keymap {
         // `L` because every letter with a better claim is taken: `P` is
         // NewProject, `K` is the board. It at least sits beside `K`.
         t.insert(plain(K::L), OpenPlan);
+        t.insert(plain(K::H), OpenGitHistory);
 
         // --- float toggle: tiled ⇄ floating ---
         t.insert(plain(K::F), TermFloat);
@@ -747,10 +751,13 @@ mod tests {
         );
         // vi keys are no longer bound by default (dropped in the §2 rebind);
         // plain K was later reclaimed by OpenBoard (kanban-board spec) and
-        // plain L by OpenPlan (plan-view spec) — the merge contract gives old
+        // plain L by OpenPlan and H by OpenGitHistory — the merge contract gives old
         // keybindings.json files these defaults too, and an explicit user
         // binding still wins over both.
-        assert_eq!(km.resolve(Chord::new(K::H, false, false, false)), None);
+        assert_eq!(
+            km.resolve(Chord::new(K::H, false, false, false)),
+            Some(Command::OpenGitHistory)
+        );
         assert_eq!(km.resolve(Chord::new(K::J, false, false, false)), None);
         assert_eq!(
             km.resolve(Chord::new(K::K, false, false, false)),

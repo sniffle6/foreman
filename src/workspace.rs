@@ -120,6 +120,8 @@ pub enum ContentSnap {
     /// `.foreman/tasks`, so there is nothing to snapshot but the fact that
     /// the window was open. Old workspace files simply lack this variant.
     Plan,
+    /// Restore against the owning project directory, without cached Git data.
+    GitHistory,
     Project {
         child: ManagerSnap,
     },
