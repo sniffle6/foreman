@@ -49,6 +49,7 @@ mod terminal_titles;
 mod theme;
 mod title_notify;
 mod update;
+mod view_scale;
 mod wm;
 mod workspace;
 

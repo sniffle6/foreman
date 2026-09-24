@@ -326,6 +326,8 @@ pub struct HistoryView {
     scroll_y: f32,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
+    #[cfg(test)]
+    header_button_h: f32,
 }
 impl Drop for HistoryView {
     fn drop(&mut self) {
@@ -360,6 +362,8 @@ impl HistoryView {
             scroll_y: 0.0,
             #[cfg(test)]
             drawn: 0..0,
+            #[cfg(test)]
+            header_button_h: 0.0,
         }
     }
     fn request(&mut self) {
@@ -408,23 +412,19 @@ impl HistoryView {
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         self.poll(ui.ctx());
         let th = crate::theme::live(ui.ctx());
-        // Follow the theme font size (Appearance / Ctrl+Scroll), like the board.
-        let s = crate::terminal::font_size(ui.ctx()) / crate::config::DEFAULT_FONT_SIZE;
+        let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
+        let s = zoom.factor();
         let rescroll = (s != self.scale).then(|| self.scroll_y * s / self.scale);
         self.scale = s;
         ui.painter().rect_filled(rect, 0.0, th.bg);
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(base)
-                .max_rect(rect.shrink(8.0 * s))
+                .max_rect(rect.shrink(zoom.px(8.0)))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
-        child.spacing_mut().button_padding *= s;
-        child.spacing_mut().interact_size *= s;
-        for font in child.style_mut().text_styles.values_mut() {
-            font.size *= s;
-        }
+        zoom.apply(&mut child);
         let mut refresh = false;
         child.horizontal(|ui| {
             ui.label(egui::RichText::new("All branches").color(th.text).strong());
@@ -439,7 +439,12 @@ impl HistoryView {
             if self.pending {
                 ui.spinner();
             }
-            refresh = ui.button("Refresh").clicked();
+            let button = ui.button("Refresh");
+            #[cfg(test)]
+            {
+                self.header_button_h = button.rect.height();
+            }
+            refresh = button.clicked();
         });
         if refresh {
             let cwd = self.cwd.clone();
@@ -481,7 +486,7 @@ impl HistoryView {
         );
         child.set_clip_rect(timeline.intersect(ui.clip_rect()));
         let mut selected = None;
-        let (row_h, lane_w) = (ROW_H * s, LANE_W * s);
+        let (row_h, lane_w) = (zoom.px(ROW_H), zoom.px(LANE_W));
         let graph_w = (self.width as f32 + 1.0) * lane_w;
         let total_w = (graph_w + 720.0 * s).max(child.available_width() - 12.0 * s);
         let author_x = total_w - 230.0 * s;
@@ -895,12 +900,16 @@ mod tests {
                     |ui| view.show(ui, rect, egui::Id::new("zoom")),
                 );
             }
-            view.drawn.len()
+            (view.drawn.len(), view.header_button_h)
         };
         let base = rows_at(crate::config::DEFAULT_FONT_SIZE);
         let zoomed = rows_at(crate::config::DEFAULT_FONT_SIZE * 2.0);
         assert_eq!(view.scale, 2.0);
-        assert!(zoomed * 2 <= base + 2, "base {base}, zoomed {zoomed}");
+        assert!(
+            zoomed.0 * 2 <= base.0 + 2,
+            "base {base:?}, zoomed {zoomed:?}"
+        );
+        assert!(zoomed.1 >= base.1 * 1.9, "base {base:?}, zoomed {zoomed:?}");
     }
 
     #[test]

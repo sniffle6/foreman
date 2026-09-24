@@ -345,7 +345,8 @@ impl DetailsView {
     }
     pub(super) fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         let th = crate::theme::live(ui.ctx());
-        let scale = crate::terminal::font_size(ui.ctx()) / crate::config::DEFAULT_FONT_SIZE;
+        let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
+        let scale = zoom.factor();
         let mut ui = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(base)
@@ -353,11 +354,7 @@ impl DetailsView {
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         ui.set_clip_rect(rect.intersect(ui.clip_rect()));
-        ui.spacing_mut().button_padding *= scale;
-        ui.spacing_mut().interact_size *= scale;
-        for font in ui.style_mut().text_styles.values_mut() {
-            font.size *= scale;
-        }
+        zoom.apply(&mut ui);
         let Some(request) = &self.request else {
             ui.colored_label(th.dim, "Select a commit to view its details.");
             return;

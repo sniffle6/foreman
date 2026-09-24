@@ -432,13 +432,24 @@ impl BoardView {
             .borrow_mut()
             .mark_shown(std::time::Instant::now());
 
-        let next_scale = crate::terminal::font_size(ui.ctx()) / crate::config::DEFAULT_FONT_SIZE;
+        let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
+        let next_scale = zoom.factor();
         if next_scale != self.scale {
             for scroll in &mut self.scroll {
                 *scroll *= next_scale / self.scale;
             }
             self.scale = next_scale;
         }
+        // Keep the whole board in one scaled style scope. New egui widgets
+        // inherit zoom without each call site remembering the font ratio.
+        let mut scaled_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(base.with("scaled-board"))
+                .max_rect(rect),
+        );
+        scaled_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        zoom.apply(&mut scaled_ui);
+        let ui = &mut scaled_ui;
         let th = crate::theme::live(ui.ctx());
         let p = ui.painter_at(rect);
         // The board and its detail page share the terminal's base surface.
@@ -497,7 +508,7 @@ impl BoardView {
         let mut rect = rect;
         if let Some((text, attention)) = crate::kanban::worktree_strip(&rows) {
             let strip = egui::Rect::from_min_max(
-                egui::pos2(rect.min.x, rect.max.y - STRIP_H * self.scale),
+                egui::pos2(rect.min.x, rect.max.y - zoom.px(STRIP_H)),
                 rect.max,
             );
             rect.max.y = strip.min.y;
@@ -825,16 +836,10 @@ impl BoardView {
                     .id_salt(base.with((col_idx, "version-ui")))
                     .max_rect(dd),
             );
-            // The combo sizes itself from the style, which is in unscaled
-            // px: without this it keeps its default height and overflows the
-            // slot into the first card row whenever the font is zoomed out.
+            // The combo inherits the board's scaled style. Clamp its
+            // interaction height to the slot so zoom cannot push it into
+            // the first card row.
             child.spacing_mut().interact_size.y = dd.height();
-            child.spacing_mut().button_padding *= self.scale;
-            child.spacing_mut().icon_width *= self.scale;
-            child.spacing_mut().icon_width_inner *= self.scale;
-            for font in child.style_mut().text_styles.values_mut() {
-                font.size *= self.scale;
-            }
             let combo = egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
                 .width(dd.width())
                 .truncate()
@@ -1409,12 +1414,6 @@ impl BoardView {
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         child.set_clip_rect(rect);
-        for font in child.style_mut().text_styles.values_mut() {
-            font.size *= self.scale;
-        }
-        child.spacing_mut().interact_size *= self.scale;
-        child.spacing_mut().button_padding *= self.scale;
-        child.spacing_mut().item_spacing *= self.scale;
         child.visuals_mut().override_text_color = Some(th.text);
         if child.button("‹ Back to board").clicked() {
             self.worktrees_open = false;
@@ -1576,12 +1575,6 @@ impl BoardView {
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         child.set_clip_rect(rect);
-        for font in child.style_mut().text_styles.values_mut() {
-            font.size *= self.scale;
-        }
-        child.spacing_mut().interact_size *= self.scale;
-        child.spacing_mut().button_padding *= self.scale;
-        child.spacing_mut().item_spacing *= self.scale;
         child.visuals_mut().override_text_color = Some(th.text);
         if child.button("‹ Back to board").clicked() {
             self.selected = None;
