@@ -1,6 +1,7 @@
 //! Read-only Git history: a demand-driven Git stream, pure lane layout, and virtualized native rows.
 use eframe::egui;
 mod details;
+mod git;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{
@@ -194,11 +195,9 @@ fn stream_history(
     cancel: &Arc<AtomicBool>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new("git");
-    cmd.current_dir(cwd)
-        .args([
-            "--no-pager",
+    let (stdout, exit) = git::spawn(
+        &cwd,
+        &[
             "log",
             "--all",
             "--topo-order",
@@ -210,58 +209,13 @@ fn stream_history(
             "-z",
             "--format=%H%x00%P%x00%D%x00%an%x00%as%x00%s",
             "--",
-        ])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("Cannot start Git: {e}"))?;
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
-    let mut errors = Some(std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let mut buf = [0; 4096];
-        while let Ok(n) = stderr.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let keep = n.min(16384usize.saturating_sub(text.len()));
-            text.extend_from_slice(&buf[..keep]);
-        }
-        String::from_utf8_lossy(&text).trim().to_owned()
-    }));
-    // A separate owner can interrupt a blocked pipe read when a view closes or
-    // refreshes. The GUI never kills/waits on a child, and idle streams sleep.
-    let stop = cancel.clone();
-    let (status_tx, status_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let _ = status_tx.send(Ok(status));
-                    return;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = status_tx.send(Err(e));
-                    return;
-                }
-            }
-        }
-        let _ = status_tx.send(child.wait());
-    });
+        ],
+        cancel,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stdout);
+    let mut exit = Some(exit);
     let mut graph = Graph::default();
     let result = (|| {
         while requests.recv().is_ok() {
@@ -280,18 +234,13 @@ fn stream_history(
                 }
             }
             let error = if end {
-                let status = status_rx
-                    .recv()
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?;
-                let stderr = errors.take().unwrap().join().unwrap_or_default();
-                (!status.success()).then(|| {
-                    if stderr.is_empty() {
-                        "Git history could not be read".into()
-                    } else {
-                        stderr
+                match exit.take().expect("the stream ends once").finish() {
+                    Ok(()) => None,
+                    Err(git::GitError::Failed(stderr)) if stderr.is_empty() => {
+                        Some("Git history could not be read".into())
                     }
-                })
+                    Err(e) => Some(e.to_string()),
+                }
             } else {
                 None
             };

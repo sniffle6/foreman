@@ -2,8 +2,6 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::Instant;
 
 #[derive(Debug, PartialEq)]
 struct ChangedFile {
@@ -136,84 +134,20 @@ impl Details {
     }
 }
 
-// This function runs only on a worker. Pipe readers drain concurrently, while
-// the child owner checks cancellation/timeout and always reaps the process.
-fn git_output(cwd: &Path, args: &[&str], cancel: &AtomicBool) -> Result<Vec<u8>, String> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err("Cancelled".into());
-    }
-    let mut cmd = Command::new("git");
-    cmd.current_dir(cwd)
-        .arg("--no-pager")
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("Cannot start Git: {e}"))?;
-    fn drain(mut pipe: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
-        let mut bytes = Vec::new();
-        let mut overflow = false;
-        let mut buf = [0; 8192];
-        loop {
-            let n = pipe.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            let keep = n.min(limit.saturating_sub(bytes.len()));
-            overflow |= keep < n;
-            bytes.extend_from_slice(&buf[..keep]);
+// Runs only on a worker. The shared helper drains the pipes and kills/reaps on
+// cancel or timeout; this maps its errors to the pane's existing messages.
+fn git_output(cwd: &Path, args: &[&str], cancel: &Arc<AtomicBool>) -> Result<Vec<u8>, String> {
+    git::output(cwd, args, cancel, 32 * 1024 * 1024, Duration::from_secs(30)).map_err(|e| match e {
+        git::GitError::Cancelled | git::GitError::TimedOut => {
+            "Git details cancelled or timed out".to_owned()
         }
-        Ok((bytes, overflow))
-    }
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || drain(stdout, 32 * 1024 * 1024));
-    let err = std::thread::spawn(move || drain(stderr, 16384));
-    let start = Instant::now();
-    let status = loop {
-        if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(30) {
-            let _ = child.kill();
-            let _ = child.wait();
-            break Err("Git details cancelled or timed out".to_owned());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(e.to_string());
-            }
-        }
-    };
-    let output = out
-        .join()
-        .map_err(|_| "Git output reader stopped")?
-        .map_err(|e| e.to_string())?;
-    let error = err
-        .join()
-        .map_err(|_| "Git error reader stopped")?
-        .map_err(|e| e.to_string())?;
-    if !status?.success() {
-        return Err(format!(
-            "Cannot read commit details: {}",
-            String::from_utf8_lossy(&error.0).trim()
-        ));
-    }
-    if output.1 {
-        return Err("Commit details exceed the 32 MiB display limit".into());
-    }
-    Ok(output.0)
+        git::GitError::TooLarge => "Commit details exceed the 32 MiB display limit".into(),
+        git::GitError::Failed(stderr) => format!("Cannot read commit details: {stderr}"),
+        other => other.to_string(),
+    })
 }
 
-fn load(cwd: &Path, hash: &str, cancel: &AtomicBool) -> Result<Details, String> {
+fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, String> {
     // Only object ids obtained from the timeline may be used as revision args.
     if !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Invalid commit id".into());
@@ -845,7 +779,7 @@ mod tests {
     }
     fn read(dir: &Path, rev: &str) -> Details {
         let hash = git(dir, &["rev-parse", rev]);
-        load(dir, &hash, &AtomicBool::new(false)).unwrap()
+        load(dir, &hash, &Arc::new(AtomicBool::new(false))).unwrap()
     }
 
     #[test]
@@ -940,9 +874,9 @@ mod tests {
         let details = read(dir, "HEAD");
         assert!(details.files.is_empty());
         assert!(details.branches.is_empty());
-        assert!(load(dir, &"0".repeat(40), &AtomicBool::new(false)).is_err());
-        assert!(load(dir, "--bad-revision", &AtomicBool::new(false)).is_err());
-        assert!(load(dir, &details.hash, &AtomicBool::new(true)).is_err());
+        assert!(load(dir, &"0".repeat(40), &Arc::new(AtomicBool::new(false))).is_err());
+        assert!(load(dir, "--bad-revision", &Arc::new(AtomicBool::new(false))).is_err());
+        assert!(load(dir, &details.hash, &Arc::new(AtomicBool::new(true))).is_err());
     }
 
     #[test]
