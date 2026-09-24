@@ -718,7 +718,10 @@ mod tests {
         frame(&mut view, 1000.0, vec![egui::Event::PointerMoved(end)]);
         frame(&mut view, 1000.0, vec![press(end, false)]);
         let dragged = view.drawn_details_w;
-        assert!((dragged - (before + 100.0)).abs() < 1.0, "{before} -> {dragged}");
+        assert!(
+            (dragged - (before + 100.0)).abs() < 1.0,
+            "{before} -> {dragged}"
+        );
         frame(&mut view, 600.0, vec![]);
         assert!(view.drawn_details_w < dragged, "{}", view.drawn_details_w);
         frame(&mut view, 1000.0, vec![]);

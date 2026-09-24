@@ -391,6 +391,8 @@ impl App {
             self.desktop.handle_ctrl(msg, ctx);
             ctrl_activity = true;
         }
+        // `kanban dispatch` replies held on a worktree bring-up thread.
+        self.desktop.poll_card_dispatches(ctx);
 
         while let Ok(ev) = self.update_rx.try_recv() {
             self.drive_update(ev, ctx);

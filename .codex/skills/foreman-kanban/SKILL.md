@@ -1,6 +1,6 @@
 ---
 name: foreman-kanban
-description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
+description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, dispatching a worker onto a card, creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
 ---
 
 # The Foreman Project Kanban Board
@@ -32,6 +32,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
 & $env:FOREMAN_EXE kanban edit a3f8k2 --plan "Terminal work" --wave 2
 & $env:FOREMAN_EXE kanban list --state backlog
 & $env:FOREMAN_EXE kanban start a3f8k2
+& $env:FOREMAN_EXE kanban dispatch a3f8k2 --agent codex --worktree
 & $env:FOREMAN_EXE kanban done a3f8k2
 & $env:FOREMAN_EXE kanban block a3f8k2 --reason "needs a design decision"
 & $env:FOREMAN_EXE kanban rm a3f8k2
@@ -65,6 +66,14 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
   lists one Version, `--all` everything.
 - `start` — self-service claim of a backlog card. Requires Codex to be
   inside a Foreman terminal (`FOREMAN_TERMINAL_ID` set).
+- `dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree]` —
+  what the board's "Start with" button does, for an orchestrator: spawn the
+  agent in a new terminal with the generated dispatch prompt (`# Workspace`
+  section, close-out lines, `Card:` trailer) and claim the card for it.
+  Backlog cards only; refused while a live Session holds the card. Reply is
+  `open`'s shape (`{"ok":true,"terminal":"tN","project":"pN"}`); follow the
+  worker with `wait <id>`. Never hand-roll `git worktree add` for a card —
+  that skips the integration queue, teardown, and orphan tracking.
 - `done` — closes a card you hold: in-progress -> done.
 - `block --reason R` — in-progress -> blocked; the reason is mandatory.
 - `rm` — deletes the card's file outright, from any state.
@@ -128,12 +137,13 @@ numbers a worker needs to start — not a full brief crammed into the card.
 
 ## Worktrees: where a dispatched card runs
 
-A card started from the board may run in its own git worktree —
+A card started from the board (or `kanban dispatch`) may run in its own
+git worktree —
 `<repo>/.foreman/worktrees/<id>` on branch `card/<id>` — so no two workers
-share a checkout. The choice is made on the board at dispatch time (a
-`wt on/off` chip beside the agent picker, defaulting to the app setting);
-there is no CLI flag, and a card that already has a worktree always restarts
-in it. If you were dispatched into one, your prompt has a `# Workspace`
+share a checkout. The choice is made at dispatch time: the board's
+`wt on/off` chip beside the agent picker, or `dispatch --worktree` /
+`--no-worktree`; both default to the app setting. A card that already has a
+worktree always restarts in it (`--no-worktree` is refused for it). If you were dispatched into one, your prompt has a `# Workspace`
 section saying so; if it does not, you are in the project cwd.
 
 What that changes for you:

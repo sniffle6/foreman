@@ -27,8 +27,9 @@ sibling — read those for *why*, this doc for *how*.
   picker carries a `wt on/off` chip and the detail page a checkbox, both
   seeded from `dispatch_worktrees` (default on; Agents pane) and reset per
   card, so one card's override never leaks onto the next. A card that already
-  has a worktree hides the toggle and always restarts in it. There is no CLI
-  flag: the choice lives on the board. With the toggle on, Start creates
+  has a worktree hides the toggle and always restarts in it. The CLI twin is
+  `kanban dispatch --worktree|--no-worktree` (no flag = the same setting).
+  With the toggle on, Start creates
   `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
   and spawns the worker there, so no two workers share a checkout. The card
   records `worktree` (path, branch, and `base` — the branch the main checkout
@@ -185,6 +186,8 @@ foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N]
                                           # at least one of the four; --plan "" clears
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
 foreman kanban start <id>                 # claim a card yourself
+foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree]
+                                          # the board's "Start with": spawn + claim
 foreman kanban done <id>                  # close out: In Progress -> Done
 foreman kanban block <id> --reason "..."  # close out: needs a human
 foreman kanban rm <id>                    # delete the card file, any state
@@ -205,6 +208,18 @@ embedded **foreman-kanban** skill.
 Host errors also exit `2`. Busy and no-response replies retry until the wait
 deadline; other host errors exit immediately. Only card-state verdicts produce
 exit `1`, so temporary host load does not masquerade as a blocked Card.
+
+**`dispatch`** exists so an orchestrating agent gets the same dispatch the
+board does — worktree, generated prompt, integration close-out, orphan
+tracking — instead of hand-rolling `git worktree add`. It runs the board's
+own code (`dispatch_precheck` → bring-up → `dispatch_spawn`), with two
+differences: it only starts **Backlog** cards (Restart of a Blocked or
+orphaned card stays a board action), and the agent must be one of the board's
+`AGENTS`. The reply is `open`'s shape, so the caller can `wait <id>`.
+Worktree bring-up runs on a thread and the reply waits for it, bounded by the
+control plane's 5 s reply timeout: a bring-up slower than that spawns nothing
+(the tree it made is reused next time), and a reply nobody is listening for
+undoes the spawn and releases the card back to Backlog.
 
 **Transitions** are enforced identically for CLI and board: claims move
 Backlog/Blocked cards to In Progress; `start` on a card with a live claim is
@@ -351,8 +366,11 @@ its base (`docs/integration-queue.md`).
   `show_worktree_row`, the `RemoveStray` / `DiscardStray` acts).
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
   reload), `kanban_dispatch` (the control-pipe verb table), `drain_board_acts`
-  (applies board intents: store writes, jump-to-terminal, dispatch-from-card
-  with bring-up), `drain_worktree_msgs` (queued teardowns, thread results,
+  (applies board intents: store writes, jump-to-terminal, dispatch-from-card),
+  `dispatch_card` / `dispatch_precheck` / `dispatch_spawn` (the one dispatch
+  path, shared by the board and `kanban dispatch`), `ctrl_card_dispatch` +
+  `poll_card_dispatches` (the CLI verb: off-thread bring-up, held reply,
+  spawn undo), `drain_worktree_msgs` (queued teardowns, thread results,
   status poll kick including the stray listing), `CloseTarget::DiscardStray`,
   `kanban_rm` (the `rm` pre-check), `open_board_window` /
   `open_plan_window` (per-project singletons), `drain_plan_acts` (opens or

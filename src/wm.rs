@@ -605,6 +605,52 @@ struct PendingTeardown {
     force: bool,
 }
 
+/// A `kanban dispatch` whose worktree bring-up is running on a thread
+/// (desktop only). The reply waits here; `poll_card_dispatches` finishes it
+/// when the thread reports, or drops it unexecuted once REPLY_TIMEOUT has
+/// passed (the client was already told "foreman did not respond").
+struct PendingCardDispatch {
+    pid: WinId,
+    id: String,
+    agent: String,
+    rx: std::sync::mpsc::Receiver<Result<crate::kanban::BringUp, String>>,
+    reply: std::sync::mpsc::Sender<crate::control::OpenReply>,
+    sent: std::time::Instant,
+}
+
+/// How `card_dispatch_begin` left a `kanban dispatch`.
+enum CardDispatchBegun {
+    /// No worktree: spawned and claimed already.
+    Spawned { pid: WinId, id: String, tid: WinId },
+    /// Bring-up is running on a thread; `rx` carries its verdict.
+    BringingUp {
+        pid: WinId,
+        id: String,
+        agent: String,
+        rx: std::sync::mpsc::Receiver<Result<crate::kanban::BringUp, String>>,
+    },
+}
+
+/// `kanban dispatch`'s worktree decision, mirroring the board chip: a card
+/// that already carries a worktree resumes in it (forced on, so an explicit
+/// `--no-worktree` is refused rather than silently ignored); otherwise the
+/// flag wins, and no flag means the app's worktree setting.
+fn dispatch_worktree_choice(
+    flag: Option<bool>,
+    card_has_worktree: bool,
+    setting: bool,
+) -> Result<bool, String> {
+    match (flag, card_has_worktree) {
+        (Some(false), true) => Err(
+            "already has a worktree from an earlier run and resumes in it; drop --no-worktree"
+                .into(),
+        ),
+        (_, true) => Ok(true),
+        (Some(v), false) => Ok(v),
+        (None, false) => Ok(setting),
+    }
+}
+
 /// The Cut release in flight or awaiting dismissal (`drain_release`).
 struct ReleaseRun {
     /// `Some` until the thread reports its outcome.
@@ -700,6 +746,9 @@ pub struct WindowManager {
     /// Pending `foreman send` settle entries, serviced each frame by
     /// `advance_settles` so the GUI never blocks waiting for a terminal to quiet.
     pending_settles: Vec<PendingSettle>,
+    /// `kanban dispatch` requests waiting on a worktree bring-up thread
+    /// (desktop only), finished by `poll_card_dispatches`.
+    pending_card_dispatches: Vec<PendingCardDispatch>,
     /// When `Some`, this manager's close-confirm modal is open: a close (or the
     /// app quit) is waiting on the user. Holds the target and the modal view.
     /// At most one is pending *per manager*; the app-wide "only one anywhere"
@@ -765,6 +814,7 @@ impl WindowManager {
             zoomed: None,
             drag_from_tree: None,
             pending_settles: Vec::new(),
+            pending_card_dispatches: Vec::new(),
             pending_close: None,
             quit_confirmed: false,
             app_modal: false,
@@ -1544,6 +1594,10 @@ impl WindowManager {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return; // stale: the client was already told "foreman did not respond"
                 }
+                if req.action == "dispatch" {
+                    self.ctrl_card_dispatch(&req, reply, sent, ctx);
+                    return;
+                }
                 // Repaint only on a successful WRITE — an open board reacts
                 // to the app's own change; a `list` read changes nothing.
                 let is_write = req.action != "list";
@@ -1558,6 +1612,152 @@ impl WindowManager {
                     Ok(r) => r,
                     Err(e) => OpenReply::err(e),
                 });
+            }
+        }
+    }
+
+    /// `kanban dispatch`: the board's dispatch path (`dispatch_precheck`,
+    /// bring-up, `dispatch_spawn`) behind the control plane. Without a
+    /// worktree it finishes now. With one, bring-up runs on a thread so git
+    /// never holds the GUI thread; the reply waits in
+    /// `pending_card_dispatches` (the pipe server's own wait is bounded by
+    /// REPLY_TIMEOUT).
+    fn ctrl_card_dispatch(
+        &mut self,
+        req: &crate::control::KanbanRequest,
+        reply: std::sync::mpsc::Sender<crate::control::OpenReply>,
+        sent: std::time::Instant,
+        ctx: &egui::Context,
+    ) {
+        // Only the board's agents: this verb must not become a second,
+        // unguarded `open` (tests drive `card_dispatch_begin` directly).
+        let begun = match req.agent.as_deref() {
+            Some(a) if !crate::board::AGENTS.contains(&a) => Err(format!(
+                "unknown agent {a}; expected one of {}",
+                crate::board::AGENTS.join(", ")
+            )),
+            _ => self.card_dispatch_begin(req, ctx),
+        };
+        match begun {
+            Err(e) => {
+                let _ = reply.send(crate::control::OpenReply::err(e));
+            }
+            Ok(CardDispatchBegun::Spawned { pid, id, tid }) => {
+                ctx.request_repaint();
+                self.card_dispatch_reply(pid, &id, Ok(tid), reply);
+            }
+            Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx }) => {
+                self.pending_card_dispatches.push(PendingCardDispatch {
+                    pid,
+                    id,
+                    agent,
+                    rx,
+                    reply,
+                    sent,
+                });
+            }
+        }
+    }
+
+    fn card_dispatch_begin(
+        &mut self,
+        req: &crate::control::KanbanRequest,
+        ctx: &egui::Context,
+    ) -> Result<CardDispatchBegun, String> {
+        let id = req.id.clone().ok_or("missing id")?;
+        let agent = req.agent.clone().ok_or("dispatch requires an agent")?;
+        let pid = self.resolve_project(req.project.as_deref())?;
+        let child = self.project_child_mut(pid)?;
+        let cwd = child
+            .cwd
+            .clone()
+            .ok_or("project has no working directory")?;
+        {
+            let mut store = child.kanban.borrow_mut();
+            store.set_dir(Some(&cwd));
+            // Files are authoritative: the Backlog guard must not judge a
+            // stale in-memory copy.
+            store.reload();
+        }
+        let has_wt = child
+            .kanban
+            .borrow()
+            .get(&id)
+            .is_some_and(|c| c.worktree.is_some());
+        let worktree = dispatch_worktree_choice(
+            req.worktree,
+            has_wt,
+            crate::config::live(ctx).dispatch_worktrees,
+        )
+        .map_err(|e| format!("card {id}: {e}"))?;
+        let card = child.dispatch_precheck(&id, true)?;
+        if !worktree {
+            let tid = child.dispatch_spawn(card, &agent, None, ctx)?;
+            return Ok(CardDispatchBegun::Spawned { pid, id, tid });
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::kanban::bring_up_worktree(&cwd, &card));
+            wake.request_repaint();
+        });
+        Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx })
+    }
+
+    /// Finish `kanban dispatch` requests whose bring-up thread has reported.
+    /// Called every frame from the app's background service (desktop only).
+    /// A request past REPLY_TIMEOUT is dropped without spawning: its client
+    /// already heard "foreman did not respond", and a tree the thread made
+    /// is reused by the next dispatch of the card.
+    pub fn poll_card_dispatches(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+        if self.pending_card_dispatches.is_empty() {
+            return;
+        }
+        for p in std::mem::take(&mut self.pending_card_dispatches) {
+            if p.sent.elapsed() >= crate::control::REPLY_TIMEOUT {
+                continue;
+            }
+            let res = match p.rx.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    self.pending_card_dispatches.push(p);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    Err(format!("card {}: worktree bring-up thread died", p.id))
+                }
+                // State may have moved while git ran (a board click, a
+                // close-out): the guards run again before the spawn.
+                Ok(bring) => self.project_child_mut(p.pid).and_then(|child| {
+                    let card = child.dispatch_precheck(&p.id, true)?;
+                    child.dispatch_spawn(card, &p.agent, Some(bring), ctx)
+                }),
+            };
+            ctx.request_repaint();
+            self.card_dispatch_reply(p.pid, &p.id, res, p.reply);
+        }
+    }
+
+    /// Reply to `kanban dispatch`. At-most-once, like `open`: when the
+    /// client is gone the spawn is undone — terminal closed, card released
+    /// back to Backlog (where the CLI dispatch found it) so a retry can
+    /// dispatch it again.
+    fn card_dispatch_reply(
+        &mut self,
+        pid: WinId,
+        id: &str,
+        res: Result<WinId, String>,
+        reply: std::sync::mpsc::Sender<crate::control::OpenReply>,
+    ) {
+        let undo = res.as_ref().ok().copied();
+        if reply
+            .send(Self::open_reply(res.map(|tid| (pid, tid))))
+            .is_err()
+            && let Some(tid) = undo
+        {
+            self.close_terminal(pid, tid);
+            if let Ok(child) = self.project_child_mut(pid) {
+                let _ = child.kanban.borrow_mut().release(id);
             }
         }
     }
@@ -2768,149 +2968,175 @@ impl WindowManager {
                     agent,
                     worktree,
                 } => {
-                    let Some(mut card) = self.kanban.borrow().get(&id).cloned() else {
+                    if let Err(e) = self.dispatch_card(&id, &agent, worktree, ctx) {
                         crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
-                            format!("board: dispatch on missing card {id}"),
+                            format!("board: {e}"),
                         );
-                        continue;
-                    };
-                    // A teardown left over from this card's previous run
-                    // (release, then re-dispatch) must not race the new
-                    // worker: a still-queued one is cancelled — the new
-                    // Session adopts the tree and its own close-out queues
-                    // teardown afresh — and a running one refuses dispatch,
-                    // because bring-up would reuse a tree mid-removal.
-                    if self.teardowns_in_flight.contains(&id) {
-                        crate::notify::queue(
-                            ctx,
-                            crate::notify::Level::Error,
-                            format!("card {id}: worktree teardown in progress; retry in a moment"),
-                        );
-                        continue;
-                    }
-                    // The queue owns the worktree while a request is queued
-                    // or integrating: a new worker would race the rebase.
-                    if let Some(phase) = self.integration_owns(&id) {
-                        crate::notify::queue(
-                            ctx,
-                            crate::notify::Level::Error,
-                            format!(
-                                "card {id}: integration is {}; wait for it or cancel it first",
-                                phase.label()
-                            ),
-                        );
-                        continue;
-                    }
-                    self.cancel_pending_teardown(&id);
-                    // Bring-up (spec: dispatch-worktrees). The act carries the
-                    // per-dispatch choice (the board seeds it from the global
-                    // setting). `record` is what the claim write stores;
-                    // `card.worktree` only steers the prompt template. Any git
-                    // failure aborts before the spawn with the card untouched.
-                    let mut record: Option<crate::kanban::Worktree> = None;
-                    if worktree {
-                        if let Some(cwd) = self.cwd.clone() {
-                            match crate::kanban::bring_up_worktree(&cwd, &card) {
-                                Ok(crate::kanban::BringUp::Worktree(wt)) => {
-                                    card.worktree = Some(wt.clone());
-                                    record = Some(wt);
-                                }
-                                Ok(crate::kanban::BringUp::InPlace) => card.worktree = None,
-                                Ok(crate::kanban::BringUp::Detached) => {
-                                    card.worktree = None;
-                                    crate::notify::queue(
-                                        ctx,
-                                        crate::notify::Level::Warning,
-                                        format!(
-                                            "card {id}: no branch checked out; dispatched without a worktree"
-                                        ),
-                                    );
-                                }
-                                Err(e) => {
-                                    crate::notify::queue(
-                                        ctx,
-                                        crate::notify::Level::Error,
-                                        format!("card {id}: worktree bring-up failed: {e}"),
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        card.worktree = None; // the prompt renders today's text
-                    }
-                    let prompt =
-                        crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
-                    let spawn_cwd = record.as_ref().map(|w| std::path::PathBuf::from(&w.path));
-                    match self.add_terminal_cmd(
-                        &[agent.clone(), prompt],
-                        spawn_cwd.as_deref(),
-                        Some(&card.title),
-                        ctx,
-                    ) {
-                        Ok(tid) => {
-                            // The claim transition cares about the STATE OF
-                            // THE CARD'S EXISTING CLAIM (to decide whether a
-                            // live InProgress claim may be seized), not the
-                            // just-spawned terminal — same lookup as
-                            // `is_orphaned`.
-                            let states = self.term_states();
-                            let existing_term = card
-                                .claim
-                                .as_ref()
-                                .and_then(|c| states.get(&c.terminal).copied())
-                                .unwrap_or(crate::kanban::TermState::Missing);
-                            let run = crate::kanban::run_nonce();
-                            // Bind the result before matching on it: an
-                            // `if let` on the `borrow_mut()` call directly
-                            // would extend the `RefMut` temporary's lifetime
-                            // over the whole `if` body, which then can't
-                            // borrow `self` mutably for the undo path below.
-                            let claimed = self.kanban.borrow_mut().claim_for_dispatch(
-                                &id,
-                                &term_tag(tid),
-                                &agent,
-                                run,
-                                existing_term,
-                                record,
-                            );
-                            if let Err(e) = claimed {
-                                crate::notify::queue(
-                                    ctx,
-                                    crate::notify::Level::Error,
-                                    format!("board: dispatch claim failed for {id}: {e}"),
-                                );
-                                // Open-undo: the card was closed out (or
-                                // re-claimed) mid-frame — close the terminal
-                                // we just spawned rather than leave an
-                                // unclaimed dispatch running.
-                                if let Some((win, tab)) = self.terminal_location(tid) {
-                                    self.close_tab(win, tab);
-                                    self.mark_workspace_dirty();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("board: dispatch spawn failed for {id}: {e}");
-                            let detail = if e.to_string().contains("runs via a cmd-shim") {
-                                format!(
-                                    "{agent} could not start directly. Install a native executable; command shims cannot carry the card's multiline prompt."
-                                )
-                            } else {
-                                e.to_string()
-                            };
-                            crate::notify::queue(
-                                ctx,
-                                crate::notify::Level::Error,
-                                format!("board: dispatch spawn failed for {id}: {detail}"),
-                            );
-                        }
                     }
                 }
             }
         }
+    }
+
+    /// The board's dispatch: guards, worktree bring-up inline, spawn +
+    /// claim. `kanban dispatch` runs the same three steps with bring-up on a
+    /// thread (see `ctrl_card_dispatch`).
+    fn dispatch_card(
+        &mut self,
+        id: &str,
+        agent: &str,
+        worktree: bool,
+        ctx: &egui::Context,
+    ) -> Result<WinId, String> {
+        let card = self.dispatch_precheck(id, false)?;
+        let bring = match (worktree, self.cwd.clone()) {
+            (true, Some(cwd)) => Some(crate::kanban::bring_up_worktree(&cwd, &card)),
+            _ => None,
+        };
+        self.dispatch_spawn(card, agent, bring, ctx)
+    }
+
+    /// Every guard a dispatch passes before bring-up; returns the card to
+    /// dispatch. `backlog_only` is the CLI's stricter rule (the board also
+    /// restarts Blocked and orphaned cards). Cancels a queued teardown only
+    /// once every guard has passed.
+    fn dispatch_precheck(
+        &mut self,
+        id: &str,
+        backlog_only: bool,
+    ) -> Result<crate::kanban::Card, String> {
+        let card = self
+            .kanban
+            .borrow()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("dispatch on missing card {id}"))?;
+        if backlog_only && card.state != crate::kanban::CardState::Backlog {
+            return Err(format!(
+                "card {id} is {:?}, not Backlog; dispatch only starts backlog cards",
+                card.state
+            ));
+        }
+        // A teardown left over from this card's previous run (release, then
+        // re-dispatch) must not race the new worker: a still-queued one is
+        // cancelled below — the new Session adopts the tree and its own
+        // close-out queues teardown afresh — and a running one refuses
+        // dispatch, because bring-up would reuse a tree mid-removal.
+        if self.teardowns_in_flight.contains(id) {
+            return Err(format!(
+                "card {id}: worktree teardown in progress; retry in a moment"
+            ));
+        }
+        // The queue owns the worktree while a request is queued or
+        // integrating: a new worker would race the rebase.
+        if let Some(phase) = self.integration_owns(id) {
+            return Err(format!(
+                "card {id}: integration is {}; wait for it or cancel it first",
+                phase.label()
+            ));
+        }
+        // Two agents, one card (the `start` guard): the claim write would
+        // refuse this after the spawn anyway; refusing here skips a doomed
+        // bring-up and a spawn-then-close flicker.
+        let term = card
+            .claim
+            .as_ref()
+            .and_then(|c| self.term_states().get(&c.terminal).copied())
+            .unwrap_or(crate::kanban::TermState::Missing);
+        if !crate::kanban::claim_is_dead(card.claim.as_ref(), crate::kanban::run_nonce(), term) {
+            let holder = card.claim.as_ref().map_or("", |c| c.terminal.as_str());
+            return Err(format!("card {id} is held by live Session {holder}"));
+        }
+        self.cancel_pending_teardown(id);
+        Ok(card)
+    }
+
+    /// Spawn + claim after bring-up (spec: dispatch-worktrees). `bring` is
+    /// the bring-up verdict, `None` for a dispatch without a worktree.
+    /// `record` is what the claim write stores; `card.worktree` only steers
+    /// the prompt template. A bring-up failure aborts before the spawn with
+    /// the card untouched; a failed claim closes the just-spawned terminal.
+    fn dispatch_spawn(
+        &mut self,
+        mut card: crate::kanban::Card,
+        agent: &str,
+        bring: Option<Result<crate::kanban::BringUp, String>>,
+        ctx: &egui::Context,
+    ) -> Result<WinId, String> {
+        let id = card.id.clone();
+        let mut record: Option<crate::kanban::Worktree> = None;
+        match bring {
+            Some(Ok(crate::kanban::BringUp::Worktree(wt))) => {
+                card.worktree = Some(wt.clone());
+                record = Some(wt);
+            }
+            Some(Ok(crate::kanban::BringUp::InPlace)) => card.worktree = None,
+            Some(Ok(crate::kanban::BringUp::Detached)) => {
+                card.worktree = None;
+                crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Warning,
+                    format!("card {id}: no branch checked out; dispatched without a worktree"),
+                );
+            }
+            Some(Err(e)) => return Err(format!("card {id}: worktree bring-up failed: {e}")),
+            None => card.worktree = None, // the prompt renders today's text
+        }
+        let prompt = crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
+        let spawn_cwd = record.as_ref().map(|w| std::path::PathBuf::from(&w.path));
+        let tid = match self.add_terminal_cmd(
+            &[agent.to_string(), prompt],
+            spawn_cwd.as_deref(),
+            Some(&card.title),
+            ctx,
+        ) {
+            Ok(tid) => tid,
+            Err(e) => {
+                eprintln!("board: dispatch spawn failed for {id}: {e}");
+                let detail = if e.to_string().contains("runs via a cmd-shim") {
+                    format!(
+                        "{agent} could not start directly. Install a native executable; command shims cannot carry the card's multiline prompt."
+                    )
+                } else {
+                    e.to_string()
+                };
+                return Err(format!("dispatch spawn failed for {id}: {detail}"));
+            }
+        };
+        // The claim transition cares about the STATE OF THE CARD'S EXISTING
+        // CLAIM (to decide whether a live InProgress claim may be seized),
+        // not the just-spawned terminal — same lookup as `is_orphaned`.
+        let states = self.term_states();
+        let existing_term = card
+            .claim
+            .as_ref()
+            .and_then(|c| states.get(&c.terminal).copied())
+            .unwrap_or(crate::kanban::TermState::Missing);
+        // Bind the result before matching on it: an `if let` on the
+        // `borrow_mut()` call directly would extend the `RefMut` temporary's
+        // lifetime over the whole `if` body, which then can't borrow `self`
+        // mutably for the undo path below.
+        let claimed = self.kanban.borrow_mut().claim_for_dispatch(
+            &id,
+            &term_tag(tid),
+            agent,
+            crate::kanban::run_nonce(),
+            existing_term,
+            record,
+        );
+        if let Err(e) = claimed {
+            // Open-undo: the card was closed out (or re-claimed) mid-frame —
+            // close the terminal we just spawned rather than leave an
+            // unclaimed dispatch running.
+            if let Some((win, tab)) = self.terminal_location(tid) {
+                self.close_tab(win, tab);
+                self.mark_workspace_dirty();
+            }
+            return Err(format!("dispatch claim failed for {id}: {e}"));
+        }
+        Ok(tid)
     }
 
     /// The terminal tag holding `id`'s claim right now, captured BEFORE a
@@ -15952,6 +16178,286 @@ mod tests {
         assert!(
             !notifications.contains_text("teardown failed"),
             "a clean merged tree must tear down silently"
+        );
+    }
+
+    // --- kanban dispatch: the board's dispatch path behind the CLI ---
+
+    fn dispatch_req(id: &str, worktree: Option<bool>) -> crate::control::KanbanRequest {
+        let mut req = kanban_req("dispatch");
+        req.id = Some(id.to_string());
+        req.agent = Some(pause_argv()[0].clone());
+        req.worktree = worktree;
+        req
+    }
+
+    /// Finish a `kanban dispatch` the way the GUI does — begin, then poll the
+    /// bring-up thread (if any) — and return its reply.
+    fn cli_dispatch(
+        m: &mut WindowManager,
+        req: &crate::control::KanbanRequest,
+        ctx: &egui::Context,
+    ) -> crate::control::OpenReply {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        match m.card_dispatch_begin(req, ctx) {
+            Err(e) => return crate::control::OpenReply::err(e),
+            Ok(CardDispatchBegun::Spawned { pid, id, tid }) => {
+                m.card_dispatch_reply(pid, &id, Ok(tid), rtx)
+            }
+            Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx }) => {
+                // Wait out git first, then hand the verdict to the poll with
+                // a fresh `sent`: a loaded test machine can take longer than
+                // REPLY_TIMEOUT to add a worktree, and the drop-when-stale
+                // branch has its own test.
+                let bring = rx.recv().expect("bring-up thread reports");
+                let (btx, brx) = std::sync::mpsc::channel();
+                btx.send(bring).unwrap();
+                m.pending_card_dispatches.push(PendingCardDispatch {
+                    pid,
+                    id,
+                    agent,
+                    rx: brx,
+                    reply: rtx,
+                    sent: std::time::Instant::now(),
+                });
+                m.poll_card_dispatches(ctx);
+            }
+        }
+        rrx.try_recv().expect("dispatch replied")
+    }
+
+    fn add_card(m: &mut WindowManager, title: &str) -> String {
+        let mut add = kanban_req("add");
+        add.title = Some(title.into());
+        m.kanban_dispatch(&add).unwrap().id.unwrap()
+    }
+
+    #[test]
+    fn dispatch_worktree_choice_mirrors_the_board_chip() {
+        // no flag = the setting; a flag wins over it
+        assert_eq!(dispatch_worktree_choice(None, false, true), Ok(true));
+        assert_eq!(dispatch_worktree_choice(None, false, false), Ok(false));
+        assert_eq!(dispatch_worktree_choice(Some(true), false, false), Ok(true));
+        assert_eq!(
+            dispatch_worktree_choice(Some(false), false, true),
+            Ok(false)
+        );
+        // a card with a tree resumes in it; an explicit opt-out is refused
+        assert_eq!(dispatch_worktree_choice(None, true, false), Ok(true));
+        assert_eq!(dispatch_worktree_choice(Some(true), true, false), Ok(true));
+        assert!(dispatch_worktree_choice(Some(false), true, true).is_err());
+    }
+
+    #[test]
+    fn cli_dispatch_without_worktree_spawns_claims_and_replies_like_open() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Plain dispatch");
+
+        let r = cli_dispatch(&mut m, &dispatch_req(&id, Some(false)), &ctx);
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.project, Some(format!("p{pid}")));
+        let card = m
+            .project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow()
+            .get(&id)
+            .cloned()
+            .unwrap();
+        assert_eq!(card.state, crate::kanban::CardState::InProgress);
+        assert!(card.worktree.is_none());
+        let claim = card.claim.unwrap();
+        assert_eq!(
+            Some(claim.terminal),
+            r.terminal,
+            "reply names the claimed Session"
+        );
+        assert_eq!(claim.agent, Some(pause_argv()[0].clone()));
+
+        // A second dispatch of the now-InProgress card is refused (Backlog only).
+        let again = cli_dispatch(&mut m, &dispatch_req(&id, Some(false)), &ctx);
+        assert!(!again.ok);
+        assert!(again.error.unwrap().contains("not Backlog"));
+    }
+
+    #[test]
+    fn cli_dispatch_with_worktree_brings_up_off_thread_and_records_it() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Worktree dispatch");
+
+        let r = cli_dispatch(&mut m, &dispatch_req(&id, Some(true)), &ctx);
+        assert!(r.ok, "{:?}", r.error);
+        assert!(m.pending_card_dispatches.is_empty());
+        let child = m.project_child_mut(pid).unwrap();
+        let card = child.kanban.borrow().get(&id).cloned().unwrap();
+        assert_eq!(card.state, crate::kanban::CardState::InProgress);
+        let wt = card.worktree.expect("dispatch records the worktree");
+        assert_eq!(wt.branch, format!("card/{id}"));
+        assert!(std::path::Path::new(&wt.path).is_dir());
+        assert_eq!(Some(card.claim.unwrap().terminal), r.terminal);
+    }
+
+    #[test]
+    fn cli_dispatch_defaults_to_the_worktree_setting() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let off = crate::config::Settings {
+            dispatch_worktrees: false,
+            ..Default::default()
+        };
+        crate::config::seed_live(&ctx, &off);
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Setting off");
+        assert!(matches!(
+            m.card_dispatch_begin(&dispatch_req(&id, None), &ctx),
+            Ok(CardDispatchBegun::Spawned { .. })
+        ));
+        let child = m.project_child_mut(pid).unwrap();
+        assert!(child.kanban.borrow().get(&id).unwrap().worktree.is_none());
+    }
+
+    #[test]
+    fn cli_dispatch_refusals_leave_the_card_untouched_and_spawn_nothing() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Refused");
+        let windows = |m: &mut WindowManager| m.project_child_mut(pid).unwrap().windows.len();
+        let before = windows(&mut m);
+
+        let e = cli_dispatch(&mut m, &dispatch_req("nope", Some(false)), &ctx);
+        assert!(e.error.unwrap().contains("missing card"));
+
+        m.project_child_mut(pid)
+            .unwrap()
+            .teardowns_in_flight
+            .insert(id.clone());
+        let e = cli_dispatch(&mut m, &dispatch_req(&id, Some(true)), &ctx);
+        assert!(e.error.unwrap().contains("teardown in progress"));
+        m.project_child_mut(pid)
+            .unwrap()
+            .teardowns_in_flight
+            .remove(&id);
+
+        // A card still carrying a tree resumes in it; --no-worktree is refused.
+        // (Written to the card file: the CLI path re-reads the files.)
+        let file = tmp.path().join(".foreman/tasks").join(format!("{id}.json"));
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        v["worktree"] = serde_json::json!({
+            "path": tmp.path().join("wt").to_string_lossy(),
+            "branch": format!("card/{id}"),
+            "base": "main",
+        });
+        std::fs::write(&file, v.to_string()).unwrap();
+        let e = cli_dispatch(&mut m, &dispatch_req(&id, Some(false)), &ctx);
+        assert!(e.error.unwrap().contains("--no-worktree"));
+
+        // An unknown agent never reaches the store (handle_ctrl's gate).
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let mut bad = dispatch_req(&id, Some(true));
+        bad.agent = Some("gpt".into());
+        m.handle_ctrl(
+            crate::control::CtrlMsg::Kanban(bad, rtx, std::time::Instant::now()),
+            &ctx,
+        );
+        assert!(rrx.recv().unwrap().error.unwrap().contains("unknown agent"));
+
+        assert_eq!(windows(&mut m), before, "no refusal spawns a terminal");
+        let card = m
+            .project_child_mut(pid)
+            .unwrap()
+            .kanban
+            .borrow()
+            .get(&id)
+            .cloned()
+            .unwrap();
+        assert_eq!(card.state, crate::kanban::CardState::Backlog);
+        assert!(card.claim.is_none());
+    }
+
+    #[test]
+    fn cli_dispatch_undoes_the_spawn_when_the_client_is_gone() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Orphaned reply");
+        let before = m.project_child_mut(pid).unwrap().windows.len();
+
+        let Ok(CardDispatchBegun::Spawned {
+            pid: p,
+            id: cid,
+            tid,
+        }) = m.card_dispatch_begin(&dispatch_req(&id, Some(false)), &ctx)
+        else {
+            panic!("no-worktree dispatch spawns at once");
+        };
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        drop(rrx); // the pipe server gave up on this client
+        m.card_dispatch_reply(p, &cid, Ok(tid), rtx);
+
+        let child = m.project_child_mut(pid).unwrap();
+        assert_eq!(
+            child.windows.len(),
+            before,
+            "the spawned terminal is closed"
+        );
+        let card = child.kanban.borrow().get(&id).cloned().unwrap();
+        assert_eq!(
+            card.state,
+            crate::kanban::CardState::Backlog,
+            "a retry may dispatch it"
+        );
+        assert!(card.claim.is_none());
+    }
+
+    #[test]
+    fn cli_dispatch_past_the_reply_timeout_is_dropped_unexecuted() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Slow git");
+        let before = m.project_child_mut(pid).unwrap().windows.len();
+
+        // Bring-up finished, but only after the server stopped waiting.
+        let (btx, brx) = std::sync::mpsc::channel();
+        btx.send(Ok(crate::kanban::BringUp::InPlace)).unwrap();
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        m.pending_card_dispatches.push(PendingCardDispatch {
+            pid,
+            id: id.clone(),
+            agent: pause_argv()[0].clone(),
+            rx: brx,
+            reply: rtx,
+            sent: std::time::Instant::now()
+                - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1)),
+        });
+        m.poll_card_dispatches(&ctx);
+
+        assert!(m.pending_card_dispatches.is_empty());
+        assert!(
+            rrx.try_recv().is_err(),
+            "no reply: the client already gave up"
+        );
+        let child = m.project_child_mut(pid).unwrap();
+        assert_eq!(child.windows.len(), before, "nothing spawned");
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::Backlog
         );
     }
 

@@ -226,7 +226,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KanbanRequest {
     pub cmd: String,    // always "kanban"
-    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit" | "worktrees" | "integrate"
+    pub action: String, // "add" | "list" | "start" | "done" | "block" | "rm" | "cut" | "uncut" | "edit" | "worktrees" | "integrate" | "dispatch"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // None = caller's FOREMAN_PROJECT_ID, else focused
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +272,14 @@ pub struct KanbanRequest {
     /// false (wire compat v1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub release: bool,
+    /// `dispatch --agent NAME`: the agent to spawn (one of the board's
+    /// `AGENTS`). Skipped when unset (wire compat v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// `dispatch --worktree` / `--no-worktree`; None = the app's worktree
+    /// setting, same as the board chip. Skipped when unset (wire compat v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -926,8 +934,69 @@ pub fn parse_kanban_args(
         "uncut" => parse_kanban_named(rest, default_project, "uncut"),
         "worktrees" => parse_kanban_worktrees(rest, default_project),
         "integrate" => parse_kanban_integrate(rest, default_project),
+        "dispatch" => parse_kanban_dispatch(rest, default_project),
         other => Err(format!("unknown kanban action: {other}")),
     }
+}
+
+/// `dispatch <id> --agent NAME [--worktree|--no-worktree] [--project P]` —
+/// the board's "Start with" button over the pipe: claim, optional worktree,
+/// spawn with the generated dispatch prompt. The agent is checked against
+/// the board's `AGENTS` here (exit 2) and again by the server.
+fn parse_kanban_dispatch(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<KanbanAction, String> {
+    let mut project = default_project;
+    let mut id: Option<String> = None;
+    let mut agent: Option<String> = None;
+    let mut worktree: Option<bool> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--agent" => {
+                agent = Some(args.get(i + 1).ok_or("--agent needs a value")?.clone());
+                i += 2;
+            }
+            flag @ ("--worktree" | "--no-worktree") => {
+                let v = flag == "--worktree";
+                if worktree.is_some_and(|w| w != v) {
+                    return Err("give --worktree or --no-worktree, not both".into());
+                }
+                worktree = Some(v);
+                i += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => {
+                if id.is_some() {
+                    return Err(format!("unexpected argument: {other}"));
+                }
+                id = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let id = id.ok_or("missing <id>")?;
+    let agent = agent.ok_or("dispatch needs --agent NAME")?;
+    if !crate::board::AGENTS.contains(&agent.as_str()) {
+        return Err(format!(
+            "unknown agent: {agent} (expected one of {})",
+            crate::board::AGENTS.join(", ")
+        ));
+    }
+    Ok(KanbanAction::Request(KanbanRequest {
+        cmd: "kanban".into(),
+        action: "dispatch".into(),
+        project,
+        id: Some(id),
+        agent: Some(agent),
+        worktree,
+        ..Default::default()
+    }))
 }
 
 /// `integrate <id> [--cancel] [--json] [--project P]` — submit the card's
@@ -1399,7 +1468,7 @@ USAGE
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
-  foreman kanban <action> ...                add/list/start/edit/done/block/rm/wait a card
+  foreman kanban <action> ...                add/list/start/dispatch/edit/done/block/rm/wait a card
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help, view --help, kanban --help)
@@ -1518,6 +1587,7 @@ foreman kanban add <title words...> [--body B] [--project P]
 foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
 foreman kanban start <id> [--project P]
+foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree] [--project P]
 foreman kanban done <id> [--project P]
 foreman kanban block <id> --reason R [--project P]
 foreman kanban rm <id> [--project P]
@@ -1566,6 +1636,19 @@ focused project).
   start   self-service claim: requires FOREMAN_TERMINAL_ID (be inside a
           foreman terminal). Errors if another live Session already holds
           the card; succeeds and seizes an orphaned claim.
+  dispatch
+          what the board's \"Start with\" button does: spawn --agent in a new
+          terminal with the generated dispatch prompt (workspace section,
+          close-out lines, Card: trailer) and claim the card for it. Backlog
+          cards only; refused while a live Session holds the card, a
+          worktree teardown is running, or the integration queue owns it.
+          --worktree / --no-worktree picks a git worktree
+          (.foreman/worktrees/<id>, branch card/<id>) or the project
+          checkout; neither = the app's dispatch-worktrees setting (the
+          board chip's default). A card that already carries a worktree
+          resumes in it, and --no-worktree is refused for it. Reply, like
+          open: {\"ok\":true,\"terminal\":\"tN\",\"project\":\"pN\"}; follow
+          the card with wait <id>.
   done    InProgress -> Done. Errors on any other state or a missing card
           (close-out never resurrects a card). A worktree card whose branch
           has commits not yet on its base is refused: submit it with
@@ -1612,7 +1695,7 @@ focused project).
           is removed — or, for wait <id>, until its integration is handed
           back. --timeout SECS bounds the wait; queued and integrating are
           still pending.
-Exit codes for add/list/start/edit/done/block/rm/cut/uncut/integrate: 0 ok,
+Exit codes for add/list/start/dispatch/edit/done/block/rm/cut/uncut/integrate: 0 ok,
 1 refused/unreachable, 2 bad arguments.
 Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
 (Blocked, orphaned, or removed), 2 timeout or foreman unreachable — a
@@ -3752,6 +3835,91 @@ mod tests {
         assert!(parse_kanban_args(&s(&["integrate"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["integrate", "a1", "b2"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["integrate", "a1", "--nope"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_dispatch_takes_id_agent_worktree_and_project() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parse = |v: &[&str]| parse_kanban_args(&s(v), Some("p2".into()), None);
+        let KanbanAction::Request(r) = parse(&["dispatch", "a1", "--agent", "codex"]).unwrap()
+        else {
+            panic!("dispatch is a wire request");
+        };
+        assert_eq!(r.action, "dispatch");
+        assert_eq!(r.id.as_deref(), Some("a1"));
+        assert_eq!(r.agent.as_deref(), Some("codex"));
+        assert_eq!(r.project.as_deref(), Some("p2"));
+        assert_eq!(
+            r.worktree, None,
+            "no flag = the app's setting, decided by the GUI"
+        );
+        assert!(r.from.is_none(), "dispatch needs no FOREMAN_TERMINAL_ID");
+
+        let KanbanAction::Request(r) = parse(&[
+            "dispatch",
+            "--worktree",
+            "a1",
+            "--agent",
+            "claude",
+            "--project",
+            "p9",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(r.worktree, Some(true));
+        assert_eq!(r.project.as_deref(), Some("p9"));
+        let KanbanAction::Request(r) =
+            parse(&["dispatch", "a1", "--agent", "grok", "--no-worktree"]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(r.worktree, Some(false));
+
+        // missing id / agent, bad agent, contradictory or unknown flags
+        assert!(
+            parse(&["dispatch", "--agent", "claude"])
+                .unwrap_err()
+                .contains("<id>")
+        );
+        assert!(parse(&["dispatch", "a1"]).unwrap_err().contains("--agent"));
+        assert!(parse(&["dispatch", "a1", "--agent"]).is_err());
+        let e = parse(&["dispatch", "a1", "--agent", "gpt"]).unwrap_err();
+        assert!(e.contains("unknown agent") && e.contains("claude"), "{e}");
+        assert!(
+            parse(&[
+                "dispatch",
+                "a1",
+                "--agent",
+                "claude",
+                "--worktree",
+                "--no-worktree"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["dispatch", "a1", "b2", "--agent", "claude"]).is_err());
+        assert!(parse(&["dispatch", "a1", "--agent", "claude", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn kanban_request_agent_and_worktree_are_wire_compatible_with_v1() {
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "start".into(),
+            id: Some("a1".into()),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&req).unwrap();
+        assert!(
+            !j.contains("\"agent\"") && !j.contains("\"worktree\""),
+            "{j}"
+        );
+        let r: KanbanRequest = serde_json::from_str(
+            r#"{"cmd":"kanban","action":"dispatch","id":"a1","agent":"claude","worktree":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.agent.as_deref(), Some("claude"));
+        assert_eq!(r.worktree, Some(false));
     }
 
     #[test]
