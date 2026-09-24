@@ -26,6 +26,25 @@
   ```
 - Test commands: `cargo test --target-dir target/agent git_history` covers `git_history`, `details`, `diff`, `diff_view`, and `git` modules. Run `cargo fmt` before each commit.
 
+## Sequencing with card zfw4je (read before starting)
+
+Card **zfw4je** ("Polish Git History file tree and commit details") touches
+the same files. At the time of writing it was blocked, with uncommitted edits
+to `src/git_history/details.rs` and `docs/git-history.md` sitting in the main
+checkout. It recolors `status_color` (the Darcula file-status palette) and adds
+**single-file selection** to the details pane.
+
+- **Before Task 1:** `git status` must show no foreign edits to
+  `src/git_history/*` or `docs/git-history.md`. If zfw4je's edits are still
+  there, stop and ask the human; do not stage, stash, or overwrite them.
+- Tasks 1–4 do not depend on zfw4je. The diff palette is deliberately its own
+  constants, not `status_color`.
+- **Task 5's details-pane step assumes zfw4je has landed.** If the pane
+  already has a selected-file row, hook the diff open into that selection
+  (selecting a file opens its diff) and reuse its highlight. Skip the
+  `opened` field and the `background_color` highlight below. The `target()`
+  builder, `open`/`take_open`, and all of the wm wiring stay as written.
+
 ## Review Focus
 
 1. **A single enormous line** (minified JS, a lockfile line of 1 MB): painting must lay out only the visible slice of a line, not the whole line, every frame. Pinned by `visible_slice_*` tests in Task 4.
@@ -827,7 +846,7 @@ Card: l8th0t"
 **Files:**
 - Create: `src/git_history/diff_view.rs` (target + load half; the view comes in Task 4)
 - Modify: `src/git_history.rs` (add `mod diff_view; pub use diff_view::DiffTarget;`)
-- Modify: `src/git_history/details.rs` (make `display_path` and `status_color` `pub(super)`)
+- Modify: `src/git_history/details.rs` (make `display_path` `pub(super)`)
 
 **Interfaces:**
 - Consumes: `git::output`, `git::GitError` (Task 1); `diff::{parse, Diff, Notice, CONTEXT_LINES}` (Task 2)
@@ -1111,7 +1130,7 @@ pub(super) fn load(cwd: &Path, target: &DiffTarget, cancel: &Arc<AtomicBool>) ->
 }
 ```
 
-In `details.rs`, change `fn display_path` and `fn status_color` to `pub(super) fn`. They're used in Task 4.
+In `details.rs`, change `fn display_path` to `pub(super) fn`. It's used in Task 4.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -1140,7 +1159,7 @@ Card: l8th0t"
 - Modify: `src/git_history.rs` (`pub use diff_view::{DiffTarget, DiffView};`)
 
 **Interfaces:**
-- Consumes: `DiffTarget`, `load` (Task 3); `diff::{Doc, Row, Cell, Kind, Block}` (Task 2); `details::{display_path, status_color}` (Task 3 made them `pub(super)`)
+- Consumes: `DiffTarget`, `load` (Task 3); `diff::{Doc, Row, Cell, Kind, Block}` (Task 2); `details::display_path` (Task 3 made it `pub(super)`)
 - Produces:
   - `pub struct DiffView` with `pub fn new(cwd: Option<PathBuf>) -> Self`, `pub fn retarget(&mut self, target: DiffTarget)`, `pub fn target(&self) -> Option<&DiffTarget>`, `pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, active: bool, base: egui::Id)`
   - `fn step_block(blocks: &[Block], current: Option<usize>, anchor: usize, forward: bool) -> Option<usize>` (pure)
@@ -1311,7 +1330,7 @@ Expected: compile errors (`DiffView`, `step_block`, `visible`, `Request` missing
 - [ ] **Step 3: Implement the view.** Replace the imports at the top of `diff_view.rs` with:
 
 ```rust
-use super::details::{display_path, status_color};
+use super::details::display_path;
 use super::diff::{self, Block, Diff, Doc, Kind, Notice, Row};
 use super::git;
 use eframe::egui;
@@ -1553,11 +1572,17 @@ fn header(ui: &mut egui::Ui, target: &DiffTarget, blocks: Option<usize>, th: &cr
     step
 }
 
+/// The diff's own band palette. Deliberately NOT `details::status_color`:
+/// that is the file-tree legend and is being restyled separately (card zfw4je).
+const REMOVED: egui::Color32 = egui::Color32::from_rgb(224, 118, 113);
+const ADDED: egui::Color32 = egui::Color32::from_rgb(116, 190, 140);
+const MODIFIED: egui::Color32 = egui::Color32::from_rgb(231, 169, 63);
+
 fn kind_color(kind: Kind) -> egui::Color32 {
     match kind {
-        Kind::Removed => status_color('D'),
-        Kind::Added => status_color('A'),
-        Kind::Modified | Kind::Same => status_color('M'),
+        Kind::Removed => REMOVED,
+        Kind::Added => ADDED,
+        Kind::Modified | Kind::Same => MODIFIED,
     }
 }
 

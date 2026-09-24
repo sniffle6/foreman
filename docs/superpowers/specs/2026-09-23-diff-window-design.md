@@ -193,8 +193,9 @@ thread, as History already does with its pages.
   including rescaling the scroll offset on zoom.
 - **Bands:** `Removed` red on the left, `Added` green on the right, `Modified`
   amber both sides with a stronger tint over `hot`, padding cells a faint
-  neutral fill. Colors come from `details.rs`'s `status_color` family at
-  reduced alpha; no new theme fields in v1.
+  neutral fill. The diff has its own three color constants (not `details.rs`'s
+  `status_color`, which is the file-tree legend and is being restyled by
+  card zfw4je); no new theme fields in v1.
 - **Connector gutter:** for each visible row inside a block, a straight band in
   the block's color spans the gap.
 - **Marker strip:** pinned at the right edge, outside the scroll area. Each
