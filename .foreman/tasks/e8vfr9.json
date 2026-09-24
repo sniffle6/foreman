@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "id": "e8vfr9",
+  "title": "Finish shared zoom-style review fixes",
+  "body": "Reviewed fixes are committed as 056179c on branch card/p6lrek. Dispatch this card from the board with wt on, then cherry-pick 056179c into its worktree, verify, commit with Card: e8vfr9 if needed, and integrate. Computer Use native pipe was unavailable to dispatch from this session.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.4",
+    "at": "2026-09-24T10:53:43Z",
+    "commits": [
+      "d9a86fc",
+      "44405c0"
+    ]
+  },
+  "created": "2026-09-24T03:13:29Z",
+  "updated": "2026-09-24T10:53:43Z"
+}

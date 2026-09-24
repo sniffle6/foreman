@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "w163az",
+  "title": "Find the one-frame egui ID clash when focus moves between Git History and Diff windows",
+  "body": "GitHub issue #8. Debug builds flash egui's red ID-clash outline for one frame on the focus-change click; unknown whether pre-existing. Start with a headless wm test that simulates the click and scans the frame's shapes for 'Double use of' / 'First use of' text to get the Id.",
+  "state": "backlog",
+  "created": "2026-09-24T04:33:35Z",
+  "updated": "2026-09-24T04:33:35Z"
+}

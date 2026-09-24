@@ -4,11 +4,14 @@
   "title": "Polish Git History file tree and commit details",
   "body": "The specification below is self-contained because the original docs/git-history.md section was left uncommitted in the shared checkout and is absent from newly created worktrees. Implement it and include the feature documentation in your changes. Primary code: src/git_history/details.rs and src/git_history.rs.\n\nThe polish scope is presentation and single-file selection; opening file diffs\nis outside this scope. Preserve Foreman's warm dark palette, compact density,\nand restrained separators while using JetBrains' information hierarchy.\n\n- Place the changed-file tree above commit details with a draggable divider\n  and independent scrolling for each region.\n- Give the tree folder/file icons, consistent indentation and disclosure-arrow\n  spacing, and muted file counts beside directories.\n- Keep status-colored filenames and status letters using the shared palette in\n  `status_color`. Remove the permanent legend and explain statuses on hover.\n- Lead commit details with the subject, then the message, then compact author,\n  date, and hash metadata. Show a short hash; its copy action copies the full\n  hash. Show containing branches as compact badges alongside the metadata.\n- Clicking a file selects only that file with a subtle full-row background.\n  Keep its status color and letter readable. Hover has a lighter treatment\n  distinct from selection. File clicks only select; they do not open a diff.\n- Preserve file selection through scrolling and directory collapse/expansion.\n  Directory clicks only toggle expansion. Selecting another commit or\n  refreshing clears file selection.\n\nValidate the layout, divider, scrolling, hover/selection distinction, and\nstatus-color readability with native screenshots. Verify selection persistence\nand clearing behavior, and run the repository's build/test checks.\n\nThe color change is also uncommitted in the shared checkout. Required JetBrains Darcula mapping: added/copied #629755; modified/type-changed #6897BB; deleted #6C6C6C; renamed #3A8484. Use the same mapping for status letters and filenames.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/zfw4je",
-    "branch": "card/zfw4je",
-    "base": "main"
+  "shipped": {
+    "name": "v0.5.4",
+    "at": "2026-09-24T10:53:43Z",
+    "commits": [
+      "a685aa1",
+      "15eabe4"
+    ]
   },
   "created": "2026-09-24T00:59:19Z",
-  "updated": "2026-09-24T01:52:04Z"
+  "updated": "2026-09-24T10:53:43Z"
 }

@@ -4,6 +4,13 @@
   "title": "Git history: commit details pane (changed-file tree + message)",
   "body": "Select a commit in Git History -> right-hand pane shows changed-file tree colored by status, full message, hash/author/date, containing branches. Spec: docs/superpowers/specs/ (commit-details, in progress). Diff viewer is a separate card.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.4",
+    "at": "2026-09-24T10:53:43Z",
+    "commits": [
+      "67cdbc8"
+    ]
+  },
   "created": "2026-09-23T23:25:34Z",
-  "updated": "2026-09-23T23:54:08Z"
+  "updated": "2026-09-24T10:53:43Z"
 }

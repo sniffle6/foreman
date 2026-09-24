@@ -3,7 +3,14 @@
   "id": "p6lrek",
   "title": "Share font-size scaling between board and Git history",
   "body": "board.rs and git_history.rs each hand-multiply every px value by font_size / DEFAULT_FONT_SIZE (the git_history version came from card 06zk79). Any new size without the factor won't zoom, and no test catches that. Pull the scaling into one shared helper, e.g. a scaled-style wrapper, so new UI zooms by default. Low priority: do it when a third view needs zoom. Start in a fresh session.",
-  "state": "backlog",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.4",
+    "at": "2026-09-24T10:53:43Z",
+    "commits": [
+      "cc6f6e3"
+    ]
+  },
   "created": "2026-09-23T23:45:30Z",
-  "updated": "2026-09-23T23:45:30Z"
+  "updated": "2026-09-24T10:53:43Z"
 }

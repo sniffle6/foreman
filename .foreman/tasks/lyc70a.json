@@ -2,8 +2,19 @@
   "v": 1,
   "id": "lyc70a",
   "title": "Git working tree view: dirty files in their own window (read-only)",
-  "body": "Per-Project window showing uncommitted changes: staged, unstaged, untracked, colored by status, like the commit details file tree. View only, no stage/commit/push. Reuse the tree from src/git_history/details.rs and the shared git_output from l8th0t. Clicking a file should open the l8th0t diff window (HEAD/index vs working copy). Needs a short brainstorm: staged/unstaged split, refresh model (manual vs watch).",
-  "state": "backlog",
+  "body": "Per-Project window showing uncommitted changes: staged, unstaged, untracked, colored by status, like the commit details file tree. View only, no stage/commit/push. Reuse the tree from src/git_history/details.rs and the shared git helper (src/git_history/git.rs) from l8th0t. Clicking a file should open the l8th0t diff window (HEAD/index vs working copy).\n\nDEPENDS ON l8th0t (blocked 2026-09-24; l8th0t was still backlog). Start only after l8th0t lands.\n\nBrainstorm decisions (from the human, 2026-09-24):\n- Layout: copy the JetBrains \"Commit\" tool window's change list, in Foreman style, minus everything that writes. Top-level collapsible groups \"Changes N files\" and \"Unversioned Files N files\" (untracked), each with a muted file count and a directory tree under it (folder rows with \"N files\", files colored by status via details.rs status_color). No checkboxes, no commit message box, no Commit/Amend/Push buttons, and no rollback/shelve toolbar actions. A Refresh button is the only toolbar item. Staged vs unstaged is not decided in the screenshot. JetBrains merges them into \"Changes\"; confirm with the human whether to add a separate \"Staged\" group or merge them the way JetBrains does.\n- Refresh: manual Refresh button, plus a debounced automatic re-read when the window opens or becomes active. No file watcher, no polling, and no work while idle.\n- Diff: working-tree diffs are out of scope for l8th0t v1, so this card must add a working-tree DiffTarget kind (index/HEAD vs working copy; untracked = new file).",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.4",
+    "at": "2026-09-24T10:53:43Z",
+    "commits": [
+      "ec716d3",
+      "55f1074",
+      "cee4f1c",
+      "a8b1091",
+      "de8ed67"
+    ]
+  },
   "created": "2026-09-24T00:50:59Z",
-  "updated": "2026-09-24T00:50:59Z"
+  "updated": "2026-09-24T10:53:43Z"
 }
