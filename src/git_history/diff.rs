@@ -42,6 +42,10 @@ pub(super) struct Cell {
     pub(super) text: String,
     /// Byte range (char-aligned) of the differing middle, `Modified` rows only.
     pub(super) hot: Option<Range<usize>>,
+    /// `hot` in chars (= columns), so painting never counts a long line.
+    pub(super) hot_chars: Option<Range<usize>>,
+    /// Char count (= columns) of `text`. Equal to `text.len()` iff ASCII.
+    pub(super) chars: usize,
     pub(super) no_eol: bool,
 }
 #[derive(Debug, PartialEq)]
@@ -160,6 +164,8 @@ impl Builder {
             line,
             text,
             hot: None,
+            hot_chars: None,
+            chars: cols,
             no_eol: false,
         }
     }
@@ -264,23 +270,22 @@ fn display(raw: &[u8]) -> (String, usize) {
 /// char-aligned prefix and suffix. An empty middle stays `None`.
 fn trim(old: &mut Cell, new: &mut Cell) {
     let (a, b) = (old.text.as_str(), new.text.as_str());
-    let prefix: usize = a
-        .chars()
-        .zip(b.chars())
-        .take_while(|(x, y)| x == y)
-        .map(|(x, _)| x.len_utf8())
-        .sum();
-    let suffix: usize = a[prefix..]
-        .chars()
-        .rev()
-        .zip(b[prefix..].chars().rev())
-        .take_while(|(x, y)| x == y)
-        .map(|(x, _)| x.len_utf8())
-        .sum();
-    let span = |len: usize| (prefix < len - suffix).then(|| prefix..len - suffix);
-    let (ol, nl) = (a.len(), b.len());
-    old.hot = span(ol);
-    new.hot = span(nl);
+    // (bytes, chars) of the common prefix and suffix.
+    let common = |pairs: &mut dyn Iterator<Item = (char, char)>| {
+        pairs
+            .take_while(|(x, y)| x == y)
+            .fold((0, 0), |(bytes, chars), (x, _)| {
+                (bytes + x.len_utf8(), chars + 1)
+            })
+    };
+    let (prefix, prefix_chars) = common(&mut a.chars().zip(b.chars()));
+    let (suffix, suffix_chars) =
+        common(&mut a[prefix..].chars().rev().zip(b[prefix..].chars().rev()));
+    let span = |start: usize, end: usize| (start < end).then_some(start..end);
+    old.hot = span(prefix, a.len() - suffix);
+    new.hot = span(prefix, b.len() - suffix);
+    old.hot_chars = span(prefix_chars, old.chars - suffix_chars);
+    new.hot_chars = span(prefix_chars, new.chars - suffix_chars);
 }
 
 #[cfg(test)]
@@ -457,6 +462,18 @@ mod tests {
         }
         assert_eq!(hot(old), " = 1");
         assert_eq!(hot(new), "é = 12");
+        // Char offsets for painting: "let café" is 8 chars (9 bytes).
+        assert_eq!((old.chars, new.chars), (13, 15));
+        assert_eq!(old.hot, Some(9..13));
+        assert_eq!(old.hot_chars, Some(8..12));
+        assert_eq!(new.hot, Some(9..16));
+        assert_eq!(new.hot_chars, Some(8..14));
+        for c in [old, new] {
+            assert_eq!(c.chars, c.text.chars().count());
+            let (h, hc) = (c.hot.clone().unwrap(), c.hot_chars.clone().unwrap());
+            assert_eq!(c.text[..h.start].chars().count(), hc.start);
+            assert_eq!(c.text[..h.end].chars().count(), hc.end);
+        }
         // Pure insertion inside a line: only the new side is hot.
         let d = doc(&format!("{HEAD}@@ -1 +1 @@\n-ab\n+aXb\n"));
         assert_eq!(d.rows[0].old.as_ref().unwrap().hot, None);

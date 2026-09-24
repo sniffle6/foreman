@@ -220,6 +220,18 @@ fn visible(text: &str, skip: usize, take: usize) -> Range<usize> {
     start..end
 }
 
+/// `visible` for a parsed cell. ASCII text (char count = byte length) maps
+/// columns straight to bytes, so a far horizontal scroll into a huge line
+/// costs nothing; other text walks chars.
+fn visible_cell(cell: &diff::Cell, skip: usize, take: usize) -> Range<usize> {
+    let len = cell.text.len();
+    if cell.chars == len {
+        let start = skip.min(len);
+        return start..start.saturating_add(take).min(len);
+    }
+    visible(&cell.text, skip, take)
+}
+
 impl DiffView {
     pub fn new(cwd: Option<PathBuf>) -> Self {
         Self {
@@ -676,13 +688,9 @@ fn paint_row(
         let text_rect = egui::Rect::from_min_max(egui::pos2(x(text_x), r.top()), side.max);
         let tp = p.with_clip_rect(text_rect.intersect(p.clip_rect()));
         let x0 = text_rect.left() - hx;
-        // `get`, not indexing: a byte offset off a char boundary must not
-        // panic the frame, which would take every terminal down with it.
-        let col_x = |byte: usize| {
-            let chars = cell.text.get(..byte).map_or(0, |t| t.chars().count());
-            x0 + chars as f32 * cols.char_w
-        };
-        if let (Some(t), Some(hot)) = (tint, &cell.hot) {
+        // Char offsets come from the parser: no per-frame scan of the line.
+        let col_x = |chars: usize| x0 + chars as f32 * cols.char_w;
+        if let (Some(t), Some(hot)) = (tint, &cell.hot_chars) {
             tp.rect_filled(
                 egui::Rect::from_x_y_ranges(col_x(hot.start)..=col_x(hot.end), r.y_range()),
                 0.0,
@@ -691,7 +699,7 @@ fn paint_row(
         }
         let skip = (hx / cols.char_w) as usize;
         let take = (cols.side_w / cols.char_w) as usize + 2;
-        let vis = visible(&cell.text, skip, take);
+        let vis = visible_cell(cell, skip, take);
         tp.text(
             egui::pos2(x0 + skip as f32 * cols.char_w, r.center().y),
             egui::Align2::LEFT_CENTER,
@@ -701,7 +709,7 @@ fn paint_row(
         );
         if cell.no_eol {
             tp.text(
-                egui::pos2(col_x(cell.text.len()) + cols.char_w, r.center().y),
+                egui::pos2(col_x(cell.chars) + cols.char_w, r.center().y),
                 egui::Align2::LEFT_CENTER,
                 "(no newline)",
                 font.clone(),
@@ -1009,6 +1017,32 @@ mod tests {
         assert_eq!(visible(s, 2, 0), 3..3);
         let cjk = "日本語";
         assert_eq!(&cjk[visible(cjk, 1, 1)], "本");
+    }
+
+    #[test]
+    fn visible_cell_matches_visible_for_ascii_and_multibyte() {
+        let cell = |text: &str| diff::Cell {
+            line: 1,
+            text: text.into(),
+            hot: None,
+            hot_chars: None,
+            chars: text.chars().count(),
+            no_eol: false,
+        };
+        for text in ["", "plain ascii line", "héllo wörld", "日本語 text"] {
+            let c = cell(text);
+            for skip in [0, 1, 3, 7, 40] {
+                for take in [0, 1, 2, 5, 100] {
+                    assert_eq!(visible_cell(&c, skip, take), visible(text, skip, take));
+                }
+            }
+        }
+        let huge = cell(&"x".repeat(1_000_000));
+        assert_eq!(visible_cell(&huge, 999_990, 120), 999_990..1_000_000);
+        assert_eq!(
+            visible_cell(&huge, usize::MAX, usize::MAX),
+            1_000_000..1_000_000
+        );
     }
 
     #[test]
