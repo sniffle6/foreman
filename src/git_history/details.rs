@@ -568,7 +568,7 @@ fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
     }
 }
 
-fn display_path(path: &str) -> String {
+pub(super) fn display_path(path: &str) -> String {
     path.chars()
         .flat_map(|c| {
             if c.is_control() {

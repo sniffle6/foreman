@@ -2,7 +2,9 @@
 use eframe::egui;
 mod details;
 mod diff;
+mod diff_view;
 mod git;
+pub use diff_view::DiffTarget;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{
