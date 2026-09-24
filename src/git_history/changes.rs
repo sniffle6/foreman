@@ -23,6 +23,11 @@ const SECTIONS: [(&str, Stage); 4] = [
     ("Changes", Stage::Unstaged),
     ("Unversioned Files", Stage::Untracked),
 ];
+// Indices into `SECTIONS`.
+const CONFLICTS: usize = 0;
+const STAGED: usize = 1;
+const CHANGES: usize = 2;
+const UNVERSIONED: usize = 3;
 
 #[derive(Debug, PartialEq)]
 struct Entry {
@@ -70,7 +75,7 @@ fn parse_status(bytes: &[u8]) -> Result<(Option<String>, Vec<Entry>), String> {
                 }
             }
             "?" => entries.push(Entry {
-                section: 3,
+                section: UNVERSIONED,
                 file: ChangedFile {
                     status: '?',
                     path: rest.to_owned(),
@@ -80,7 +85,7 @@ fn parse_status(bytes: &[u8]) -> Result<(Option<String>, Vec<Entry>), String> {
             "u" => {
                 let path = parts.get(9).ok_or_else(incomplete)?;
                 entries.push(Entry {
-                    section: 0,
+                    section: CONFLICTS,
                     file: ChangedFile {
                         status: 'U',
                         path: (*path).to_owned(),
@@ -102,7 +107,7 @@ fn parse_status(bytes: &[u8]) -> Result<(Option<String>, Vec<Entry>), String> {
                 }
                 if xy[0] != b'.' {
                     entries.push(Entry {
-                        section: 1,
+                        section: STAGED,
                         file: ChangedFile {
                             status: status_char(xy[0])?,
                             path: (*path).to_owned(),
@@ -112,7 +117,7 @@ fn parse_status(bytes: &[u8]) -> Result<(Option<String>, Vec<Entry>), String> {
                 }
                 if xy[1] != b'.' {
                     entries.push(Entry {
-                        section: 2,
+                        section: CHANGES,
                         file: ChangedFile {
                             status: status_char(xy[1])?,
                             path: (*path).to_owned(),
