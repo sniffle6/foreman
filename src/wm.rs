@@ -450,13 +450,7 @@ enum Act {
     Max(WinId),
     /// Toggle window between tiled and floating (the header toggle button).
     Float(WinId),
-    /// Dispatch a terminal of `Shell` into project window `WinId`. Deferred like
-    /// the rest: the header key is drawn mid-loop, but reaching into the project's
-    /// nested manager has to wait until after the render borrow is released.
-    AddTerm(WinId, Shell),
-    /// Open the directory picker to create a new sibling project on the desktop.
-    /// Fired by the "+" on a project titlebar; the actual project is created when
-    /// the user accepts a directory in the picker.
+    /// Desktop-scope directory picker for a new project.
     OpenProjectPicker,
     /// Switch window `WinId` to tab index `usize` (tab-bar click).
     SetTab(WinId, usize),
@@ -478,12 +472,8 @@ enum Act {
     MinPath(crate::panel::TargetPath),
     /// Close a panel row target (routes through the close-confirm path).
     ClosePath(crate::panel::TargetPath),
-    /// Spawn a default-shell terminal into the project a panel row names —
-    /// the sessions-panel `+`. Same spawn path as the header `+` and
-    /// `Command::NewTerm` (`add_terminal`), but addressed by `TargetPath` so
-    /// a background project *tab* is activated first and the project is
-    /// surfaced (unminimized, focused) so the new terminal is visible.
-    AddTermPath(crate::panel::TargetPath),
+    /// Launch into a project addressed by the titlebar or panel path.
+    LaunchPath(crate::panel::TargetPath, crate::launcher::Launch),
     /// Panel drag-drop reorder: presentation-only rank rewrite. Never touches
     /// the tree, z-order, tab-strip order, focus, or active tabs. Deferred:
     /// renumbering needs `&mut` across windows while the panel view's render
@@ -3435,6 +3425,20 @@ impl WindowManager {
         }
     }
 
+    fn open_tools(&self) -> std::collections::HashSet<crate::launcher::Tool> {
+        self.windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .filter_map(|t| match &t.content {
+                Content::Chat(_) => Some(crate::launcher::Tool::Chat),
+                Content::Board(_) => Some(crate::launcher::Tool::Board),
+                Content::Plan(_) => Some(crate::launcher::Tool::Plan),
+                Content::GitHistory(_) => Some(crate::launcher::Tool::GitHistory),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Pure snapshot of the whole tree for the task-manager panel (read seam).
     /// One `ProjectEntry` per `Content::Project` tab; the panel window itself is
     /// skipped. Cheap; rebuilt each frame by the desktop `show`.
@@ -3502,6 +3506,7 @@ impl WindowManager {
                         });
                     }
                 }
+                let open_tools = inner.open_tools();
                 projects.push(ProjectEntry {
                     path: ppath,
                     title: pt.title.clone(),
@@ -3511,6 +3516,7 @@ impl WindowManager {
                     rank: pt.panel_order,
                     collapsed: pt.panel_collapsed,
                     uid: pt.tab_uid,
+                    open_tools,
                     tabs,
                 });
             }
@@ -3832,9 +3838,10 @@ impl WindowManager {
     }
 
     /// Drain panel-row interactions recorded during the draw into deferred Acts.
-    fn drain_panel_acts(&mut self, acts: &mut Vec<Act>) {
+    fn drain_panel_acts(&mut self, acts: &mut Vec<Act>, ctx: &egui::Context) {
         let mut click = None;
         let mut hover = None;
+        let mut launch = None;
         let mut toggle = false;
         let mut reorder = None;
         let mut folder_toggle = None;
@@ -3846,6 +3853,9 @@ impl WindowManager {
                     }
                     if let Some(h) = v.hover_act.take() {
                         hover = Some(h);
+                    }
+                    if let Some(a) = v.launch.take() {
+                        launch = Some(a);
                     }
                     if v.toggle_collapse {
                         v.toggle_collapse = false;
@@ -3880,7 +3890,19 @@ impl WindowManager {
             acts.push(match b {
                 crate::panel::PanelBtn::Min => Act::MinPath(p),
                 crate::panel::PanelBtn::Close => Act::ClosePath(p),
-                crate::panel::PanelBtn::AddTerm => Act::AddTermPath(p),
+                crate::panel::PanelBtn::AddTerm => Act::LaunchPath(
+                    p,
+                    crate::launcher::Launch::Shell(
+                        crate::config::live(ctx).default_shell.to_shell(),
+                    ),
+                ),
+            });
+        }
+        if let Some((p, a)) = launch {
+            acts.push(if a == crate::launcher::Launch::NewProject {
+                Act::OpenProjectPicker
+            } else {
+                Act::LaunchPath(p, a)
             });
         }
         if let Some(r) = reorder {
@@ -3939,12 +3961,19 @@ impl WindowManager {
         }
     }
 
-    /// Sessions-panel `+`: add a default-shell terminal to the project tab a
-    /// panel row names, then surface that project. Project rows carry the
+    /// Launch into the project tab a panel row or titlebar names, then surface
+    /// that project. Project rows carry the
     /// project-tab index in `tab`; anything else (a stale or child path) falls
     /// back to the window's active project tab. No-op if the window is gone or
     /// the tab is not a project.
-    fn apply_add_term_path(&mut self, p: crate::panel::TargetPath, ctx: &egui::Context) {
+    fn apply_launch_path(
+        &mut self,
+        p: crate::panel::TargetPath,
+        launch: crate::launcher::Launch,
+        ctx: &egui::Context,
+    ) {
+        use crate::launcher::Launch;
+        debug_assert_ne!(launch, Launch::NewProject);
         let Some(pidx) = self.windows.iter().position(|w| w.id == p.project) else {
             return;
         };
@@ -3955,9 +3984,34 @@ impl WindowManager {
         let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content else {
             return;
         };
-        // `add_terminal` handles default placement (and `new_windows_float`)
-        // itself; it also focuses the new terminal inside the project.
-        inner.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx);
+        match launch {
+            Launch::Shell(shell) => {
+                inner.add_terminal(shell, ctx);
+            }
+            Launch::Agent(agent) => {
+                if !agent.installed() {
+                    crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Error,
+                        format!("{} isn't installed", agent.label()),
+                    );
+                } else if let Some(id) =
+                    inner.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx)
+                    && let Some(w) = inner.windows.iter_mut().find(|w| w.id == id)
+                    && let Content::Terminal(session) = w.active_content()
+                    && let Some(cmd) = agent.launch_command()
+                {
+                    session.inject_input(cmd);
+                }
+            }
+            Launch::Tool(tool) => match tool {
+                crate::launcher::Tool::Chat => inner.open_chat_window(),
+                crate::launcher::Tool::Board => inner.open_board_window(),
+                crate::launcher::Tool::Plan => inner.open_plan_window(),
+                crate::launcher::Tool::GitHistory => inner.open_git_history_window(),
+            },
+            Launch::NewProject => unreachable!(),
+        }
         self.surface_target(crate::panel::TargetPath {
             project: p.project,
             ptab: None,
@@ -6736,35 +6790,78 @@ impl WindowManager {
                             [egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)],
                             stroke,
                         );
-                        if let Some(act) = hover_menu(
+                        let path = crate::panel::TargetPath {
+                            project: id,
+                            ptab: None,
+                            window: None,
+                            tab: None,
+                        };
+                        if presp.clicked() {
+                            acts.push(Act::LaunchPath(
+                                path,
+                                crate::launcher::Launch::Shell(
+                                    crate::config::live(ui.ctx()).default_shell.to_shell(),
+                                ),
+                            ));
+                        }
+                        let menu_ctx = ui.ctx().clone();
+                        if let Some(launch) = crate::hover_menu::show(
                             ui,
                             base.with((id, "plusmenu")),
                             pr,
                             area,
-                            &[
-                                ("New project", Act::OpenProjectPicker),
-                                ("New PS terminal", Act::AddTerm(id, Shell::PowerShell)),
-                                ("New CMD terminal", Act::AddTerm(id, Shell::Cmd)),
-                                ("New SH terminal", Act::AddTerm(id, Shell::Bash)),
-                            ],
+                            || {
+                                let open_tools = match self.windows[i].active_content() {
+                                    Content::Project(inner) => inner.open_tools(),
+                                    _ => Default::default(),
+                                };
+                                crate::launcher::entries(
+                                    &crate::keymap::live(&menu_ctx),
+                                    crate::config::live(&menu_ctx).default_shell.to_shell(),
+                                    &open_tools,
+                                )
+                            },
                             false,
+                            presp.clicked(),
                         ) {
-                            acts.push(act);
+                            acts.push(if launch == crate::launcher::Launch::NewProject {
+                                Act::OpenProjectPicker
+                            } else {
+                                Act::LaunchPath(path, launch)
+                            });
                         }
                     }
                     // The ⋯ on the right: window controls for the project.
                     let float_label = if is_tiled { "Float" } else { "Tile" };
-                    if let Some(act) = hover_menu(
+                    if let Some(act) = crate::hover_menu::show(
                         ui,
                         base.with((id, "ovfmenu")),
                         ovf_rect,
                         area,
-                        &[
-                            (float_label, Act::Float(id)),
-                            ("Minimize", Act::Min(id)),
-                            ("Maximize", Act::Max(id)),
-                        ],
+                        || {
+                            vec![
+                                crate::hover_menu::Entry::Item {
+                                    label: float_label,
+                                    hint: None,
+                                    mark: false,
+                                    act: Act::Float(id),
+                                },
+                                crate::hover_menu::Entry::Item {
+                                    label: "Minimize",
+                                    hint: None,
+                                    mark: false,
+                                    act: Act::Min(id),
+                                },
+                                crate::hover_menu::Entry::Item {
+                                    label: "Maximize",
+                                    hint: None,
+                                    mark: false,
+                                    act: Act::Max(id),
+                                },
+                            ]
+                        },
                         true,
+                        false,
                     ) {
                         acts.push(act);
                     }
@@ -7013,7 +7110,7 @@ impl WindowManager {
         let ctx = ui.ctx().clone();
         // Panel drains join the same act list before apply (focus/min/close paths).
         if self.desktop {
-            self.drain_panel_acts(&mut acts);
+            self.drain_panel_acts(&mut acts, &ctx);
         }
         // Any Act means a window in this manager was interacted with this frame.
         // Captured before the apply loop consumes `acts`, returned at the end so
@@ -7235,16 +7332,6 @@ impl WindowManager {
             match a {
                 Act::Drop { src, pointer } => self.commit_drop(src, pointer),
                 Act::Focus(id) => self.focus(id),
-                Act::AddTerm(id, shell) => {
-                    if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                        if let Content::Project(wm) = w.active_content() {
-                            // `add_terminal` handles default placement (and
-                            // `new_windows_float`) itself.
-                            wm.add_terminal(shell, ctx);
-                        }
-                    }
-                    self.focus(id);
-                }
                 Act::OpenProjectPicker => {
                     self.picker = Some(DirPicker::new(self.picker_start(ctx)));
                 }
@@ -7276,7 +7363,7 @@ impl WindowManager {
                 Act::FocusPath(p) => self.toggle_surface_target(p),
                 Act::MinPath(p) => self.apply_min_path(p),
                 Act::ClosePath(p) => self.apply_close_path(p),
-                Act::AddTermPath(p) => self.apply_add_term_path(p, ctx),
+                Act::LaunchPath(p, launch) => self.apply_launch_path(p, launch, ctx),
                 Act::ReorderPanel(r) => {
                     // Rejects are no-ops; the trailing mark_workspace_dirty()
                     // over-dirties by design (see the comment below the loop).
@@ -7512,99 +7599,6 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 /// anchor+panel region (4 px slop bridges the gap). The open flag is
 /// transient egui memory — per-frame UI state, never model state.
 /// `align_right` right-aligns the panel to the anchor's right edge.
-fn hover_menu(
-    ui: &mut egui::Ui,
-    menu_id: egui::Id,
-    anchor: egui::Rect,
-    area: egui::Rect,
-    items: &[(&str, Act)],
-    align_right: bool,
-) -> Option<Act> {
-    let th = crate::theme::live(ui.ctx());
-    let open_id = menu_id.with("open");
-    let was_open = ui
-        .ctx()
-        .data(|d| d.get_temp::<bool>(open_id))
-        .unwrap_or(false);
-    // Layer-aware open test: an occluded header can't pop a menu through a
-    // floating window above it.
-    let open = was_open || ui.rect_contains_pointer(anchor);
-    if !open {
-        return None;
-    }
-    let font = egui::FontId::proportional(12.0);
-    let row_h = 22.0;
-    let pad = 10.0;
-    let w = items
-        .iter()
-        .map(|(l, _)| {
-            ui.painter()
-                .layout_no_wrap((*l).to_owned(), font.clone(), th.text)
-                .size()
-                .x
-        })
-        .fold(0.0f32, f32::max)
-        + pad * 2.0;
-    let panel_h = row_h * items.len() as f32 + 8.0;
-    // Below the anchor; flip above it at the bottom desktop edge.
-    let below = anchor.bottom() + 2.0;
-    let oy = if below + panel_h > area.max.y {
-        (anchor.top() - 2.0 - panel_h).max(area.min.y)
-    } else {
-        below
-    };
-    let ox = if align_right {
-        (anchor.right() - w).max(area.min.x)
-    } else {
-        anchor.left().min(area.max.x - w).max(area.min.x)
-    };
-    let panel = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(w, panel_h));
-    let mut clicked = None;
-    egui::Area::new(menu_id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(panel.min)
-        .show(ui.ctx(), |mui| {
-            let mp = mui.painter();
-            mp.rect_filled(panel, egui::CornerRadius::same(4), th.title_bg);
-            mp.rect_stroke(
-                panel,
-                egui::CornerRadius::same(4),
-                egui::Stroke::new(1.0, th.border),
-                egui::StrokeKind::Inside,
-            );
-            for (ri, (label, act)) in items.iter().enumerate() {
-                let rr = egui::Rect::from_min_size(
-                    egui::pos2(panel.min.x, panel.min.y + 4.0 + row_h * ri as f32),
-                    egui::vec2(w, row_h),
-                );
-                let rresp = mui.interact(rr, menu_id.with(("item", ri)), egui::Sense::click());
-                if rresp.hovered() {
-                    mui.painter().rect_filled(rr, 0.0, th.title_bg_focus);
-                }
-                mui.painter().text(
-                    egui::pos2(rr.min.x + pad, rr.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    *label,
-                    font.clone(),
-                    th.text,
-                );
-                if rresp.clicked() {
-                    clicked = Some(act.clone());
-                }
-            }
-        });
-    // Stay open only while the pointer rides the anchor or panel. Geometric
-    // containment is safe here: the panel is topmost Foreground.
-    let ptr_near = ui
-        .ctx()
-        .pointer_latest_pos()
-        .is_some_and(|p| anchor.union(panel).expand(4.0).contains(p));
-    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    let stay = ptr_near && !esc && clicked.is_none();
-    ui.ctx().data_mut(|d| d.insert_temp(open_id, stay));
-    clicked
-}
-
 // --- header layout (pure) --------------------------------------------------
 // All rect math for the TITLE_H band: chip packing, the project `+` clamp,
 // and the control row. Pure over caller-measured label widths (fonts are
@@ -8162,7 +8156,7 @@ mod tests {
                 view.folder_toggle = Some(uid);
             }
         }
-        wm.drain_panel_acts(&mut Vec::new());
+        wm.drain_panel_acts(&mut Vec::new(), &egui::Context::default());
         assert!(wm.poll_workspace_dirty());
         let json = serde_json::to_string(&wm.capture_workspace()).unwrap();
         let snap = crate::workspace::parse_workspace_json(&json);
@@ -8181,7 +8175,7 @@ mod tests {
             }
         }
         restored.poll_workspace_dirty();
-        restored.drain_panel_acts(&mut Vec::new());
+        restored.drain_panel_acts(&mut Vec::new(), &egui::Context::default());
         assert!(restored.poll_workspace_dirty());
         let expanded = serde_json::to_string(&restored.capture_workspace()).unwrap();
         assert!(!expanded.contains("panel_collapsed"));
@@ -9398,12 +9392,15 @@ mod tests {
         win.active = 0;
         desk.minimize(w);
         desk.apply_acts(
-            vec![Act::AddTermPath(crate::panel::TargetPath {
-                project: w,
-                ptab: None,
-                window: None,
-                tab: Some(1),
-            })],
+            vec![Act::LaunchPath(
+                crate::panel::TargetPath {
+                    project: w,
+                    ptab: None,
+                    window: None,
+                    tab: Some(1),
+                },
+                crate::launcher::Launch::Shell(Shell::PowerShell),
+            )],
             egui::vec2(0.0, 0.0),
             egui::Id::new("t"),
             &ctx,
@@ -13321,6 +13318,8 @@ mod tests {
         let p = &m.projects[0];
         assert_eq!(p.title, "projA");
         assert!(p.focused && !p.minimized);
+        assert!(p.open_tools.contains(&crate::launcher::Tool::Chat));
+        assert!(!p.open_tools.contains(&crate::launcher::Tool::Board));
         assert_eq!(
             p.path,
             crate::panel::TargetPath {

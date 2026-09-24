@@ -128,6 +128,8 @@ pub struct ProjectEntry {
     /// `Tab` uid (`src/wm.rs`), process-unique and travelling with the tab
     /// through merge/untab.
     pub uid: u64,
+    /// Singleton project tools currently present in the nested manager.
+    pub open_tools: HashSet<crate::launcher::Tool>,
 }
 
 /// Display variant for the update chip; one per Phase-4 `update::State` case
@@ -339,6 +341,7 @@ pub struct PanelView {
     thumb_last_scroll: f32,
     pub click: Option<TargetPath>,
     pub hover_act: Option<(TargetPath, PanelBtn)>,
+    pub launch: Option<(TargetPath, crate::launcher::Launch)>,
     pub toggle_collapse: bool,
     /// Latched when the user clicks the update chip; wm drains it each frame.
     pub update_click: bool,
@@ -379,6 +382,7 @@ impl PanelView {
             thumb_last_scroll: 0.0,
             click: None,
             hover_act: None,
+            launch: None,
             toggle_collapse: false,
             update_click: false,
             reorder: None,
@@ -1777,6 +1781,7 @@ impl PanelView {
         }
 
         let mut btn_hit = false;
+        let mut plus_clicked = false;
         if over {
             let btn_y = row.center().y;
             let min_c = egui::pos2(row.max.x - 26.0, btn_y);
@@ -1829,9 +1834,8 @@ impl PanelView {
             if rp.project_row {
                 let add_c = egui::pos2(row.max.x - 42.0, btn_y);
                 let add_r = egui::Rect::from_center_size(add_c, egui::vec2(16.0, 16.0));
-                let add_resp = ui
-                    .interact(add_r.intersect(clip), id.with("add"), egui::Sense::click())
-                    .on_hover_text("New terminal");
+                let add_resp =
+                    ui.interact(add_r.intersect(clip), id.with("add"), egui::Sense::click());
                 let s = 3.5;
                 let stroke =
                     egui::Stroke::new(1.3, if add_resp.hovered() { th.text } else { th.dim });
@@ -1852,6 +1856,7 @@ impl PanelView {
                 if add_resp.clicked() {
                     self.hover_act = Some((rp.path, PanelBtn::AddTerm));
                     btn_hit = true;
+                    plus_clicked = true;
                 }
             }
         } else if rp.bell {
@@ -1882,6 +1887,41 @@ impl PanelView {
                 egui::FontId::proportional(10.0),
                 th.dim,
             );
+        }
+
+        // Keep describing the popup while the pointer is on the popup itself:
+        // the row is no longer hovered in that frame.
+        if rp.project_row {
+            let anchor = egui::Rect::from_center_size(
+                egui::pos2(row.max.x - 42.0, row.center().y),
+                egui::vec2(16.0, 16.0),
+            )
+            .intersect(clip);
+            let ctx = ui.ctx().clone();
+            if let Some(launch) = crate::hover_menu::show(
+                ui,
+                id.with("add-menu"),
+                anchor,
+                ctx.content_rect(),
+                || {
+                    let open_tools = self
+                        .model
+                        .projects
+                        .iter()
+                        .find(|project| project.path == rp.path)
+                        .map(|project| &project.open_tools);
+                    crate::launcher::entries(
+                        &crate::keymap::live(&ctx),
+                        crate::config::live(&ctx).default_shell.to_shell(),
+                        open_tools.unwrap_or(&HashSet::new()),
+                    )
+                },
+                false,
+                plus_clicked,
+            ) {
+                self.launch = Some((rp.path, launch));
+                btn_hit = true;
+            }
         }
 
         if resp.clicked() && !btn_hit && !folder_hit {

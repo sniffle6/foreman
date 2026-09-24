@@ -49,14 +49,13 @@ and the landing site for future agent-state badges.
 - **Project rows have a hover `+`:** left of the min/close buttons on a
   project row (expanded vertical and Columns modes). Click spawns a
   default-shell terminal into *that* project through `PanelBtn::AddTerm` →
-  `Act::AddTermPath(TargetPath)` → `WindowManager::add_terminal` — the same
-  spawn path as the project titlebar `+` and `Command::NewTerm`, so placement
-  and `new_windows_float` behave identically. The path's `tab` names the
-  project tab, so a background tab of a tabbed-projects window is activated
-  first, and the project is surfaced (unminimized, focused) so the new
-  terminal is visible. Unlike the titlebar `+`, there is no shell menu: it
-  always uses `Settings::default_shell`. Strip and rail modes have no `+`
-  (expand to manage).
+  `Act::LaunchPath(TargetPath, Launch)` → `WindowManager::add_terminal`.
+  Hover opens the same grouped launcher as the titlebar: Agents, Shells,
+  Project tools, and New project. Its menu clamps to the desktop, opening
+  leftward from a right-docked panel. The path's `tab` names the project tab,
+  so a background tab of a tabbed-projects window is activated first, and
+  each launch surfaces the project. Project tools show a dot when already
+  open. Strip and rail modes have no `+` (expand to manage).
 - **Elided titles get a hover tooltip:** rows (expanded modes) and strip chips
   attach egui's `on_hover_text` with the full title only when the `…`
   truncation actually kicked in (`Galley::elided`), and never while a reorder
@@ -156,6 +155,8 @@ and the landing site for future agent-state badges.
 
 ## Key files
 
+- `src/launcher.rs` — shared launcher choices, groups, and keymap hints.
+- `src/hover_menu.rs` — shared grouped hover menu.
 - `src/panel.rs` — model types + row paint; axis-aware scrollbar input/paint;
   horizontal painters (`paint_columns`, `paint_strip`, `paint_rail_h`,
   `paint_chevron`); folder fold (`toggle_folder`, `vertical_content_height`,

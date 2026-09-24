@@ -273,6 +273,12 @@ A window interaction recorded during the draw pass and applied after it, because
 the draw cannot mutate nested Window managers mid-render.
 _Avoid_: command, event (overloaded), callback.
 
+**Project launcher**:
+The ordered Agents, Shells, Project tools, and New project choices shared by
+project titlebars and task-manager project rows. `src/launcher.rs` builds the
+list from the live keymap, default shell, and open project tools; `LaunchPath`
+resolves the target project tab, performs the action, and surfaces that project.
+
 **Panel order**:
 Presentation-only per-tab rank (`Tab::panel_order`) driving sessions-panel row
 order. Written only by `Act::ReorderPanel` (dense per scope), projected by
