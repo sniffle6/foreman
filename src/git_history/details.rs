@@ -512,11 +512,13 @@ fn status_name(status: char) -> &'static str {
     }
 }
 fn status_color(status: char) -> egui::Color32 {
+    // JetBrains Darcula FILESTATUS colors, independent of graph lane colors.
+    // Copies are additions; Git type changes use the modified-file color.
     match status {
-        'A' => egui::Color32::from_rgb(116, 190, 140),
-        'D' => egui::Color32::from_rgb(224, 118, 113),
-        'R' | 'C' => COLORS[2],
-        'M' | 'T' => COLORS[1],
+        'A' | 'C' => egui::Color32::from_rgb(0x62, 0x97, 0x55),
+        'D' => egui::Color32::from_rgb(0x6c, 0x6c, 0x6c),
+        'R' => egui::Color32::from_rgb(0x3a, 0x84, 0x84),
+        'M' | 'T' => egui::Color32::from_rgb(0x68, 0x97, 0xbb),
         _ => COLORS[3],
     }
 }

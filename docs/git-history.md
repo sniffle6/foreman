@@ -26,9 +26,13 @@ commit message, copyable object id, author name/email, author timestamp with
 timezone, and local/remote branches containing that commit. The branch list is
 an ancestry query, not just the decorations attached to the selected row.
 
-The changed-file tree groups paths into collapsible directories. Added files
-are green, modifications and type changes amber, deletions red, and renames or
-copies blue; status letters and a legend also identify each change. Hover a
+The changed-file tree groups paths into collapsible directories. File labels
+and the legend share JetBrains' Darcula file-status palette, independently of
+graph lane colors. Copies use the added-file color and type changes use the
+modified-file color; status letters also identify each change. The mapping is
+in `src/git_history/details.rs` (`status_color`), based on JetBrains'
+[default color schemes](https://github.com/JetBrains/intellij-community/blob/master/platform/platform-resources/src/DefaultColorSchemesManager.xml).
+Hover a
 rename for both paths. Roots compare against the empty tree; merges compare
 against their first parent, as labeled in the pane. Empty changes have an
 explicit placeholder. Metadata/message and file-tree scrolling are independent.
@@ -38,6 +42,34 @@ Branch selection and checkout/switching belong to the next task. Diffs, search,
 context menus, and other Git operations are outside this viewer's scope.
 
 ## Design and implementation plan
+
+### Details-pane polish specification
+
+The polish scope is presentation and single-file selection; opening file diffs
+is outside this scope. Preserve Foreman's warm dark palette, compact density,
+and restrained separators while using JetBrains' information hierarchy.
+
+- Place the changed-file tree above commit details with a draggable divider
+  and independent scrolling for each region.
+- Give the tree folder/file icons, consistent indentation and disclosure-arrow
+  spacing, and muted file counts beside directories.
+- Keep status-colored filenames and status letters using the shared palette in
+  `status_color`. Remove the permanent legend and explain statuses on hover.
+- Lead commit details with the subject, then the message, then compact author,
+  date, and hash metadata. Show a short hash; its copy action copies the full
+  hash. Show containing branches as compact badges alongside the metadata.
+- Clicking a file selects only that file with a subtle full-row background.
+  Keep its status color and letter readable. Hover has a lighter treatment
+  distinct from selection. File clicks only select; they do not open a diff.
+- Preserve file selection through scrolling and directory collapse/expansion.
+  Directory clicks only toggle expansion. Selecting another commit or
+  refreshing clears file selection.
+
+Validate the layout, divider, scrolling, hover/selection distinction, and
+status-color readability with native screenshots. Verify selection persistence
+and clearing behavior, and run the repository's build/test checks.
+
+### Existing viewer architecture
 
 The implementation follows the existing Project viewer seam instead of adding
 another window system:
