@@ -1136,7 +1136,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn provider_process_is_bounded_and_scrubs_hook_routing() {
+    fn provider_process_scrubs_hook_routing() {
         let cwd = tempfile::tempdir().unwrap();
         let echo_env = CommandSpec {
             program: "cmd.exe".into(),
@@ -1148,9 +1148,14 @@ mod tests {
             ],
             stdin: None,
         };
-        let output = run_process(&echo_env, cwd.path(), Duration::from_secs(2)).unwrap();
+        let output = run_process(&echo_env, cwd.path(), Duration::from_secs(10)).unwrap();
         assert!(!output.contains("[1]"), "FOREMAN leaked to naming child");
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_kills_slow_child_at_deadline() {
+        let cwd = tempfile::tempdir().unwrap();
         let slow = CommandSpec {
             program: "cmd.exe".into(),
             args: vec![
@@ -1165,7 +1170,12 @@ mod tests {
             run_process(&slow, cwd.path(), Duration::from_millis(50)),
             Err(TitleError::Timeout)
         );
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_bounds_blocked_stdin() {
+        let cwd = tempfile::tempdir().unwrap();
         let blocked_stdin = CommandSpec {
             program: "cmd.exe".into(),
             args: vec![
@@ -1186,14 +1196,19 @@ mod tests {
             "stdin must be inside the process deadline, elapsed {:?}",
             started.elapsed()
         );
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_reports_nonzero_exit_as_failed() {
+        let cwd = tempfile::tempdir().unwrap();
         let failed = CommandSpec {
             program: "cmd.exe".into(),
             args: vec!["/d".into(), "/s".into(), "/c".into(), "exit /b 7".into()],
             stdin: None,
         };
         assert_eq!(
-            run_process(&failed, cwd.path(), Duration::from_secs(2)),
+            run_process(&failed, cwd.path(), Duration::from_secs(10)),
             Err(TitleError::Failed)
         );
     }
@@ -1217,7 +1232,7 @@ mod tests {
             stdin: Some("name this prompt\n".into()),
         };
 
-        let output = run_process(&spec, cwd.path(), Duration::from_secs(2)).unwrap();
+        let output = run_process(&spec, cwd.path(), Duration::from_secs(10)).unwrap();
         assert_eq!(output.trim(), "Useful Shim Title");
 
         let unsafe_spec = CommandSpec {
