@@ -20,6 +20,11 @@ use std::time::Duration;
 const BATCH: usize = 512;
 const ROW_H: f32 = 28.0;
 const LANE_W: f32 = 16.0;
+/// Unscaled timeline column widths: author name, gaps, and the least subject
+/// room before a wide graph starts scrolling sideways.
+const AUTHOR_W: f32 = 140.0;
+const COL_GAP: f32 = 12.0;
+const MIN_SUBJECT_W: f32 = 120.0;
 const COLORS: [egui::Color32; 6] = [
     egui::Color32::from_rgb(116, 176, 164),
     egui::Color32::from_rgb(231, 169, 63),
@@ -490,10 +495,16 @@ impl HistoryView {
         let mut selected = None;
         let (row_h, lane_w) = (zoom.px(ROW_H), zoom.px(LANE_W));
         let graph_w = (self.width as f32 + 1.0) * lane_w;
-        let total_w = (graph_w + 720.0 * s).max(child.available_width() - 12.0 * s);
-        let author_x = total_w - 230.0 * s;
-        let date_x = total_w - 90.0 * s;
         let font = egui::FontId::proportional(13.0 * s);
+        let date_w = child
+            .painter()
+            .layout_no_wrap("0000-00-00".into(), font.clone(), th.dim)
+            .size()
+            .x;
+        // Only a lane graph wider than the pane scrolls sideways; the
+        // metadata stays pinned to the visible edge either way.
+        let total_w = (graph_w + MIN_SUBJECT_W * s + meta_w(date_w, s))
+            .max(child.available_width() - 12.0 * s);
         let mut last = 0;
         child.spacing_mut().item_spacing.y = 0.0;
         let mut area = egui::ScrollArea::both()
@@ -517,6 +528,7 @@ impl HistoryView {
                 if response.clicked() {
                     selected = Some(row.commit.hash.clone());
                 }
+                let cols = columns(r, ui.clip_rect(), date_w, s);
                 let painter = ui.painter_at(r.intersect(ui.clip_rect()));
                 if i % 2 == 0 {
                     painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
@@ -524,9 +536,11 @@ impl HistoryView {
                 if response.hovered() || self.details.selected() == Some(row.commit.hash.as_str()) {
                     painter.rect_filled(r, 0.0, th.sel_bg);
                 }
+                // Graph, refs, and subject all clip before the metadata columns.
+                let p = painter.with_clip_rect(cols.left.intersect(painter.clip_rect()));
                 let x = |lane: usize| r.left() + (lane as f32 + 1.0) * lane_w;
                 for (lane, color) in &row.incoming {
-                    painter.line_segment(
+                    p.line_segment(
                         [
                             egui::pos2(x(*lane), r.top()),
                             egui::pos2(x(*lane), r.center().y),
@@ -535,7 +549,7 @@ impl HistoryView {
                     );
                 }
                 for edge in &row.outgoing {
-                    painter.line_segment(
+                    p.line_segment(
                         [
                             egui::pos2(x(edge.from), r.center().y),
                             egui::pos2(x(edge.to), r.bottom()),
@@ -543,52 +557,53 @@ impl HistoryView {
                         egui::Stroke::new(1.7 * s, COLORS[edge.color % COLORS.len()]),
                     );
                 }
-                painter.circle_filled(
+                p.circle_filled(
                     egui::pos2(x(row.lane), r.center().y),
                     4.0 * s,
                     COLORS[row.color % COLORS.len()],
                 );
-                let text_rect = egui::Rect::from_min_max(
-                    egui::pos2(r.left() + graph_w, r.top()),
-                    egui::pos2(r.left() + author_x - 12.0 * s, r.bottom()),
-                );
-                let p = painter.with_clip_rect(text_rect.intersect(ui.clip_rect()));
-                let mut left = text_rect.left();
+                let mut left = r.left() + graph_w;
                 if !row.commit.refs.is_empty() {
                     let galley = p.layout_no_wrap(row.commit.refs.clone(), font.clone(), COLORS[0]);
-                    let w = galley.size().x.min((text_rect.width() * 0.5).max(0.0));
+                    let w = galley
+                        .size()
+                        .x
+                        .min(((cols.left.right() - left) * 0.5).max(0.0));
                     let chip = egui::Rect::from_min_size(
                         egui::pos2(left, r.top() + 4.0 * s),
                         egui::vec2(w + 10.0 * s, 20.0 * s),
                     );
                     p.rect_filled(chip, 3.0 * s, th.sel_bg);
-                    p.with_clip_rect(chip.intersect(text_rect).intersect(ui.clip_rect()))
-                        .galley(chip.min + egui::vec2(5.0, 2.0) * s, galley, COLORS[0]);
+                    p.with_clip_rect(chip.intersect(p.clip_rect())).galley(
+                        chip.min + egui::vec2(5.0, 2.0) * s,
+                        galley,
+                        COLORS[0],
+                    );
                     left += w + 18.0 * s;
                 }
-                p.text(
-                    egui::pos2(left, r.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &row.commit.subject,
-                    font.clone(),
+                let elided = |text: &str, width: f32, color| {
+                    let mut job =
+                        egui::text::LayoutJob::simple_singleline(text.into(), font.clone(), color);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+                    p.layout_job(job)
+                };
+                let subject = elided(&row.commit.subject, cols.left.right() - left, th.text);
+                p.galley(
+                    egui::pos2(left, r.center().y - subject.size().y / 2.0),
+                    subject,
                     th.text,
                 );
-                let author_rect = egui::Rect::from_min_max(
-                    egui::pos2(r.left() + author_x, r.top()),
-                    egui::pos2(r.left() + date_x - 10.0 * s, r.bottom()),
-                );
+                let author = elided(&row.commit.author, cols.author.width(), th.dim);
                 painter
-                    .with_clip_rect(author_rect.intersect(ui.clip_rect()))
-                    .text(
-                        author_rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        &row.commit.author,
-                        font.clone(),
+                    .with_clip_rect(cols.author.intersect(painter.clip_rect()))
+                    .galley(
+                        egui::pos2(cols.author.left(), r.center().y - author.size().y / 2.0),
+                        author,
                         th.dim,
                     );
                 painter.text(
-                    egui::pos2(r.left() + date_x, r.center().y),
-                    egui::Align2::LEFT_CENTER,
+                    egui::pos2(cols.date.right(), r.center().y),
+                    egui::Align2::RIGHT_CENTER,
                     &row.commit.date,
                     font.clone(),
                     th.dim,
@@ -620,6 +635,33 @@ impl HistoryView {
             self.acts.push(HistoryAct::OpenDiff(target));
         }
     }
+}
+
+fn meta_w(date_w: f32, s: f32) -> f32 {
+    date_w + (AUTHOR_W + 2.0 * COL_GAP) * s
+}
+
+/// Screen-space columns of one timeline row.
+#[derive(Debug)]
+struct Columns {
+    /// Clip for graph, refs, and subject.
+    left: egui::Rect,
+    author: egui::Rect,
+    date: egui::Rect,
+}
+
+/// Pins author and date to the right edge of the visible pane, however wide the
+/// row is or wherever it is scrolled. On a tight pane the metadata wins: the
+/// left clip shrinks first and may reach zero width.
+fn columns(row: egui::Rect, visible: egui::Rect, date_w: f32, s: f32) -> Columns {
+    let right = row.right().min(visible.right()) - 6.0 * s;
+    let date = egui::Rect::from_x_y_ranges(right - date_w..=right, row.y_range());
+    let author_right = date.left() - COL_GAP * s;
+    let author =
+        egui::Rect::from_x_y_ranges(author_right - AUTHOR_W * s..=author_right, row.y_range());
+    let left_right = (author.left() - COL_GAP * s).max(row.left());
+    let left = egui::Rect::from_x_y_ranges(row.left()..=left_right, row.y_range());
+    Columns { left, author, date }
 }
 
 #[cfg(test)]
@@ -726,6 +768,78 @@ mod tests {
         assert!(view.drawn_details_w < dragged, "{}", view.drawn_details_w);
         frame(&mut view, 1000.0, vec![]);
         assert_eq!(view.drawn_details_w, dragged);
+    }
+
+    #[test]
+    fn metadata_pins_to_visible_right_and_wins_when_tight() {
+        let rect =
+            |x0: f32, x1: f32| egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x1, 28.0));
+        // Wide pane: metadata at the right edge, subject room before it.
+        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 1.0);
+        assert_eq!(wide.date.right(), 994.0);
+        assert_eq!(wide.author.right(), wide.date.left() - COL_GAP);
+        assert_eq!(wide.left.right(), wide.author.left() - COL_GAP);
+        // Row scrolled wider than the pane: metadata follows the visible edge.
+        let scrolled = columns(rect(-300.0, 1200.0), rect(0.0, 600.0), 80.0, 1.0);
+        assert_eq!(scrolled.date.right(), 594.0);
+        assert!(scrolled.left.right() < scrolled.author.left());
+        // Too narrow for everything: the left clip collapses, never overlapping.
+        let tight = columns(rect(0.0, 200.0), rect(0.0, 200.0), 80.0, 1.0);
+        assert_eq!(tight.date.right(), 194.0);
+        assert_eq!(tight.left.width(), 0.0);
+        assert!(tight.left.right() <= tight.author.left().max(0.0));
+        // Zoom scales every gap.
+        let zoomed = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 160.0, 2.0);
+        assert_eq!(zoomed.author.width(), AUTHOR_W * 2.0);
+        assert_eq!(zoomed.date.right(), 988.0);
+    }
+
+    #[test]
+    fn narrow_pane_paints_date_at_visible_edge_and_elides_subject() {
+        let mut view = HistoryView::new(None);
+        view.end = true;
+        let mut graph = Graph::default();
+        let mut c = commit("only", &[]);
+        c.subject = "a very long subject ".repeat(20);
+        view.pages.push(vec![graph.push(c)]);
+        view.count = 1;
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 400.0));
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, egui::Id::new("narrow")),
+            ));
+        }
+        // Body 8..692; timeline ends half a gap left of the divider.
+        let timeline_right = 692.0 - view.drawn_details_w - 6.0;
+        let mut texts = vec![];
+        for clipped in &out.unwrap().shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                texts.push((
+                    text.galley.text().to_owned(),
+                    text.visual_bounding_rect(),
+                    text.galley.elided,
+                ));
+            }
+        }
+        let find = |needle: &str| texts.iter().find(|t| t.0.starts_with(needle)).unwrap();
+        let date = find("2026-09-23");
+        let author = find("Author");
+        let subject = find("a very long");
+        assert!(
+            date.1.right() <= timeline_right && date.1.right() > timeline_right - 20.0,
+            "{date:?} vs {timeline_right}"
+        );
+        assert!(author.1.right() < date.1.left(), "{author:?} {date:?}");
+        assert!(
+            subject.2 && subject.1.right() < author.1.left(),
+            "{subject:?} {author:?}"
+        );
     }
 
     #[test]

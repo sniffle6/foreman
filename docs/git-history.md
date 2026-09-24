@@ -10,9 +10,14 @@ tiling, tabbing, zoom, and workspace restore behavior as other viewers.
 
 The timeline shows commits reachable from all refs and HEAD in topological
 order, with colored branch/merge lanes, commit subjects, branch/tag decorations,
-authors, and author dates. Hover a row for its full hash and untruncated metadata.
-Scroll vertically through history; horizontal scrolling keeps wide graphs and
-metadata reachable in a narrow window. Refresh starts a new read from the current
+authors, and author dates. The subject sits beside the graph and ref chips; the
+author and date columns stay pinned to the right edge of the visible timeline
+pane, even while scrolled sideways. When the pane is tight the right side wins:
+the subject (then refs and graph) is clipped or elided with "…" before it can
+touch the author column. Hover a row for its full hash and untruncated metadata.
+Scroll vertically through history; the timeline only scrolls sideways when the
+lane graph itself is too wide for the pane. Column geometry is the pure
+`columns` function in `src/git_history.rs`. Refresh starts a new read from the current
 repository state. An empty repository and a failed Git read have distinct states.
 Git must be available on PATH. Linked worktrees and detached HEAD work through
 Git's own repository discovery.
