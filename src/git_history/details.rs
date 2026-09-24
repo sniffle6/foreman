@@ -53,6 +53,7 @@ struct TreeRow {
     file: Option<usize>,
     end: usize,
     collapsed: bool,
+    file_count: usize,
 }
 #[derive(Default)]
 struct Directory {
@@ -60,7 +61,8 @@ struct Directory {
     files: BTreeMap<String, usize>,
 }
 impl Directory {
-    fn flatten(self, depth: usize, rows: &mut Vec<TreeRow>) {
+    fn flatten(self, depth: usize, rows: &mut Vec<TreeRow>) -> usize {
+        let mut count = self.files.len();
         for (label, dir) in self.dirs {
             let index = rows.len();
             rows.push(TreeRow {
@@ -69,9 +71,12 @@ impl Directory {
                 file: None,
                 end: 0,
                 collapsed: false,
+                file_count: 0,
             });
-            dir.flatten(depth + 1, rows);
+            let descendants = dir.flatten(depth + 1, rows);
+            count += descendants;
             rows[index].end = rows.len();
+            rows[index].file_count = descendants;
         }
         for (label, file) in self.files {
             rows.push(TreeRow {
@@ -80,8 +85,10 @@ impl Directory {
                 file: Some(file),
                 end: rows.len() + 1,
                 collapsed: false,
+                file_count: 1,
             });
         }
+        count
     }
 }
 fn file_tree(files: &[ChangedFile]) -> Vec<TreeRow> {
@@ -112,6 +119,7 @@ struct Details {
     files: Vec<ChangedFile>,
     tree: Vec<TreeRow>,
     visible: Vec<usize>,
+    selected_file: Option<usize>,
 }
 impl Details {
     fn rebuild_visible(&mut self) {
@@ -271,6 +279,7 @@ fn load(cwd: &Path, hash: &str, cancel: &AtomicBool) -> Result<Details, String> 
         files,
         tree,
         visible,
+        selected_file: None,
     })
 }
 
@@ -288,6 +297,7 @@ impl Drop for Request {
 pub(super) struct DetailsView {
     request: Option<Request>,
     result: Option<Result<Details, String>>,
+    tree_fraction: Option<f32>,
 }
 impl Drop for DetailsView {
     fn drop(&mut self) {
@@ -375,120 +385,255 @@ impl DetailsView {
                 return;
             }
         };
-        ui.push_id(egui::Id::new(&details.hash), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("metadata")
-                .max_height((rect.height() * 0.48).max(24.0))
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.strong("Commit details");
-                    ui.horizontal(|ui| {
-                        ui.label("Hash");
-                        if ui.small_button("Copy").clicked() {
-                            ui.ctx().copy_text(details.hash.clone());
-                        }
-                    });
+        // Keep the split across commit changes, but scope scroll state to the commit.
+        let gap = (8.0 * scale).min(rect.height().max(0.0));
+        let usable = (rect.height() - gap).max(0.0);
+        let minimum = (72.0 * scale).min(usable * 0.5);
+        let mut height = (usable * self.tree_fraction.unwrap_or(0.58))
+            .clamp(minimum, (usable - minimum).max(minimum));
+        let divider = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top() + height),
+            egui::vec2(rect.width(), gap),
+        );
+        let response = ui
+            .interact(divider, base.with("divider"), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if response.dragged() {
+            height = (height + ui.input(|i| i.pointer.delta().y))
+                .clamp(minimum, (usable - minimum).max(minimum));
+            self.tree_fraction = Some(height / usable.max(1.0));
+        }
+        let y = rect.top() + height;
+        ui.painter().hline(
+            rect.x_range(),
+            y + gap * 0.5,
+            egui::Stroke::new(
+                1.0,
+                if response.hovered() || response.dragged() {
+                    th.dim
+                } else {
+                    th.border
+                },
+            ),
+        );
+        let tree_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), y));
+        let metadata_rect = egui::Rect::from_min_max(egui::pos2(rect.left(), y + gap), rect.max);
+        let mut tree_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt((&details.hash, "tree"))
+                .max_rect(tree_rect),
+        );
+        tree_ui.set_clip_rect(tree_rect.intersect(ui.clip_rect()));
+        tree_ui.horizontal(|ui| {
+            ui.strong(format!("Changed files ({})", details.files.len()));
+            if details.merge {
+                ui.colored_label(th.dim, "· first parent");
+            }
+        });
+        if details.files.is_empty() {
+            tree_ui.colored_label(th.dim, "No changed files.");
+        } else {
+            show_tree(&mut tree_ui, details, scale);
+        }
+        let mut metadata_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt((&details.hash, "metadata"))
+                .max_rect(metadata_rect),
+        );
+        metadata_ui.set_clip_rect(metadata_rect.intersect(ui.clip_rect()));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(&mut metadata_ui, |ui| {
+                let (subject, body) = details
+                    .message
+                    .split_once('\n')
+                    .unwrap_or((&details.message, ""));
+                ui.add(
+                    egui::Label::new(egui::RichText::new(subject).strong())
+                        .wrap()
+                        .selectable(true),
+                );
+                if !body.trim().is_empty() {
+                    ui.add(egui::Label::new(body.trim()).wrap().selectable(true));
+                }
+                ui.add_space(4.0 * scale);
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
-                        egui::Label::new(egui::RichText::new(&details.hash).monospace())
-                            .wrap()
+                        egui::Label::new(egui::RichText::new(&details.author).color(th.dim))
                             .selectable(true),
                     );
                     ui.add(
-                        egui::Label::new(format!(
-                            "Author: {}\nDate: {}",
-                            details.author, details.date
-                        ))
-                        .wrap()
-                        .selectable(true),
+                        egui::Label::new(egui::RichText::new(&details.date).color(th.dim))
+                            .selectable(true),
                     );
-                    ui.label(egui::RichText::new("Containing branches").color(th.dim));
-                    ui.add(
-                        egui::Label::new(if details.branches.is_empty() {
-                            "None (detached or tag-only history)"
-                        } else {
-                            &details.branches
-                        })
-                        .wrap()
-                        .selectable(true),
-                    );
-                    ui.separator();
-                    ui.add(egui::Label::new(&details.message).wrap().selectable(true));
-                });
-            ui.separator();
-            ui.strong(format!("Changed files ({})", details.files.len()));
-            if details.merge {
-                ui.colored_label(th.dim, "Compared with first parent");
-            }
-            if details.files.is_empty() {
-                ui.colored_label(th.dim, "No changed files.");
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                for status in ['A', 'M', 'D', 'R', 'C', 'T'] {
-                    ui.colored_label(status_color(status), status_name(status));
-                }
-            });
-            let mut toggled = None;
-            egui::ScrollArea::both()
-                .id_salt("files")
-                .auto_shrink([false, false])
-                .show_rows(ui, 22.0 * scale, details.visible.len(), |ui, range| {
-                    for i in range {
-                        let index = details.visible[i];
-                        let row = &details.tree[index];
-                        ui.horizontal(|ui| {
-                            ui.add_space(row.depth as f32 * 14.0 * scale);
-                            if let Some(file) = row.file {
-                                let file = &details.files[file];
+                    if ui
+                        .small_button(
+                            egui::RichText::new(&details.hash[..details.hash.len().min(8)])
+                                .monospace(),
+                        )
+                        .on_hover_text(format!("{}\nClick to copy full commit id", details.hash))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(details.hash.clone());
+                    }
+                    if details.branches.is_empty() {
+                        ui.colored_label(th.dim, "No containing branches");
+                    }
+                    for branch in details.branches.lines() {
+                        egui::Frame::new()
+                            .fill(th.tab_bg)
+                            .corner_radius(3)
+                            .inner_margin(egui::Margin::symmetric(5, 1))
+                            .show(ui, |ui| {
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!(
-                                            "{}  {}",
-                                            file.status,
-                                            display_path(&row.label)
-                                        ))
-                                        .color(status_color(file.status)),
-                                    )
-                                    .extend(),
+                                    egui::Label::new(egui::RichText::new(branch).small()).wrap(),
                                 )
-                                .on_hover_text(
-                                    match &file.previous {
-                                        Some(old) => format!(
-                                            "{}\n{} → {}",
-                                            status_name(file.status),
-                                            display_path(old),
-                                            display_path(&file.path)
-                                        ),
-                                        None => format!(
-                                            "{}\n{}",
-                                            status_name(file.status),
-                                            display_path(&file.path)
-                                        ),
-                                    },
-                                );
-                            } else if ui
-                                .add(
-                                    egui::Button::new(format!(
-                                        "{} {}/",
-                                        if row.collapsed { "▶" } else { "▼" },
-                                        display_path(&row.label)
-                                    ))
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                toggled = Some(index);
-                            }
-                        });
+                                .on_hover_text("Branch containing this commit");
+                            });
                     }
                 });
-            if let Some(index) = toggled {
-                details.tree[index].collapsed = !details.tree[index].collapsed;
-                details.rebuild_visible();
-            }
-        });
+            });
     }
 }
+
+fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let row_height = 20.0 * scale;
+    let th = crate::theme::live(ui.ctx());
+    let font = egui::FontId::proportional(13.0 * scale);
+    let folder = crate::icons::texture(
+        ui.ctx(),
+        crate::icons::IconKind::Folder,
+        (14.0 * scale * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32,
+    );
+    let mut toggled = None;
+    egui::ScrollArea::both()
+        .id_salt("files")
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, details.visible.len(), |ui, range| {
+            for i in range {
+                let index = details.visible[i];
+                let row = &details.tree[index];
+                let color = row
+                    .file
+                    .map(|f| status_color(details.files[f].status))
+                    .unwrap_or(th.text);
+                let label =
+                    ui.painter()
+                        .layout_no_wrap(display_path(&row.label), font.clone(), color);
+                let indent = row.depth as f32 * 18.0 * scale;
+                let width = (indent + 65.0 * scale + label.size().x + 45.0 * scale)
+                    .max(ui.available_width());
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
+                let selected = row.file.is_some() && details.selected_file == row.file;
+                if selected || response.hovered() {
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        if selected {
+                            th.sel_bg
+                        } else {
+                            th.sel_bg.gamma_multiply(0.45)
+                        },
+                    );
+                }
+                let x = rect.left() + indent;
+                let cy = rect.center().y;
+                let painter = ui.painter();
+                // Reuse the Sessions folder asset; draw a folded page for files.
+                // Neither icon nor disclosure relies on platform font glyphs.
+                let center = egui::pos2(x + 26.0 * scale, cy);
+                if row.file.is_none() {
+                    let arrow = egui::pos2(x + 7.0 * scale, cy);
+                    let points = if row.collapsed {
+                        [(-2.0, -3.0), (2.0, 0.0), (-2.0, 3.0)]
+                    } else {
+                        [(-3.0, -2.0), (3.0, -2.0), (0.0, 2.0)]
+                    };
+                    painter.add(egui::Shape::convex_polygon(
+                        points
+                            .into_iter()
+                            .map(|(x, y)| arrow + egui::vec2(x, y) * scale)
+                            .collect(),
+                        th.dim,
+                        egui::Stroke::NONE,
+                    ));
+                    painter.image(
+                        folder.id(),
+                        egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0) * scale),
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        crate::icons::IconKind::Folder.tint(),
+                    );
+                } else {
+                    let point = |x, y| center + egui::vec2(x, y) * scale;
+                    let stroke = egui::Stroke::new(scale, th.dim);
+                    painter.add(egui::Shape::closed_line(
+                        vec![
+                            point(-5.0, -6.0),
+                            point(1.0, -6.0),
+                            point(5.0, -2.0),
+                            point(5.0, 6.0),
+                            point(-5.0, 6.0),
+                        ],
+                        stroke,
+                    ));
+                    painter.add(egui::Shape::line(
+                        vec![point(1.0, -6.0), point(1.0, -2.0), point(5.0, -2.0)],
+                        stroke,
+                    ));
+                    for y in [1.0, 3.5] {
+                        painter.line_segment([point(-2.5, y), point(2.5, y)], stroke);
+                    }
+                }
+                if let Some(file_index) = row.file {
+                    let file = &details.files[file_index];
+                    painter.text(
+                        egui::pos2(x + 44.0 * scale, cy),
+                        egui::Align2::CENTER_CENTER,
+                        file.status,
+                        font.clone(),
+                        color,
+                    );
+                    if response.clicked() {
+                        details.selected_file = Some(file_index);
+                    }
+                    response.on_hover_text(match &file.previous {
+                        Some(old) => format!(
+                            "{}\n{} → {}",
+                            status_name(file.status),
+                            display_path(old),
+                            display_path(&file.path)
+                        ),
+                        None => {
+                            format!("{}\n{}", status_name(file.status), display_path(&file.path))
+                        }
+                    });
+                } else {
+                    if response.clicked() {
+                        toggled = Some(index);
+                    }
+                    painter.text(
+                        egui::pos2(x + 58.0 * scale + label.size().x + 8.0 * scale, cy),
+                        egui::Align2::LEFT_CENTER,
+                        row.file_count,
+                        font.clone(),
+                        th.dim,
+                    );
+                }
+                painter.galley(
+                    egui::pos2(x + 58.0 * scale, cy - label.size().y * 0.5),
+                    label,
+                    color,
+                );
+            }
+        });
+    if let Some(index) = toggled {
+        details.tree[index].collapsed = !details.tree[index].collapsed;
+        details.rebuild_visible();
+    }
+}
+
 fn display_path(path: &str) -> String {
     path.chars()
         .flat_map(|c| {
@@ -527,6 +672,151 @@ fn status_color(status: char) -> egui::Color32 {
 mod tests {
     use super::*;
     use crate::git_history::tests::git;
+
+    #[test]
+    fn file_statuses_use_darcula_colors_independently_of_graph_lanes() {
+        for (statuses, rgb) in [
+            ("AC", [0x62, 0x97, 0x55]),
+            ("MT", [0x68, 0x97, 0xbb]),
+            ("D", [0x6c, 0x6c, 0x6c]),
+            ("R", [0x3a, 0x84, 0x84]),
+        ] {
+            for status in statuses.chars() {
+                assert_eq!(
+                    status_color(status),
+                    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+                );
+            }
+        }
+    }
+
+    fn fixture() -> Details {
+        let files = parse_files(b"A\0src/added.rs\0M\0src/modified.rs\0D\0removed.rs\0").unwrap();
+        let tree = file_tree(&files);
+        let visible = (0..tree.len()).collect();
+        Details {
+            hash: "a".repeat(40),
+            author: "Author <author@example.test>".into(),
+            date: "2026-09-23T12:00:00-04:00".into(),
+            message: "Subject\n\nBody".into(),
+            branches: "main\norigin/main".into(),
+            merge: false,
+            files,
+            tree,
+            visible,
+            selected_file: None,
+        }
+    }
+
+    #[test]
+    fn file_clicks_select_one_and_directories_preserve_selection() {
+        let ctx = egui::Context::default();
+        let mut details = fixture();
+        assert_eq!(details.tree[0].file_count, 2);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 150.0));
+        let mut frame = |details: &mut Details, events| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| show_tree(ui, details, 1.0),
+            );
+        };
+        let mut click = |details: &mut Details, pos| {
+            frame(details, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    details,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+        };
+        click(&mut details, egui::pos2(170.0, 30.0));
+        assert_eq!(details.selected_file, Some(0));
+        click(&mut details, egui::pos2(170.0, 50.0));
+        assert_eq!(details.selected_file, Some(1));
+        click(&mut details, egui::pos2(170.0, 11.0));
+        assert!(details.tree[0].collapsed);
+        assert_eq!(details.selected_file, Some(1));
+        click(&mut details, egui::pos2(170.0, 11.0));
+        assert!(!details.tree[0].collapsed);
+        assert_eq!(details.selected_file, Some(1));
+        frame(
+            &mut details,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                phase: egui::TouchPhase::Move,
+                delta: egui::vec2(0.0, -80.0),
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(details.selected_file, Some(1));
+    }
+
+    #[test]
+    fn divider_drags_and_commit_changes_clear_file_selection() {
+        let ctx = egui::Context::default();
+        let mut view = DetailsView::default();
+        let (_tx, receiver) = mpsc::sync_channel(1);
+        view.request = Some(Request {
+            hash: "a".repeat(40),
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver,
+        });
+        let mut details = fixture();
+        details.selected_file = Some(1);
+        view.result = Some(Ok(details));
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0));
+        let frame = |view: &mut DetailsView, events| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, egui::Id::new("details-test")),
+            );
+        };
+        frame(&mut view, vec![]);
+        let start = egui::pos2(200.0, 392.0 * 0.58 + 4.0);
+        frame(&mut view, vec![egui::Event::PointerMoved(start)]);
+        frame(
+            &mut view,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        frame(
+            &mut view,
+            vec![egui::Event::PointerMoved(start + egui::vec2(0.0, -60.0))],
+        );
+        assert!(view.tree_fraction.unwrap() < 0.58);
+        assert_eq!(
+            view.result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .selected_file,
+            Some(1)
+        );
+        view.select(PathBuf::new(), "different".into(), ctx.clone());
+        assert!(view.result.is_none());
+        assert!(view.tree_fraction.is_some());
+        view.clear();
+        assert!(view.selected().is_none());
+        assert!(view.result.is_none());
+    }
 
     #[test]
     fn nul_paths_and_rename_pairs_keep_their_boundaries() {

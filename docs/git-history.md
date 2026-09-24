@@ -27,15 +27,20 @@ timezone, and local/remote branches containing that commit. The branch list is
 an ancestry query, not just the decorations attached to the selected row.
 
 The changed-file tree groups paths into collapsible directories. File labels
-and the legend share JetBrains' Darcula file-status palette, independently of
+and status letters share JetBrains' Darcula file-status palette, independently of
 graph lane colors. Copies use the added-file color and type changes use the
 modified-file color; status letters also identify each change. The mapping is
 in `src/git_history/details.rs` (`status_color`), based on JetBrains'
 [default color schemes](https://github.com/JetBrains/intellij-community/blob/master/platform/platform-resources/src/DefaultColorSchemesManager.xml).
-Hover a
-rename for both paths. Roots compare against the empty tree; merges compare
+Hover a rename for both paths. Roots compare against the empty tree; merges compare
 against their first parent, as labeled in the pane. Empty changes have an
-explicit placeholder. Metadata/message and file-tree scrolling are independent.
+explicit placeholder. The tree sits above the subject-led commit details, with a
+draggable divider and independent scrolling. Folders reuse the Sessions panel
+icon; files have a folded-page icon. Clicking a file selects it;
+directory expansion and scrolling preserve that selection. Status meanings and
+rename paths are available on hover, without a permanent legend. Compact
+metadata includes containing-branch badges and a short hash that copies the
+full object id when clicked.
 Selecting another row cancels the previous read. Refresh clears the selection.
 
 Branch selection and checkout/switching belong to the next task. Diffs, search,
@@ -126,6 +131,14 @@ Native screenshots use a seeded workspace and fixture repository under
 `target/history-evidence`, with isolated APPDATA and global skill installation
 disabled. The build-screenshot script captures via PrintWindow without driving
 the user's mouse or keyboard.
+
+On 2026-09-23, details-pane polish was checked in native 1280×800 captures
+under `target/history-evidence`: default layout, distinct hover and selection,
+scrolled tree, resized divider, collapsed directories, and scrolled metadata.
+The captures used temporary fixture-selection/input instrumentation, removed
+before committing; no user mouse or keyboard input was used. Pointer-event tests
+cover single-file selection, directory toggling, and divider dragging. Selection
+is owned by the loaded commit details, so retiring those details clears it.
 
 ## Key files
 
