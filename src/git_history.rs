@@ -287,8 +287,14 @@ pub struct HistoryView {
     scale: f32,
     /// Last vertical scroll offset, so a zoom keeps the same rows in view.
     scroll_y: f32,
+    /// Dragged details pane width in unscaled px; `None` until the first drag.
+    /// Clamped when drawn but only written on drag, so a shrink-then-regrow of
+    /// the window restores it. Not persisted across restart.
+    details_w: Option<f32>,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
+    #[cfg(test)]
+    drawn_details_w: f32,
     #[cfg(test)]
     header_button_h: f32,
 }
@@ -324,8 +330,11 @@ impl HistoryView {
             generation: 0,
             scale: 1.0,
             scroll_y: 0.0,
+            details_w: None,
             #[cfg(test)]
             drawn: 0..0,
+            #[cfg(test)]
+            drawn_details_w: 0.0,
             #[cfg(test)]
             header_button_h: 0.0,
         }
@@ -413,8 +422,10 @@ impl HistoryView {
         if refresh {
             let cwd = self.cwd.clone();
             let generation = self.generation + 1;
+            let details_w = self.details_w;
             // Retire potentially large cached histories off the GUI thread.
             let old = std::mem::replace(self, Self::new(cwd));
+            self.details_w = details_w;
             if let Some(stream) = &old.stream {
                 stream.cancel.store(true, Ordering::Relaxed);
             }
@@ -431,17 +442,44 @@ impl HistoryView {
             return;
         }
         let body = child.available_rect_before_wrap();
-        let split = body.left() + body.width() * 0.55;
+        // Window growth goes to the timeline; the details pane keeps its px width.
+        let half_gap = 6.0 * s;
+        let minimum = (220.0 * s).min(body.width() * 0.5);
+        let clamp = |w: f32| w.clamp(minimum, (body.width() - minimum).max(minimum));
+        let mut details_w = clamp(self.details_w.map_or(body.width() * 0.45, |w| w * s));
+        let gap = egui::Rect::from_x_y_ranges(
+            body.right() - details_w - half_gap..=body.right() - details_w + half_gap,
+            body.y_range(),
+        );
+        let response = child
+            .interact(gap, base.with("timeline-divider"), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            details_w = clamp(body.right() - pos.x);
+            self.details_w = Some(details_w / s);
+        }
+        #[cfg(test)]
+        {
+            self.drawn_details_w = details_w;
+        }
+        let split = body.right() - details_w;
         let timeline =
-            egui::Rect::from_min_max(body.min, egui::pos2(split - 5.0 * s, body.bottom()));
+            egui::Rect::from_min_max(body.min, egui::pos2(split - half_gap, body.bottom()));
         let detail_rect =
-            egui::Rect::from_min_max(egui::pos2(split + 8.0 * s, body.top()), body.max);
-        child.painter().line_segment(
-            [
-                egui::pos2(split, body.top()),
-                egui::pos2(split, body.bottom()),
-            ],
-            egui::Stroke::new(1.0, th.border),
+            egui::Rect::from_min_max(egui::pos2(split + half_gap, body.top()), body.max);
+        child.painter().vline(
+            split,
+            body.y_range(),
+            egui::Stroke::new(
+                1.0,
+                if response.hovered() || response.dragged() {
+                    th.dim
+                } else {
+                    th.border
+                },
+            ),
         );
         let mut child = child.new_child(
             egui::UiBuilder::new()
@@ -643,6 +681,48 @@ mod tests {
         click(&mut view, &mut frame, egui::pos2(180.0, 18.0));
         assert_eq!(view.details.selected(), None);
         assert_eq!(view.count, 0);
+    }
+
+    #[test]
+    fn timeline_divider_width_survives_window_shrink() {
+        let mut view = HistoryView::new(None);
+        view.end = true;
+        let mut graph = Graph::default();
+        view.pages.push(vec![graph.push(commit("only", &[]))]);
+        view.count = 1;
+        let ctx = egui::Context::default();
+        let frame = |view: &mut HistoryView, width: f32, events| {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0));
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, egui::Id::new("split")),
+            );
+        };
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut view, 1000.0, vec![]);
+        let before = view.drawn_details_w;
+        // Body spans 8..992 inside the 8px margin.
+        let start = egui::pos2(992.0 - before, 300.0);
+        let end = start + egui::vec2(-100.0, 0.0);
+        frame(&mut view, 1000.0, vec![egui::Event::PointerMoved(start)]);
+        frame(&mut view, 1000.0, vec![press(start, true)]);
+        frame(&mut view, 1000.0, vec![egui::Event::PointerMoved(end)]);
+        frame(&mut view, 1000.0, vec![press(end, false)]);
+        let dragged = view.drawn_details_w;
+        assert!((dragged - (before + 100.0)).abs() < 1.0, "{before} -> {dragged}");
+        frame(&mut view, 600.0, vec![]);
+        assert!(view.drawn_details_w < dragged, "{}", view.drawn_details_w);
+        frame(&mut view, 1000.0, vec![]);
+        assert_eq!(view.drawn_details_w, dragged);
     }
 
     #[test]

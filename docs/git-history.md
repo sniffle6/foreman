@@ -28,6 +28,11 @@ commit message, copyable object id, author name/email, author timestamp with
 timezone, and local/remote branches containing that commit. The branch list is
 an ancestry query, not just the decorations attached to the selected row.
 
+Drag the vertical divider between the timeline and the details pane to resize
+them. The pane keeps its width in px (scaled by zoom), so growing the window
+widens the timeline, and shrinking then regrowing it restores your width. The
+width survives commit selection and Refresh but is not saved across restart.
+
 The changed-file tree groups paths into collapsible directories; a chain of
 single-child directories folds into one row (`.foreman/tasks`). File labels
 and status letters share JetBrains' Darcula file-status palette, independently of
