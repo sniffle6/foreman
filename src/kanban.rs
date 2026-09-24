@@ -49,12 +49,26 @@ pub struct Worktree {
     /// The branch checked out in the main checkout at dispatch — the
     /// integration target.
     pub base: String,
+    /// Branch mode (spec: dispatch-branch): no worktree was made; the card
+    /// works on `branch` in the project checkout itself and `path` is that
+    /// checkout's root. Absent in the file when false, so worktree cards
+    /// are byte-identical to before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_place: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Worktree {
     /// The repository root the layout was derived from: `path` minus its
-    /// last three components (`.foreman/worktrees/<id>`).
+    /// last three components (`.foreman/worktrees/<id>`), or `path` itself
+    /// for a branch-mode card.
     pub fn root(&self) -> std::path::PathBuf {
+        if self.in_place {
+            return std::path::PathBuf::from(&self.path);
+        }
         std::path::Path::new(&self.path)
             .ancestors()
             .nth(3)
@@ -72,6 +86,19 @@ pub fn worktree_layout(root: &std::path::Path, id: &str, base: &str) -> Worktree
         path: format!("{}/.foreman/worktrees/{id}", root.trim_end_matches('/')),
         branch: format!("card/{id}"),
         base: base.to_string(),
+        in_place: false,
+    }
+}
+
+/// Naming for a branch-mode card (spec: dispatch-branch): the same
+/// `card/<id>` branch, in the project checkout at `root`.
+pub fn branch_layout(root: &std::path::Path, id: &str, base: &str) -> Worktree {
+    let root = root.to_string_lossy().replace('\\', "/");
+    Worktree {
+        path: root.trim_end_matches('/').to_string(),
+        branch: format!("card/{id}"),
+        base: base.to_string(),
+        in_place: true,
     }
 }
 
@@ -250,7 +277,8 @@ pub fn worktree_rows(
     let mut owned: Vec<(u8, WorktreeRow)> = cards
         .iter()
         .filter_map(|c| {
-            let wt = c.worktree.clone()?;
+            // A branch-mode card has no tree: the page lists worktrees only.
+            let wt = c.worktree.clone().filter(|w| !w.in_place)?;
             let st = status_of(&c.id);
             let orphaned = orphans.contains(&c.id);
             let terminal = c
@@ -305,7 +333,12 @@ pub fn live_worktree_rows(
 ) -> Vec<WorktreeRow> {
     let owned: Vec<(String, Worktree)> = cards
         .iter()
-        .filter_map(|c| c.worktree.clone().map(|w| (c.id.clone(), w)))
+        .filter_map(|c| {
+            c.worktree
+                .clone()
+                .filter(|w| !w.in_place)
+                .map(|w| (c.id.clone(), w))
+        })
         .collect();
     let by_card: std::collections::HashMap<String, Option<WorktreeStatus>> = owned
         .iter()
@@ -384,6 +417,7 @@ impl WorktreeLine {
             path: self.path.clone(),
             branch: self.branch.clone(),
             base: self.base.clone(),
+            in_place: false,
         };
         let tail = format!("[wt {}]", worktree_summary(&wt, self.status.as_ref()));
         match &self.card {
@@ -1522,7 +1556,23 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         title = card.title,
         body = card.body.as_deref().unwrap_or(""),
     );
-    if let Some(wt) = &card.worktree {
+    if let Some(wt) = &card.worktree
+        && wt.in_place
+    {
+        // Branch mode (spec: dispatch-branch): no private tree. The human's
+        // uncommitted changes may share the checkout, so the prompt forbids
+        // every command that would sweep them into the card or move them.
+        out.push_str(&format!(
+            "# Workspace\n\
+             You are in the project checkout at {path}, on branch {branch}, created from {base}. There is no worktree.\n\
+             This checkout may hold uncommitted changes that are not yours. Stage only the files you changed, by name: never git add -A or git add ., never stash, reset, restore, clean, or switch branches.\n\
+             Leave .foreman/ untouched and never stage it.\n\
+             \n",
+            path = wt.path,
+            branch = wt.branch,
+            base = wt.base,
+        ));
+    } else if let Some(wt) = &card.worktree {
         out.push_str(&format!(
             "# Workspace\n\
              You are in a git worktree at {path}, on branch {branch}, based on {base}.\n\
@@ -1546,7 +1596,24 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         CloseoutStyle::Path => "foreman",
         CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
     };
-    if let Some(wt) = &card.worktree {
+    if let Some(wt) = &card.worktree
+        && wt.in_place
+    {
+        // Branch mode integrates through the same queue, but in place: the
+        // queue never rebases the shared checkout, so a moved base comes
+        // back to the worker (spec: dispatch-branch §Integration).
+        out.push_str(&format!(
+            "Commit your work on {branch}, then hand integration to Foreman's queue (never merge or switch branches yourself):\n\
+             \x20   {cli} kanban integrate {id}\n\
+             \x20   {cli} kanban wait {id} --timeout 1800\n\
+             wait exit 0: Foreman ran the project checks, fast-forwarded {base} to your branch, put the checkout back on {base}, and marked the card Done. You are finished; do not run done yourself.\n\
+             wait exit 3: a check failed or {base} moved. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it here (for a moved base: git rebase {base}, resolving any conflicts; if git refuses because of uncommitted changes that are not yours, block instead), commit, then run integrate and wait again. Queued is not Done.\n\
+             wait exit 2: still queued or checking; run wait again.\n",
+            id = card.id,
+            branch = wt.branch,
+            base = wt.base,
+        ));
+    } else if let Some(wt) = &card.worktree {
         // The integration queue (spec: worktree-integration-queue): the
         // worker submits and waits; Foreman rebases, checks, fast-forwards,
         // and marks the card Done. The worker never merges into the shared
@@ -1623,8 +1690,10 @@ impl CardLine {
             }
         }
         if let Some(wt) = &self.card.worktree {
+            // `br` marks a branch-mode card: no tree, the project checkout.
             tail.push(format!(
-                "[wt {}]",
+                "[{} {}]",
+                if wt.in_place { "br" } else { "wt" },
                 worktree_summary(wt, self.worktree_status.as_ref())
             ));
         }
@@ -1762,6 +1831,70 @@ pub fn git_available() -> bool {
     git(std::path::Path::new("."), &["--version"]).is_ok()
 }
 
+/// Where a card-dispatched worker runs — the per-dispatch choice the board
+/// offers (seeded from `Settings::dispatch_worktrees`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchMode {
+    /// A private worktree under `.foreman/worktrees/<id>` on `card/<id>`.
+    Worktree,
+    /// `card/<id>` in the project checkout itself (spec: dispatch-branch).
+    Branch,
+    /// The project checkout on whatever branch it has; no git at all.
+    InPlace,
+}
+
+impl DispatchMode {
+    /// The choice a card already carrying a record must restart with: its
+    /// tree, or its branch. `None` for a card without one.
+    pub fn locked_for(card: &Card) -> Option<Self> {
+        card.worktree.as_ref().map(|w| {
+            if w.in_place {
+                DispatchMode::Branch
+            } else {
+                DispatchMode::Worktree
+            }
+        })
+    }
+
+    /// The board chip's cycle: worktree → branch → in place → worktree.
+    pub fn next(self) -> Self {
+        match self {
+            DispatchMode::Worktree => DispatchMode::Branch,
+            DispatchMode::Branch => DispatchMode::InPlace,
+            DispatchMode::InPlace => DispatchMode::Worktree,
+        }
+    }
+
+    /// Short chip label (the inline picker has room for a word).
+    pub fn chip(self) -> &'static str {
+        match self {
+            DispatchMode::Worktree => "wt",
+            DispatchMode::Branch => "branch",
+            DispatchMode::InPlace => "here",
+        }
+    }
+
+    /// The mode's name in toasts and on the detail page.
+    pub fn name(self) -> &'static str {
+        match self {
+            DispatchMode::Worktree => "worktree",
+            DispatchMode::Branch => "branch",
+            DispatchMode::InPlace => "in place",
+        }
+    }
+
+    /// The chip's hover text and the detail page's option text.
+    pub fn describe(self) -> &'static str {
+        match self {
+            DispatchMode::Worktree => "A private git worktree on card/<id>",
+            DispatchMode::Branch => {
+                "Branch card/<id> in the project checkout (no worktree; uncommitted changes stay put)"
+            }
+            DispatchMode::InPlace => "The project checkout as it is (no branch)",
+        }
+    }
+}
+
 /// What bring-up decided for one dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BringUp {
@@ -1813,6 +1946,9 @@ pub fn bring_up_worktree(project_cwd: &std::path::Path, card: &Card) -> Result<B
     let Ok(base) = git(&root, &["symbolic-ref", "--short", "HEAD"]) else {
         return Ok(BringUp::Detached);
     };
+    // A branch-mode card has the checkout on its branch: basing a tree on
+    // that would integrate this card into the other card's branch.
+    refuse_card_branch(&base, &card.id)?;
     // 3. naming; a card that already carries this worktree keeps its base
     let mut wt = worktree_layout(&root, &card.id, &base);
     if let Some(prev) = &card.worktree {
@@ -1862,6 +1998,96 @@ pub fn bring_up_worktree(project_cwd: &std::path::Path, card: &Card) -> Result<B
     Ok(BringUp::Worktree(wt))
 }
 
+/// The checkout is on another card's branch (a live branch-mode card):
+/// refuse, naming the card, rather than stack one card on another.
+fn refuse_card_branch(current: &str, id: &str) -> Result<(), String> {
+    match current.strip_prefix("card/") {
+        Some(other) if other != id => Err(format!(
+            "the project checkout is on {current}, card {other}'s branch; integrate or release that card first"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Branch-mode bring-up (spec: dispatch-branch §Bring-up). Puts the project
+/// checkout on `card/<id>` without making a worktree. Only non-forcing git
+/// verbs touch the checkout, so uncommitted changes are never lost:
+///
+/// - already on `card/<id>` → reuse (Restart), no git write;
+/// - `card/<id>` exists → `git switch card/<id>`, which refuses when the
+///   switch would overwrite a local change (the error aborts the dispatch);
+/// - otherwise → `git switch -c card/<id>` from HEAD, which never touches the
+///   working tree: the changes stay where they are, uncommitted.
+///
+/// Not a repository → `InPlace`; detached HEAD → `Detached` (same as the
+/// worktree bring-up). A git operation in progress, or the checkout on
+/// another card's branch, is `Err`.
+pub fn bring_up_branch(project_cwd: &std::path::Path, card: &Card) -> Result<BringUp, String> {
+    let Ok(root) = git(project_cwd, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(BringUp::InPlace);
+    };
+    let root = std::path::PathBuf::from(root);
+    let Ok(current) = git(&root, &["symbolic-ref", "--short", "HEAD"]) else {
+        return Ok(BringUp::Detached);
+    };
+    refuse_card_branch(&current, &card.id)?;
+    if let Some(op) = crate::integrate::git_op_in_progress(&root) {
+        return Err(format!(
+            "a git {op} is in progress in the project checkout; finish it first"
+        ));
+    }
+    let mut wt = branch_layout(&root, &card.id, &current);
+    // Restart keeps the base recorded at first dispatch: the checkout is on
+    // the card's own branch (or on whatever the human switched to) now.
+    if let Some(prev) = &card.worktree
+        && prev.in_place
+        && same_path(&prev.path, &wt.path)
+    {
+        wt.base = prev.base.clone();
+    }
+    if current == wt.branch {
+        return Ok(BringUp::Worktree(wt));
+    }
+    let branch_ref = format!("refs/heads/{}", wt.branch);
+    if git(&root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok() {
+        git(&root, &["switch", &wt.branch])?;
+    } else {
+        git(&root, &["switch", "-c", &wt.branch])?;
+    }
+    Ok(BringUp::Worktree(wt))
+}
+
+/// Tracked files with uncommitted changes in the checkout at `root`,
+/// outside `.foreman/` (the app writes card files there). Branch-mode
+/// dispatch warns with the count; empty on any git failure.
+pub fn checkout_changes(root: &std::path::Path) -> Vec<String> {
+    checkout_changes_strict(root)
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.trim_start().split_once(' '))
+                .map(|(_, p)| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `git status --porcelain` of tracked files outside `.foreman/`; fails
+/// closed (the status probe must not read a git error as clean).
+fn checkout_changes_strict(root: &std::path::Path) -> Result<String, String> {
+    git(
+        root,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            ".",
+            ":(exclude).foreman",
+        ],
+    )
+}
+
 /// Live status probe (spec §Status poll): dirty from inside the tree,
 /// ahead/behind from any checkout of the repo. Also the synchronous `rm`
 /// pre-check. A vanished directory reads as `missing` with counts intact.
@@ -1877,7 +2103,17 @@ pub fn worktree_status_now(
     // of a partial removal) `git status` run inside the directory would
     // climb to the main repository and report ITS changes as the card's.
     let tree = std::path::Path::new(&wt.path);
-    let porcelain = if tree.join(".git").exists() {
+    let porcelain = if wt.in_place {
+        // Branch mode: the checkout's changes count as the card's only
+        // while the checkout is on the card's branch; `.foreman/` is the
+        // app's own churn. The checkout itself is never "missing".
+        let on = git(tree, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap_or_default();
+        if on == wt.branch {
+            Some(checkout_changes_strict(tree)?)
+        } else {
+            Some(String::new())
+        }
+    } else if tree.join(".git").exists() {
         Some(git(
             tree,
             &["status", "--porcelain", "--untracked-files=no"],
@@ -1911,6 +2147,7 @@ pub fn foreman_worktrees_now(project_cwd: &std::path::Path) -> Result<Vec<Worktr
             path,
             branch,
             base: base.clone(),
+            in_place: false,
         })
         .collect())
 }
@@ -1995,6 +2232,9 @@ pub fn teardown_worktree(
     wt: &Worktree,
     force: bool,
 ) -> TeardownOutcome {
+    if wt.in_place {
+        return teardown_branch(project_cwd, wt, force);
+    }
     // Count only; a failed probe reads as 0 here because the outcome below
     // is decided by git's own refusal, not by this number.
     let ahead = worktree_status_now(project_cwd, wt)
@@ -2006,6 +2246,45 @@ pub fn teardown_worktree(
         .then(|| delete_branch(project_cwd, &wt.branch, force));
     let _ = git(project_cwd, &["worktree", "prune"]);
     teardown_verdict(remove, branch, ahead)
+}
+
+/// Branch-mode teardown (spec: dispatch-branch §Teardown): there is no tree
+/// to remove — the checkout is the project's — so only the branch goes.
+/// A checkout still on the card's branch is first moved back to base with a
+/// non-forcing `git switch`, and only when the branch is merged into base
+/// (or under Discard): an unmerged branch is never switched away from
+/// behind the human's back. `switch` carries uncommitted changes along and
+/// refuses when it would overwrite one — that reads as `Dirty`.
+fn teardown_branch(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> TeardownOutcome {
+    let root = wt.root();
+    let ahead = worktree_status_now(project_cwd, wt)
+        .map(|s| s.ahead)
+        .unwrap_or(0);
+    let on = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"]).unwrap_or_default();
+    if on == wt.branch {
+        let merged = git(
+            &root,
+            &["merge-base", "--is-ancestor", &wt.branch, &wt.base],
+        )
+        .is_ok();
+        if !merged && !force {
+            return TeardownOutcome::Unmerged { ahead };
+        }
+        if let Err(e) = git(&root, &["switch", &wt.base]) {
+            return if e.to_lowercase().contains("would be overwritten") {
+                TeardownOutcome::Dirty
+            } else {
+                TeardownOutcome::Failed(e)
+            };
+        }
+    }
+    match delete_branch(&root, &wt.branch, force) {
+        Ok(()) => TeardownOutcome::Removed,
+        Err(e) if e.to_lowercase().contains("not fully merged") => {
+            TeardownOutcome::Unmerged { ahead }
+        }
+        Err(e) => TeardownOutcome::Failed(e),
+    }
 }
 
 /// Is `path` a working tree git still tracks? Fails closed: an `Err` when
@@ -2724,6 +3003,7 @@ mod tests {
             path: tmp.path().join("nope").to_string_lossy().into_owned(),
             branch: "card/a1b2c3".into(),
             base: "main".into(),
+            in_place: false,
         };
         assert!(worktree_status_now(tmp.path(), &wt).is_err());
     }
@@ -2764,6 +3044,233 @@ mod tests {
             worktree_status_now(repo.path(), &wt).unwrap(),
             WorktreeStatus::default()
         );
+    }
+
+    fn branch_card(id: &str) -> Card {
+        Card::new(id.into(), "t".into(), None, now_stamp())
+    }
+
+    fn on_branch(dir: &std::path::Path) -> String {
+        git_in(dir, &["symbolic-ref", "--short", "HEAD"])
+    }
+
+    #[test]
+    fn branch_bring_up_switches_the_checkout_and_keeps_uncommitted_changes() {
+        let Some(repo) = git_repo() else { return };
+        // The human's work in progress: a tracked edit and an untracked file.
+        std::fs::write(repo.path().join("f.txt"), "human edit\n").unwrap();
+        std::fs::write(repo.path().join("scratch.txt"), "notes\n").unwrap();
+        let card = branch_card("b1b2b3");
+        let BringUp::Worktree(wt) = bring_up_branch(repo.path(), &card).unwrap() else {
+            panic!("expected a branch record");
+        };
+        assert!(wt.in_place);
+        assert_eq!(wt.branch, "card/b1b2b3");
+        assert_eq!(wt.base, "main");
+        assert!(same_path(&wt.path, &repo.path().to_string_lossy()));
+        assert!(same_path(
+            &wt.root().to_string_lossy(),
+            &repo.path().to_string_lossy()
+        ));
+        assert_eq!(on_branch(repo.path()), "card/b1b2b3");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "human edit\n"
+        );
+        assert!(repo.path().join("scratch.txt").exists());
+        assert_eq!(checkout_changes(repo.path()), vec!["f.txt".to_string()]);
+        // No worktree was made.
+        let listed = git_in(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+        // Restart while on the branch: reuse, base kept, no git write.
+        let mut again = card.clone();
+        again.worktree = Some(wt.clone());
+        let BringUp::Worktree(wt2) = bring_up_branch(repo.path(), &again).unwrap() else {
+            panic!("expected reuse");
+        };
+        assert_eq!(wt2, wt);
+    }
+
+    #[test]
+    fn branch_bring_up_restarts_on_an_existing_branch_and_refuses_to_clobber() {
+        let Some(repo) = git_repo() else { return };
+        let card = branch_card("c1c2c3");
+        let BringUp::Worktree(wt) = bring_up_branch(repo.path(), &card).unwrap() else {
+            panic!("expected a branch record");
+        };
+        std::fs::write(repo.path().join("f.txt"), "card edit\n").unwrap();
+        git_in(repo.path(), &["commit", "-q", "-am", "card work"]);
+        git_in(repo.path(), &["switch", "-q", "main"]);
+        // Restart from main: switches back onto the existing branch.
+        let mut restart = card.clone();
+        restart.worktree = Some(wt.clone());
+        bring_up_branch(repo.path(), &restart).unwrap();
+        assert_eq!(on_branch(repo.path()), "card/c1c2c3");
+        // From main with a local edit to the file the branch changed: git
+        // refuses the switch, the edit survives, the checkout stays put.
+        git_in(repo.path(), &["switch", "-q", "main"]);
+        std::fs::write(repo.path().join("f.txt"), "human edit\n").unwrap();
+        let err = bring_up_branch(repo.path(), &restart).unwrap_err();
+        assert!(err.contains("overwritten"), "{err}");
+        assert_eq!(on_branch(repo.path()), "main");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "human edit\n"
+        );
+    }
+
+    #[test]
+    fn dispatch_refuses_to_stack_on_another_cards_branch() {
+        let Some(repo) = git_repo() else { return };
+        bring_up_branch(repo.path(), &branch_card("d1d2d3")).unwrap();
+        let err = bring_up_branch(repo.path(), &branch_card("e1e2e3")).unwrap_err();
+        assert!(err.contains("card d1d2d3's branch"), "{err}");
+        let err = bring_up_worktree(repo.path(), &branch_card("e1e2e3")).unwrap_err();
+        assert!(err.contains("card d1d2d3's branch"), "{err}");
+        assert_eq!(on_branch(repo.path()), "card/d1d2d3");
+    }
+
+    #[test]
+    fn branch_status_counts_the_checkout_only_while_it_is_on_the_branch() {
+        let Some(repo) = git_repo() else { return };
+        let BringUp::Worktree(wt) = bring_up_branch(repo.path(), &branch_card("f1f2f3")).unwrap()
+        else {
+            panic!("expected a branch record");
+        };
+        std::fs::write(repo.path().join("g.txt"), "g\n").unwrap();
+        git_in(repo.path(), &["add", "g.txt"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "g"]);
+        std::fs::write(repo.path().join("f.txt"), "dirty\n").unwrap();
+        let st = worktree_status_now(repo.path(), &wt).unwrap();
+        assert_eq!(
+            (st.dirty, st.ahead, st.behind, st.missing),
+            (true, 1, 0, false)
+        );
+        git_in(repo.path(), &["switch", "-q", "main"]);
+        let st = worktree_status_now(repo.path(), &wt).unwrap();
+        assert_eq!(
+            (st.dirty, st.ahead),
+            (false, 1),
+            "off the branch, the checkout's changes are not the card's"
+        );
+    }
+
+    #[test]
+    fn branch_teardown_deletes_only_the_branch_and_never_strands_work() {
+        let Some(repo) = git_repo() else { return };
+        let BringUp::Worktree(wt) = bring_up_branch(repo.path(), &branch_card("a9a9a9")).unwrap()
+        else {
+            panic!("expected a branch record");
+        };
+        std::fs::write(repo.path().join("g.txt"), "g\n").unwrap();
+        git_in(repo.path(), &["add", "g.txt"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "g"]);
+        std::fs::write(repo.path().join("f.txt"), "human edit\n").unwrap();
+        // Unmerged and checked out: kept, checkout untouched.
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Unmerged { ahead: 1 }
+        );
+        assert_eq!(on_branch(repo.path()), "card/a9a9a9");
+        // Merged (base fast-forwarded by hand): switched back, branch gone,
+        // the uncommitted edit rides along.
+        let tip = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        git_in(repo.path(), &["update-ref", "refs/heads/main", &tip]);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert_eq!(on_branch(repo.path()), "main");
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a9a9a9"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "human edit\n"
+        );
+        assert!(
+            repo.path().join(".git").exists(),
+            "the checkout is never removed"
+        );
+        // Repeating is harmless.
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn branch_discard_switches_to_base_and_drops_unmerged_commits() {
+        let Some(repo) = git_repo() else { return };
+        let BringUp::Worktree(wt) = bring_up_branch(repo.path(), &branch_card("b9b9b9")).unwrap()
+        else {
+            panic!("expected a branch record");
+        };
+        std::fs::write(repo.path().join("g.txt"), "g\n").unwrap();
+        git_in(repo.path(), &["add", "g.txt"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "g"]);
+        std::fs::write(repo.path().join("scratch.txt"), "notes\n").unwrap();
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Removed
+        );
+        assert_eq!(on_branch(repo.path()), "main");
+        assert!(git_in(repo.path(), &["branch", "--list", "card/b9b9b9"]).is_empty());
+        assert!(repo.path().join("scratch.txt").exists());
+    }
+
+    #[test]
+    fn branch_cards_never_appear_on_the_worktrees_page() {
+        let mut card = branch_card("c9c9c9");
+        card.worktree = Some(branch_layout(
+            std::path::Path::new("C:/r"),
+            "c9c9c9",
+            "main",
+        ));
+        let rows = worktree_rows(
+            std::slice::from_ref(&card),
+            &Default::default(),
+            |_| None,
+            &[],
+        );
+        assert!(rows.is_empty());
+        let rows = live_worktree_rows(&[card], &Default::default(), Vec::new(), |_| None);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn branch_record_round_trips_and_a_worktree_record_omits_the_flag() {
+        let wt = branch_layout(std::path::Path::new("C:\\r"), "d9d9d9", "main");
+        assert_eq!(wt.path, "C:/r");
+        let text = serde_json::to_string(&wt).unwrap();
+        assert!(text.contains("\"in_place\":true"), "{text}");
+        assert_eq!(serde_json::from_str::<Worktree>(&text).unwrap(), wt);
+        let tree = worktree_layout(std::path::Path::new("C:/r"), "d9d9d9", "main");
+        let text = serde_json::to_string(&tree).unwrap();
+        assert!(!text.contains("in_place"), "{text}");
+    }
+
+    #[test]
+    fn dispatch_prompt_for_a_branch_card_guards_the_shared_checkout() {
+        let mut card = branch_card("e9e9e9");
+        card.title = "Branch work".into();
+        card.worktree = Some(branch_layout(
+            std::path::Path::new("C:/r"),
+            "e9e9e9",
+            "main",
+        ));
+        let p = dispatch_prompt(&card, CloseoutStyle::Path);
+        for want in [
+            "You are in the project checkout at C:/r, on branch card/e9e9e9, created from main. There is no worktree.",
+            "never git add -A or git add ., never stash, reset, restore, clean, or switch branches.",
+            "    foreman kanban integrate e9e9e9\n",
+            "    foreman kanban wait e9e9e9 --timeout 1800\n",
+            "put the checkout back on main",
+            "for a moved base: git rebase main",
+            "Do not end the session without the card Done (by the queue) or blocked.",
+        ] {
+            assert!(p.contains(want), "missing {want:?} in:\n{p}");
+        }
+        assert!(!p.contains("kanban done"), "{p}");
+        assert!(!p.contains("git worktree at"), "{p}");
     }
 
     #[test]
@@ -3012,6 +3519,7 @@ mod tests {
             path: stray.to_string_lossy().replace('\\', "/"),
             branch: "card/a1b2c3".into(),
             base: "main".into(),
+            in_place: false,
         };
         assert!(matches!(
             teardown_worktree(repo.path(), &wt, true),
@@ -3186,6 +3694,7 @@ mod tests {
             path: "H:/repo/.foreman/worktrees/a3f8k2".into(),
             branch: "card/a3f8k2".into(),
             base: "main".into(),
+            in_place: false,
         }
     }
 
@@ -4118,6 +4627,7 @@ mod tests {
             path: format!("H:/repo/.foreman/worktrees/{id}"),
             branch: format!("card/{id}"),
             base: "main".into(),
+            in_place: false,
         };
         let done = store.add("done card", None).unwrap();
         let live = store.add("live card", None).unwrap();
@@ -4269,6 +4779,7 @@ mod tests {
             path: format!("H:/repo/.foreman/worktrees/{id}"),
             branch: format!("card/{id}"),
             base: "main".into(),
+            in_place: false,
         };
         // A card whose tree git no longer lists (pruned) still gets a row.
         let pruned = store.add("pruned", None).unwrap();

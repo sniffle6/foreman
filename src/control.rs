@@ -280,6 +280,10 @@ pub struct KanbanRequest {
     /// setting, same as the board chip. Skipped when unset (wire compat v1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<bool>,
+    /// `dispatch --branch`: branch mode (card/<id> in the project checkout,
+    /// no worktree). Skipped when false (wire compat v1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub branch: bool,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -939,7 +943,7 @@ pub fn parse_kanban_args(
     }
 }
 
-/// `dispatch <id> --agent NAME [--worktree|--no-worktree] [--project P]` —
+/// `dispatch <id> --agent NAME [--worktree|--branch|--no-worktree] [--project P]` —
 /// the board's "Start with" button over the pipe: claim, optional worktree,
 /// spawn with the generated dispatch prompt. The agent is checked against
 /// the board's `AGENTS` here (exit 2) and again by the server.
@@ -951,6 +955,7 @@ fn parse_kanban_dispatch(
     let mut id: Option<String> = None;
     let mut agent: Option<String> = None;
     let mut worktree: Option<bool> = None;
+    let mut branch = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -970,6 +975,10 @@ fn parse_kanban_dispatch(
                 worktree = Some(v);
                 i += 1;
             }
+            "--branch" => {
+                branch = true;
+                i += 1;
+            }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => {
                 if id.is_some() {
@@ -979,6 +988,9 @@ fn parse_kanban_dispatch(
                 i += 1;
             }
         }
+    }
+    if branch && worktree.is_some() {
+        return Err("give one of --worktree, --branch, --no-worktree".into());
     }
     let id = id.ok_or("missing <id>")?;
     let agent = agent.ok_or("dispatch needs --agent NAME")?;
@@ -995,6 +1007,7 @@ fn parse_kanban_dispatch(
         id: Some(id),
         agent: Some(agent),
         worktree,
+        branch,
         ..Default::default()
     }))
 }
@@ -1587,7 +1600,7 @@ foreman kanban add <title words...> [--body B] [--project P]
 foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
 foreman kanban start <id> [--project P]
-foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree] [--project P]
+foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree] [--project P]
 foreman kanban done <id> [--project P]
 foreman kanban block <id> --reason R [--project P]
 foreman kanban rm <id> [--project P]
@@ -1644,9 +1657,11 @@ focused project).
           worktree teardown is running, or the integration queue owns it.
           --worktree / --no-worktree picks a git worktree
           (.foreman/worktrees/<id>, branch card/<id>) or the project
-          checkout; neither = the app's dispatch-worktrees setting (the
-          board chip's default). A card that already carries a worktree
-          resumes in it, and --no-worktree is refused for it. Reply, like
+          checkout; --branch puts branch card/<id> in the project checkout
+          itself (no worktree; uncommitted changes stay put). None = the
+          app's dispatch-worktrees setting (the board chip's default). A
+          card that already carries a worktree or a branch resumes in it,
+          and a flag naming another mode is refused. Reply, like
           open: {\"ok\":true,\"terminal\":\"tN\",\"project\":\"pN\"}; follow
           the card with wait <id>.
   done    InProgress -> Done. Errors on any other state or a missing card
@@ -3875,6 +3890,18 @@ mod tests {
             panic!()
         };
         assert_eq!(r.worktree, Some(false));
+        assert!(!r.branch);
+        let KanbanAction::Request(r) =
+            parse(&["dispatch", "a1", "--agent", "claude", "--branch"]).unwrap()
+        else {
+            panic!()
+        };
+        assert!(r.branch);
+        assert_eq!(r.worktree, None);
+        for flag in ["--worktree", "--no-worktree"] {
+            let e = parse(&["dispatch", "a1", "--agent", "claude", "--branch", flag]).unwrap_err();
+            assert!(e.contains("one of"), "{e}");
+        }
 
         // missing id / agent, bad agent, contradictory or unknown flags
         assert!(
@@ -3911,7 +3938,7 @@ mod tests {
         };
         let j = serde_json::to_string(&req).unwrap();
         assert!(
-            !j.contains("\"agent\"") && !j.contains("\"worktree\""),
+            !j.contains("\"agent\"") && !j.contains("\"worktree\"") && !j.contains("\"branch\""),
             "{j}"
         );
         let r: KanbanRequest = serde_json::from_str(

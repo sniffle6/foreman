@@ -170,6 +170,13 @@ A Card's private checkout under `.foreman/worktrees/<id>`, on branch
 `card/<id>`, created at dispatch and recorded on the Card.
 _Avoid_: sandbox, checkout (ambiguous with the main checkout).
 
+**Branch mode**:
+Dispatching a Card onto branch `card/<id>` in the project checkout itself,
+with no Worktree. The Card records it as a Worktree record flagged
+`in_place` whose path is the checkout root; it integrates through the same
+Integration queue, without a rebase.
+_Avoid_: in-place worktree, feature-branch mode.
+
 **Base**:
 The branch the main checkout had at dispatch; the Worktree's integration
 target.

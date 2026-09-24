@@ -66,7 +66,7 @@ map, not the last word on syntax. Per-verb `--help` is not accepted.
   lists one Version, `--all` everything.
 - `start` — self-service claim of a backlog card. Requires Codex to be
   inside a Foreman terminal (`FOREMAN_TERMINAL_ID` set).
-- `dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree]` —
+- `dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree]` —
   what the board's "Start with" button does, for an orchestrator: spawn the
   agent in a new terminal with the generated dispatch prompt (`# Workspace`
   section, close-out lines, `Card:` trailer) and claim the card for it.
@@ -141,10 +141,23 @@ A card started from the board (or `kanban dispatch`) may run in its own
 git worktree —
 `<repo>/.foreman/worktrees/<id>` on branch `card/<id>` — so no two workers
 share a checkout. The choice is made at dispatch time: the board's
-`wt on/off` chip beside the agent picker, or `dispatch --worktree` /
-`--no-worktree`; both default to the app setting. A card that already has a
-worktree always restarts in it (`--no-worktree` is refused for it). If you were dispatched into one, your prompt has a `# Workspace`
-section saying so; if it does not, you are in the project cwd.
+`wt` / `branch` / `here` chip beside the agent picker, or `dispatch
+--worktree` / `--branch` / `--no-worktree`; both default to the app setting
+(`wt` or `here`). A card that already has a worktree or a branch always
+restarts in it (a conflicting flag is refused). If you were dispatched into
+one, your prompt has a `# Workspace` section saying so; if it does not, you
+are in the project cwd.
+
+**Branch mode** (`branch`) puts `card/<id>` in the project checkout itself,
+no worktree. Your `# Workspace` says "There is no worktree". The checkout may
+hold the human's uncommitted changes, so: stage only your own files by name
+(never `git add -A` / `git add .`), and never stash, reset, restore, clean,
+or switch branches. Integration is the same `integrate` + `wait`, but the
+queue never rebases the shared checkout: if the base moved, `wait` exits 3
+with reason `base moved` and you rebase yourself (block if the human's
+changes stop the rebase). On success the checkout is back on the base with
+the human's changes untouched. Only one branch-mode card can hold the
+checkout at a time; while it does, worktree cards' integrations hold.
 
 What that changes for you:
 

@@ -62,6 +62,19 @@ against.
   fast-forward is re-prepared and re-checked, up to three times per turn,
   then the request goes back to the queue with a note. Git lock contention
   on the destination is retried the same bounded way.
+- **Branch-mode cards** (spec: dispatch-branch) submit with `in_place`:
+  the source is the project checkout itself, on `card/<id>`. Their turn
+  skips the rebase — a target that is no longer an ancestor is handed back
+  as `base moved` — runs the checks in the checkout (uncommitted changes
+  and all; submission does not require a clean checkout, because the
+  changes may be the human's), then moves the target with `git update-ref
+  <target> <commit> <old>` and HEAD with `git symbolic-ref`. No file in the
+  checkout changes. A target checked out in some worktree holds the
+  request. After any hold, the rest of the turn still tries branch-mode
+  requests (each once): the worktree card held because the checkout is on
+  `card/<id>` must not keep that card from landing. Recovery: commit on
+  target → integrated (and HEAD moved if still on the branch at that
+  commit); otherwise queued again.
 - **Done follows integration**: the turn writes `integrated` with the
   prepared commit; the coordinator of any window whose board has the card
   then marks it Done, queues the ordinary held teardown, and removes the

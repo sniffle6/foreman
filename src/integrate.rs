@@ -126,6 +126,9 @@ pub enum Reason {
     ProcessFailed,
     /// A previous owner died mid-rebase; the worktree needs a human/worker.
     Interrupted,
+    /// Branch mode: the target is no longer an ancestor of the card's
+    /// branch. The queue never rebases the shared checkout; the worker does.
+    BaseMoved,
 }
 
 impl Reason {
@@ -142,6 +145,7 @@ impl Reason {
             Reason::TargetMoved => "target moved",
             Reason::ProcessFailed => "process failed",
             Reason::Interrupted => "interrupted",
+            Reason::BaseMoved => "base moved",
         }
     }
 
@@ -172,6 +176,9 @@ impl Reason {
             Reason::ProcessFailed => "read the detail, fix the cause, then resubmit",
             Reason::Interrupted => {
                 "in the worktree run `git rebase --abort` (or finish the rebase), then resubmit"
+            }
+            Reason::BaseMoved => {
+                "in the checkout run `git rebase <base>` (block if uncommitted changes that are not yours stop it), commit, then resubmit"
             }
         }
     }
@@ -282,6 +289,12 @@ pub struct Request {
     /// What recovery did to this request, for the human.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Branch mode (spec: dispatch-branch): `worktree` is the destination
+    /// checkout itself, on `branch`. Integrated by [`integrate_in_place`]:
+    /// no rebase, a ref-only fast-forward, and the checkout's HEAD moved
+    /// back to `target` without touching a file.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_place: bool,
 }
 
 impl Request {
@@ -302,6 +315,7 @@ pub struct Submission {
     pub branch: String,
     pub commit: String,
     pub worker: Option<String>,
+    pub in_place: bool,
 }
 
 /// What [`Queue::submit`] did.
@@ -700,6 +714,7 @@ impl Queue {
             hold: None,
             cancel_requested: false,
             note: None,
+            in_place: sub.in_place,
         };
         self.write(&request)?;
         Ok(Submitted {
@@ -782,7 +797,7 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 /// Which git operation, if any, is in progress in `tree` (the per-worktree
 /// git dir holds the markers). `None` when git cannot answer — a missing
 /// tree is caught earlier by the callers.
-fn git_op_in_progress(tree: &Path) -> Option<&'static str> {
+pub(crate) fn git_op_in_progress(tree: &Path) -> Option<&'static str> {
     let gitdir = crate::kanban::git(tree, &["rev-parse", "--absolute-git-dir"]).ok()?;
     let g = Path::new(&gitdir);
     [
@@ -854,6 +869,85 @@ fn source_preflight(
     Ok(head)
 }
 
+/// Branch mode's source preflight: the project checkout is present, idle,
+/// on `branch`, and — when `expect` is given — still at that commit.
+/// Uncommitted changes are allowed: they may be the human's, and nothing in
+/// the in-place turn touches the working tree. Returns HEAD.
+fn source_preflight_in_place(
+    tree: &Path,
+    branch: &str,
+    expect: Option<&str>,
+) -> Result<String, (Reason, String)> {
+    if !tree.is_dir() {
+        return Err((
+            Reason::SourceMissing,
+            format!("checkout {} is missing", tree.display()),
+        ));
+    }
+    if let Some(op) = git_op_in_progress(tree) {
+        return Err((
+            Reason::SourceBusy,
+            format!("a git {op} is in progress in the checkout"),
+        ));
+    }
+    let on = crate::kanban::git(tree, &["symbolic-ref", "--short", "HEAD"]).map_err(|e| {
+        (
+            Reason::SourceChanged,
+            format!("checkout is not on a branch: {e}"),
+        )
+    })?;
+    if on != branch {
+        return Err((
+            Reason::SourceChanged,
+            format!("checkout is on {on}, expected {branch}"),
+        ));
+    }
+    let head =
+        crate::kanban::git(tree, &["rev-parse", "HEAD"]).map_err(|e| (Reason::ProcessFailed, e))?;
+    if let Some(x) = expect
+        && x != head
+    {
+        return Err((
+            Reason::SourceChanged,
+            format!(
+                "{branch} moved from {} to {} after submission",
+                short(x),
+                short(&head)
+            ),
+        ));
+    }
+    Ok(head)
+}
+
+/// Branch mode's target preflight: `target` exists and is checked out in no
+/// worktree (moving a ref another tree has checked out would leave that
+/// tree's files behind its HEAD — held, retried). Returns its commit.
+fn target_preflight(tree: &Path, target: &str) -> Result<String, (Reason, String)> {
+    let target_ref = format!("refs/heads/{target}");
+    let listed = crate::kanban::git(tree, &["worktree", "list", "--porcelain"])
+        .map_err(|e| (Reason::ProcessFailed, e))?;
+    let mut path = None;
+    for line in listed.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(p.trim().to_string());
+        } else if line.strip_prefix("branch ").map(str::trim) == Some(target_ref.as_str()) {
+            return Err((
+                Reason::DestinationBranch,
+                format!(
+                    "{target} is checked out in {}; switch that tree off it",
+                    path.unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    crate::kanban::git(tree, &["rev-parse", "--verify", "--quiet", &target_ref]).map_err(|_| {
+        (
+            Reason::ProcessFailed,
+            format!("target branch {target} does not exist"),
+        )
+    })
+}
+
 /// The first few file names of a porcelain status, for a one-line detail.
 fn name_list(porcelain: &str) -> String {
     // `XY path`: the status columns then a space. The first line may have
@@ -885,7 +979,12 @@ pub fn prepare_submission(
     let repo = repo_identity(dest_cwd)?;
     let dest = crate::kanban::git(dest_cwd, &["rev-parse", "--show-toplevel"])?;
     let tree = Path::new(&wt.path);
-    let commit = source_preflight(tree, &wt.branch, None).map_err(|(_, d)| d)?;
+    let commit = if wt.in_place {
+        source_preflight_in_place(tree, &wt.branch, None)
+    } else {
+        source_preflight(tree, &wt.branch, None)
+    }
+    .map_err(|(_, d)| d)?;
     let wt_repo = repo_identity(tree)?;
     if wt_repo != repo {
         return Err(format!(
@@ -903,6 +1002,7 @@ pub fn prepare_submission(
         branch: wt.branch.clone(),
         commit,
         worker,
+        in_place: wt.in_place,
     })
 }
 
@@ -1360,6 +1460,9 @@ fn cancelled(req: Request, note: String) -> (Request, TurnEvent) {
 /// fast-forward — persisting the stage before each step. Cancel checkpoints
 /// sit between stages and inside the check runner.
 fn integrate_one(queue: &Queue, mut req: Request, hooks: &dyn TurnHooks) -> (Request, TurnEvent) {
+    if req.in_place {
+        return integrate_in_place(queue, req, hooks);
+    }
     let card = req.card.clone();
     let tree = PathBuf::from(&req.worktree);
     let dest = PathBuf::from(&req.dest);
@@ -1558,6 +1661,240 @@ fn integrate_one(queue: &Queue, mut req: Request, hooks: &dyn TurnHooks) -> (Req
     }
 }
 
+/// Branch mode's turn (spec: dispatch-branch §Integration): preflight,
+/// ancestry, check, final preflight, then a ref-only fast-forward. The
+/// checkout is never rebased or switched with files in flight:
+///
+/// - a target that is not an ancestor of the branch goes back to the worker
+///   (`base moved`) — rebasing a shared checkout could strand the human's
+///   uncommitted changes mid-conflict;
+/// - the target moves by `git update-ref <target> <commit> <old>`, a
+///   compare-and-swap that fails if anyone moved it meanwhile;
+/// - HEAD then moves to the target by `git symbolic-ref`. Target and branch
+///   are the same commit at that point, so the index and every file,
+///   committed or not, are already right: nothing on disk changes.
+///
+/// The check runs in the checkout as it stands, uncommitted changes and all.
+fn integrate_in_place(
+    queue: &Queue,
+    mut req: Request,
+    hooks: &dyn TurnHooks,
+) -> (Request, TurnEvent) {
+    let card = req.card.clone();
+    let tree = PathBuf::from(&req.worktree);
+    let target_ref = format!("refs/heads/{}", req.target);
+    let commit = req.commit.clone();
+    let is_cancelled = || queue.cancel_pending(&card);
+    macro_rules! save {
+        () => {
+            if let Err(e) = queue.save_progress(&mut req) {
+                return resolve(req, Reason::ProcessFailed, e);
+            }
+        };
+    }
+    macro_rules! stage {
+        ($s:expr) => {
+            if let Some(a) = req.attempt.as_mut() {
+                a.stage = $s;
+            }
+            save!();
+        };
+    }
+
+    let mut retries = 0u32;
+    'turn: loop {
+        if let Err((reason, detail)) = source_preflight_in_place(&tree, &req.branch, Some(&commit))
+        {
+            return resolve(req, reason, detail);
+        }
+        let target_commit = match target_preflight(&tree, &req.target) {
+            Ok(c) => c,
+            Err((reason, detail)) => return hold(req, reason, detail),
+        };
+        if crate::kanban::git(
+            &tree,
+            &["merge-base", "--is-ancestor", &target_commit, &commit],
+        )
+        .is_err()
+        {
+            let detail = format!(
+                "{} moved to {} and is no longer an ancestor of {}",
+                req.target,
+                short(&target_commit),
+                req.branch
+            );
+            return resolve(req, Reason::BaseMoved, detail);
+        }
+        if is_cancelled() {
+            return cancelled(req, "cancelled before the check; checkout untouched".into());
+        }
+        if let Some(a) = req.attempt.as_mut() {
+            a.target_commit = Some(target_commit.clone());
+            a.retries = retries;
+            a.prepared = Some(commit.clone());
+            a.check = None;
+        }
+        stage!(Stage::Check);
+        let policy = match load_policy(&tree) {
+            Ok(p) => p,
+            Err(e) => return resolve(req, Reason::ProcessFailed, e),
+        };
+        match run_check(
+            &tree,
+            policy.as_ref(),
+            &commit,
+            &target_commit,
+            &is_cancelled,
+        ) {
+            Ok(rec) => {
+                let ok = rec.ok;
+                let tail = rec.tail.clone();
+                if let Some(a) = req.attempt.as_mut() {
+                    a.check = Some(rec);
+                }
+                if !ok {
+                    return resolve(req, Reason::CheckFailed, tail);
+                }
+            }
+            Err(CheckError::Cancelled) => {
+                return cancelled(req, "cancelled during the check; checkout untouched".into());
+            }
+            Err(CheckError::Failed(e)) => return resolve(req, Reason::ProcessFailed, e),
+        }
+        save!();
+        hooks.after_check(&card);
+        if is_cancelled() {
+            return cancelled(req, "cancelled after the check; checkout untouched".into());
+        }
+        // Final preflight: same branch commit, same target.
+        if let Err((reason, detail)) = source_preflight_in_place(&tree, &req.branch, Some(&commit))
+        {
+            return resolve(req, reason, detail);
+        }
+        match target_preflight(&tree, &req.target) {
+            Ok(c) if c == target_commit => {}
+            Ok(_) => {
+                retries += 1;
+                if retries > MAX_TARGET_RETRIES {
+                    let note = format!(
+                        "{} moved {retries} times during the turn; queued again",
+                        req.target
+                    );
+                    return requeue(req, note);
+                }
+                continue 'turn;
+            }
+            Err((reason, detail)) => return hold(req, reason, detail),
+        }
+        stage!(Stage::Merge);
+        hooks.before_merge(&card);
+        let msg = format!("foreman: integrate {}", req.branch);
+        let mut lock_retries = 0u32;
+        loop {
+            match crate::kanban::git(
+                &tree,
+                &[
+                    "update-ref",
+                    "-m",
+                    &msg,
+                    &target_ref,
+                    &commit,
+                    &target_commit,
+                ],
+            ) {
+                Ok(_) => break,
+                Err(e) if e.contains(".lock") && lock_retries < MAX_TARGET_RETRIES => {
+                    lock_retries += 1;
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => {
+                    let now = crate::kanban::git(&tree, &["rev-parse", &target_ref]);
+                    if now.as_deref().is_ok_and(|n| n != target_commit) {
+                        retries += 1;
+                        if retries > MAX_TARGET_RETRIES {
+                            let note = format!(
+                                "{} moved {retries} times during the turn; queued again",
+                                req.target
+                            );
+                            return requeue(req, note);
+                        }
+                        continue 'turn;
+                    }
+                    return resolve(req, Reason::ProcessFailed, e);
+                }
+            }
+        }
+        // The target now holds the branch's commit. Put the checkout on
+        // it: a pure HEAD move, since both refs name the same commit.
+        if let Err(e) = crate::kanban::git(&tree, &["symbolic-ref", "HEAD", &target_ref]) {
+            let detail = format!(
+                "{} was fast-forwarded to {} but the checkout could not be moved onto it ({e}); run git switch {}",
+                req.target,
+                short(&commit),
+                req.target
+            );
+            return resolve(req, Reason::ProcessFailed, detail);
+        }
+        match crate::kanban::git(&tree, &["rev-parse", "HEAD"]) {
+            Ok(h) if h == commit => {}
+            Ok(h) => {
+                let detail = format!(
+                    "fast-forward reported success but {} is at {}",
+                    req.target,
+                    short(&h)
+                );
+                return resolve(req, Reason::ProcessFailed, detail);
+            }
+            Err(e) => return resolve(req, Reason::ProcessFailed, e),
+        }
+        req.phase = Phase::Integrated;
+        req.outcome = None;
+        req.hold = None;
+        let card = req.card.clone();
+        return (
+            req,
+            TurnEvent::Integrated {
+                card,
+                prepared: commit,
+            },
+        );
+    }
+}
+
+/// Recovery for a branch-mode request a dead owner left `integrating`.
+/// Landed (the commit is on the target) → integrated, and a checkout still
+/// on the card's branch at that same commit is moved onto the target the
+/// way the turn would have; otherwise nothing was written that the next
+/// turn's preflight cannot judge, so it is queued again.
+fn recover_in_place(req: &mut Request) -> String {
+    let tree = PathBuf::from(&req.worktree);
+    let target_ref = format!("refs/heads/{}", req.target);
+    let landed = crate::kanban::git(
+        &tree,
+        &["merge-base", "--is-ancestor", &req.commit, &target_ref],
+    )
+    .is_ok();
+    if !landed {
+        req.phase = Phase::Queued;
+        req.outcome = None;
+        req.attempt = None;
+        return "recovered before the fast-forward; queued again".into();
+    }
+    req.phase = Phase::Integrated;
+    req.outcome = None;
+    let on = crate::kanban::git(&tree, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+    let head = crate::kanban::git(&tree, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let target = crate::kanban::git(&tree, &["rev-parse", &target_ref]).unwrap_or_default();
+    if on == format!("refs/heads/{}", req.branch) && !head.is_empty() && head == target {
+        let _ = crate::kanban::git(&tree, &["symbolic-ref", "HEAD", &target_ref]);
+    }
+    format!(
+        "recovered: {} is already on {}",
+        short(&req.commit),
+        req.target
+    )
+}
+
 /// Requests a dead owner left `integrating`: decide from git history and
 /// operation state, never from a missing reply. Runs under the turn lock,
 /// so "integrating" with the lock free means the owner is gone.
@@ -1570,6 +1907,21 @@ fn recover(queue: &Queue) -> Result<Vec<TurnEvent>, String> {
         let tree = PathBuf::from(&req.worktree);
         let dest = PathBuf::from(&req.dest);
         let prepared = req.attempt.as_ref().and_then(|a| a.prepared.clone());
+        if req.in_place {
+            let note = recover_in_place(&mut req);
+            req.hold = None;
+            req.note = Some(note.clone());
+            {
+                let _m = queue.meta()?;
+                req.touch();
+                queue.write(&req)?;
+            }
+            events.push(TurnEvent::Recovered {
+                card: req.card.clone(),
+                note,
+            });
+            continue;
+        }
         let landed = prepared.as_deref().is_some_and(|p| {
             crate::kanban::git(&dest, &["merge-base", "--is-ancestor", p, &req.target]).is_ok()
         });
@@ -1662,12 +2014,15 @@ pub fn run_turn(
         return Ok(None);
     };
     let mut events = recover(queue)?;
+    // After a hold, only branch-mode requests are still tried this turn,
+    // each at most once: a worktree card held because the checkout is on a
+    // branch-mode card's branch must not keep that card from integrating
+    // and putting the checkout back (spec: dispatch-branch §Integration).
+    let mut held: Vec<String> = Vec::new();
     loop {
-        let Some(mut req) = queue
-            .requests()
-            .into_iter()
-            .find(|r| r.phase == Phase::Queued)
-        else {
+        let Some(mut req) = queue.requests().into_iter().find(|r| {
+            r.phase == Phase::Queued && (held.is_empty() || (r.in_place && !held.contains(&r.card)))
+        }) else {
             break;
         };
         {
@@ -1688,6 +2043,7 @@ pub fn run_turn(
             req.touch();
             queue.write(&req)?;
         }
+        let req_card = req.card.clone();
         let (req, mut event) = integrate_one(queue, req, hooks);
         {
             let _m = queue.meta()?;
@@ -1719,7 +2075,11 @@ pub fn run_turn(
                 }
             }
         }
-        let stop = matches!(event, TurnEvent::Held { .. } | TurnEvent::Requeued { .. });
+        let is_held = matches!(event, TurnEvent::Held { .. });
+        let stop = matches!(event, TurnEvent::Requeued { .. });
+        if is_held {
+            held.push(req_card);
+        }
         events.push(event);
         if stop {
             break;
@@ -1852,6 +2212,7 @@ mod tests {
             hold: None,
             cancel_requested: false,
             note: None,
+            in_place: false,
         }
     }
 
@@ -1964,6 +2325,7 @@ mod tests {
             branch: format!("card/{card}"),
             commit: commit.into(),
             worker: None,
+            in_place: false,
         }
     }
 
@@ -2156,6 +2518,160 @@ mod tests {
     }
 
     // -- turns ----------------------------------------------------------------
+
+    fn bring_up_branch(repo: &Path, id: &str) -> crate::kanban::Worktree {
+        let card =
+            crate::kanban::Card::new(id.into(), "t".into(), None, crate::kanban::now_stamp());
+        match crate::kanban::bring_up_branch(repo, &card).unwrap() {
+            crate::kanban::BringUp::Worktree(wt) if wt.in_place => wt,
+            other => panic!("expected a branch record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_branch_card_integrates_in_place_and_the_humans_changes_survive() {
+        let Some(r) = repo() else { return };
+        // Uncommitted human work in the shared checkout, before and after
+        // the card starts.
+        std::fs::write(r.path().join("f.txt"), "human edit\n").unwrap();
+        std::fs::write(r.path().join("notes.txt"), "untracked\n").unwrap();
+        let wt = bring_up_branch(r.path(), "cc");
+        let tip = commit_file(r.path(), "g.txt", "g\n", "card work");
+        write_policy(r.path(), &["git", "cat-file", "-e", "HEAD:g.txt"]);
+        let (q, sub) = submit(r.path(), "cc", &wt);
+        assert!(sub.request.in_place);
+        assert_eq!(sub.request.worktree, sub.request.dest);
+        let events = turn(&q);
+        assert!(
+            matches!(&events[..], [TurnEvent::Integrated { card, prepared }] if card == "cc" && *prepared == tip),
+            "{events:?}"
+        );
+        assert_eq!(git_in(r.path(), &["rev-parse", "main"]), tip);
+        assert_eq!(
+            git_in(r.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "main",
+            "the checkout is back on the base"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("f.txt")).unwrap(),
+            "human edit\n"
+        );
+        assert!(r.path().join("notes.txt").exists());
+        let status = git_in(r.path(), &["status", "--porcelain", "--untracked-files=no"]);
+        assert_eq!(status, "M f.txt", "only the human's edit is uncommitted");
+        let check = q.get("cc").unwrap().attempt.unwrap().check.unwrap();
+        assert!(check.ok);
+    }
+
+    #[test]
+    fn a_branch_card_whose_base_moved_goes_back_to_the_worker_untouched() {
+        let Some(r) = repo() else { return };
+        let wt = bring_up_branch(r.path(), "cc");
+        let tip = commit_file(r.path(), "g.txt", "g\n", "card work");
+        // Someone advances main without checking it out.
+        let tree = git_in(r.path(), &["rev-parse", "main^{tree}"]);
+        let moved = git_in(
+            r.path(),
+            &["commit-tree", &tree, "-p", "main", "-m", "elsewhere"],
+        );
+        git_in(r.path(), &["update-ref", "refs/heads/main", &moved]);
+        let (q, _) = submit(r.path(), "cc", &wt);
+        let events = turn(&q);
+        assert!(
+            matches!(&events[..], [TurnEvent::NeedsResolution { card, reason: Reason::BaseMoved, .. }] if card == "cc"),
+            "{events:?}"
+        );
+        assert_eq!(git_in(r.path(), &["rev-parse", "main"]), moved);
+        assert_eq!(head(r.path()), tip);
+        assert_eq!(
+            git_in(r.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "card/cc"
+        );
+        let view = &q.views()["cc"];
+        assert_eq!(view.phase, Phase::NeedsResolution);
+    }
+
+    #[test]
+    fn a_failed_check_leaves_the_branch_card_on_its_branch() {
+        let Some(r) = repo() else { return };
+        let wt = bring_up_branch(r.path(), "cc");
+        commit_file(r.path(), "g.txt", "g\n", "card work");
+        write_policy(r.path(), &["git", "cat-file", "-e", "HEAD:missing.txt"]);
+        let before = git_in(r.path(), &["rev-parse", "main"]);
+        let (q, _) = submit(r.path(), "cc", &wt);
+        let events = turn(&q);
+        assert!(
+            matches!(
+                &events[..],
+                [TurnEvent::NeedsResolution {
+                    reason: Reason::CheckFailed,
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        assert_eq!(git_in(r.path(), &["rev-parse", "main"]), before);
+        assert_eq!(
+            git_in(r.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "card/cc"
+        );
+    }
+
+    #[test]
+    fn a_worktree_card_held_by_a_branch_card_does_not_block_it() {
+        let Some(r) = repo() else { return };
+        let a = bring_up(r.path(), "aa");
+        commit_file(Path::new(&a.path), "a.txt", "a\n", "a");
+        let c = bring_up_branch(r.path(), "cc");
+        let ctip = commit_file(r.path(), "c.txt", "c\n", "c");
+        let (q, _) = submit(r.path(), "aa", &a);
+        submit(r.path(), "cc", &c);
+        // aa is first in line but the checkout is on card/cc: aa holds,
+        // cc still integrates and puts the checkout back on main.
+        let events = turn(&q);
+        assert!(
+            matches!(&events[0], TurnEvent::Held { card, .. } if card == "aa"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1], TurnEvent::Integrated { card, .. } if card == "cc"),
+            "{events:?}"
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(git_in(r.path(), &["rev-parse", "main"]), ctip);
+        q.remove("cc").unwrap();
+        // The next turn lands aa on top.
+        let events = turn(&q);
+        assert!(
+            matches!(&events[..], [TurnEvent::Integrated { card, .. }] if card == "aa"),
+            "{events:?}"
+        );
+        assert_eq!(git_in(r.path(), &["rev-parse", "main~1"]), ctip);
+    }
+
+    #[test]
+    fn a_dead_owners_in_place_merge_is_recovered_and_the_checkout_moved() {
+        let Some(r) = repo() else { return };
+        let wt = bring_up_branch(r.path(), "cc");
+        let tip = commit_file(r.path(), "g.txt", "g\n", "card work");
+        let (q, sub) = submit(r.path(), "cc", &wt);
+        // Simulate an owner that died right after the ref update.
+        git_in(r.path(), &["update-ref", "refs/heads/main", &tip]);
+        let mut req = sub.request;
+        req.phase = Phase::Integrating;
+        req.attempt = Some(attempt_for(&owner()));
+        q.write(&req).unwrap();
+        let events = turn(&q);
+        assert!(
+            matches!(&events[..], [TurnEvent::Recovered { card, .. }] if card == "cc"),
+            "{events:?}"
+        );
+        assert_eq!(q.get("cc").unwrap().phase, Phase::Integrated);
+        assert_eq!(
+            git_in(r.path(), &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+    }
 
     #[test]
     fn two_nonconflicting_submissions_land_in_order_and_the_second_is_checked_against_the_first() {

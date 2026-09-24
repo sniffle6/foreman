@@ -631,23 +631,35 @@ enum CardDispatchBegun {
     },
 }
 
-/// `kanban dispatch`'s worktree decision, mirroring the board chip: a card
-/// that already carries a worktree resumes in it (forced on, so an explicit
-/// `--no-worktree` is refused rather than silently ignored); otherwise the
-/// flag wins, and no flag means the app's worktree setting.
+/// `kanban dispatch`'s mode decision, mirroring the board chip: a card that
+/// already carries a worktree or a branch resumes in it (so a flag naming a
+/// different mode is refused rather than silently ignored); otherwise the
+/// flag wins, and no flag means the app's worktree setting (worktree or in
+/// place — branch mode is always explicit). `worktree` is
+/// `--worktree`/`--no-worktree`, `branch` is `--branch`.
 fn dispatch_worktree_choice(
-    flag: Option<bool>,
-    card_has_worktree: bool,
+    worktree: Option<bool>,
+    branch: bool,
+    locked: Option<crate::kanban::DispatchMode>,
     setting: bool,
-) -> Result<bool, String> {
-    match (flag, card_has_worktree) {
-        (Some(false), true) => Err(
-            "already has a worktree from an earlier run and resumes in it; drop --no-worktree"
-                .into(),
-        ),
-        (_, true) => Ok(true),
-        (Some(v), false) => Ok(v),
-        (None, false) => Ok(setting),
+) -> Result<crate::kanban::DispatchMode, String> {
+    use crate::kanban::DispatchMode;
+    let asked = match (branch, worktree) {
+        (true, Some(_)) => return Err("give one of --worktree, --branch, --no-worktree".into()),
+        (true, None) => Some((DispatchMode::Branch, "--branch")),
+        (false, Some(true)) => Some((DispatchMode::Worktree, "--worktree")),
+        (false, Some(false)) => Some((DispatchMode::InPlace, "--no-worktree")),
+        (false, None) => None,
+    };
+    match (locked, asked) {
+        (Some(have), Some((want, flag))) if have != want => Err(format!(
+            "already has a {} from an earlier run and resumes in it; drop {flag}",
+            have.name()
+        )),
+        (Some(have), _) => Ok(have),
+        (None, Some((want, _))) => Ok(want),
+        (None, None) if setting => Ok(DispatchMode::Worktree),
+        (None, None) => Ok(DispatchMode::InPlace),
     }
 }
 
@@ -1679,26 +1691,31 @@ impl WindowManager {
             // stale in-memory copy.
             store.reload();
         }
-        let has_wt = child
+        let locked = child
             .kanban
             .borrow()
             .get(&id)
-            .is_some_and(|c| c.worktree.is_some());
-        let worktree = dispatch_worktree_choice(
+            .and_then(crate::kanban::DispatchMode::locked_for);
+        let mode = dispatch_worktree_choice(
             req.worktree,
-            has_wt,
+            req.branch,
+            locked,
             crate::config::live(ctx).dispatch_worktrees,
         )
         .map_err(|e| format!("card {id}: {e}"))?;
         let card = child.dispatch_precheck(&id, true)?;
-        if !worktree {
+        if mode == crate::kanban::DispatchMode::InPlace {
             let tid = child.dispatch_spawn(card, &agent, None, ctx)?;
             return Ok(CardDispatchBegun::Spawned { pid, id, tid });
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let wake = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::kanban::bring_up_worktree(&cwd, &card));
+            let _ = tx.send(if mode == crate::kanban::DispatchMode::Branch {
+                crate::kanban::bring_up_branch(&cwd, &card)
+            } else {
+                crate::kanban::bring_up_worktree(&cwd, &card)
+            });
             wake.request_repaint();
         });
         Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx })
@@ -2854,17 +2871,28 @@ impl WindowManager {
                     let Some(wt) = wt else {
                         continue;
                     };
-                    self.pending_close = Some(PendingClose {
-                        target: CloseTarget::DiscardWorktree(id),
-                        view: crate::confirm::ConfirmClose::new(
+                    // Branch mode never deletes the checkout: only the
+                    // branch and its unmerged commits go.
+                    let (title, body) = if wt.in_place {
+                        (
+                            "Discard branch?",
+                            format!(
+                                "Deletes branch {} with any unmerged commits. The checkout at {} stays; if it is on {}, it switches to {} first and keeps uncommitted changes.",
+                                wt.branch, wt.path, wt.branch, wt.base
+                            ),
+                        )
+                    } else {
+                        (
                             "Discard worktree?",
                             format!(
                                 "Deletes {} and branch {}, including any uncommitted or unmerged work.",
                                 wt.path, wt.branch
                             ),
-                            "Discard",
-                            Vec::new(),
-                        ),
+                        )
+                    };
+                    self.pending_close = Some(PendingClose {
+                        target: CloseTarget::DiscardWorktree(id),
+                        view: crate::confirm::ConfirmClose::new(title, body, "Discard", Vec::new()),
                     });
                 }
                 crate::board::BoardAct::RemoveStray(wt) => {
@@ -2963,12 +2991,8 @@ impl WindowManager {
                         });
                     }
                 }
-                crate::board::BoardAct::Dispatch {
-                    id,
-                    agent,
-                    worktree,
-                } => {
-                    if let Err(e) = self.dispatch_card(&id, &agent, worktree, ctx) {
+                crate::board::BoardAct::Dispatch { id, agent, mode } => {
+                    if let Err(e) = self.dispatch_card(&id, &agent, mode, ctx) {
                         crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
@@ -2987,12 +3011,19 @@ impl WindowManager {
         &mut self,
         id: &str,
         agent: &str,
-        worktree: bool,
+        mode: crate::kanban::DispatchMode,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
+        use crate::kanban::DispatchMode;
         let card = self.dispatch_precheck(id, false)?;
-        let bring = match (worktree, self.cwd.clone()) {
-            (true, Some(cwd)) => Some(crate::kanban::bring_up_worktree(&cwd, &card)),
+        // A card that already carries a tree or a branch restarts in it,
+        // whatever the act says.
+        let mode = DispatchMode::locked_for(&card).unwrap_or(mode);
+        let bring = match (mode, self.cwd.clone()) {
+            (DispatchMode::Worktree, Some(cwd)) => {
+                Some(crate::kanban::bring_up_worktree(&cwd, &card))
+            }
+            (DispatchMode::Branch, Some(cwd)) => Some(crate::kanban::bring_up_branch(&cwd, &card)),
             _ => None,
         };
         self.dispatch_spawn(card, agent, bring, ctx)
@@ -3069,6 +3100,20 @@ impl WindowManager {
         let mut record: Option<crate::kanban::Worktree> = None;
         match bring {
             Some(Ok(crate::kanban::BringUp::Worktree(wt))) => {
+                if wt.in_place {
+                    let changed = crate::kanban::checkout_changes(&wt.root());
+                    if !changed.is_empty() {
+                        crate::notify::queue(
+                            ctx,
+                            crate::notify::Level::Warning,
+                            format!(
+                                "card {id}: the checkout has {} uncommitted file(s); they stay in place on {} and are not the card's",
+                                changed.len(),
+                                wt.branch
+                            ),
+                        );
+                    }
+                }
                 card.worktree = Some(wt.clone());
                 record = Some(wt);
             }
@@ -3081,11 +3126,16 @@ impl WindowManager {
                     format!("card {id}: no branch checked out; dispatched without a worktree"),
                 );
             }
-            Some(Err(e)) => return Err(format!("card {id}: worktree bring-up failed: {e}")),
+            Some(Err(e)) => return Err(format!("card {id}: bring-up failed: {e}")),
             None => card.worktree = None, // the prompt renders today's text
         }
         let prompt = crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
-        let spawn_cwd = record.as_ref().map(|w| std::path::PathBuf::from(&w.path));
+        // A branch-mode record's path is the checkout root; a project cwd
+        // below the root stays where it was.
+        let spawn_cwd = record
+            .as_ref()
+            .filter(|w| !w.in_place)
+            .map(|w| std::path::PathBuf::from(&w.path));
         let tid = match self.add_terminal_cmd(
             &[agent.to_string(), prompt],
             spawn_cwd.as_deref(),
@@ -3454,11 +3504,22 @@ impl WindowManager {
                             // An rm'd card has nothing to clear — not an error.
                             let _ = self.kanban.borrow_mut().clear_worktree(&id);
                         }
-                        Dirty => crate::notify::queue(
-                            ctx,
-                            crate::notify::Level::Warning,
-                            format!("card {id}: worktree kept: uncommitted changes"),
-                        ),
+                        Dirty => {
+                            let in_place = self
+                                .kanban
+                                .borrow()
+                                .get(&id)
+                                .and_then(|c| c.worktree.as_ref().map(|w| w.in_place))
+                                .unwrap_or(false);
+                            let text = if in_place {
+                                format!(
+                                    "card {id}: branch kept: switching the checkout back would overwrite uncommitted changes"
+                                )
+                            } else {
+                                format!("card {id}: worktree kept: uncommitted changes")
+                            };
+                            crate::notify::queue(ctx, crate::notify::Level::Warning, text);
+                        }
                         Unmerged { ahead } => {
                             let base = self
                                 .kanban
@@ -9710,6 +9771,7 @@ mod tests {
                 path: format!("/x/.foreman/worktrees/{id}"),
                 branch: format!("card/{id}"),
                 base: "main".into(),
+                in_place: false,
             },
             held_by: None,
             force: false,
@@ -15671,6 +15733,7 @@ mod tests {
                     path: tmp.path().join("no-such-tree").to_string_lossy().into(),
                     branch: "card/ghost".into(),
                     base: "main".into(),
+                    in_place: false,
                 }),
             );
             // No worktree: never probed, always a candidate.
@@ -15976,7 +16039,7 @@ mod tests {
                     .join("missing-agent.exe")
                     .to_string_lossy()
                     .into_owned(),
-                worktree: true,
+                mode: crate::kanban::DispatchMode::Worktree,
             },
         );
         let before = child.windows.len();
@@ -16014,7 +16077,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: id.clone(),
                 agent: agent.clone(),
-                worktree: true,
+                mode: crate::kanban::DispatchMode::Worktree,
             },
         );
 
@@ -16094,7 +16157,7 @@ mod tests {
     fn dispatch_from_board(
         child: &mut WindowManager,
         id: &str,
-        worktree: bool,
+        mode: crate::kanban::DispatchMode,
         ctx: &egui::Context,
     ) -> (WinId, usize) {
         push_board_act(
@@ -16102,7 +16165,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: id.to_string(),
                 agent: pause_argv()[0].clone(),
-                worktree,
+                mode,
             },
         );
         child.drain_board_acts(ctx);
@@ -16139,7 +16202,8 @@ mod tests {
         add.title = Some("wt card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
         let child = m.project_child_mut(pid).unwrap();
-        let (win, tab) = dispatch_from_board(child, &id, true, &ctx);
+        let (win, tab) =
+            dispatch_from_board(child, &id, crate::kanban::DispatchMode::Worktree, &ctx);
 
         let wt = child
             .kanban
@@ -16234,18 +16298,47 @@ mod tests {
 
     #[test]
     fn dispatch_worktree_choice_mirrors_the_board_chip() {
+        use crate::kanban::DispatchMode::{Branch, InPlace, Worktree};
         // no flag = the setting; a flag wins over it
-        assert_eq!(dispatch_worktree_choice(None, false, true), Ok(true));
-        assert_eq!(dispatch_worktree_choice(None, false, false), Ok(false));
-        assert_eq!(dispatch_worktree_choice(Some(true), false, false), Ok(true));
         assert_eq!(
-            dispatch_worktree_choice(Some(false), false, true),
-            Ok(false)
+            dispatch_worktree_choice(None, false, None, true),
+            Ok(Worktree)
         );
-        // a card with a tree resumes in it; an explicit opt-out is refused
-        assert_eq!(dispatch_worktree_choice(None, true, false), Ok(true));
-        assert_eq!(dispatch_worktree_choice(Some(true), true, false), Ok(true));
-        assert!(dispatch_worktree_choice(Some(false), true, true).is_err());
+        assert_eq!(
+            dispatch_worktree_choice(None, false, None, false),
+            Ok(InPlace)
+        );
+        assert_eq!(
+            dispatch_worktree_choice(Some(true), false, None, false),
+            Ok(Worktree)
+        );
+        assert_eq!(
+            dispatch_worktree_choice(Some(false), false, None, true),
+            Ok(InPlace)
+        );
+        assert_eq!(dispatch_worktree_choice(None, true, None, true), Ok(Branch));
+        assert!(dispatch_worktree_choice(Some(true), true, None, true).is_err());
+        // a card with a tree resumes in it; an explicit other mode is refused
+        assert_eq!(
+            dispatch_worktree_choice(None, false, Some(Worktree), false),
+            Ok(Worktree)
+        );
+        assert_eq!(
+            dispatch_worktree_choice(Some(true), false, Some(Worktree), false),
+            Ok(Worktree)
+        );
+        assert!(dispatch_worktree_choice(Some(false), false, Some(Worktree), true).is_err());
+        assert!(dispatch_worktree_choice(None, true, Some(Worktree), true).is_err());
+        // likewise a card with a branch
+        assert_eq!(
+            dispatch_worktree_choice(None, false, Some(Branch), true),
+            Ok(Branch)
+        );
+        assert_eq!(
+            dispatch_worktree_choice(None, true, Some(Branch), true),
+            Ok(Branch)
+        );
+        assert!(dispatch_worktree_choice(Some(true), false, Some(Branch), true).is_err());
     }
 
     #[test]
@@ -16303,6 +16396,31 @@ mod tests {
         assert_eq!(wt.branch, format!("card/{id}"));
         assert!(std::path::Path::new(&wt.path).is_dir());
         assert_eq!(Some(card.claim.unwrap().terminal), r.terminal);
+    }
+
+    #[test]
+    fn cli_dispatch_with_branch_puts_the_checkout_on_the_card_branch() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Branch dispatch");
+
+        let mut req = dispatch_req(&id, None);
+        req.branch = true;
+        let r = cli_dispatch(&mut m, &req, &ctx);
+        assert!(r.ok, "{:?}", r.error);
+        let child = m.project_child_mut(pid).unwrap();
+        let card = child.kanban.borrow().get(&id).cloned().unwrap();
+        assert_eq!(card.state, crate::kanban::CardState::InProgress);
+        let wt = card.worktree.expect("dispatch records the branch");
+        assert!(wt.in_place);
+        assert_eq!(
+            crate::kanban::git(repo.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            format!("card/{id}")
+        );
     }
 
     #[test]
@@ -16462,6 +16580,69 @@ mod tests {
     }
 
     #[test]
+    fn branch_dispatch_switches_the_checkout_keeps_changes_and_release_switches_back() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let file = "f.txt"; // the fixture's one tracked file
+        std::fs::write(repo.path().join(file), "human edit\n").unwrap();
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let mut add = kanban_req("add");
+        add.title = Some("branch card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        let (win, tab) = dispatch_from_board(child, &id, crate::kanban::DispatchMode::Branch, &ctx);
+
+        let wt = child
+            .kanban
+            .borrow()
+            .get(&id)
+            .unwrap()
+            .worktree
+            .clone()
+            .expect("dispatch records the branch");
+        assert!(wt.in_place);
+        assert_eq!(wt.branch, format!("card/{id}"));
+        assert_eq!(wt.base, "main");
+        assert_eq!(
+            crate::kanban::git(repo.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            wt.branch
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(file)).unwrap(),
+            "human edit\n"
+        );
+        let mut notifications = crate::notify::Notifications::new();
+        notifications.drain_pending(&ctx);
+        assert!(notifications.contains_text("uncommitted file"));
+
+        // Release with nothing committed: the branch is merged by
+        // definition, so teardown puts the checkout back and deletes it.
+        push_board_act(child, crate::board::BoardAct::Release(id.clone()));
+        child.drain_board_acts(&ctx);
+        child.close_tab(win, tab);
+        drain_until(child, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().worktree.is_none()
+        });
+        assert_eq!(
+            crate::kanban::git(repo.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            "main"
+        );
+        assert!(
+            crate::kanban::git(repo.path(), &["branch", "--list", &wt.branch])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(file)).unwrap(),
+            "human edit\n"
+        );
+    }
+
+    #[test]
     fn a_shown_board_tears_down_a_done_cards_leftover_worktree_once_per_run() {
         // The queued-teardown list does not survive an app restart, so a
         // Done card can come back with its worktree still recorded. The
@@ -16530,7 +16711,7 @@ mod tests {
         add.title = Some("plain card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
         let child = m.project_child_mut(pid).unwrap();
-        dispatch_from_board(child, &id, false, &ctx);
+        dispatch_from_board(child, &id, crate::kanban::DispatchMode::InPlace, &ctx);
         let card = child.kanban.borrow().get(&id).unwrap().clone();
         assert!(card.claim.is_some());
         assert!(card.worktree.is_none());
@@ -16549,7 +16730,12 @@ mod tests {
         let mut add = kanban_req("add");
         add.title = Some("dirty card".into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
-        dispatch_from_board(m.project_child_mut(pid).unwrap(), &id, true, &ctx);
+        dispatch_from_board(
+            m.project_child_mut(pid).unwrap(),
+            &id,
+            crate::kanban::DispatchMode::Worktree,
+            &ctx,
+        );
         let wt = m
             .project_child_mut(pid)
             .unwrap()
@@ -16588,7 +16774,7 @@ mod tests {
             crate::board::BoardAct::Dispatch {
                 id: "no0000".into(),
                 agent: pause_argv()[0].clone(),
-                worktree: true,
+                mode: crate::kanban::DispatchMode::Worktree,
             },
         );
         m.project_child_mut(pid).unwrap().drain_board_acts(&ctx);
@@ -16667,6 +16853,7 @@ mod tests {
             path: "/x/.foreman/worktrees/qq1".into(),
             branch: "card/qq1".into(),
             base: "main".into(),
+            in_place: false,
         };
         push_board_act(child, crate::board::BoardAct::RemoveStray(wt.clone()));
         child.drain_board_acts(&ctx);
@@ -16815,7 +17002,7 @@ mod tests {
         add.title = Some(title.into());
         let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
         let child = m.project_child_mut(pid).unwrap();
-        dispatch_from_board(child, &id, true, ctx);
+        dispatch_from_board(child, &id, crate::kanban::DispatchMode::Worktree, ctx);
         let wt = child
             .kanban
             .borrow()
@@ -16993,7 +17180,12 @@ mod tests {
         let mut add = kanban_req("add");
         add.title = Some("plain".into());
         let plain = m.kanban_dispatch(&add).unwrap().id.unwrap();
-        dispatch_from_board(m.project_child_mut(pid).unwrap(), &plain, false, &ctx);
+        dispatch_from_board(
+            m.project_child_mut(pid).unwrap(),
+            &plain,
+            crate::kanban::DispatchMode::InPlace,
+            &ctx,
+        );
         let mut done2 = kanban_req("done");
         done2.id = Some(plain);
         assert!(m.kanban_dispatch(&done2).unwrap().ok);

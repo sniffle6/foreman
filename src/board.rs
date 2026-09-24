@@ -24,7 +24,8 @@ const PAD: f32 = 6.0;
 const BTN_W: f32 = 46.0;
 const BTN_H: f32 = 22.0;
 const BTN_GAP: f32 = 4.0;
-/// The inline picker's "wt on/off" chip, left of the agent buttons.
+/// The inline picker's dispatch-mode chip (`wt` / `branch` / `here`), left
+/// of the agent buttons.
 const WT_CHIP_W: f32 = 36.0;
 /// The worktree strip along the bottom of the board (logical px).
 const STRIP_H: f32 = 22.0;
@@ -197,12 +198,13 @@ fn gated_by_pointer(over: bool, pointer: Option<egui::Pos2>, sub_rect: egui::Rec
 /// after `apply_acts` (content cannot mutate the manager mid-loop).
 pub enum BoardAct {
     QuickAdd(String),
-    /// `worktree` is the per-dispatch choice (spec: dispatch-worktrees; the
-    /// global setting is only its default): true = bring up a worktree.
+    /// `mode` is the per-dispatch choice (spec: dispatch-worktrees,
+    /// dispatch-branch; the global setting only seeds it). A card already
+    /// carrying a tree or branch restarts in it whatever `mode` says.
     Dispatch {
         id: String,
         agent: String,
-        worktree: bool,
+        mode: crate::kanban::DispatchMode,
     },
     Done(String),
     Release(String),
@@ -237,10 +239,10 @@ pub struct BoardView {
     store: std::rc::Rc<std::cell::RefCell<crate::kanban::CardStore>>,
     quick_add: String,
     picker: Option<String>,
-    /// The per-dispatch "into a worktree?" choice as (card id, value). Seeded
-    /// from the global setting the first time a card's picker or detail page
-    /// asks, so one card's override never leaks onto the next card.
-    worktree_choice: Option<(String, bool)>,
+    /// The per-dispatch mode choice as (card id, value). Seeded from the
+    /// global setting the first time a card's picker or detail page asks,
+    /// so one card's override never leaks onto the next card.
+    worktree_choice: Option<(String, crate::kanban::DispatchMode)>,
     scroll: [f32; 4],
     collapsed: [bool; 4],
     selected: Option<String>,
@@ -397,17 +399,26 @@ impl BoardView {
         self.selected.as_deref()
     }
 
-    /// The dispatch-time worktree choice for `card`: forced on for a card
-    /// that already carries a worktree (Restart resumes in it), otherwise
-    /// the remembered per-card toggle, seeded from the global setting.
-    fn worktree_choice_for(&mut self, ctx: &egui::Context, card: &crate::kanban::Card) -> bool {
-        if card.worktree.is_some() {
-            return true;
+    /// The dispatch-time mode for `card`: locked for a card that already
+    /// carries a tree or a branch (Restart resumes in it), otherwise the
+    /// remembered per-card choice, seeded from the global setting (worktree
+    /// when on, in place when off; branch mode is always an explicit pick).
+    fn worktree_choice_for(
+        &mut self,
+        ctx: &egui::Context,
+        card: &crate::kanban::Card,
+    ) -> crate::kanban::DispatchMode {
+        if let Some(m) = crate::kanban::DispatchMode::locked_for(card) {
+            return m;
         }
         match &self.worktree_choice {
             Some((id, v)) if *id == card.id => *v,
             _ => {
-                let v = crate::config::live(ctx).dispatch_worktrees;
+                let v = if crate::config::live(ctx).dispatch_worktrees {
+                    crate::kanban::DispatchMode::Worktree
+                } else {
+                    crate::kanban::DispatchMode::InPlace
+                };
                 self.worktree_choice = Some((card.id.clone(), v));
                 v
             }
@@ -1623,11 +1634,15 @@ impl BoardView {
                 }
                 if let Some(wt) = &card.worktree {
                     ui.add_space(12.0 * self.scale);
-                    ui.strong("Worktree");
+                    ui.strong(if wt.in_place { "Branch" } else { "Worktree" });
                     ui.add(
-                        egui::Label::new(format!("Path: {}", wt.path))
-                            .wrap()
-                            .selectable(true),
+                        egui::Label::new(if wt.in_place {
+                            format!("Checkout: {} (no worktree)", wt.path)
+                        } else {
+                            format!("Path: {}", wt.path)
+                        })
+                        .wrap()
+                        .selectable(true),
                     );
                     ui.label(format!("Branch: {}   base: {}", wt.branch, wt.base));
                     let st = self.store.borrow().worktree_status(&card.id);
@@ -1744,11 +1759,20 @@ impl BoardView {
                         {
                             self.offered_discard = true;
                         }
-                        if ui
-                            .button(egui::RichText::new("Discard worktree").color(th.danger))
-                            .on_hover_text(
+                        let (label, hover) = if wt.in_place {
+                            (
+                                "Discard branch",
+                                "Force-deletes the branch, including unmerged commits; the checkout stays",
+                            )
+                        } else {
+                            (
+                                "Discard worktree",
                                 "Force-removes the tree and branch, including unmerged work",
                             )
+                        };
+                        if ui
+                            .button(egui::RichText::new(label).color(th.danger))
+                            .on_hover_text(hover)
                             .clicked()
                         {
                             self.acts.push(BoardAct::DiscardWorktree(card.id.clone()));
@@ -1792,13 +1816,19 @@ impl BoardView {
                         crate::kanban::CardState::Backlog | crate::kanban::CardState::Blocked
                     )
                 {
-                    let mut use_worktree = self.worktree_choice_for(ui.ctx(), card);
+                    let mut mode = self.worktree_choice_for(ui.ctx(), card);
                     if card.worktree.is_none() {
-                        if ui
-                            .checkbox(&mut use_worktree, "Dispatch into a git worktree")
-                            .changed()
-                        {
-                            self.worktree_choice = Some((card.id.clone(), use_worktree));
+                        ui.label("Dispatch into");
+                        let before = mode;
+                        for m in [
+                            crate::kanban::DispatchMode::Worktree,
+                            crate::kanban::DispatchMode::Branch,
+                            crate::kanban::DispatchMode::InPlace,
+                        ] {
+                            ui.radio_value(&mut mode, m, m.describe());
+                        }
+                        if mode != before {
+                            self.worktree_choice = Some((card.id.clone(), mode));
                         }
                     }
                     ui.label(if orphaned {
@@ -1812,7 +1842,7 @@ impl BoardView {
                                 self.acts.push(BoardAct::Dispatch {
                                     id: card.id.clone(),
                                     agent: (*agent).to_owned(),
-                                    worktree: use_worktree,
+                                    mode,
                                 });
                             }
                         }
@@ -1852,7 +1882,7 @@ impl BoardView {
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
     ) {
-        let use_worktree = self.worktree_choice_for(ui.ctx(), card);
+        let mode = self.worktree_choice_for(ui.ctx(), card);
         let mut bx = card_rect.max.x - PAD * self.scale;
         for agent in AGENTS.iter().rev() {
             let btn_rect = egui::Rect::from_min_size(
@@ -1882,16 +1912,16 @@ impl BoardView {
                 self.acts.push(BoardAct::Dispatch {
                     id: card.id.clone(),
                     agent: agent.to_string(),
-                    worktree: use_worktree,
+                    mode,
                 });
                 self.picker = None;
             }
             bx -= BTN_W * self.scale + BTN_GAP * self.scale;
         }
-        // The worktree chip: only for a card without a worktree (one that
+        // The mode chip: only for a card without a tree or branch (one that
         // has one always restarts in it), and only when the card is wide
         // enough — a narrow card still dispatches with the default, and the
-        // detail page always offers the checkbox.
+        // detail page always offers the choice. Click cycles the modes.
         if card.worktree.is_some() {
             return;
         }
@@ -1911,11 +1941,11 @@ impl BoardView {
                 base.with((card.id.as_str(), "pick", "worktree")),
                 egui::Sense::click(),
             )
-            .on_hover_text(if use_worktree {
-                "Dispatch into a git worktree (click for the project cwd)"
-            } else {
-                "Dispatch in the project cwd (click for a git worktree)"
-            });
+            .on_hover_text(format!(
+                "{} (click for: {})",
+                mode.describe(),
+                mode.next().name()
+            ));
         cp.rect_filled(
             chip_rect,
             2.0,
@@ -1928,13 +1958,17 @@ impl BoardView {
         cp.text(
             chip_rect.center(),
             egui::Align2::CENTER_CENTER,
-            if use_worktree { "wt on" } else { "wt off" },
+            mode.chip(),
             egui::FontId::proportional(9.0 * self.scale),
-            if use_worktree { th.text } else { th.dim },
+            if mode == crate::kanban::DispatchMode::InPlace {
+                th.dim
+            } else {
+                th.text
+            },
         );
         if chip_resp.clicked() {
             *picker_click_consumed = true;
-            self.worktree_choice = Some((card.id.clone(), !use_worktree));
+            self.worktree_choice = Some((card.id.clone(), mode.next()));
         }
     }
 }
@@ -2093,8 +2127,8 @@ mod tests {
         click_at(&ctx, &mut board, rect, base, chip);
         assert_eq!(
             board.worktree_choice,
-            Some((id.clone(), false)),
-            "one click flips the default (on) to off"
+            Some((id.clone(), crate::kanban::DispatchMode::Branch)),
+            "one click cycles the default (worktree) to branch"
         );
         assert_eq!(
             board.picker.as_deref(),
@@ -2107,11 +2141,15 @@ mod tests {
             Some(BoardAct::Dispatch {
                 id: aid,
                 agent,
-                worktree,
+                mode,
             }) => {
                 assert_eq!(aid, id);
                 assert_eq!(agent, *AGENTS.last().unwrap());
-                assert!(!worktree, "the act carries the flipped choice");
+                assert_eq!(
+                    mode,
+                    crate::kanban::DispatchMode::Branch,
+                    "the act carries the cycled choice"
+                );
             }
             _ => panic!("agent click must record a Dispatch act"),
         }
@@ -2127,6 +2165,7 @@ mod tests {
             path: "H:/repo/.foreman/worktrees/x".into(),
             branch: "card/x".into(),
             base: "main".into(),
+            in_place: false,
         };
         store
             .borrow_mut()
@@ -2165,7 +2204,9 @@ mod tests {
         run_frame(&ctx, &mut board, rect, base, vec![moved(agent)]);
         click_at(&ctx, &mut board, rect, base, agent);
         match board.acts.pop() {
-            Some(BoardAct::Dispatch { worktree, .. }) => assert!(worktree),
+            Some(BoardAct::Dispatch { mode, .. }) => {
+                assert_eq!(mode, crate::kanban::DispatchMode::Worktree)
+            }
             _ => panic!("agent click must record a Dispatch act"),
         }
     }
@@ -2179,6 +2220,7 @@ mod tests {
             path: "H:/repo/.foreman/worktrees/x".into(),
             branch: "card/x".into(),
             base: "main".into(),
+            in_place: false,
         };
         store
             .borrow_mut()
@@ -2236,6 +2278,7 @@ mod tests {
             path: "H:/repo/.foreman/worktrees/x".into(),
             branch: "card/x".into(),
             base: "main".into(),
+            in_place: false,
         };
         store
             .borrow_mut()
@@ -3000,6 +3043,7 @@ mod tests {
             path: format!("H:/repo/.foreman/worktrees/{id}"),
             branch: format!("card/{id}"),
             base: "main".into(),
+            in_place: false,
         };
         store
             .borrow_mut()
@@ -3054,6 +3098,7 @@ mod tests {
             path: "H:/repo/.foreman/worktrees/qq1".into(),
             branch: "card/qq1".into(),
             base: "main".into(),
+            in_place: false,
         };
         store.borrow_mut().set_worktree_statuses(
             Default::default(),

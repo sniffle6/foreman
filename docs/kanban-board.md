@@ -24,12 +24,16 @@ sibling — read those for *why*, this doc for *how*.
   Other command shims that cannot accept the multiline card prompt report that
   limitation and suggest installing a native executable.
 - **Per-card worktrees**: the choice is made per dispatch. The inline agent
-  picker carries a `wt on/off` chip and the detail page a checkbox, both
-  seeded from `dispatch_worktrees` (default on; Agents pane) and reset per
+  picker carries a mode chip that cycles `wt` → `branch` → `here`, and the
+  detail page offers the same three as radio buttons. Both are seeded from
+  `dispatch_worktrees` (on = `wt`, off = `here`; Agents pane) and reset per
   card, so one card's override never leaks onto the next. A card that already
-  has a worktree hides the toggle and always restarts in it. The CLI twin is
-  `kanban dispatch --worktree|--no-worktree` (no flag = the same setting).
-  With the toggle on, Start creates
+  has a worktree or a branch hides the choice and always restarts in it.
+  The CLI twin is `kanban dispatch --worktree|--branch|--no-worktree` (no
+  flag = the same setting; a flag that contradicts the card's existing tree
+  or branch is refused). `branch` is **branch mode** — the card's branch in
+  the project checkout, no worktree; see its own bullet below. With `wt`,
+  Start creates
   `<repo>/.foreman/worktrees/<id>` on branch `card/<id>`
   and spawns the worker there, so no two workers share a checkout. The card
   records `worktree` (path, branch, and `base` — the branch the main checkout
@@ -49,6 +53,31 @@ sibling — read those for *why*, this doc for *how*.
   a Done, Blocked, or orphaned card's detail page is the only forcing path and
   is human-only (no wire verb), behind the standard confirm. Why this shape
   and what was rejected: `docs/superpowers/specs/2026-09-15-dispatch-worktrees-design.md`.
+- **Branch mode** (`branch`): Start puts the project checkout on
+  `card/<id>` — `git switch -c` from the current branch the first time,
+  `git switch card/<id>` on Restart — and spawns the worker in the project
+  cwd. No worktree is made. Only non-forcing git touches the checkout, so
+  uncommitted changes are never lost: `switch -c` leaves them in place,
+  and a `switch` that would overwrite one is refused by git and aborts the
+  dispatch with the card unchanged. Dispatch warns when the checkout has
+  uncommitted tracked files. The card records the branch as a `worktree`
+  object with `"in_place": true` and `path` = the checkout root; `base` is
+  the branch the checkout had at first dispatch. Dispatch refuses while
+  the checkout sits on another card's branch (worktree dispatch too — its
+  base would be the other card's branch), and while a git operation is in
+  progress. Integration is the same queue with a different turn: no rebase
+  (the checkout may hold the human's edits), so a base that moved is handed
+  back as `base moved`; otherwise checks run in the checkout as it stands,
+  base moves by a compare-and-swap `update-ref`, and HEAD moves back to base
+  by `symbolic-ref` — both refs name the same commit then, so no file
+  changes. Teardown only deletes the branch (`branch -d`), first switching
+  the checkout back to base when it is still on the branch and the branch
+  is merged; an unmerged branch is never switched away from. Discard
+  (`Discard branch`) switches back and uses `branch -D`; the checkout is
+  never removed. Branch cards are not worktrees: they are left off the
+  Worktrees page, the strip, and `kanban worktrees`; `list` tags them
+  `[br …]` instead of `[wt …]`. Design and rejected alternatives:
+  `docs/superpowers/specs/2026-09-24-dispatch-branch-design.md`.
 - **Worktree status is derived**: while a board is shown, every worktree card
   is probed every few seconds on a background thread (dirty, ahead, behind,
   missing) and the result is shown on the card face and by
@@ -186,7 +215,7 @@ foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N]
                                           # at least one of the four; --plan "" clears
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
 foreman kanban start <id>                 # claim a card yourself
-foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--no-worktree]
+foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree]
                                           # the board's "Start with": spawn + claim
 foreman kanban done <id>                  # close out: In Progress -> Done
 foreman kanban block <id> --reason "..."  # close out: needs a human
@@ -246,6 +275,18 @@ its base (`docs/integration-queue.md`).
 - **Close-out on a missing card errors, never creates.** A deleted card is not
   resurrected by its worker's `done`; the worker sees the error, the board
   simply lacks the card.
+- **A branch-mode card holds the checkout.** While the checkout is on
+  `card/<id>`, every worktree card's integration holds (`destination
+  checkout is on card/<id>`) and no other card can dispatch. The turn still
+  integrates the branch card past those holds, which puts the checkout
+  back and frees the queue. Release or Discard the card to give it back
+  without integrating.
+- **Branch-mode status is the checkout's.** `dirty` counts tracked changes
+  outside `.foreman/` only while the checkout is on the card's branch;
+  those may be the human's. A branch card is never `missing`.
+- **A failed spawn leaves the checkout on the card's branch.** Bring-up runs
+  before the spawn. Starting the card again reuses the branch; switch back
+  by hand if you give up on it.
 - **`.foreman/tasks/` travels with the clone.** Cards are repo files by
   design (they merge branch-to-branch); add the directory to a repo's
   `.gitignore` to opt out per-project.
@@ -378,7 +419,12 @@ its base (`docs/integration-queue.md`).
   and trailer walk injected into the store), `cut_and_release` (stamp, then
   spawn the release; one at a time) and `drain_release` (events → progress
   → board views, uncut on an uncommitted failure, the outcome toast).
-- `src/config.rs` — `Settings::dispatch_worktrees`.
+- `src/config.rs` — `Settings::dispatch_worktrees` (seeds the mode chip).
+- Branch mode: `DispatchMode`, `branch_layout`, `bring_up_branch`,
+  `checkout_changes`, `teardown_branch` (`src/kanban.rs`);
+  `integrate_in_place`, `recover_in_place`, `source_preflight_in_place`,
+  `target_preflight` (`src/integrate.rs`); the `Dispatch` arm of
+  `drain_board_acts` (`src/wm.rs`).
 - `src/control.rs` — `KanbanRequest` (the wire shape), `parse_kanban_args`,
   `parse_kanban_edit`, `kanban_main`, `kanban_wait` (client-side poll loop),
   `HELP_KANBAN`.
