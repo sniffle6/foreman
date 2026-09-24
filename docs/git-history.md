@@ -121,6 +121,15 @@ Keys while the window is focused: F7 / Shift+F7 next/previous difference;
 Up/Down/PgUp/PgDn/Home/End scroll. Shift+wheel scrolls both sides
 horizontally together; so does the thin bar under the text.
 
+Drag the connector gutter between the panes to give one side more room;
+double-click it to even them out. The split is a fraction of the text width,
+so it holds when you open another file in the same Diff window or resize the
+window. Each side stops at a 12-char minimum. With unequal sides the shared
+horizontal scroll range is sized to the narrower side, so both can reach line
+ends. The divider's hit area is registered after the rows so it wins over the
+ScrollArea's own drag; move it earlier and dragging the gutter scrolls
+instead. The split is not saved across restarts.
+
 Binary files, submodules, diffs over 16 MiB or that git cannot return as one
 whole-file hunk (a change more than 200,000 lines from the file start or from
 the next change), and changes with no content difference (pure renames, mode

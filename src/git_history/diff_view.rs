@@ -261,6 +261,8 @@ const ROW_H: f32 = 18.0;
 const GUTTER_W: f32 = 14.0;
 const STRIP_W: f32 = 8.0;
 const HBAR_H: f32 = 6.0;
+/// Narrowest a text side may be dragged, in chars.
+const MIN_SIDE_CHARS: f32 = 12.0;
 
 struct Request {
     cancel: Arc<AtomicBool>,
@@ -293,9 +295,15 @@ pub struct DiffView {
     request: Option<Request>,
     result: Option<Result<Diff, String>>,
     nav: Nav,
+    /// Old side's share of the text width. A fraction, not px, so it survives
+    /// both retargets and window resizes.
+    split: f32,
     scale: f32,
     #[cfg(test)]
     drawn: Range<usize>,
+    /// Screen x of the old/new divider last frame.
+    #[cfg(test)]
+    divider_x: f32,
 }
 impl Drop for DiffView {
     fn drop(&mut self) {
@@ -317,6 +325,14 @@ fn step_block(
         (None, true) => blocks.iter().position(|b| b.rows.start > anchor),
         (None, false) => blocks.iter().rposition(|b| b.rows.start < anchor),
     }
+}
+
+/// Old and new text widths: `split` of `avail`, each at least `min` (less
+/// only when `avail` cannot fit two minimums, then an even split).
+fn side_widths(avail: f32, split: f32, min: f32) -> (f32, f32) {
+    let min = min.min(avail / 2.0).max(0.0);
+    let old = (avail * split).clamp(min, (avail - min).max(min));
+    (old, (avail - old).max(0.0))
 }
 
 /// Byte range of chars `skip..skip + take` of `text`, on char boundaries.
@@ -354,9 +370,12 @@ impl DiffView {
             request: None,
             result: None,
             nav: Nav::default(),
+            split: 0.5,
             scale: 1.0,
             #[cfg(test)]
             drawn: 0..0,
+            #[cfg(test)]
+            divider_x: 0.0,
         }
     }
     pub fn target(&self) -> Option<&DiffTarget> {
@@ -475,10 +494,11 @@ impl DiffView {
         let drawn = &mut self.drawn;
         #[cfg(not(test))]
         let drawn = &mut (0..0);
-        body(
+        let _divider_x = body(
             &mut ui,
             doc,
             &mut self.nav,
+            &mut self.split,
             active,
             step,
             s,
@@ -487,6 +507,10 @@ impl DiffView {
             &th,
             drawn,
         );
+        #[cfg(test)]
+        {
+            self.divider_x = _divider_x;
+        }
     }
 }
 
@@ -550,7 +574,8 @@ fn kind_color(kind: Kind) -> egui::Color32 {
 /// Column x-offsets from a row's left edge.
 struct Cols {
     num_w: f32,
-    side_w: f32,
+    old_w: f32,
+    new_w: f32,
     gutter_w: f32,
     char_w: f32,
 }
@@ -562,7 +587,7 @@ impl Cols {
         self.num_w
     }
     fn gutter(&self) -> f32 {
-        self.num_w + self.side_w
+        self.num_w + self.old_w
     }
     fn new_num(&self) -> f32 {
         self.gutter() + self.gutter_w
@@ -577,6 +602,7 @@ fn body(
     ui: &mut egui::Ui,
     doc: &Doc,
     nav: &mut Nav,
+    split: &mut f32,
     active: bool,
     mut step: Option<bool>,
     s: f32,
@@ -584,7 +610,7 @@ fn body(
     base: egui::Id,
     th: &crate::theme::Theme,
     drawn: &mut Range<usize>,
-) {
+) -> f32 {
     let row_h = ROW_H * s;
     let font = egui::FontId::monospace(13.0 * s);
     let char_w = ui
@@ -604,13 +630,17 @@ fn body(
     let gutter_w = GUTTER_W * s;
     // Reserve the ScrollArea's vertical bar so the new side is not covered.
     let bar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin;
-    let side_w = ((main.width() - bar - gutter_w) / 2.0 - num_w).max(char_w);
+    let avail = (main.width() - bar - gutter_w - 2.0 * num_w).max(2.0 * char_w);
+    let (old_w, new_w) = side_widths(avail, *split, MIN_SIDE_CHARS * char_w);
     let cols = Cols {
         num_w,
-        side_w,
+        old_w,
+        new_w,
         gutter_w,
         char_w,
     };
+    // One offset scrolls both sides; the narrower side must reach line ends.
+    let side_w = old_w.min(new_w);
     let text_w = (doc.max_cols as f32 + 1.0) * char_w;
     let max_hx = (text_w - side_w).max(0.0);
     let view_h = main.height();
@@ -755,6 +785,37 @@ fn body(
     if jumped {
         nav.jumped_to = Some(nav.scroll_y);
     }
+
+    // Old/new divider over the connector gutter. Registered after the rows so
+    // it wins the hit test over the ScrollArea's own drag.
+    let gutter_x = main.left() + cols.gutter();
+    let handle = egui::Rect::from_x_y_ranges(gutter_x..=gutter_x + gutter_w, main.y_range());
+    let response = ui
+        .interact(
+            handle,
+            base.with("diff-divider"),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text("Drag to resize; double-click to even");
+    let hot = response.hovered() || response.dragged();
+    ui.painter_at(main).vline(
+        handle.center().x,
+        main.y_range(),
+        egui::Stroke::new(1.0, if hot { th.dim } else { th.border }),
+    );
+    if response.double_clicked() {
+        *split = 0.5;
+        ui.ctx().request_repaint();
+    } else if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let old = pos.x - gutter_w / 2.0 - main.left() - num_w;
+        let (old, _) = side_widths(avail, old / avail, MIN_SIDE_CHARS * char_w);
+        *split = old / avail;
+        ui.ctx().request_repaint();
+    }
+    handle.center().x
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -776,13 +837,13 @@ fn paint_row(
         _ => None,
     };
     let x = |off: f32| r.left() + off;
-    for (cell, num_x, text_x, old_side) in [
-        (&row.old, cols.old_num(), cols.old_text(), true),
-        (&row.new, cols.new_num(), cols.new_text(), false),
+    for (cell, num_x, text_x, side_w, old_side) in [
+        (&row.old, cols.old_num(), cols.old_text(), cols.old_w, true),
+        (&row.new, cols.new_num(), cols.new_text(), cols.new_w, false),
     ] {
         let side = egui::Rect::from_min_max(
             egui::pos2(x(num_x), r.top()),
-            egui::pos2(x(text_x + cols.side_w), r.bottom()),
+            egui::pos2(x(text_x + side_w), r.bottom()),
         );
         let Some(cell) = cell else {
             if row.kind != Kind::Same {
@@ -814,7 +875,7 @@ fn paint_row(
             );
         }
         let skip = (hx / cols.char_w) as usize;
-        let take = (cols.side_w / cols.char_w) as usize + 2;
+        let take = (side_w / cols.char_w) as usize + 2;
         let vis = visible_cell(cell, skip, take);
         tp.text(
             egui::pos2(x0 + skip as f32 * cols.char_w, r.center().y),
@@ -1293,6 +1354,82 @@ mod tests {
         let line = "x".repeat(1_000_000);
         let r = visible(&line, 500_000, 120);
         assert_eq!(r.len(), 120);
+    }
+
+    #[test]
+    fn side_widths_split_and_respect_minimums() {
+        assert_eq!(side_widths(800.0, 0.5, 100.0), (400.0, 400.0));
+        assert_eq!(side_widths(800.0, 0.25, 100.0), (200.0, 600.0));
+        assert_eq!(side_widths(800.0, 0.0, 100.0), (100.0, 700.0));
+        assert_eq!(side_widths(800.0, 1.0, 100.0), (700.0, 100.0));
+        // Too narrow for two minimums: even, whatever the split.
+        assert_eq!(side_widths(150.0, 0.9, 100.0), (75.0, 75.0));
+        assert_eq!(side_widths(0.0, 0.3, 100.0), (0.0, 0.0));
+    }
+
+    fn drag(ctx: &egui::Context, view: &mut DiffView, from: egui::Pos2, to: egui::Pos2) {
+        let press = |pos, pressed| {
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        run(ctx, view, vec![egui::Event::PointerMoved(from)]);
+        run(ctx, view, press(from, true));
+        run(ctx, view, vec![egui::Event::PointerMoved(to)]);
+        run(ctx, view, press(to, false));
+        run(ctx, view, vec![]);
+    }
+
+    #[test]
+    fn divider_drags_and_survives_retarget_and_resize() {
+        let ctx = egui::Context::default();
+        let mut view = loaded(synthetic(200, &[5]));
+        run(&ctx, &mut view, vec![]);
+        run(&ctx, &mut view, vec![]);
+        let even = view.divider_x;
+        let from = egui::pos2(even, 300.0);
+        drag(&ctx, &mut view, from, from + egui::vec2(-200.0, 0.0));
+        assert!(
+            (view.divider_x - (even - 200.0)).abs() < 1.0,
+            "{even} -> {}",
+            view.divider_x
+        );
+        let split = view.split;
+        assert!(split < 0.4, "{split}");
+        // Dragging far past the edge stops at the minimum, not off-screen.
+        let at = egui::pos2(view.divider_x, 300.0);
+        drag(&ctx, &mut view, at, egui::pos2(-500.0, 300.0));
+        assert!(
+            view.split > 0.0 && view.divider_x > 100.0,
+            "{}",
+            view.divider_x
+        );
+        let at = egui::pos2(view.divider_x, 300.0);
+        drag(&ctx, &mut view, at, from + egui::vec2(-200.0, 0.0));
+        assert!((view.split - split).abs() < 0.01);
+        // Switching files keeps the split; navigation still lands.
+        let mut next = view.target.clone().unwrap();
+        next.path = "g".into();
+        view.retarget(next);
+        view.result = Some(Ok(Diff::Doc(synthetic(5000, &[3000]))));
+        run(&ctx, &mut view, vec![]);
+        run(&ctx, &mut view, vec![]);
+        assert!(view.drawn.contains(&2999), "{:?}", view.drawn);
+        assert!((view.split - split).abs() < 0.01);
+        // A window resize keeps the proportion rather than the px offset.
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0));
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| view.show(ui, rect, true, egui::Id::new("diff")),
+        );
+        assert!((view.split - split).abs() < 0.01);
+        assert!(view.divider_x < 300.0, "{}", view.divider_x);
     }
 
     #[test]
