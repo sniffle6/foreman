@@ -1075,8 +1075,7 @@ fn run_child(
     // Bounded: a lingering descendant that kept a pipe open must not hold
     // the repository's turn hostage. Whatever arrived is what we report;
     // the Job drop at return kills the straggler.
-    let out = collect_output(&out_rx);
-    let err = collect_output(&err_rx);
+    let (out, err) = collect_output(&out_rx, &err_rx, OUTPUT_GRACE);
     drop(job);
     let mut combined = out;
     if !err.trim().is_empty() {
@@ -1117,8 +1116,19 @@ fn read_all(
     rx
 }
 
-fn collect_output(rx: &std::sync::mpsc::Receiver<String>) -> String {
-    rx.recv_timeout(OUTPUT_GRACE).unwrap_or_default()
+/// Both pipes share one deadline: a straggler holds stdout and stderr
+/// alike, and waiting `grace` on each in turn would double the stall.
+fn collect_output(
+    out_rx: &std::sync::mpsc::Receiver<String>,
+    err_rx: &std::sync::mpsc::Receiver<String>,
+    grace: Duration,
+) -> (String, String) {
+    let deadline = Instant::now() + grace;
+    let recv = |rx: &std::sync::mpsc::Receiver<String>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    };
+    (recv(out_rx), recv(err_rx))
 }
 
 fn tail_lines(text: &str, n: usize) -> String {
@@ -3222,6 +3232,32 @@ mod tests {
         assert_eq!(q.get("aa").unwrap().commit, c2);
     }
 
+    #[test]
+    fn both_pipes_share_one_output_grace() {
+        // Senders held, never sent: both pipes are "still open". Waiting the
+        // grace per pipe would take at least 2 × grace (recv_timeout never
+        // returns early), so anything under that proves one shared deadline.
+        let (_out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (_err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+        let grace = Duration::from_secs(2);
+        let start = Instant::now();
+        let (out, err) = collect_output(&out_rx, &err_rx, grace);
+        let took = start.elapsed();
+        assert!(out.is_empty() && err.is_empty());
+        assert!(took >= grace, "waited the grace, took {took:?}");
+        assert!(took < grace * 2, "one deadline for both pipes, took {took:?}");
+    }
+
+    #[test]
+    fn output_already_delivered_is_collected_after_the_deadline() {
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+        out_tx.send("out".into()).unwrap();
+        err_tx.send("err".into()).unwrap();
+        let (out, err) = collect_output(&out_rx, &err_rx, Duration::ZERO);
+        assert_eq!((out.as_str(), err.as_str()), ("out", "err"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_finished_check_whose_descendant_keeps_the_pipe_open_does_not_hang_the_turn() {
@@ -3230,14 +3266,16 @@ mod tests {
         commit_file(Path::new(&a.path), "a.txt", "a\n", "a");
         std::fs::create_dir_all(r.path().join(".foreman")).unwrap();
         // cmd exits at once (success) but leaves a background ping that
-        // inherited the captured pipes and runs for ~90 s. The bound below
+        // inherited the captured pipes and runs for ~2 min. The bound below
         // times the whole turn (rebase, check, fast-forward), whose git steps
         // alone ran past 20 s under a parallel `cargo test` with no console
-        // (the integration queue's own check) — so the hang being detected
-        // is kept well above the bound rather than just over it.
+        // (the integration queue's own check) — so it sits far above a loaded
+        // turn and far below the descendant's lifetime, failing only if the
+        // turn waited on it. The grace's own size is pinned by
+        // both_pipes_share_one_output_grace, not here.
         std::fs::write(
             r.path().join(POLICY_FILE),
-            r#"{"check":["cmd","/c","start /b ping -n 90 127.0.0.1 & exit 0"],"timeout_secs":120}"#,
+            r#"{"check":["cmd","/c","start /b ping -n 120 127.0.0.1 & exit 0"],"timeout_secs":600}"#,
         )
         .unwrap();
         let (q, _) = submit(r.path(), "aa", &a);
@@ -3263,14 +3301,15 @@ mod tests {
         std::fs::create_dir_all(r.path().join(".foreman")).unwrap();
         std::fs::write(
             r.path().join(POLICY_FILE),
-            r#"{"check":["ping","-n","30","127.0.0.1"],"timeout_secs":1}"#,
+            r#"{"check":["ping","-n","120","127.0.0.1"],"timeout_secs":1}"#,
         )
         .unwrap();
         let (q, _) = submit(r.path(), "aa", &a);
         let start = Instant::now();
         let events = turn(&q);
+        // ~2 min of ping against a 60 s bound: only a missed kill fails it.
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < Duration::from_secs(60),
             "the check was killed at its deadline"
         );
         assert!(

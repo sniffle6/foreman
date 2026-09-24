@@ -119,7 +119,9 @@ again from that commit; anything else is `source changed`.
 Git and check subprocesses run under a kill-on-close Job, so an owner that
 dies takes its children with it — a half-finished rebase or a `cargo test`
 tree cannot overlap the next owner. Long git operations and checks have
-deadlines; a check past its timeout is killed and reported as failed.
+deadlines; a check past its timeout is killed and reported as failed. A
+check that exits while a descendant still holds its output pipes gets one
+5 s grace, shared by stdout and stderr, then whatever arrived is reported.
 
 ## How to use it
 
