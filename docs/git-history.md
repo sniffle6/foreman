@@ -45,8 +45,45 @@ metadata includes containing-branch badges and a short hash that copies the
 full object id when clicked.
 Selecting another row cancels the previous read. Refresh clears the selection.
 
-Branch selection and checkout/switching belong to the next task. Diffs, search,
-context menus, and other Git operations are outside this viewer's scope.
+Click a file in the changed-file tree to open it in the project's Diff window.
+Branch selection, checkout, search, context menus, and other Git operations are
+outside this viewer's scope.
+
+## Diff window
+
+One Diff window per Project, reused: clicking another file retargets it. It
+tiles, tabs, zooms and restores (with its file) like any viewer. It shows the
+whole file side by side, old left and new right, with both line numbers.
+Changed regions are banded: red removed, green added, amber modified, with the
+changed middle of a modified line tinted stronger. A gutter band links each
+change across the panes; a strip on the right marks every change in the file
+and outlines the viewport (click it to jump). The header shows the path
+(`old → new` for renames), the commits compared, and "N differences".
+
+Keys while the window is focused: F7 / Shift+F7 next/previous difference;
+Up/Down/PgUp/PgDn/Home/End scroll. Shift+wheel scrolls both sides
+horizontally together; so does the thin bar under the text.
+
+Binary files, submodules, diffs over 16 MiB or that git cannot return as one
+whole-file hunk (a change more than 200,000 lines from the file start or from
+the next change), and changes with no content difference (pure renames, mode
+changes, empty adds) show a one-line notice instead.
+
+Gotchas:
+- Git computes the diff with `-U200000`: `diff-tree -p` for A/D/M, the
+  `<rev>:<path>` form for R/C, and bare blob ids (`rev-parse` first) for T.
+  T can't use `<rev>:<path>`: when the file mode changes, git 2.39 splits it
+  into a delete plus an add. Never raise `-U` toward `i32::MAX`: git 2.39
+  emits overlapping repeated hunks there. The parser accepts exactly one
+  whole-file hunk and turns anything else into the too-large notice.
+- CRLF is shown as LF, so a pure line-ending change shows Modified rows with
+  nothing highlighted inside them. Tabs are expanded to 4 columns.
+- The monospace grid assumes one column per char; wide CJK glyphs render wider
+  than their column and can misalign highlights on that line.
+- Painting lays out only the visible slice of each line, so a 1 MB minified
+  line stays cheap. Slices always land on char boundaries; a bad slice would
+  panic the frame and take the whole app down.
+- No syntax highlighting, text selection, or copy (v1).
 
 ## Design and implementation plan
 
@@ -119,7 +156,9 @@ manual, keeping a single stream's ordering and decorations stable while browsing
 ## Validation
 
 Run `cargo test --target-dir target/agent git_history -- --nocapture` for graph,
-parser, batch, repository, virtualization, and workspace tests. The repository
+parser, batch, repository, virtualization, workspace, `diff` (unified-diff
+parser), and `diff_view` (git reads, request lifecycle, painting) tests.
+`cargo test --target-dir target/agent git_diff_window` covers the wm wiring. The repository
 fixture exercises an annotated tag, merge, linked worktree, detached commit,
 empty repository, and non-repository error. The graph cases include linear,
 diamond, octopus, and disconnected history.
@@ -128,6 +167,10 @@ On 2026-09-23, the synthetic 100,000-commit test built the graph in 148 ms and
 rendered twelve headless debug frames in 39 ms. After a large scroll it painted
 only the visible rows around commit 1,700. This is a bounded-work regression
 check, not a release-build end-to-end frame-time benchmark.
+
+On 2026-09-23, the diff view parsed a synthetic 100,000-line file in 82 ms and
+rendered twelve headless debug frames in 52 ms. Same caveat: a bounded-work
+check, not a release frame-time benchmark.
 
 Native screenshots use a seeded workspace and fixture repository under
 `target/history-evidence`, with isolated APPDATA and global skill installation
@@ -148,8 +191,14 @@ is owned by the loaded commit details, so retiring those details clears it.
   module-local tests.
 - `src/git_history/details.rs`: `DetailsView`, cancellable commit queries,
   changed-file parsing, and the virtualized tree.
-- `src/wm.rs`: `Content::GitHistory`, `open_git_history_window`, snapshot capture
-  and restore, and the Project-scoped command dispatch.
+- `src/git_history/git.rs`: the shared Git subprocess helper (spawn, capped
+  drains, cancel/timeout watchdog) used by the history stream, details, and diff.
+- `src/git_history/diff.rs`: pure unified-diff parser into aligned rows and blocks.
+- `src/git_history/diff_view.rs`: `DiffTarget`, the diff reads, and `DiffView`.
+- `src/wm.rs`: `Content::GitHistory`, `Content::GitDiff`, `open_git_history_window`,
+  `open_git_diff_window`, `drain_history_acts`, snapshot capture and restore,
+  and the Project-scoped command dispatch.
 - `src/keymap.rs`: `Command::OpenGitHistory` and its default binding.
 - `src/workspace.rs`: `ContentSnap::GitHistory` (window identity only; cached
-  commits and scroll position are not persisted).
+  commits and scroll position are not persisted) and `ContentSnap::GitDiff`
+  (the target is persisted; restore re-reads it from git).

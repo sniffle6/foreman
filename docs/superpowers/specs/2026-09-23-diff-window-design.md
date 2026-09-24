@@ -156,14 +156,18 @@ pub struct DiffTarget {
 | Status | Command |
 |---|---|
 | `A`, `D`, `M` | `git diff-tree -p <parent> <commit> -- <path>`; root commit: `git diff-tree -p --root <commit> -- <path>` |
-| `T` | `git diff <parent>:<path> <commit>:<path>` |
+| `T` | `git rev-parse <parent>:<path> <commit>:<path>`, then `git diff <old-blob> <new-blob>` |
 | `R`, `C` | `git diff <parent>:<old_path> <commit>:<path>` |
 
 `M` stays on `diff-tree` because a submodule's `<rev>:<path>` names a commit
 this repository does not contain; `diff-tree` shows its gitlink header
-instead (the submodule notice). `T` uses the blob form because `diff-tree`
-splits a type change into a delete plus an add, which would trip the
-strict-hunk rule.
+instead (the submodule notice). `T` diffs bare blob ids because both
+`diff-tree` and the `<rev>:<path>` form carry the file mode, and when the
+modes differ (100644 → 120000) git 2.39 splits the change into a delete plus
+an add, which would trip the strict-hunk rule. Bare blob ids carry no mode,
+so they come back as one hunk. (Found during implementation; a type change
+where one side is a submodule resolves to a commit id and lands on an error
+line.)
 
 200,000 lines is the effective line cap: a change more than that many lines
 from the file start, or from the next change, cannot come back as one
