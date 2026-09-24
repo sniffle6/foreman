@@ -538,6 +538,8 @@ mod tests {
         // Staying active never re-reads; a quick refocus inside the debounce doesn't either.
         frame(&ctx, &mut view, true, vec![]);
         frame(&ctx, &mut view, false, vec![]);
+        // The Git read in settle() may already have consumed the debounce.
+        view.started = Some(Instant::now());
         frame(&ctx, &mut view, true, vec![]);
         assert!(view.request.is_none());
     }
