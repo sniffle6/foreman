@@ -1883,14 +1883,15 @@ impl DispatchMode {
         }
     }
 
-    /// The chip's hover text and the detail page's option text.
-    pub fn describe(self) -> &'static str {
+    /// The chip's hover text and the detail page's option text, naming the
+    /// branch card `id` would get (the same `card/<id>` the layouts use).
+    pub fn describe(self, id: &str) -> String {
         match self {
-            DispatchMode::Worktree => "A private git worktree on card/<id>",
-            DispatchMode::Branch => {
-                "Branch card/<id> in the project checkout (no worktree; uncommitted changes stay put)"
-            }
-            DispatchMode::InPlace => "The project checkout as it is (no branch)",
+            DispatchMode::Worktree => format!("A private git worktree on card/{id}"),
+            DispatchMode::Branch => format!(
+                "Branch card/{id} in the project checkout (no worktree; uncommitted changes stay put)"
+            ),
+            DispatchMode::InPlace => "The project checkout as it is (no branch)".into(),
         }
     }
 }
@@ -3215,6 +3216,20 @@ mod tests {
         assert_eq!(on_branch(repo.path()), "main");
         assert!(git_in(repo.path(), &["branch", "--list", "card/b9b9b9"]).is_empty());
         assert!(repo.path().join("scratch.txt").exists());
+    }
+
+    #[test]
+    fn dispatch_mode_labels_name_the_cards_real_branch() {
+        assert_eq!(
+            DispatchMode::Worktree.describe("ab12cd"),
+            "A private git worktree on card/ab12cd"
+        );
+        assert!(
+            DispatchMode::Branch
+                .describe("ab12cd")
+                .starts_with("Branch card/ab12cd in the project checkout")
+        );
+        assert!(!DispatchMode::InPlace.describe("ab12cd").contains("card/"));
     }
 
     #[test]

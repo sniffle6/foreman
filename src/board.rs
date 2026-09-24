@@ -1825,7 +1825,7 @@ impl BoardView {
                             crate::kanban::DispatchMode::Branch,
                             crate::kanban::DispatchMode::InPlace,
                         ] {
-                            ui.radio_value(&mut mode, m, m.describe());
+                            ui.radio_value(&mut mode, m, m.describe(&card.id));
                         }
                         if mode != before {
                             self.worktree_choice = Some((card.id.clone(), mode));
@@ -1943,7 +1943,7 @@ impl BoardView {
             )
             .on_hover_text(format!(
                 "{} (click for: {})",
-                mode.describe(),
+                mode.describe(&card.id),
                 mode.next().name()
             ));
         cp.rect_filled(
