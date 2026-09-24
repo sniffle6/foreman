@@ -33,7 +33,7 @@ impl ViewScale {
     }
 
     fn scaled_style(self, ctx: &egui::Context) -> egui::Style {
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         Self::scale_style(&mut style, self.0);
         style
     }
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn scoped_widgets_and_detached_popup_follow_font_zoom_without_compounding() {
         let ctx = egui::Context::default();
-        let base = (*ctx.style()).clone();
+        let base = (*ctx.global_style()).clone();
         for factor in [0.5, 1.0, 2.0] {
             crate::terminal::set_font_size(&ctx, crate::config::DEFAULT_FONT_SIZE * factor);
             let zoom = ViewScale::from_ctx(&ctx);
