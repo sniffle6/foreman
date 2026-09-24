@@ -399,8 +399,15 @@ changed-file tree. Owned by `src/git_history/details.rs`; each selection has a
 cancellable background request and a private reply channel so stale results
 cannot replace the current selection. Merge changes use the first parent.
 
+**Git Changes**:
+The per-Project read-only window listing uncommitted files in Conflicts,
+Staged, Changes, and Unversioned Files sections. Owned by
+`src/git_history/changes.rs`; it re-reads `git status` on Refresh and when it
+becomes active, never on a timer.
+
 **Diff window**:
-The per-Project, reused side-by-side view of one changed file at one commit,
-opened from Commit details. Owned by `src/git_history/diff_view.rs`; rows are
+The per-Project, reused side-by-side view of one changed file, either at one
+commit (opened from Commit details) or in the working tree (opened from Git
+Changes). Owned by `src/git_history/diff_view.rs`; rows are
 padded so both sides align, and git's single whole-file hunk is the only
 accepted input.

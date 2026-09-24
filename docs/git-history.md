@@ -28,11 +28,12 @@ commit message, copyable object id, author name/email, author timestamp with
 timezone, and local/remote branches containing that commit. The branch list is
 an ancestry query, not just the decorations attached to the selected row.
 
-The changed-file tree groups paths into collapsible directories. File labels
+The changed-file tree groups paths into collapsible directories; a chain of
+single-child directories folds into one row (`.foreman/tasks`). File labels
 and status letters share JetBrains' Darcula file-status palette, independently of
 graph lane colors. Copies use the added-file color and type changes use the
 modified-file color; status letters also identify each change. The mapping is
-in `src/git_history/details.rs` (`status_color`), based on JetBrains'
+in `src/git_history/file_tree.rs` (`status_color`), based on JetBrains'
 [default color schemes](https://github.com/JetBrains/intellij-community/blob/master/platform/platform-resources/src/DefaultColorSchemesManager.xml).
 Hover a rename for both paths. Roots compare against the empty tree; merges compare
 against their first parent, as labeled in the pane. Empty changes have an
@@ -49,6 +50,56 @@ Click a file in the changed-file tree to open it in the project's Diff window.
 Branch selection, checkout, search, context menus, and other Git operations are
 outside this viewer's scope.
 
+## Git Changes window
+
+Each Project can open a read-only Git Changes window: Leader then U, or
+**Open project Git changes** in the bindings help. It's the JetBrains Commit
+tool window's change list without anything that writes: no checkboxes, commit
+message, stage, rollback, or push. Opening again surfaces the existing window.
+
+The header shows the branch ("On main", or "Detached HEAD") and the change
+count. Files sit under collapsible sections, each a directory tree in the same
+status colors as the commit details:
+
+- **Conflicts**: unmerged files (`U`). Their diff is working copy vs HEAD,
+  because a conflicted index has no single version to compare against.
+- **Staged**: what the next commit would contain (HEAD vs index), including
+  staged renames.
+- **Changes**: edits not yet staged (index vs working copy).
+- **Unversioned Files**: untracked files (`?`). Every file inside a new
+  directory is listed, not just the directory. Ignored files are not shown.
+
+A file that is staged and then edited again shows up twice, once in Staged and
+once in Changes, and each opens its own diff. That split is the reason for the
+Staged section: JetBrains merges them, which hides what a commit would contain.
+Empty sections are hidden. A clean tree says so.
+
+Click a file to open it in the Diff window. Clicking the same working-tree file
+again re-reads it; a commit diff with an unchanged target does not.
+
+**Refresh model:** one `git status --porcelain=v2 -z --branch
+--untracked-files=all` read per refresh, on a worker. Refresh runs when the
+window first shows, when you press Refresh, and when the window becomes active
+(focused, inside the active Project), at most once per second. There is no
+file watcher and no polling, so nothing runs while you aren't looking at the
+window. The flip side: while the window stays focused, agents' edits don't
+appear until you press Refresh or focus away and back. The previous list stays
+up while a re-read runs, and collapsed folders and the selected file carry over.
+
+Gotchas:
+- Untracked files are read from disk and turned into an all-added diff, not run
+  through `git diff --no-index`: that command exits 1 whenever the files
+  differ, which the shared git helper reports as failure. The binary check
+  copies Git's (a NUL in the first 8000 bytes), and the size cap is 16 MiB. A
+  nested repository (`dir/` in status) shows the submodule notice. Paths from a
+  restored workspace are rejected if they're absolute or contain `..`.
+- Staged T/R/C diffs use the blob form (`HEAD:old` vs `:new`, resolved to ids),
+  for the same mode-split reason as commit diffs. An unstaged type change
+  (file ↔ symlink) still splits and shows the too-large notice.
+- Reads are repository-read-only: the shared helper sets
+  `GIT_OPTIONAL_LOCKS=0`, so `git status` doesn't refresh the index as it
+  normally would.
+
 ## Diff window
 
 One Diff window per Project, reused: clicking another file retargets it. It
@@ -58,7 +109,8 @@ Changed regions are banded: red removed, green added, amber modified, with the
 changed middle of a modified line tinted stronger. A gutter band links each
 change across the panes; a strip on the right marks every change in the file
 and outlines the viewport (click it to jump). The header shows the path
-(`old → new` for renames), the commits compared, and "N differences".
+(`old → new` for renames), the commits compared (or, for a Git Changes file,
+"Staged vs HEAD", "Working copy vs index", and so on), and "N differences".
 
 Keys while the window is focused: F7 / Shift+F7 next/previous difference;
 Up/Down/PgUp/PgDn/Home/End scroll. Shift+wheel scrolls both sides
@@ -189,16 +241,26 @@ is owned by the loaded commit details, so retiring those details clears it.
 
 - `src/git_history.rs`: `HistoryView`, `Stream`, `stream_history`, `Graph`, and
   module-local tests.
-- `src/git_history/details.rs`: `DetailsView`, cancellable commit queries,
-  changed-file parsing, and the virtualized tree.
+- `src/git_history/details.rs`: `DetailsView`, cancellable commit queries, and
+  changed-file parsing.
+- `src/git_history/file_tree.rs`: `FileTree`, the virtualized status-colored
+  tree (with sections) shared by the details pane and Git Changes, and
+  `status_color`.
+- `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
+  parser, and the refresh-on-activate model.
 - `src/git_history/git.rs`: the shared Git subprocess helper (spawn, capped
   drains, cancel/timeout watchdog) used by the history stream, details, and diff.
 - `src/git_history/diff.rs`: pure unified-diff parser into aligned rows and blocks.
-- `src/git_history/diff_view.rs`: `DiffTarget`, the diff reads, and `DiffView`.
-- `src/wm.rs`: `Content::GitHistory`, `Content::GitDiff`, `open_git_history_window`,
-  `open_git_diff_window`, `drain_history_acts`, snapshot capture and restore,
+- `src/git_history/diff_view.rs`: `DiffTarget` and its `Stage`, the diff reads
+  (commit and working tree, plus the untracked-file synthesis), and `DiffView`.
+- `src/wm.rs`: `Content::GitHistory`, `Content::GitDiff`, `Content::GitChanges`,
+  `open_git_history_window`, `open_git_diff_window`, `open_git_changes_window`,
+  `drain_history_acts`, snapshot capture and restore,
   and the Project-scoped command dispatch.
-- `src/keymap.rs`: `Command::OpenGitHistory` and its default binding.
+- `src/keymap.rs`: `Command::OpenGitHistory` / `OpenGitChanges` and their
+  default bindings (H / U).
 - `src/workspace.rs`: `ContentSnap::GitHistory` (window identity only; cached
-  commits and scroll position are not persisted) and `ContentSnap::GitDiff`
-  (the target is persisted; restore re-reads it from git).
+  commits and scroll position are not persisted), `ContentSnap::GitChanges`
+  (window identity only), and `ContentSnap::GitDiff` (the target, including its
+  `stage`, is persisted; restore re-reads it from git; old files without
+  `stage` restore as commit diffs).
