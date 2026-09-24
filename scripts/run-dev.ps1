@@ -22,6 +22,11 @@ already bitten in this repo:
      -Kill here matches on the dev exe path only, and refuses to kill any
      process that is an ancestor of this one.
 
+  4. A Codex sandbox process can be in the same Windows session as the user
+     but on an invisible desktop. Run this script as the desktop user. From
+     Codex, use exec_command with sandbox_permissions = require_escalated.
+     The script refuses the known sandbox account before killing or building.
+
 Known limitation: the control plane binds a fixed global pipe (\\.\pipe\foreman).
 Your existing instance owns it, so `foreman open` / `chat` / `send` / `snapshot`
 from a terminal still talk to THAT instance, not the dev one. GUI behaviour
@@ -58,7 +63,11 @@ List every running foreman with its exe path, and exit.
 
 .EXAMPLE
 .\scripts\run-dev.ps1
-Release build of the current repo, launched in a sandbox.
+Release build of the current repo, launched with isolated app data.
+
+.EXAMPLE
+.\scripts\run-dev.ps1 -Debug
+Debug build of the current repo, launched on the caller's desktop.
 
 .EXAMPLE
 .\scripts\run-dev.ps1 -Path C:\tmp\wt-galley -Fresh
@@ -137,15 +146,22 @@ function Stop-DevInstances {
     $ancestors = Get-AncestorIds
     $found = @(Get-DevInstances)
     if (-not $found) { Write-Host "no dev instances running"; return }
+    $stopped = @()
     foreach ($p in $found) {
         if ($ancestors -contains $p.Id) {
             Write-Warning "PID $($p.Id) is an ancestor of this shell (you are running inside it) - refusing to kill"
             continue
         }
         Write-Host "killing dev instance PID $($p.Id)"
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        Stop-Process -Id $p.Id -Force -ErrorAction Stop
+        $stopped += $p.Id
     }
     Start-Sleep -Milliseconds 500
+    foreach ($id in $stopped) {
+        if (Get-Process -Id $id -ErrorAction SilentlyContinue) {
+            throw "dev instance PID $id is still running"
+        }
+    }
 }
 
 if ($List) {
@@ -158,9 +174,41 @@ if ($List) {
     return
 }
 
+if ([Security.Principal.WindowsIdentity]::GetCurrent().Name -match '\\CodexSandboxOffline$') {
+    throw 'The Codex sandbox cannot show GUI windows on the user desktop. Run this script from a user terminal, or call it through exec_command with sandbox_permissions = require_escalated.'
+}
+
 if ($Kill) { Stop-DevInstances; return }
 
+function Stop-TargetInstance {
+    # The linker cannot replace a running copy of this exact exe. Other dev
+    # builds and the installed app may stay open.
+    $running = @(Get-DevInstances | Where-Object { $_.Path -eq $Exe })
+    if (-not $running) { return }
+    $ancestors = Get-AncestorIds
+    foreach ($p in $running) {
+        if ($ancestors -contains $p.Id) {
+            throw "PID $($p.Id) is this shell's host; refusing to rebuild its executable"
+        }
+        Write-Host "stopping previous dev instance PID $($p.Id)"
+        Stop-Process -Id $p.Id -Force -ErrorAction Stop
+    }
+    Start-Sleep -Milliseconds 500
+    if (@(Get-DevInstances | Where-Object { $_.Path -eq $Exe }).Count -gt 0) {
+        throw "previous dev instance still holds $Exe"
+    }
+}
+
 # --- build ------------------------------------------------------------------
+Stop-TargetInstance
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    if (Test-Path (Join-Path $cargoBin 'cargo.exe')) { $env:Path = "$cargoBin;$env:Path" }
+}
+if (-not (Get-Command gcc -ErrorAction SilentlyContinue) -and
+    (Test-Path 'C:\w64devkit\bin\gcc.exe')) {
+    $env:Path = "C:\w64devkit\bin;$env:Path"
+}
 Write-Host "building $BuildProfile from $SrcDir" -ForegroundColor Cyan
 Push-Location $SrcDir
 try {
@@ -198,8 +246,17 @@ if ($SeedWorkspace) {
 # APPDATA is what config_dir() reads (src/config.rs), so overriding it here is
 # the whole isolation mechanism. Set on THIS shell only; Start-Process inherits.
 $env:APPDATA = $Sandbox
+foreach ($name in @('FOREMAN', 'FOREMAN_EXE', 'FOREMAN_PIPE',
+                   'FOREMAN_PROJECT_ID', 'FOREMAN_TERMINAL_ID', 'FOREMAN_TITLE_PIPE')) {
+    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+}
 
-$p = Start-Process -FilePath $Exe -PassThru
+$p = Start-Process -FilePath $Exe -WorkingDirectory $SrcDir -WindowStyle Normal -PassThru
+Start-Sleep -Seconds 2
+$live = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+if (-not $live -or $live.Path -ne $Exe -or $live.MainWindowHandle -eq 0) {
+    throw "dev foreman did not open a desktop window (PID $($p.Id))"
+}
 Add-Content $PidFile $p.Id
 
 Write-Host ""

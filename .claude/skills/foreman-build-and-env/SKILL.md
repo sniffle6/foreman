@@ -100,6 +100,20 @@ NOT `Stop-Process foreman`: you kill your own host, every other terminal, and
 yourself mid-command (incident: 2026-07-09). Ask the user to close foreman, or
 build without touching the running exe: `cargo build --target-dir target/agent`.
 
+### Visible debug client from Codex
+
+Use `scripts/run-dev.ps1 -Debug` to build and launch a separate client. It uses
+isolated app data and a target directory keyed to the source checkout. It
+closes only a previous copy of the exact executable it is about to rebuild,
+and leaves the installed Foreman running.
+
+Codex tool commands may run as `CodexSandboxOffline` on an invisible desktop,
+even when `FOREMAN=1` and the Windows session id matches the user's. Run the
+script through `exec_command` with `sandbox_permissions: "require_escalated"`.
+The script rejects the sandbox account before any build or process stop. Its
+post-launch check requires a GUI window. `-List` is safe in either context;
+`-Kill` also needs the user's desktop context.
+
 Binaries land at `target\debug\foreman.exe` and `target\release\foreman.exe`.
 The GUI cannot be seen from a terminal — to verify visually, use the
 **build-screenshot** skill; for headless send/Snapshot verification and
