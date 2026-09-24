@@ -58,6 +58,8 @@ const GIT_OP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Lines of check output kept on the request for the worker to read.
 const OUTPUT_TAIL_LINES: usize = 40;
+const FAILURE_LINES_MAX: usize = 12;
+const FAILURE_LINE_CHARS: usize = 240;
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -1013,6 +1015,7 @@ pub fn prepare_submission(
 struct ChildOutcome {
     ok: bool,
     tail: String,
+    failure_lines: String,
     timed_out: bool,
     cancelled: bool,
 }
@@ -1021,7 +1024,8 @@ struct ChildOutcome {
 /// 100 ms. The child joins a kill-on-close Job, so an owner that dies takes
 /// it (and its own children — a `cargo test` tree) along instead of leaving
 /// an orphan to overlap the next owner. Output is captured (both streams)
-/// and the last [`OUTPUT_TAIL_LINES`] returned.
+/// and the last [`OUTPUT_TAIL_LINES`] returned. Potential failure lines are
+/// also kept separately so a noisy ending cannot bury the useful diagnosis.
 fn run_child(
     mut cmd: std::process::Command,
     timeout: Duration,
@@ -1087,6 +1091,7 @@ fn run_child(
     Ok(ChildOutcome {
         ok: status.success() && !timed_out && !was_cancelled,
         tail: tail_lines(&combined, OUTPUT_TAIL_LINES),
+        failure_lines: failure_lines(&combined),
         timed_out,
         cancelled: was_cancelled,
     })
@@ -1135,6 +1140,34 @@ fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n").trim().to_string()
+}
+
+fn failure_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("failed") || lower.contains("panicked at") || lower.contains("error:")
+        })
+        .take(FAILURE_LINES_MAX)
+        .map(|line| {
+            line.trim()
+                .chars()
+                .take(FAILURE_LINE_CHARS)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn check_output(out: &ChildOutcome) -> String {
+    if !out.ok && !out.failure_lines.is_empty() {
+        format!(
+            "Failure lines:\n{}\n\nLast {OUTPUT_TAIL_LINES} lines:\n{}",
+            out.failure_lines, out.tail
+        )
+    } else {
+        out.tail.clone()
+    }
 }
 
 /// A long-lived git command in `cwd` (rebase, merge): bounded, never
@@ -1212,10 +1245,11 @@ fn run_check(
     if out.cancelled {
         return Err(CheckError::Cancelled);
     }
+    let detail = check_output(&out);
     let tail = if out.timed_out {
-        format!("timed out after {} s\n{}", p.timeout_secs, out.tail)
+        format!("timed out after {} s\n{detail}", p.timeout_secs)
     } else {
-        out.tail
+        detail
     };
     Ok(CheckRecord {
         command: p.check.clone(),
@@ -2224,6 +2258,53 @@ mod tests {
             note: None,
             in_place: false,
         }
+    }
+
+    #[test]
+    fn failed_check_puts_bounded_failure_lines_before_unchanged_tail() {
+        let output = format!(
+            "test queue::reports_name ... FAILED\nthread 'queue' panicked at src/queue.rs:12\nerror: check exited\n{}",
+            (0..50)
+                .map(|n| format!("warning {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tail = tail_lines(&output, OUTPUT_TAIL_LINES);
+        assert!(!tail.contains("reports_name"));
+        let out = ChildOutcome {
+            ok: false,
+            tail: tail.clone(),
+            failure_lines: failure_lines(&output),
+            timed_out: false,
+            cancelled: false,
+        };
+        let detail = check_output(&out);
+        assert!(detail.starts_with("Failure lines:\ntest queue::reports_name ... FAILED\n"));
+        assert!(detail.contains("panicked at src/queue.rs:12\nerror: check exited"));
+        assert!(detail.ends_with(&format!("Last {OUTPUT_TAIL_LINES} lines:\n{tail}")));
+    }
+
+    #[test]
+    fn failure_excerpt_limits_lines_and_width_and_success_keeps_only_tail() {
+        let output = (0..20)
+            .map(|n| format!("error: {n} {}", "x".repeat(500)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = failure_lines(&output);
+        assert_eq!(excerpt.lines().count(), FAILURE_LINES_MAX);
+        assert!(
+            excerpt
+                .lines()
+                .all(|line| line.chars().count() == FAILURE_LINE_CHARS)
+        );
+        let out = ChildOutcome {
+            ok: true,
+            tail: "ordinary output".into(),
+            failure_lines: excerpt,
+            timed_out: false,
+            cancelled: false,
+        };
+        assert_eq!(check_output(&out), "ordinary output");
     }
 
     #[test]
@@ -3245,7 +3326,10 @@ mod tests {
         let took = start.elapsed();
         assert!(out.is_empty() && err.is_empty());
         assert!(took >= grace, "waited the grace, took {took:?}");
-        assert!(took < grace * 2, "one deadline for both pipes, took {took:?}");
+        assert!(
+            took < grace * 2,
+            "one deadline for both pipes, took {took:?}"
+        );
     }
 
     #[test]
