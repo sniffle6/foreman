@@ -261,7 +261,15 @@ fn stream_history(
     result
 }
 
+/// Intents from the history window that change sibling windows; drained by
+/// `WindowManager::drain_history_acts` after the draw pass.
+pub enum HistoryAct {
+    OpenDiff(DiffTarget),
+}
+
 pub struct HistoryView {
+    /// Recorded during `show`; the owning manager drains them after the draw.
+    pub acts: Vec<HistoryAct>,
     details: details::DetailsView,
     cwd: Option<PathBuf>,
     stream: Option<Stream>,
@@ -300,6 +308,7 @@ impl Drop for HistoryView {
 impl HistoryView {
     pub fn new(cwd: Option<PathBuf>) -> Self {
         Self {
+            acts: Vec::new(),
             details: details::DetailsView::default(),
             cwd,
             stream: None,
@@ -566,6 +575,9 @@ impl HistoryView {
         }
         self.details
             .show(ui, detail_rect, base.with(("details", self.generation)));
+        if let Some(target) = self.details.take_open() {
+            self.acts.push(HistoryAct::OpenDiff(target));
+        }
     }
 }
 

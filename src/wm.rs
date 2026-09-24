@@ -147,6 +147,9 @@ pub enum Content {
     Plan(crate::plan_view::PlanView),
     /// Read-only, asynchronously loaded project Git timeline.
     GitHistory(crate::git_history::HistoryView),
+    /// Per-project side-by-side diff of one file at one commit (singleton,
+    /// retargeted by the Git History details pane).
+    GitDiff(crate::git_history::DiffView),
     /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
     /// Floating/closable/tabbable/tileable like any normal window; restored
     /// across restarts by path only (see `ContentSnap::Image`).
@@ -225,6 +228,9 @@ impl Content {
             Content::GitHistory(view) => claims_click(ui, |ui| {
                 view.show(ui, rect, base.with((win_id, "git-history")))
             }),
+            Content::GitDiff(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, active, base.with((win_id, "git-diff")))
+            }),
             Content::Image(view) => {
                 view.show(ui, rect, active, resp);
                 false
@@ -273,7 +279,7 @@ impl Content {
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
             Content::Board(_) => {} // no PTY; the store is shared state, nothing to pump
-            Content::GitHistory(_) => {}
+            Content::GitHistory(_) | Content::GitDiff(_) => {}
             Content::Plan(_) => {}  // ditto: a derived read of the same store
             Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
@@ -288,7 +294,7 @@ impl Content {
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
             Content::Board(_) => None,
-            Content::Plan(_) | Content::GitHistory(_) => None,
+            Content::Plan(_) | Content::GitHistory(_) | Content::GitDiff(_) => None,
             Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
@@ -806,7 +812,11 @@ impl WindowManager {
             let mut new_active = 0usize;
             let mut found_active = false;
             for (i, t) in w.tabs.iter().enumerate() {
-                if matches!(t.content, Content::TaskManager(_) | Content::Settings(_)) {
+                // A Diff window with no target has nothing to restore. Skip it
+                // here, before the active-index bookkeeping below.
+                if matches!(t.content, Content::TaskManager(_) | Content::Settings(_))
+                    || matches!(&t.content, Content::GitDiff(v) if v.target().is_none())
+                {
                     continue;
                 }
                 if i == w.active {
@@ -821,6 +831,17 @@ impl WindowManager {
                     Content::Board(_) => ContentSnap::Board,
                     Content::Plan(_) => ContentSnap::Plan,
                     Content::GitHistory(_) => ContentSnap::GitHistory,
+                    Content::GitDiff(view) => {
+                        let t = view.target().expect("target-less diff filtered above");
+                        ContentSnap::GitDiff {
+                            commit: t.commit.clone(),
+                            parent: t.parent.clone(),
+                            status: t.status,
+                            old_path: t.old_path.clone(),
+                            path: t.path.clone(),
+                            merge: t.merge,
+                        }
+                    }
                     Content::Image(view) => ContentSnap::Image {
                         path: view.path.clone(),
                     },
@@ -1010,6 +1031,25 @@ impl WindowManager {
                     }
                     ContentSnap::Board => {
                         Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban)))
+                    }
+                    ContentSnap::GitDiff {
+                        commit,
+                        parent,
+                        status,
+                        old_path,
+                        path,
+                        merge,
+                    } => {
+                        let mut view = crate::git_history::DiffView::new(self.cwd.clone());
+                        view.retarget(crate::git_history::DiffTarget {
+                            commit: commit.clone(),
+                            parent: parent.clone(),
+                            status: *status,
+                            old_path: old_path.clone(),
+                            path: path.clone(),
+                            merge: *merge,
+                        });
+                        Content::GitDiff(view)
                     }
                     ContentSnap::GitHistory => {
                         Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone()))
@@ -2345,6 +2385,59 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// Open or surface the project's singleton Diff window, pointed at `target`.
+    fn open_git_diff_window(&mut self, target: crate::git_history::DiffTarget) {
+        let title = format!("Diff: {}", target.file_name());
+        let found = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::GitDiff(_)))
+                .map(|i| (w.id, i))
+        });
+        if let Some((win, tab)) = found {
+            if let Some(w) = self.windows.iter_mut().find(|w| w.id == win) {
+                let t = &mut w.tabs[tab];
+                t.title = title;
+                if let Content::GitDiff(view) = &mut t.content {
+                    view.retarget(target);
+                }
+            }
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                ptab: None,
+                window: None,
+                tab: Some(tab),
+            });
+            self.mark_workspace_dirty();
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(1100.0, 640.0));
+        let mut view = crate::git_history::DiffView::new(self.cwd.clone());
+        view.retarget(target);
+        self.push_win(id, Tab::fixed(title, Content::GitDiff(view)), rect);
+        self.mark_workspace_dirty();
+    }
+
+    /// Apply Git History intents recorded during the draw: the details pane
+    /// and the Diff window are siblings inside one project.
+    fn drain_history_acts(&mut self) {
+        let mut acts = Vec::new();
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::GitHistory(v) = &mut t.content {
+                    acts.append(&mut v.acts);
+                }
+            }
+        }
+        for act in acts {
+            match act {
+                crate::git_history::HistoryAct::OpenDiff(target) => {
+                    self.open_git_diff_window(target)
+                }
+            }
+        }
+    }
+
     /// Apply plan-view intents recorded during the draw - same deferred
     /// discipline as `drain_board_acts`, and it runs in THIS manager because
     /// the plan view and the board window are siblings inside one project.
@@ -3373,6 +3466,7 @@ impl WindowManager {
                             Content::Chat(_)
                             | Content::Board(_)
                             | Content::GitHistory(_)
+                            | Content::GitDiff(_)
                             | Content::Plan(_) => RowKind::Chat,
                             // Nested project content is not a product path today; tests
                             // use empty Project stubs as PTY-free tab stand-ins.
@@ -3975,6 +4069,7 @@ impl WindowManager {
                     Content::Chat(_)
                     | Content::Board(_)
                     | Content::GitHistory(_)
+                    | Content::GitDiff(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -5592,6 +5687,7 @@ impl WindowManager {
                     Content::Chat(_)
                     | Content::Board(_)
                     | Content::GitHistory(_)
+                    | Content::GitDiff(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -5624,6 +5720,7 @@ impl WindowManager {
                     Content::Chat(_)
                     | Content::Board(_)
                     | Content::GitHistory(_)
+                    | Content::GitDiff(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -6930,6 +7027,7 @@ impl WindowManager {
         self.drain_chat_posts();
         self.drain_board_acts(&ctx);
         self.drain_plan_acts();
+        self.drain_history_acts();
         self.drain_worktree_msgs(&ctx);
         self.drain_release(&ctx);
         if self.drain_settings() {
@@ -7930,6 +8028,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
         Content::Chat(_)
         | Content::Board(_)
         | Content::GitHistory(_)
+        | Content::GitDiff(_)
         | Content::Plan(_)
         | Content::Image(_)
         | Content::TaskManager(_)
@@ -10892,6 +10991,68 @@ mod tests {
         wm.open_board_window();
         assert_eq!(board_wins(&wm), 1);
         assert_eq!(wm.focused, Some(first));
+    }
+
+    #[test]
+    fn git_diff_window_is_one_per_project_retargeted_and_restored() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.windows[0].id;
+        let child = m.project_child_mut(pid).unwrap();
+        let target = |path: &str| crate::git_history::DiffTarget {
+            commit: "a".repeat(40),
+            parent: Some("b".repeat(40)),
+            status: 'M',
+            old_path: None,
+            path: path.into(),
+            merge: false,
+        };
+        // The details click reaches the manager through HistoryView.acts.
+        child.open_git_history_window();
+        for w in &mut child.windows {
+            for t in &mut w.tabs {
+                if let Content::GitHistory(v) = &mut t.content {
+                    v.acts.push(crate::git_history::HistoryAct::OpenDiff(target(
+                        "src/one.rs",
+                    )));
+                }
+            }
+        }
+        child.drain_history_acts();
+        child.open_git_diff_window(target("src/two.rs"));
+        let diffs: Vec<_> = child
+            .windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .filter(|t| matches!(t.content, Content::GitDiff(_)))
+            .collect();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].title, "Diff: two.rs");
+        let Content::GitDiff(v) = &diffs[0].content else {
+            unreachable!()
+        };
+        assert_eq!(v.target().unwrap().path, "src/two.rs");
+
+        let json = serde_json::to_string(&m.capture_workspace()).unwrap();
+        assert!(json.contains("GitDiff") && json.contains("src/two.rs"));
+        let mut back = WindowManager::new().as_desktop();
+        back.apply_workspace(&serde_json::from_str(&json).unwrap(), &ctx);
+        let Content::Project(child) =
+            &back.windows.iter().find(|w| w.is_project()).unwrap().tabs[0].content
+        else {
+            panic!()
+        };
+        let restored = child
+            .windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .find_map(|t| match &t.content {
+                Content::GitDiff(v) => v.target().cloned(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored, target("src/two.rs"));
     }
 
     #[test]

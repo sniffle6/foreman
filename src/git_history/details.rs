@@ -114,12 +114,26 @@ struct Details {
     message: String,
     branches: String,
     merge: bool,
+    /// First parent (the side a merge is diffed against); `None` for a root.
+    parent: Option<String>,
     files: Vec<ChangedFile>,
     tree: Vec<TreeRow>,
     visible: Vec<usize>,
     selected_file: Option<usize>,
 }
 impl Details {
+    /// The Diff window target for `files[file]`, against the first parent.
+    pub(super) fn target(&self, file: usize) -> super::DiffTarget {
+        let f = &self.files[file];
+        super::DiffTarget {
+            commit: self.hash.clone(),
+            parent: self.parent.clone(),
+            status: f.status,
+            old_path: f.previous.clone(),
+            path: f.path.clone(),
+            merge: self.merge,
+        }
+    }
     fn rebuild_visible(&mut self) {
         self.visible.clear();
         let mut i = 0;
@@ -210,6 +224,7 @@ fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, Str
         message: fields[4].trim_end_matches('\n').into(),
         branches: String::from_utf8_lossy(&branches).trim().into(),
         merge: parents.len() > 1,
+        parent: parents.first().map(|p| p.to_string()),
         files,
         tree,
         visible,
@@ -232,6 +247,8 @@ pub(super) struct DetailsView {
     request: Option<Request>,
     result: Option<Result<Details, String>>,
     tree_fraction: Option<f32>,
+    /// A file row clicked this frame, taken by `HistoryView` after the draw.
+    open: Option<super::DiffTarget>,
 }
 impl Drop for DetailsView {
     fn drop(&mut self) {
@@ -251,6 +268,10 @@ impl DetailsView {
                 drop(result);
             });
         }
+    }
+    /// A file row clicked this frame, for `HistoryView` to forward.
+    pub(super) fn take_open(&mut self) -> Option<super::DiffTarget> {
+        self.open.take()
     }
     pub(super) fn selected(&self) -> Option<&str> {
         self.request.as_ref().map(|r| r.hash.as_str())
@@ -363,8 +384,8 @@ impl DetailsView {
         });
         if details.files.is_empty() {
             tree_ui.colored_label(th.dim, "No changed files.");
-        } else {
-            show_tree(&mut tree_ui, details, scale);
+        } else if let Some(file) = show_tree(&mut tree_ui, details, scale) {
+            self.open = Some(details.target(file));
         }
         let mut metadata_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -430,7 +451,8 @@ impl DetailsView {
     }
 }
 
-fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
+/// Draw the file tree; returns the file clicked this frame, already selected.
+fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) -> Option<usize> {
     ui.spacing_mut().item_spacing.y = 0.0;
     let row_height = 20.0 * scale;
     let th = crate::theme::live(ui.ctx());
@@ -441,6 +463,7 @@ fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
         (14.0 * scale * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32,
     );
     let mut toggled = None;
+    let mut clicked = None;
     egui::ScrollArea::both()
         .id_salt("files")
         .auto_shrink([false, false])
@@ -531,6 +554,7 @@ fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
                     );
                     if response.clicked() {
                         details.selected_file = Some(file_index);
+                        clicked = Some(file_index);
                     }
                     response.on_hover_text(match &file.previous {
                         Some(old) => format!(
@@ -566,6 +590,7 @@ fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) {
         details.tree[index].collapsed = !details.tree[index].collapsed;
         details.rebuild_visible();
     }
+    clicked
 }
 
 pub(super) fn display_path(path: &str) -> String {
@@ -635,6 +660,7 @@ mod tests {
             message: "Subject\n\nBody".into(),
             branches: "main\norigin/main".into(),
             merge: false,
+            parent: None,
             files,
             tree,
             visible,
@@ -648,20 +674,23 @@ mod tests {
         let mut details = fixture();
         assert_eq!(details.tree[0].file_count, 2);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 150.0));
-        let mut frame = |details: &mut Details, events| {
+        let frame = |details: &mut Details, events| {
+            let mut clicked = None;
             let _ = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     events,
                     ..Default::default()
                 },
-                |ui| show_tree(ui, details, 1.0),
+                |ui| clicked = show_tree(ui, details, 1.0),
             );
+            clicked
         };
-        let mut click = |details: &mut Details, pos| {
-            frame(details, vec![egui::Event::PointerMoved(pos)]);
+        // Returns the file the click reported (what the Diff window opens).
+        let click = |details: &mut Details, pos| {
+            let mut clicked = frame(details, vec![egui::Event::PointerMoved(pos)]);
             for pressed in [true, false] {
-                frame(
+                clicked = clicked.or(frame(
                     details,
                     vec![egui::Event::PointerButton {
                         pos,
@@ -669,14 +698,15 @@ mod tests {
                         pressed,
                         modifiers: egui::Modifiers::NONE,
                     }],
-                );
+                ));
             }
+            clicked
         };
-        click(&mut details, egui::pos2(170.0, 30.0));
+        assert_eq!(click(&mut details, egui::pos2(170.0, 30.0)), Some(0));
         assert_eq!(details.selected_file, Some(0));
-        click(&mut details, egui::pos2(170.0, 50.0));
+        assert_eq!(click(&mut details, egui::pos2(170.0, 50.0)), Some(1));
         assert_eq!(details.selected_file, Some(1));
-        click(&mut details, egui::pos2(170.0, 11.0));
+        assert_eq!(click(&mut details, egui::pos2(170.0, 11.0)), None);
         assert!(details.tree[0].collapsed);
         assert_eq!(details.selected_file, Some(1));
         click(&mut details, egui::pos2(170.0, 11.0));
@@ -795,6 +825,7 @@ mod tests {
         let root = read(dir, "HEAD");
         assert_eq!(root.files.len(), 3);
         assert!(root.files.iter().all(|f| f.status == 'A'));
+        assert_eq!(root.target(0).parent, None);
         git(dir, &["mv", "src/old name.txt", "src/new name.txt"]);
         git(dir, &["rm", "gone.txt"]);
         std::fs::write(dir.join("src/edit.txt"), "modified\n").unwrap();
@@ -839,6 +870,12 @@ mod tests {
         let renamed = &details.files[2];
         assert_eq!(renamed.previous.as_deref(), Some("src/old name.txt"));
         assert_eq!(renamed.path, "src/new name.txt");
+        let t = details.target(2);
+        assert_eq!(
+            (t.status, t.old_path.as_deref(), t.path.as_str()),
+            ('R', Some("src/old name.txt"), "src/new name.txt")
+        );
+        assert!(!t.merge);
         assert_eq!(git(work.path(), &["status", "--porcelain=v1"]), before);
         let mut details = details;
         let folder = details.tree.iter().position(|r| r.label == "src").unwrap();
@@ -869,6 +906,14 @@ mod tests {
         assert!(details.merge);
         assert_eq!(details.files.len(), 1);
         assert_eq!(details.files[0].path, "topic.txt");
+        let target = details.target(0);
+        assert_eq!(target.commit, details.hash);
+        assert_eq!(
+            target.parent.as_deref(),
+            Some(git(dir, &["rev-parse", "HEAD^1"]).as_str())
+        );
+        assert!(target.merge);
+        assert_eq!((target.status, target.path.as_str()), ('A', "topic.txt"));
         git(dir, &["checkout", "--detach"]);
         git(dir, &["commit", "--allow-empty", "-m", "Detached"]);
         let details = read(dir, "HEAD");

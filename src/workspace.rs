@@ -122,6 +122,17 @@ pub enum ContentSnap {
     Plan,
     /// Restore against the owning project directory, without cached Git data.
     GitHistory,
+    /// The per-project Diff window and its target; restore re-reads from Git.
+    /// A target whose commit is gone restores into the error state.
+    GitDiff {
+        commit: String,
+        parent: Option<String>,
+        status: char,
+        old_path: Option<String>,
+        path: String,
+        #[serde(default)]
+        merge: bool,
+    },
     Project {
         child: ManagerSnap,
     },
