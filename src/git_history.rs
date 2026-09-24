@@ -1,6 +1,7 @@
 //! Read-only Git history: a demand-driven Git stream, pure lane layout, and virtualized native rows.
 use eframe::egui;
 mod details;
+mod diff;
 mod git;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
