@@ -39,11 +39,18 @@ checkout. It recolors `status_color` (the Darcula file-status palette) and adds
   there, stop and ask the human; do not stage, stash, or overwrite them.
 - Tasks 1–4 do not depend on zfw4je. The diff palette is deliberately its own
   constants, not `status_color`.
-- **Task 5's details-pane step assumes zfw4je has landed.** If the pane
-  already has a selected-file row, hook the diff open into that selection
-  (selecting a file opens its diff) and reuse its highlight. Skip the
-  `opened` field and the `background_color` highlight below. The `target()`
-  builder, `open`/`take_open`, and all of the wm wiring stay as written.
+- **Task 5 waits for zfw4je to land.** As of 2026-09-23 its colors are on main
+  (`2964666`), but the implementation `b30637b` is still on `card/zfw4je`
+  (blocked, pending resubmission). That commit rewrites the file-row drawing
+  and adds `Details.selected_file: Option<usize>`, set by
+  `details.selected_file = Some(file_index)` when a file row is clicked. Once
+  it's on main, Task 5's details step becomes: next to that assignment, also
+  record `self.open = Some(details.target(file_index))`, lifting it out of
+  the closure if the borrow checker requires. **Skip** the `opened` field, the
+  `background_color` highlight, and the Label-sense rewrite below; zfw4je's
+  selection highlight is the "last opened" highlight. The `target()` builder,
+  `open`/`take_open`, and all of the wm wiring stay as written. If zfw4je
+  still hasn't landed when Task 5 starts, stop and ask the human.
 
 ## Review Focus
 
