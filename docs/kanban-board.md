@@ -158,7 +158,10 @@ tokens and Visuals bridge; there is no board-specific palette. There is
 no separate board font-size setting: text follows the shared terminal font
 size, with proportional card heights, spacing, and button hit areas. Changes
 apply to the open board and its detail page on the next frame. There is
-deliberately no block button — blocking demands a typed reason, so it is the
+one shared widget style for the board and its detached Version popup; the
+popup rows follow the same font zoom as the trigger. Painted card geometry
+still uses explicit scaled coordinates. There is deliberately no block
+button — blocking demands a typed reason, so it is the
 CLI's move.
 
 **Plan view**: leader then `L` (`Command::OpenPlan`) opens the project's plan

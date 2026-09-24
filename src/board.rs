@@ -840,10 +840,12 @@ impl BoardView {
             // interaction height to the slot so zoom cannot push it into
             // the first card row.
             child.spacing_mut().interact_size.y = dd.height();
+            let popup_style = crate::view_scale::ViewScale::from_ctx(ui.ctx()).popup_style();
             let combo = egui::ComboBox::from_id_salt(base.with((col_idx, "version")))
                 .width(dd.width())
                 .truncate()
                 .selected_text(selected_text)
+                .popup_style(popup_style)
                 .show_ui(&mut child, |ui| {
                     let r = ui.selectable_label(self.version.is_none(), crate::kanban::CURRENT);
                     #[cfg(test)]
@@ -952,7 +954,7 @@ impl BoardView {
                     .hint_text("+ new card…")
                     .vertical_align(egui::Align::Center)
                     .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::symmetric(4, 0))
+                    .margin(egui::Margin::symmetric((4.0 * self.scale).round() as i8, 0))
                     .desired_width(qa_rect.width()),
             );
             if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -986,7 +988,7 @@ impl BoardView {
                     .hint_text("version name…  Enter cuts, Esc cancels")
                     .vertical_align(egui::Align::Center)
                     .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::symmetric(4, 0))
+                    .margin(egui::Margin::symmetric((4.0 * self.scale).round() as i8, 0))
                     .desired_width(field_rect.width()),
             );
             if std::mem::take(&mut self.cut_focus_pending) {
@@ -2618,6 +2620,34 @@ mod tests {
         assert!(board.drew_banner);
         assert!(!board.offered_cut, "no Cut inside a Version");
         assert!(board.acts.is_empty(), "switching views is not an act");
+    }
+
+    #[test]
+    fn open_version_popup_rows_follow_font_zoom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        add_done(&store, "shipped");
+        cut(&store, "v1");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2400.0, 1400.0));
+        let mut heights = Vec::new();
+        for factor in [0.5, 1.0, 2.0] {
+            let ctx = egui::Context::default();
+            crate::terminal::set_font_size(&ctx, crate::config::DEFAULT_FONT_SIZE * factor);
+            let mut board = BoardView::new(Rc::clone(&store));
+            let base = egui::Id::new("popup-zoom");
+            run_frame(&ctx, &mut board, rect, base, vec![]);
+            let button = board.dropdown_btn.expect("dropdown is visible");
+            click_at(&ctx, &mut board, rect, base, button.center());
+            run_frame(&ctx, &mut board, rect, base, vec![]);
+            let row = board
+                .dropdown_rows
+                .iter()
+                .find(|(name, _)| name == "v1")
+                .expect("popup is open");
+            heights.push(row.1.height());
+        }
+        assert!(heights[1] >= heights[0] * 1.8, "{heights:?}");
+        assert!(heights[2] >= heights[1] * 1.8, "{heights:?}");
     }
 
     #[test]

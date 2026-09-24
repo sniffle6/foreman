@@ -479,8 +479,11 @@ impl DetailsView {
                     for branch in details.branches.lines() {
                         egui::Frame::new()
                             .fill(th.tab_bg)
-                            .corner_radius(3)
-                            .inner_margin(egui::Margin::symmetric(5, 1))
+                            .corner_radius((3.0 * scale).round() as u8)
+                            .inner_margin(egui::Margin::symmetric(
+                                (5.0 * scale).round() as i8,
+                                scale.round() as i8,
+                            ))
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::Label::new(egui::RichText::new(branch).small()).wrap(),

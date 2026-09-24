@@ -20,6 +20,8 @@ Git's own repository discovery.
 Text and row geometry follow the theme font size (Appearance → Font size, or
 Ctrl+Scroll zoom), scaled from the 13px default the same way the board does.
 Zooming keeps the same rows in view by rescaling the scroll offset.
+Widget fonts and spacing use the shared view scale; painted graph geometry
+uses explicit scaled coordinates.
 
 Click a timeline row to select it. The right-hand details pane shows the full
 commit message, copyable object id, author name/email, author timestamp with
