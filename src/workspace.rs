@@ -125,6 +125,9 @@ pub enum ContentSnap {
     /// The per-project Diff window and its target; restore re-reads from Git.
     /// A target whose commit is gone restores into the error state.
     GitDiff {
+        /// Absent in files written before the Git Changes window: a commit diff.
+        #[serde(default)]
+        stage: crate::git_history::Stage,
         commit: String,
         parent: Option<String>,
         status: char,

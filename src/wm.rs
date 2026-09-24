@@ -824,6 +824,7 @@ impl WindowManager {
                     Content::GitDiff(view) => {
                         let t = view.target().expect("target-less diff filtered above");
                         ContentSnap::GitDiff {
+                            stage: t.stage,
                             commit: t.commit.clone(),
                             parent: t.parent.clone(),
                             status: t.status,
@@ -1023,6 +1024,7 @@ impl WindowManager {
                         Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban)))
                     }
                     ContentSnap::GitDiff {
+                        stage,
                         commit,
                         parent,
                         status,
@@ -1032,6 +1034,7 @@ impl WindowManager {
                     } => {
                         let mut view = crate::git_history::DiffView::new(self.cwd.clone());
                         view.retarget(crate::git_history::DiffTarget {
+                            stage: *stage,
                             commit: commit.clone(),
                             parent: parent.clone(),
                             status: *status,
@@ -10998,6 +11001,7 @@ mod tests {
         let pid = m.windows[0].id;
         let child = m.project_child_mut(pid).unwrap();
         let target = |path: &str| crate::git_history::DiffTarget {
+            stage: crate::git_history::Stage::Commit,
             commit: "a".repeat(40),
             parent: Some("b".repeat(40)),
             status: 'M',

@@ -3,8 +3,9 @@ use eframe::egui;
 mod details;
 mod diff;
 mod diff_view;
+mod file_tree;
 mod git;
-pub use diff_view::{DiffTarget, DiffView};
+pub use diff_view::{DiffTarget, DiffView, Stage};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::{

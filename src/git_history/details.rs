@@ -54,6 +54,7 @@ impl Details {
     pub(super) fn target(&self, file: usize) -> super::DiffTarget {
         let f = &self.tree.files[file];
         super::DiffTarget {
+            stage: super::Stage::Commit,
             commit: self.hash.clone(),
             parent: self.parent.clone(),
             status: f.status,

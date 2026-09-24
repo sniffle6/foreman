@@ -13,10 +13,28 @@ use std::sync::{
 };
 use std::time::Duration;
 
-/// One file's change at one commit. Built by the details pane; persisted in
-/// `ContentSnap::GitDiff`, so it carries no live state.
+/// Which pair of file versions a target compares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stage {
+    /// `commit` against its first parent (Git History).
+    #[default]
+    Commit,
+    /// HEAD against the index (Git Changes).
+    Staged,
+    /// The index against the working copy; an unmerged file against HEAD.
+    Unstaged,
+    /// A file Git does not track, shown whole as added.
+    Untracked,
+}
+
+/// One file's change: at one commit, or in the working tree. Built by the
+/// details pane or the Git Changes window; persisted in `ContentSnap::GitDiff`,
+/// so it carries no live state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiffTarget {
+    pub stage: Stage,
+    /// Empty unless `stage` is `Commit`.
     pub commit: String,
     /// First parent; `None` for a root commit.
     pub parent: Option<String>,
@@ -38,6 +56,16 @@ impl DiffTarget {
     }
     fn versus(&self) -> String {
         let short = |h: &str| h.get(..7).unwrap_or(h).to_owned();
+        match (self.stage, self.status) {
+            (Stage::Commit, _) => {}
+            (Stage::Staged, 'A') => return "Staged · new file".into(),
+            (Stage::Staged, 'D') => return "Staged · deleted file".into(),
+            (Stage::Staged, _) => return "Staged vs HEAD".into(),
+            (Stage::Unstaged, 'U') => return "Working copy vs HEAD · conflict".into(),
+            (Stage::Unstaged, 'D') => return "Deleted from working copy".into(),
+            (Stage::Unstaged, _) => return "Working copy vs index".into(),
+            (Stage::Untracked, _) => return "Untracked · new file".into(),
+        }
         match (self.status, &self.parent) {
             ('A', _) | (_, None) => format!("{} · new file", short(&self.commit)),
             ('D', _) => format!("{} · deleted file", short(&self.commit)),
@@ -52,9 +80,6 @@ impl DiffTarget {
     /// pairs renamed/copied paths exactly; `load` resolves a T pair to bare
     /// blob ids so the mode change does not split it into delete + add.
     fn args(&self) -> Result<Vec<String>, String> {
-        if !is_object_id(&self.commit) || self.parent.as_deref().is_some_and(|p| !is_object_id(p)) {
-            return Err("Invalid commit id".into());
-        }
         let mut args: Vec<String> = Vec::new();
         let flags = [
             "--no-ext-diff".to_owned(),
@@ -62,6 +87,38 @@ impl DiffTarget {
             "--no-color".into(),
             format!("-U{}", diff::CONTEXT_LINES),
         ];
+        let path = || ["--".to_owned(), self.path.clone()];
+        match (self.stage, self.status) {
+            (Stage::Commit, _) => {}
+            // `:path` names the index blob; `load` resolves both specs to ids.
+            (Stage::Staged, 'T' | 'R' | 'C') => {
+                let old = self.old_path.as_deref().unwrap_or(&self.path);
+                args.push("diff".into());
+                args.extend(flags);
+                args.extend([format!("HEAD:{old}"), format!(":{}", self.path)]);
+                return Ok(args);
+            }
+            (Stage::Staged, _) => {
+                args.extend(["diff".into(), "--cached".into()]);
+                args.extend(flags);
+                args.extend(path());
+                return Ok(args);
+            }
+            (Stage::Unstaged, status) => {
+                args.push("diff".into());
+                args.extend(flags);
+                // A conflicted index has no single stage to compare against.
+                if status == 'U' {
+                    args.push("HEAD".into());
+                }
+                args.extend(path());
+                return Ok(args);
+            }
+            (Stage::Untracked, _) => return Err("Untracked files are not read through Git".into()),
+        }
+        if !is_object_id(&self.commit) || self.parent.as_deref().is_some_and(|p| !is_object_id(p)) {
+            return Err("Invalid commit id".into());
+        }
         match (self.status, &self.parent) {
             ('T' | 'R' | 'C', Some(parent)) => {
                 let old = self.old_path.as_deref().unwrap_or(&self.path);
@@ -97,8 +154,16 @@ pub(super) fn load(
     target: &DiffTarget,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Diff, String> {
+    if target.stage == Stage::Untracked {
+        return untracked(cwd, &target.path);
+    }
     let mut args = target.args()?;
-    if target.status == 'T' && target.parent.is_some() {
+    let blob_pair = match target.stage {
+        Stage::Commit => target.status == 'T' && target.parent.is_some(),
+        Stage::Staged => matches!(target.status, 'T' | 'R' | 'C'),
+        _ => false,
+    };
+    if blob_pair {
         // git 2.39 still splits a `rev:path` pair whose modes differ into a
         // delete plus an add. Bare blob ids carry no mode: one content hunk.
         let specs = args.split_off(args.len() - 2);
@@ -109,6 +174,55 @@ pub(super) fn load(
         Err(git::GitError::TooLarge) => Ok(Diff::Notice(Notice::TooLarge)),
         Err(e) => Err(message(e)),
     }
+}
+
+/// An untracked file as an all-added diff, read straight from disk: `git diff
+/// --no-index` exits 1 on any difference, which the helper reports as failure.
+fn untracked(cwd: &Path, path: &str) -> Result<Diff, String> {
+    if path.ends_with('/') {
+        // `status` lists a nested repository as its directory.
+        return Ok(Diff::Notice(Notice::Submodule));
+    }
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("Invalid path".into());
+    }
+    let full = cwd.join(relative);
+    let unreadable = |e: std::io::Error| format!("Cannot read {}: {e}", display_path(path));
+    if std::fs::metadata(&full).map_err(unreadable)?.len() > UNTRACKED_CAP {
+        return Ok(Diff::Notice(Notice::TooLarge));
+    }
+    diff::parse(&as_added(&std::fs::read(&full).map_err(unreadable)?))
+}
+const UNTRACKED_CAP: u64 = 16 << 20;
+
+/// Unified-diff text adding `bytes` as a whole new file. Binary uses Git's
+/// heuristic: a NUL in the first 8000 bytes.
+fn as_added(bytes: &[u8]) -> Vec<u8> {
+    if bytes[..bytes.len().min(8000)].contains(&0) {
+        return b"Binary files /dev/null and b/file differ\n".to_vec();
+    }
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let body = bytes.strip_suffix(b"\n");
+    let lines = body.unwrap_or(bytes).split(|b| *b == b'\n');
+    let count = lines.clone().count();
+    let mut out = format!("--- /dev/null\n+++ b/file\n@@ -0,0 +1,{count} @@\n").into_bytes();
+    out.reserve(bytes.len() + count);
+    for line in lines {
+        out.push(b'+');
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    if body.is_none() {
+        out.extend_from_slice(b"\\ No newline at end of file\n");
+    }
+    out
 }
 
 fn run(
@@ -251,8 +365,10 @@ impl DiffView {
     /// Show `target`. The load starts lazily on the next `show`, so restore can
     /// call this without an egui context.
     pub fn retarget(&mut self, target: DiffTarget) {
+        // The working tree moves under a fixed target: clicking it again re-reads.
         let failed = matches!(self.result, Some(Err(_)));
-        if self.target.as_ref() == Some(&target) && !failed {
+        let same = self.target.as_ref() == Some(&target) && target.stage == Stage::Commit;
+        if same && !failed {
             return;
         }
         self.clear();
@@ -752,6 +868,7 @@ mod tests {
     }
     fn target(dir: &Path, status: char, old: Option<&str>, path: &str) -> DiffTarget {
         DiffTarget {
+            stage: Stage::Commit,
             commit: git(dir, &["rev-parse", "HEAD"]),
             parent: Some(git(dir, &["rev-parse", "HEAD^"])),
             status,
@@ -779,6 +896,7 @@ mod tests {
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "base"]);
         let root = DiffTarget {
+            stage: Stage::Commit,
             commit: git(dir, &["rev-parse", "HEAD"]),
             parent: None,
             status: 'A',
@@ -884,12 +1002,110 @@ mod tests {
         );
     }
 
+    fn worktree(stage: Stage, status: char, old: Option<&str>, path: &str) -> DiffTarget {
+        DiffTarget {
+            stage,
+            commit: String::new(),
+            parent: None,
+            status,
+            old_path: old.map(Into::into),
+            path: path.into(),
+            merge: false,
+        }
+    }
+    fn texts(d: &diff::Doc) -> Vec<(diff::Kind, Option<&str>, Option<&str>)> {
+        d.rows
+            .iter()
+            .map(|r| {
+                let old = r.old.as_ref().map(|c| c.text.as_str());
+                (r.kind, old, r.new.as_ref().map(|c| c.text.as_str()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn working_tree_stages_diff_the_right_pair_without_writes() {
+        use diff::Kind::*;
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("old.txt"), lines(20)).unwrap();
+        std::fs::write(dir.join("gone.txt"), "x\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "one\nTWO\n").unwrap();
+        git(dir, &["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(dir, &["mv", "old.txt", "new.txt"]);
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        std::fs::write(dir.join("u.txt"), "hello\r\nworld").unwrap();
+        std::fs::write(dir.join("bin.dat"), b"a\0b").unwrap();
+        std::fs::write(dir.join("empty.txt"), "").unwrap();
+        let before = git(dir, &["status", "--porcelain=v1"]);
+
+        let staged = doc(load(dir, &worktree(Stage::Staged, 'M', None, "a.txt"), &flag()));
+        assert_eq!(
+            texts(&staged),
+            [(Same, Some("one"), Some("one")), (Modified, Some("two"), Some("TWO"))]
+        );
+        let unstaged = doc(load(dir, &worktree(Stage::Unstaged, 'M', None, "a.txt"), &flag()));
+        assert_eq!(texts(&unstaged)[2], (Added, None, Some("three")));
+        let renamed = worktree(Stage::Staged, 'R', Some("old.txt"), "new.txt");
+        assert_eq!(
+            load(dir, &renamed, &flag()).unwrap(),
+            Diff::Notice(Notice::Unchanged)
+        );
+        let deleted = doc(load(dir, &worktree(Stage::Unstaged, 'D', None, "gone.txt"), &flag()));
+        assert_eq!(texts(&deleted), [(Removed, Some("x"), None)]);
+        let new = doc(load(dir, &worktree(Stage::Untracked, '?', None, "u.txt"), &flag()));
+        assert_eq!(
+            texts(&new),
+            [(Added, None, Some("hello")), (Added, None, Some("world"))]
+        );
+        assert!(new.rows[1].new.as_ref().unwrap().no_eol);
+        for (path, notice) in [
+            ("bin.dat", Notice::Binary),
+            ("empty.txt", Notice::Unchanged),
+            ("nested/", Notice::Submodule),
+        ] {
+            let t = worktree(Stage::Untracked, '?', None, path);
+            assert_eq!(load(dir, &t, &flag()).unwrap(), Diff::Notice(notice));
+        }
+        for path in ["../outside.txt", "missing.txt"] {
+            assert!(load(dir, &worktree(Stage::Untracked, '?', None, path), &flag()).is_err());
+        }
+        assert_eq!(git(dir, &["status", "--porcelain=v1"]), before);
+    }
+
+    #[test]
+    fn working_tree_targets_label_and_reread_on_retarget() {
+        let conflict = worktree(Stage::Unstaged, 'U', None, "c.txt");
+        assert!(conflict.args().unwrap().contains(&"HEAD".to_owned()));
+        assert_eq!(conflict.versus(), "Working copy vs HEAD · conflict");
+        assert_eq!(worktree(Stage::Staged, 'M', None, "f").versus(), "Staged vs HEAD");
+        assert_eq!(
+            worktree(Stage::Unstaged, 'M', None, "f").versus(),
+            "Working copy vs index"
+        );
+        assert_eq!(
+            worktree(Stage::Untracked, '?', None, "f").versus(),
+            "Untracked · new file"
+        );
+        let mut view = DiffView::new(Some(PathBuf::new()));
+        let target = worktree(Stage::Unstaged, 'M', None, "f");
+        view.retarget(target.clone());
+        view.result = Some(Ok(Diff::Notice(Notice::Unchanged)));
+        view.retarget(target);
+        assert!(view.result.is_none(), "same working-tree target must re-read");
+    }
+
     #[test]
     fn missing_commits_and_bad_ids_are_errors_not_panics() {
         let repo = repo();
         let dir = repo.path();
         git(dir, &["commit", "--allow-empty", "-m", "root"]);
         let mut t = DiffTarget {
+            stage: Stage::Commit,
             commit: "0".repeat(40),
             parent: Some("1".repeat(40)),
             status: 'M',
@@ -908,6 +1124,7 @@ mod tests {
     #[test]
     fn target_labels() {
         let t = DiffTarget {
+            stage: Stage::Commit,
             commit: "abcdef0123".repeat(4),
             parent: Some("1234567890".repeat(4)),
             status: 'M',
@@ -943,6 +1160,7 @@ mod tests {
     fn loaded(doc: diff::Doc) -> DiffView {
         let mut view = DiffView::new(None);
         view.target = Some(DiffTarget {
+            stage: Stage::Commit,
             commit: "a".repeat(40),
             parent: Some("b".repeat(40)),
             status: 'M',
@@ -1113,6 +1331,7 @@ mod tests {
         let (_tx, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         view.target = Some(DiffTarget {
+            stage: Stage::Commit,
             commit: "a".repeat(40),
             parent: None,
             status: 'A',
