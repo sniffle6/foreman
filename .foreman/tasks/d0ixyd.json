@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "d0ixyd",
+  "title": "Start card work on a feature branch without a worktree",
+  "body": "Add a dispatch option that starts a card on a feature branch in the project checkout. Define safe branch creation, restart behavior, and integration back into the base branch while preserving existing checkout changes.",
+  "state": "backlog",
+  "created": "2026-09-24T13:12:55Z",
+  "updated": "2026-09-24T13:12:55Z"
+}
