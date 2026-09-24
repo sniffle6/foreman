@@ -1,9 +1,9 @@
 {
   "v": 1,
   "id": "l8th0t",
-  "title": "Git history: side-by-side diff window (slim JetBrains-style)",
-  "body": "Click a file in the Git History commit details pane -> reusable per-Project side-by-side Diff window (slim JetBrains-style).\n\nSpec (approved): docs/superpowers/specs/2026-09-23-diff-window-design.md\nPlan: docs/superpowers/plans/2026-09-23-diff-window.md (6 tasks; Task 1 = shared src/git_history/git.rs helper extraction, behavior-preserving)\n\nSettled: no syntax highlighting, padded rows + straight connector gutter, prefix/suffix word highlight, no dropdowns, shared horizontal scroll, restore with target, git computes the diff with bounded -U200000 (INT_MAX corrupts output in git 2.39).",
+  "title": "Git history: side-by-side diff window — execute plan",
+  "body": "Execute docs/superpowers/plans/2026-09-23-diff-window.md (spec: docs/superpowers/specs/2026-09-23-diff-window-design.md, approved).\n\nMethod: Hybrid. Task 1 own subagent (existing git_history tests are the gate, no review). Tasks 2+3 one subagent. Task 4 own subagent + review (egui-heavy, uncompiled code in plan). Task 5 own subagent + foreman-reviewer. Task 6 inline; ask the human to run build-screenshot.\n\nNotes:\n- zfw4je has LANDED (a685aa1): Task 5 hooks the diff open into Details.selected_file; skip the plan's `opened` field / highlight / Label-sense rewrite.\n- Inside foreman: cargo via PowerShell with --target-dir target/agent; never Stop-Process foreman.\n- Every commit ends with Card: l8th0t.",
   "state": "backlog",
   "created": "2026-09-23T23:35:11Z",
-  "updated": "2026-09-24T01:37:05Z"
+  "updated": "2026-09-24T01:54:20Z"
 }
