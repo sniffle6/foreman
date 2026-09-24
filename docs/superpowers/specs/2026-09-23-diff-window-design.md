@@ -1,6 +1,7 @@
 # Git History diff window — design
 
-Status: spec, awaiting review (card `l8th0t`). Not yet planned or built.
+Status: approved 2026-09-23 (card `l8th0t`). Plan:
+`docs/superpowers/plans/2026-09-23-diff-window.md`. Not yet built.
 
 Clicking a file in the Git History commit details pane opens that file's change
 in a side-by-side Diff window: a slim take on the JetBrains "Repository Diff"
@@ -145,6 +146,7 @@ pub struct DiffTarget {
     status: char,            // A M D R C T
     old_path: Option<String>,// R/C source
     path: String,
+    merge: bool,             // label "(first parent)" in the header
 }
 ```
 
@@ -153,12 +155,21 @@ pub struct DiffTarget {
 
 | Status | Command |
 |---|---|
-| `A`, `D` | `git diff-tree -p <parent> <commit> -- <path>`; root commit: `git diff-tree -p --root <commit> -- <path>` |
-| `M`, `T` | `git diff <parent>:<path> <commit>:<path>` |
+| `A`, `D`, `M` | `git diff-tree -p <parent> <commit> -- <path>`; root commit: `git diff-tree -p --root <commit> -- <path>` |
+| `T` | `git diff <parent>:<path> <commit>:<path>` |
 | `R`, `C` | `git diff <parent>:<old_path> <commit>:<path>` |
 
-200,000 lines is the line cap: anything longer produces more than one hunk and
-lands on `Notice::TooLarge` by the strict-hunk rule. `GitError::TooLarge` maps
+`M` stays on `diff-tree` because a submodule's `<rev>:<path>` names a commit
+this repository does not contain; `diff-tree` shows its gitlink header
+instead (the submodule notice). `T` uses the blob form because `diff-tree`
+splits a type change into a delete plus an add, which would trip the
+strict-hunk rule.
+
+200,000 lines is the effective line cap: a change more than that many lines
+from the file start, or from the next change, cannot come back as one
+whole-file hunk, and lands on `Notice::TooLarge` by the strict-hunk rule.
+(A long file changed only near both ends is still one complete hunk, and
+rendering it is correct.) `GitError::TooLarge` maps
 to the same notice. Paths that were lossily decoded from non-UTF-8 bytes will
 fail the object lookup and show git's error; acceptable for v1.
 
@@ -200,9 +211,12 @@ thread, as History already does with its pages.
 
 - After each load, scroll to the first difference.
 - Prev/next (buttons, or F7 / Shift+F7 while the window is active) put the
-  adjacent block's first row a third of the way down the viewport. The
-  "current" block is derived from the scroll offset each frame, never stored,
-  so free scrolling cannot leave it stale.
+  adjacent block's first row a third of the way down the viewport. The block
+  navigation landed on stays "current" only while the scroll offset is still
+  where navigation left it. Any other scroll re-derives the next/previous block
+  from the row a third of the way down, so free scrolling cannot leave it stale.
+  (Deriving it purely from the scroll offset fails near the top of the file,
+  where the offset clamps at 0 and the anchor row sits past the block.)
 - Up/Down/PgUp/PgDn/Home/End scroll while active. Keys are read locally, like
   `imageview.rs`'s Ctrl+0; they do not go through the Leader keymap.
 
