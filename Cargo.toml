@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sniffle6/foreman"
 description = "Fast native desktop for running many AI-agent terminal sessions"
+default-run = "foreman"
 
 [dependencies]
 alacritty_terminal = "0.26.0"
@@ -44,6 +45,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Color emoji raster (DirectWrite + D2D → WIC bitmap). Not the same crate as windows-sys.
 windows = { version = "0.62", features = [

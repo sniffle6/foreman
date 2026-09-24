@@ -50,12 +50,22 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: PowerShell CLI smoke
+        run: |
+          & target/release/foreman.exe kanban --help
+          if ($LASTEXITCODE -ne 0) { throw "help exited $LASTEXITCODE" }
+          & target/release/foreman.exe kanban nonsense
+          if ($LASTEXITCODE -ne 2) { throw "bad command exited $LASTEXITCODE" }
+          $helpText = & target/release/foreman.exe kanban --help
+          if (($helpText -join "`n") -notmatch 'foreman kanban wait') { throw 'help text missing from stdout' }
+
       - name: Package
         run: |
           $v = '${{ steps.ver.outputs.version }}'
           $zip = "foreman-v$v-x86_64-windows.zip"
           New-Item -ItemType Directory staging | Out-Null
           Copy-Item target/release/foreman.exe staging/
+          Copy-Item target/release/foreman-gui.exe staging/
           Copy-Item LICENSE-MIT, LICENSE-APACHE staging/
           Copy-Item assets/fonts/LICENSE-Hack.md staging/THIRD-PARTY-Hack-font.md
           Copy-Item assets/conpty/LICENSE staging/THIRD-PARTY-ConPTY.txt

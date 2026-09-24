@@ -28,7 +28,8 @@ version exists. Spec with the full decision history:
 
 - **One-click apply (Phase 4, current)**: clicking the chip on an applicable
   release downloads the zip and checksums, verifies the SHA-256, and swaps the
-  running exe for the new one (`foreman.exe` → `.old`, `.new` → `foreman.exe`).
+  running exe and its GUI launcher for the new versions (`*.exe` → `.old`,
+  `.new` → `*.exe`).
   The chip then reads "Restart to update"; a first click arms it ("Restart? N
   sessions close"), a second click within 5 s actually restarts (spawns the
   new exe, which waits out the old process, then the old one exits), and
@@ -96,13 +97,13 @@ instead of publishing.
   the old process out) — never set this by hand.
 - The collapsed-rail glyph (`↓`/`↻`/`!`) is steady, not pulsing — a deliberate
   simplification from the original spec's animated cell.
-- The swap only replaces the exe (two-rename dance: `foreman.exe` → `.old`,
-  `.new` → `foreman.exe`, staged in `%TEMP%\foreman-update`). It does not
-  touch licenses, the Start-menu shortcut, or PATH — those are install.ps1's
-  job, untouched by an in-place update. Only the GUI process cleans up a
-  leftover `.old` at startup, never the CLI verbs (`foreman open`/`status`/...),
-  so a leftover can't race a concurrent update download from a dispatching
-  agent.
+- The swap replaces `foreman.exe` and `foreman-gui.exe` with the two-rename
+  dance, staged in `%TEMP%\foreman-update`. An existing Foreman Start-menu
+  shortcut pointing at `foreman.exe` is migrated to `foreman-gui.exe` on update;
+  custom shortcuts are left alone. The updater does not touch licenses or PATH.
+  Only the GUI process cleans up leftover `.old` files at startup, never the
+  CLI verbs (`foreman open`/`status`/...), so cleanup cannot race a concurrent
+  update download from a dispatching agent.
 - The updater uses rustls + webpki-roots, not the Windows cert store —
   corporate MITM proxies make the check fail, which is a silent skip by
   design (stderr gets one line).
@@ -110,12 +111,11 @@ instead of publishing.
   call `exit` (it runs under `iex` in the user's shell — it uses `return`).
 - Unauthenticated GitHub API is limited to 60 requests/h/IP; the 6 h cadence
   keeps foreman far under it.
-- Release builds are GUI-subsystem (no console window on double-click; the
-  CLI verbs adopt the parent console via `attach_parent_console`). Side
-  effect: bare `foreman status` in PowerShell doesn't set `$LASTEXITCODE`
-  because pwsh doesn't wait for GUI-subsystem exes. Piped/captured output
-  works everywhere, and Git Bash (what agents use) waits and gets exit codes
-  correctly. Debug builds stay console-subsystem.
+- `foreman.exe` is console-subsystem in every build so PowerShell waits for CLI
+  verbs and sets `$LASTEXITCODE`. CLI verbs adopt the parent console via
+  `attach_parent_console`. `foreman-gui.exe` is a GUI-subsystem launcher for
+  the Start-menu shortcut and double-click use; it starts `foreman.exe` without
+  allocating a console window. The in-app restart does the same.
 
 ## Key files
 
@@ -129,6 +129,7 @@ instead of publishing.
   `paint_rail_update_glyph` (collapsed rails, steady glyph).
 - `src/main.rs` — App wiring: event drain, chip state hand-off, release-only
   spawn gating, the restart handshake (`FOREMAN_WAIT_PID`, `restart_for_update`).
+- `src/bin/foreman-gui.rs` — GUI-subsystem launcher used by the shortcut.
 - `src/control.rs` — pipe-creation retry (`listen_retry`) so a restarted
   instance wins `\\.\pipe\foreman` even if the old one lingers a beat past
   the restart handshake's wait.

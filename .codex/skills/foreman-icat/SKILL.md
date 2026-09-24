@@ -51,10 +51,9 @@ bash: `"$FOREMAN_EXE" icat "/c/path/to/image.png"` (same for `view`).
   it just writes kitty-graphics bytes to stdout — it means **stdout could
   not be written**, i.e. the harness-capture / redirect failure above, not
   a dead GUI.
-- The release foreman.exe is a GUI-subsystem binary: cmd/PowerShell don't
-  wait for it or surface its stderr unless output is redirected/piped. A
-  silent no-window `view` means the args were bad — rerun with stderr
-  captured to see the reason.
+- Current release builds use a console-subsystem `foreman.exe`, so PowerShell
+  waits for CLI verbs and sets `$LASTEXITCODE`. On older GUI-subsystem builds,
+  redirect or pipe output to make PowerShell wait and surface CLI errors.
 - If foreman replies `unexpected argument "icat"`/`"view"` or shows usage,
   the installed foreman predates the verb (icat needs ≥ v0.3.0, view
   ≥ v0.3.2) — tell the user to update foreman, and fall back to naming the

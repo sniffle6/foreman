@@ -381,23 +381,25 @@ pub fn expected_hash(sums_text: &str, file_name: &str) -> Option<String> {
     None
 }
 
-// Release zips store foreman.exe at the root; match by final path component
+// Release zips store the executables at the root; match by final path component
 // in case a future release nests it (spec doesn't guarantee root, just
 // presence) -- NOT by suffix, which would also match "not-foreman.exe".
-pub fn extract_exe(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+pub fn extract_exe(
+    zip_path: &std::path::Path,
+    name: &str,
+    dest: &std::path::Path,
+) -> Result<(), String> {
     let f = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
     let mut idx = None;
     for i in 0..archive.len() {
         let entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        if std::path::Path::new(entry.name()).file_name()
-            == Some(std::ffi::OsStr::new("foreman.exe"))
-        {
+        if std::path::Path::new(entry.name()).file_name() == Some(std::ffi::OsStr::new(name)) {
             idx = Some(i);
             break;
         }
     }
-    let idx = idx.ok_or_else(|| "foreman.exe not found in release zip".to_string())?;
+    let idx = idx.ok_or_else(|| format!("{name} not found in release zip"))?;
     let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
     let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
     std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
@@ -432,8 +434,37 @@ pub fn cleanup_leftovers() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::fs::remove_file(sibling(&exe, ".old"));
         let _ = std::fs::remove_file(sibling(&exe, ".new"));
+        let gui = exe.with_file_name("foreman-gui.exe");
+        let _ = std::fs::remove_file(sibling(&gui, ".old"));
+        let _ = std::fs::remove_file(sibling(&gui, ".new"));
     }
     let _ = std::fs::remove_dir_all(staging_dir());
+}
+
+// An older install's Start-menu shortcut still points at foreman.exe. Once
+// the GUI launcher is in place, retarget only Foreman's own shortcut. This is
+// best effort: a missing/custom shortcut must not prevent a verified update.
+fn migrate_start_menu_shortcut(exe: &std::path::Path, gui: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    const SCRIPT: &str = r#"
+        $link = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
+        if (Test-Path -LiteralPath $link) {
+            $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+            if ([string]::Equals($shortcut.TargetPath, $env:FOREMAN_SHORTCUT_OLD, [StringComparison]::OrdinalIgnoreCase)) {
+                $shortcut.TargetPath = $env:FOREMAN_SHORTCUT_NEW
+                $shortcut.Save()
+            }
+        }
+    "#;
+    let result = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("FOREMAN_SHORTCUT_OLD", exe)
+        .env("FOREMAN_SHORTCUT_NEW", gui)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .status();
+    if !result.is_ok_and(|status| status.success()) {
+        eprintln!("update: could not migrate Start-menu shortcut; rerun install.ps1 to refresh it");
+    }
 }
 
 struct Staged {
@@ -550,10 +581,25 @@ fn verify_and_swap(st: &Staged) -> Event {
         Ok(e) => e,
         Err(_) => return Event::SwapFailed,
     };
-    if let Err(e) = extract_exe(&st.zip_path, &sibling(&exe, ".new")) {
+    let gui = exe.with_file_name("foreman-gui.exe");
+    if let Err(e) = extract_exe(&st.zip_path, "foreman.exe", &sibling(&exe, ".new")) {
         eprintln!("update: extract failed: {e}");
         return Event::SwapFailed;
     }
+    if let Err(e) = extract_exe(&st.zip_path, "foreman-gui.exe", &sibling(&gui, ".new")) {
+        eprintln!("update: extract failed: {e}");
+        return Event::SwapFailed;
+    }
+    let gui_result = if gui.exists() {
+        swap_exe(&gui)
+    } else {
+        std::fs::rename(sibling(&gui, ".new"), &gui).map_err(|e| e.to_string())
+    };
+    if let Err(e) = gui_result {
+        eprintln!("update: GUI launcher swap failed: {e}");
+        return Event::SwapFailed;
+    }
+    migrate_start_menu_shortcut(&exe, &gui);
     match swap_exe(&exe) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(staging_dir());
@@ -1162,12 +1208,17 @@ mod tests {
         w.write_all(b"DECOY-BYTES").unwrap();
         w.start_file("foreman.exe", opts).unwrap();
         w.write_all(b"NEW-EXE-BYTES").unwrap();
+        w.start_file("foreman-gui.exe", opts).unwrap();
+        w.write_all(b"NEW-GUI-BYTES").unwrap();
         w.start_file("LICENSE", opts).unwrap();
         w.write_all(b"license").unwrap();
         w.finish().unwrap();
         let dest = dir.join("foreman.exe.new");
-        extract_exe(&zip_path, &dest).unwrap();
+        extract_exe(&zip_path, "foreman.exe", &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW-EXE-BYTES");
+        let gui = dir.join("foreman-gui.exe.new");
+        extract_exe(&zip_path, "foreman-gui.exe", &gui).unwrap();
+        assert_eq!(std::fs::read(&gui).unwrap(), b"NEW-GUI-BYTES");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

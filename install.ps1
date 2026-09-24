@@ -54,11 +54,11 @@ try {
     # Exe path is stable across updates, so re-creating is harmless.
     $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
     $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $sc.TargetPath = Join-Path $dest 'foreman.exe'
+    $sc.TargetPath = Join-Path $dest 'foreman-gui.exe'
     $sc.WorkingDirectory = $dest
     $sc.Save()
     Write-Host "foreman $($rel.tag_name) installed to $dest" -ForegroundColor Green
-    Write-Host "run it: `"$dest\foreman.exe`" (or 'foreman' from a new terminal)"
+    Write-Host "launch from Start or run 'foreman' from a new terminal"
 }
 finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

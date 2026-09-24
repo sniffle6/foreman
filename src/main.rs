@@ -1,7 +1,6 @@
-// Release builds are GUI-subsystem so launching foreman.exe from Explorer
-// does not spawn a console window. Debug builds stay console-subsystem so
-// eprintln/panic output lands somewhere during development.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Keep this executable console-subsystem in every build. PowerShell only waits
+// for console executables and only then sets $LASTEXITCODE. The Start-menu
+// shortcut launches the GUI through the GUI-subsystem foreman-gui.exe sibling.
 
 mod agent_command;
 mod agent_hooks;
@@ -431,8 +430,10 @@ impl App {
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
+        use std::os::windows::process::CommandExt;
         match std::process::Command::new(&exe)
             .env("FOREMAN_WAIT_PID", std::process::id().to_string())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .spawn()
         {
             Ok(_) => {
