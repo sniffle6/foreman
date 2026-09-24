@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "id": "06zk79",
+  "title": "Make Git history view respect theme font",
+  "body": "The read-only project Git timeline (commit 67a51e5) doesn't use the theme's configured font. Make it follow the theme font like the rest of the UI.",
+  "state": "done",
+  "worktree": {
+    "path": "H:/claude code/foreman/.foreman/worktrees/06zk79",
+    "branch": "card/06zk79",
+    "base": "main"
+  },
+  "created": "2026-09-23T23:23:00Z",
+  "updated": "2026-09-23T23:40:18Z"
+}

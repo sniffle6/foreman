@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "lyc70a",
+  "title": "Git working tree view: dirty files in their own window (read-only)",
+  "body": "Per-Project window showing uncommitted changes: staged, unstaged, untracked, colored by status, like the commit details file tree. View only, no stage/commit/push. Reuse the tree from src/git_history/details.rs and the shared git_output from l8th0t. Clicking a file should open the l8th0t diff window (HEAD/index vs working copy). Needs a short brainstorm: staged/unstaged split, refresh model (manual vs watch).",
+  "state": "backlog",
+  "created": "2026-09-24T00:50:59Z",
+  "updated": "2026-09-24T00:50:59Z"
+}
