@@ -2714,17 +2714,21 @@ mod tests {
         commit_file(Path::new(&a.path), "a.txt", "a\n", "a");
         std::fs::create_dir_all(r.path().join(".foreman")).unwrap();
         // cmd exits at once (success) but leaves a background ping that
-        // inherited the captured pipes and runs for ~30 s.
+        // inherited the captured pipes and runs for ~90 s. The bound below
+        // times the whole turn (rebase, check, fast-forward), whose git steps
+        // alone ran past 20 s under a parallel `cargo test` with no console
+        // (the integration queue's own check) — so the hang being detected
+        // is kept well above the bound rather than just over it.
         std::fs::write(
             r.path().join(POLICY_FILE),
-            r#"{"check":["cmd","/c","start /b ping -n 30 127.0.0.1 & exit 0"],"timeout_secs":60}"#,
+            r#"{"check":["cmd","/c","start /b ping -n 90 127.0.0.1 & exit 0"],"timeout_secs":120}"#,
         )
         .unwrap();
         let (q, _) = submit(r.path(), "aa", &a);
         let start = Instant::now();
         let events = turn(&q);
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < Duration::from_secs(60),
             "output collection must be bounded, took {:?}",
             start.elapsed()
         );
