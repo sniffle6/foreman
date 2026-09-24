@@ -579,7 +579,12 @@ mod tests {
         assert!(details.branches.lines().any(|b| b == "topic"));
         assert!(details.branches.lines().any(|b| b == "origin/main"));
         assert_eq!(
-            details.tree.files.iter().map(|f| f.status).collect::<Vec<_>>(),
+            details
+                .tree
+                .files
+                .iter()
+                .map(|f| f.status)
+                .collect::<Vec<_>>(),
             ['D', 'M', 'R', 'A']
         );
         let renamed = &details.tree.files[2];

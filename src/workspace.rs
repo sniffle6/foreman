@@ -122,6 +122,8 @@ pub enum ContentSnap {
     Plan,
     /// Restore against the owning project directory, without cached Git data.
     GitHistory,
+    /// The Git Changes window; restore re-reads the working tree.
+    GitChanges,
     /// The per-project Diff window and its target; restore re-reads from Git.
     /// A target whose commit is gone restores into the error state.
     GitDiff {

@@ -41,6 +41,8 @@ pub enum Command {
     OpenPlan,
     /// Open (or focus) the focused project's read-only Git history.
     OpenGitHistory,
+    /// Open (or focus) the focused project's read-only list of uncommitted files.
+    OpenGitChanges,
     /// Toggle the focused terminal between tiled (in the layout tree) and floating.
     TermFloat,
     // project (outer) level
@@ -106,6 +108,7 @@ impl Command {
             OpenBoard,
             OpenPlan,
             OpenGitHistory,
+            OpenGitChanges,
             TermFloat,
             // Actions
             Help,
@@ -122,7 +125,7 @@ impl Command {
             | ProjFloat => Group::Projects,
             TermFocus(_) | TermSnap(_) | Split(_) | ZoomTerm | CloseTerm | NewTerm | Rename
             | LastTerm | TabCycle | TabPrev | OpenChat | OpenBoard | OpenPlan | OpenGitHistory
-            | TermFloat => Group::Terminals,
+            | OpenGitChanges | TermFloat => Group::Terminals,
             Help | OpenSettings | ToggleTaskManager => Group::Actions,
         }
     }
@@ -178,6 +181,7 @@ impl Command {
             OpenBoard => "Open project board",
             OpenPlan => "Open project plan view",
             OpenGitHistory => "Open project Git history",
+            OpenGitChanges => "Open project Git changes",
             Help => "Show bindings cheat sheet",
             OpenSettings => "Open keybindings editor",
             ToggleTaskManager => "Toggle task panel",
@@ -510,6 +514,9 @@ impl Default for Keymap {
         // NewProject, `K` is the board. It at least sits beside `K`.
         t.insert(plain(K::L), OpenPlan);
         t.insert(plain(K::H), OpenGitHistory);
+        // `U` for uncommitted; Shift+H would be closer, but a shifted chord is
+        // easy to fumble after the Leader.
+        t.insert(plain(K::U), OpenGitChanges);
 
         // --- float toggle: tiled ⇄ floating ---
         t.insert(plain(K::F), TermFloat);

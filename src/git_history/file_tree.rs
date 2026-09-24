@@ -197,8 +197,8 @@ pub(super) fn show(ui: &mut egui::Ui, tree: &mut FileTree, scale: f32) -> Option
                 let indent = row.depth as f32 * 18.0 * scale;
                 // Sections have no icon, so their label sits where the icon would.
                 let label_x = if row.section { 16.0 } else { 58.0 } * scale;
-                let width = (indent + label_x + label.size().x + 60.0 * scale)
-                    .max(ui.available_width());
+                let width =
+                    (indent + label_x + label.size().x + 60.0 * scale).max(ui.available_width());
                 let (rect, response) =
                     ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
                 let selected = row.file.is_some() && tree.selected == row.file;
@@ -398,7 +398,15 @@ mod tests {
         let labels: Vec<_> = tree.rows.iter().map(|r| r.label.as_str()).collect();
         assert_eq!(
             labels,
-            [".foreman/tasks", "a.json", "b.json", "src", "x", "y.rs", "z.rs"]
+            [
+                ".foreman/tasks",
+                "a.json",
+                "b.json",
+                "src",
+                "x",
+                "y.rs",
+                "z.rs"
+            ]
         );
         assert_eq!(tree.rows[0].file_count, 2);
         assert_eq!(tree.rows[3].file_count, 2);

@@ -1,10 +1,12 @@
 //! Read-only Git history: a demand-driven Git stream, pure lane layout, and virtualized native rows.
 use eframe::egui;
+mod changes;
 mod details;
 mod diff;
 mod diff_view;
 mod file_tree;
 mod git;
+pub use changes::ChangesView;
 pub use diff_view::{DiffTarget, DiffView, Stage};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
@@ -262,8 +264,8 @@ fn stream_history(
     result
 }
 
-/// Intents from the history window that change sibling windows; drained by
-/// `WindowManager::drain_history_acts` after the draw pass.
+/// Intents from the Git History or Git Changes window that change sibling
+/// windows; drained by `WindowManager::drain_history_acts` after the draw pass.
 pub enum HistoryAct {
     OpenDiff(DiffTarget),
 }

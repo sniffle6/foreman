@@ -1,7 +1,7 @@
 //! The Diff window: a reusable per-Project side-by-side view of one file's
 //! change at one commit, loaded on a cancellable worker.
-use super::file_tree::display_path;
 use super::diff::{self, Block, Diff, Doc, Kind, Notice, Row};
+use super::file_tree::display_path;
 use super::git;
 use eframe::egui;
 use std::ops::Range;
@@ -1043,21 +1043,40 @@ mod tests {
         std::fs::write(dir.join("empty.txt"), "").unwrap();
         let before = git(dir, &["status", "--porcelain=v1"]);
 
-        let staged = doc(load(dir, &worktree(Stage::Staged, 'M', None, "a.txt"), &flag()));
+        let staged = doc(load(
+            dir,
+            &worktree(Stage::Staged, 'M', None, "a.txt"),
+            &flag(),
+        ));
         assert_eq!(
             texts(&staged),
-            [(Same, Some("one"), Some("one")), (Modified, Some("two"), Some("TWO"))]
+            [
+                (Same, Some("one"), Some("one")),
+                (Modified, Some("two"), Some("TWO"))
+            ]
         );
-        let unstaged = doc(load(dir, &worktree(Stage::Unstaged, 'M', None, "a.txt"), &flag()));
+        let unstaged = doc(load(
+            dir,
+            &worktree(Stage::Unstaged, 'M', None, "a.txt"),
+            &flag(),
+        ));
         assert_eq!(texts(&unstaged)[2], (Added, None, Some("three")));
         let renamed = worktree(Stage::Staged, 'R', Some("old.txt"), "new.txt");
         assert_eq!(
             load(dir, &renamed, &flag()).unwrap(),
             Diff::Notice(Notice::Unchanged)
         );
-        let deleted = doc(load(dir, &worktree(Stage::Unstaged, 'D', None, "gone.txt"), &flag()));
+        let deleted = doc(load(
+            dir,
+            &worktree(Stage::Unstaged, 'D', None, "gone.txt"),
+            &flag(),
+        ));
         assert_eq!(texts(&deleted), [(Removed, Some("x"), None)]);
-        let new = doc(load(dir, &worktree(Stage::Untracked, '?', None, "u.txt"), &flag()));
+        let new = doc(load(
+            dir,
+            &worktree(Stage::Untracked, '?', None, "u.txt"),
+            &flag(),
+        ));
         assert_eq!(
             texts(&new),
             [(Added, None, Some("hello")), (Added, None, Some("world"))]
@@ -1082,7 +1101,10 @@ mod tests {
         let conflict = worktree(Stage::Unstaged, 'U', None, "c.txt");
         assert!(conflict.args().unwrap().contains(&"HEAD".to_owned()));
         assert_eq!(conflict.versus(), "Working copy vs HEAD · conflict");
-        assert_eq!(worktree(Stage::Staged, 'M', None, "f").versus(), "Staged vs HEAD");
+        assert_eq!(
+            worktree(Stage::Staged, 'M', None, "f").versus(),
+            "Staged vs HEAD"
+        );
         assert_eq!(
             worktree(Stage::Unstaged, 'M', None, "f").versus(),
             "Working copy vs index"
@@ -1096,7 +1118,10 @@ mod tests {
         view.retarget(target.clone());
         view.result = Some(Ok(Diff::Notice(Notice::Unchanged)));
         view.retarget(target);
-        assert!(view.result.is_none(), "same working-tree target must re-read");
+        assert!(
+            view.result.is_none(),
+            "same working-tree target must re-read"
+        );
     }
 
     #[test]

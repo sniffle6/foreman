@@ -150,6 +150,9 @@ pub enum Content {
     /// Per-project side-by-side diff of one file at one commit (singleton,
     /// retargeted by the Git History details pane).
     GitDiff(crate::git_history::DiffView),
+    /// Per-project read-only list of uncommitted files (singleton); clicks
+    /// open the Diff window.
+    GitChanges(crate::git_history::ChangesView),
     /// A persistent PNG viewer window (`foreman view`). No PTY, no membership.
     /// Floating/closable/tabbable/tileable like any normal window; restored
     /// across restarts by path only (see `ContentSnap::Image`).
@@ -231,6 +234,9 @@ impl Content {
             Content::GitDiff(view) => claims_click(ui, |ui| {
                 view.show(ui, rect, active, base.with((win_id, "git-diff")))
             }),
+            Content::GitChanges(view) => claims_click(ui, |ui| {
+                view.show(ui, rect, active, base.with((win_id, "git-changes")))
+            }),
             Content::Image(view) => {
                 view.show(ui, rect, active, resp);
                 false
@@ -279,7 +285,7 @@ impl Content {
             Content::Project(wm) => wm.keepalive(),
             Content::Chat(_) => {} // no PTY; the log is shared state, nothing to pump
             Content::Board(_) => {} // no PTY; the store is shared state, nothing to pump
-            Content::GitHistory(_) | Content::GitDiff(_) => {}
+            Content::GitHistory(_) | Content::GitDiff(_) | Content::GitChanges(_) => {}
             Content::Plan(_) => {}  // ditto: a derived read of the same store
             Content::Image(_) => {} // no PTY; a static decoded image, nothing to pump
             Content::TaskManager(_) | Content::Settings(_) => {}
@@ -294,7 +300,10 @@ impl Content {
             Content::Project(_) => Some(crate::icons::IconKind::Folder),
             Content::Chat(_) => None,
             Content::Board(_) => None,
-            Content::Plan(_) | Content::GitHistory(_) | Content::GitDiff(_) => None,
+            Content::Plan(_)
+            | Content::GitHistory(_)
+            | Content::GitDiff(_)
+            | Content::GitChanges(_) => None,
             Content::Image(_) => None,
             Content::TaskManager(_) => None,
             Content::Settings(_) => None,
@@ -821,6 +830,7 @@ impl WindowManager {
                     Content::Board(_) => ContentSnap::Board,
                     Content::Plan(_) => ContentSnap::Plan,
                     Content::GitHistory(_) => ContentSnap::GitHistory,
+                    Content::GitChanges(_) => ContentSnap::GitChanges,
                     Content::GitDiff(view) => {
                         let t = view.target().expect("target-less diff filtered above");
                         ContentSnap::GitDiff {
@@ -1046,6 +1056,9 @@ impl WindowManager {
                     }
                     ContentSnap::GitHistory => {
                         Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone()))
+                    }
+                    ContentSnap::GitChanges => {
+                        Content::GitChanges(crate::git_history::ChangesView::new(self.cwd.clone()))
                     }
                     ContentSnap::Plan => {
                         Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban)))
@@ -2378,6 +2391,34 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// Open or surface the project's singleton Git Changes window.
+    fn open_git_changes_window(&mut self) {
+        if let Some((win, tab)) = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| matches!(t.content, Content::GitChanges(_)))
+                .map(|i| (w.id, i))
+        }) {
+            self.surface_target(crate::panel::TargetPath {
+                project: win,
+                ptab: None,
+                window: None,
+                tab: Some(tab),
+            });
+            return;
+        }
+        let (id, rect) = self.next_slot(egui::vec2(420.0, 560.0));
+        self.push_win(
+            id,
+            Tab::fixed(
+                "Git Changes",
+                Content::GitChanges(crate::git_history::ChangesView::new(self.cwd.clone())),
+            ),
+            rect,
+        );
+        self.mark_workspace_dirty();
+    }
+
     /// Open or surface the project's singleton Diff window, pointed at `target`.
     fn open_git_diff_window(&mut self, target: crate::git_history::DiffTarget) {
         let title = format!("Diff: {}", target.file_name());
@@ -2411,14 +2452,16 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
-    /// Apply Git History intents recorded during the draw: the details pane
+    /// Apply Git History / Git Changes intents recorded during the draw: they
     /// and the Diff window are siblings inside one project.
     fn drain_history_acts(&mut self) {
         let mut acts = Vec::new();
         for w in &mut self.windows {
             for t in &mut w.tabs {
-                if let Content::GitHistory(v) = &mut t.content {
-                    acts.append(&mut v.acts);
+                match &mut t.content {
+                    Content::GitHistory(v) => acts.append(&mut v.acts),
+                    Content::GitChanges(v) => acts.append(&mut v.acts),
+                    _ => {}
                 }
             }
         }
@@ -3474,6 +3517,7 @@ impl WindowManager {
                             | Content::Board(_)
                             | Content::GitHistory(_)
                             | Content::GitDiff(_)
+                            | Content::GitChanges(_)
                             | Content::Plan(_) => RowKind::Chat,
                             // Nested project content is not a product path today; tests
                             // use empty Project stubs as PTY-free tab stand-ins.
@@ -4127,6 +4171,7 @@ impl WindowManager {
                     | Content::Board(_)
                     | Content::GitHistory(_)
                     | Content::GitDiff(_)
+                    | Content::GitChanges(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -4738,6 +4783,7 @@ impl WindowManager {
                         Command::OpenBoard => child.open_board_window(),
                         Command::OpenPlan => child.open_plan_window(),
                         Command::OpenGitHistory => child.open_git_history_window(),
+                        Command::OpenGitChanges => child.open_git_changes_window(),
                         // project-level handled above
                         _ => {}
                     }
@@ -5745,6 +5791,7 @@ impl WindowManager {
                     | Content::Board(_)
                     | Content::GitHistory(_)
                     | Content::GitDiff(_)
+                    | Content::GitChanges(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -5778,6 +5825,7 @@ impl WindowManager {
                     | Content::Board(_)
                     | Content::GitHistory(_)
                     | Content::GitDiff(_)
+                    | Content::GitChanges(_)
                     | Content::Plan(_)
                     | Content::Image(_)
                     | Content::TaskManager(_)
@@ -8026,6 +8074,7 @@ fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
         | Content::Board(_)
         | Content::GitHistory(_)
         | Content::GitDiff(_)
+        | Content::GitChanges(_)
         | Content::Plan(_)
         | Content::Image(_)
         | Content::TaskManager(_)
@@ -11054,6 +11103,84 @@ mod tests {
             })
             .unwrap();
         assert_eq!(restored, target("src/two.rs"));
+    }
+
+    #[test]
+    fn git_changes_is_a_singleton_opens_working_tree_diffs_and_restores() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.windows[0].id;
+        let child = m.project_child_mut(pid).unwrap();
+        child.open_git_changes_window();
+        let id = child.windows.last().unwrap().id;
+        child.windows.last_mut().unwrap().minimized = true;
+        child.focused = None;
+        child.open_git_changes_window();
+        assert_eq!(child.focused, Some(id));
+        assert!(!child.windows.last().unwrap().minimized);
+        let count = |child: &WindowManager, f: fn(&Content) -> bool| {
+            child
+                .windows
+                .iter()
+                .flat_map(|w| &w.tabs)
+                .filter(|t| f(&t.content))
+                .count()
+        };
+        assert_eq!(count(child, |c| matches!(c, Content::GitChanges(_))), 1);
+        // A file click reaches the Diff window through ChangesView.acts.
+        let target = crate::git_history::DiffTarget {
+            stage: crate::git_history::Stage::Unstaged,
+            commit: String::new(),
+            parent: None,
+            status: 'M',
+            old_path: None,
+            path: "src/dirty.rs".into(),
+            merge: false,
+        };
+        for w in &mut child.windows {
+            for t in &mut w.tabs {
+                if let Content::GitChanges(v) = &mut t.content {
+                    v.acts
+                        .push(crate::git_history::HistoryAct::OpenDiff(target.clone()));
+                }
+            }
+        }
+        child.drain_history_acts();
+        assert_eq!(count(child, |c| matches!(c, Content::GitDiff(_))), 1);
+
+        let json = serde_json::to_string(&m.capture_workspace()).unwrap();
+        assert!(json.contains("GitChanges") && json.contains(r#""stage":"unstaged""#));
+        let mut back = WindowManager::new().as_desktop();
+        back.apply_workspace(&serde_json::from_str(&json).unwrap(), &ctx);
+        let Content::Project(child) =
+            &back.windows.iter().find(|w| w.is_project()).unwrap().tabs[0].content
+        else {
+            panic!()
+        };
+        assert_eq!(count(child, |c| matches!(c, Content::GitChanges(_))), 1);
+        let restored = child
+            .windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .find_map(|t| match &t.content {
+                Content::GitDiff(v) => v.target().cloned(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(restored, target);
+        // Files written before stages existed restore as commit diffs.
+        let old: crate::workspace::ContentSnap = serde_json::from_str(
+            r#"{"kind":"GitDiff","commit":"c","parent":null,"status":"M","old_path":null,"path":"p"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            crate::workspace::ContentSnap::GitDiff {
+                stage: crate::git_history::Stage::Commit,
+                ..
+            }
+        ));
     }
 
     #[test]
