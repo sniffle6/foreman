@@ -1,14 +1,7 @@
 //! Selected-commit details: cancellable read-only Git queries and a virtualized file tree.
+use super::file_tree::{self, ChangedFile, FileTree};
 use super::*;
-use std::collections::BTreeMap;
 use std::path::Path;
-
-#[derive(Debug, PartialEq)]
-struct ChangedFile {
-    status: char,
-    path: String,
-    previous: Option<String>,
-}
 
 // -z keeps tabs, newlines, quoting, and rename pairs unambiguous. Decode only
 // after splitting; paths need not be UTF-8 to preserve the record boundaries.
@@ -45,68 +38,6 @@ fn parse_files(bytes: &[u8]) -> Result<Vec<ChangedFile>, String> {
     Ok(files)
 }
 
-struct TreeRow {
-    label: String,
-    depth: usize,
-    file: Option<usize>,
-    end: usize,
-    collapsed: bool,
-    file_count: usize,
-}
-#[derive(Default)]
-struct Directory {
-    dirs: BTreeMap<String, Directory>,
-    files: BTreeMap<String, usize>,
-}
-impl Directory {
-    fn flatten(self, depth: usize, rows: &mut Vec<TreeRow>) -> usize {
-        let mut count = self.files.len();
-        for (label, dir) in self.dirs {
-            let index = rows.len();
-            rows.push(TreeRow {
-                label,
-                depth,
-                file: None,
-                end: 0,
-                collapsed: false,
-                file_count: 0,
-            });
-            let descendants = dir.flatten(depth + 1, rows);
-            count += descendants;
-            rows[index].end = rows.len();
-            rows[index].file_count = descendants;
-        }
-        for (label, file) in self.files {
-            rows.push(TreeRow {
-                label,
-                depth,
-                file: Some(file),
-                end: rows.len() + 1,
-                collapsed: false,
-                file_count: 1,
-            });
-        }
-        count
-    }
-}
-fn file_tree(files: &[ChangedFile]) -> Vec<TreeRow> {
-    let mut root = Directory::default();
-    for (index, file) in files.iter().enumerate() {
-        let mut parts = file.path.split('/').peekable();
-        let mut dir = &mut root;
-        while let Some(part) = parts.next() {
-            if parts.peek().is_some() {
-                dir = dir.dirs.entry(part.into()).or_default();
-            } else {
-                dir.files.insert(part.into(), index);
-            }
-        }
-    }
-    let mut rows = Vec::new();
-    root.flatten(0, &mut rows);
-    rows
-}
-
 struct Details {
     hash: String,
     author: String,
@@ -116,15 +47,12 @@ struct Details {
     merge: bool,
     /// First parent (the side a merge is diffed against); `None` for a root.
     parent: Option<String>,
-    files: Vec<ChangedFile>,
-    tree: Vec<TreeRow>,
-    visible: Vec<usize>,
-    selected_file: Option<usize>,
+    tree: FileTree,
 }
 impl Details {
     /// The Diff window target for `files[file]`, against the first parent.
     pub(super) fn target(&self, file: usize) -> super::DiffTarget {
-        let f = &self.files[file];
+        let f = &self.tree.files[file];
         super::DiffTarget {
             commit: self.hash.clone(),
             parent: self.parent.clone(),
@@ -132,18 +60,6 @@ impl Details {
             old_path: f.previous.clone(),
             path: f.path.clone(),
             merge: self.merge,
-        }
-    }
-    fn rebuild_visible(&mut self) {
-        self.visible.clear();
-        let mut i = 0;
-        while i < self.tree.len() {
-            self.visible.push(i);
-            i = if self.tree[i].collapsed {
-                self.tree[i].end
-            } else {
-                i + 1
-            };
         }
     }
 }
@@ -215,8 +131,6 @@ fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, Str
         ],
         cancel,
     )?;
-    let tree = file_tree(&files);
-    let visible = (0..tree.len()).collect();
     Ok(Details {
         hash: fields[0].into(),
         author: fields[1].into(),
@@ -225,10 +139,7 @@ fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, Str
         branches: String::from_utf8_lossy(&branches).trim().into(),
         merge: parents.len() > 1,
         parent: parents.first().map(|p| p.to_string()),
-        files,
-        tree,
-        visible,
-        selected_file: None,
+        tree: FileTree::new(files),
     })
 }
 
@@ -377,14 +288,14 @@ impl DetailsView {
         );
         tree_ui.set_clip_rect(tree_rect.intersect(ui.clip_rect()));
         tree_ui.horizontal(|ui| {
-            ui.strong(format!("Changed files ({})", details.files.len()));
+            ui.strong(format!("Changed files ({})", details.tree.files.len()));
             if details.merge {
                 ui.colored_label(th.dim, "· first parent");
             }
         });
-        if details.files.is_empty() {
+        if details.tree.files.is_empty() {
             tree_ui.colored_label(th.dim, "No changed files.");
-        } else if let Some(file) = show_tree(&mut tree_ui, details, scale) {
+        } else if let Some(file) = file_tree::show(&mut tree_ui, &mut details.tree, scale) {
             self.open = Some(details.target(file));
         }
         let mut metadata_ui = ui.new_child(
@@ -451,208 +362,13 @@ impl DetailsView {
     }
 }
 
-/// Draw the file tree; returns the file clicked this frame, already selected.
-fn show_tree(ui: &mut egui::Ui, details: &mut Details, scale: f32) -> Option<usize> {
-    ui.spacing_mut().item_spacing.y = 0.0;
-    let row_height = 20.0 * scale;
-    let th = crate::theme::live(ui.ctx());
-    let font = egui::FontId::proportional(13.0 * scale);
-    let folder = crate::icons::texture(
-        ui.ctx(),
-        crate::icons::IconKind::Folder,
-        (14.0 * scale * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32,
-    );
-    let mut toggled = None;
-    let mut clicked = None;
-    egui::ScrollArea::both()
-        .id_salt("files")
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, details.visible.len(), |ui, range| {
-            for i in range {
-                let index = details.visible[i];
-                let row = &details.tree[index];
-                let color = row
-                    .file
-                    .map(|f| status_color(details.files[f].status))
-                    .unwrap_or(th.text);
-                let label =
-                    ui.painter()
-                        .layout_no_wrap(display_path(&row.label), font.clone(), color);
-                let indent = row.depth as f32 * 18.0 * scale;
-                let width = (indent + 65.0 * scale + label.size().x + 45.0 * scale)
-                    .max(ui.available_width());
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
-                let selected = row.file.is_some() && details.selected_file == row.file;
-                if selected || response.hovered() {
-                    ui.painter().rect_filled(
-                        rect,
-                        2.0,
-                        if selected {
-                            th.sel_bg
-                        } else {
-                            th.sel_bg.gamma_multiply(0.45)
-                        },
-                    );
-                }
-                let x = rect.left() + indent;
-                let cy = rect.center().y;
-                let painter = ui.painter();
-                // Reuse the Sessions folder asset; draw a folded page for files.
-                // Neither icon nor disclosure relies on platform font glyphs.
-                let center = egui::pos2(x + 26.0 * scale, cy);
-                if row.file.is_none() {
-                    let arrow = egui::pos2(x + 7.0 * scale, cy);
-                    let points = if row.collapsed {
-                        [(-2.0, -3.0), (2.0, 0.0), (-2.0, 3.0)]
-                    } else {
-                        [(-3.0, -2.0), (3.0, -2.0), (0.0, 2.0)]
-                    };
-                    painter.add(egui::Shape::convex_polygon(
-                        points
-                            .into_iter()
-                            .map(|(x, y)| arrow + egui::vec2(x, y) * scale)
-                            .collect(),
-                        th.dim,
-                        egui::Stroke::NONE,
-                    ));
-                    painter.image(
-                        folder.id(),
-                        egui::Rect::from_center_size(center, egui::vec2(14.0, 14.0) * scale),
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        crate::icons::IconKind::Folder.tint(),
-                    );
-                } else {
-                    let point = |x, y| center + egui::vec2(x, y) * scale;
-                    let stroke = egui::Stroke::new(scale, th.dim);
-                    painter.add(egui::Shape::closed_line(
-                        vec![
-                            point(-5.0, -6.0),
-                            point(1.0, -6.0),
-                            point(5.0, -2.0),
-                            point(5.0, 6.0),
-                            point(-5.0, 6.0),
-                        ],
-                        stroke,
-                    ));
-                    painter.add(egui::Shape::line(
-                        vec![point(1.0, -6.0), point(1.0, -2.0), point(5.0, -2.0)],
-                        stroke,
-                    ));
-                    for y in [1.0, 3.5] {
-                        painter.line_segment([point(-2.5, y), point(2.5, y)], stroke);
-                    }
-                }
-                if let Some(file_index) = row.file {
-                    let file = &details.files[file_index];
-                    painter.text(
-                        egui::pos2(x + 44.0 * scale, cy),
-                        egui::Align2::CENTER_CENTER,
-                        file.status,
-                        font.clone(),
-                        color,
-                    );
-                    if response.clicked() {
-                        details.selected_file = Some(file_index);
-                        clicked = Some(file_index);
-                    }
-                    response.on_hover_text(match &file.previous {
-                        Some(old) => format!(
-                            "{}\n{} → {}",
-                            status_name(file.status),
-                            display_path(old),
-                            display_path(&file.path)
-                        ),
-                        None => {
-                            format!("{}\n{}", status_name(file.status), display_path(&file.path))
-                        }
-                    });
-                } else {
-                    if response.clicked() {
-                        toggled = Some(index);
-                    }
-                    painter.text(
-                        egui::pos2(x + 58.0 * scale + label.size().x + 8.0 * scale, cy),
-                        egui::Align2::LEFT_CENTER,
-                        row.file_count,
-                        font.clone(),
-                        th.dim,
-                    );
-                }
-                painter.galley(
-                    egui::pos2(x + 58.0 * scale, cy - label.size().y * 0.5),
-                    label,
-                    color,
-                );
-            }
-        });
-    if let Some(index) = toggled {
-        details.tree[index].collapsed = !details.tree[index].collapsed;
-        details.rebuild_visible();
-    }
-    clicked
-}
-
-pub(super) fn display_path(path: &str) -> String {
-    path.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
-}
-fn status_name(status: char) -> &'static str {
-    match status {
-        'A' => "Added",
-        'D' => "Deleted",
-        'R' => "Renamed",
-        'C' => "Copied",
-        'T' => "Type changed",
-        'M' => "Modified",
-        _ => "Other",
-    }
-}
-fn status_color(status: char) -> egui::Color32 {
-    // JetBrains Darcula FILESTATUS colors, independent of graph lane colors.
-    // Copies are additions; Git type changes use the modified-file color.
-    match status {
-        'A' | 'C' => egui::Color32::from_rgb(0x62, 0x97, 0x55),
-        'D' => egui::Color32::from_rgb(0x6c, 0x6c, 0x6c),
-        'R' => egui::Color32::from_rgb(0x3a, 0x84, 0x84),
-        'M' | 'T' => egui::Color32::from_rgb(0x68, 0x97, 0xbb),
-        _ => COLORS[3],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git_history::tests::git;
 
-    #[test]
-    fn file_statuses_use_darcula_colors_independently_of_graph_lanes() {
-        for (statuses, rgb) in [
-            ("AC", [0x62, 0x97, 0x55]),
-            ("MT", [0x68, 0x97, 0xbb]),
-            ("D", [0x6c, 0x6c, 0x6c]),
-            ("R", [0x3a, 0x84, 0x84]),
-        ] {
-            for status in statuses.chars() {
-                assert_eq!(
-                    status_color(status),
-                    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
-                );
-            }
-        }
-    }
-
     fn fixture() -> Details {
         let files = parse_files(b"A\0src/added.rs\0M\0src/modified.rs\0D\0removed.rs\0").unwrap();
-        let tree = file_tree(&files);
-        let visible = (0..tree.len()).collect();
         Details {
             hash: "a".repeat(40),
             author: "Author <author@example.test>".into(),
@@ -661,10 +377,7 @@ mod tests {
             branches: "main\norigin/main".into(),
             merge: false,
             parent: None,
-            files,
-            tree,
-            visible,
-            selected_file: None,
+            tree: FileTree::new(files),
         }
     }
 
@@ -672,7 +385,7 @@ mod tests {
     fn file_clicks_select_one_and_directories_preserve_selection() {
         let ctx = egui::Context::default();
         let mut details = fixture();
-        assert_eq!(details.tree[0].file_count, 2);
+        assert_eq!(details.tree.rows[0].file_count, 2);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 150.0));
         let frame = |details: &mut Details, events| {
             let mut clicked = None;
@@ -682,7 +395,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| clicked = show_tree(ui, details, 1.0),
+                |ui| clicked = file_tree::show(ui, &mut details.tree, 1.0),
             );
             clicked
         };
@@ -703,15 +416,15 @@ mod tests {
             clicked
         };
         assert_eq!(click(&mut details, egui::pos2(170.0, 30.0)), Some(0));
-        assert_eq!(details.selected_file, Some(0));
+        assert_eq!(details.tree.selected, Some(0));
         assert_eq!(click(&mut details, egui::pos2(170.0, 50.0)), Some(1));
-        assert_eq!(details.selected_file, Some(1));
+        assert_eq!(details.tree.selected, Some(1));
         assert_eq!(click(&mut details, egui::pos2(170.0, 11.0)), None);
-        assert!(details.tree[0].collapsed);
-        assert_eq!(details.selected_file, Some(1));
+        assert!(details.tree.rows[0].collapsed);
+        assert_eq!(details.tree.selected, Some(1));
         click(&mut details, egui::pos2(170.0, 11.0));
-        assert!(!details.tree[0].collapsed);
-        assert_eq!(details.selected_file, Some(1));
+        assert!(!details.tree.rows[0].collapsed);
+        assert_eq!(details.tree.selected, Some(1));
         frame(
             &mut details,
             vec![egui::Event::MouseWheel {
@@ -721,7 +434,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        assert_eq!(details.selected_file, Some(1));
+        assert_eq!(details.tree.selected, Some(1));
     }
 
     #[test]
@@ -735,7 +448,7 @@ mod tests {
             receiver,
         });
         let mut details = fixture();
-        details.selected_file = Some(1);
+        details.tree.selected = Some(1);
         view.result = Some(Ok(details));
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0));
         let frame = |view: &mut DetailsView, events| {
@@ -771,7 +484,8 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .selected_file,
+                .tree
+                .selected,
             Some(1)
         );
         view.select(PathBuf::new(), "different".into(), ctx.clone());
@@ -793,7 +507,7 @@ mod tests {
         assert!(parse_files(b"R100\0old\0").is_err());
         assert!(parse_files(b"M\0unterminated").is_err());
         assert!(parse_files(b"").unwrap().is_empty());
-        assert_eq!(display_path("tab\tline\n"), "tab\\tline\\n");
+        assert_eq!(file_tree::display_path("tab\tline\n"), "tab\\tline\\n");
     }
 
     fn repo() -> tempfile::TempDir {
@@ -823,8 +537,8 @@ mod tests {
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "Root"]);
         let root = read(dir, "HEAD");
-        assert_eq!(root.files.len(), 3);
-        assert!(root.files.iter().all(|f| f.status == 'A'));
+        assert_eq!(root.tree.files.len(), 3);
+        assert!(root.tree.files.iter().all(|f| f.status == 'A'));
         assert_eq!(root.target(0).parent, None);
         git(dir, &["mv", "src/old name.txt", "src/new name.txt"]);
         git(dir, &["rm", "gone.txt"]);
@@ -864,10 +578,10 @@ mod tests {
         assert!(details.branches.lines().any(|b| b == "topic"));
         assert!(details.branches.lines().any(|b| b == "origin/main"));
         assert_eq!(
-            details.files.iter().map(|f| f.status).collect::<Vec<_>>(),
+            details.tree.files.iter().map(|f| f.status).collect::<Vec<_>>(),
             ['D', 'M', 'R', 'A']
         );
-        let renamed = &details.files[2];
+        let renamed = &details.tree.files[2];
         assert_eq!(renamed.previous.as_deref(), Some("src/old name.txt"));
         assert_eq!(renamed.path, "src/new name.txt");
         let t = details.target(2);
@@ -878,14 +592,15 @@ mod tests {
         assert!(!t.merge);
         assert_eq!(git(work.path(), &["status", "--porcelain=v1"]), before);
         let mut details = details;
-        let folder = details.tree.iter().position(|r| r.label == "src").unwrap();
-        details.tree[folder].collapsed = true;
-        details.rebuild_visible();
-        assert!(!details.visible.contains(&(folder + 1)));
-        assert!(details.visible.contains(&folder));
-        details.tree[folder].collapsed = false;
-        details.rebuild_visible();
-        assert_eq!(details.visible.len(), details.tree.len());
+        let tree = &mut details.tree;
+        let folder = tree.rows.iter().position(|r| r.label == "src").unwrap();
+        tree.rows[folder].collapsed = true;
+        tree.rebuild_visible();
+        assert!(!tree.visible.contains(&(folder + 1)));
+        assert!(tree.visible.contains(&folder));
+        tree.rows[folder].collapsed = false;
+        tree.rebuild_visible();
+        assert_eq!(tree.visible.len(), tree.rows.len());
     }
 
     #[test]
@@ -904,8 +619,8 @@ mod tests {
         git(dir, &["merge", "--no-ff", "topic", "-m", "Merge"]);
         let details = read(dir, "HEAD");
         assert!(details.merge);
-        assert_eq!(details.files.len(), 1);
-        assert_eq!(details.files[0].path, "topic.txt");
+        assert_eq!(details.tree.files.len(), 1);
+        assert_eq!(details.tree.files[0].path, "topic.txt");
         let target = details.target(0);
         assert_eq!(target.commit, details.hash);
         assert_eq!(
@@ -917,7 +632,7 @@ mod tests {
         git(dir, &["checkout", "--detach"]);
         git(dir, &["commit", "--allow-empty", "-m", "Detached"]);
         let details = read(dir, "HEAD");
-        assert!(details.files.is_empty());
+        assert!(details.tree.files.is_empty());
         assert!(details.branches.is_empty());
         assert!(load(dir, &"0".repeat(40), &Arc::new(AtomicBool::new(false))).is_err());
         assert!(load(dir, "--bad-revision", &Arc::new(AtomicBool::new(false))).is_err());

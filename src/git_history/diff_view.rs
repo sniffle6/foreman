@@ -1,6 +1,6 @@
 //! The Diff window: a reusable per-Project side-by-side view of one file's
 //! change at one commit, loaded on a cancellable worker.
-use super::details::display_path;
+use super::file_tree::display_path;
 use super::diff::{self, Block, Diff, Doc, Kind, Notice, Row};
 use super::git;
 use eframe::egui;
@@ -417,7 +417,7 @@ fn header(
     step
 }
 
-/// The diff's own band palette. Deliberately NOT `details::status_color`:
+/// The diff's own band palette. Deliberately NOT `file_tree::status_color`:
 /// that is the file-tree legend and is being restyled separately (card zfw4je).
 const REMOVED: egui::Color32 = egui::Color32::from_rgb(224, 118, 113);
 const ADDED: egui::Color32 = egui::Color32::from_rgb(116, 190, 140);
