@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "kg5ktv",
+  "title": "Keep Git History subjects left and metadata right",
+  "body": "Implement GitHub issue #9: https://github.com/sniffle6/foreman/issues/9. Anchor commit subjects beside the graph and author/date at the right edge; right-side text wins when space is tight.",
+  "state": "backlog",
+  "created": "2026-09-24T12:12:04Z",
+  "updated": "2026-09-24T12:12:04Z"
+}

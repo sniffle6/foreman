@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "ob7zzw",
+  "title": "Resize Git timeline and changed-file pane",
+  "body": "Add a draggable vertical divider between the Git History timeline and the right-hand changed-file/details pane. Preserve the existing changed-files/commit-details divider. Persist the width while selecting commits and resizing the window. See src/git_history.rs, src/git_history/details.rs, and docs/git-history.md.",
+  "state": "backlog",
+  "created": "2026-09-24T11:59:10Z",
+  "updated": "2026-09-24T11:59:10Z"
+}

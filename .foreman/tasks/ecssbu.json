@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "ecssbu",
+  "title": "Resize before and after Diff views",
+  "body": "Implement GitHub issue #10: https://github.com/sniffle6/foreman/issues/10. Add a draggable divider between old and new text while preserving aligned rows, navigation, and the right-edge change markers.",
+  "state": "backlog",
+  "created": "2026-09-24T12:12:13Z",
+  "updated": "2026-09-24T12:12:13Z"
+}
