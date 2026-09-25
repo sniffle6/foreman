@@ -54,6 +54,12 @@ fn restored_identity_id(next: &mut WinId, win_id: WinId, win_id_taken: &mut bool
 // fires before a settle reply lands.
 const MAX_SETTLE_MS: u64 = 4000;
 
+// How long a Done card's `Held` teardown waits before the leftover retry
+// tries again. Each attempt is a background thread spending up to ~2s in
+// the hold probe, and the hold (often a debug app launched from the tree)
+// can last hours, so this is far apart rather than every status poll.
+const HELD_TEARDOWN_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 // One pending `foreman send` settle: the terminal to watch, the channel to
 // answer, and the silence-timer state advanced each frame by `advance_settles`.
 struct PendingSettle {
@@ -711,6 +717,11 @@ pub struct WindowManager {
     /// Done cards whose leftover worktree this run already tried to tear
     /// down (one non-forcing attempt per run; see `drain_worktree_msgs`).
     teardown_attempted: std::collections::HashSet<String>,
+    /// Done cards whose last teardown was `Held`, with the earliest time the
+    /// leftover retry may try again. A hold clears on its own when the
+    /// process exits, so these are exempt from the once-per-run limit; an
+    /// entry also means the hold was already toasted.
+    teardown_held: std::collections::HashMap<String, std::time::Instant>,
     /// Card ids whose teardown thread is running right now. `pending_teardowns`
     /// drains an entry the moment its thread starts, so without this the
     /// Done-leftover retry and a re-dispatch both saw "nothing queued" and
@@ -810,6 +821,7 @@ impl WindowManager {
             release: None,
             pending_teardowns: Vec::new(),
             teardown_attempted: std::collections::HashSet::new(),
+            teardown_held: std::collections::HashMap::new(),
             teardowns_in_flight: std::collections::HashSet::new(),
             integration: IntegrationDriver::new(),
             picker: None,
@@ -3440,9 +3452,16 @@ impl WindowManager {
     }
 
     /// The Done-leftover retry gate: not while a teardown is queued or
-    /// running, and at most once per app run (marks the attempt).
-    fn leftover_teardown_due(&mut self, id: &str) -> bool {
-        !self.teardown_busy(id) && self.teardown_attempted.insert(id.to_string())
+    /// running; a held tree again once its retry time has passed; anything
+    /// else at most once per app run (marks the attempt).
+    fn leftover_teardown_due(&mut self, id: &str, now: std::time::Instant) -> bool {
+        if self.teardown_busy(id) {
+            return false;
+        }
+        match self.teardown_held.get(id) {
+            Some(retry_at) => now >= *retry_at,
+            None => self.teardown_attempted.insert(id.to_string()),
+        }
     }
 
     fn start_teardown(&mut self, pending: PendingTeardown, ctx: &egui::Context) {
@@ -3497,8 +3516,10 @@ impl WindowManager {
                     self.teardowns_in_flight.remove(&id);
                     // Whatever the outcome, this run has had its attempt: the
                     // leftover retry must not re-run a teardown that just
-                    // reported a kept tree.
+                    // reported a kept tree — except a hold, which keeps
+                    // retrying until the process exits.
                     self.teardown_attempted.insert(id.clone());
+                    let was_held = self.teardown_held.remove(&id).is_some();
                     match outcome {
                         Removed => {
                             // An rm'd card has nothing to clear — not an error.
@@ -3533,6 +3554,18 @@ impl WindowManager {
                                 format!("card {id}: branch kept: {ahead} commits not on {base}"),
                             );
                         }
+                        Held(e) => {
+                            // Toast the hold once, not on every retry.
+                            if !was_held {
+                                crate::notify::queue(
+                                    ctx,
+                                    crate::notify::Level::Warning,
+                                    format!("card {id}: worktree kept: {e}"),
+                                );
+                            }
+                            self.teardown_held
+                                .insert(id, std::time::Instant::now() + HELD_TEARDOWN_RETRY);
+                        }
                         Failed(e) => crate::notify::queue(
                             ctx,
                             crate::notify::Level::Error,
@@ -3555,7 +3588,7 @@ impl WindowManager {
                     .borrow()
                     .get(id)
                     .is_some_and(|c| c.state == crate::kanban::CardState::Done);
-                if is_done && self.leftover_teardown_due(id) {
+                if is_done && self.leftover_teardown_due(id, now) {
                     self.queue_teardown(PendingTeardown {
                         id: id.clone(),
                         wt: wt.clone(),
@@ -9795,15 +9828,45 @@ mod tests {
         // The Done-leftover safety net must never queue a second
         // `git worktree remove` against one already on a thread.
         let mut wm = WindowManager::new();
+        let now = std::time::Instant::now();
         wm.teardowns_in_flight.insert("a".into());
-        assert!(!wm.leftover_teardown_due("a"));
+        assert!(!wm.leftover_teardown_due("a", now));
         assert!(
             !wm.teardown_attempted.contains("a"),
             "a skipped round must not burn the run's single attempt"
         );
         wm.teardowns_in_flight.clear();
-        assert!(wm.leftover_teardown_due("a"), "first idle round fires");
-        assert!(!wm.leftover_teardown_due("a"), "second round does not");
+        assert!(wm.leftover_teardown_due("a", now), "first idle round fires");
+        assert!(!wm.leftover_teardown_due("a", now), "second round does not");
+    }
+
+    #[test]
+    fn leftover_retry_keeps_retrying_a_held_tree_after_its_backoff() {
+        // A hold clears when the process exits, so it is exempt from the
+        // once-per-run limit — but not retried every status poll.
+        let mut wm = WindowManager::new();
+        let now = std::time::Instant::now();
+        assert!(wm.leftover_teardown_due("a", now), "the run's attempt");
+        wm.teardown_held
+            .insert("a".into(), now + HELD_TEARDOWN_RETRY);
+        assert!(!wm.leftover_teardown_due("a", now), "inside the backoff");
+        let later = now + HELD_TEARDOWN_RETRY;
+        assert!(wm.leftover_teardown_due("a", later), "after it");
+        assert!(
+            wm.leftover_teardown_due("a", later),
+            "every due round, while held"
+        );
+        wm.teardowns_in_flight.insert("a".into());
+        assert!(
+            !wm.leftover_teardown_due("a", later),
+            "never beside a running one"
+        );
+        wm.teardowns_in_flight.clear();
+        wm.teardown_held.clear();
+        assert!(
+            !wm.leftover_teardown_due("a", later),
+            "no longer held: back to the spent once-per-run attempt"
+        );
     }
 
     #[test]

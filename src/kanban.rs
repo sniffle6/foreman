@@ -2197,6 +2197,11 @@ pub enum TeardownOutcome {
     Dirty,
     /// `branch -d` refused: commits not on base. Tree removed, branch kept.
     Unmerged { ahead: u32 },
+    /// A running process holds something inside the tree (see
+    /// `ensure_not_held`); nothing touched, still registered. Unlike the
+    /// other kept rows this clears on its own once the process exits, so
+    /// the Done-leftover retry keeps trying.
+    Held(String),
     /// git missing or an unexpected error; everything kept.
     Failed(String),
 }
@@ -2211,6 +2216,7 @@ pub fn teardown_verdict(
 ) -> TeardownOutcome {
     match remove {
         Err(e) if e.to_lowercase().contains("modified or untracked") => TeardownOutcome::Dirty,
+        Err(e) if e.starts_with(HELD_REFUSAL) => TeardownOutcome::Held(e),
         Err(e) => TeardownOutcome::Failed(e),
         Ok(()) => match branch {
             None => TeardownOutcome::Failed("branch step did not run".into()),
@@ -2344,6 +2350,10 @@ fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Res
 /// and straight back proves nothing holds it before git deletes anything.
 /// Retried briefly like `git_worktree_remove`: the worker's shell may have
 /// only just exited. Elsewhere open files do not block deletion; no probe.
+/// Leads `ensure_not_held`'s error so `teardown_verdict` can tell a hold
+/// from any other failure.
+const HELD_REFUSAL: &str = "worktree is in use";
+
 fn ensure_not_held(tree: &std::path::Path) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
@@ -2367,7 +2377,7 @@ fn ensure_not_held(tree: &std::path::Path) -> Result<(), String> {
             Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(400)),
             Err(e) => {
                 return Err(format!(
-                    "worktree is in use by a running process (a program started from inside it, or a shell whose directory is inside it); close it and retry: {} ({e})",
+                    "{HELD_REFUSAL} by a running process (a program started from inside it, or a shell whose directory is inside it); close it and teardown retries: {} ({e})",
                     tree.display()
                 ));
             }
@@ -2985,6 +2995,11 @@ mod tests {
             teardown_verdict(Ok(()), Some(other), 0),
             TeardownOutcome::Failed("fatal: something else".into())
         );
+        let held = format!("{HELD_REFUSAL} by a running process: x");
+        assert_eq!(
+            teardown_verdict(Err(held.clone()), None, 0),
+            TeardownOutcome::Held(held)
+        );
         // a remove failure decides regardless of a (never-run) branch step
         assert_eq!(
             teardown_verdict(dirty, Some(Ok(())), 0),
@@ -3600,11 +3615,10 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         match outcome {
-            TeardownOutcome::Failed(e) => {
-                assert!(e.contains("in use"), "actionable message, got: {e}");
+            TeardownOutcome::Held(e) => {
                 assert!(e.contains(&wt.path), "names the directory, got: {e}");
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected Held, got {other:?}"),
         }
         assert!(registered, "still a git worktree, so a retry can finish");
         assert!(file_kept, "nothing deleted");

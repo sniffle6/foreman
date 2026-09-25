@@ -326,8 +326,10 @@ its base (`docs/integration-queue.md`).
   leftover the rule above keeps forever. Before git runs, teardown renames
   the tree to a sibling and straight back; Windows refuses that while
   anything inside is open, so the toast says "worktree is in use" and
-  nothing is touched. Close the process; the next launch's leftover retry
-  (or Discard) finishes the job.
+  nothing is touched. Close the process: unlike other kept trees (one retry
+  per app run), a held one is retried every 30s while the board is shown,
+  toasted only the first time, so it clears on its own. The retry is
+  non-forcing even after a Discard — a dirty tree then needs Discard again.
 - **Each worktree cold-builds.** It has its own `target/`; the first build
   costs minutes (`docs/dev-launcher.md` forbids sharing a target dir). Minutes
   of compile beat corrupted commits.
