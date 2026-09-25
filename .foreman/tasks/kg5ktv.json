@@ -4,19 +4,14 @@
   "title": "Keep Git History subjects left and metadata right",
   "body": "Implement GitHub issue #9: https://github.com/sniffle6/foreman/issues/9. Anchor commit subjects beside the graph and author/date at the right edge; right-side text wins when space is tight.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/kg5ktv",
-    "branch": "card/kg5ktv",
-    "base": "main"
-  },
   "shipped": {
     "name": "v0.5.5",
-    "at": "2026-09-25T00:53:22Z",
+    "at": "2026-09-25T01:48:35Z",
     "commits": [
       "bbb667d",
       "51ea6fe"
     ]
   },
   "created": "2026-09-24T12:12:04Z",
-  "updated": "2026-09-25T00:53:22Z"
+  "updated": "2026-09-25T01:50:00Z"
 }

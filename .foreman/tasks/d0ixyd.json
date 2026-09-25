@@ -4,11 +4,14 @@
   "title": "Start card work on a feature branch without a worktree",
   "body": "Add a dispatch option that starts a card on a feature branch in the project checkout. Define safe branch creation, restart behavior, and integration back into the base branch while preserving existing checkout changes.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/d0ixyd",
-    "branch": "card/d0ixyd",
-    "base": "main"
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T01:48:35Z",
+    "commits": [
+      "04ff17c",
+      "0ef954a"
+    ]
   },
   "created": "2026-09-24T13:12:55Z",
-  "updated": "2026-09-24T22:51:20Z"
+  "updated": "2026-09-25T01:48:35Z"
 }

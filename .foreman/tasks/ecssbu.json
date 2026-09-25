@@ -4,19 +4,14 @@
   "title": "Resize before and after Diff views",
   "body": "Implement GitHub issue #10: https://github.com/sniffle6/foreman/issues/10. Add a draggable divider between old and new text while preserving aligned rows, navigation, and the right-edge change markers.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/ecssbu",
-    "branch": "card/ecssbu",
-    "base": "main"
-  },
   "shipped": {
     "name": "v0.5.5",
-    "at": "2026-09-25T00:53:22Z",
+    "at": "2026-09-25T01:48:35Z",
     "commits": [
       "bbb667d",
       "baf31dc"
     ]
   },
   "created": "2026-09-24T12:12:13Z",
-  "updated": "2026-09-25T00:53:22Z"
+  "updated": "2026-09-25T01:50:00Z"
 }
