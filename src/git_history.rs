@@ -21,11 +21,12 @@ const BATCH: usize = 512;
 const ROW_H: f32 = 28.0;
 const LANE_W: f32 = 16.0;
 /// Unscaled timeline column widths: the most an author name may take, the
-/// least it is worth showing at, the gap after the subject, the tighter gap
-/// between name and date, and the subject room a lane graph wider than the
-/// pane leaves before the timeline scrolls sideways.
+/// spare room over which a metadata column fades out as the subject nears
+/// it, the gap after the subject, the tighter gap between name and date, and
+/// the subject room a lane graph wider than the pane leaves before the
+/// timeline scrolls sideways.
 const AUTHOR_W: f32 = 140.0;
-const MIN_AUTHOR_W: f32 = 24.0;
+const FADE_W: f32 = 32.0;
 const COL_GAP: f32 = 12.0;
 const NAME_GAP: f32 = 6.0;
 const MIN_SUBJECT_W: f32 = 120.0;
@@ -609,8 +610,9 @@ impl HistoryView {
                     subject,
                     th.text,
                 );
-                if cols.author.width() > 0.0 {
-                    let author = elided(&row.commit.author, cols.author.width(), th.dim);
+                if cols.author_alpha > 0.0 {
+                    let color = th.dim.gamma_multiply(cols.author_alpha);
+                    let author = elided(&row.commit.author, cols.author.width(), color);
                     painter
                         .with_clip_rect(cols.author.intersect(painter.clip_rect()))
                         .galley(
@@ -619,16 +621,16 @@ impl HistoryView {
                                 r.center().y - author.size().y / 2.0,
                             ),
                             author,
-                            th.dim,
+                            color,
                         );
                 }
-                if cols.date.width() > 0.0 {
+                if cols.date_alpha > 0.0 {
                     painter.text(
                         egui::pos2(cols.date.right(), r.center().y),
                         egui::Align2::RIGHT_CENTER,
                         &row.commit.date,
                         font.clone(),
-                        th.dim,
+                        th.dim.gamma_multiply(cols.date_alpha),
                     );
                 }
                 response.on_hover_ui(|ui| {
@@ -664,21 +666,27 @@ fn meta_w(date_w: f32, s: f32) -> f32 {
     date_w + (AUTHOR_W + COL_GAP + NAME_GAP) * s
 }
 
-/// Screen-space columns of one timeline row. A hidden column is zero-width.
+/// Screen-space columns of one timeline row, with each metadata column's
+/// opacity. A column at alpha 0 is not painted.
 #[derive(Debug)]
 struct Columns {
     /// Clip for graph, refs, and subject.
     left: egui::Rect,
     author: egui::Rect,
     date: egui::Rect,
+    author_alpha: f32,
+    date_alpha: f32,
 }
 
 /// Pins the date to the right edge of the visible pane, however wide the row
 /// is or wherever it is scrolled, with the author name right-aligned just
-/// before it. The subject wins: metadata only takes room the subject's full
-/// text leaves free (`subject_right` is where that text ends). As the room
-/// runs out the author name elides, then drops out, then the date drops out,
-/// and only then is the subject itself elided at the row's visible edge.
+/// before it. The subject wins: metadata only uses room the subject's full
+/// text leaves free (`subject_right` is where that text ends). Columns never
+/// move or shrink; each fades out across the last `FADE_W` of spare room
+/// before the subject would reach it, the name first and then the date.
+/// Opacity is a function of width, not time, so dragging the pane fades
+/// smoothly both ways. Once both are gone the subject gets the whole row and
+/// elides at the visible edge.
 fn columns(
     row: egui::Rect,
     visible: egui::Rect,
@@ -688,34 +696,31 @@ fn columns(
     s: f32,
 ) -> Columns {
     let right = row.right().min(visible.right()) - 6.0 * s;
-    let hidden = egui::Rect::from_x_y_ranges(right..=right, row.y_range());
-    // Room the metadata may use without covering any of the subject.
-    let room = right - (subject_right + COL_GAP * s);
-    if room < date_w {
-        let left = egui::Rect::from_x_y_ranges(row.left()..=right.max(row.left()), row.y_range());
-        return Columns {
-            left,
-            author: hidden,
-            date: hidden,
-        };
-    }
     let date = egui::Rect::from_x_y_ranges(right - date_w..=right, row.y_range());
-    let author_w = author_w.min(room - date_w - NAME_GAP * s);
-    let (author, meta_left) = if author_w >= MIN_AUTHOR_W * s {
-        let author_right = date.left() - NAME_GAP * s;
-        let author =
-            egui::Rect::from_x_y_ranges(author_right - author_w..=author_right, row.y_range());
-        (author, author.left())
-    } else {
-        let at = date.left();
-        (
-            egui::Rect::from_x_y_ranges(at..=at, row.y_range()),
-            date.left(),
-        )
+    let author_right = date.left() - NAME_GAP * s;
+    let author = egui::Rect::from_x_y_ranges(author_right - author_w..=author_right, row.y_range());
+    // Spare room between the subject's end (plus its gap) and a column.
+    let fade = |column_left: f32| {
+        ((column_left - (subject_right + COL_GAP * s)) / (FADE_W * s)).clamp(0.0, 1.0)
     };
-    let left_right = (meta_left - COL_GAP * s).max(row.left());
-    let left = egui::Rect::from_x_y_ranges(row.left()..=left_right, row.y_range());
-    Columns { left, author, date }
+    let date_alpha = fade(date.left());
+    // The name never outlives the date beside it.
+    let author_alpha = fade(author.left()).min(date_alpha);
+    let left_right = if author_alpha > 0.0 {
+        author.left() - COL_GAP * s
+    } else if date_alpha > 0.0 {
+        date.left() - COL_GAP * s
+    } else {
+        right
+    };
+    let left = egui::Rect::from_x_y_ranges(row.left()..=left_right.max(row.left()), row.y_range());
+    Columns {
+        left,
+        author,
+        date,
+        author_alpha,
+        date_alpha,
+    }
 }
 
 #[cfg(test)]
@@ -825,16 +830,45 @@ mod tests {
     }
 
     #[test]
-    fn subject_wins_and_metadata_takes_only_what_it_leaves() {
+    fn metadata_fades_as_the_subject_nears_it_and_never_moves() {
         let rect =
             |x0: f32, x1: f32| egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x1, 28.0));
-        // Short subject: date at the right edge, the name just before it at
-        // its own width, the subject clip ending a gap before the name.
-        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 40.0, 300.0, 1.0);
-        assert_eq!(wide.date.right(), 994.0);
-        assert_eq!(wide.author.right(), wide.date.left() - NAME_GAP);
-        assert_eq!(wide.author.width(), 40.0);
-        assert_eq!(wide.left.right(), wide.author.left() - COL_GAP);
+        let at = |subject_right: f32| {
+            columns(
+                rect(0.0, 500.0),
+                rect(0.0, 500.0),
+                80.0,
+                40.0,
+                subject_right,
+                1.0,
+            )
+        };
+        // Date 414..494, name 368..408. Short subject: both fully opaque,
+        // the subject clip ending a gap before the name.
+        let short = at(200.0);
+        assert_eq!((short.date.right(), short.author.width()), (494.0, 40.0));
+        assert_eq!(short.author.right(), short.date.left() - NAME_GAP);
+        assert_eq!((short.author_alpha, short.date_alpha), (1.0, 1.0));
+        assert_eq!(short.left.right(), short.author.left() - COL_GAP);
+        // Subject halfway into the name's fade band: name half faded, date
+        // untouched, and nothing moved.
+        let half = at(368.0 - COL_GAP - FADE_W / 2.0);
+        assert!((half.author_alpha - 0.5).abs() < 1e-4, "{half:?}");
+        assert_eq!(half.date_alpha, 1.0);
+        assert_eq!((half.author, half.date), (short.author, short.date));
+        // Subject reaching the name: name gone, date fully shown, and the
+        // subject clip now ends a gap before the date.
+        let no_name = at(368.0 - COL_GAP);
+        assert_eq!((no_name.author_alpha, no_name.date_alpha), (0.0, 1.0));
+        assert_eq!(no_name.left.right(), no_name.date.left() - COL_GAP);
+        // Subject halfway into the date's band: date half faded.
+        let fading = at(414.0 - COL_GAP - FADE_W / 2.0);
+        assert!((fading.date_alpha - 0.5).abs() < 1e-4, "{fading:?}");
+        assert_eq!(fading.author_alpha, 0.0);
+        // Subject past the date: all metadata gone, subject gets the row.
+        let long = at(460.0);
+        assert_eq!((long.author_alpha, long.date_alpha), (0.0, 0.0));
+        assert_eq!(long.left.right(), 494.0);
         // Row scrolled wider than the pane: metadata follows the visible edge.
         let scrolled = columns(
             rect(-300.0, 1200.0),
@@ -845,22 +879,7 @@ mod tests {
             1.0,
         );
         assert_eq!(scrolled.date.right(), 594.0);
-        assert!(scrolled.left.right() < scrolled.author.left());
-        // Longer subject: the name elides so the subject stays whole.
-        let squeezed = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 100.0, 340.0, 1.0);
-        assert!(squeezed.author.width() < 100.0 && squeezed.author.width() >= MIN_AUTHOR_W);
-        assert!(squeezed.left.right() >= 340.0);
-        // Longer still: the name drops out, the date stays.
-        let no_name = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 100.0, 390.0, 1.0);
-        assert_eq!(no_name.author.width(), 0.0);
-        assert_eq!(no_name.date.width(), 80.0);
-        assert!(no_name.left.right() >= 390.0);
-        // Subject reaches the date's room: all metadata goes, the subject
-        // gets the whole visible row.
-        let long = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 40.0, 420.0, 1.0);
-        assert_eq!((long.author.width(), long.date.width()), (0.0, 0.0));
-        assert_eq!(long.left.right(), 494.0);
-        // Zoom scales every gap.
+        // Zoom scales every gap and the fade band.
         let zoomed = columns(
             rect(0.0, 1000.0),
             rect(0.0, 1000.0),
