@@ -4,6 +4,13 @@
   "title": "Resize Git timeline and changed-file pane",
   "body": "Add a draggable vertical divider between the Git History timeline and the right-hand changed-file/details pane (src/git_history.rs, currently hard-coded 0.55 split). Preserve the existing changed-files/commit-details divider (src/git_history/details.rs). See docs/git-history.md.\n\nDecisions:\n- Store the details pane width in unscaled px (divide by view scale s) on HistoryView, not as a fraction: window growth goes to the timeline, and zoom scales the pane.\n- Clamp when drawing only; write the stored width back only on drag, so shrinking and then regrowing the window restores the chosen width.\n- Set the position from interact_pointer_pos, not by adding pointer.delta() (that drifts after hitting a clamp). Leave the old divider's delta math alone.\n- Drag area is the whole gap, centered on the line (+/-6px scaled), with the ResizeHorizontal cursor and the same th.dim/th.border hover swap.\n- Details minimum is about 220px scaled, capped at half the body width. The timeline already scrolls horizontally.\n- The width survives commit selection and Refresh. It is NOT saved across restart (ContentSnap stays identity-only).\n- Hand-rolled divider, not SidePanel::show_inside (that ignores zoom and risks duplicate Ids across Projects).\n\nTest: drag, shrink the window, regrow it, assert the width is restored. Mirror divider_drags_and_commit_changes_clear_file_selection.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T00:53:22Z",
+    "commits": [
+      "bbb667d"
+    ]
+  },
   "created": "2026-09-24T11:59:10Z",
-  "updated": "2026-09-24T21:11:41Z"
+  "updated": "2026-09-25T00:53:22Z"
 }

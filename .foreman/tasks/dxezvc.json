@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "dxezvc",
+  "title": "Fix timing-flaky terminal_titles provider-process tests",
+  "body": "terminal_titles::tests::provider_process_is_bounded_and_scrubs_hook_routing and provider_process_falls_back_to_safe_windows_cmd_shim (src/terminal_titles.rs) unwrap Err(Timeout) on their happy-path run_process calls (cmd echo, the .cmd shim) under a 2s ceiling. Failed 2 of 5 full-suite runs under double load. That 2s is only a don't-hang ceiling, not a speed claim; production uses PROCESS_TIMEOUT=30s for a background model call. Fix: raise the happy-path and exit-7 ceilings to about 10s. Keep the real bounds as they are: the 50ms timeout cases and the 750ms stdin-inside-deadline assert. Split the bundled test into its four claims (env scrub, slow provider killed, blocked stdin bounded, nonzero exit -> Failed) so a slow echo can't hide the others. Keep the shim's injection-refusal assert (BatBadBut class). No product change expected.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T00:53:22Z",
+    "commits": [
+      "ac4db5a"
+    ]
+  },
+  "created": "2026-09-24T23:11:49Z",
+  "updated": "2026-09-25T00:53:22Z"
+}

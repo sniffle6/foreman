@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "ibpvx3",
+  "title": "Fix timing-flaky git_history refocus debounce test",
+  "body": "git_history::changes::tests::refocus_rereads_keeps_selection_and_clicks_open_the_diff (src/git_history/changes.rs) failed 1 of 5 loaded full-suite runs at the final assert (view.request.is_none()). Likely cause, unverified: the 'quick refocus inside the debounce' check relies on the wall clock. If settle() (a real git read) plus frames take over REFOCUS_DEBOUNCE (1s) under load, the refocus is past the debounce and correctly starts a re-read. Confirm, then pin 'started' (or inject the clock) right before that check rather than widening the debounce.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T00:53:22Z",
+    "commits": [
+      "f362216"
+    ]
+  },
+  "created": "2026-09-24T23:13:15Z",
+  "updated": "2026-09-25T00:53:22Z"
+}

@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "0d06b4",
+  "title": "Integration queue: check-failure detail loses the failing test's name",
+  "body": "Symptom: when a project check fails, the integration object's detail (kanban list --json) shows only compiler warnings from cargo test. The FAILED / panicked lines never appear, so the worker can't tell which test failed. Card hzgzig lost two queue round trips to this and had to rerun the suite under CREATE_NO_WINDOW to find the test.\n\nCause: src/integrate.rs run_child appends stderr after stdout, then tail_lines keeps the last OUTPUT_TAIL_LINES (40). cargo test's test results go to stdout and its warnings to stderr, so the warnings fill the tail.\n\nFix direction: keep the lines that say why the check failed. For example, pull the FAILED / panicked / 'failures:' lines (plus a little context) out of the combined output ahead of the tail, or keep a tail of each stream separately with stdout's last. Do not grow the stored detail without a bound. Test with a fake check that prints a FAILED line to stdout and more than 40 warning lines to stderr, then assert the FAILED line survives into the detail.\n\nKey code: run_child, tail_lines, OUTPUT_TAIL_LINES, and the Reason::CheckFailed resolve in the turn.",
+  "state": "backlog",
+  "created": "2026-09-24T22:51:04Z",
+  "updated": "2026-09-24T22:51:04Z"
+}

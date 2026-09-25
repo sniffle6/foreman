@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "jnnzqx",
+  "title": "Name the failing test in the integration queue's check-failed detail",
+  "body": "When a queue check fails, the integration detail keeps only the last OUTPUT_TAIL_LINES of stdout+stderr (run_child/tail_lines in src/integrate.rs). For cargo test that tail is mostly compiler warnings on stderr, so it never names the failing test (seen on card kg5ktv: the suite had to be rerun to find it). Keep the tail, but also pull out the lines that name the failure (e.g. 'test ... FAILED', 'panicked at', 'error:') and put them first, with a bound on length. Keep it independent of any one tool, and don't parse cargo's output format. Update docs/integration-queue.md.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T00:53:22Z",
+    "commits": [
+      "ea070e7"
+    ]
+  },
+  "created": "2026-09-24T23:25:46Z",
+  "updated": "2026-09-25T00:53:22Z"
+}

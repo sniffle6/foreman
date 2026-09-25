@@ -4,6 +4,13 @@
   "title": "foreman CLI prints nothing and sets no exit code when run from PowerShell",
   "body": "Installed foreman.exe (%LOCALAPPDATA%\\Programs\\foreman) run from pwsh inside a foreman Session: 'kanban integrate/wait/list' print no stdout and $LASTEXITCODE is empty (the commands do run: integrate queued the card). The same calls via bash print output and return exit codes. Likely a GUI-subsystem exe that PowerShell doesn't wait on or attach stdio to. This breaks the worker close-out (kanban wait exit codes) and the foreman-kanban skill's PowerShell examples. Seen 2026-09-24 on card l8th0t.",
   "state": "done",
+  "shipped": {
+    "name": "v0.5.5",
+    "at": "2026-09-25T00:53:22Z",
+    "commits": [
+      "3c847ff"
+    ]
+  },
   "created": "2026-09-24T04:33:05Z",
-  "updated": "2026-09-24T21:28:44Z"
+  "updated": "2026-09-25T00:53:22Z"
 }
