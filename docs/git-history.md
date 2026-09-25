@@ -11,10 +11,11 @@ tiling, tabbing, zoom, and workspace restore behavior as other viewers.
 The timeline shows commits reachable from all refs and HEAD in topological
 order, with colored branch/merge lanes, commit subjects, branch/tag decorations,
 authors, and author dates. The subject sits beside the graph and ref chips; the
-author and date columns stay pinned to the right edge of the visible timeline
-pane, even while scrolled sideways. When the pane is tight the right side wins:
-the subject (then refs and graph) is clipped or elided with "…" before it can
-touch the author column. Hover a row for its full hash and untruncated metadata.
+date stays pinned to the right edge of the visible timeline pane, even while
+scrolled sideways, with the author name right-aligned just before it at its own
+width (capped). When the pane is tight the subject wins: it keeps a minimum
+width past the graph, the author name elides and then drops out, and last the
+date drops out. Hover a row for its full hash and untruncated metadata.
 Scroll vertically through history; the timeline only scrolls sideways when the
 lane graph itself is too wide for the pane. Column geometry is the pure
 `columns` function in `src/git_history.rs`. Refresh starts a new read from the current

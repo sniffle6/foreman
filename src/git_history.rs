@@ -20,10 +20,13 @@ use std::time::Duration;
 const BATCH: usize = 512;
 const ROW_H: f32 = 28.0;
 const LANE_W: f32 = 16.0;
-/// Unscaled timeline column widths: author name, gaps, and the least subject
-/// room before a wide graph starts scrolling sideways.
+/// Unscaled timeline column widths: the most an author name may take, the
+/// least it is worth showing at, the gap after the subject, the tighter gap
+/// between name and date, and the subject room metadata never takes.
 const AUTHOR_W: f32 = 140.0;
+const MIN_AUTHOR_W: f32 = 24.0;
 const COL_GAP: f32 = 12.0;
+const NAME_GAP: f32 = 6.0;
 const MIN_SUBJECT_W: f32 = 120.0;
 const COLORS: [egui::Color32; 6] = [
     egui::Color32::from_rgb(116, 176, 164),
@@ -528,7 +531,13 @@ impl HistoryView {
                 if response.clicked() {
                     selected = Some(row.commit.hash.clone());
                 }
-                let cols = columns(r, ui.clip_rect(), date_w, s);
+                let author_w = ui
+                    .painter()
+                    .layout_no_wrap(row.commit.author.clone(), font.clone(), th.dim)
+                    .size()
+                    .x
+                    .min(AUTHOR_W * s);
+                let cols = columns(r, ui.clip_rect(), date_w, author_w, graph_w, s);
                 let painter = ui.painter_at(r.intersect(ui.clip_rect()));
                 if i % 2 == 0 {
                     painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
@@ -593,21 +602,28 @@ impl HistoryView {
                     subject,
                     th.text,
                 );
-                let author = elided(&row.commit.author, cols.author.width(), th.dim);
-                painter
-                    .with_clip_rect(cols.author.intersect(painter.clip_rect()))
-                    .galley(
-                        egui::pos2(cols.author.left(), r.center().y - author.size().y / 2.0),
-                        author,
+                if cols.author.width() > 0.0 {
+                    let author = elided(&row.commit.author, cols.author.width(), th.dim);
+                    painter
+                        .with_clip_rect(cols.author.intersect(painter.clip_rect()))
+                        .galley(
+                            egui::pos2(
+                                cols.author.right() - author.size().x,
+                                r.center().y - author.size().y / 2.0,
+                            ),
+                            author,
+                            th.dim,
+                        );
+                }
+                if cols.date.width() > 0.0 {
+                    painter.text(
+                        egui::pos2(cols.date.right(), r.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        &row.commit.date,
+                        font.clone(),
                         th.dim,
                     );
-                painter.text(
-                    egui::pos2(cols.date.right(), r.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    &row.commit.date,
-                    font.clone(),
-                    th.dim,
-                );
+                }
                 response.on_hover_ui(|ui| {
                     ui.label(format!(
                         "{}\n{}\n{}\n{} · {}",
@@ -638,10 +654,10 @@ impl HistoryView {
 }
 
 fn meta_w(date_w: f32, s: f32) -> f32 {
-    date_w + (AUTHOR_W + 2.0 * COL_GAP) * s
+    date_w + (AUTHOR_W + COL_GAP + NAME_GAP) * s
 }
 
-/// Screen-space columns of one timeline row.
+/// Screen-space columns of one timeline row. A hidden column is zero-width.
 #[derive(Debug)]
 struct Columns {
     /// Clip for graph, refs, and subject.
@@ -650,16 +666,46 @@ struct Columns {
     date: egui::Rect,
 }
 
-/// Pins author and date to the right edge of the visible pane, however wide the
-/// row is or wherever it is scrolled. On a tight pane the metadata wins: the
-/// left clip shrinks first and may reach zero width.
-fn columns(row: egui::Rect, visible: egui::Rect, date_w: f32, s: f32) -> Columns {
+/// Pins the date to the right edge of the visible pane, however wide the row
+/// is or wherever it is scrolled, with the author name right-aligned just
+/// before it. The subject wins a tight pane: it keeps `graph_w +
+/// MIN_SUBJECT_W` of room, the author name elides and then drops out, and
+/// last the date drops out.
+fn columns(
+    row: egui::Rect,
+    visible: egui::Rect,
+    date_w: f32,
+    author_w: f32,
+    graph_w: f32,
+    s: f32,
+) -> Columns {
     let right = row.right().min(visible.right()) - 6.0 * s;
+    let hidden = egui::Rect::from_x_y_ranges(right..=right, row.y_range());
+    // Room the metadata may use without cutting into the subject's minimum.
+    let room = right - (row.left() + graph_w + MIN_SUBJECT_W * s);
+    if room < date_w + COL_GAP * s {
+        let left = egui::Rect::from_x_y_ranges(row.left()..=right.max(row.left()), row.y_range());
+        return Columns {
+            left,
+            author: hidden,
+            date: hidden,
+        };
+    }
     let date = egui::Rect::from_x_y_ranges(right - date_w..=right, row.y_range());
-    let author_right = date.left() - COL_GAP * s;
-    let author =
-        egui::Rect::from_x_y_ranges(author_right - AUTHOR_W * s..=author_right, row.y_range());
-    let left_right = (author.left() - COL_GAP * s).max(row.left());
+    let author_w = author_w.min(room - date_w - (NAME_GAP + COL_GAP) * s);
+    let (author, meta_left) = if author_w >= MIN_AUTHOR_W * s {
+        let author_right = date.left() - NAME_GAP * s;
+        let author =
+            egui::Rect::from_x_y_ranges(author_right - author_w..=author_right, row.y_range());
+        (author, author.left())
+    } else {
+        let at = date.left();
+        (
+            egui::Rect::from_x_y_ranges(at..=at, row.y_range()),
+            date.left(),
+        )
+    };
+    let left_right = (meta_left - COL_GAP * s).max(row.left());
     let left = egui::Rect::from_x_y_ranges(row.left()..=left_right, row.y_range());
     Columns { left, author, date }
 }
@@ -771,26 +817,43 @@ mod tests {
     }
 
     #[test]
-    fn metadata_pins_to_visible_right_and_wins_when_tight() {
+    fn subject_wins_a_tight_pane_and_the_name_hugs_the_date() {
         let rect =
             |x0: f32, x1: f32| egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x1, 28.0));
-        // Wide pane: metadata at the right edge, subject room before it.
-        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 1.0);
+        // Wide pane: date at the right edge, the name just before it at its
+        // own width, subject room before that.
+        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 40.0, 32.0, 1.0);
         assert_eq!(wide.date.right(), 994.0);
-        assert_eq!(wide.author.right(), wide.date.left() - COL_GAP);
+        assert_eq!(wide.author.right(), wide.date.left() - NAME_GAP);
+        assert_eq!(wide.author.width(), 40.0);
         assert_eq!(wide.left.right(), wide.author.left() - COL_GAP);
         // Row scrolled wider than the pane: metadata follows the visible edge.
-        let scrolled = columns(rect(-300.0, 1200.0), rect(0.0, 600.0), 80.0, 1.0);
+        let scrolled = columns(
+            rect(-300.0, 1200.0),
+            rect(0.0, 600.0),
+            80.0,
+            40.0,
+            32.0,
+            1.0,
+        );
         assert_eq!(scrolled.date.right(), 594.0);
         assert!(scrolled.left.right() < scrolled.author.left());
-        // Too narrow for everything: the left clip collapses, never overlapping.
-        let tight = columns(rect(0.0, 200.0), rect(0.0, 200.0), 80.0, 1.0);
-        assert_eq!(tight.date.right(), 194.0);
-        assert_eq!(tight.left.width(), 0.0);
-        assert!(tight.left.right() <= tight.author.left().max(0.0));
+        // Tighter: the name elides so the subject keeps its minimum.
+        let squeezed = columns(rect(0.0, 300.0), rect(0.0, 300.0), 80.0, 100.0, 32.0, 1.0);
+        assert!(squeezed.author.width() < 100.0 && squeezed.author.width() >= MIN_AUTHOR_W);
+        assert!(squeezed.left.right() >= 32.0 + MIN_SUBJECT_W);
+        // Tighter still: the name drops out, the date stays.
+        let no_name = columns(rect(0.0, 260.0), rect(0.0, 260.0), 80.0, 100.0, 32.0, 1.0);
+        assert_eq!(no_name.author.width(), 0.0);
+        assert_eq!(no_name.date.width(), 80.0);
+        assert!(no_name.left.right() >= 32.0 + MIN_SUBJECT_W);
+        // Too narrow for any metadata: the subject gets the whole row.
+        let tight = columns(rect(0.0, 200.0), rect(0.0, 200.0), 80.0, 40.0, 32.0, 1.0);
+        assert_eq!((tight.author.width(), tight.date.width()), (0.0, 0.0));
+        assert_eq!(tight.left.right(), 194.0);
         // Zoom scales every gap.
-        let zoomed = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 160.0, 2.0);
-        assert_eq!(zoomed.author.width(), AUTHOR_W * 2.0);
+        let zoomed = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 160.0, 80.0, 64.0, 2.0);
+        assert_eq!(zoomed.author.right(), zoomed.date.left() - NAME_GAP * 2.0);
         assert_eq!(zoomed.date.right(), 988.0);
     }
 
@@ -836,6 +899,10 @@ mod tests {
             "{date:?} vs {timeline_right}"
         );
         assert!(author.1.right() < date.1.left(), "{author:?} {date:?}");
+        assert!(
+            date.1.left() - author.1.right() <= NAME_GAP + 2.0,
+            "name should hug the date: {author:?} {date:?}"
+        );
         assert!(
             subject.2 && subject.1.right() < author.1.left(),
             "{subject:?} {author:?}"
