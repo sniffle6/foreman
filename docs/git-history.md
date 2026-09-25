@@ -13,9 +13,11 @@ order, with colored branch/merge lanes, commit subjects, branch/tag decorations,
 authors, and author dates. The subject sits beside the graph and ref chips; the
 date stays pinned to the right edge of the visible timeline pane, even while
 scrolled sideways, with the author name right-aligned just before it at its own
-width (capped). When the pane is tight the subject wins: it keeps a minimum
-width past the graph, the author name elides and then drops out, and last the
-date drops out. Hover a row for its full hash and untruncated metadata.
+width (capped). The subject wins: author and date only use room the subject's
+full text leaves free on that row. As room runs out the author name elides,
+then drops out, then the date drops out, and only then is the subject elided at
+the pane's edge. So on a narrow pane, rows with long subjects show no
+metadata. Hover a row for its full hash and untruncated metadata.
 Scroll vertically through history; the timeline only scrolls sideways when the
 lane graph itself is too wide for the pane. Column geometry is the pure
 `columns` function in `src/git_history.rs`. Refresh starts a new read from the current

@@ -22,7 +22,8 @@ const ROW_H: f32 = 28.0;
 const LANE_W: f32 = 16.0;
 /// Unscaled timeline column widths: the most an author name may take, the
 /// least it is worth showing at, the gap after the subject, the tighter gap
-/// between name and date, and the subject room metadata never takes.
+/// between name and date, and the subject room a lane graph wider than the
+/// pane leaves before the timeline scrolls sideways.
 const AUTHOR_W: f32 = 140.0;
 const MIN_AUTHOR_W: f32 = 24.0;
 const COL_GAP: f32 = 12.0;
@@ -531,13 +532,25 @@ impl HistoryView {
                 if response.clicked() {
                     selected = Some(row.commit.hash.clone());
                 }
-                let author_w = ui
-                    .painter()
-                    .layout_no_wrap(row.commit.author.clone(), font.clone(), th.dim)
-                    .size()
-                    .x
-                    .min(AUTHOR_W * s);
-                let cols = columns(r, ui.clip_rect(), date_w, author_w, graph_w, s);
+                let measure = |text: &str| {
+                    ui.painter()
+                        .layout_no_wrap(text.into(), font.clone(), th.text)
+                        .size()
+                        .x
+                };
+                // Lay the left side out first: the subject gets its natural
+                // width and the metadata takes only what is left of the row.
+                let visible_right = r.right().min(ui.clip_rect().right()) - 6.0 * s;
+                let mut left = r.left() + graph_w;
+                let chip_w = (!row.commit.refs.is_empty()).then(|| {
+                    measure(&row.commit.refs).min(((visible_right - left) * 0.5).max(0.0))
+                });
+                if let Some(w) = chip_w {
+                    left += w + 18.0 * s;
+                }
+                let subject_right = left + measure(&row.commit.subject);
+                let author_w = measure(&row.commit.author).min(AUTHOR_W * s);
+                let cols = columns(r, ui.clip_rect(), date_w, author_w, subject_right, s);
                 let painter = ui.painter_at(r.intersect(ui.clip_rect()));
                 if i % 2 == 0 {
                     painter.rect_filled(r, 0.0, th.sel_bg.gamma_multiply(0.22));
@@ -571,15 +584,10 @@ impl HistoryView {
                     4.0 * s,
                     COLORS[row.color % COLORS.len()],
                 );
-                let mut left = r.left() + graph_w;
-                if !row.commit.refs.is_empty() {
+                if let Some(w) = chip_w {
                     let galley = p.layout_no_wrap(row.commit.refs.clone(), font.clone(), COLORS[0]);
-                    let w = galley
-                        .size()
-                        .x
-                        .min(((cols.left.right() - left) * 0.5).max(0.0));
                     let chip = egui::Rect::from_min_size(
-                        egui::pos2(left, r.top() + 4.0 * s),
+                        egui::pos2(r.left() + graph_w, r.top() + 4.0 * s),
                         egui::vec2(w + 10.0 * s, 20.0 * s),
                     );
                     p.rect_filled(chip, 3.0 * s, th.sel_bg);
@@ -588,7 +596,6 @@ impl HistoryView {
                         galley,
                         COLORS[0],
                     );
-                    left += w + 18.0 * s;
                 }
                 let elided = |text: &str, width: f32, color| {
                     let mut job =
@@ -668,22 +675,23 @@ struct Columns {
 
 /// Pins the date to the right edge of the visible pane, however wide the row
 /// is or wherever it is scrolled, with the author name right-aligned just
-/// before it. The subject wins a tight pane: it keeps `graph_w +
-/// MIN_SUBJECT_W` of room, the author name elides and then drops out, and
-/// last the date drops out.
+/// before it. The subject wins: metadata only takes room the subject's full
+/// text leaves free (`subject_right` is where that text ends). As the room
+/// runs out the author name elides, then drops out, then the date drops out,
+/// and only then is the subject itself elided at the row's visible edge.
 fn columns(
     row: egui::Rect,
     visible: egui::Rect,
     date_w: f32,
     author_w: f32,
-    graph_w: f32,
+    subject_right: f32,
     s: f32,
 ) -> Columns {
     let right = row.right().min(visible.right()) - 6.0 * s;
     let hidden = egui::Rect::from_x_y_ranges(right..=right, row.y_range());
-    // Room the metadata may use without cutting into the subject's minimum.
-    let room = right - (row.left() + graph_w + MIN_SUBJECT_W * s);
-    if room < date_w + COL_GAP * s {
+    // Room the metadata may use without covering any of the subject.
+    let room = right - (subject_right + COL_GAP * s);
+    if room < date_w {
         let left = egui::Rect::from_x_y_ranges(row.left()..=right.max(row.left()), row.y_range());
         return Columns {
             left,
@@ -692,7 +700,7 @@ fn columns(
         };
     }
     let date = egui::Rect::from_x_y_ranges(right - date_w..=right, row.y_range());
-    let author_w = author_w.min(room - date_w - (NAME_GAP + COL_GAP) * s);
+    let author_w = author_w.min(room - date_w - NAME_GAP * s);
     let (author, meta_left) = if author_w >= MIN_AUTHOR_W * s {
         let author_right = date.left() - NAME_GAP * s;
         let author =
@@ -817,12 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn subject_wins_a_tight_pane_and_the_name_hugs_the_date() {
+    fn subject_wins_and_metadata_takes_only_what_it_leaves() {
         let rect =
             |x0: f32, x1: f32| egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x1, 28.0));
-        // Wide pane: date at the right edge, the name just before it at its
-        // own width, subject room before that.
-        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 40.0, 32.0, 1.0);
+        // Short subject: date at the right edge, the name just before it at
+        // its own width, the subject clip ending a gap before the name.
+        let wide = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 80.0, 40.0, 300.0, 1.0);
         assert_eq!(wide.date.right(), 994.0);
         assert_eq!(wide.author.right(), wide.date.left() - NAME_GAP);
         assert_eq!(wide.author.width(), 40.0);
@@ -833,39 +841,49 @@ mod tests {
             rect(0.0, 600.0),
             80.0,
             40.0,
-            32.0,
+            300.0,
             1.0,
         );
         assert_eq!(scrolled.date.right(), 594.0);
         assert!(scrolled.left.right() < scrolled.author.left());
-        // Tighter: the name elides so the subject keeps its minimum.
-        let squeezed = columns(rect(0.0, 300.0), rect(0.0, 300.0), 80.0, 100.0, 32.0, 1.0);
+        // Longer subject: the name elides so the subject stays whole.
+        let squeezed = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 100.0, 340.0, 1.0);
         assert!(squeezed.author.width() < 100.0 && squeezed.author.width() >= MIN_AUTHOR_W);
-        assert!(squeezed.left.right() >= 32.0 + MIN_SUBJECT_W);
-        // Tighter still: the name drops out, the date stays.
-        let no_name = columns(rect(0.0, 260.0), rect(0.0, 260.0), 80.0, 100.0, 32.0, 1.0);
+        assert!(squeezed.left.right() >= 340.0);
+        // Longer still: the name drops out, the date stays.
+        let no_name = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 100.0, 390.0, 1.0);
         assert_eq!(no_name.author.width(), 0.0);
         assert_eq!(no_name.date.width(), 80.0);
-        assert!(no_name.left.right() >= 32.0 + MIN_SUBJECT_W);
-        // Too narrow for any metadata: the subject gets the whole row.
-        let tight = columns(rect(0.0, 200.0), rect(0.0, 200.0), 80.0, 40.0, 32.0, 1.0);
-        assert_eq!((tight.author.width(), tight.date.width()), (0.0, 0.0));
-        assert_eq!(tight.left.right(), 194.0);
+        assert!(no_name.left.right() >= 390.0);
+        // Subject reaches the date's room: all metadata goes, the subject
+        // gets the whole visible row.
+        let long = columns(rect(0.0, 500.0), rect(0.0, 500.0), 80.0, 40.0, 420.0, 1.0);
+        assert_eq!((long.author.width(), long.date.width()), (0.0, 0.0));
+        assert_eq!(long.left.right(), 494.0);
         // Zoom scales every gap.
-        let zoomed = columns(rect(0.0, 1000.0), rect(0.0, 1000.0), 160.0, 80.0, 64.0, 2.0);
+        let zoomed = columns(
+            rect(0.0, 1000.0),
+            rect(0.0, 1000.0),
+            160.0,
+            80.0,
+            300.0,
+            2.0,
+        );
         assert_eq!(zoomed.author.right(), zoomed.date.left() - NAME_GAP * 2.0);
         assert_eq!(zoomed.date.right(), 988.0);
     }
 
     #[test]
-    fn narrow_pane_paints_date_at_visible_edge_and_elides_subject() {
+    fn narrow_pane_keeps_subjects_whole_and_drops_metadata_first() {
         let mut view = HistoryView::new(None);
         view.end = true;
         let mut graph = Graph::default();
-        let mut c = commit("only", &[]);
-        c.subject = "a very long subject ".repeat(20);
-        view.pages.push(vec![graph.push(c)]);
-        view.count = 1;
+        let mut short = commit("short", &["long"]);
+        short.subject = "short subject".into();
+        let mut long = commit("long", &[]);
+        long.subject = "a very long subject ".repeat(20);
+        view.pages.push(vec![graph.push(short), graph.push(long)]);
+        view.count = 2;
         let ctx = egui::Context::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 400.0));
         let mut out = None;
@@ -890,22 +908,37 @@ mod tests {
                 ));
             }
         }
-        let find = |needle: &str| texts.iter().find(|t| t.0.starts_with(needle)).unwrap();
-        let date = find("2026-09-23");
-        let author = find("Author");
-        let subject = find("a very long");
+        let all = |needle: &str| {
+            texts
+                .iter()
+                .filter(|t| t.0.starts_with(needle))
+                .collect::<Vec<_>>()
+        };
+        // Short subject: whole, with the name hugging the date at the edge.
+        let (dates, authors) = (all("2026-09-23"), all("Author"));
+        assert_eq!((dates.len(), authors.len()), (1, 1), "{texts:?}");
+        let (date, author) = (dates[0], authors[0]);
+        let subject = all("short subject")[0];
+        assert!(!subject.2, "{subject:?}");
         assert!(
             date.1.right() <= timeline_right && date.1.right() > timeline_right - 20.0,
             "{date:?} vs {timeline_right}"
         );
-        assert!(author.1.right() < date.1.left(), "{author:?} {date:?}");
         assert!(
             date.1.left() - author.1.right() <= NAME_GAP + 2.0,
             "name should hug the date: {author:?} {date:?}"
         );
         assert!(
-            subject.2 && subject.1.right() < author.1.left(),
+            subject.1.right() < author.1.left(),
             "{subject:?} {author:?}"
+        );
+        // Long subject: its row paints no metadata and the subject runs to
+        // the visible edge before eliding.
+        let long = all("a very long")[0];
+        assert!(long.2, "{long:?}");
+        assert!(
+            long.1.right() > timeline_right - 20.0 && long.1.right() <= timeline_right + 1.0,
+            "{long:?} vs {timeline_right}"
         );
     }
 
