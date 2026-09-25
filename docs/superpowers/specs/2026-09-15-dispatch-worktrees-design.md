@@ -180,6 +180,13 @@ what is actually left rather than the previous step's assumed state:
   it is empty and its parent is `<root>/.foreman/worktrees/`. A nonempty
   unregistered directory is kept and reported (git no longer tracks it, so
   nothing inside is provably ours) — even under Discard.
+- (Amended 2026-09-24.) Before `worktree remove`, a registered tree must
+  pass a hold probe: rename it to a sibling and back. A hold below the top
+  directory (a running exe from the tree's `target/`, a subdirectory cwd)
+  otherwise makes git delete part of the tree, stop, and drop the
+  registration regardless — a nonempty leftover the rule above keeps
+  forever. A failed probe is the errored row with the tree still registered
+  and whole, so a retry after the process exits completes.
 - Step 2 treats an already-missing branch as done; an existing branch keeps
   git's own `-d` / `-D` protection.
 - Nothing left at all is `Both removed`, so a repeated teardown clears the

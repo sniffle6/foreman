@@ -2304,9 +2304,12 @@ fn worktree_registered(project_cwd: &std::path::Path, path: &str) -> Result<bool
 /// deleted its contents AND its registration. Retrying git on that leftover
 /// fails forever ("not a working tree"), so:
 ///
-/// - registered + directory present → `git worktree remove` (retried
-///   briefly for a transient hold; a refusal that leaves the path
-///   unregistered falls through to the leftover rule);
+/// - registered + directory present → first `ensure_not_held` (a hold
+///   anywhere inside makes git delete part of the tree and drop the
+///   registration anyway, stranding a nonempty leftover the rule below must
+///   keep forever), then `git worktree remove` (retried briefly for a
+///   transient hold; a refusal that leaves the path unregistered falls
+///   through to the leftover rule);
 /// - registered + directory gone → `git worktree prune`;
 /// - unregistered → the leftover rule: remove the directory only when it is
 ///   EMPTY and sits under `<root>/.foreman/worktrees/`. Git no longer tracks
@@ -2318,6 +2321,7 @@ fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Res
         if !tree.is_dir() {
             return git(project_cwd, &["worktree", "prune"]).map(|_| ());
         }
+        ensure_not_held(tree)?;
         match git_worktree_remove(project_cwd, &wt.path, force) {
             Ok(()) => return Ok(()),
             Err(e) if is_dirty_refusal(&e) => return Err(e),
@@ -2332,6 +2336,43 @@ fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Res
         }
     }
     remove_leftover_dir(project_cwd, tree)
+}
+
+/// Windows refuses to rename a directory while anything inside it is open
+/// without delete sharing — a running exe, a shell's cwd — which is exactly
+/// what stops git's recursive delete partway. Renaming the tree to a sibling
+/// and straight back proves nothing holds it before git deletes anything.
+/// Retried briefly like `git_worktree_remove`: the worker's shell may have
+/// only just exited. Elsewhere open files do not block deletion; no probe.
+fn ensure_not_held(tree: &std::path::Path) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let mut probe = tree.as_os_str().to_owned();
+    probe.push(".teardown-probe");
+    let probe = std::path::PathBuf::from(probe);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::rename(tree, &probe) {
+            Ok(()) => {
+                return std::fs::rename(&probe, tree).map_err(|e| {
+                    format!(
+                        "cannot move worktree back from {} to {}: {e}",
+                        probe.display(),
+                        tree.display()
+                    )
+                });
+            }
+            Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(400)),
+            Err(e) => {
+                return Err(format!(
+                    "worktree is in use by a running process (a program started from inside it, or a shell whose directory is inside it); close it and retry: {} ({e})",
+                    tree.display()
+                ));
+            }
+        }
+    }
 }
 
 fn is_dirty_refusal(err: &str) -> bool {
@@ -3521,6 +3562,59 @@ mod tests {
                 "the branch step does not run after a kept directory"
             );
         }
+    }
+
+    /// A process holding something deep in the tree (a debug build launched
+    /// from `target/`, a shell cd'd into a subdirectory) used to make git
+    /// delete part of the tree, fail on the held entry, and drop the
+    /// registration anyway — a nonempty unregistered leftover no retry could
+    /// clear. The hold must be reported with the tree still registered and
+    /// whole, and a retry after the process exits must finish the job.
+    #[cfg(windows)]
+    #[test]
+    fn teardown_reports_a_held_tree_without_touching_it() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        // Ignored build output, like `target/`, sorting after the tracked file.
+        std::fs::write(tree.join(".gitignore"), "/z/\n").unwrap();
+        git_in(tree, &["add", ".gitignore"]);
+        git_in(tree, &["commit", "-q", "-m", "ignore z"]);
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        let held = tree.join("z");
+        std::fs::create_dir(&held).unwrap();
+        // Spawned directly: a `cmd /c` wrapper's grandchild would survive
+        // the kill below and keep holding the directory.
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .current_dir(&held)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let outcome = teardown_worktree(repo.path(), &wt, true);
+        let registered = worktree_registered(repo.path(), &wt.path).unwrap();
+        let file_kept = tree.join("f.txt").exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        match outcome {
+            TeardownOutcome::Failed(e) => {
+                assert!(e.contains("in use"), "actionable message, got: {e}");
+                assert!(e.contains(&wt.path), "names the directory, got: {e}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(registered, "still a git worktree, so a retry can finish");
+        assert!(file_kept, "nothing deleted");
+        assert!(held.is_dir());
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
     }
 
     #[test]

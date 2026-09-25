@@ -318,6 +318,16 @@ its base (`docs/integration-queue.md`).
   teardown is harmless. A nonempty unregistered directory is never deleted
   (git no longer tracks it, so nothing in it is provably ours) — the error
   toast names it; inspect and delete it by hand.
+- **A process running from inside the tree blocks teardown up front.** A
+  hold deeper than the top directory — a debug build launched from the
+  tree's `target/` (the screenshot flow leaves one running), a shell cd'd
+  into a subdirectory — used to make git delete up to the held entry
+  (alphabetically), stop, and drop the registration anyway: a nonempty
+  leftover the rule above keeps forever. Before git runs, teardown renames
+  the tree to a sibling and straight back; Windows refuses that while
+  anything inside is open, so the toast says "worktree is in use" and
+  nothing is touched. Close the process; the next launch's leftover retry
+  (or Discard) finishes the job.
 - **Each worktree cold-builds.** It has its own `target/`; the first build
   costs minutes (`docs/dev-launcher.md` forbids sharing a target dir). Minutes
   of compile beat corrupted commits.
