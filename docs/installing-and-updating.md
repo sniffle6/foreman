@@ -28,8 +28,8 @@ version exists. Spec with the full decision history:
 
 - **One-click apply (Phase 4, current)**: clicking the chip on an applicable
   release downloads the zip and checksums, verifies the SHA-256, and swaps the
-  running exe and its GUI launcher for the new versions (`*.exe` → `.old`,
-  `.new` → `*.exe`).
+  running `foreman.exe` and its `foreman.com` CLI shim for the new versions
+  (`foreman.exe` → `.old`, `.new` → `foreman.exe`).
   The chip then reads "Restart to update"; a first click arms it ("Restart? N
   sessions close"), a second click within 5 s actually restarts (spawns the
   new exe, which waits out the old process, then the old one exits), and
@@ -97,10 +97,10 @@ instead of publishing.
   the old process out) — never set this by hand.
 - The collapsed-rail glyph (`↓`/`↻`/`!`) is steady, not pulsing — a deliberate
   simplification from the original spec's animated cell.
-- The swap replaces `foreman.exe` and `foreman-gui.exe` with the two-rename
-  dance, staged in `%TEMP%\foreman-update`. An existing Foreman Start-menu
-  shortcut pointing at `foreman.exe` is migrated to `foreman-gui.exe` on update;
-  custom shortcuts are left alone. The updater does not touch licenses or PATH.
+- The swap replaces `foreman.com` then `foreman.exe` with the two-rename
+  dance, staged in `%TEMP%\foreman-update`; an install without `foreman.com`
+  gets it by plain rename. The updater does not touch licenses, shortcuts, or
+  PATH.
   Only the GUI process cleans up leftover `.old` files at startup, never the
   CLI verbs (`foreman open`/`status`/...), so cleanup cannot race a concurrent
   update download from a dispatching agent.
@@ -111,11 +111,25 @@ instead of publishing.
   call `exit` (it runs under `iex` in the user's shell — it uses `return`).
 - Unauthenticated GitHub API is limited to 60 requests/h/IP; the 6 h cadence
   keeps foreman far under it.
-- `foreman.exe` is console-subsystem in every build so PowerShell waits for CLI
-  verbs and sets `$LASTEXITCODE`. CLI verbs adopt the parent console via
-  `attach_parent_console`. `foreman-gui.exe` is a GUI-subsystem launcher for
-  the Start-menu shortcut and double-click use; it starts `foreman.exe` without
-  allocating a console window. The in-app restart does the same.
+- **Two executables, on purpose.** Release `foreman.exe` is GUI-subsystem, so
+  a shortcut, pin, or double-click never opens a console window. PowerShell
+  and cmd don't wait for GUI executables, so `foreman.com` (built from
+  `src/bin/foreman-cli.rs`, renamed at packaging) is a console-subsystem shim:
+  it runs `foreman.exe` with the same args and returns its exit code. Shells
+  resolve bare `foreman` to `.com` before `.exe` (PATHEXT order), and
+  `FOREMAN_EXE` points at the shim when it exists. Git Bash still resolves
+  `foreman` to the `.exe`, which is fine: Bash waits for GUI executables.
+  CLI verbs in `foreman.exe` adopt the parent console via
+  `attach_parent_console`. Debug builds are console-subsystem and have no shim
+  in their dir, so `FOREMAN_EXE` is the exe itself. CI fails the release if
+  either file ships with the wrong subsystem.
+- **Never make `foreman.exe` console-subsystem.** v0.5.5 did, to fix
+  PowerShell waiting; every existing shortcut and pin opened a console window
+  beside the app, and the fix rode on a launcher that the old updater never
+  installed. `foreman-gui.exe` is that launcher's leftover: it still ships
+  because the v0.5.5 updater fails on a zip without it, and a Start-menu
+  shortcut that updater pointed at it gets pointed back at `foreman.exe` at
+  startup (`update::restore_start_menu_shortcut`).
 
 ## Key files
 
@@ -129,7 +143,8 @@ instead of publishing.
   `paint_rail_update_glyph` (collapsed rails, steady glyph).
 - `src/main.rs` — App wiring: event drain, chip state hand-off, release-only
   spawn gating, the restart handshake (`FOREMAN_WAIT_PID`, `restart_for_update`).
-- `src/bin/foreman-gui.rs` — GUI-subsystem launcher used by the shortcut.
+- `src/bin/foreman-cli.rs` — the `foreman.com` console shim.
+- `src/bin/foreman-gui.rs` — legacy v0.5.5 launcher, shipped for compat only.
 - `src/control.rs` — pipe-creation retry (`listen_retry`) so a restarted
   instance wins `\\.\pipe\foreman` even if the old one lingers a beat past
   the restart handshake's wait.

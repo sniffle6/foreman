@@ -1,6 +1,9 @@
-// Keep this executable console-subsystem in every build. PowerShell only waits
-// for console executables and only then sets $LASTEXITCODE. The Start-menu
-// shortcut launches the GUI through the GUI-subsystem foreman-gui.exe sibling.
+// Release builds are GUI-subsystem so launching foreman.exe from Explorer, a
+// shortcut, or a taskbar pin never opens a console window. Debug builds stay
+// console-subsystem so eprintln/panic output lands somewhere during
+// development. Shells reach the CLI through the console-subsystem foreman.com
+// shim (src/bin/foreman-cli.rs), which PowerShell and cmd waits on.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent_command;
 mod agent_hooks;
@@ -432,10 +435,8 @@ impl App {
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        use std::os::windows::process::CommandExt;
         match std::process::Command::new(&exe)
             .env("FOREMAN_WAIT_PID", std::process::id().to_string())
-            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .spawn()
         {
             Ok(_) => {
@@ -1381,6 +1382,7 @@ fn main() -> eframe::Result {
     // staging-dir delete here can't race a concurrent update download (agents
     // dispatch these constantly from inside terminals while the app updates).
     update::cleanup_leftovers();
+    update::restore_start_menu_shortcut();
     install_panic_logger();
     // Gate on `Settings::install_skills` / `Settings::update_check` — both take
     // effect next launch (their menu rows already say "on launch"). Loaded once

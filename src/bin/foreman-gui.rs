@@ -1,4 +1,7 @@
-//! GUI-subsystem entry point for the console-subsystem foreman executable.
+//! Legacy launcher from v0.5.5, when foreman.exe was briefly console-subsystem.
+//! foreman.exe is GUI-subsystem again, so nothing new points here. It still
+//! ships because the v0.5.5 updater fails a swap whose zip lacks it, and
+//! shortcuts that updater retargeted here must keep working.
 #![windows_subsystem = "windows"]
 
 use std::os::windows::process::CommandExt;

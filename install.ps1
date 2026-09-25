@@ -43,6 +43,9 @@ try {
 
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     Expand-Archive -Path $zipPath -DestinationPath $dest -Force
+    # The zip carries foreman-gui.exe only for the v0.5.5 updater; a fresh
+    # install points its shortcut at foreman.exe and never needs it.
+    Remove-Item -LiteralPath (Join-Path $dest 'foreman-gui.exe') -ErrorAction SilentlyContinue
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (($userPath -split ';') -notcontains $dest) {
@@ -54,7 +57,7 @@ try {
     # Exe path is stable across updates, so re-creating is harmless.
     $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
     $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $sc.TargetPath = Join-Path $dest 'foreman-gui.exe'
+    $sc.TargetPath = Join-Path $dest 'foreman.exe'
     $sc.WorkingDirectory = $dest
     $sc.Save()
     Write-Host "foreman $($rel.tag_name) installed to $dest" -ForegroundColor Green

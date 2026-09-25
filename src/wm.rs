@@ -1411,8 +1411,13 @@ impl WindowManager {
             v.push(("FOREMAN_PROJECT_ID".to_string(), t.clone()));
         }
         // The client needs to find this exe; PATH won't have target\debug.
+        // Prefer the console-subsystem foreman.com shim beside an installed
+        // GUI-subsystem foreman.exe: `& $env:FOREMAN_EXE` in PowerShell only
+        // waits and sets $LASTEXITCODE for a console executable.
         if let Ok(exe) = std::env::current_exe() {
-            v.push(("FOREMAN_EXE".to_string(), exe.display().to_string()));
+            let shim = exe.with_file_name("foreman.com");
+            let cli = if shim.is_file() { shim } else { exe };
+            v.push(("FOREMAN_EXE".to_string(), cli.display().to_string()));
         }
         // This instance's own control pipe, so the CLI inside this terminal
         // reaches the host that spawned it even when several foremans run

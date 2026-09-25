@@ -430,41 +430,56 @@ pub fn swap_exe(exe: &std::path::Path) -> Result<(), String> {
 
 // Startup best-effort: a prior run's leftover .old (never cleaned because the
 // process using it had already restarted) and any abandoned staging dir.
+// foreman-gui.exe leftovers come from the v0.5.5 updater's swap.
 pub fn cleanup_leftovers() {
     if let Ok(exe) = std::env::current_exe() {
+        for name in ["foreman.com", "foreman-gui.exe"] {
+            let p = exe.with_file_name(name);
+            let _ = std::fs::remove_file(sibling(&p, ".old"));
+            let _ = std::fs::remove_file(sibling(&p, ".new"));
+        }
         let _ = std::fs::remove_file(sibling(&exe, ".old"));
         let _ = std::fs::remove_file(sibling(&exe, ".new"));
-        let gui = exe.with_file_name("foreman-gui.exe");
-        let _ = std::fs::remove_file(sibling(&gui, ".old"));
-        let _ = std::fs::remove_file(sibling(&gui, ".new"));
     }
     let _ = std::fs::remove_dir_all(staging_dir());
 }
 
-// An older install's Start-menu shortcut still points at foreman.exe. Once
-// the GUI launcher is in place, retarget only Foreman's own shortcut. This is
-// best effort: a missing/custom shortcut must not prevent a verified update.
-fn migrate_start_menu_shortcut(exe: &std::path::Path, gui: &std::path::Path) {
-    use std::os::windows::process::CommandExt;
-    const SCRIPT: &str = r#"
-        $link = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
-        if (Test-Path -LiteralPath $link) {
-            $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
-            if ([string]::Equals($shortcut.TargetPath, $env:FOREMAN_SHORTCUT_OLD, [StringComparison]::OrdinalIgnoreCase)) {
-                $shortcut.TargetPath = $env:FOREMAN_SHORTCUT_NEW
-                $shortcut.Save()
-            }
-        }
-    "#;
-    let result = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-        .env("FOREMAN_SHORTCUT_OLD", exe)
-        .env("FOREMAN_SHORTCUT_NEW", gui)
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .status();
-    if !result.is_ok_and(|status| status.success()) {
-        eprintln!("update: could not migrate Start-menu shortcut; rerun install.ps1 to refresh it");
+// v0.5.5 made foreman.exe console-subsystem and its updater retargeted the
+// Start-menu shortcut at a foreman-gui.exe launcher. foreman.exe is GUI again,
+// so point that shortcut straight back at it: a shortcut whose target is not
+// the window's own exe gets a separate taskbar button. Only runs while the
+// launcher exists, and only touches a shortcut that targets it. Best effort,
+// off the UI thread.
+pub fn restore_start_menu_shortcut() {
+    if cfg!(debug_assertions) {
+        return;
     }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let gui = exe.with_file_name("foreman-gui.exe");
+    if !gui.is_file() {
+        return;
+    }
+    std::thread::spawn(move || {
+        use std::os::windows::process::CommandExt;
+        const SCRIPT: &str = r#"
+            $link = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foreman.lnk'
+            if (Test-Path -LiteralPath $link) {
+                $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($link)
+                if ([string]::Equals($shortcut.TargetPath, $env:FOREMAN_SHORTCUT_OLD, [StringComparison]::OrdinalIgnoreCase)) {
+                    $shortcut.TargetPath = $env:FOREMAN_SHORTCUT_NEW
+                    $shortcut.Save()
+                }
+            }
+        "#;
+        let _ = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .env("FOREMAN_SHORTCUT_OLD", &gui)
+            .env("FOREMAN_SHORTCUT_NEW", &exe)
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .status();
+    });
 }
 
 struct Staged {
@@ -581,25 +596,29 @@ fn verify_and_swap(st: &Staged) -> Event {
         Ok(e) => e,
         Err(_) => return Event::SwapFailed,
     };
-    let gui = exe.with_file_name("foreman-gui.exe");
+    // foreman.com is the console shim shells run for CLI verbs. Swap it
+    // first and foreman.exe last, so a failure leaves the old app in place.
+    // An install that predates the shim gets it by a plain rename. The
+    // foreman-gui.exe launcher in the zip is only for the v0.5.5 updater;
+    // this one leaves any copy on disk alone.
+    let com = exe.with_file_name("foreman.com");
     if let Err(e) = extract_exe(&st.zip_path, "foreman.exe", &sibling(&exe, ".new")) {
         eprintln!("update: extract failed: {e}");
         return Event::SwapFailed;
     }
-    if let Err(e) = extract_exe(&st.zip_path, "foreman-gui.exe", &sibling(&gui, ".new")) {
+    if let Err(e) = extract_exe(&st.zip_path, "foreman.com", &sibling(&com, ".new")) {
         eprintln!("update: extract failed: {e}");
         return Event::SwapFailed;
     }
-    let gui_result = if gui.exists() {
-        swap_exe(&gui)
+    let com_result = if com.exists() {
+        swap_exe(&com)
     } else {
-        std::fs::rename(sibling(&gui, ".new"), &gui).map_err(|e| e.to_string())
+        std::fs::rename(sibling(&com, ".new"), &com).map_err(|e| e.to_string())
     };
-    if let Err(e) = gui_result {
-        eprintln!("update: GUI launcher swap failed: {e}");
+    if let Err(e) = com_result {
+        eprintln!("update: CLI shim swap failed: {e}");
         return Event::SwapFailed;
     }
-    migrate_start_menu_shortcut(&exe, &gui);
     match swap_exe(&exe) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(staging_dir());
@@ -1208,17 +1227,17 @@ mod tests {
         w.write_all(b"DECOY-BYTES").unwrap();
         w.start_file("foreman.exe", opts).unwrap();
         w.write_all(b"NEW-EXE-BYTES").unwrap();
-        w.start_file("foreman-gui.exe", opts).unwrap();
-        w.write_all(b"NEW-GUI-BYTES").unwrap();
+        w.start_file("foreman.com", opts).unwrap();
+        w.write_all(b"NEW-COM-BYTES").unwrap();
         w.start_file("LICENSE", opts).unwrap();
         w.write_all(b"license").unwrap();
         w.finish().unwrap();
         let dest = dir.join("foreman.exe.new");
         extract_exe(&zip_path, "foreman.exe", &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW-EXE-BYTES");
-        let gui = dir.join("foreman-gui.exe.new");
-        extract_exe(&zip_path, "foreman-gui.exe", &gui).unwrap();
-        assert_eq!(std::fs::read(&gui).unwrap(), b"NEW-GUI-BYTES");
+        let com = dir.join("foreman.com.new");
+        extract_exe(&zip_path, "foreman.com", &com).unwrap();
+        assert_eq!(std::fs::read(&com).unwrap(), b"NEW-COM-BYTES");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

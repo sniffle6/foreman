@@ -50,21 +50,14 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: PowerShell CLI smoke
-        run: |
-          & target/release/foreman.exe kanban --help
-          if ($LASTEXITCODE -ne 0) { throw "help exited $LASTEXITCODE" }
-          & target/release/foreman.exe kanban nonsense
-          if ($LASTEXITCODE -ne 2) { throw "bad command exited $LASTEXITCODE" }
-          $helpText = & target/release/foreman.exe kanban --help
-          if (($helpText -join "`n") -notmatch 'foreman kanban wait') { throw 'help text missing from stdout' }
-
       - name: Package
         run: |
           $v = '${{ steps.ver.outputs.version }}'
           $zip = "foreman-v$v-x86_64-windows.zip"
           New-Item -ItemType Directory staging | Out-Null
           Copy-Item target/release/foreman.exe staging/
+          Copy-Item target/release/foreman-cli.exe staging/foreman.com
+          # Legacy launcher: the v0.5.5 updater refuses a zip without it.
           Copy-Item target/release/foreman-gui.exe staging/
           Copy-Item LICENSE-MIT, LICENSE-APACHE staging/
           Copy-Item assets/fonts/LICENSE-Hack.md staging/THIRD-PARTY-Hack-font.md
@@ -73,6 +66,23 @@ jobs:
           $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           "$h  $zip" | Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt
+
+      - name: Subsystem and PowerShell CLI smoke
+        run: |
+          # PE optional-header Subsystem: 2 = GUI (no console window), 3 = console.
+          function Subsystem($path) {
+            $b = [IO.File]::ReadAllBytes((Resolve-Path $path))
+            $pe = [BitConverter]::ToInt32($b, 0x3c)
+            [BitConverter]::ToUInt16($b, $pe + 24 + 68)
+          }
+          if ((Subsystem staging/foreman.exe) -ne 2) { throw 'foreman.exe must be GUI-subsystem: a console one opens a console window on launch' }
+          if ((Subsystem staging/foreman.com) -ne 3) { throw 'foreman.com must be console-subsystem: PowerShell only waits for console executables' }
+          & staging/foreman.com kanban --help
+          if ($LASTEXITCODE -ne 0) { throw "help exited $LASTEXITCODE" }
+          & staging/foreman.com kanban nonsense
+          if ($LASTEXITCODE -ne 2) { throw "bad command exited $LASTEXITCODE" }
+          $helpText = & staging/foreman.com kanban --help
+          if (($helpText -join "`n") -notmatch 'foreman kanban wait') { throw 'help text missing from stdout' }
 
       - name: Upload dry-run artifacts
         if: "!startsWith(github.ref, 'refs/tags/')"
