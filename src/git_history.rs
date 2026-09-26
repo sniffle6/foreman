@@ -31,6 +31,13 @@ const FADE_W: f32 = 32.0;
 const COL_GAP: f32 = 12.0;
 const NAME_GAP: f32 = 6.0;
 const MIN_SUBJECT_W: f32 = 120.0;
+/// Branch counts above this show a filter field in the scope dropdown.
+const FILTER_MIN: usize = 8;
+/// Unscaled height of the scope dropdown's menu, fixed from its first frame.
+/// egui sizes a popup once, the first time it is shown, and its scroll area
+/// never grows past that; a menu that opens on a spinner and then fills with
+/// branches would stay spinner-sized and clip every branch row.
+const MENU_H: f32 = 360.0;
 const COLORS: [egui::Color32; 6] = [
     egui::Color32::from_rgb(116, 176, 164),
     egui::Color32::from_rgb(231, 169, 63),
@@ -328,6 +335,12 @@ pub struct HistoryView {
     scope: scope::Scope,
     /// The resolved scope's name for the header; `None` until the first page.
     label: Option<String>,
+    /// The dropdown's branch list, read on a worker each time it opens.
+    branches: Option<Result<scope::Branches, String>>,
+    branch_rx: Option<mpsc::Receiver<Result<scope::Branches, String>>>,
+    /// Whether the dropdown was open last frame, to spot it opening.
+    popup_open: bool,
+    filter: String,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
     #[cfg(test)]
@@ -336,6 +349,12 @@ pub struct HistoryView {
     header_button_h: f32,
     #[cfg(test)]
     refresh_btn: egui::Rect,
+    #[cfg(test)]
+    scope_rows: Vec<(String, egui::Rect)>,
+    #[cfg(test)]
+    scope_btn: egui::Rect,
+    #[cfg(test)]
+    filter_rect: Option<egui::Rect>,
 }
 impl Drop for HistoryView {
     fn drop(&mut self) {
@@ -372,6 +391,10 @@ impl HistoryView {
             details_w: None,
             scope: scope::Scope::default(),
             label: None,
+            branches: None,
+            branch_rx: None,
+            popup_open: false,
+            filter: String::new(),
             #[cfg(test)]
             drawn: 0..0,
             #[cfg(test)]
@@ -380,6 +403,12 @@ impl HistoryView {
             header_button_h: 0.0,
             #[cfg(test)]
             refresh_btn: egui::Rect::NOTHING,
+            #[cfg(test)]
+            scope_rows: Vec::new(),
+            #[cfg(test)]
+            scope_btn: egui::Rect::NOTHING,
+            #[cfg(test)]
+            filter_rect: None,
         }
     }
     fn request(&mut self) {
@@ -428,6 +457,136 @@ impl HistoryView {
                 _ => {}
             }
         }
+        if let Some(rx) = &self.branch_rx
+            && let Ok(branches) = rx.try_recv()
+        {
+            self.branches = Some(branches);
+            self.branch_rx = None;
+        }
+    }
+    /// Start over on `scope`. Retires the old rows off the GUI thread and
+    /// keeps the details pane width. A scope change keeps the selected
+    /// commit (it is still a valid commit); Refresh clears it.
+    fn restart(&mut self, ctx: &egui::Context, scope: scope::Scope, keep_selection: bool) {
+        let cwd = self.cwd.clone();
+        let generation = self.generation + 1;
+        let mut old = std::mem::replace(self, Self::new(cwd));
+        self.details_w = old.details_w;
+        self.scope = scope;
+        // The old name stays until the worker resolves the new scope.
+        self.label = old.label.take();
+        if keep_selection {
+            std::mem::swap(&mut self.details, &mut old.details);
+        }
+        if let Some(stream) = &old.stream {
+            stream.cancel.store(true, Ordering::Relaxed);
+        }
+        std::thread::spawn(move || drop(old));
+        self.generation = generation;
+        ctx.request_repaint();
+    }
+
+    fn load_branches(&mut self, ctx: &egui::Context) {
+        self.filter.clear();
+        self.branch_rx = None;
+        let Some(cwd) = self.cwd.clone() else {
+            self.branches = Some(Err("This project has no directory".into()));
+            return;
+        };
+        self.branches = None;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(scope::branches(&cwd, &Arc::new(AtomicBool::new(false))));
+            ctx.request_repaint();
+        });
+        self.branch_rx = Some(rx);
+    }
+
+    /// The dropdown's rows; returns the scope the human clicked.
+    fn scope_menu(&mut self, ui: &mut egui::Ui) -> Option<scope::Scope> {
+        use scope::Scope;
+        let th = crate::theme::live(ui.ctx());
+        let s = crate::view_scale::ViewScale::from_ctx(ui.ctx()).factor();
+        ui.set_min_width(220.0 * s);
+        ui.set_min_height(MENU_H * s);
+        #[cfg(test)]
+        {
+            self.scope_rows.clear();
+            self.filter_rect = None;
+        }
+        let mut pick = None;
+        let current = match &self.branches {
+            Some(Ok(b)) => scope::current_row(b.head.as_deref(), b.upstream.as_deref()),
+            _ => "Current branch".to_string(),
+        };
+        for (scope, text) in [
+            (Scope::Current, current),
+            (Scope::Local, "Local branches".to_string()),
+            (Scope::All, "All".to_string()),
+        ] {
+            let response = menu_row(ui, self.scope == scope, &text);
+            #[cfg(test)]
+            self.scope_rows.push((text.clone(), response.rect));
+            if response.clicked() {
+                pick = Some(scope);
+            }
+        }
+        ui.separator();
+        let branches = self.branches.take();
+        match &branches {
+            None => {
+                ui.spinner();
+            }
+            Some(Err(error)) => {
+                ui.colored_label(th.dim, error);
+            }
+            Some(Ok(b)) => {
+                if b.local.len() + b.cards.len() + b.remote.len() > FILTER_MIN {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("filter…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    #[cfg(test)]
+                    {
+                        self.filter_rect = Some(field.rect);
+                    }
+                    #[cfg(not(test))]
+                    let _ = field;
+                }
+                let needle = self.filter.to_lowercase();
+                for (heading, refs) in [
+                    ("LOCAL", &b.local),
+                    ("CARDS", &b.cards),
+                    ("REMOTE", &b.remote),
+                ] {
+                    let shown: Vec<&String> = refs
+                        .iter()
+                        .filter(|r| scope::short(r).to_lowercase().contains(&needle))
+                        .collect();
+                    if shown.is_empty() {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(heading).small().color(th.dim));
+                    for r in shown {
+                        let scope = Scope::Branch(r.clone());
+                        let response = menu_row(ui, self.scope == scope, scope::short(r));
+                        #[cfg(test)]
+                        self.scope_rows
+                            .push((scope::short(r).to_string(), response.rect));
+                        if response.clicked() {
+                            pick = Some(scope);
+                        }
+                    }
+                }
+            }
+        }
+        self.branches = branches;
+        if pick.is_some() {
+            ui.close();
+        }
+        pick
     }
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         self.poll(ui.ctx());
@@ -446,9 +605,29 @@ impl HistoryView {
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
         zoom.apply(&mut child);
         let mut refresh = false;
+        let mut pick = None;
         child.horizontal(|ui| {
             let label = self.label.clone().unwrap_or_else(|| "…".into());
-            ui.label(egui::RichText::new(label).color(th.text).strong());
+            let combo = egui::ComboBox::from_id_salt(base.with("scope"))
+                .selected_text(egui::RichText::new(label).color(th.text).strong())
+                // Clicks in the filter field must not close it; rows close it
+                // themselves with `ui.close()`.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                // The combo's own scroll area holds the whole list; a second
+                // `ScrollArea` nested inside it collapses to a sliver.
+                .height(MENU_H * s)
+                .popup_style(zoom.popup_style())
+                .show_ui(ui, |ui| self.scope_menu(ui));
+            #[cfg(test)]
+            {
+                self.scope_btn = combo.response.rect;
+            }
+            let open = combo.inner.is_some();
+            if open && !self.popup_open {
+                self.load_branches(ui.ctx());
+            }
+            self.popup_open = open;
+            pick = combo.inner.flatten();
             ui.label(
                 egui::RichText::new(format!(
                     "{} commits{}",
@@ -469,20 +648,13 @@ impl HistoryView {
             refresh = button.clicked();
         });
         if refresh {
-            let cwd = self.cwd.clone();
-            let generation = self.generation + 1;
-            let details_w = self.details_w;
-            // Retire potentially large cached histories off the GUI thread.
-            let old = std::mem::replace(self, Self::new(cwd));
-            self.details_w = details_w;
-            self.scope = old.scope.clone();
-            self.label = old.label.clone();
-            if let Some(stream) = &old.stream {
-                stream.cancel.store(true, Ordering::Relaxed);
-            }
-            std::thread::spawn(move || drop(old));
-            self.generation = generation;
-            child.ctx().request_repaint();
+            self.restart(child.ctx(), self.scope.clone(), false);
+            return;
+        }
+        if let Some(scope) = pick
+            && scope != self.scope
+        {
+            self.restart(child.ctx(), scope, true);
             return;
         }
         if let Some(error) = &self.error {
@@ -701,6 +873,19 @@ impl HistoryView {
             self.acts.push(HistoryAct::OpenDiff(target));
         }
     }
+}
+
+/// One dropdown row: the theme's selectable label, with a check on the
+/// current choice.
+fn menu_row(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
+    ui.selectable_label(
+        on,
+        if on {
+            format!("{text}  ✓")
+        } else {
+            text.to_owned()
+        },
+    )
 }
 
 fn meta_w(date_w: f32, s: f32) -> f32 {
@@ -1343,5 +1528,141 @@ mod tests {
                 "{scope:?} walked the stash: {subjects:?}"
             );
         }
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut HistoryView,
+        rect: egui::Rect,
+        base: egui::Id,
+        events: Vec<egui::Event>,
+    ) {
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            },
+            |ui| view.show(ui, rect, base),
+        );
+    }
+    fn click_at(
+        ctx: &egui::Context,
+        view: &mut HistoryView,
+        rect: egui::Rect,
+        base: egui::Id,
+        pos: egui::Pos2,
+    ) {
+        frame(ctx, view, rect, base, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            let press = egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(ctx, view, rect, base, vec![press]);
+        }
+    }
+    /// Draw frames until `done` holds; workers answer between frames.
+    fn settle(
+        ctx: &egui::Context,
+        view: &mut HistoryView,
+        rect: egui::Rect,
+        base: egui::Id,
+        done: impl Fn(&HistoryView) -> bool,
+    ) {
+        let start = std::time::Instant::now();
+        while !done(view) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "view never settled"
+            );
+            frame(ctx, view, rect, base, vec![]);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn scope_dropdown_picks_a_branch_and_keeps_the_selected_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "History Test"]);
+        git(dir, &["config", "user.email", "history@example.test"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Root"]);
+        git(dir, &["checkout", "-b", "topic"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Topic"]);
+        git(dir, &["checkout", "main"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Main"]);
+        // More than FILTER_MIN branches, so the filter field shows.
+        for i in 0..9 {
+            git(dir, &["branch", &format!("card/c{i}")]);
+        }
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let base = egui::Id::new("scope-pick");
+        let mut view = HistoryView::new(Some(dir.into()));
+        settle(&ctx, &mut view, rect, base, |v| v.end);
+        assert_eq!(view.label.as_deref(), Some("main"));
+        let main = view.pages[0][0].commit.hash.clone();
+        view.details.select(dir.into(), main.clone(), ctx.clone());
+
+        let btn = view.scope_btn.center();
+        click_at(&ctx, &mut view, rect, base, btn);
+        settle(&ctx, &mut view, rect, base, |v| {
+            v.scope_rows.iter().any(|(n, _)| n == "topic")
+        });
+        // No upstream is configured, so the Current row is just the branch.
+        assert_eq!(view.scope_rows[0].0, "main");
+        // Clicking the filter field must not close the popup.
+        let filter = view
+            .filter_rect
+            .expect("more than FILTER_MIN branches show the filter");
+        click_at(&ctx, &mut view, rect, base, filter.center());
+        frame(&ctx, &mut view, rect, base, vec![]);
+        assert!(view.popup_open, "the filter click closed the popup");
+
+        let topic = view
+            .scope_rows
+            .iter()
+            .find(|(n, _)| n == "topic")
+            .unwrap()
+            .1;
+        click_at(&ctx, &mut view, rect, base, topic.center());
+        assert_eq!(view.scope, scope::Scope::Branch("refs/heads/topic".into()));
+        assert_eq!(
+            view.details.selected(),
+            Some(main.as_str()),
+            "details keep the commit"
+        );
+        settle(&ctx, &mut view, rect, base, |v| v.end);
+        let subjects: Vec<&str> = view
+            .pages
+            .iter()
+            .flatten()
+            .map(|r| r.commit.subject.as_str())
+            .collect();
+        assert_eq!(subjects, ["Topic", "Root"]);
+        assert_eq!(view.label.as_deref(), Some("topic"));
+        assert!(!view.popup_open, "a pick closes the popup");
+    }
+
+    #[test]
+    fn scope_dropdown_without_a_directory_still_offers_the_scopes() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let base = egui::Id::new("scope-none");
+        let mut view = HistoryView::new(None);
+        frame(&ctx, &mut view, rect, base, vec![]);
+        let btn = view.scope_btn.center();
+        click_at(&ctx, &mut view, rect, base, btn);
+        frame(&ctx, &mut view, rect, base, vec![]);
+        let names: Vec<&str> = view.scope_rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Current branch", "Local branches", "All"]);
+        assert!(
+            matches!(view.branches, Some(Err(_))),
+            "no Git ran without a directory"
+        );
     }
 }
