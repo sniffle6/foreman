@@ -8,9 +8,34 @@ help or keybindings editor. Opening again surfaces the existing window, includin
 a minimized window or an inactive tab. It floats initially and supports the same
 tiling, tabbing, zoom, and workspace restore behavior as other viewers.
 
-The timeline shows commits reachable from all refs and HEAD in topological
-order, with colored branch/merge lanes, commit subjects, branch/tag decorations,
-authors, and author dates. The subject sits beside the graph and ref chips; the
+The timeline shows commits in topological order, with colored branch/merge
+lanes, commit subjects, branch/tag decorations, authors, and author dates.
+Which commits it walks is the **scope**, picked from the dropdown at the left
+of the header:
+
+- **Current** (the default, shown as the branch name): `HEAD` plus its
+  upstream. `Detached HEAD` when detached.
+- **Local branches**: `HEAD` and every local branch, `card/*` included.
+- **All**: `HEAD`, local and remote branches, and tags. Unlike `git log
+  --all` it skips `refs/stash` (stash commits draw as fake merges) and other
+  tools' private refs.
+- **One branch**: any branch from the list below the scopes, grouped Local /
+  Cards / Remote, with a filter once there are more than eight.
+
+The branch list is read fresh each time the dropdown opens. Picking restarts
+the read and keeps the selected commit in the details pane. The scope
+survives Refresh but not closing the window: a new History window starts on
+Current. If a picked branch is deleted (a finished card), the next read falls
+back to Current. Resolution lives in `src/git_history/scope.rs` (`resolve`,
+`revisions`).
+
+Gotcha: the dropdown menu is a fixed height (`MENU_H`), even for two
+branches. The branch list arrives a frame or more after the popup opens, and
+egui's combo scroll area never grows past the size it had on the spinner
+frame, so a content-sized menu clipped every branch row. Don't nest a second
+`ScrollArea` inside the combo either; it collapses to a sliver.
+
+The subject sits beside the graph and ref chips; the
 date stays pinned to the right edge of the visible timeline pane, even while
 scrolled sideways, with the author name right-aligned just before it at its own
 width (capped). The subject wins: author and date only use room the subject's
@@ -19,6 +44,12 @@ within 32px of one, it fades out, the name first and then the date. The fade
 follows pane width, not time, so dragging the divider fades smoothly both ways.
 Once both are gone the subject is elided at the pane's edge. So on a narrow
 pane, rows with long subjects show no metadata. Hover a row for its full hash and untruncated metadata.
+
+Subjects start after the widest lane graph **on screen**, not the widest in
+the whole history, so a busy stretch only pushes text right while it is
+visible. Growth is instant (lanes never paint under text); when the wide
+rows scroll away the column glides back over 150 ms (`ease_lanes`).
+
 Scroll vertically through history; the timeline only scrolls sideways when the
 lane graph itself is too wide for the pane. Column geometry is the pure
 `columns` function in `src/git_history.rs`. Refresh starts a new read from the current
@@ -61,8 +92,8 @@ full object id when clicked.
 Selecting another row cancels the previous read. Refresh clears the selection.
 
 Click a file in the changed-file tree to open it in the project's Diff window.
-Branch selection, checkout, search, context menus, and other Git operations are
-outside this viewer's scope.
+Checkout, search, context menus, and other Git operations are outside this
+viewer's scope.
 
 ## Git Changes window
 
@@ -262,8 +293,13 @@ is owned by the loaded commit details, so retiring those details clears it.
 
 ## Key files
 
-- `src/git_history.rs`: `HistoryView`, `Stream`, `stream_history`, `Graph`, and
+- `src/git_history.rs`: `HistoryView` (including `restart`, the one path for
+  Refresh and a scope change, and the scope dropdown), `Stream`,
+  `stream_history`, `Graph`, `ease_lanes` (the per-screen text column), and
   module-local tests.
+- `src/git_history/scope.rs`: `Scope`, `resolve` (scope → `git log`
+  revisions and header label, with the deleted-branch fallback), and
+  `branches` (the dropdown's grouped branch list).
 - `src/git_history/details.rs`: `DetailsView`, cancellable commit queries, and
   changed-file parsing.
 - `src/git_history/file_tree.rs`: `FileTree`, the virtualized status-colored

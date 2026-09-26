@@ -37,9 +37,9 @@ const MIN_SUBJECT_W: f32 = 120.0;
 /// Branch counts above this show a filter field in the scope dropdown.
 const FILTER_MIN: usize = 8;
 /// Unscaled height of the scope dropdown's menu, fixed from its first frame.
-/// egui sizes a popup once, the first time it is shown, and its scroll area
-/// never grows past that; a menu that opens on a spinner and then fills with
-/// branches would stay spinner-sized and clip every branch row.
+/// The combo's scroll area auto-shrinks to the smaller of last frame's room
+/// and this frame's content, so a menu that opens on a spinner and then
+/// fills with branches stays spinner-sized and clips every branch row.
 const MENU_H: f32 = 360.0;
 const COLORS: [egui::Color32; 6] = [
     egui::Color32::from_rgb(116, 176, 164),
