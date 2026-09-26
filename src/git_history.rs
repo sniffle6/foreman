@@ -130,6 +130,7 @@ impl Graph {
         }
     }
     /// Immediate layout with every edge drawn as a lane.
+    #[cfg(test)]
     fn push(&mut self, commit: Commit) -> Row {
         self.layout(commit, false)
     }
@@ -380,22 +381,31 @@ fn stream_history(
     let mut reader = BufReader::new(stdout);
     let mut exit = Some(exit);
     let mut graph = Graph::default();
+    // Rows `Graph::finish` laid out at EOF that did not fit the page.
+    let mut tail = std::collections::VecDeque::new();
+    let mut eof = false;
     let result = (|| {
         while requests.recv().is_ok() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
             let mut rows = Vec::with_capacity(BATCH);
-            let mut end = false;
-            for _ in 0..BATCH {
-                match read_commit(&mut reader)? {
-                    Some(commit) => rows.push(graph.push(commit)),
-                    None => {
-                        end = true;
-                        break;
+            while rows.len() < BATCH {
+                if let Some(row) = tail.pop_front() {
+                    rows.push(row);
+                } else if eof {
+                    break;
+                } else {
+                    match read_commit(&mut reader)? {
+                        Some(commit) => rows.extend(graph.feed(commit)),
+                        None => {
+                            eof = true;
+                            tail.extend(graph.finish());
+                        }
                     }
                 }
             }
+            let end = eof && tail.is_empty();
             let error = if end {
                 match exit.take().expect("the stream ends once").finish() {
                     Ok(()) => None,
@@ -1896,14 +1906,17 @@ mod tests {
             .spawn()
             .unwrap();
         let mut input = import.stdin.take().unwrap();
-        for i in 0..BATCH + 20 {
-            writeln!(input, "commit refs/heads/main\ncommitter Test <test@example.test> {} +0000\ndata 7\nCommit!\n", 1_700_000_000+i).unwrap();
+        for i in 0..BATCH + 19 {
+            writeln!(input, "commit refs/heads/main\nmark :{}\ncommitter Test <test@example.test> {} +0000\ndata 7\nCommit!\n", i + 1, 1_700_000_000+i).unwrap();
         }
+        // The newest commit, on a card that forked from the 11th main
+        // commit: its parent sits deep in the second page.
+        writeln!(input, "commit refs/heads/card\ncommitter Test <test@example.test> 1800000000 +0000\ndata 5\nCard!\nfrom :11\n").unwrap();
         drop(input);
         assert!(import.wait().unwrap().success());
         let stream = Stream::start(
             repo.path().into(),
-            scope::Scope::Current,
+            scope::Scope::Local,
             egui::Context::default(),
         );
         stream.next.send(()).unwrap();
@@ -1923,6 +1936,20 @@ mod tests {
             first.rows.last().unwrap().commit.parents[0],
             second.rows[0].commit.hash
         );
+        let card = &first.rows[0];
+        assert_eq!(card.commit.subject, "Card!");
+        let down = card
+            .arrows
+            .iter()
+            .find(|a| a.direction == Direction::Down)
+            .expect("the card fork is long");
+        assert!(first.rows[1..].iter().all(|r| r.width == 1));
+        let fork = second
+            .rows
+            .iter()
+            .position(|r| r.commit.hash == card.commit.parents[0])
+            .expect("the fork is on the second page");
+        assert_eq!(second.rows[fork].color, down.color);
         let cancel = stream.cancel.clone();
         drop(stream);
         assert!(cancel.load(Ordering::Relaxed));
