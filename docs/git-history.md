@@ -291,6 +291,15 @@ before committing; no user mouse or keyboard input was used. Pointer-event tests
 cover single-file selection, directory toggling, and divider dragging. Selection
 is owned by the loaded commit details, so retiring those details clears it.
 
+On 2026-09-26 the scope dropdown and per-screen text column were checked in a
+native build against `epic-manager`. The closed dropdown reads `main ▾` and fits
+at default and 2× zoom. The popup shows the three scope rows, dim LOCAL /
+CARDS / REMOTE headings, the filter field and a ✓ that renders as a check, and
+the fixed-height empty space is acceptable. On All, subjects move right
+through busy regions and glide back afterwards. `scope_dropdown_*`,
+`scopes_walk_only_their_refs`, `text_column_grows_at_once_and_eases_back` and
+`subjects_start_after_the_widest_graph_on_screen` pin the behavior.
+
 ## Key files
 
 - `src/git_history.rs`: `HistoryView` (including `restart`, the one path for
