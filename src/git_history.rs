@@ -65,6 +65,19 @@ struct Edge {
     to: usize,
     color: usize,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Direction {
+    Up,
+    Down,
+}
+/// A paint-only stub end on a long edge: ▼ below a child whose parent is far
+/// away, ▲ one stub above the parent. It carries no jump target.
+#[derive(Debug, PartialEq)]
+struct Arrow {
+    lane: usize,
+    color: usize,
+    direction: Direction,
+}
 #[derive(Debug)]
 struct Row {
     commit: Commit,
@@ -72,22 +85,108 @@ struct Row {
     color: usize,
     incoming: Vec<(usize, usize)>,
     outgoing: Vec<Edge>,
+    /// ▼ stems run from this row's node to the bottom of `lane`; ▲ sits on
+    /// top of an ordinary live lane.
+    arrows: Vec<Arrow>,
     width: usize,
 }
-#[derive(Default)]
+/// A long edge's parent between its stubs: it keeps a color but no lane.
+struct Parked {
+    color: usize,
+}
 struct Graph {
     lanes: Vec<(String, usize)>,
     next_color: usize,
+    /// Parent distances above this are drawn as stubs, not lanes.
+    long: usize,
+    /// Rows a ▲ stub runs above its parent.
+    stub: usize,
+    /// Read but not yet laid out: the lookahead window.
+    queue: std::collections::VecDeque<Commit>,
+    /// Queue hashes by global read index.
+    future: std::collections::HashMap<String, usize>,
+    parked: std::collections::HashMap<String, Parked>,
+    read: usize,
+    laid: usize,
+}
+impl Default for Graph {
+    fn default() -> Self {
+        Self::with_lengths(30, 1)
+    }
 }
 impl Graph {
+    fn with_lengths(long: usize, stub: usize) -> Self {
+        assert!(long > 0 && stub > 0 && stub < long);
+        Self {
+            lanes: Vec::new(),
+            next_color: 0,
+            long,
+            stub,
+            queue: Default::default(),
+            future: Default::default(),
+            parked: Default::default(),
+            read: 0,
+            laid: 0,
+        }
+    }
+    /// Immediate layout with every edge drawn as a lane.
+    fn push(&mut self, commit: Commit) -> Row {
+        self.layout(commit, false)
+    }
+    /// Buffers `long` commits of lookahead, so a row is laid out knowing
+    /// which of its parents arrive soon; returns at most one final row.
+    fn feed(&mut self, commit: Commit) -> Option<Row> {
+        self.future.insert(commit.hash.clone(), self.read);
+        self.read += 1;
+        self.queue.push_back(commit);
+        (self.queue.len() > self.long).then(|| self.pop())
+    }
+    /// Lays out the rest of the window at the end of history. Parents still
+    /// parked never arrive and keep only their ▼.
+    fn finish(&mut self) -> Vec<Row> {
+        let rows = (0..self.queue.len()).map(|_| self.pop()).collect();
+        self.parked.clear();
+        rows
+    }
+    fn pop(&mut self) -> Row {
+        let commit = self.queue.pop_front().expect("a buffered commit");
+        self.future.remove(&commit.hash);
+        let row = self.layout(commit, true);
+        self.laid += 1;
+        row
+    }
     // Before/after frontiers name commits still to be visited. Persistent lanes
     // keep their color when compacted; each parent has exactly one frontier slot.
-    fn push(&mut self, commit: Commit) -> Row {
+    // With `collapse`, a parent that is not live and not within `long` rows of
+    // lookahead is parked instead of taking a lane.
+    fn layout(&mut self, commit: Commit, collapse: bool) -> Row {
+        let mut arrows = Vec::new();
+        if collapse {
+            // A parked parent `stub` rows ahead goes live under a ▲, unless
+            // this row is its short child and revives it below.
+            if let Some(ahead) = self.queue.get(self.stub - 1)
+                && !commit.parents.contains(&ahead.hash)
+                && let Some(p) = self.parked.remove(&ahead.hash)
+            {
+                arrows.push(Arrow {
+                    lane: self.lanes.len(),
+                    color: p.color,
+                    direction: Direction::Up,
+                });
+                self.lanes.push((ahead.hash.clone(), p.color));
+            }
+        }
         let existing = self.lanes.iter().position(|(h, _)| h == &commit.hash);
         let lane = existing.unwrap_or_else(|| {
             let lane = self.lanes.len();
-            self.lanes.push((commit.hash.clone(), self.next_color));
-            self.next_color += 1;
+            let color = match self.parked.remove(&commit.hash) {
+                Some(p) => p.color,
+                None => {
+                    self.next_color += 1;
+                    self.next_color - 1
+                }
+            };
+            self.lanes.push((commit.hash.clone(), color));
             lane
         });
         let color = self.lanes[lane].1;
@@ -100,15 +199,28 @@ impl Graph {
             .collect();
         let before = self.lanes.clone();
         self.lanes.remove(lane);
+        let mut down = Vec::new();
         for (i, parent) in commit.parents.iter().enumerate() {
-            if !self.lanes.iter().any(|(h, _)| h == parent) {
-                let c = if i == 0 {
+            if self.lanes.iter().any(|(h, _)| h == parent) {
+                continue;
+            }
+            let near = self
+                .future
+                .get(parent)
+                .is_some_and(|&at| at - self.laid <= self.long);
+            let parked = self.parked.remove(parent).map(|p| p.color);
+            let c = parked.unwrap_or_else(|| {
+                if i == 0 {
                     color
                 } else {
-                    let c = self.next_color;
                     self.next_color += 1;
-                    c
-                };
+                    self.next_color - 1
+                }
+            });
+            if collapse && !near {
+                self.parked.insert(parent.clone(), Parked { color: c });
+                down.push(c);
+            } else {
                 self.lanes
                     .insert((lane + i).min(self.lanes.len()), (parent.clone(), c));
             }
@@ -125,20 +237,31 @@ impl Graph {
             }
         }
         for parent in &commit.parents {
-            let to = self.lanes.iter().position(|(h, _)| h == parent).unwrap();
-            outgoing.push(Edge {
-                from: lane,
-                to,
-                color: self.lanes[to].1,
-            });
+            if let Some(to) = self.lanes.iter().position(|(h, _)| h == parent) {
+                outgoing.push(Edge {
+                    from: lane,
+                    to,
+                    color: self.lanes[to].1,
+                });
+            }
         }
+        // ▼ stems end right of every continuing lane, so they cross no
+        // lane's end point at the row bottom.
+        let first = lane.max(self.lanes.len());
+        arrows.extend(down.into_iter().enumerate().map(|(k, color)| Arrow {
+            lane: first + k,
+            color,
+            direction: Direction::Down,
+        }));
+        let stubs = arrows.iter().map(|a| a.lane + 1).max().unwrap_or(0);
         Row {
-            width: before.len().max(self.lanes.len()),
+            width: before.len().max(self.lanes.len()).max(stubs),
             commit,
             lane,
             color,
             incoming,
             outgoing,
+            arrows,
         }
     }
 }
@@ -1288,6 +1411,312 @@ mod tests {
             assert_eq!(unique.len(), g.lanes.len());
         }
         assert!(g.lanes.is_empty());
+    }
+    fn collect(g: &mut Graph, commits: Vec<Commit>) -> Vec<Row> {
+        let hashes: Vec<_> = commits.iter().map(|c| c.hash.clone()).collect();
+        let mut rows: Vec<_> = commits.into_iter().filter_map(|c| g.feed(c)).collect();
+        rows.extend(g.finish());
+        assert_eq!(
+            rows.iter().map(|r| &r.commit.hash).collect::<Vec<_>>(),
+            hashes.iter().collect::<Vec<_>>()
+        );
+        rows
+    }
+    type Shape<'a> = (
+        &'a str,
+        usize,
+        usize,
+        &'a [(usize, usize)],
+        &'a [Edge],
+        usize,
+        &'a [Arrow],
+    );
+    fn shape(r: &Row) -> Shape<'_> {
+        (
+            &r.commit.hash,
+            r.lane,
+            r.color,
+            &r.incoming,
+            &r.outgoing,
+            r.width,
+            &r.arrows,
+        )
+    }
+    fn arrows(rows: &[Row], direction: Direction) -> Vec<(usize, &Arrow)> {
+        rows.iter()
+            .enumerate()
+            .flat_map(|(i, r)| r.arrows.iter().map(move |a| (i, a)))
+            .filter(|(_, a)| a.direction == direction)
+            .collect()
+    }
+    #[test]
+    fn edge_at_threshold_stays_short() {
+        let rows = collect(
+            &mut Graph::with_lengths(3, 1),
+            vec![
+                commit("a", &["d"]),
+                commit("x", &["y"]),
+                commit("y", &[]),
+                commit("d", &[]),
+            ],
+        );
+        assert!(rows.iter().all(|r| r.arrows.is_empty()));
+        assert!(
+            rows[1..3]
+                .iter()
+                .all(|r| r.incoming.contains(&(0, rows[0].color)))
+        );
+        assert_eq!((rows[3].lane, rows[3].color), (0, rows[0].color));
+    }
+    #[test]
+    fn long_edge_frees_lane_between_colored_stubs() {
+        let rows = collect(
+            &mut Graph::with_lengths(3, 1),
+            vec![
+                commit("card", &["fork"]),
+                commit("m0", &["m1"]),
+                commit("m1", &["m2"]),
+                commit("m2", &["m3"]),
+                commit("m3", &["m4"]),
+                commit("m4", &[]),
+                commit("fork", &[]),
+            ],
+        );
+        let down = rows[0]
+            .arrows
+            .iter()
+            .find(|a| a.direction == Direction::Down)
+            .unwrap();
+        let up = rows[5]
+            .arrows
+            .iter()
+            .find(|a| a.direction == Direction::Up)
+            .unwrap();
+        assert_eq!(down.color, up.color);
+        assert_eq!(arrows(&rows, Direction::Down).len(), 1);
+        assert_eq!(arrows(&rows, Direction::Up).len(), 1);
+        assert!(rows[1..5].iter().all(|r| r.width == 1));
+        assert!(rows[1..5].iter().all(|r| r.arrows.is_empty()));
+        assert!(
+            rows[1..5]
+                .iter()
+                .all(|r| r.incoming.iter().all(|&(_, c)| c != down.color))
+        );
+        let mut main = Graph::default();
+        let baseline: Vec<_> = ["m0", "m1", "m2", "m3"]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| main.push(commit(h, &[&format!("m{}", i + 1)])).width)
+            .collect();
+        assert_eq!(
+            rows[1..5].iter().map(|r| r.width).collect::<Vec<_>>(),
+            baseline
+        );
+        assert_eq!((rows[6].lane, rows[6].color), (0, up.color));
+    }
+    #[test]
+    fn parked_parent_joined_by_short_child_has_no_up_arrow() {
+        let mut g = Graph::with_lengths(3, 1);
+        let rows = collect(
+            &mut g,
+            vec![
+                commit("a", &["far"]),
+                commit("m0", &["m1"]),
+                commit("m1", &["m2"]),
+                commit("m2", &["m3"]),
+                commit("near", &["far"]),
+                commit("m3", &[]),
+                commit("far", &[]),
+            ],
+        );
+        let down = arrows(&rows, Direction::Down);
+        assert_eq!(down.len(), 1);
+        let parked = down[0].1.color;
+        assert!(arrows(&rows, Direction::Up).is_empty());
+        let near = &rows[4];
+        assert!(
+            near.outgoing
+                .iter()
+                .any(|e| e.from == near.lane && e.color == parked)
+        );
+        assert!(rows[5].incoming.iter().any(|&(_, c)| c == parked));
+        assert_eq!(rows[6].color, parked);
+        assert!(g.parked.is_empty());
+    }
+    #[test]
+    fn long_children_share_one_up_stub() {
+        let mut g = Graph::with_lengths(3, 1);
+        let mut history = vec![commit("c1", &["far"])];
+        for i in 0..4 {
+            history.push(commit(&format!("m{i}"), &[&format!("m{}", i + 1)]));
+        }
+        history.push(commit("c2", &["far"]));
+        for i in 4..8 {
+            history.push(commit(&format!("m{i}"), &[&format!("m{}", i + 1)]));
+        }
+        history.push(commit("m8", &[]));
+        history.push(commit("far", &[]));
+        let mut rows = Vec::new();
+        let mut most_parked = 0;
+        for c in history {
+            rows.extend(g.feed(c));
+            most_parked = most_parked.max(g.parked.len());
+        }
+        rows.extend(g.finish());
+        assert_eq!(most_parked, 1);
+        let down = arrows(&rows, Direction::Down);
+        let up = arrows(&rows, Direction::Up);
+        assert_eq!(down.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 5]);
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].0, rows.len() - 2);
+        assert!(down.iter().all(|(_, a)| a.color == up[0].1.color));
+    }
+    #[test]
+    fn missing_parent_has_only_down_stub() {
+        let mut g = Graph::with_lengths(3, 1);
+        let rows = collect(
+            &mut g,
+            vec![
+                commit("a", &["ghost"]),
+                commit("b", &["c"]),
+                commit("c", &[]),
+            ],
+        );
+        assert_eq!(arrows(&rows, Direction::Down).len(), 1);
+        assert_eq!(rows[0].arrows[0].direction, Direction::Down);
+        assert!(arrows(&rows, Direction::Up).is_empty());
+        assert!(g.parked.is_empty());
+        assert!(g.finish().is_empty(), "finish drains once");
+    }
+    #[test]
+    fn merge_with_long_second_parent_keeps_first_parent_short() {
+        let rows = collect(
+            &mut Graph::with_lengths(3, 1),
+            vec![
+                commit("merge", &["near", "far"]),
+                commit("near", &["n1"]),
+                commit("n1", &["n2"]),
+                commit("n2", &["n3"]),
+                commit("n3", &["n4"]),
+                commit("n4", &[]),
+                commit("far", &[]),
+            ],
+        );
+        let merge = &rows[0];
+        assert_eq!(
+            merge.outgoing,
+            [Edge {
+                from: 0,
+                to: 0,
+                color: merge.color
+            }]
+        );
+        let down = arrows(&rows, Direction::Down);
+        let up = arrows(&rows, Direction::Up);
+        assert_eq!((down.len(), down[0].0), (1, 0));
+        assert_ne!(down[0].1.color, merge.color);
+        assert_eq!((up.len(), up[0].0), (1, 5));
+        assert_eq!(up[0].1.color, down[0].1.color);
+        assert!(rows[1..5].iter().all(|r| r.width == 1));
+        assert!(merge.width <= 2);
+    }
+    #[test]
+    fn lookahead_is_independent_of_page_cuts() {
+        let history = || {
+            let mut h = staggered_cards(5);
+            h.insert(3, commit("stray", &["ghost"]));
+            h
+        };
+        let unpaged = collect(&mut Graph::with_lengths(3, 1), history());
+        for capacity in [1, 2, 4, 7] {
+            let mut g = Graph::with_lengths(3, 1);
+            let mut pages: Vec<Vec<Row>> = vec![Vec::new()];
+            let add = |pages: &mut Vec<Vec<Row>>, row: Row| {
+                if pages.last().unwrap().len() == capacity {
+                    pages.push(Vec::new());
+                }
+                pages.last_mut().unwrap().push(row);
+            };
+            for c in history() {
+                if let Some(row) = g.feed(c) {
+                    add(&mut pages, row);
+                }
+            }
+            for row in g.finish() {
+                add(&mut pages, row);
+            }
+            assert!(pages.iter().all(|p| p.len() <= capacity));
+            let paged: Vec<_> = pages.iter().flatten().map(shape).collect();
+            assert_eq!(
+                paged,
+                unpaged.iter().map(shape).collect::<Vec<_>>(),
+                "capacity {capacity}"
+            );
+        }
+    }
+    /// Newest-first topological history: every even card is merged through
+    /// the main commit above it, odd cards stay open, and each card forks
+    /// from its own distant point on the later main spine.
+    fn staggered_cards(n: usize) -> Vec<Commit> {
+        let mut history = Vec::new();
+        for i in 0..n {
+            let next = format!("main/{}", i + 1);
+            let card = format!("card/{i}");
+            let parents = if i % 2 == 0 {
+                vec![next.as_str(), card.as_str()]
+            } else {
+                vec![next.as_str()]
+            };
+            history.push(commit(&format!("main/{i}"), &parents));
+            let fork = format!("main/{}", n + 5 + i * 5);
+            history.push(commit(&card, &[fork.as_str()]));
+        }
+        for i in n..=6 * n + 10 {
+            let parents = if i == 6 * n + 10 {
+                Vec::new()
+            } else {
+                vec![format!("main/{}", i + 1)]
+            };
+            history.push(commit(
+                &format!("main/{i}"),
+                &parents.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+        }
+        history
+    }
+    #[test]
+    fn staggered_card_branches_have_bounded_visible_width() {
+        for n in [5, 20, 50] {
+            let history = staggered_cards(n);
+            let mut collapsed = Graph::with_lengths(3, 1);
+            let mut collapsed_rows = Vec::new();
+            for c in &history {
+                if let Some(row) = collapsed.feed(commit(
+                    &c.hash,
+                    &c.parents.iter().map(String::as_str).collect::<Vec<_>>(),
+                )) {
+                    collapsed_rows.push(row);
+                }
+            }
+            collapsed_rows.extend(collapsed.finish());
+            assert_eq!(collapsed_rows.len(), history.len());
+            let collapsed_max = collapsed_rows.iter().map(|r| r.width).max().unwrap();
+            let mut old = Graph::default();
+            let uncollapsed_max = history
+                .into_iter()
+                .map(|c| old.push(c).width)
+                .max()
+                .unwrap();
+            eprintln!("N={n}: collapsed max width {collapsed_max}, uncollapsed {uncollapsed_max}");
+            assert!(
+                collapsed_max <= 4,
+                "N={n}, collapsed={collapsed_max}, old={uncollapsed_max}"
+            );
+            assert!(
+                uncollapsed_max >= n / 2,
+                "N={n}, collapsed={collapsed_max}, old={uncollapsed_max}"
+            );
+        }
     }
     #[test]
     fn parser_preserves_unicode_and_delimiter_like_subjects() {
