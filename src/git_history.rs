@@ -947,6 +947,31 @@ impl HistoryView {
                         egui::Stroke::new(1.7 * s, COLORS[edge.color % COLORS.len()]),
                     );
                 }
+                // Long-edge stubs, paint only: a ▼ stem from the node to the
+                // row bottom, and a ▲ capping a live lane at the row top.
+                for arrow in &row.arrows {
+                    let color = COLORS[arrow.color % COLORS.len()];
+                    let (ax, half, tall) = (x(arrow.lane), 4.0 * s, 7.0 * s);
+                    let (tip, base) = match arrow.direction {
+                        Direction::Down => (r.bottom(), r.bottom() - tall),
+                        Direction::Up => (r.top(), r.top() + tall),
+                    };
+                    if arrow.direction == Direction::Down {
+                        p.line_segment(
+                            [egui::pos2(x(row.lane), r.center().y), egui::pos2(ax, base)],
+                            egui::Stroke::new(1.7 * s, color),
+                        );
+                    }
+                    p.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(ax, tip),
+                            egui::pos2(ax - half, base),
+                            egui::pos2(ax + half, base),
+                        ],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
                 p.circle_filled(
                     egui::pos2(x(row.lane), r.center().y),
                     4.0 * s,
@@ -1663,6 +1688,71 @@ mod tests {
                 "capacity {capacity}"
             );
         }
+    }
+    #[test]
+    fn long_stub_arrows_paint_in_lane_color() {
+        let rows = collect(
+            &mut Graph::with_lengths(3, 1),
+            vec![
+                commit("m", &["n", "far"]),
+                commit("n", &["n1"]),
+                commit("n1", &["n2"]),
+                commit("n2", &["n3"]),
+                commit("n3", &["n4"]),
+                commit("n4", &[]),
+                commit("far", &[]),
+            ],
+        );
+        let color = COLORS[rows[0].arrows[0].color % COLORS.len()];
+        let mut view = HistoryView::new(None);
+        view.end = true;
+        view.count = rows.len();
+        view.pages.push(rows);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let run = |view: &mut HistoryView| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, egui::Id::new("arrows")),
+            )
+        };
+        run(&mut view);
+        let out = run(&mut view);
+        // Filled triangles: (tip y - base y) says which way each points.
+        let triangles: Vec<_> = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Path(p) if p.points.len() == 3 && p.fill == color => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(triangles.len(), 2, "one ▼ and one ▲");
+        let graph_right = view.drawn_graph_w;
+        let mut tips = Vec::new();
+        for t in &triangles {
+            let base = (t.points[1].y + t.points[2].y) / 2.0;
+            tips.push(t.points[0].y - base);
+            assert!(
+                t.points.iter().all(|p| p.x > 0.0 && p.x < graph_right),
+                "{t:?}"
+            );
+        }
+        tips.sort_by(f32::total_cmp);
+        assert!(tips[0] < 0.0 && tips[1] > 0.0, "{tips:?}");
+        // The ▼ (pointing down) is on the merge row, above the ▲ one.
+        let y = |dir: f32| {
+            triangles
+                .iter()
+                .find(|t| (t.points[0].y - t.points[1].y).signum() == dir)
+                .unwrap()
+                .points[0]
+                .y
+        };
+        assert!(y(1.0) < y(-1.0));
     }
     /// Newest-first topological history: every even card is merged through
     /// the main commit above it, odd cards stay open, and each card forks
