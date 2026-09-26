@@ -79,13 +79,19 @@ The popup:
 | Scope | `git log` revisions |
 |---|---|
 | **Current** (default) | `HEAD` plus its upstream when one exists |
-| **Local branches** | `--branches` |
-| **All** | `--branches --remotes --tags` |
+| **Local branches** | `HEAD --branches` |
+| **All** | `HEAD --branches --remotes --tags` |
+
+`HEAD` is in every scope except One branch so a detached checkout's commits
+never vanish (`--all` walked `HEAD` too). An unborn `HEAD` (an empty repo) is
+left out, since `git log` fails on it; with nothing left to walk, the timeline
+shows "No commits yet."
 | **One branch** | the picked ref, by full refname (`refs/heads/…` or `refs/remotes/…`) |
 
-- **Current** resolves the upstream with `git rev-parse --abbrev-ref
-  --symbolic-full-name @{upstream}` before the log starts; failure means "no
-  upstream" and the scope is `HEAD` alone. The label is the short branch name,
+- **Current** resolves the upstream with `git rev-parse --symbolic-full-name
+  @{upstream}` before the log starts (a full refname, so it cannot collide
+  with a same-named local branch); failure means "no upstream" and the scope
+  is `HEAD` alone. The label is the short branch name,
   or `Detached HEAD` when `HEAD` is detached.
 - **All** deliberately differs from `--all`: it drops `refs/stash` (stash
   commits are 2–3-parent merges that draw as fake branches) and non-standard
