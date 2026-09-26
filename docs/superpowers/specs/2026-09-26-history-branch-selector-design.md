@@ -270,6 +270,16 @@ commits.
   if someone does.
 - **Collapsing linear runs, dimming off-branch commits.** Out of scope.
 
+### Phase 2 shipped lean (2026-09-26)
+
+Phase 2 shipped without arrow jumps. What shipped: long edges (over 30 rows)
+as colored ▼/▲ stubs, parked parents that keep one color and no lane, one ▲
+per parent however many long children it has, no ▲ when a near child revives
+the parent, and the 30-commit lookahead inside `Graph`. Deferred: row-index
+or hash jump targets on arrows, arrow tooltips and clicks, and arrow-click UI
+tests. The design above stays as the record of what a jump would take.
+`docs/git-history.md` explains how the shipped version works.
+
 ## Testing
 
 Phase 1:

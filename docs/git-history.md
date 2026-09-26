@@ -50,6 +50,43 @@ the whole history, so a busy stretch only pushes text right while it is
 visible. Growth is instant (lanes never paint under text); when the wide
 rows scroll away the column glides back over 150 ms (`ease_lanes`).
 
+### Long edges are stubs
+
+A card branch that forked from `main` long ago used to hold a lane open for
+every row down to its fork point. With twenty open cards that is twenty lanes,
+and the subjects get shoved off the pane. Now an edge longer than **30 rows**
+is drawn as two colored stubs instead:
+
+- a **▼** under the child, one half-row stem ending at the row bottom;
+- a **▲** capping the parent's lane one row above the parent.
+
+Both are the parked edge's color, so you can match them by eye. Between them
+the lane is free for other branches. Exactly 30 rows is still a normal lane.
+A parent that never shows up (shallow clone, or outside the scope) gets only
+its ▼.
+
+If a *near* child (within 30 rows) reaches the parent first, the parent goes
+live in that child's ordinary edge, keeps the parked color, and gets no ▲.
+On a linear `main` this is the common case: the main commit above a fork point
+is its child, so the fork point just takes the card's color, the same color
+change the old full lanes showed. You mostly see a ▲ under a long merged side
+branch, where the merge's first parent lands 30+ rows down. Many far children
+of one parent share one parked color and one ▲.
+
+The ▼ sits right of every lane that continues past that row, so it can angle
+sideways from its node. It never lands on another lane's end point.
+
+Arrows are paint only: no click, hover, tooltip, or jump. Clicking the row
+still selects the commit.
+
+How it works: `Graph::feed` buffers 30 commits of lookahead so each row knows
+whether a parent arrives soon. It returns at most one finished row per call.
+`Graph::finish` lays out the rest at EOF, exactly once. A long parent is
+*parked*: a color and no lane. It goes live one row before it arrives.
+`stream_history` only packs those rows into 512-row pages, so the first page
+reads up to 542 commits and page cuts never change a row. `Row::width` counts
+live lanes and visible stubs, never parked parents.
+
 Scroll vertically through history; the timeline only scrolls sideways when the
 lane graph itself is too wide for the pane. Column geometry is the pure
 `columns` function in `src/git_history.rs`. Refresh starts a new read from the current
@@ -300,12 +337,26 @@ through busy regions and glide back afterwards. `scope_dropdown_*`,
 `scopes_walk_only_their_refs`, `text_column_grows_at_once_and_eases_back` and
 `subjects_start_after_the_widest_graph_on_screen` pin the behavior.
 
+On 2026-09-26 the long-edge stubs were checked two ways. First, the pure
+width proof `staggered_card_branches_have_bounded_visible_width`: a generated
+history of N card branches, each forking from its own distant point on
+`main`, half of them merged. Collapsed max width was 2 lanes at N = 5, 20 and
+50, where the old full-lane layout reached 6, 21 and 51. All 73 `git_history`
+tests passed. Second, native captures of a fast-import fixture (`main` 0–59
+plus merged cards A, B, C and a 40-commit card D) under
+`target/history-evidence/phase2`, font size 7 and detached HEAD to frame each
+stretch without input. At `main 3`, the teal ▼ and the teal ▲ on `card D 1`
+match, with lane 1 free between them. At `main 8`, card A's ▼ is orange and
+card C's is blue. `card B 1` rejoins the parked `main 45` in card A's orange
+with no ▲.
+
 ## Key files
 
 - `src/git_history.rs`: `HistoryView` (including `restart`, the one path for
   Refresh and a scope change, and the scope dropdown), `Stream`,
-  `stream_history`, `Graph`, `ease_lanes` (the per-screen text column), and
-  module-local tests.
+  `stream_history`, `Graph` (`Graph::feed` / `Graph::finish`: lookahead,
+  parked long edges and `Arrow` stubs), `HistoryView::show` (paints the
+  ▲/▼), `ease_lanes` (the per-screen text column), and module-local tests.
 - `src/git_history/scope.rs`: `Scope`, `resolve` (scope → `git log`
   revisions and header label, with the deleted-branch fallback), and
   `branches` (the dropdown's grouped branch list).
