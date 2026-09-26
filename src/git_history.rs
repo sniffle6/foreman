@@ -28,6 +28,9 @@ const LANE_W: f32 = 16.0;
 /// timeline scrolls sideways.
 const AUTHOR_W: f32 = 140.0;
 const FADE_W: f32 = 32.0;
+/// Seconds the subject column takes to slide back left after a wide
+/// stretch of graph scrolls off screen.
+const EASE_S: f32 = 0.15;
 const COL_GAP: f32 = 12.0;
 const NAME_GAP: f32 = 6.0;
 const MIN_SUBJECT_W: f32 = 120.0;
@@ -320,7 +323,9 @@ pub struct HistoryView {
     pending: bool,
     end: bool,
     error: Option<String>,
-    width: usize,
+    /// Graph room shown, in lanes: the widest row on screen, eased down.
+    lanes: f32,
+    shrink_rate: f32,
     generation: u64,
     /// Theme font size / default, applied to every px dimension below.
     scale: f32,
@@ -345,6 +350,8 @@ pub struct HistoryView {
     drawn: std::ops::Range<usize>,
     #[cfg(test)]
     drawn_details_w: f32,
+    #[cfg(test)]
+    drawn_graph_w: f32,
     #[cfg(test)]
     header_button_h: f32,
     #[cfg(test)]
@@ -384,7 +391,8 @@ impl HistoryView {
             pending: false,
             end: false,
             error: None,
-            width: 1,
+            lanes: 1.0,
+            shrink_rate: 0.0,
             generation: 0,
             scale: 1.0,
             scroll_y: 0.0,
@@ -399,6 +407,8 @@ impl HistoryView {
             drawn: 0..0,
             #[cfg(test)]
             drawn_details_w: 0.0,
+            #[cfg(test)]
+            drawn_graph_w: 0.0,
             #[cfg(test)]
             header_button_h: 0.0,
             #[cfg(test)]
@@ -441,9 +451,6 @@ impl HistoryView {
                         self.scope = resolved.scope;
                         self.label = Some(resolved.label);
                     }
-                    self.width = self
-                        .width
-                        .max(page.rows.iter().map(|r| r.width).max().unwrap_or(1));
                     self.count += page.rows.len();
                     if !page.rows.is_empty() {
                         self.pages.push(page.rows);
@@ -712,17 +719,14 @@ impl HistoryView {
         child.set_clip_rect(timeline.intersect(ui.clip_rect()));
         let mut selected = None;
         let (row_h, lane_w) = (zoom.px(ROW_H), zoom.px(LANE_W));
-        let graph_w = (self.width as f32 + 1.0) * lane_w;
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let avail_w = child.available_width() - 12.0 * s;
         let font = egui::FontId::proportional(13.0 * s);
         let date_w = child
             .painter()
             .layout_no_wrap("0000-00-00".into(), font.clone(), th.dim)
             .size()
             .x;
-        // Only a lane graph wider than the pane scrolls sideways; the
-        // metadata stays pinned to the visible edge either way.
-        let total_w = (graph_w + MIN_SUBJECT_W * s + meta_w(date_w, s))
-            .max(child.available_width() - 12.0 * s);
         let mut last = 0;
         child.spacing_mut().item_spacing.y = 0.0;
         let mut area = egui::ScrollArea::both()
@@ -733,6 +737,23 @@ impl HistoryView {
         }
         let out = area.show_rows(&mut child, row_h, self.count, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let target = range
+                .clone()
+                .map(|i| self.pages[i / BATCH][i % BATCH].width)
+                .max()
+                .unwrap_or(1) as f32;
+            (self.lanes, self.shrink_rate) = ease_lanes(self.lanes, self.shrink_rate, target, dt);
+            if self.shrink_rate > 0.0 {
+                ui.ctx().request_repaint();
+            }
+            let graph_w = (self.lanes + 1.0) * lane_w;
+            #[cfg(test)]
+            {
+                self.drawn_graph_w = graph_w;
+            }
+            // Only a lane graph wider than the pane scrolls sideways; the
+            // metadata stays pinned to the visible edge either way.
+            let total_w = (graph_w + MIN_SUBJECT_W * s + meta_w(date_w, s)).max(avail_w);
             ui.set_min_width(total_w);
             last = range.end;
             #[cfg(test)]
@@ -888,6 +909,18 @@ fn menu_row(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
     )
 }
 
+/// Lanes of graph room to show this frame, and the shrink rate to carry to
+/// the next. Growth is instant so a wider row never paints under text. A
+/// shrink runs at the speed that closes the largest gap seen in `EASE_S`,
+/// so the column glides back instead of jumping.
+fn ease_lanes(shown: f32, rate: f32, target: f32, dt: f32) -> (f32, f32) {
+    if target >= shown {
+        return (target, 0.0);
+    }
+    let rate = rate.max((shown - target) / EASE_S);
+    let next = (shown - rate * dt).max(target);
+    (next, if next > target { rate } else { 0.0 })
+}
 fn meta_w(date_w: f32, s: f32) -> f32 {
     date_w + (AUTHOR_W + COL_GAP + NAME_GAP) * s
 }
@@ -1664,5 +1697,106 @@ mod tests {
             matches!(view.branches, Some(Err(_))),
             "no Git ran without a directory"
         );
+    }
+
+    #[test]
+    fn text_column_grows_at_once_and_eases_back() {
+        let dt = 1.0 / 60.0;
+        assert_eq!(
+            ease_lanes(2.0, 0.0, 6.0, dt),
+            (6.0, 0.0),
+            "growth is instant"
+        );
+        assert_eq!(ease_lanes(3.0, 0.0, 3.0, dt), (3.0, 0.0), "steady state");
+        assert_eq!(
+            ease_lanes(4.0, 9.0, 5.0, dt),
+            (5.0, 0.0),
+            "growth cancels a shrink"
+        );
+        let (mut lanes, mut rate, mut frames) = (6.0f32, 0.0f32, 0);
+        while lanes > 2.0 {
+            let (next, r) = ease_lanes(lanes, rate, 2.0, dt);
+            assert!(next < lanes && next >= 2.0, "{lanes} -> {next}");
+            (lanes, rate, frames) = (next, r, frames + 1);
+            assert!(frames <= 10, "shrink took longer than EASE_S");
+        }
+        // 0.15 s at 60 fps is 9 frames; float rounding may add one.
+        assert!((9..=10).contains(&frames), "{frames} frames");
+        assert_eq!(rate, 0.0, "a finished shrink forgets its rate");
+    }
+
+    #[test]
+    fn subjects_start_after_the_widest_graph_on_screen() {
+        let mut view = HistoryView::new(None);
+        view.end = true;
+        let mut g = Graph::default();
+        let mut rows = Vec::new();
+        // 100 linear rows (1 lane), an octopus opening 6 lanes for ~60 rows,
+        // then 200 linear rows again.
+        for i in 0..100 {
+            let parent = if i < 99 {
+                format!("a{}", i + 1)
+            } else {
+                "m".into()
+            };
+            rows.push(g.push(commit(&format!("a{i}"), &[&parent])));
+        }
+        let heads: Vec<String> = (0..6).map(|k| format!("b{k}_0")).collect();
+        let heads: Vec<&str> = heads.iter().map(String::as_str).collect();
+        rows.push(g.push(commit("m", &heads)));
+        for k in 0..6 {
+            for j in 0..10 {
+                let parent = if j < 9 {
+                    format!("b{k}_{}", j + 1)
+                } else {
+                    "r".into()
+                };
+                rows.push(g.push(commit(&format!("b{k}_{j}"), &[&parent])));
+            }
+        }
+        rows.push(g.push(commit("r", &["c0"])));
+        for i in 0..200 {
+            let parent = format!("c{}", i + 1);
+            let parents: &[&str] = if i < 199 { &[&parent] } else { &[] };
+            rows.push(g.push(commit(&format!("c{i}"), parents)));
+        }
+        view.count = rows.len();
+        view.pages.push(rows);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let base = egui::Id::new("column");
+        let narrow = 2.0 * LANE_W;
+        let wheel = |dy: f32| {
+            vec![
+                egui::Event::PointerMoved(egui::pos2(200.0, 300.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    phase: egui::TouchPhase::Move,
+                    delta: egui::vec2(0.0, dy),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&ctx, &mut view, rect, base, vec![]);
+        assert_eq!(view.drawn_graph_w, narrow, "top of history is one lane");
+        // Scroll into the octopus stretch (row 101 onward).
+        frame(&ctx, &mut view, rect, base, wheel(-104.0 * ROW_H));
+        settle(&ctx, &mut view, rect, base, |v| v.drawn.start >= 100);
+        frame(&ctx, &mut view, rect, base, vec![]);
+        assert!(view.drawn.start < 150, "{:?}", view.drawn);
+        assert_eq!(
+            view.drawn_graph_w,
+            7.0 * LANE_W,
+            "six lanes on screen, instantly"
+        );
+        // Back to the top: the column glides back within the ease.
+        frame(&ctx, &mut view, rect, base, wheel(200.0 * ROW_H));
+        settle(&ctx, &mut view, rect, base, |v| v.drawn.start == 0);
+        // Headless frames advance `stable_dt` by egui's default 1/60 s, so
+        // 15 frames (0.25 s) outlast the 0.15 s ease.
+        for _ in 0..15 {
+            frame(&ctx, &mut view, rect, base, vec![]);
+        }
+        assert_eq!(view.drawn_graph_w, narrow);
     }
 }
