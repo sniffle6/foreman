@@ -169,6 +169,8 @@ struct Page {
     rows: Vec<Row>,
     end: bool,
     error: Option<String>,
+    /// The scope as the worker resolved it; set on a stream's first page.
+    resolved: Option<scope::Resolved>,
 }
 struct Stream {
     next: mpsc::SyncSender<()>,
@@ -181,18 +183,19 @@ impl Drop for Stream {
     }
 }
 impl Stream {
-    fn start(cwd: PathBuf, ctx: egui::Context) -> Self {
+    fn start(cwd: PathBuf, scope: scope::Scope, ctx: egui::Context) -> Self {
         let (next, requests) = mpsc::sync_channel(1);
         let (tx, pages) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         std::thread::spawn(move || {
-            let result = stream_history(cwd, &requests, &tx, &stop, &ctx);
+            let result = stream_history(cwd, scope, &requests, &tx, &stop, &ctx);
             if let Err(error) = result {
                 let _ = tx.send(Page {
                     rows: Vec::new(),
                     end: true,
                     error: Some(error),
+                    resolved: None,
                 });
                 ctx.request_repaint();
             }
@@ -207,30 +210,40 @@ impl Stream {
 
 fn stream_history(
     cwd: PathBuf,
+    scope: scope::Scope,
     requests: &mpsc::Receiver<()>,
     tx: &mpsc::SyncSender<Page>,
     cancel: &Arc<AtomicBool>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    let (stdout, exit) = git::spawn(
-        &cwd,
-        &[
-            "log",
-            "--all",
-            "--topo-order",
-            "--decorate=short",
-            "--no-color",
-            "--no-patch",
-            "--encoding=UTF-8",
-            "--no-show-signature",
-            "-z",
-            "--format=%H%x00%P%x00%D%x00%an%x00%as%x00%s",
-            "--",
-        ],
-        cancel,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    let resolved = scope::resolve(&cwd, scope, cancel)?;
+    if resolved.revisions.is_empty() {
+        // An unborn HEAD: nothing to walk, and `git log` would fail on it.
+        let _ = tx.send(Page {
+            rows: Vec::new(),
+            end: true,
+            error: None,
+            resolved: Some(resolved),
+        });
+        ctx.request_repaint();
+        return Ok(());
+    }
+    let revisions = resolved.revisions.clone();
+    let mut args = vec![
+        "log",
+        "--topo-order",
+        "--decorate=short",
+        "--no-color",
+        "--no-patch",
+        "--encoding=UTF-8",
+        "--no-show-signature",
+        "-z",
+        "--format=%H%x00%P%x00%D%x00%an%x00%as%x00%s",
+    ];
+    args.extend(revisions.iter().map(String::as_str));
+    args.push("--");
+    let (stdout, exit) = git::spawn(&cwd, &args, cancel, None).map_err(|e| e.to_string())?;
+    let mut resolved = Some(resolved);
     let mut reader = BufReader::new(stdout);
     let mut exit = Some(exit);
     let mut graph = Graph::default();
@@ -261,7 +274,15 @@ fn stream_history(
             } else {
                 None
             };
-            if tx.send(Page { rows, end, error }).is_err() {
+            if tx
+                .send(Page {
+                    rows,
+                    end,
+                    error,
+                    resolved: resolved.take(),
+                })
+                .is_err()
+            {
                 break;
             }
             ctx.request_repaint();
@@ -302,12 +323,19 @@ pub struct HistoryView {
     /// Clamped when drawn but only written on drag, so a shrink-then-regrow of
     /// the window restores it. Not persisted across restart.
     details_w: Option<f32>,
+    /// What the timeline walks. Survives Refresh; a new window starts on
+    /// `Current`. Updated from the worker, which may fall back to `Current`.
+    scope: scope::Scope,
+    /// The resolved scope's name for the header; `None` until the first page.
+    label: Option<String>,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
     #[cfg(test)]
     drawn_details_w: f32,
     #[cfg(test)]
     header_button_h: f32,
+    #[cfg(test)]
+    refresh_btn: egui::Rect,
 }
 impl Drop for HistoryView {
     fn drop(&mut self) {
@@ -342,12 +370,16 @@ impl HistoryView {
             scale: 1.0,
             scroll_y: 0.0,
             details_w: None,
+            scope: scope::Scope::default(),
+            label: None,
             #[cfg(test)]
             drawn: 0..0,
             #[cfg(test)]
             drawn_details_w: 0.0,
             #[cfg(test)]
             header_button_h: 0.0,
+            #[cfg(test)]
+            refresh_btn: egui::Rect::NOTHING,
         }
     }
     fn request(&mut self) {
@@ -363,7 +395,7 @@ impl HistoryView {
     fn poll(&mut self, ctx: &egui::Context) {
         if self.stream.is_none() && !self.end {
             if let Some(cwd) = &self.cwd {
-                self.stream = Some(Stream::start(cwd.clone(), ctx.clone()));
+                self.stream = Some(Stream::start(cwd.clone(), self.scope.clone(), ctx.clone()));
                 self.request();
             } else {
                 self.error = Some("This project has no directory".into());
@@ -376,6 +408,10 @@ impl HistoryView {
                     self.pending = false;
                     self.end = page.end;
                     self.error = page.error;
+                    if let Some(resolved) = page.resolved {
+                        self.scope = resolved.scope;
+                        self.label = Some(resolved.label);
+                    }
                     self.width = self
                         .width
                         .max(page.rows.iter().map(|r| r.width).max().unwrap_or(1));
@@ -411,7 +447,8 @@ impl HistoryView {
         zoom.apply(&mut child);
         let mut refresh = false;
         child.horizontal(|ui| {
-            ui.label(egui::RichText::new("All branches").color(th.text).strong());
+            let label = self.label.clone().unwrap_or_else(|| "…".into());
+            ui.label(egui::RichText::new(label).color(th.text).strong());
             ui.label(
                 egui::RichText::new(format!(
                     "{} commits{}",
@@ -427,6 +464,7 @@ impl HistoryView {
             #[cfg(test)]
             {
                 self.header_button_h = button.rect.height();
+                self.refresh_btn = button.rect;
             }
             refresh = button.clicked();
         });
@@ -437,6 +475,8 @@ impl HistoryView {
             // Retire potentially large cached histories off the GUI thread.
             let old = std::mem::replace(self, Self::new(cwd));
             self.details_w = details_w;
+            self.scope = old.scope.clone();
+            self.label = old.label.clone();
             if let Some(stream) = &old.stream {
                 stream.cancel.store(true, Ordering::Relaxed);
             }
@@ -780,7 +820,8 @@ mod tests {
         assert_eq!(view.details.selected(), Some("first"));
         click(&mut view, &mut frame, egui::pos2(250.0, 73.0));
         assert_eq!(view.details.selected(), Some("second"));
-        click(&mut view, &mut frame, egui::pos2(180.0, 18.0));
+        let refresh = view.refresh_btn.center();
+        click(&mut view, &mut frame, refresh);
         assert_eq!(view.details.selected(), None);
         assert_eq!(view.count, 0);
     }
@@ -1076,7 +1117,7 @@ mod tests {
         );
         git(&work, &["commit", "--allow-empty", "-m", "Detached"]);
         let before = git(&work, &["status", "--porcelain=v1"]);
-        let stream = Stream::start(work.clone(), egui::Context::default());
+        let stream = Stream::start(work.clone(), scope::Scope::All, egui::Context::default());
         stream.next.send(()).unwrap();
         let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(page.end);
@@ -1091,7 +1132,7 @@ mod tests {
     fn empty_and_non_repository_results_are_distinct() {
         let repo = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
-        let stream = Stream::start(repo.path().into(), ctx.clone());
+        let stream = Stream::start(repo.path().into(), scope::Scope::Current, ctx.clone());
         stream.next.send(()).unwrap();
         assert!(
             stream
@@ -1102,7 +1143,7 @@ mod tests {
                 .is_some()
         );
         git(repo.path(), &["init"]);
-        let stream = Stream::start(repo.path().into(), ctx);
+        let stream = Stream::start(repo.path().into(), scope::Scope::Current, ctx);
         stream.next.send(()).unwrap();
         let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(page.end && page.rows.is_empty() && page.error.is_none());
@@ -1213,7 +1254,11 @@ mod tests {
         }
         drop(input);
         assert!(import.wait().unwrap().success());
-        let stream = Stream::start(repo.path().into(), egui::Context::default());
+        let stream = Stream::start(
+            repo.path().into(),
+            scope::Scope::Current,
+            egui::Context::default(),
+        );
         stream.next.send(()).unwrap();
         let first = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(first.rows.len(), BATCH);
@@ -1234,5 +1279,69 @@ mod tests {
         let cancel = stream.cancel.clone();
         drop(stream);
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn scopes_walk_only_their_refs() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "History Test"]);
+        git(dir, &["config", "user.email", "history@example.test"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Root"]);
+        git(dir, &["checkout", "-b", "topic"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Topic"]);
+        git(dir, &["checkout", "main"]);
+        git(dir, &["commit", "--allow-empty", "-m", "Main"]);
+        // A foreign namespace and a stash: `--all` walked both.
+        let tree = git(dir, &["rev-parse", "HEAD^{tree}"]);
+        let private = git(dir, &["commit-tree", &tree, "-m", "Private"]);
+        git(dir, &["update-ref", "refs/x/private", &private]);
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        git(dir, &["add", "wip.txt"]);
+        git(dir, &["stash"]);
+        let read = |scope: scope::Scope| {
+            let stream = Stream::start(dir.into(), scope, egui::Context::default());
+            stream.next.send(()).unwrap();
+            let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(page.error.is_none(), "{:?}", page.error);
+            let subjects: Vec<String> =
+                page.rows.iter().map(|r| r.commit.subject.clone()).collect();
+            (
+                subjects,
+                page.resolved.expect("first page carries the scope").label,
+            )
+        };
+        assert_eq!(
+            read(scope::Scope::Current),
+            (
+                vec!["Main".to_string(), "Root".to_string()],
+                "main".to_string()
+            )
+        );
+        assert_eq!(
+            read(scope::Scope::Branch("refs/heads/topic".into())),
+            (
+                vec!["Topic".to_string(), "Root".to_string()],
+                "topic".to_string()
+            )
+        );
+        for scope in [scope::Scope::Local, scope::Scope::All] {
+            let (subjects, _) = read(scope.clone());
+            assert!(
+                subjects.contains(&"Topic".to_string()),
+                "{scope:?}: {subjects:?}"
+            );
+            assert!(
+                !subjects.contains(&"Private".to_string()),
+                "{scope:?}: {subjects:?}"
+            );
+            assert!(
+                !subjects
+                    .iter()
+                    .any(|s| s.starts_with("WIP on") || s.starts_with("index on")),
+                "{scope:?} walked the stash: {subjects:?}"
+            );
+        }
     }
 }
