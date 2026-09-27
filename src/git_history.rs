@@ -606,6 +606,9 @@ pub struct HistoryView {
     stream: Option<Stream>,
     pages: Vec<Vec<Row>>,
     count: usize,
+    /// `pages` are the previous read's rows, kept painted until this
+    /// stream's first page replaces them, so a re-read never blanks.
+    stale: bool,
     pending: bool,
     end: bool,
     error: Option<String>,
@@ -687,6 +690,7 @@ impl HistoryView {
             stream: None,
             pages: Vec::new(),
             count: 0,
+            stale: false,
             pending: false,
             end: false,
             error: None,
@@ -758,6 +762,7 @@ impl HistoryView {
         if let Some(stream) = &self.stream {
             match stream.pages.try_recv() {
                 Ok(page) => {
+                    self.drop_stale();
                     self.pending = false;
                     self.end = page.end;
                     self.error = page.error;
@@ -775,6 +780,7 @@ impl HistoryView {
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) if !self.end => {
+                    self.drop_stale();
                     self.pending = false;
                     self.end = true;
                     self.error = Some("Git history worker stopped".into());
@@ -821,8 +827,9 @@ impl HistoryView {
             ));
         }
     }
-    /// Start over on `scope`. Retires the old rows off the GUI thread and
-    /// keeps the details pane width. A scope change keeps the selected
+    /// Start over on `scope`. The old rows stay painted until the new
+    /// stream's first page lands (then retire off the GUI thread), and the
+    /// details pane keeps its width. A scope change keeps the selected
     /// commit (it is still a valid commit); Refresh clears it.
     fn restart(&mut self, ctx: &egui::Context, scope: scope::Scope, keep_selection: bool) {
         let cwd = self.cwd.clone();
@@ -830,6 +837,10 @@ impl HistoryView {
         let mut old = std::mem::replace(self, Self::new(cwd));
         self.details_w = old.details_w;
         self.follow = std::mem::take(&mut old.follow);
+        self.pages = std::mem::take(&mut old.pages);
+        self.count = std::mem::take(&mut old.count);
+        self.stale = true;
+        (self.lanes, self.shrink_rate) = (old.lanes, old.shrink_rate);
         self.scope = scope;
         // The old name stays until the worker resolves the new scope.
         self.label = old.label.take();
@@ -842,6 +853,17 @@ impl HistoryView {
         std::thread::spawn(move || drop(old));
         self.generation = generation;
         ctx.request_repaint();
+    }
+    /// The new read has its first page: retire the held rows off the GUI
+    /// thread.
+    fn drop_stale(&mut self) {
+        if std::mem::take(&mut self.stale) {
+            self.count = 0;
+            let pages = std::mem::take(&mut self.pages);
+            if !pages.is_empty() {
+                std::thread::spawn(move || drop(pages));
+            }
+        }
     }
 
     fn load_branches(&mut self, ctx: &egui::Context) {
@@ -1462,7 +1484,8 @@ mod tests {
         let refresh = view.refresh_btn.center();
         click(&mut view, &mut frame, refresh);
         assert_eq!(view.details.selected(), None);
-        assert_eq!(view.count, 0);
+        // The old rows stay painted until the re-read's first page.
+        assert_eq!((view.count, view.stale), (2, true));
     }
 
     #[test]
@@ -2534,7 +2557,13 @@ mod tests {
         assert!(view.scroll_y <= 0.5);
         settle(&ctx, &mut view, rect, base, ready);
         git(dir, &["commit", "--allow-empty", "-m", "on main"]);
-        settle(&ctx, &mut view, rect, base, |v| v.end && v.count == 32);
+        // The old rows stay up through the re-read: no blank frame.
+        let fewest = std::cell::Cell::new(usize::MAX);
+        settle(&ctx, &mut view, rect, base, |v| {
+            fewest.set(fewest.get().min(v.count));
+            v.end && v.count == 32
+        });
+        assert_eq!(fewest.get(), 31, "the timeline never blanked");
         assert_eq!(view.pill, None);
         // A stash moves no ref Local walks: no pill, no re-read.
         settle(&ctx, &mut view, rect, base, ready);

@@ -167,8 +167,13 @@ but shows up in Local and All; `refs/stash` counts nowhere. The stream takes
 its fingerprint *before* `git log` starts, so a ref that moves during the
 read is caught by the next event instead of being missed.
 
-Gotcha: a re-read (pill or silent) blanks the timeline for the moment
-before its first page arrives, like Refresh does.
+A re-read (pill, silent, Refresh, or a scope change) keeps the old rows
+and count painted until the new stream's first page lands, then swaps them
+in one frame and frees the old rows on a worker thread, so agents
+committing often never blink the timeline. Gotcha: the scroll area is
+keyed by the read's generation, so a re-read still jumps to the top at
+once, over the old rows; clicking a held row selects that (still valid)
+commit.
 
 ## Repository watch
 
