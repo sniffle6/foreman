@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "id": "3u4ri0",
+  "title": "Board: replace the 5 s worktree status poll with RepoWatch",
+  "body": "Planning card: design first, then implement. The board polls card worktree status every STATUS_POLL_INTERVAL (src/kanban.rs); RepoWatch (src/git_history/watch.rs) could drive it on change instead. Open questions: RepoWatch is pub(super) inside git_history and must be exposed; the main checkout's watch ignores .foreman/worktrees/, so each card tree needs its own watch (or a new mode); a watch must never hold a tree teardown wants gone (watch.rs already exits on root delete, and a test pins that); keep polling as the fallback where there is no watch (network paths). See docs/git-history.md 'Repository watch'.",
+  "state": "blocked",
+  "blocked_reason": "Integration queue held by uncommitted src/git_history/watch.rs in the shared main checkout; commit e77cea7 is clean and queued behind another card.",
+  "worktree": {
+    "path": "H:/claude code/foreman/.foreman/worktrees/3u4ri0",
+    "branch": "card/3u4ri0",
+    "base": "main"
+  },
+  "created": "2026-09-27T05:26:02Z",
+  "updated": "2026-09-27T05:50:31Z"
+}

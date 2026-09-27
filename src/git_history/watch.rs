@@ -543,7 +543,15 @@ impl Dir {
             )
         };
         self.reading = false;
-        (ok != 0).then_some(n)
+        if ok != 0 {
+            return Some(n);
+        }
+        // An overflowed read can fail with ERROR_NOTIFY_ENUM_DIR instead of
+        // completing empty. Report it as the overflow it is; treating it as
+        // a dead root would end the watch on the first big `cargo build`.
+        // SAFETY: no arguments; reads this thread's last error.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        (error == windows_sys::Win32::Foundation::ERROR_NOTIFY_ENUM_DIR).then_some(0)
     }
     /// Changed paths in the finished read, absolute and normalized.
     fn paths(&self, len: u32) -> Vec<String> {
