@@ -14,9 +14,16 @@ pub const CARD_V: u32 = 1;
 /// section, not a live-update mechanism.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How often a shown board re-derives every worktree card's git status on a
-/// background thread (spec: dispatch-worktrees §Status poll).
+/// Fallback interval for unwatched card trees and for discovering strays.
 pub const STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One background status round. `cards` is the full snapshot for stray
+/// ownership; only `probe` needs a Git status read this round.
+pub struct StatusBatch {
+    pub probe: Vec<(String, Worktree)>,
+    pub cards: Vec<(String, Worktree)>,
+    pub scan_strays: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,7 +46,7 @@ pub struct Claim {
 
 /// A card's private checkout (spec: dispatch-worktrees). Stored on the card
 /// so `block` and Restart keep it; status (dirty/ahead/behind/missing) is
-/// derived by the poll and never written to the file.
+/// derived by a background probe and never written to the file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Worktree {
     /// Absolute worktree root, forward slashes: `<root>/.foreman/worktrees/<id>`.
@@ -881,8 +888,7 @@ pub struct CardStore {
     last_poll: Option<std::time::Instant>,
     last_shown: Option<std::time::Instant>,
     orphans: std::collections::HashSet<String>,
-    /// Last poll round's derived worktree status per card id (spec:
-    /// dispatch-worktrees §Status poll). Memory only, replaced wholesale.
+    /// Last derived worktree status per card id. Memory only.
     worktree_status: std::collections::HashMap<String, WorktreeStatus>,
     /// Last poll round's foreman worktrees that no card owns. Memory only.
     strays: Vec<StrayWorktree>,
@@ -1003,8 +1009,8 @@ impl CardStore {
         self.worktree_status.get(id).copied()
     }
 
-    /// Replace the derived status map wholesale (one poll round) and release
-    /// the in-flight latch so the next round may start.
+    /// Replace the derived status map wholesale (used by snapshot consumers).
+    #[cfg(test)]
     pub fn set_worktree_statuses(
         &mut self,
         mut map: std::collections::HashMap<String, WorktreeStatus>,
@@ -1032,6 +1038,46 @@ impl CardStore {
         self.status_inflight = false;
     }
 
+    /// Apply only the cards probed by an event-driven round. A failed probe
+    /// clears its old badge; an unrelated card keeps its last status.
+    pub fn update_worktree_statuses(
+        &mut self,
+        map: std::collections::HashMap<String, WorktreeStatus>,
+        probed: &[(String, Worktree)],
+        strays: Option<Vec<StrayWorktree>>,
+    ) {
+        for (id, _) in probed {
+            self.worktree_status.remove(id);
+        }
+        for (id, status) in map {
+            if probed.iter().any(|(probed_id, wt)| {
+                *probed_id == id
+                    && self
+                        .cards
+                        .iter()
+                        .any(|c| c.id == id && c.worktree.as_ref() == Some(wt))
+            }) {
+                self.worktree_status.insert(id, status);
+            }
+        }
+        self.worktree_status.retain(|id, _| {
+            self.cards
+                .iter()
+                .any(|c| c.id == *id && c.worktree.is_some())
+        });
+        if let Some(mut strays) = strays {
+            strays.retain(|s| {
+                !self.cards.iter().any(|c| {
+                    c.worktree
+                        .as_ref()
+                        .is_some_and(|w| same_path(&w.path, &s.wt.path))
+                })
+            });
+            self.strays = strays;
+        }
+        self.status_inflight = false;
+    }
+
     /// Foreman worktrees no card owns, from the last poll round.
     pub fn strays(&self) -> &[StrayWorktree] {
         &self.strays
@@ -1050,30 +1096,48 @@ impl CardStore {
         self.integration = map;
     }
 
-    /// When a round is due — board shown, no round in flight, interval
-    /// elapsed — return the card batch to poll (possibly empty: the round
-    /// still lists strays) and latch in-flight. The caller runs git on a
-    /// background thread and answers with [`Self::set_worktree_statuses`].
-    pub fn take_status_poll(&mut self, now: std::time::Instant) -> Option<Vec<(String, Worktree)>> {
+    /// Start a round for changed watched cards, or on the fallback interval
+    /// for unwatched cards and stray discovery. Git runs on a worker.
+    pub fn take_status_poll(
+        &mut self,
+        now: std::time::Instant,
+        watched: &std::collections::HashSet<String>,
+        changed: &std::collections::HashSet<String>,
+    ) -> Option<StatusBatch> {
         if !self.shown_recently(now) || self.status_inflight {
             return None;
         }
-        if let Some(last) = self.last_status_poll {
-            if now.duration_since(last) < STATUS_POLL_INTERVAL {
-                return None;
-            }
+        let due = self
+            .last_status_poll
+            .is_none_or(|last| now.duration_since(last) >= STATUS_POLL_INTERVAL);
+        if !due && changed.is_empty() {
+            return None;
         }
-        let batch: Vec<(String, Worktree)> = self
+        let cards: Vec<(String, Worktree)> = self
             .cards
             .iter()
             .filter_map(|c| c.worktree.clone().map(|w| (c.id.clone(), w)))
             .collect();
-        if batch.is_empty() {
+        let probe: Vec<_> = cards
+            .iter()
+            .filter(|(id, _)| changed.contains(id) || (due && !watched.contains(id)))
+            .cloned()
+            .collect();
+        if !due && probe.is_empty() {
+            return None;
+        }
+        if cards.is_empty() {
             self.worktree_status.clear();
         }
-        self.last_status_poll = Some(now);
+        if due {
+            self.last_status_poll = Some(now);
+        }
         self.status_inflight = true;
-        Some(batch)
+        Some(StatusBatch {
+            probe,
+            cards,
+            scan_strays: due,
+        })
     }
 
     /// Drop the worktree field after a successful teardown. Missing card =
@@ -1091,6 +1155,11 @@ impl CardStore {
 
     /// Stamped by the board view each rendered frame; see [`Self::shown_recently`].
     pub fn mark_shown(&mut self, now: std::time::Instant) {
+        if !self.shown_recently(now) {
+            // Watches were released while hidden. Reopen them and get a fresh
+            // snapshot instead of waiting for the old fallback deadline.
+            self.last_status_poll = None;
+        }
         self.last_shown = Some(now);
     }
 
@@ -1656,7 +1725,7 @@ pub struct CardLine {
     #[serde(flatten)]
     pub card: Card,
     pub orphaned: bool,
-    /// Derived from the store's last poll round; absent for cards without a
+    /// Derived from the store's last background probe; absent for cards without a
     /// worktree and for cards not yet polled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_status: Option<WorktreeStatus>,
@@ -4467,15 +4536,25 @@ mod tests {
             .unwrap();
         let t0 = std::time::Instant::now();
         // hidden board: nothing
-        assert!(store.take_status_poll(t0).is_none());
+        assert!(
+            store
+                .take_status_poll(t0, &Default::default(), &Default::default())
+                .is_none()
+        );
         store.mark_shown(t0);
-        let batch = store.take_status_poll(t0).unwrap();
-        assert_eq!(batch, vec![(with.clone(), sample_worktree())]);
-        assert!(!batch.iter().any(|(id, _)| id == &plain));
+        let batch = store
+            .take_status_poll(t0, &Default::default(), &Default::default())
+            .unwrap();
+        assert_eq!(batch.probe, vec![(with.clone(), sample_worktree())]);
+        assert!(!batch.probe.iter().any(|(id, _)| id == &plain));
         // in flight: no second batch until results land
         assert!(
             store
-                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .take_status_poll(
+                    t0 + STATUS_POLL_INTERVAL * 2,
+                    &Default::default(),
+                    &Default::default()
+                )
                 .is_none()
         );
         let mut map = std::collections::HashMap::new();
@@ -4491,13 +4570,21 @@ mod tests {
         // interval not elapsed since the last kick
         assert!(
             store
-                .take_status_poll(t0 + std::time::Duration::from_secs(1))
+                .take_status_poll(
+                    t0 + std::time::Duration::from_secs(1),
+                    &Default::default(),
+                    &Default::default()
+                )
                 .is_none()
         );
         store.mark_shown(t0 + STATUS_POLL_INTERVAL * 2);
         assert!(
             store
-                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .take_status_poll(
+                    t0 + STATUS_POLL_INTERVAL * 2,
+                    &Default::default(),
+                    &Default::default()
+                )
                 .is_some()
         );
         // A round that started before a teardown cleared a card's field
@@ -4510,6 +4597,106 @@ mod tests {
         store.set_worktree_statuses(stale, Vec::new());
         assert!(store.worktree_status(&with).is_none());
         assert!(store.worktree_status(&plain).is_none());
+    }
+
+    #[test]
+    fn watched_card_refreshes_on_change_while_only_unwatched_card_uses_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let run = run_nonce();
+        let watched_id = store.add("watched", None).unwrap();
+        let fallback_id = store.add("fallback", None).unwrap();
+        for id in [&watched_id, &fallback_id] {
+            store
+                .claim_for_dispatch(
+                    id,
+                    "t1",
+                    "codex",
+                    run,
+                    TermState::Missing,
+                    Some(sample_worktree()),
+                )
+                .unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        store.mark_shown(t0);
+        let first = store
+            .take_status_poll(t0, &Default::default(), &Default::default())
+            .unwrap();
+        assert_eq!(first.probe.len(), 2);
+        assert!(first.scan_strays);
+        let initial = std::collections::HashMap::from([
+            (
+                watched_id.clone(),
+                WorktreeStatus {
+                    ahead: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                fallback_id.clone(),
+                WorktreeStatus {
+                    ahead: 2,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let both = first.probe.iter().cloned().collect::<Vec<_>>();
+        store.update_worktree_statuses(initial, &both, Some(Vec::new()));
+
+        let watched = std::collections::HashSet::from([watched_id.clone()]);
+        let changed = std::collections::HashSet::from([watched_id.clone()]);
+        let soon = t0 + std::time::Duration::from_millis(500);
+        store.mark_shown(soon);
+        assert!(
+            store
+                .take_status_poll(soon, &watched, &Default::default())
+                .is_none()
+        );
+        let event = store.take_status_poll(soon, &watched, &changed).unwrap();
+        assert_eq!(event.probe, vec![(watched_id.clone(), sample_worktree())]);
+        assert!(!event.scan_strays);
+        store.update_worktree_statuses(
+            std::collections::HashMap::from([(
+                watched_id.clone(),
+                WorktreeStatus {
+                    ahead: 3,
+                    ..Default::default()
+                },
+            )]),
+            &[(watched_id.clone(), sample_worktree())],
+            None,
+        );
+        assert_eq!(store.worktree_status(&fallback_id).unwrap().ahead, 2);
+        let later = t0 + STATUS_POLL_INTERVAL;
+        store.mark_shown(later);
+        let fallback = store
+            .take_status_poll(later, &watched, &Default::default())
+            .unwrap();
+        assert_eq!(
+            fallback.probe,
+            vec![(fallback_id.clone(), sample_worktree())]
+        );
+        assert!(fallback.scan_strays);
+        store.update_worktree_statuses(
+            Default::default(),
+            &[(fallback_id.clone(), sample_worktree())],
+            Some(Vec::new()),
+        );
+        assert!(
+            store.worktree_status(&fallback_id).is_none(),
+            "failed probe clears stale badge"
+        );
+        assert_eq!(store.worktree_status(&watched_id).unwrap().ahead, 3);
+        // The manager drops watches while hidden; reopening does not wait
+        // for the remaining fallback interval.
+        let reopened = later + std::time::Duration::from_secs(2);
+        store.mark_shown(reopened);
+        let first_again = store
+            .take_status_poll(reopened, &Default::default(), &Default::default())
+            .unwrap();
+        assert_eq!(first_again.probe.len(), 2);
+        assert!(first_again.scan_strays);
     }
 
     #[test]
@@ -4864,11 +5051,17 @@ mod tests {
         let t0 = std::time::Instant::now();
         store.mark_shown(t0);
         // No card has a worktree: the round still runs (it lists strays).
-        let batch = store.take_status_poll(t0).unwrap();
-        assert!(batch.is_empty());
+        let batch = store
+            .take_status_poll(t0, &Default::default(), &Default::default())
+            .unwrap();
+        assert!(batch.probe.is_empty());
         assert!(
             store
-                .take_status_poll(t0 + STATUS_POLL_INTERVAL * 2)
+                .take_status_poll(
+                    t0 + STATUS_POLL_INTERVAL * 2,
+                    &Default::default(),
+                    &Default::default()
+                )
                 .is_none(),
             "in flight"
         );

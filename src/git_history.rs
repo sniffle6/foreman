@@ -7,7 +7,7 @@ mod diff_view;
 mod file_tree;
 mod git;
 mod scope;
-mod watch;
+pub(crate) mod watch;
 pub use changes::ChangesView;
 pub use diff_view::{DiffTarget, DiffView, Stage};
 use std::io::{BufRead, BufReader, Read};

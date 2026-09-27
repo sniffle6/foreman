@@ -540,7 +540,7 @@ enum CloseTarget {
     DiscardStray(crate::kanban::Worktree),
 }
 
-/// Results from the worktree background threads (teardown, status poll),
+/// Results from the worktree background threads (teardown, status probes),
 /// drained once per frame by `drain_worktree_msgs`.
 enum WorktreeMsg {
     Teardown {
@@ -549,8 +549,37 @@ enum WorktreeMsg {
     },
     Status {
         map: std::collections::HashMap<String, crate::kanban::WorktreeStatus>,
-        strays: Vec<crate::kanban::StrayWorktree>,
+        probed: Vec<(String, crate::kanban::Worktree)>,
+        strays: Option<Vec<crate::kanban::StrayWorktree>>,
+        watches: Vec<(String, crate::kanban::Worktree, CardStatusWatch)>,
     },
+}
+
+/// The card tree's own watch. Generations are sampled before a status probe,
+/// so a change during that probe still schedules another read.
+struct CardStatusWatch {
+    watch: std::sync::Arc<crate::git_history::watch::RepoWatch>,
+    seen_worktree: u64,
+    seen_refs: u64,
+}
+
+impl CardStatusWatch {
+    fn new(watch: std::sync::Arc<crate::git_history::watch::RepoWatch>) -> Self {
+        Self {
+            seen_worktree: watch.worktree_gen(),
+            seen_refs: watch.refs_gen(),
+            watch,
+        }
+    }
+
+    fn changed(&self) -> bool {
+        self.watch.worktree_gen() != self.seen_worktree || self.watch.refs_gen() != self.seen_refs
+    }
+
+    fn acknowledge(&mut self) {
+        self.seen_worktree = self.watch.worktree_gen();
+        self.seen_refs = self.watch.refs_gen();
+    }
 }
 
 /// The result of one coordinator thread run (`integrate::run_turn`) for
@@ -707,6 +736,9 @@ pub struct WindowManager {
     /// into each spawned thread; the receiver is drained per frame.
     worktree_tx: std::sync::mpsc::Sender<WorktreeMsg>,
     worktree_rx: std::sync::mpsc::Receiver<WorktreeMsg>,
+    /// Held only while a card still owns this exact tree. RepoWatch opens its
+    /// directory handles with delete sharing and exits when the root goes.
+    status_watches: std::collections::HashMap<String, (crate::kanban::Worktree, CardStatusWatch)>,
     /// The Cut release (see `release.rs`): one at a time. The receiver is
     /// `Some` while the thread runs; the progress stays until the board
     /// dismisses it.
@@ -818,6 +850,7 @@ impl WindowManager {
             kanban: Rc::new(RefCell::new(crate::kanban::CardStore::default())),
             worktree_tx,
             worktree_rx,
+            status_watches: Default::default(),
             release: None,
             pending_teardowns: Vec::new(),
             teardown_attempted: std::collections::HashSet::new(),
@@ -3489,7 +3522,7 @@ impl WindowManager {
     /// Per-frame worktree maintenance (spec: dispatch-worktrees): start
     /// queued teardowns whose holding terminal is gone, apply thread results
     /// (clear the field on success, toast the kept cases), and kick the
-    /// status poll when the store says a round is due. Runs from `show`,
+    /// watch-driven status probes or fallback scan when due. Runs from `show`,
     /// per manager — each project owns its threads' channel like its store.
     fn drain_worktree_msgs(&mut self, ctx: &egui::Context) {
         if !self.pending_teardowns.is_empty() {
@@ -3513,8 +3546,25 @@ impl WindowManager {
         }
         while let Ok(msg) = self.worktree_rx.try_recv() {
             match msg {
-                WorktreeMsg::Status { map, strays } => {
-                    self.kanban.borrow_mut().set_worktree_statuses(map, strays);
+                WorktreeMsg::Status {
+                    map,
+                    probed,
+                    strays,
+                    watches,
+                } => {
+                    self.kanban
+                        .borrow_mut()
+                        .update_worktree_statuses(map, &probed, strays);
+                    for (id, wt, watch) in watches {
+                        let still_owns = self
+                            .kanban
+                            .borrow()
+                            .get(&id)
+                            .is_some_and(|c| c.worktree.as_ref() == Some(&wt));
+                        if still_owns && watch.watch.alive() {
+                            self.status_watches.insert(id, (wt, watch));
+                        }
+                    }
                 }
                 WorktreeMsg::Teardown { id, outcome } => {
                     use crate::kanban::TeardownOutcome::*;
@@ -3581,13 +3631,36 @@ impl WindowManager {
             }
         }
         let now = std::time::Instant::now();
-        let batch = self.kanban.borrow_mut().take_status_poll(now);
+        if !self.kanban.borrow().shown_recently(now) {
+            self.status_watches.clear();
+        } else {
+            self.status_watches.retain(|id, (wt, watch)| {
+                watch.watch.alive()
+                    && self
+                        .kanban
+                        .borrow()
+                        .get(id)
+                        .is_some_and(|c| c.worktree.as_ref() == Some(wt))
+            });
+        }
+        let watched: std::collections::HashSet<String> =
+            self.status_watches.keys().cloned().collect();
+        let changed: std::collections::HashSet<String> = self
+            .status_watches
+            .iter()
+            .filter(|(_, (_, watch))| watch.changed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let batch = self
+            .kanban
+            .borrow_mut()
+            .take_status_poll(now, &watched, &changed);
         if let (Some(batch), Some(cwd)) = (batch, self.cwd.clone()) {
             // A Done card still carrying a worktree is a leftover — the
             // queued teardown died with the previous app run, or the tree
             // was kept and the human has since integrated it. Attempt the
             // non-forcing teardown once per run; it is safe to fail.
-            for (id, wt) in &batch {
+            for (id, wt) in &batch.cards {
                 let is_done = self
                     .kanban
                     .borrow()
@@ -3602,14 +3675,29 @@ impl WindowManager {
                     });
                 }
             }
+            for id in &changed {
+                if let Some((_, watch)) = self.status_watches.get_mut(id) {
+                    watch.acknowledge();
+                }
+            }
             let tx = self.worktree_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
+                let mut watches = Vec::new();
                 // A card whose probe errored gets no entry this round: the
                 // badge shows the branch alone rather than a fake clean status.
                 let map = batch
+                    .probe
                     .iter()
                     .filter_map(|(id, wt)| {
+                        if !watched.contains(id) {
+                            if let Some(watch) = crate::git_history::watch::open(
+                                std::path::Path::new(&wt.path),
+                                &ctx,
+                            ) {
+                                watches.push((id.clone(), wt.clone(), CardStatusWatch::new(watch)));
+                            }
+                        }
                         crate::kanban::worktree_status_now(&cwd, wt)
                             .ok()
                             .map(|st| (id.clone(), st))
@@ -3618,16 +3706,24 @@ impl WindowManager {
                 // Foreman trees no card in the snapshot owns (Worktrees
                 // page). Not a repository = none; a stray whose probe
                 // errored shows its branch alone.
-                let strays = crate::kanban::foreman_worktrees_now(&cwd)
-                    .map(|listed| crate::kanban::strays_among(listed, &batch))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|wt| {
-                        let status = crate::kanban::worktree_status_now(&cwd, &wt).ok();
-                        crate::kanban::StrayWorktree { wt, status }
-                    })
-                    .collect();
-                let _ = tx.send(WorktreeMsg::Status { map, strays });
+                let strays = batch.scan_strays.then(|| {
+                    crate::kanban::foreman_worktrees_now(&cwd)
+                        .map(|listed| crate::kanban::strays_among(listed, &batch.cards))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|wt| {
+                            let status = crate::kanban::worktree_status_now(&cwd, &wt).ok();
+                            crate::kanban::StrayWorktree { wt, status }
+                        })
+                        .collect()
+                });
+                let probed = batch.probe;
+                let _ = tx.send(WorktreeMsg::Status {
+                    map,
+                    probed,
+                    strays,
+                    watches,
+                });
                 ctx.request_repaint();
             });
         }
@@ -5729,6 +5825,7 @@ impl WindowManager {
     /// un-rendered manager's show loop (which normally pumps the active tab) never
     /// runs this frame.
     pub(crate) fn keepalive(&mut self) {
+        self.status_watches.clear();
         for w in &mut self.windows {
             for t in &mut w.tabs {
                 t.content.keepalive();

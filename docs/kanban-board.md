@@ -78,12 +78,15 @@ sibling — read those for *why*, this doc for *how*.
   Worktrees page, the strip, and `kanban worktrees`; `list` tags them
   `[br …]` instead of `[wt …]`. Design and rejected alternatives:
   `docs/superpowers/specs/2026-09-24-dispatch-branch-design.md`.
-- **Worktree status is derived**: while a board is shown, every worktree card
-  is probed every few seconds on a background thread (dirty, ahead, behind,
-  missing) and the result is shown on the card face and by
+- **Worktree status is derived**: while a board is shown, each card tree has
+  its own repository watch. Changes to its working tree, index, HEAD, or refs
+  schedule a background status probe (dirty, ahead, behind, missing). Trees
+  without a working watch use the fallback interval. The result is shown on
+  the card face and by
   `foreman kanban list` (`[wt card/<id> +A -B dirty]`; `--json` adds
   `worktree` and `worktree_status`). Nothing about status is written to a
-  card file; a hidden board polls nothing.
+  card file; a hidden board polls nothing and releases its watches. Reopening
+  starts with a fresh snapshot.
 - **Worktrees page**: every worktree foreman made for the project, in one
   place. While at least one exists, the board shows a one-line strip along
   its bottom (`N worktrees · D dirty · S no card`, zero segments omitted,
@@ -106,9 +109,9 @@ sibling — read those for *why*, this doc for *how*.
   unmerged tree and the toast says so), **Discard** the forcing one behind
   the standard confirm. Stray status is measured against whatever branch
   the main checkout has at poll time (`HEAD` when detached), since no card
-  remembers a base. Strays are found by the same status poll as card
-  status, so a hidden board lists nothing and the poll now runs on a shown
-  board even when no card has a worktree.
+  remembers a base. Strays are discovered on the fallback interval, so a
+  hidden board lists nothing and discovery runs on a shown board even when
+  no card has a worktree.
 - **Cut and Versions**: Done is the live pile until you Cut it. Cut (a
   button on the Done header, or `foreman kanban cut <name>`) stamps every
   ungrouped Done card with `shipped` (`{name, at, commits}`), which moves
@@ -338,7 +341,7 @@ its base (`docs/integration-queue.md`).
   that runs `git add -A` commits stale card files and the fast-forward
   carries them into base. The prompt says never to stage `.foreman/`; review
   for it anyway.
-- **`kanban list` worktree status comes from the last poll round.** A board
+- **`kanban list` worktree status comes from the last background probe.** A board
   that has not been shown since the card was dispatched prints the branch
   with no counts.
 - **`kanban list` never shows a stray.** It knows cards. `kanban worktrees`
@@ -423,8 +426,8 @@ its base (`docs/integration-queue.md`).
   `dispatch_card` / `dispatch_precheck` / `dispatch_spawn` (the one dispatch
   path, shared by the board and `kanban dispatch`), `ctrl_card_dispatch` +
   `poll_card_dispatches` (the CLI verb: off-thread bring-up, held reply,
-  spawn undo), `drain_worktree_msgs` (queued teardowns, thread results,
-  status poll kick including the stray listing), `CloseTarget::DiscardStray`,
+  spawn undo), `drain_worktree_msgs` (queued teardowns, watch generations,
+  status probes and fallback stray listing), `CloseTarget::DiscardStray`,
   `kanban_rm` (the `rm` pre-check), `open_board_window` /
   `open_plan_window` (per-project singletons), `drain_plan_acts` (opens or
   focuses the board and points it at the clicked card), `term_states`, `kanban_cut` (the hold-back probe

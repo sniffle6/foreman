@@ -178,8 +178,8 @@ commit.
 ## Repository watch
 
 `src/git_history/watch.rs`. One `RepoWatch` per worktree root, shared by the
-Changes and History windows through a registry of weak refs; the last window
-to close stops its thread. A thread waits on `ReadDirectoryChangesW`
+Changes and History windows and the board's card status through a registry of
+weak refs; the last holder to drop stops its thread. A thread waits on `ReadDirectoryChangesW`
 (recursive) on the worktree root, plus the common git dir when that is
 outside it (a linked worktree like a card's). Each changed path is sorted:
 
@@ -219,8 +219,8 @@ Gotchas:
   windows keep the refresh-on-activate fallback.
 - Our own reads don't wake it: they run with `GIT_OPTIONAL_LOCKS=0` and
   write nothing. `our_own_reads_never_wake_the_watch` pins that.
-- The watch thread runs while a window exists, even minimized, but only
-  waits in the kernel; no Git runs until the window is shown again.
+- The watch thread runs while a view or card holds it, even when minimized,
+  but only waits in the kernel; hidden views and the board run no Git.
 
 ## Git Changes window
 

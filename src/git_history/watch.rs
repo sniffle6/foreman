@@ -285,7 +285,7 @@ impl Drop for Handle {
     }
 }
 
-pub(super) struct RepoWatch {
+pub(crate) struct RepoWatch {
     shared: Arc<Shared>,
     stop: Arc<Handle>,
 }
@@ -298,15 +298,15 @@ impl Drop for RepoWatch {
     }
 }
 impl RepoWatch {
-    pub(super) fn worktree_gen(&self) -> u64 {
+    pub(crate) fn worktree_gen(&self) -> u64 {
         self.shared.worktree_gen.load(Ordering::Relaxed)
     }
-    pub(super) fn refs_gen(&self) -> u64 {
+    pub(crate) fn refs_gen(&self) -> u64 {
         self.shared.refs_gen.load(Ordering::Relaxed)
     }
     /// False once the watch root was deleted or a read failed; views fall
     /// back to reading on focus.
-    pub(super) fn alive(&self) -> bool {
+    pub(crate) fn alive(&self) -> bool {
         self.shared.alive.load(Ordering::Relaxed)
     }
 }
@@ -384,7 +384,7 @@ fn discover(cwd: &Path) -> Option<Layout> {
 /// The shared watch for the repository around `cwd`, starting one if none
 /// is running. Runs Git: call it on a worker, never the GUI thread. `None`
 /// when `cwd` is not in a worktree or the filesystem cannot be watched.
-pub(super) fn open(cwd: &Path, ctx: &egui::Context) -> Option<Arc<RepoWatch>> {
+pub(crate) fn open(cwd: &Path, ctx: &egui::Context) -> Option<Arc<RepoWatch>> {
     let layout = discover(cwd)?;
     let key = layout.roots.worktree.clone();
     let mut registry = REGISTRY.lock().unwrap();
@@ -1096,6 +1096,7 @@ mod tests {
                 assert!(!Arc::ptr_eq(own, &main));
                 let before = quiet(own);
                 std::fs::write(tree.join("src/a.rs"), "card\n").unwrap();
+                wait_until("the card's worktree bump", || own.worktree_gen() > before.0);
                 git(&tree, &["commit", "-qam", "card work"]);
                 wait_until("the card's refs bump", || own.refs_gen() > before.1);
             }

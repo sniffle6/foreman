@@ -437,8 +437,8 @@ impl BoardView {
         resp: &egui::Response,
         base: egui::Id,
     ) {
-        // Arms Task 3's staleness poll only while the board is actually
-        // rendered this frame (spec: nothing while hidden).
+        // Card status reads run only while the board is rendered. A fresh
+        // showing also starts a new snapshot and opens its card watches.
         self.store
             .borrow_mut()
             .mark_shown(std::time::Instant::now());
