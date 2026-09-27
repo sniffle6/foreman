@@ -7,6 +7,7 @@ mod diff_view;
 mod file_tree;
 mod git;
 mod scope;
+mod watch;
 pub use changes::ChangesView;
 pub use diff_view::{DiffTarget, DiffView, Stage};
 use std::io::{BufRead, BufReader, Read};
@@ -397,6 +398,9 @@ struct Page {
     error: Option<String>,
     /// The scope as the worker resolved it; set on a stream's first page.
     resolved: Option<scope::Resolved>,
+    /// What the stream was read from, taken before `git log` started; set
+    /// on the first page. `None` if Git couldn't say (no pill then).
+    fingerprint: Option<scope::Fingerprint>,
 }
 struct Stream {
     next: mpsc::SyncSender<()>,
@@ -422,6 +426,7 @@ impl Stream {
                     end: true,
                     error: Some(error),
                     resolved: None,
+                    fingerprint: None,
                 });
                 ctx.request_repaint();
             }
@@ -443,6 +448,9 @@ fn stream_history(
     ctx: &egui::Context,
 ) -> Result<(), String> {
     let resolved = scope::resolve(&cwd, scope, cancel)?;
+    // Before `git log`: refs that move after this are caught by the next
+    // watch event, never lost.
+    let mut fingerprint = scope::read_fingerprint(&cwd, &resolved.scope, cancel).ok();
     if resolved.revisions.is_empty() {
         // An unborn HEAD: nothing to walk, and `git log` would fail on it.
         let _ = tx.send(Page {
@@ -450,6 +458,7 @@ fn stream_history(
             end: true,
             error: None,
             resolved: Some(resolved),
+            fingerprint,
         });
         ctx.request_repaint();
         return Ok(());
@@ -517,6 +526,7 @@ fn stream_history(
                     end,
                     error,
                     resolved: resolved.take(),
+                    fingerprint: fingerprint.take(),
                 })
                 .is_err()
             {
@@ -531,6 +541,55 @@ fn stream_history(
     })();
     cancel.store(true, Ordering::Relaxed);
     result
+}
+
+/// A running "did the refs move?" read: re-fingerprint, and count new
+/// commits if they did. Cancelled on drop.
+struct Check {
+    cancel: Arc<AtomicBool>,
+    /// `None`: same fingerprint. `Some(n)`: changed, `n` new commits.
+    result: mpsc::Receiver<Option<usize>>,
+}
+impl Drop for Check {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+impl Check {
+    fn start(
+        cwd: PathBuf,
+        scope: scope::Scope,
+        revisions: Vec<String>,
+        old: scope::Fingerprint,
+        ctx: egui::Context,
+    ) -> Self {
+        let (tx, result) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let changed = match scope::read_fingerprint(&cwd, &scope, &stop) {
+                Ok(now) if now.hash != old.hash => Some(
+                    // Reset, rebase, a deleted branch or a tag: changed
+                    // with nothing new to count.
+                    scope::new_commits(&cwd, &revisions, &old.tips, &stop).unwrap_or(0),
+                ),
+                _ => None,
+            };
+            if !stop.load(Ordering::Relaxed) && tx.send(changed).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        Self { cancel, result }
+    }
+}
+
+/// The header pill's text for `n` new commits.
+fn pill_text(n: usize) -> String {
+    match n {
+        0 => "↻ History changed".into(),
+        1 => "↻ 1 new commit".into(),
+        n => format!("↻ {n} new commits"),
+    }
 }
 
 /// Intents from the Git History or Git Changes window that change sibling
@@ -573,6 +632,17 @@ pub struct HistoryView {
     /// Whether the dropdown was open last frame, to spot it opening.
     popup_open: bool,
     filter: String,
+    /// The shared repository watch; carried across restarts.
+    follow: watch::Follow,
+    /// The watch's refs generation the shown timeline (or the last check)
+    /// covers; `None` makes the next frame check.
+    refs_seen: Option<u64>,
+    fingerprint: Option<scope::Fingerprint>,
+    /// The resolved scope's `git log` revisions, for counting new commits.
+    revisions: Vec<String>,
+    check: Option<Check>,
+    /// Refs moved since the read: `n` new commits (0: changed otherwise).
+    pill: Option<usize>,
     #[cfg(test)]
     drawn: std::ops::Range<usize>,
     #[cfg(test)]
@@ -589,6 +659,8 @@ pub struct HistoryView {
     scope_btn: egui::Rect,
     #[cfg(test)]
     filter_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    pill_btn: Option<egui::Rect>,
 }
 impl Drop for HistoryView {
     fn drop(&mut self) {
@@ -630,6 +702,12 @@ impl HistoryView {
             branch_rx: None,
             popup_open: false,
             filter: String::new(),
+            follow: watch::Follow::default(),
+            refs_seen: None,
+            fingerprint: None,
+            revisions: Vec::new(),
+            check: None,
+            pill: None,
             #[cfg(test)]
             drawn: 0..0,
             #[cfg(test)]
@@ -646,6 +724,8 @@ impl HistoryView {
             scope_btn: egui::Rect::NOTHING,
             #[cfg(test)]
             filter_rect: None,
+            #[cfg(test)]
+            pill_btn: None,
         }
     }
     fn request(&mut self) {
@@ -659,8 +739,15 @@ impl HistoryView {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        let refs_gen = self
+            .follow
+            .live(self.cwd.as_deref(), ctx)
+            .map(|w| w.refs_gen());
         if self.stream.is_none() && !self.end {
             if let Some(cwd) = &self.cwd {
+                // Everything after this generation is checked against the
+                // fingerprint the stream is about to take.
+                self.refs_seen = refs_gen;
                 self.stream = Some(Stream::start(cwd.clone(), self.scope.clone(), ctx.clone()));
                 self.request();
             } else {
@@ -677,6 +764,10 @@ impl HistoryView {
                     if let Some(resolved) = page.resolved {
                         self.scope = resolved.scope;
                         self.label = Some(resolved.label);
+                        self.revisions = resolved.revisions;
+                    }
+                    if page.fingerprint.is_some() {
+                        self.fingerprint = page.fingerprint;
                     }
                     self.count += page.rows.len();
                     if !page.rows.is_empty() {
@@ -697,6 +788,38 @@ impl HistoryView {
             self.branches = Some(branches);
             self.branch_rx = None;
         }
+        self.poll_refs(ctx, refs_gen);
+    }
+    /// Refs moved while shown: re-fingerprint on a worker, and offer the
+    /// pill if the timeline is stale. At the top of the timeline there is
+    /// nothing to lose, so it just re-reads (JetBrains follows the top the
+    /// same way). A generation that moved while hidden is handled here on
+    /// the next show.
+    fn poll_refs(&mut self, ctx: &egui::Context, refs_gen: Option<u64>) {
+        if let Some(check) = &self.check {
+            match check.result.try_recv() {
+                Ok(Some(_)) if self.scroll_y <= 0.5 => {
+                    self.restart(ctx, self.scope.clone(), true);
+                    return;
+                }
+                Ok(changed) => self.pill = changed,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+            self.check = None;
+        }
+        if let (Some(generation), Some(old), Some(cwd)) = (refs_gen, &self.fingerprint, &self.cwd)
+            && self.refs_seen != Some(generation)
+        {
+            self.refs_seen = Some(generation);
+            self.check = Some(Check::start(
+                cwd.clone(),
+                self.scope.clone(),
+                self.revisions.clone(),
+                old.clone(),
+                ctx.clone(),
+            ));
+        }
     }
     /// Start over on `scope`. Retires the old rows off the GUI thread and
     /// keeps the details pane width. A scope change keeps the selected
@@ -706,6 +829,7 @@ impl HistoryView {
         let generation = self.generation + 1;
         let mut old = std::mem::replace(self, Self::new(cwd));
         self.details_w = old.details_w;
+        self.follow = std::mem::take(&mut old.follow);
         self.scope = scope;
         // The old name stays until the worker resolves the new scope.
         self.label = old.label.take();
@@ -839,7 +963,12 @@ impl HistoryView {
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
         zoom.apply(&mut child);
         let mut refresh = false;
+        let mut reload = false;
         let mut pick = None;
+        #[cfg(test)]
+        {
+            self.pill_btn = None;
+        }
         child.horizontal(|ui| {
             let label = self.label.clone().unwrap_or_else(|| "…".into());
             let combo = egui::ComboBox::from_id_salt(base.with("scope"))
@@ -873,6 +1002,20 @@ impl HistoryView {
             if self.pending {
                 ui.spinner();
             }
+            if let Some(n) = self.pill {
+                let pill = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(pill_text(n)).color(th.text))
+                            .fill(th.border_focus.gamma_multiply(0.35))
+                            .corner_radius(10.0 * s),
+                    )
+                    .on_hover_text("Refs moved since this was read; click to re-read");
+                #[cfg(test)]
+                {
+                    self.pill_btn = Some(pill.rect);
+                }
+                reload |= pill.clicked();
+            }
             let button = ui.button("Refresh");
             #[cfg(test)]
             {
@@ -881,8 +1024,9 @@ impl HistoryView {
             }
             refresh = button.clicked();
         });
-        if refresh {
-            self.restart(child.ctx(), self.scope.clone(), false);
+        if refresh || reload {
+            // The pill keeps the selected commit; Refresh starts clean.
+            self.restart(child.ctx(), self.scope.clone(), reload && !refresh);
             return;
         }
         if let Some(scope) = pick
@@ -2334,6 +2478,78 @@ mod tests {
             frame(ctx, view, rect, base, vec![]);
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn moved_refs_offer_a_pill_when_scrolled_and_reread_silently_at_the_top() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "History Test"]);
+        git(dir, &["config", "user.email", "history@example.test"]);
+        for i in 0..30 {
+            git(dir, &["commit", "--allow-empty", "-m", &format!("c{i}")]);
+        }
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0));
+        let base = egui::Id::new("pill-test");
+        let mut view = HistoryView::new(Some(dir.to_path_buf()));
+        view.scope = scope::Scope::Local;
+        // Loaded, watched, and the first check (the watch arriving) done.
+        let ready = |v: &HistoryView| {
+            v.end && v.fingerprint.is_some() && v.refs_seen.is_some() && v.check.is_none()
+        };
+        settle(&ctx, &mut view, rect, base, ready);
+        assert_eq!((view.count, view.pill), (30, None));
+        let wheel = vec![
+            egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                phase: egui::TouchPhase::Move,
+                delta: egui::vec2(0.0, -200.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        frame(&ctx, &mut view, rect, base, wheel);
+        settle(&ctx, &mut view, rect, base, |v| v.scroll_y > 0.5);
+        // A commit on a card branch the scope walks: one new commit.
+        let pick = view.pages[0][5].commit.hash.clone();
+        view.details
+            .select(dir.to_path_buf(), pick.clone(), ctx.clone());
+        git(dir, &["checkout", "-q", "-b", "card/a1"]);
+        git(dir, &["commit", "--allow-empty", "-m", "card work"]);
+        git(dir, &["checkout", "-q", "main"]);
+        settle(&ctx, &mut view, rect, base, |v| v.pill == Some(1));
+        assert_eq!(view.count, 30, "nothing re-read behind the human's back");
+        let pill = view.pill_btn.expect("pill drawn");
+        click_at(&ctx, &mut view, rect, base, pill.center());
+        settle(&ctx, &mut view, rect, base, |v| v.end && v.count == 31);
+        assert_eq!(view.pill, None);
+        assert_eq!(
+            view.details.selected(),
+            Some(pick.as_str()),
+            "the pill keeps the selection"
+        );
+        // At the top (a restart starts there), a move just re-reads.
+        assert!(view.scroll_y <= 0.5);
+        settle(&ctx, &mut view, rect, base, ready);
+        git(dir, &["commit", "--allow-empty", "-m", "on main"]);
+        settle(&ctx, &mut view, rect, base, |v| v.end && v.count == 32);
+        assert_eq!(view.pill, None);
+        // A stash moves no ref Local walks: no pill, no re-read.
+        settle(&ctx, &mut view, rect, base, ready);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git(dir, &["add", "f.txt"]);
+        git(dir, &["stash"]);
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < until {
+            frame(&ctx, &mut view, rect, base, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle(&ctx, &mut view, rect, base, ready);
+        assert_eq!((view.count, view.pill), (32, None));
+        assert_eq!(pill_text(0), "↻ History changed");
+        assert_eq!(pill_text(3), "↻ 3 new commits");
     }
 
     #[test]

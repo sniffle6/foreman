@@ -104,7 +104,8 @@ live lanes and visible stubs, never parked parents.
 Scroll vertically through history; the timeline only scrolls sideways when the
 lane graph itself is too wide for the pane. Column geometry is the pure
 `columns` function in `src/git_history.rs`. Refresh starts a new read from the current
-repository state. An empty repository and a failed Git read have distinct states.
+repository state (see **Live updates** below for what happens when refs move
+on their own). An empty repository and a failed Git read have distinct states.
 Git must be available on PATH. Linked worktrees and detached HEAD work through
 Git's own repository discovery.
 
@@ -146,6 +147,76 @@ Click a file in the changed-file tree to open it in the project's Diff window.
 Checkout, search, context menus, and other Git operations are outside this
 viewer's scope.
 
+### Live updates: the "↻ N new commits" pill
+
+While the History window is shown, the repository watch (below) tells it
+when a ref or `HEAD` moved. It then re-reads the scope's **fingerprint** on
+a worker: the tips of the refs the scope walks, plus `HEAD`, plus (Current
+only) which branch is checked out. If that changed:
+
+- scrolled down: a pill appears in the header, `↻ 1 new commit` /
+  `↻ N new commits` (`git rev-list --count <scope> --not <old tips>`), or
+  `↻ History changed` when nothing new is reachable (reset, rebase, a
+  deleted branch, a tag). Clicking it re-reads and keeps the selected
+  commit. Refresh still clears the selection.
+- at the top of the timeline: it just re-reads, no pill. Nothing is lost
+  there, and JetBrains follows the top the same way.
+
+Refs the scope doesn't walk never count: a card commit leaves Current alone
+but shows up in Local and All; `refs/stash` counts nowhere. The stream takes
+its fingerprint *before* `git log` starts, so a ref that moves during the
+read is caught by the next event instead of being missed.
+
+Gotcha: a re-read (pill or silent) blanks the timeline for the moment
+before its first page arrives, like Refresh does.
+
+## Repository watch
+
+`src/git_history/watch.rs`. One `RepoWatch` per worktree root, shared by the
+Changes and History windows through a registry of weak refs; the last window
+to close stops its thread. A thread waits on `ReadDirectoryChangesW`
+(recursive) on the worktree root, plus the common git dir when that is
+outside it (a linked worktree like a card's). Each changed path is sorted:
+
+| Path | Means |
+|---|---|
+| this worktree's git dir: `HEAD` | both |
+| … `index` | working tree changed |
+| … `MERGE_HEAD`, `rebase-merge/`, `rebase-apply/` | refs moved |
+| common dir: `refs/heads/**`, `refs/remotes/**`, `refs/tags/**`, `packed-refs`, `reftable/**` | refs moved |
+| common dir: `config`, `info/exclude`; any `.gitignore` | re-list ignored paths |
+| `objects/`, `logs/`, `FETCH_HEAD`, `ORIG_HEAD`, `refs/stash`, `*.lock`, other worktrees' git dirs | nothing |
+| anything else in the worktree, unless ignored | working tree changed |
+
+Bursts are debounced (trailing 300 ms, at most 2 s late), then a generation
+counter per kind is bumped and egui repaints. Views compare generations, so
+two windows on one watch never eat each other's signal. If the kernel buffer
+overflows, it waits 500 ms and bumps everything.
+
+Gotchas:
+- **Ignored paths are load-bearing.** Card worktrees live inside the main
+  checkout (`.foreman/worktrees/<id>`, excluded via `.git/info/exclude`), so
+  without the `git ls-files --others --ignored --exclude-standard
+  --directory` list every agent write would wake the main project's Changes
+  window. `target/` likewise. The list is re-read on ignore-file changes, and
+  at most every 10 s while the working tree churns (so a `target/` created
+  after opening stops waking it).
+- `*.lock` is ignored only inside git dirs (git writes `index.lock` and
+  renames it onto `index`; the rename is the event). `Cargo.lock` in the
+  worktree counts.
+- Events can arrive as 8.3 short names (`PACKED~1`). The thread expands
+  them; one it can't expand (already deleted) counts as everything.
+- The handles share read/write/delete, so a watch never blocks a card
+  teardown. When the watched root is deleted the read fails and the thread
+  exits for good; it never retries (a retry would hold the tree teardown
+  wants gone). Windows then fall back to the old behavior.
+- No watch on network paths (UNC, mapped network drives, `\\wsl$`): the
+  windows keep the refresh-on-activate fallback.
+- Our own reads don't wake it: they run with `GIT_OPTIONAL_LOCKS=0` and
+  write nothing. `our_own_reads_never_wake_the_watch` pins that.
+- The watch thread runs while a window exists, even minimized, but only
+  waits in the kernel; no Git runs until the window is shown again.
+
 ## Git Changes window
 
 Each Project can open a read-only Git Changes window: Leader then U, or
@@ -174,13 +245,23 @@ Click a file to open it in the Diff window. Clicking the same working-tree file
 again re-reads it; a commit diff with an unchanged target does not.
 
 **Refresh model:** one `git status --porcelain=v2 -z --branch
---untracked-files=all` read per refresh, on a worker. Refresh runs when the
-window first shows, when you press Refresh, and when the window becomes active
-(focused, inside the active Project), at most once per second. There is no
-file watcher and no polling, so nothing runs while you aren't looking at the
-window. The flip side: while the window stays focused, agents' edits don't
-appear until you press Refresh or focus away and back. The previous list stays
-up while a re-read runs, and collapsed folders and the selected file carry over.
+--untracked-files=all` read per refresh, on a worker. It runs when the
+window first shows, when you press Refresh, and whenever the repository
+watch says the working tree changed while the window is shown, so agents'
+edits appear without touching anything. A watch-triggered read never cancels
+one in flight (steady churn would starve it); it marks "again" and reads
+once more when the current one lands. Those reads show no spinner, and when
+the status bytes hash the same as last time, the shown tree is kept as is.
+The previous list stays up while a re-read runs, and collapsed folders and
+the selected file carry over.
+
+Without a watch (a network share, or the watched root was deleted) it falls
+back to the old rule: re-read when the window becomes active, at most once
+per second.
+
+It is a whole-tree `git status`, not JetBrains' dirty-path-scoped one: about
+76 ms on this repo, almost all Windows process spawn. Revisit only if a big
+repository proves it slow.
 
 Gotchas:
 - Untracked files are read from disk and turned into an all-added diff, not run
@@ -307,8 +388,10 @@ and reject oversized output with an error instead of displaying partial data.
 The viewport requests more rows near the loaded end. There is no fixed history
 cutoff. Memory grows with the history actually visited, not the full repository
 at open; Git may itself traverse a large graph before returning the first row.
-The status count is the loaded count until the stream reaches EOF. Refresh is
-manual, keeping a single stream's ordering and decorations stable while browsing.
+The status count is the loaded count until the stream reaches EOF. A stream
+never changes under you: when refs move, the pill offers a re-read (or, at
+the top, it re-reads), so one stream's ordering and decorations stay stable
+while browsing.
 
 ## Validation
 
@@ -364,6 +447,18 @@ match, with lane 1 free between them. At `main 8`, card A's ▼ is orange and
 card C's is blue. `card B 1` rejoins the parked `main 45` in card A's orange
 with no ▲.
 
+On 2026-09-27 the live updates were pinned by tests, not screenshots:
+`classify_sorts_paths_into_worktree_refs_and_ignore` (main checkout and
+linked worktree layouts, `*.lock`, `logs/`, ignored prefixes, case, short
+names), `debounce_trails_by_quiet_time_and_caps_at_max_wait`,
+`bursts_in_ignored_dirs_are_silent_and_source_bursts_report_once` (1000
+`target/` writes: no bump; 50 `src/` writes: exactly one),
+`our_own_reads_never_wake_the_watch`, `deleting_the_watch_root_stops_the_thread`,
+`a_watched_main_checkout_or_card_worktree_never_blocks_teardown` (both
+`TeardownOutcome::Removed`), `watched_edits_appear_while_shown_without_a_focus_change`,
+and `moved_refs_offer_a_pill_when_scrolled_and_reread_silently_at_the_top`.
+No native screenshot of the pill yet.
+
 ## Key files
 
 - `src/git_history.rs`: `HistoryView` (including `restart`, the one path for
@@ -372,15 +467,19 @@ with no ▲.
   parked long edges and `Arrow` stubs), `HistoryView::show` (paints the
   ▲/▼), `ease_lanes` (the per-screen text column), and module-local tests.
 - `src/git_history/scope.rs`: `Scope`, `resolve` (scope → `git log`
-  revisions and header label, with the deleted-branch fallback), and
-  `branches` (the dropdown's grouped branch list).
+  revisions and header label, with the deleted-branch fallback),
+  `branches` (the dropdown's grouped branch list), and `fingerprint` /
+  `new_commits` for the pill.
 - `src/git_history/details.rs`: `DetailsView`, cancellable commit queries, and
   changed-file parsing.
 - `src/git_history/file_tree.rs`: `FileTree`, the virtualized status-colored
   tree (with sections) shared by the details pane and Git Changes, and
   `status_color`.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
-  parser, and the refresh-on-activate model.
+  parser, and the watch-driven refresh (refresh-on-activate as fallback).
+- `src/git_history/watch.rs`: `RepoWatch`, the registry and `open`, the
+  pure `classify` / `Debounce` core, the `ReadDirectoryChangesW` thread, and
+  `Follow` (a view's lazily opened handle on the watch).
 - `src/git_history/git.rs`: the shared Git subprocess helper (spawn, capped
   drains, cancel/timeout watchdog) used by the history stream, details, and diff.
 - `src/git_history/diff.rs`: pure unified-diff parser into aligned rows and blocks.

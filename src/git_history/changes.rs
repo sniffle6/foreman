@@ -1,8 +1,9 @@
 //! Git Changes: the working tree's uncommitted files in a read-only window.
 //! One `git status` read per refresh, on a cancellable worker; clicking a file
-//! opens it in the Project's Diff window.
+//! opens it in the Project's Diff window. While shown, the repository watch
+//! (`watch.rs`) triggers the refreshes; without one, becoming active does.
 use super::file_tree::{self, ChangedFile, FileTree};
-use super::{DiffTarget, HistoryAct, Stage, git};
+use super::{DiffTarget, HistoryAct, Stage, git, watch};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -12,7 +13,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-/// Becoming active re-reads the status unless the last read started this recently.
+/// Without a live watch, becoming active re-reads the status unless the last
+/// read started this recently.
 const REFOCUS_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Section headings, in display order: what needs attention first, then what
@@ -36,6 +38,8 @@ struct Entry {
 }
 
 struct Status {
+    /// Of the raw `git status` bytes: an identical re-read keeps this Status.
+    hash: u64,
     branch: Option<String>,
     tree: FileTree,
     /// Parallel to `tree.files`.
@@ -133,8 +137,13 @@ fn parse_status(bytes: &[u8]) -> Result<(Option<String>, Vec<Entry>), String> {
     Ok((branch, entries))
 }
 
-/// Worker-only: read the status and build the sectioned tree.
-fn load(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Status, String> {
+/// Worker-only: read the status and build the sectioned tree. `Ok(None)` when
+/// the output hashes to `unchanged`, so the shown tree is kept as is.
+fn load(
+    cwd: &Path,
+    cancel: &Arc<AtomicBool>,
+    unchanged: Option<u64>,
+) -> Result<Option<Status>, String> {
     let bytes = git::output(
         cwd,
         &[
@@ -154,6 +163,15 @@ fn load(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Status, String> {
         git::GitError::Failed(stderr) => format!("Cannot read the working tree: {stderr}"),
         other => other.to_string(),
     })?;
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    };
+    if unchanged == Some(hash) {
+        return Ok(None);
+    }
     let (branch, entries) = parse_status(&bytes)?;
     let mut sections: Vec<Vec<ChangedFile>> = SECTIONS.iter().map(|_| Vec::new()).collect();
     for entry in entries {
@@ -182,16 +200,19 @@ fn load(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Status, String> {
             .map(|((name, _), files)| (*name, files))
             .collect(),
     );
-    Ok(Status {
+    Ok(Some(Status {
+        hash,
         branch,
         tree,
         targets,
-    })
+    }))
 }
 
 struct Request {
     cancel: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<Result<Status, String>>,
+    receiver: mpsc::Receiver<Result<Option<Status>, String>>,
+    /// Started by the watch: no spinner.
+    quiet: bool,
 }
 impl Drop for Request {
     fn drop(&mut self) {
@@ -207,6 +228,12 @@ pub struct ChangesView {
     status: Option<Result<Status, String>>,
     started: Option<Instant>,
     was_active: bool,
+    follow: watch::Follow,
+    /// The watch's worktree generation the last read covers; `None` until
+    /// the watch arrives, which triggers one read for anything missed.
+    seen: Option<u64>,
+    /// The watch fired during a read: read again when it lands.
+    again: bool,
     #[cfg(test)]
     tree_top: f32,
 }
@@ -228,13 +255,20 @@ impl ChangesView {
             status: None,
             started: None,
             was_active: false,
+            follow: watch::Follow::default(),
+            seen: None,
+            again: false,
             #[cfg(test)]
             tree_top: 0.0,
         }
     }
     /// Start a fresh read, cancelling any in flight. The shown status stays
     /// until the new one arrives, so a refresh never blanks the window.
-    fn refresh(&mut self, ctx: &egui::Context) {
+    /// `quiet` reads (from the watch) hide the spinner; callers only start
+    /// one when no read is in flight, since cancelling on every event would
+    /// starve under steady churn.
+    fn refresh(&mut self, ctx: &egui::Context, quiet: bool) {
+        self.again = false;
         let Some(cwd) = self.cwd.clone() else {
             self.status = Some(Err("This project has no directory".into()));
             return;
@@ -243,21 +277,35 @@ impl ChangesView {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let ctx = ctx.clone();
+        let unchanged = match &self.status {
+            Some(Ok(status)) => Some(status.hash),
+            _ => None,
+        };
         std::thread::spawn(move || {
-            let result = load(&cwd, &stop);
+            let result = load(&cwd, &stop, unchanged);
             if !stop.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
                 ctx.request_repaint();
             }
         });
         // Replacing the request drops (and so cancels) the previous one.
-        self.request = Some(Request { cancel, receiver });
+        self.request = Some(Request {
+            cancel,
+            receiver,
+            quiet,
+        });
         self.started = Some(Instant::now());
     }
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let Some(request) = &self.request else { return };
         let mut next = match request.receiver.try_recv() {
-            Ok(result) => result,
+            Ok(Ok(Some(status))) => Ok(status),
+            // Same bytes as shown: keep the tree, rows and all.
+            Ok(Ok(None)) => {
+                self.request = None;
+                return self.follow_up(ctx);
+            }
+            Ok(Err(e)) => Err(e),
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => Err("Git status worker stopped".into()),
         };
@@ -270,17 +318,41 @@ impl ChangesView {
         }
         let old = std::mem::replace(&mut self.status, Some(next));
         std::thread::spawn(move || drop(old));
+        self.follow_up(ctx);
+    }
+    fn follow_up(&mut self, ctx: &egui::Context) {
+        if self.again {
+            self.refresh(ctx, true);
+        }
     }
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, active: bool, base: egui::Id) {
-        // Read on first show, and again whenever the window becomes active.
+        // Read on first show; then on every watch change while shown, or,
+        // with no live watch, whenever the window becomes active.
         let refocused = active
             && !self.was_active
             && self.started.is_none_or(|t| t.elapsed() >= REFOCUS_DEBOUNCE);
         self.was_active = active;
-        if self.started.is_none() || (refocused && self.request.is_none()) {
-            self.refresh(ui.ctx());
+        if self.started.is_none() {
+            self.refresh(ui.ctx(), false);
         }
-        self.poll();
+        let generation = self
+            .follow
+            .live(self.cwd.as_deref(), ui.ctx())
+            .map(|w| w.worktree_gen());
+        match generation {
+            Some(g) if self.seen != Some(g) => {
+                self.seen = Some(g);
+                if self.request.is_none() {
+                    self.refresh(ui.ctx(), true);
+                } else {
+                    self.again = true;
+                }
+            }
+            Some(_) => {}
+            None if refocused && self.request.is_none() => self.refresh(ui.ctx(), false),
+            None => {}
+        }
+        self.poll(ui.ctx());
         let th = crate::theme::live(ui.ctx());
         let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
         let scale = zoom.factor();
@@ -314,18 +386,16 @@ impl ChangesView {
                     ui.label(egui::RichText::new("Working tree").color(th.text).strong());
                 }
             }
-            if self.request.is_some() {
+            if self.request.as_ref().is_some_and(|r| !r.quiet) {
                 ui.spinner();
             }
             refresh = ui
                 .button("Refresh")
-                .on_hover_text(
-                    "Re-read the working tree (also happens when this window is focused)",
-                )
+                .on_hover_text("Re-read the working tree (it also updates as files change)")
                 .clicked();
         });
         if refresh {
-            self.refresh(ui.ctx());
+            self.refresh(ui.ctx(), false);
         }
         match &mut self.status {
             None => {
@@ -409,7 +479,7 @@ mod tests {
         ] {
             git(dir, args);
         }
-        let empty = load(dir, &flag()).unwrap();
+        let empty = load(dir, &flag(), None).unwrap().unwrap();
         assert!(empty.tree.files.is_empty());
         assert_eq!(empty.branch.as_deref(), Some("main"));
         std::fs::create_dir(dir.join("src")).unwrap();
@@ -423,8 +493,11 @@ mod tests {
         git(dir, &["mv", "old.rs", "new.rs"]);
         std::fs::write(dir.join("notes.txt"), "untracked\n").unwrap();
         let before = git(dir, &["status", "--porcelain=v1"]);
-        let status = load(dir, &flag()).unwrap();
+        let status = load(dir, &flag(), None).unwrap().unwrap();
         assert_eq!(git(dir, &["status", "--porcelain=v1"]), before);
+        // An identical re-read keeps the shown tree.
+        assert!(load(dir, &flag(), Some(status.hash)).unwrap().is_none());
+        assert!(load(dir, &flag(), Some(empty.hash)).unwrap().is_some());
         let sections: Vec<_> = status
             .tree
             .rows
@@ -455,8 +528,8 @@ mod tests {
             assert_eq!((file.status, &file.path), (target.status, &target.path));
         }
         let not_repo = tempfile::tempdir().unwrap();
-        assert!(load(not_repo.path(), &flag()).is_err());
-        assert!(load(dir, &Arc::new(AtomicBool::new(true))).is_err());
+        assert!(load(not_repo.path(), &flag(), None).is_err());
+        assert!(load(dir, &Arc::new(AtomicBool::new(true)), None).is_err());
     }
 
     fn frame(ctx: &egui::Context, view: &mut ChangesView, active: bool, events: Vec<egui::Event>) {
@@ -479,6 +552,39 @@ mod tests {
         assert!(view.request.is_none(), "status read did not finish");
     }
 
+    fn files(view: &ChangesView) -> Vec<String> {
+        match &view.status {
+            Some(Ok(s)) => s.tree.files.iter().map(|f| f.path.clone()).collect(),
+            _ => panic!("no status"),
+        }
+    }
+
+    #[test]
+    fn watched_edits_appear_while_shown_without_a_focus_change() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut view = ChangesView::new(Some(dir.to_path_buf()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Until the watch is live and its catch-up read has landed.
+        while (view.seen.is_none() || view.request.is_some()) && Instant::now() < deadline {
+            frame(&ctx, &mut view, true, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(files(&view), ["b.txt"]);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        let mut quiet = false;
+        while files(&view).len() < 2 && Instant::now() < deadline {
+            frame(&ctx, &mut view, true, vec![]);
+            quiet |= view.request.as_ref().is_some_and(|r| r.quiet);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(files(&view), ["a.txt", "b.txt"]);
+        assert!(quiet, "watch reads show no spinner");
+    }
+
     #[test]
     fn refocus_rereads_keeps_selection_and_clicks_open_the_diff() {
         let repo = tempfile::tempdir().unwrap();
@@ -487,17 +593,10 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         let ctx = egui::Context::default();
         let mut view = ChangesView::new(Some(dir.to_path_buf()));
+        // Without a watch (a network share), focus drives the re-reads.
+        view.follow = watch::Follow::off();
         frame(&ctx, &mut view, true, vec![]);
         settle(&ctx, &mut view, true);
-        let files = |view: &ChangesView| match &view.status {
-            Some(Ok(s)) => s
-                .tree
-                .files
-                .iter()
-                .map(|f| f.path.clone())
-                .collect::<Vec<_>>(),
-            _ => panic!("no status"),
-        };
         assert_eq!(files(&view), ["b.txt"]);
         let row = view_row_y(&view, "b.txt");
         let pos = egui::pos2(200.0, row);

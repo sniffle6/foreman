@@ -174,6 +174,101 @@ pub(super) fn branches(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Branches,
     Ok(group(&refs, head, upstream))
 }
 
+/// What a scope's timeline was read from: the tips of the refs it walks,
+/// plus `HEAD` (and, for Current, which branch is checked out). When the
+/// repository watch says refs moved, a changed fingerprint means the shown
+/// timeline is stale. Refs the scope doesn't walk (`refs/stash`, other
+/// cards in Current) never count.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Fingerprint {
+    pub(super) hash: u64,
+    /// Object ids the timeline already covers, for counting new commits.
+    pub(super) tips: Vec<String>,
+}
+
+const FOR_EACH_REF: &str = "--format=%(objectname)%09%(HEAD)%09%(refname)%09%(upstream)";
+
+/// Pure. `refs` is `git for-each-ref` output in the `FOR_EACH_REF` format;
+/// `head` is `HEAD`'s object id (`None` when unborn).
+pub(super) fn fingerprint(refs: &str, head: Option<&str>, scope: &Scope) -> Fingerprint {
+    let rows: Vec<Vec<&str>> = refs
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| f.len() >= 3)
+        .collect();
+    let checked_out = rows.iter().find(|f| f[1] == "*");
+    let upstream = checked_out.and_then(|f| f.get(3)).filter(|u| !u.is_empty());
+    let walks = |name: &str| match scope {
+        Scope::Current => upstream.is_some_and(|u| *u == name),
+        Scope::Local => name.starts_with("refs/heads/"),
+        Scope::All => ["refs/heads/", "refs/remotes/", "refs/tags/"]
+            .iter()
+            .any(|p| name.starts_with(p)),
+        Scope::Branch(r) => name == r,
+    };
+    let mut lines: Vec<String> = rows
+        .iter()
+        .filter(|f| walks(f[2]))
+        .map(|f| format!("{} {}", f[0], f[2]))
+        .collect();
+    let mut tips: Vec<String> = rows
+        .iter()
+        .filter(|f| walks(f[2]))
+        .map(|f| f[0].to_string())
+        .collect();
+    if !matches!(scope, Scope::Branch(_))
+        && let Some(head) = head
+    {
+        lines.push(format!("{head} HEAD"));
+        tips.push(head.to_string());
+    }
+    if *scope == Scope::Current {
+        // Switching to a branch at the same commit still changes the label.
+        lines.push(format!("* {}", checked_out.map_or("", |f| f[2])));
+    }
+    lines.sort();
+    tips.sort();
+    tips.dedup();
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        lines.hash(&mut h);
+        h.finish()
+    };
+    Fingerprint { hash, tips }
+}
+
+/// Worker-only: the scope's fingerprint as the repository stands now.
+pub(super) fn read_fingerprint(
+    cwd: &Path,
+    scope: &Scope,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Fingerprint, String> {
+    let refs = text(cwd, &["for-each-ref", FOR_EACH_REF], cancel).map_err(|e| e.to_string())?;
+    let head = text(cwd, &["rev-parse", "-q", "--verify", "HEAD"], cancel).ok();
+    Ok(fingerprint(&refs, head.as_deref(), scope))
+}
+
+/// Worker-only: commits `revisions` reach that none of `old` did. `None`
+/// when Git can't say (an old tip was pruned, too many tips for one
+/// command line).
+pub(super) fn new_commits(
+    cwd: &Path,
+    revisions: &[String],
+    old: &[String],
+    cancel: &Arc<AtomicBool>,
+) -> Option<usize> {
+    if revisions.is_empty() || old.len() > 500 {
+        return None;
+    }
+    let mut args = vec!["rev-list", "--count"];
+    args.extend(revisions.iter().map(String::as_str));
+    args.push("--not");
+    args.extend(old.iter().map(String::as_str));
+    args.push("--");
+    text(cwd, &args, cancel).ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +396,60 @@ mod tests {
             resolve(dir, Scope::Current, &cancel()).unwrap().label,
             "Detached HEAD"
         );
+    }
+
+    #[test]
+    fn fingerprint_counts_only_the_refs_a_scope_walks() {
+        let refs = "a1\t*\trefs/heads/main\trefs/remotes/origin/main\n\
+                    b2\t \trefs/heads/card/x\t\n\
+                    c3\t \trefs/remotes/origin/main\t\n\
+                    d4\t \trefs/tags/v1\t\n\
+                    e5\t \trefs/stash\t\n";
+        let fp = |refs: &str, head, scope: &Scope| fingerprint(refs, head, scope);
+        let current = fp(refs, Some("a1"), &Scope::Current);
+        assert_eq!(current.tips, ["a1", "c3"]);
+        assert_eq!(fp(refs, Some("a1"), &Scope::Local).tips, ["a1", "b2"]);
+        assert_eq!(
+            fp(refs, Some("a1"), &Scope::All).tips,
+            ["a1", "b2", "c3", "d4"]
+        );
+        let card = Scope::Branch("refs/heads/card/x".into());
+        assert_eq!(fp(refs, Some("a1"), &card).tips, ["b2"]);
+        // A stash, or a card moving, leaves Current alone; Local sees the card.
+        let moved = refs.replace("e5", "f6").replace("b2", "b9");
+        assert_eq!(fp(&moved, Some("a1"), &Scope::Current), current);
+        assert_ne!(
+            fp(&moved, Some("a1"), &Scope::Local).hash,
+            fp(refs, Some("a1"), &Scope::Local).hash
+        );
+        // HEAD moving (a commit, a detached checkout) changes every HEAD scope.
+        assert_ne!(fp(refs, Some("zz"), &Scope::Current).hash, current.hash);
+        assert_eq!(fp(refs, Some("zz"), &card), fp(refs, Some("a1"), &card));
+        // Switching branch at the same commit changes Current's label.
+        let switched = refs.replace("\t*\t", "\t \t").replace("b2\t \t", "b2\t*\t");
+        assert_ne!(
+            fp(&switched, Some("a1"), &Scope::Current).hash,
+            current.hash
+        );
+        assert_eq!(fp("", None, &Scope::Local).tips, Vec::<String>::new());
+    }
+
+    #[test]
+    fn new_commits_counts_what_the_old_tips_did_not_reach() {
+        let repo = repo_with_root();
+        let dir = repo.path();
+        let before = read_fingerprint(dir, &Scope::Local, &cancel()).unwrap();
+        git(dir, &["commit", "--allow-empty", "-m", "one"]);
+        git(dir, &["commit", "--allow-empty", "-m", "two"]);
+        git(dir, &["branch", "card/a1"]);
+        let after = read_fingerprint(dir, &Scope::Local, &cancel()).unwrap();
+        assert_ne!(after.hash, before.hash);
+        let local = revisions(&Scope::Local, true, None);
+        assert_eq!(new_commits(dir, &local, &before.tips, &cancel()), Some(2));
+        assert_eq!(new_commits(dir, &local, &after.tips, &cancel()), Some(0));
+        let pruned = ["0".repeat(40)];
+        assert_eq!(new_commits(dir, &local, &pruned, &cancel()), None);
+        assert_eq!(new_commits(dir, &[], &before.tips, &cancel()), None);
     }
 
     #[test]
