@@ -294,9 +294,28 @@ fn read_commit(reader: &mut impl BufRead) -> Result<Option<Commit>, String> {
             .collect(),
         refs: f.next().unwrap(),
         author: f.next().unwrap(),
-        date: f.next().unwrap(),
+        date: commit_date(&f.next().unwrap(), &chrono::Local),
         subject: f.next().unwrap(),
     }))
+}
+
+/// Git's `%ct` (committer Unix seconds) as `8/18/2026 10:13 PM` in `tz`.
+/// Committer, not author, time: that is what `--date-order` sorts by, so
+/// the column reads in the same order as the rows.
+fn commit_date<Tz: chrono::TimeZone>(secs: &str, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    secs.trim()
+        .parse()
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|t| {
+            t.with_timezone(tz)
+                .format("%-m/%-d/%Y %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 struct Page {
@@ -365,14 +384,16 @@ fn stream_history(
     let revisions = resolved.revisions.clone();
     let mut args = vec![
         "log",
-        "--topo-order",
+        // Children before parents, otherwise newest commit first — lines of
+        // history interleave by time, as other Git graph clients show them.
+        "--date-order",
         "--decorate=short",
         "--no-color",
         "--no-patch",
         "--encoding=UTF-8",
         "--no-show-signature",
         "-z",
-        "--format=%H%x00%P%x00%D%x00%an%x00%as%x00%s",
+        "--format=%H%x00%P%x00%D%x00%an%x00%ct%x00%s",
     ];
     args.extend(revisions.iter().map(String::as_str));
     args.push("--");
@@ -855,11 +876,18 @@ impl HistoryView {
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         let avail_w = child.available_width() - 12.0 * s;
         let font = egui::FontId::proportional(13.0 * s);
-        let date_w = child
-            .painter()
-            .layout_no_wrap("0000-00-00".into(), font.clone(), th.dim)
-            .size()
-            .x;
+        // Widest a `commit_date` string gets; the column is fixed so it does
+        // not jitter as rows scroll.
+        let date_w = ["AM", "PM"]
+            .map(|m| {
+                child
+                    .painter()
+                    .layout_no_wrap(format!("00/00/0000 00:00 {m}"), font.clone(), th.dim)
+                    .size()
+                    .x
+            })
+            .into_iter()
+            .fold(0.0, f32::max);
         let mut last = 0;
         child.spacing_mut().item_spacing.y = 0.0;
         let mut area = egui::ScrollArea::both()
@@ -1143,13 +1171,25 @@ fn columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_date_is_unpadded_twelve_hour_local() {
+        let utc = chrono::Utc;
+        // 2026-08-18 22:13:00 UTC.
+        assert_eq!(commit_date("1787091180", &utc), "8/18/2026 10:13 PM");
+        // Midnight and noon hours read 12, minutes keep their zero.
+        assert_eq!(commit_date("1787011205", &utc), "8/18/2026 12:00 AM");
+        let pst = chrono::FixedOffset::west_opt(7 * 3600).unwrap();
+        assert_eq!(commit_date("1787091180\n", &pst), "8/18/2026 3:13 PM");
+        assert_eq!(commit_date("", &utc), "");
+    }
     fn commit(hash: &str, parents: &[&str]) -> Commit {
         Commit {
             hash: hash.into(),
             parents: parents.iter().map(|s| s.to_string()).collect(),
             refs: String::new(),
             author: "Author".into(),
-            date: "2026-09-23".into(),
+            date: "12/23/2026 10:13 PM".into(),
             subject: hash.into(),
         }
     }
@@ -1352,7 +1392,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // Short subject: whole, with the name hugging the date at the edge.
-        let (dates, authors) = (all("2026-09-23"), all("Author"));
+        let (dates, authors) = (all("12/23/2026 10:13 PM"), all("Author"));
         assert_eq!((dates.len(), authors.len()), (1, 1), "{texts:?}");
         let (date, author) = (dates[0], authors[0]);
         let subject = all("short subject")[0];
@@ -1821,11 +1861,14 @@ mod tests {
     #[test]
     fn parser_preserves_unicode_and_delimiter_like_subjects() {
         let bytes =
-            "abc\0def ghi\0HEAD -> main, tag: v1\0Zoë\02026-09-23\0Subject | tabs\t and 日本語\0";
+            "abc\0def ghi\0HEAD -> main, tag: v1\0Zoë\01790164800\0Subject | tabs\t and 日本語\0";
         let mut r = std::io::Cursor::new(bytes.as_bytes());
         let c = read_commit(&mut r).unwrap().unwrap();
         assert_eq!(c.parents, ["def", "ghi"]);
         assert_eq!(c.author, "Zoë");
+        // Mid-day on 2026-09-23 UTC: the same calendar day from UTC-12 to UTC+11
+        // this runs in, so only the time part is zone-dependent.
+        assert!(c.date.starts_with("9/23/2026 "), "{}", c.date);
         assert_eq!(c.subject, "Subject | tabs\t and 日本語");
         assert!(read_commit(&mut r).unwrap().is_none());
         assert!(read_commit(&mut std::io::Cursor::new(b"truncated")).is_err());

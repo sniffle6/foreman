@@ -8,8 +8,15 @@ help or keybindings editor. Opening again surfaces the existing window, includin
 a minimized window or an inactive tab. It floats initially and supports the same
 tiling, tabbing, zoom, and workspace restore behavior as other viewers.
 
-The timeline shows commits in topological order, with colored branch/merge
-lanes, commit subjects, branch/tag decorations, authors, and author dates.
+The timeline shows commits with colored branch/merge lanes, commit subjects,
+branch/tag decorations, authors, and local commit times (`8/18/2026 10:13 PM`).
+
+Order is `git log --date-order`: a parent never shows above its children, but
+otherwise newest first, so parallel branches interleave by time like other Git
+graph clients. The old `--topo-order` kept each branch in one block, which put
+a 10 PM mainline commit below an 8 PM branch commit. The time shown is the
+**committer** time, which is what `--date-order` sorts by. The author time can
+differ after a rebase or cherry-pick and would make rows look out of order.
 Which commits it walks is the **scope**, picked from the dropdown at the left
 of the header:
 
