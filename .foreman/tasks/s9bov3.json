@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "id": "s9bov3",
+  "title": "Git History: branch selector + per-screen text column (phase 1)",
+  "body": "Execute the approved phase 1 plan in Hybrid mode. Handoff: C:\\Users\\sniff\\AppData\\Local\\Temp\\foreman-handoff-history-phase1-hybrid.md. Plan: docs/superpowers/plans/2026-09-26-history-branch-selector-phase1.md. Spec: docs/superpowers/specs/2026-09-26-history-branch-selector-design.md (sections 1-2).",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.9",
+    "at": "2026-09-27T00:47:32Z",
+    "commits": [
+      "bf52530",
+      "caa531e",
+      "6249e66",
+      "07e5acf",
+      "7b1c4e5",
+      "c24e821"
+    ]
+  },
+  "created": "2026-09-26T19:33:07Z",
+  "updated": "2026-09-27T00:47:32Z"
+}

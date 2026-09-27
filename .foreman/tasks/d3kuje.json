@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "d3kuje",
+  "title": "Git History: plan lean phase 2 (collapsed long edges)",
+  "body": "Planning only; output is a plan file. Build the lean cut of spec section 3: long edges collapse to drawn stubs with arrows, and the 30-row lookahead lives inside Graph (feed/finish). No arrow jumps, tooltips or click tests. The proof is a pure Graph test on generated histories with N staggered card branches, not a measurement of today's repos. Handoff: C:\\Users\\sniff\\AppData\\Local\\Temp\\foreman-handoff-history-phase2-planning.md. Spec: docs/superpowers/specs/2026-09-26-history-branch-selector-design.md section 3. ADR: docs/adr/0004-history-graph-streams-with-bounded-lookahead.md.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.5.9",
+    "at": "2026-09-27T00:47:32Z",
+    "commits": [
+      "50b5fd7"
+    ]
+  },
+  "created": "2026-09-26T20:46:19Z",
+  "updated": "2026-09-27T00:47:32Z"
+}
