@@ -70,13 +70,17 @@ enum Direction {
     Up,
     Down,
 }
-/// A paint-only stub end on a long edge: ▼ below a child whose parent is far
-/// away, ▲ one stub above the parent. It carries no jump target.
+/// A paint-only stub end on a long edge: ▼ one row below a child whose parent
+/// is far away, ▲ one stub above the parent. It carries no jump target.
 #[derive(Debug, PartialEq)]
 struct Arrow {
     lane: usize,
     color: usize,
     direction: Direction,
+    /// ▲ only: the lane it runs down into at the row bottom, when this row's
+    /// commit is itself a short child of the parent and has already revived
+    /// it. `None` caps a lane that goes live here.
+    join: Option<usize>,
 }
 #[derive(Debug)]
 struct Row {
@@ -85,8 +89,8 @@ struct Row {
     color: usize,
     incoming: Vec<(usize, usize)>,
     outgoing: Vec<Edge>,
-    /// ▼ stems run from this row's node to the bottom of `lane`; ▲ sits on
-    /// top of an ordinary live lane.
+    /// ▼ ends a tail lane at this row's bottom; ▲ sits on top of an ordinary
+    /// live lane.
     arrows: Vec<Arrow>,
     width: usize,
 }
@@ -106,9 +110,18 @@ struct Graph {
     /// Queue hashes by global read index.
     future: std::collections::HashMap<String, usize>,
     parked: std::collections::HashMap<String, Parked>,
+    /// The next commit's lane, opened early so a ▼ tail runs right of it
+    /// instead of pushing it aside. It has no edge in from above.
+    fresh: Option<String>,
+    /// Parked parents a short child revived: they still get a joining ▲ on
+    /// the row above them, for the far child's sake.
+    revived: std::collections::HashMap<String, usize>,
     read: usize,
     laid: usize,
 }
+/// Lane key for the one-row tail a ▼ stub runs down below its child. Git
+/// hashes never contain NUL, so it cannot match a commit.
+const TAIL: &str = "\0tail";
 impl Default for Graph {
     fn default() -> Self {
         Self::with_lengths(30, 1)
@@ -125,6 +138,8 @@ impl Graph {
             queue: Default::default(),
             future: Default::default(),
             parked: Default::default(),
+            fresh: None,
+            revived: Default::default(),
             read: 0,
             laid: 0,
         }
@@ -147,6 +162,7 @@ impl Graph {
     fn finish(&mut self) -> Vec<Row> {
         let rows = (0..self.queue.len()).map(|_| self.pop()).collect();
         self.parked.clear();
+        self.revived.clear();
         rows
     }
     fn pop(&mut self) -> Row {
@@ -162,17 +178,25 @@ impl Graph {
     // lookahead is parked instead of taking a lane.
     fn layout(&mut self, commit: Commit, collapse: bool) -> Row {
         let mut arrows = Vec::new();
-        if collapse {
-            // A parked parent `stub` rows ahead goes live under a ▲, unless
-            // this row is its short child and revives it below.
-            if let Some(ahead) = self.queue.get(self.stub - 1)
-                && !commit.parents.contains(&ahead.hash)
-                && let Some(p) = self.parked.remove(&ahead.hash)
-            {
+        let mut join = None;
+        if collapse && let Some(ahead) = self.queue.get(self.stub - 1) {
+            // A parked parent `stub` rows ahead goes live under a ▲. If a
+            // short child revived it (this row, or one above), it is already
+            // live, and the ▲ only runs down into its lane.
+            if let Some(&color) = self.revived.get(&ahead.hash) {
+                self.revived.remove(&ahead.hash);
+                join = Some((ahead.hash.clone(), color));
+            } else if commit.parents.contains(&ahead.hash) {
+                join = self
+                    .parked
+                    .get(&ahead.hash)
+                    .map(|p| (ahead.hash.clone(), p.color));
+            } else if let Some(p) = self.parked.remove(&ahead.hash) {
                 arrows.push(Arrow {
                     lane: self.lanes.len(),
                     color: p.color,
                     direction: Direction::Up,
+                    join: None,
                 });
                 self.lanes.push((ahead.hash.clone(), p.color));
             }
@@ -191,15 +215,30 @@ impl Graph {
             lane
         });
         let color = self.lanes[lane].1;
+        let fresh = self.fresh.take().is_some_and(|h| h == commit.hash);
         let incoming = self
             .lanes
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != lane || existing.is_some())
+            .filter(|(i, _)| *i != lane || (existing.is_some() && !fresh))
             .map(|(i, (_, c))| (i, *c))
             .collect();
         let before = self.lanes.clone();
         self.lanes.remove(lane);
+        // Last row's ▼ tails end here: through the row, arrowhead at the bottom.
+        arrows.extend(
+            before
+                .iter()
+                .enumerate()
+                .filter(|(_, (h, _))| h == TAIL)
+                .map(|(lane, &(_, color))| Arrow {
+                    lane,
+                    color,
+                    direction: Direction::Down,
+                    join: None,
+                }),
+        );
+        self.lanes.retain(|(h, _)| h != TAIL);
         let mut down = Vec::new();
         for (i, parent) in commit.parents.iter().enumerate() {
             if self.lanes.iter().any(|(h, _)| h == parent) {
@@ -222,13 +261,16 @@ impl Graph {
                 self.parked.insert(parent.clone(), Parked { color: c });
                 down.push(c);
             } else {
+                if parked.is_some() && join.as_ref().is_none_or(|(h, _)| h != parent) {
+                    self.revived.insert(parent.clone(), c);
+                }
                 self.lanes
                     .insert((lane + i).min(self.lanes.len()), (parent.clone(), c));
             }
         }
         let mut outgoing = Vec::new();
         for (from, (hash, c)) in before.iter().enumerate() {
-            if from != lane {
+            if from != lane && hash != TAIL {
                 let to = self.lanes.iter().position(|(h, _)| h == hash).unwrap();
                 outgoing.push(Edge {
                     from,
@@ -246,14 +288,45 @@ impl Graph {
                 });
             }
         }
-        // ▼ stems end right of every continuing lane, so they cross no
-        // lane's end point at the row bottom.
-        let first = lane.max(self.lanes.len());
-        arrows.extend(down.into_iter().enumerate().map(|(k, color)| Arrow {
-            lane: first + k,
-            color,
-            direction: Direction::Down,
-        }));
+        // A far parent's edge runs into a tail lane right of every continuing
+        // lane, and the next row ends it with the ▼. As a real lane for that
+        // one row, nothing else is laid out across it. A next commit that
+        // would open a new lane opens it now, left of the tail, so the tail
+        // never takes its column.
+        if !down.is_empty()
+            && let Some(next) = self.queue.front()
+            && !self.lanes.iter().any(|(h, _)| h == &next.hash)
+        {
+            let color = match self.parked.remove(&next.hash) {
+                Some(p) => p.color,
+                None => {
+                    self.next_color += 1;
+                    self.next_color - 1
+                }
+            };
+            self.lanes.push((next.hash.clone(), color));
+            self.fresh = Some(next.hash.clone());
+        }
+        for color in down {
+            outgoing.push(Edge {
+                from: lane,
+                to: self.lanes.len(),
+                color,
+            });
+            self.lanes.push((TAIL.to_owned(), color));
+        }
+        // A joining ▲ sits right of every lane at the row top, then runs
+        // down into the revived parent's lane at the row bottom.
+        if let Some((hash, color)) = join
+            && let Some(to) = self.lanes.iter().position(|(h, _)| h == &hash)
+        {
+            arrows.push(Arrow {
+                lane: before.len().max(self.lanes.len()),
+                color,
+                direction: Direction::Up,
+                join: Some(to),
+            });
+        }
         let stubs = arrows.iter().map(|a| a.lane + 1).max().unwrap_or(0);
         Row {
             width: before.len().max(self.lanes.len()).max(stubs),
@@ -975,7 +1048,7 @@ impl HistoryView {
                         egui::Stroke::new(1.7 * s, COLORS[edge.color % COLORS.len()]),
                     );
                 }
-                // Long-edge stubs, paint only: a ▼ stem from the node to the
+                // Long-edge stubs, paint only: a ▼ ending a tail lane at the
                 // row bottom, and a ▲ capping a live lane at the row top.
                 for arrow in &row.arrows {
                     let color = COLORS[arrow.color % COLORS.len()];
@@ -984,11 +1057,17 @@ impl HistoryView {
                         Direction::Down => (r.bottom(), r.bottom() - tall),
                         Direction::Up => (r.top(), r.top() + tall),
                     };
+                    let stroke = egui::Stroke::new(1.7 * s, color);
                     if arrow.direction == Direction::Down {
                         p.line_segment(
-                            [egui::pos2(x(row.lane), r.center().y), egui::pos2(ax, base)],
-                            egui::Stroke::new(1.7 * s, color),
+                            [egui::pos2(ax, r.center().y), egui::pos2(ax, base)],
+                            stroke,
                         );
+                    }
+                    if let Some(to) = arrow.join {
+                        let mid = egui::pos2(ax, r.center().y);
+                        p.line_segment([egui::pos2(ax, base), mid], stroke);
+                        p.line_segment([mid, egui::pos2(x(to), r.bottom())], stroke);
                     }
                     p.add(egui::Shape::convex_polygon(
                         vec![
@@ -1557,11 +1636,21 @@ mod tests {
                 commit("fork", &[]),
             ],
         );
-        let down = rows[0]
+        // The card's edge runs one row into a tail lane, and the ▼ ends it.
+        // `m0` keeps lane 0 with no edge in from above; the tail runs right.
+        assert_eq!(rows[0].outgoing.len(), 1);
+        assert_eq!(rows[0].outgoing[0].to, 1);
+        assert_eq!((rows[1].lane, rows[1].width), (0, 2));
+        assert_eq!(
+            rows[1].incoming.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            [1]
+        );
+        let down = rows[1]
             .arrows
             .iter()
             .find(|a| a.direction == Direction::Down)
             .unwrap();
+        assert_eq!(down.lane, 1);
         let up = rows[5]
             .arrows
             .iter()
@@ -1570,10 +1659,10 @@ mod tests {
         assert_eq!(down.color, up.color);
         assert_eq!(arrows(&rows, Direction::Down).len(), 1);
         assert_eq!(arrows(&rows, Direction::Up).len(), 1);
-        assert!(rows[1..5].iter().all(|r| r.width == 1));
-        assert!(rows[1..5].iter().all(|r| r.arrows.is_empty()));
+        assert!(rows[2..5].iter().all(|r| r.width == 1));
+        assert!(rows[2..5].iter().all(|r| r.arrows.is_empty()));
         assert!(
-            rows[1..5]
+            rows[2..5]
                 .iter()
                 .all(|r| r.incoming.iter().all(|&(_, c)| c != down.color))
         );
@@ -1584,13 +1673,34 @@ mod tests {
             .map(|(i, h)| main.push(commit(h, &[&format!("m{}", i + 1)])).width)
             .collect();
         assert_eq!(
-            rows[1..5].iter().map(|r| r.width).collect::<Vec<_>>(),
-            baseline
+            rows[2..5].iter().map(|r| r.width).collect::<Vec<_>>(),
+            baseline[1..]
         );
         assert_eq!((rows[6].lane, rows[6].color), (0, up.color));
     }
     #[test]
-    fn parked_parent_joined_by_short_child_has_no_up_arrow() {
+    fn short_child_right_above_parent_carries_the_joining_up_arrow() {
+        let rows = collect(
+            &mut Graph::with_lengths(3, 1),
+            vec![
+                commit("a", &["far"]),
+                commit("m0", &["m1"]),
+                commit("m1", &["m2"]),
+                commit("m2", &["near"]),
+                commit("near", &["far"]),
+                commit("far", &[]),
+            ],
+        );
+        let up = arrows(&rows, Direction::Up);
+        assert_eq!(up.len(), 1);
+        let (at, arrow) = up[0];
+        let near = &rows[4];
+        assert_eq!((at, arrow.join), (4, Some(near.outgoing[0].to)));
+        assert!(arrow.lane > near.lane);
+        assert_eq!(rows[5].color, arrow.color);
+    }
+    #[test]
+    fn parked_parent_joined_by_short_child_gets_joining_up_arrow() {
         let mut g = Graph::with_lengths(3, 1);
         let rows = collect(
             &mut g,
@@ -1607,7 +1717,21 @@ mod tests {
         let down = arrows(&rows, Direction::Down);
         assert_eq!(down.len(), 1);
         let parked = down[0].1.color;
-        assert!(arrows(&rows, Direction::Up).is_empty());
+        // The ▲ sits on the row above the parent, right of its lanes, and
+        // runs into the revived parent's lane at the bottom.
+        let up = arrows(&rows, Direction::Up);
+        assert_eq!(up.len(), 1);
+        let (at, arrow) = up[0];
+        assert_eq!((at, arrow.color), (5, parked));
+        let above = &rows[5];
+        let into = above
+            .outgoing
+            .iter()
+            .find(|e| e.color == parked)
+            .unwrap()
+            .to;
+        assert_eq!(arrow.join, Some(into));
+        assert!(arrow.lane >= above.width - 1 && arrow.lane > into);
         let near = &rows[4];
         assert!(
             near.outgoing
@@ -1641,7 +1765,7 @@ mod tests {
         assert_eq!(most_parked, 1);
         let down = arrows(&rows, Direction::Down);
         let up = arrows(&rows, Direction::Up);
-        assert_eq!(down.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 5]);
+        assert_eq!(down.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [1, 6]);
         assert_eq!(up.len(), 1);
         assert_eq!(up[0].0, rows.len() - 2);
         assert!(down.iter().all(|(_, a)| a.color == up[0].1.color));
@@ -1658,7 +1782,7 @@ mod tests {
             ],
         );
         assert_eq!(arrows(&rows, Direction::Down).len(), 1);
-        assert_eq!(rows[0].arrows[0].direction, Direction::Down);
+        assert_eq!(rows[1].arrows[0].direction, Direction::Down);
         assert!(arrows(&rows, Direction::Up).is_empty());
         assert!(g.parked.is_empty());
         assert!(g.finish().is_empty(), "finish drains once");
@@ -1678,21 +1802,28 @@ mod tests {
             ],
         );
         let merge = &rows[0];
-        assert_eq!(
-            merge.outgoing,
-            [Edge {
-                from: 0,
-                to: 0,
-                color: merge.color
-            }]
-        );
         let down = arrows(&rows, Direction::Down);
         let up = arrows(&rows, Direction::Up);
-        assert_eq!((down.len(), down[0].0), (1, 0));
+        assert_eq!(
+            merge.outgoing,
+            [
+                Edge {
+                    from: 0,
+                    to: 0,
+                    color: merge.color
+                },
+                Edge {
+                    from: 0,
+                    to: 1,
+                    color: down[0].1.color
+                }
+            ]
+        );
+        assert_eq!((down.len(), down[0].0), (1, 1));
         assert_ne!(down[0].1.color, merge.color);
         assert_eq!((up.len(), up[0].0), (1, 5));
         assert_eq!(up[0].1.color, down[0].1.color);
-        assert!(rows[1..5].iter().all(|r| r.width == 1));
+        assert!(rows[2..5].iter().all(|r| r.width == 1));
         assert!(merge.width <= 2);
     }
     #[test]
@@ -1743,7 +1874,7 @@ mod tests {
                 commit("far", &[]),
             ],
         );
-        let color = COLORS[rows[0].arrows[0].color % COLORS.len()];
+        let color = COLORS[rows[1].arrows[0].color % COLORS.len()];
         let mut view = HistoryView::new(None);
         view.end = true;
         view.count = rows.len();
@@ -1783,7 +1914,7 @@ mod tests {
         }
         tips.sort_by(f32::total_cmp);
         assert!(tips[0] < 0.0 && tips[1] > 0.0, "{tips:?}");
-        // The ▼ (pointing down) is on the merge row, above the ▲ one.
+        // The ▼ (pointing down) is on the row below the merge, above the ▲.
         let y = |dir: f32| {
             triangles
                 .iter()
@@ -2071,12 +2202,12 @@ mod tests {
         );
         let card = &first.rows[0];
         assert_eq!(card.commit.subject, "Card!");
-        let down = card
+        let down = first.rows[1]
             .arrows
             .iter()
             .find(|a| a.direction == Direction::Down)
             .expect("the card fork is long");
-        assert!(first.rows[1..].iter().all(|r| r.width == 1));
+        assert!(first.rows[2..].iter().all(|r| r.width == 1));
         let fork = second
             .rows
             .iter()

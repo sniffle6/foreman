@@ -64,7 +64,13 @@ every row down to its fork point. With twenty open cards that is twenty lanes,
 and the subjects get shoved off the pane. Now an edge longer than **30 rows**
 is drawn as two colored stubs instead:
 
-- a **▼** under the child, one half-row stem ending at the row bottom;
+- a **▼** one row under the child: the child's edge runs into a one-row
+  "tail" lane right of the continuing lanes, and the arrowhead ends it at the
+  bottom of the next row, the way JetBrains draws it. The tail is a real lane
+  for that row, so nothing is laid across it. If the next commit would open a
+  new lane, that lane opens a row early, left of the tail, so the commit is not
+  pushed sideways. The last row of history has no next row, so a tail there
+  gets no arrowhead;
 - a **▲** capping the parent's lane one row above the parent.
 
 Both are the parked edge's color, so you can match them by eye. Between them
@@ -73,15 +79,16 @@ A parent that never shows up (shallow clone, or outside the scope) gets only
 its ▼.
 
 If a *near* child (within 30 rows) reaches the parent first, the parent goes
-live in that child's ordinary edge, keeps the parked color, and gets no ▲.
-On a linear `main` this is the common case: the main commit above a fork point
-is its child, so the fork point just takes the card's color, the same color
-change the old full lanes showed. You mostly see a ▲ under a long merged side
-branch, where the merge's first parent lands 30+ rows down. Many far children
-of one parent share one parked color and one ▲.
+live in that child's ordinary edge and keeps the parked color. It still gets
+a ▲, as JetBrains draws it: the row just above the parent carries the ▲ right
+of every lane, with a short stroke angling down into the parent's lane. On a
+linear `main` this is the common case: the main commit above a fork point is
+its child, so the fork point takes the card's color and the ▲ angles into the
+main lane. Many far children of one parent share one parked color and one ▲.
 
-The ▼ sits right of every lane that continues past that row, so it can angle
-sideways from its node. It never lands on another lane's end point.
+The ▼'s tail sits right of every lane that continues past the child's row,
+so the child's edge can angle sideways into it. The ▼ never lands on another
+lane's end point.
 
 Arrows are paint only: no click, hover, tooltip, or jump. Clicking the row
 still selects the commit.
