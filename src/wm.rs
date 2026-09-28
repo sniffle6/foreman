@@ -4815,8 +4815,16 @@ impl WindowManager {
         if json {
             return Ok(serde_json::to_string(&view).unwrap_or_default());
         }
+        // Workers read "held" as stuck and blocked their cards, which then
+        // stranded shipped work in Blocked; say what held means.
+        let held = if view.hold.is_some() {
+            "\nheld is not blocked: the queue retries by itself once the human \
+             fixes the destination. Keep waiting (kanban wait); do not block the card."
+        } else {
+            ""
+        };
         Ok(format!(
-            "{id}  {}{}",
+            "{id}  {}{}{held}",
             view.summary(),
             if submitted.existing {
                 " (already submitted)"
@@ -4879,9 +4887,9 @@ impl WindowManager {
                 .unwrap_or_default();
             // Bind before matching: a `RefMut` temporary inside the match
             // scrutinee would outlive the arm that needs `&mut self`.
-            let done = self.kanban.borrow_mut().done(&r.card);
+            let done = self.kanban.borrow_mut().integrated(&r.card);
             match done {
-                Ok(()) => {
+                Ok(true) => {
                     crate::notify::queue(
                         ctx,
                         crate::notify::Level::Info,
@@ -4894,7 +4902,18 @@ impl WindowManager {
                 }
                 // Already Done (a second instance got here first, or the
                 // human marked it): the request is still finished.
-                Err(_) => {}
+                Ok(false) => {}
+                // The branch is on the target but the card can't say so;
+                // the request is removed below, so this toast is the only
+                // record — never swallow it.
+                Err(e) => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Error,
+                    format!(
+                        "card {}: integrated into {} at {prepared}, but the card was not marked Done: {e}",
+                        r.card, r.target
+                    ),
+                ),
             }
             if let Err(e) = queue.remove(&r.card) {
                 crate::notify::queue(

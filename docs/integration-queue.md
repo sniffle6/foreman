@@ -169,6 +169,14 @@ card once the worktree is clean.
   the tick after `integrated` is written, so a crash between the merge and
   the flip still lands the same message after restart. Two instances both
   trying is harmless: the second `done` is a no-op.
+- **An integrated Blocked card still goes Done.** Workers used to read
+  `queued · held` as stuck and `block` their card; the queue landed the
+  work anyway, `done` refused Blocked, the error was swallowed, and the
+  card sat in Blocked with a stale reason and no way out but Return to
+  backlog. The bookkeeping now uses `CardStore::integrated`, which takes
+  In Progress or Blocked (the landing is verified), and any other refusal
+  is toasted. The `integrate` reply and the kanban skill both say that
+  held is not blocked.
 - **`wait --any` never returns 3.** An orchestrator waiting on any card
   sees a hand-back as still in progress; the worker's own `wait <id>` sees
   it at once.

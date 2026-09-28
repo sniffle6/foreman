@@ -217,7 +217,11 @@ Resubmitting the same commit is harmless (you get the existing request
 back). Committing more after submitting makes the submission stale: it
 comes back as `needs resolution · source changed`; resubmit. A dirty main
 checkout or one on the wrong branch holds the whole queue (`queued · held:
-…`) until the human fixes it; nothing of yours is touched. `integrate <id>
+…`) until the human fixes it; nothing of yours is touched. **Held is not
+blocked — do not `block` the card.** The queue retries by itself and lands
+your commit once the destination is clean; keep running `wait`. A card you
+block while its request is queued still lands, but you have handed the
+human a stale Blocked reason to clear. `integrate <id>
 --cancel` withdraws your request. The board shows the same substates on
 the card (queued, integrating, needs resolution) and offers Submit /
 Resubmit / Cancel on the detail page.

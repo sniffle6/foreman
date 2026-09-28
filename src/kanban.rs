@@ -1393,6 +1393,32 @@ impl CardStore {
         Ok(())
     }
 
+    /// The integration queue landed the card's branch: InProgress or
+    /// Blocked -> Done. Wider than `done` because the landing is verified —
+    /// a worker that blocked while its request sat held in the queue must
+    /// not strand shipped work in Blocked. `Ok(false)` when the card is
+    /// already Done (a second instance, or the human, got there first).
+    pub fn integrated(&mut self, id: &str) -> Result<bool, String> {
+        let dir = self.dir_or_err()?.to_path_buf();
+        let mut card = self.read_one(id)?;
+        match card.state {
+            CardState::Done => return Ok(false),
+            CardState::InProgress | CardState::Blocked => {}
+            other => {
+                return Err(format!(
+                    "card {id} was integrated but is {other:?}, not in progress or blocked"
+                ));
+            }
+        }
+        card.state = CardState::Done;
+        card.claim = None;
+        card.blocked_reason = None;
+        card.updated = now_stamp();
+        self.write_card(&dir, &card)?;
+        self.replace_in_memory(card);
+        Ok(true)
+    }
+
     /// InProgress -> Blocked only; clears the claim, records `reason`. A
     /// nonempty reason is mandatory — a Blocked column without reasons costs
     /// the human an investigation per card.
@@ -2714,6 +2740,33 @@ mod tests {
         assert!(store.done(&id2).is_err()); // Backlog -> Done is not a legal edge
         store.rm(&id2).unwrap();
         assert!(store.get(&id2).is_none());
+    }
+
+    #[test]
+    fn integrated_lands_in_progress_and_blocked_cards_as_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = store_at(tmp.path());
+        let run = run_nonce();
+
+        let live = store.add("live", None).unwrap();
+        store.start(&live, "t1", run, TermState::Running).unwrap();
+        assert_eq!(store.integrated(&live), Ok(true));
+        assert_eq!(store.get(&live).unwrap().state, CardState::Done);
+        assert_eq!(store.integrated(&live), Ok(false)); // already Done: no-op
+
+        // a worker that blocked while its request was held in the queue
+        let held = store.add("held", None).unwrap();
+        store.start(&held, "t2", run, TermState::Running).unwrap();
+        store.block(&held, "Integration queue held").unwrap();
+        assert_eq!(store.integrated(&held), Ok(true));
+        let card = store.get(&held).unwrap();
+        assert_eq!(card.state, CardState::Done);
+        assert!(card.blocked_reason.is_none());
+
+        let idle = store.add("idle", None).unwrap();
+        assert!(store.integrated(&idle).is_err()); // Backlog was never submitted
+        assert_eq!(store.get(&idle).unwrap().state, CardState::Backlog);
+        assert!(store.integrated("nope00").is_err());
     }
 
     #[test]
