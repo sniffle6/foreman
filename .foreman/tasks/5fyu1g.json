@@ -4,11 +4,6 @@
   "title": "Git History: keep old rows up during a re-read (no blink)",
   "body": "restart() swaps in a fresh HistoryView, so the timeline blanks ~100 ms until the new stream's first page lands. Silent at-top re-reads (poll_refs) now make this blink on every commit when agents commit often; pill click and Refresh blink too. Keep the retired pages/count painted until the first page arrives, then swap. Watch: scroll offset (new generation id), selection, the retire-off-GUI-thread drop. See src/git_history.rs (restart, poll_refs, poll) and docs/git-history.md 'Live updates' gotcha.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/5fyu1g",
-    "branch": "card/5fyu1g",
-    "base": "main"
-  },
   "created": "2026-09-27T05:25:40Z",
   "updated": "2026-09-28T00:52:58Z"
 }
