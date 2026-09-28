@@ -158,7 +158,7 @@ only) which branch is checked out. If that changed:
   `↻ N new commits` (`git rev-list --count <scope> --not <old tips>`), or
   `↻ History changed` when nothing new is reachable (reset, rebase, a
   deleted branch, a tag). Clicking it re-reads and keeps the selected
-  commit. Refresh still clears the selection.
+  commit.
 - at the top of the timeline: it just re-reads, no pill. Nothing is lost
   there, and JetBrains follows the top the same way.
 
@@ -166,6 +166,10 @@ Refs the scope doesn't walk never count: a card commit leaves Current alone
 but shows up in Local and All; `refs/stash` counts nowhere. The stream takes
 its fingerprint *before* `git log` starts, so a ref that moves during the
 read is caught by the next event instead of being missed.
+
+Without a live watch (see below), the window becoming active stands in for
+the event: it re-checks the fingerprint the same way, so the pill or the
+silent re-read still happen, only on focus instead of at once.
 
 A re-read (pill, silent, Refresh, or a scope change) keeps the old rows
 and count painted until the new stream's first page lands, then swaps them
@@ -213,10 +217,21 @@ Gotchas:
   them; one it can't expand (already deleted) counts as everything.
 - The handles share read/write/delete, so a watch never blocks a card
   teardown. When the watched root is deleted the read fails and the thread
-  exits for good; it never retries (a retry would hold the tree teardown
-  wants gone). Windows then fall back to the old behavior.
+  exits for good; the thread never retries on its handle (that would hold
+  the tree teardown wants gone). The *view* (`Follow`) opens a fresh watch
+  every 10 s while it is shown and down; a live watch never blocks
+  teardown, so this is safe. A retry whose folder is gone costs one stat,
+  not a `git` spawn, so a window left on a torn-down card worktree stays
+  cheap, and it reattaches if the folder comes back. Until one is live,
+  windows fall back to the old behavior.
 - No watch on network paths (UNC, mapped network drives, `\\wsl$`): the
   windows keep the refresh-on-activate fallback.
+- **Refresh only shows when it's needed.** With a live watch both windows
+  are always current, so their Refresh button is hidden. It appears when
+  the watch is down (`Follow::down`: an open finished without a live watch,
+  including while a retry is in flight, so it doesn't flicker) or when the
+  read failed. What you lose with a live watch: History's Refresh also
+  cleared the selection; click a row or pick the scope again instead.
 - Our own reads don't wake it: they run with `GIT_OPTIONAL_LOCKS=0` and
   write nothing. `our_own_reads_never_wake_the_watch` pins that.
 - The watch thread runs while a view or card holds it, even when minimized,
@@ -257,6 +272,7 @@ edits appear without touching anything. A watch-triggered read never cancels
 one in flight (steady churn would starve it); it marks "again" and reads
 once more when the current one lands. Those reads show no spinner, and when
 the status bytes hash the same as last time, the shown tree is kept as is.
+The Refresh button shows only without a live watch or after a failed read.
 The previous list stays up while a re-read runs, and collapsed folders and
 the selected file carry over.
 
@@ -461,7 +477,9 @@ names), `debounce_trails_by_quiet_time_and_caps_at_max_wait`,
 `our_own_reads_never_wake_the_watch`, `deleting_the_watch_root_stops_the_thread`,
 `a_watched_main_checkout_or_card_worktree_never_blocks_teardown` (both
 `TeardownOutcome::Removed`), `watched_edits_appear_while_shown_without_a_focus_change`,
-and `moved_refs_offer_a_pill_when_scrolled_and_reread_silently_at_the_top`.
+`moved_refs_offer_a_pill_when_scrolled_and_reread_silently_at_the_top`,
+`unwatched_history_rechecks_refs_on_refocus_and_offers_refresh`, and
+`a_dead_watch_reads_down_and_reopens_after_the_retry_interval`.
 No native screenshot of the pill yet.
 
 ## Key files

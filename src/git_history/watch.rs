@@ -718,48 +718,83 @@ fn run(layout: Layout, shared: &Shared, stop: &Handle, ready: mpsc::SyncSender<b
     }
 }
 
+/// A dead or unopenable watch is tried again this often while the view is
+/// shown, so a transient failure (a root renamed away and back, a read
+/// error) does not leave the view unwatched for its lifetime.
+const RETRY: Duration = Duration::from_secs(10);
+
 /// A view's handle on the shared watch: opened lazily on a worker the
-/// first time the view is shown.
+/// first time the view is shown, and reopened after [`RETRY`] while it is
+/// down.
 #[derive(Default)]
 pub(super) struct Follow {
     opening: Option<mpsc::Receiver<Option<Arc<RepoWatch>>>>,
     watch: Option<Arc<RepoWatch>>,
-    tried: bool,
+    /// When the last open started; `None` before the first.
+    tried: Option<Instant>,
+    /// An open has finished at least once. Until then the view is not
+    /// "down", only starting; after, a retry in flight keeps it down so the
+    /// manual Refresh does not flicker every [`RETRY`].
+    settled: bool,
+    /// Never opens (tests: a filesystem without change notifications).
+    off: bool,
 }
 impl Follow {
     /// Never watches, as on a filesystem without change notifications.
     #[cfg(test)]
     pub(super) fn off() -> Self {
         Self {
-            tried: true,
+            off: true,
             ..Self::default()
         }
     }
-    /// The live watch, starting to open one on first call. `None` while
-    /// opening, when the repository cannot be watched, or after the watcher
-    /// stopped: callers then keep their read-on-focus behavior.
+    /// The live watch, starting to open one on first call and again every
+    /// [`RETRY`] while down. `None` while opening, when the repository
+    /// cannot be watched, or after the watcher stopped: callers then keep
+    /// their read-on-focus behavior.
     pub(super) fn live(&mut self, cwd: Option<&Path>, ctx: &egui::Context) -> Option<&RepoWatch> {
-        if !self.tried {
-            self.tried = true;
-            if let Some(cwd) = cwd {
-                let (tx, rx) = mpsc::sync_channel(1);
-                let (cwd, ctx) = (cwd.to_path_buf(), ctx.clone());
-                std::thread::spawn(move || {
-                    let watch = open(&cwd, &ctx);
-                    if tx.send(watch).is_ok() {
-                        ctx.request_repaint();
-                    }
-                });
-                self.opening = Some(rx);
-            }
-        }
         if let Some(rx) = &self.opening
             && let Ok(watch) = rx.try_recv()
         {
             self.watch = watch;
             self.opening = None;
+            self.settled = true;
+        }
+        let down = self.opening.is_none() && !self.watch.as_ref().is_some_and(|w| w.alive());
+        if down
+            && !self.off
+            && let Some(cwd) = cwd
+            && self.tried.is_none_or(|t| t.elapsed() >= RETRY)
+        {
+            let retry = self.tried.is_some();
+            self.tried = Some(Instant::now());
+            // A view left open on a torn-down card worktree: one stat per
+            // interval instead of a failing `git` discovery, and it picks
+            // the folder up again if it comes back.
+            if retry && !cwd.exists() {
+                ctx.request_repaint_after(RETRY);
+                return None;
+            }
+            let (tx, rx) = mpsc::sync_channel(1);
+            let (cwd, ctx) = (cwd.to_path_buf(), ctx.clone());
+            std::thread::spawn(move || {
+                let watch = open(&cwd, &ctx);
+                if tx.send(watch).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+            self.opening = Some(rx);
+        } else if down && !self.off && cwd.is_some() {
+            // Wake for the retry even when nothing else repaints.
+            let wait = RETRY.saturating_sub(self.tried.map_or(RETRY, |t| t.elapsed()));
+            ctx.request_repaint_after(wait);
         }
         self.watch.as_deref().filter(|w| w.alive())
+    }
+    /// Not watching: an open finished without a live watch, or the watch
+    /// died (a retry may be in flight). Views show their manual Refresh then.
+    pub(super) fn down(&self) -> bool {
+        self.off || (self.settled && !self.watch.as_ref().is_some_and(|w| w.alive()))
     }
 }
 
@@ -1075,6 +1110,47 @@ mod tests {
         assert!(!dir.exists());
         // A dead watch is replaced, not shared.
         drop(repo);
+    }
+
+    #[test]
+    fn a_dead_watch_reads_down_and_reopens_after_the_retry_interval() {
+        let repo = repo();
+        let dir = repo.path().to_path_buf();
+        let ctx = egui::Context::default();
+        let mut follow = Follow::default();
+        let until_live = |follow: &mut Follow, want: bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while follow.live(Some(&dir), &ctx).is_some() != want {
+                assert!(Instant::now() < deadline, "live never became {want}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert!(!follow.down(), "the first open is starting, not down");
+        until_live(&mut follow, true);
+        assert!(!follow.down());
+        std::fs::remove_dir_all(&dir).unwrap();
+        until_live(&mut follow, false);
+        assert!(follow.down());
+        // Due, but the folder is gone: no open (no `git` spawn), still down.
+        follow.tried = Some(Instant::now() - RETRY);
+        assert!(follow.live(Some(&dir), &ctx).is_none());
+        assert!(follow.opening.is_none() && follow.down());
+        // Back again, but inside the interval nothing reopens.
+        std::fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        assert!(follow.live(Some(&dir), &ctx).is_none());
+        assert!(follow.opening.is_none());
+        // Past it: a retry starts, and stays down (no Refresh flicker)
+        // until the new watch is live.
+        follow.tried = Some(Instant::now() - RETRY);
+        assert!(follow.live(Some(&dir), &ctx).is_none());
+        assert!(follow.opening.is_some() && follow.down());
+        until_live(&mut follow, true);
+        assert!(!follow.down());
+        assert!(
+            Follow::off().down(),
+            "an unwatchable view always offers Refresh"
+        );
     }
 
     #[test]

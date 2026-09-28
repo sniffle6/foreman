@@ -235,7 +235,7 @@ impl Content {
                 view.show(ui, rect, active, resp, base.with((win_id, "plan")))
             }),
             Content::GitHistory(view) => claims_click(ui, |ui| {
-                view.show(ui, rect, base.with((win_id, "git-history")))
+                view.show(ui, rect, active, base.with((win_id, "git-history")))
             }),
             Content::GitDiff(view) => claims_click(ui, |ui| {
                 view.show(ui, rect, active, base.with((win_id, "git-diff")))

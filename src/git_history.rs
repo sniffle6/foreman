@@ -583,6 +583,16 @@ impl Check {
     }
 }
 
+/// Why a manual Refresh is on screen: no live watch, or a failed read.
+pub(super) fn refresh_hint(unwatched: bool) -> &'static str {
+    if unwatched {
+        "Live updates are off here (this folder can't be watched right now); \
+         re-read by hand. Also re-reads when the window is focused."
+    } else {
+        "Try the read again"
+    }
+}
+
 /// The header pill's text for `n` new commits.
 fn pill_text(n: usize) -> String {
     match n {
@@ -637,6 +647,9 @@ pub struct HistoryView {
     filter: String,
     /// The shared repository watch; carried across restarts.
     follow: watch::Follow,
+    /// Last frame's `active`; a rising edge re-checks refs when there is no
+    /// live watch to say they moved.
+    was_active: bool,
     /// The watch's refs generation the shown timeline (or the last check)
     /// covers; `None` makes the next frame check.
     refs_seen: Option<u64>,
@@ -707,6 +720,7 @@ impl HistoryView {
             popup_open: false,
             filter: String::new(),
             follow: watch::Follow::default(),
+            was_active: false,
             refs_seen: None,
             fingerprint: None,
             revisions: Vec::new(),
@@ -742,7 +756,7 @@ impl HistoryView {
             }
         }
     }
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn poll(&mut self, ctx: &egui::Context, refocused: bool) {
         let refs_gen = self
             .follow
             .live(self.cwd.as_deref(), ctx)
@@ -794,14 +808,15 @@ impl HistoryView {
             self.branches = Some(branches);
             self.branch_rx = None;
         }
-        self.poll_refs(ctx, refs_gen);
+        self.poll_refs(ctx, refs_gen, refocused);
     }
     /// Refs moved while shown: re-fingerprint on a worker, and offer the
     /// pill if the timeline is stale. At the top of the timeline there is
     /// nothing to lose, so it just re-reads (JetBrains follows the top the
     /// same way). A generation that moved while hidden is handled here on
-    /// the next show.
-    fn poll_refs(&mut self, ctx: &egui::Context, refs_gen: Option<u64>) {
+    /// the next show. With no live watch, the window becoming active stands
+    /// in for a generation change (as Git Changes re-reads on focus).
+    fn poll_refs(&mut self, ctx: &egui::Context, refs_gen: Option<u64>, refocused: bool) {
         if let Some(check) = &self.check {
             match check.result.try_recv() {
                 Ok(Some(_)) if self.scroll_y <= 0.5 => {
@@ -814,10 +829,14 @@ impl HistoryView {
             }
             self.check = None;
         }
-        if let (Some(generation), Some(old), Some(cwd)) = (refs_gen, &self.fingerprint, &self.cwd)
-            && self.refs_seen != Some(generation)
-        {
-            self.refs_seen = Some(generation);
+        let due = match refs_gen {
+            Some(generation) => self.refs_seen != Some(generation),
+            None => refocused,
+        };
+        if due && let (Some(old), Some(cwd)) = (&self.fingerprint, &self.cwd) {
+            if refs_gen.is_some() {
+                self.refs_seen = refs_gen;
+            }
             self.check = Some(Check::start(
                 cwd.clone(),
                 self.scope.clone(),
@@ -837,6 +856,7 @@ impl HistoryView {
         let mut old = std::mem::replace(self, Self::new(cwd));
         self.details_w = old.details_w;
         self.follow = std::mem::take(&mut old.follow);
+        self.was_active = old.was_active;
         self.pages = std::mem::take(&mut old.pages);
         self.count = std::mem::take(&mut old.count);
         self.stale = true;
@@ -968,8 +988,10 @@ impl HistoryView {
         }
         pick
     }
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
-        self.poll(ui.ctx());
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, active: bool, base: egui::Id) {
+        let refocused = active && !self.was_active;
+        self.was_active = active;
+        self.poll(ui.ctx(), refocused);
         let th = crate::theme::live(ui.ctx());
         let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
         let s = zoom.factor();
@@ -1038,13 +1060,19 @@ impl HistoryView {
                 }
                 reload |= pill.clicked();
             }
-            let button = ui.button("Refresh");
-            #[cfg(test)]
-            {
-                self.header_button_h = button.rect.height();
-                self.refresh_btn = button.rect;
+            // A live watch keeps the timeline current (the pill, or a silent
+            // re-read at the top); Refresh is only for when it can't.
+            if self.follow.down() || self.error.is_some() {
+                let button = ui
+                    .button("Refresh")
+                    .on_hover_text(refresh_hint(self.follow.down()));
+                #[cfg(test)]
+                {
+                    self.header_button_h = button.rect.height();
+                    self.refresh_btn = button.rect;
+                }
+                refresh = button.clicked();
             }
-            refresh = button.clicked();
         });
         if refresh || reload {
             // The pill keeps the selected commit; Refresh starts clean.
@@ -1441,6 +1469,7 @@ mod tests {
     #[test]
     fn clicking_rows_changes_selection_and_refresh_clears_it() {
         let mut view = HistoryView::new(Some(PathBuf::new()));
+        view.follow = watch::Follow::off(); // Refresh shows only unwatched
         view.end = true;
         let mut graph = Graph::default();
         view.pages.push(vec![
@@ -1457,7 +1486,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("click")),
+                |ui| view.show(ui, rect, true, egui::Id::new("click")),
             );
         };
         frame(&mut view, vec![]);
@@ -1504,7 +1533,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("split")),
+                |ui| view.show(ui, rect, true, egui::Id::new("split")),
             );
         };
         let press = |pos, pressed| egui::Event::PointerButton {
@@ -1616,7 +1645,7 @@ mod tests {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("narrow")),
+                |ui| view.show(ui, rect, true, egui::Id::new("narrow")),
             ));
         }
         // Body 8..692; timeline ends half a gap left of the divider.
@@ -2054,7 +2083,7 @@ mod tests {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("arrows")),
+                |ui| view.show(ui, rect, true, egui::Id::new("arrows")),
             )
         };
         run(&mut view);
@@ -2276,7 +2305,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("large")),
+                |ui| view.show(ui, rect, true, egui::Id::new("large")),
             );
             assert!(view.drawn.len() < 30, "{:?}", view.drawn);
         }
@@ -2292,6 +2321,7 @@ mod tests {
     #[test]
     fn rows_follow_theme_font_size() {
         let mut view = HistoryView::new(None);
+        view.follow = watch::Follow::off(); // measures the Refresh button
         view.end = true;
         let mut graph = Graph::default();
         view.pages.push(
@@ -2310,7 +2340,7 @@ mod tests {
                         screen_rect: Some(rect),
                         ..Default::default()
                     },
-                    |ui| view.show(ui, rect, egui::Id::new("zoom")),
+                    |ui| view.show(ui, rect, true, egui::Id::new("zoom")),
                 );
             }
             (view.drawn.len(), view.header_button_h)
@@ -2463,7 +2493,7 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ui| view.show(ui, rect, base),
+            |ui| view.show(ui, rect, true, base),
         );
     }
     fn click_at(
@@ -2579,6 +2609,61 @@ mod tests {
         assert_eq!((view.count, view.pill), (32, None));
         assert_eq!(pill_text(0), "↻ History changed");
         assert_eq!(pill_text(3), "↻ 3 new commits");
+    }
+
+    #[test]
+    fn unwatched_history_rechecks_refs_on_refocus_and_offers_refresh() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "History Test"]);
+        git(dir, &["config", "user.email", "history@example.test"]);
+        git(dir, &["commit", "--allow-empty", "-m", "c0"]);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 300.0));
+        let base = egui::Id::new("unwatched");
+        let mut view = HistoryView::new(Some(dir.to_path_buf()));
+        // Without a watch (a network share), focus drives the re-checks.
+        view.follow = watch::Follow::off();
+        let show = |view: &mut HistoryView, active: bool| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| view.show(ui, rect, active, base),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(view.end && view.fingerprint.is_some() && view.check.is_none()) {
+            assert!(std::time::Instant::now() < deadline, "never loaded");
+            show(&mut view, true);
+        }
+        assert_eq!(view.count, 1);
+        assert_ne!(
+            view.refresh_btn,
+            egui::Rect::NOTHING,
+            "unwatched: Refresh shows"
+        );
+        git(dir, &["commit", "--allow-empty", "-m", "c1"]);
+        // Staying active never re-checks.
+        for _ in 0..40 {
+            show(&mut view, true);
+        }
+        assert!(view.check.is_none());
+        assert_eq!(view.count, 1);
+        // Focus away and back: at the top, the move just re-reads.
+        show(&mut view, false);
+        show(&mut view, true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(view.end && view.count == 2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refocus never re-read"
+            );
+            show(&mut view, true);
+        }
     }
 
     #[test]

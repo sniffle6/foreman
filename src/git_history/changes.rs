@@ -389,10 +389,14 @@ impl ChangesView {
             if self.request.as_ref().is_some_and(|r| !r.quiet) {
                 ui.spinner();
             }
-            refresh = ui
-                .button("Refresh")
-                .on_hover_text("Re-read the working tree (it also updates as files change)")
-                .clicked();
+            // A live watch re-reads on every change; Refresh is only for
+            // when it can't.
+            if self.follow.down() || matches!(self.status, Some(Err(_))) {
+                refresh = ui
+                    .button("Refresh")
+                    .on_hover_text(super::refresh_hint(self.follow.down()))
+                    .clicked();
+            }
         });
         if refresh {
             self.refresh(ui.ctx(), false);
