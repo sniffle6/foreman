@@ -1017,6 +1017,20 @@ mod tests {
             last = now;
         }
     }
+    /// Retry a filesystem call Windows refuses while another handle or
+    /// process still has the path (os error 5 or 32).
+    fn patiently(what: &str, f: impl Fn() -> std::io::Result<()>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match f() {
+                Ok(()) => return,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("timed out trying to {what}: {e}"),
+            }
+        }
+    }
     fn wait_until(what: &str, f: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !f() {
@@ -1128,7 +1142,11 @@ mod tests {
         assert!(!follow.down(), "the first open is starting, not down");
         until_live(&mut follow, true);
         assert!(!follow.down());
-        std::fs::remove_dir_all(&dir).unwrap();
+        // Let the open's own `git` (the ignored-path listing, cwd in the
+        // tree) exit first, as deleting_the_watch_root_stops_the_thread
+        // does; Windows still refuses briefly on a loaded runner.
+        quiet(follow.watch.as_ref().unwrap());
+        patiently("remove the watch root", || std::fs::remove_dir_all(&dir));
         until_live(&mut follow, false);
         assert!(follow.down());
         // Due, but the folder is gone: no open (no `git` spawn), still down.
@@ -1136,7 +1154,9 @@ mod tests {
         assert!(follow.live(Some(&dir), &ctx).is_none());
         assert!(follow.opening.is_none() && follow.down());
         // Back again, but inside the interval nothing reopens.
-        std::fs::create_dir(&dir).unwrap();
+        // The old root can stay delete-pending until the dead watch's
+        // handle closes.
+        patiently("recreate the watch root", || std::fs::create_dir(&dir));
         git(&dir, &["init", "-b", "main"]);
         assert!(follow.live(Some(&dir), &ctx).is_none());
         assert!(follow.opening.is_none());
