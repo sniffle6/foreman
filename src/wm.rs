@@ -5269,12 +5269,17 @@ impl WindowManager {
 
     /// Debug-only startup preview used by native screenshot validation.
     #[cfg(debug_assertions)]
-    pub fn debug_open_settings_agents(&mut self) {
+    pub fn debug_open_settings(&mut self, name: &str) {
+        let pane = match name {
+            "appearance" => crate::settings_menu::Pane::Appearance,
+            "agents" => crate::settings_menu::Pane::Agents,
+            _ => return,
+        };
         self.open_settings();
         for window in &mut self.windows {
             for tab in &mut window.tabs {
                 if let Content::Settings(menu) = &mut tab.content {
-                    menu.select_pane(crate::settings_menu::Pane::Agents);
+                    menu.select_pane(pane);
                     menu.in_rail = false;
                     return;
                 }

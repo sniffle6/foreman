@@ -43,7 +43,7 @@ on purpose — a user slider on those creates support tickets, not value).
 
 | Pane | Settings (default) |
 |---|---|
-| Appearance | The live theme editor (split preview; see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Editing the built-in "Foreman Warm" transparently forks an editable copy |
+| Appearance | The live theme editor and theme-expert chat beside a reversible preview (see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Chat proposals apply only through Save & Apply. Editing the built-in "Foreman Warm" forks an editable copy |
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |

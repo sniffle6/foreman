@@ -63,6 +63,24 @@ controls too, one frame behind — the same lag every terminal repaint already h
   the preset name flips to the new copy. **Duplicate** makes an explicit copy.
 - **Revert to saved** undoes edits back to the baseline (the theme as it was when
   you opened/selected it). The preset dropdown switches themes.
+- **Theme expert** sits beside the color editor and sample terminal. Describe a
+  palette or ask for a refinement in the chat. Each valid answer becomes a numbered
+  preview; switch between earlier proposals or discard the preview without changing
+  the active theme. **Save & Apply** saves the selected proposal through the user
+  theme flow. When Foreman Warm is active, this creates a user copy first.
+- The chat offers Codex, Claude, and Grok. Codex is selected initially; a blank
+  model field uses that CLI's configured default model. Enter a provider model ID
+  to override it. Changing provider clears the override.
+
+## Theme expert boundary
+
+The provider runs on a background thread in a dedicated configuration directory.
+Claude and Grok have their tools disabled. Codex runs read-only with its shell
+tools disabled. No provider response is treated as a command or file edit. The
+response must be one JSON object containing a short `message` and a complete
+`Theme` value with exactly the supported color keys and valid color values. Bad
+or incomplete output is shown as an error; the current proposal and saved theme
+remain intact. Conversation and previews live only as long as the Settings window.
 
 ## User theme files
 
@@ -107,7 +125,9 @@ controls too, one frame behind — the same lag every terminal repaint already h
   hex serde (`color_hex`), and `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
 - `src/appearance.rs` — the Appearance pane (`AppearanceView`): the pure model
   (working/saved/dirty/revert/presets), the split-preview view + live sample, and
-  the color pickers.
+  the color pickers and theme chat.
+- `src/theme_expert.rs` — the bounded conversation, provider invocation, strict
+  proposal parser, and preview history.
 - `src/settings_menu.rs` — the custom-body `Pane::Appearance`, and the
   Duplicate / preset-switch / resync coordination in `draw_pane`.
 - `src/main.rs` — `App` owns/seeds/reads-back `active_theme`, installs the egui

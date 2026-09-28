@@ -52,6 +52,7 @@ mod terminal;
 mod terminal_font;
 mod terminal_titles;
 mod theme;
+mod theme_expert;
 mod title_notify;
 mod update;
 mod view_scale;
@@ -841,11 +842,11 @@ impl eframe::App for App {
                     &ctx,
                 );
             }
-            // Debug-only preview for the Agents settings pane. This avoids
+            // Debug-only preview for a settings pane. This avoids
             // synthetic mouse/keyboard input during native screenshot QA.
             #[cfg(debug_assertions)]
-            if std::env::var("FOREMAN_SETTINGS_TEST").ok().as_deref() == Some("agents") {
-                self.desktop.debug_open_settings_agents();
+            if let Ok(pane) = std::env::var("FOREMAN_SETTINGS_TEST") {
+                self.desktop.debug_open_settings(&pane);
             }
         }
 

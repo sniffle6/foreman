@@ -49,7 +49,7 @@ struct FormOut {
 }
 
 /// The Appearance pane's state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AppearanceView {
     working: Theme,
     saved: Theme,
@@ -61,6 +61,7 @@ pub struct AppearanceView {
     presets: Vec<String>,
     /// True while the delete-confirmation modal is open.
     confirm_delete: bool,
+    expert: crate::theme_expert::ThemeExpert,
 }
 
 impl AppearanceView {
@@ -72,6 +73,7 @@ impl AppearanceView {
             name_edit: BUILTIN.to_string(),
             presets: vec![BUILTIN.to_string()],
             confirm_delete: false,
+            expert: crate::theme_expert::ThemeExpert::new(),
         };
         v.refresh_presets();
         v
@@ -84,6 +86,7 @@ impl AppearanceView {
         self.name_edit = name.to_string();
         self.saved = theme.clone();
         self.working = theme;
+        self.expert.selected = None;
         self.refresh_presets();
     }
 
@@ -162,7 +165,10 @@ impl AppearanceView {
         // Mouse-only pane: the color pickers are position-routed egui widgets, so
         // they need no reads_input gate; keyboard is handled by the settings shell.
         let _ = reads_input;
+        self.expert.poll();
         let t = self.working.clone();
+        let previewing = self.expert.preview().is_some();
+        let preview = self.expert.preview().cloned().unwrap_or_else(|| t.clone());
         let pad = 16.0;
         let inner = rect.shrink(pad);
 
@@ -173,13 +179,13 @@ impl AppearanceView {
         let bottom_room = inner.height() - CONTROLS_H;
         let stacked = bottom_room > right_room;
 
-        let out = if stacked {
+        let (out, apply) = if stacked {
             // Controls on top (form capped + centred so wide rows don't stretch),
             // a horizontal divider, then the terminal filling the bottom.
             // Give the controls their full height when there's room (so the form
             // doesn't scroll while the terminal region sits half-empty), but never
             // more than ~60% of the pane, so the terminal keeps a fair share.
-            let ctrl_h = 430.0_f32.min(inner.height() * 0.6).max(180.0);
+            let ctrl_h = 340.0_f32.min(inner.height() * 0.42).max(180.0);
             let fw = inner.width().min(480.0);
             let fx = inner.left() + (inner.width() - fw) * 0.5;
             let form_rect =
@@ -195,8 +201,15 @@ impl AppearanceView {
                 egui::pos2(inner.left(), divider_y + pad * 0.5),
                 inner.max,
             );
-            Self::draw_hero(ui, term_region, &t);
-            out
+            let hero_h = (term_region.height() * 0.43).clamp(110.0, 225.0);
+            let hero =
+                egui::Rect::from_min_size(term_region.min, egui::vec2(term_region.width(), hero_h));
+            Self::draw_hero(ui, hero, &preview, previewing);
+            let chat = egui::Rect::from_min_max(
+                egui::pos2(term_region.left(), hero.bottom()),
+                term_region.max,
+            );
+            (out, self.draw_expert(ui, chat, &t))
         } else {
             // Control form on the left, terminal on the right, divider between.
             let divider_x = inner.left() + sidebar_w + pad;
@@ -210,8 +223,12 @@ impl AppearanceView {
             let out = self.draw_form(ui, sidebar, &t);
             let hero =
                 egui::Rect::from_min_max(egui::pos2(divider_x + pad, inner.top()), inner.max);
-            Self::draw_hero(ui, hero, &t);
-            out
+            let hero_h = (hero.height() * 0.43).clamp(110.0, 225.0);
+            let hero_top = egui::Rect::from_min_size(hero.min, egui::vec2(hero.width(), hero_h));
+            Self::draw_hero(ui, hero_top, &preview, previewing);
+            let chat =
+                egui::Rect::from_min_max(egui::pos2(hero.left(), hero_top.bottom()), hero.max);
+            (out, self.draw_expert(ui, chat, &t))
         };
 
         // Delete-confirmation modal (opened by the − button on a user theme).
@@ -245,6 +262,24 @@ impl AppearanceView {
         if let Some(name) = delete {
             return Outcome::Delete(name);
         }
+        if apply {
+            if let Some(proposal) = self.expert.preview().cloned() {
+                if self.active_is_builtin() {
+                    self.working = proposal;
+                    return Outcome::Duplicate(self.fork_name());
+                }
+                match proposal.save(&self.active_name) {
+                    Ok(()) => {
+                        self.working = proposal.clone();
+                        self.saved = proposal.clone();
+                        *out_theme = proposal;
+                        self.expert.selected = None;
+                        return Outcome::Changed;
+                    }
+                    Err(e) => self.expert.error = Some(format!("Could not save theme: {e}")),
+                }
+            }
+        }
         // Editing the built-in transparently forks an editable user copy — the
         // built-in stays a pristine preset you can switch back to.
         if out.changed && self.active_is_builtin() {
@@ -265,6 +300,102 @@ impl AppearanceView {
             return Outcome::Changed;
         }
         Outcome::Pending
+    }
+
+    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+        if rect.width() < 100.0 || rect.height() < 70.0 {
+            return false;
+        }
+        let mut panel =
+            ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(4.0, 2.0))));
+        egui::ScrollArea::vertical()
+            .id_salt("theme_expert_panel")
+            .auto_shrink([false, false])
+            .show(&mut panel, |panel| {
+                self.draw_expert_contents(panel, rect, t)
+            })
+            .inner
+    }
+
+    fn draw_expert_contents(&mut self, panel: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+        let mut apply = false;
+        panel.label(
+            egui::RichText::new("THEME EXPERT")
+                .size(11.0)
+                .color(t.dim)
+                .strong(),
+        );
+        panel.horizontal(|ui| {
+            let previous = self.expert.provider;
+            egui::ComboBox::from_id_salt("theme_expert_provider")
+                .selected_text(self.expert.provider.label())
+                .show_ui(ui, |ui| {
+                    for provider in [
+                        crate::config::NamingProvider::Codex,
+                        crate::config::NamingProvider::Claude,
+                        crate::config::NamingProvider::Grok,
+                    ] {
+                        ui.selectable_value(&mut self.expert.provider, provider, provider.label());
+                    }
+                });
+            if self.expert.provider != previous {
+                self.expert.model.clear();
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.expert.model)
+                    .hint_text("Model ID (blank = CLI default)")
+                    .desired_width(ui.available_width().max(70.0)),
+            );
+        });
+        if !self.expert.proposals.is_empty() {
+            panel.horizontal_wrapped(|ui| {
+                ui.label("Preview:");
+                for i in 0..self.expert.proposals.len() {
+                    ui.selectable_value(&mut self.expert.selected, Some(i), format!("{}", i + 1));
+                }
+                if self.expert.selected.is_some() && ui.button("Discard preview").clicked() {
+                    self.expert.selected = None;
+                }
+                apply = ui
+                    .add_enabled(
+                        self.expert.selected.is_some(),
+                        egui::Button::new("Save & Apply"),
+                    )
+                    .clicked();
+            });
+        }
+        let input_h = 65.0;
+        let log_h = (rect.height() - input_h - 90.0).max(30.0);
+        egui::ScrollArea::vertical().id_salt("theme_expert_turns")
+            .max_height(log_h).auto_shrink([false, false]).stick_to_bottom(true)
+            .show(panel, |ui| {
+                if self.expert.turns.is_empty() {
+                    ui.label("Describe colors, contrast, or a mood. Refine the proposal over multiple turns.");
+                }
+                for turn in &self.expert.turns {
+                    ui.label(format!("{}: {}", if turn.user { "You" } else { "Expert" }, turn.text));
+                }
+                if self.expert.busy() { ui.label("Generating proposal…"); }
+                if let Some(error) = &self.expert.error {
+                    ui.colored_label(t.danger, error);
+                }
+            });
+        panel.add(
+            egui::TextEdit::multiline(&mut self.expert.input)
+                .hint_text("Describe or refine your theme…")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        if panel
+            .add_enabled(
+                !self.expert.busy() && !self.expert.input.trim().is_empty(),
+                egui::Button::new("Send"),
+            )
+            .clicked()
+        {
+            self.expert.send(&self.working, panel.ctx());
+        }
+        apply
     }
 
     /// Draw the control form into `rect`: a vertically-scrolling body (preset ·
@@ -401,7 +532,7 @@ impl AppearanceView {
     /// Draw the live-preview terminal centred in `region`, with the caption below.
     /// The terminal is sized to fit `region`, so it never spills over the divider
     /// or the window edge.
-    fn draw_hero(ui: &mut egui::Ui, region: egui::Rect, t: &Theme) {
+    fn draw_hero(ui: &mut egui::Ui, region: egui::Rect, t: &Theme, previewing: bool) {
         if region.width() < 40.0 || region.height() < 40.0 {
             return;
         }
@@ -421,7 +552,11 @@ impl AppearanceView {
         ui.painter_at(region).text(
             egui::pos2(cx, term_rect.bottom() + cap_gap),
             egui::Align2::CENTER_TOP,
-            "Live preview · changes apply to every terminal instantly",
+            if previewing {
+                "Proposal preview · Save & Apply to make it active"
+            } else {
+                "Live preview · changes apply to every terminal instantly"
+            },
             egui::FontId::proportional(12.0),
             t.dim,
         );

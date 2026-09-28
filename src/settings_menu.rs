@@ -422,7 +422,7 @@ pub fn display(field: Field, s: &Settings) -> String {
 
 /// Navigation/focus state for the settings menu. Pure — no egui here; the
 /// view drives it from key events and reads it back to render.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SettingsMenu {
     pub pane: Pane,
     pub row: usize,
@@ -524,10 +524,10 @@ impl Default for SettingsMenu {
 // ---------------------------------------------------------------------------
 
 /// Panel geometry (points). Fixed so the layout reads the same on every pane.
-const WIN_W: f32 = 660.0;
+const WIN_W: f32 = 850.0;
 const RAIL_W: f32 = 190.0;
 const TITLE_H: f32 = 38.0;
-const BODY_H: f32 = 300.0;
+const BODY_H: f32 = 500.0;
 const FOOTER_H: f32 = 30.0;
 /// Width the pane rows are laid out at when the window is too narrow to fit them
 /// — a comfortable row width (label + control + gap). Below this the pane
