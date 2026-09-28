@@ -129,6 +129,7 @@ the column that earns its keep is *where handled*.
 | Wide chars (CJK/emoji) | app→foreman | A 2-column glyph = one `WIDE_CHAR` cell + one spacer (`WIDE_CHAR_SPACER`, or `LEADING_WIDE_CHAR_SPACER` at wrap). **Text-extraction walks must skip spacers** or output gains stray padding | one classifier: `input::CellWide::classify` / `is_wide_spacer` (paint plan, both snapshot walks). Foreman does **NOT** double keys or model the input row — whole-glyph editing is PSReadLine's job (`src/psreadline.rs` `WIDE_EDIT_FIX`, RightArrow deliberately unbound); see docs/wide-chars.md "Why the terminal-side approach failed" |
 | DEC 2026 synchronized output | app→foreman | Frame-bracketing TUIs don't strobe. `advance_scanned` force-flushes a buffered sync prefix (`sync_bytes_count` / `stop_sync`) at each graphics cut so an image placement samples the cursor as of that byte, not the previous frame | src/terminal.rs `fn advance_scanned`; caret.rs module docs |
 | Kitty graphics APC (`ESC_G…`) | app→foreman→app | alacritty's vte discards APC, so `crate::graphics` gets a parallel feed of the same bytes. Unsupported commands are skipped silently — the failure mode is "image doesn't show", never a corrupted pane | src/graphics.rs |
+| OSC 8 hyperlink (`ESC]8;;URI ST`) | app→foreman | alacritty stores it per cell (`Cell::hyperlink`); plain URLs are scanned from the soft-wrapped logical line. Only http/https/ftp/mailto are ever returned — `file:` would *execute* via the OS shell. Ctrl+Click opens ahead of app mouse ownership; doc: `docs/terminal-links.md` | src/hyperlink.rs `link_at`; wired in `Session::link_under` / `handle_mouse` |
 
 ## 4. Grid model: buffer vs viewport, and the panic hazard
 
@@ -239,6 +240,7 @@ ConPTY bytes if you need a live repro. Details: `docs/conpty-resize-reflow.md`.
 | Cell metrics (pixel↔cell), thumb + caret rect math | src/geom.rs |
 | Paint plan + overlays (pure per-frame geometry; the clamp home) | src/frame.rs |
 | Kitty graphics subset (pure: APC parse, store, placements) | src/graphics.rs |
+| Link detection (pure: OSC 8 + plain URL spans, openable schemes) | src/hyperlink.rs |
 | PSReadLine wide-char edit fix injected at pwsh spawn | src/psreadline.rs |
 | Env injection (`term_env`), keepalive walks, send/snapshot plumbing | src/wm.rs |
 | Process-tree agent scan from `root_pid` | src/proc.rs |

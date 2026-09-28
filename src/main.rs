@@ -23,6 +23,7 @@ mod geom;
 mod git_history;
 mod graphics;
 mod hover_menu;
+mod hyperlink;
 mod icat;
 mod icons;
 mod imageview;

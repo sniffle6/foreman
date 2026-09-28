@@ -394,6 +394,11 @@ fn resize_anchored<L: EventListener>(term: &mut Term<L>, size: Size) -> usize {
     pulled
 }
 
+/// What `Session::link_hover` depends on: any change in content, scroll,
+/// grid size (a height-only shrink can scroll rows into history without
+/// bumping content_gen), or the hovered buffer cell invalidates it.
+type LinkHoverKey = (u64, usize, usize, usize, Point);
+
 /// Cache key for a pane's grid-locked mono paint. All five inputs fully determine
 /// the laid-out glyphs: content version, scroll position, grid dims, and font
 /// size. Selection/caret are NOT here — they paint as separate overlays.
@@ -700,6 +705,12 @@ pub struct Session {
     /// spotted as a change. Scrolling arrives by wheel, keys, search jumps and
     /// the drag itself; watching the result catches all of them at one place.
     thumb_last_off: i32,
+    /// Link under the hover pointer, memoized on `LinkHoverKey` so a still
+    /// pointer over a quiet pane rescans nothing.
+    link_hover: Option<(LinkHoverKey, Option<crate::hyperlink::Link>)>,
+    /// A Ctrl+Click opened a link and its button is still down: suppress local
+    /// selection until the release so the click can't also start/clear one.
+    link_press: bool,
     /// Color-emoji rasterizer (DirectWrite on Windows, null elsewhere). Fail-open:
     /// `None` from `color_glyph` leaves the mono glyph alone.
     emoji_raster: Box<dyn crate::emoji_raster::EmojiRaster>,
@@ -1089,6 +1100,8 @@ impl Session {
             thumb_drag: None,
             thumb_seen: None,
             thumb_last_off: 0,
+            link_hover: None,
+            link_press: false,
             emoji_raster: crate::emoji_raster::system_emoji_raster(),
             emoji_textures: std::collections::HashMap::new(),
             graphics: crate::graphics::Graphics::default(),
@@ -1538,6 +1551,26 @@ impl Session {
         (point, side)
     }
 
+    /// The openable link under pixel `p` (OSC 8 or plain URL), memoized.
+    fn link_under(
+        &mut self,
+        metrics: &crate::geom::CellMetrics,
+        p: egui::Pos2,
+    ) -> Option<crate::hyperlink::Link> {
+        let (point, _) = self.sel_point(metrics, p);
+        let g = self.term.grid();
+        let off = g.display_offset();
+        let key = (self.content_gen, off, g.columns(), g.screen_lines(), point);
+        match &self.link_hover {
+            Some((k, link)) if *k == key => link.clone(),
+            _ => {
+                let link = crate::hyperlink::link_at(&self.term, point);
+                self.link_hover = Some((key, link.clone()));
+                link
+            }
+        }
+    }
+
     /// Input written outside the live-key path (chat injects, `foreman send`,
     /// right-click paste). Protocol replies deliberately use `send`/the writer
     /// directly: they are not user input.
@@ -1714,6 +1747,18 @@ impl Session {
                         if !crate::input::mouse_press_topmost_ok(in_content, topmost) {
                             continue;
                         }
+                        // Ctrl+Click on a link opens it — ahead of app mouse
+                        // ownership, so links work inside mouse-mode TUIs too.
+                        // No capture is stored: the release finds an empty slot.
+                        if btn == crate::input::MouseBtn::Left
+                            && (modifiers.ctrl || modifiers.command)
+                            && let Some(link) = self.link_under(metrics, *pos)
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+                            self.link_press = true;
+                            suppress_local = true;
+                            continue;
+                        }
                         let (col, row) = metrics.mouse_cell(*pos);
                         let mode = *self.term.mode();
                         let off = self.term.grid().display_offset();
@@ -1816,6 +1861,15 @@ impl Session {
 
         if self.has_app_mouse_capture() {
             suppress_local = true;
+        }
+        // A link-opening Ctrl+Click owns the button through its release frame
+        // (so the click can't also start or clear a selection). Keyed on the
+        // physical button, so a release missed while unfocused still clears it.
+        if self.link_press {
+            suppress_local = true;
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.link_press = false;
+            }
         }
         suppress_local
     }
@@ -2207,6 +2261,25 @@ impl Session {
             }
         }
 
+        // Link under the pointer (OSC 8 or plain URL): underlined on hover,
+        // hand cursor while Ctrl is held (Ctrl+Click opens it — handle_mouse).
+        let hovered_link = if paste_pending {
+            None
+        } else {
+            resp.hover_pos()
+                .filter(|p| search_bar.is_none_or(|b| !b.contains(*p)))
+                .and_then(|p| self.link_under(&metrics, p))
+        };
+        if let Some(link) = &hovered_link {
+            if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            // OSC 8 text can say anything; show where it really goes.
+            if link.kind == crate::hyperlink::LinkKind::Osc8 {
+                resp.show_tooltip_text(format!("{}\nCtrl+Click to open", link.uri));
+            }
+        }
+
         let (cur_line, cur_col, cur_shape) = {
             let cursor = self.term.renderable_content().cursor;
             (cursor.point.line.0, cursor.point.column.0, cursor.shape)
@@ -2442,6 +2515,24 @@ impl Session {
                     img_rect,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
+                );
+            }
+        }
+
+        if let Some(link) = &hovered_link {
+            let g = self.term.grid();
+            let spans = crate::hyperlink::viewport_spans(
+                link,
+                g.display_offset(),
+                g.screen_lines(),
+                g.columns(),
+            );
+            for (row, c0, c1) in spans {
+                let r = metrics.span_rect(row, c0, c1);
+                let y = r.max.y - 1.0;
+                painter.line_segment(
+                    [egui::pos2(r.min.x, y), egui::pos2(r.max.x, y)],
+                    egui::Stroke::new(1.0, th.fg),
                 );
             }
         }
@@ -2689,6 +2780,71 @@ mod tests {
         assert!(!session.owns_terminal_keyboard());
         session.pending_paste = None;
         assert!(session.owns_terminal_keyboard());
+    }
+
+    /// Ctrl+Click on a URL emits egui's OpenUrl; a plain click does not, and
+    /// the link press owns the button (local selection suppressed) through
+    /// its release frame only.
+    #[test]
+    fn ctrl_click_on_a_url_opens_it_and_plain_click_does_not() {
+        let ctx = egui::Context::default();
+        let mut s = Session::spawn_argv(
+            &["cmd.exe".into(), "/c".into(), "pause".into()],
+            None,
+            &[],
+            ctx.clone(),
+        )
+        .unwrap();
+        // Parsed straight into the model; nothing here pumps the PTY, so the
+        // child's own output can't land on top of it.
+        s.parser.advance(&mut s.term, b"go https://a.io/x now");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 480.0));
+        let metrics = crate::geom::CellMetrics::new(rect, 10.0, 20.0, 80, 24);
+        let on_url = egui::pos2(55.0, 10.0); // row 0, col 5
+        let frame = |s: &mut Session, pressed: Option<bool>, ctrl: bool| {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(on_url));
+            if let Some(pressed) = pressed {
+                input.events.push(egui::Event::PointerButton {
+                    pos: on_url,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers {
+                        ctrl,
+                        command: ctrl,
+                        ..Default::default()
+                    },
+                });
+            }
+            let mut suppress = false;
+            let out = ctx.run_ui(input, |ui| {
+                let resp = ui.interact(rect, egui::Id::new("pane"), egui::Sense::click_and_drag());
+                suppress = s.handle_mouse(ui, &resp, &metrics, false, None, false);
+            });
+            let urls: Vec<String> = out
+                .platform_output
+                .commands
+                .into_iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::OpenUrl(u) => Some(u.url),
+                    _ => None,
+                })
+                .collect();
+            (urls, suppress)
+        };
+
+        frame(&mut s, None, false); // warm-up: layers exist from here on
+        assert_eq!(frame(&mut s, Some(true), false).0, Vec::<String>::new());
+        frame(&mut s, Some(false), false);
+
+        assert_eq!(
+            frame(&mut s, Some(true), true),
+            (vec!["https://a.io/x".to_string()], true)
+        );
+        assert!(s.link_press);
+        assert_eq!(frame(&mut s, Some(false), true), (vec![], true));
+        assert!(!s.link_press);
+        assert_eq!(frame(&mut s, None, false), (vec![], false));
     }
 
     /// Acceptance for the PSReadLine-side wide-edit fix: drives a REAL
