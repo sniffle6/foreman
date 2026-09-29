@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "d68wo1",
+  "title": "Make Alt+Backspace delete the previous word",
+  "body": "Foreman currently sends Alt+Backspace as plain Backspace (0x7f), losing Alt. Encode Alt+Backspace so terminal apps can recognize the previous-word delete action. Start in src/input.rs.",
+  "state": "backlog",
+  "created": "2026-09-29T12:17:46Z",
+  "updated": "2026-09-29T13:45:54Z"
+}
