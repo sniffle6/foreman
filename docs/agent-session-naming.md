@@ -49,7 +49,7 @@ release their slot at the deadline; overload remains best-effort delivery.
 The worker runs in the empty `%APPDATA%\foreman\title-namer` directory so the
 naming CLI does not discover or inspect the active repository. Tools, approvals,
 session persistence, and repository rules are disabled where the CLI supports
-that. On Windows, native provider executables launch directly. Codex and Claude
+that (the flag lists live in the shared launcher, `docs/ai-oneshot.md`). On Windows, native provider executables launch directly. Codex and Claude
 can retry through a safe npm `.cmd` shim; Grok requires a native executable
 because its current `--single` interface carries the context as an argument.
 Codex and Claude prompts stay on stdin and are never part of their command
@@ -119,7 +119,8 @@ Foreman's member suffix. The trusted suffix (` · #N`) is appended locally.
 
 - `src/title_notify.rs` — silent hook helper and bounded one-way local pipe
 - `src/agent_hooks.rs` — guarded, recoverable hook installation
-- `src/terminal_titles.rs` — lifecycle state, provider commands, worker, cleanup
+- `src/terminal_titles.rs` — lifecycle state, naming prompt, worker, cleanup
+- `src/ai_oneshot.rs` — provider command lines and the bounded process run
 - `src/wm.rs` — project/member routing and tab-title ownership
 - `src/config.rs`, `src/settings_menu.rs` — persisted choices and UI
 - `src/workspace.rs` — managed-title restore semantics

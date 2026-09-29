@@ -1,14 +1,13 @@
 //! Isolated theme conversation: provider text becomes a preview only after a
 //! complete, known-field `Theme` value validates. No provider output is a command.
 
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui;
 use serde_json::Value;
 
+use crate::ai_oneshot::{self, LaunchError};
 use crate::config::NamingProvider;
 use crate::theme::Theme;
 
@@ -160,135 +159,26 @@ fn generate(
     let prompt = format!(
         "You are Foreman's theme expert. Discuss and refine the user's theme. Return ONLY a JSON object with exactly two keys: message (brief explanation) and theme (a COMPLETE Foreman Theme object). Change colors only. Preserve every field and every array length, using hex strings in the supplied format. No commands, file edits, markdown, or extra keys.\nCurrent theme JSON:\n{baseline}\nConversation JSON:\n{dialogue}"
     );
-    let mut args: Vec<String> = match provider {
-        NamingProvider::Codex => vec![
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--ignore-rules",
-            "--disable",
-            "shell_tool",
-            "--disable",
-            "unified_exec",
-            "--color",
-            "never",
-            "-",
-        ],
-        NamingProvider::Claude => vec![
-            "-p",
-            "--restricted",
-            "--tools",
-            "",
-            "--disable-slash-commands",
-            "--no-chrome",
-            "--no-session-persistence",
-            "--output-format",
-            "text",
-        ],
-        NamingProvider::Grok => vec![
-            "--no-auto-update",
-            "--single",
-            "--output-format",
-            "plain",
-            "--tools",
-            "",
-            "--disable-web-search",
-            "--no-subagents",
-            "--max-turns",
-            "1",
-            "--permission-mode",
-            "dontAsk",
-            "--verbatim",
-        ],
-    }
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    if !model.is_empty() {
-        args.extend(["--model".into(), model.into()]);
-    }
-    if provider == NamingProvider::Grok {
-        args.push(prompt.clone());
-    }
-    let program = match provider {
-        NamingProvider::Codex => "codex",
-        NamingProvider::Claude => "claude",
-        NamingProvider::Grok => "grok",
-    };
     let cwd = crate::config::config_dir()
         .ok_or("No settings directory")?
         .join("theme-expert");
     std::fs::create_dir_all(&cwd).map_err(|_| "Could not prepare theme expert".to_string())?;
-    let argv = std::iter::once(program.to_owned())
-        .chain(args)
-        .collect::<Vec<_>>();
-    let resolved =
-        crate::agent_command::npm_codex(&argv, &cwd, &std::env::var_os("PATH").unwrap_or_default());
-    let argv = resolved.unwrap_or(argv);
-    let mut command = Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|_| format!("{program} CLI is unavailable"))?;
-    #[cfg(windows)]
-    let child_job = crate::job::Job::assign(child.id());
-    if let Some(mut stdin) = child.stdin.take() {
-        let input = if provider == NamingProvider::Grok {
-            String::new()
-        } else {
-            prompt
-        };
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(input.as_bytes());
-        });
-    }
-    let stdout = child.stdout.take().ok_or("Provider output unavailable")?;
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((MAX_OUTPUT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = tx.send(result);
-    });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < TIMEOUT => std::thread::sleep(Duration::from_millis(25)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("Theme provider timed out or failed".into());
-            }
-        }
-    };
-    #[cfg(windows)]
-    drop(child_job);
-    if !status.success() {
-        return Err(format!("{program} could not generate a theme"));
-    }
-    let bytes = rx
-        .recv_timeout(TIMEOUT.saturating_sub(start.elapsed()))
-        .map_err(|_| "Provider output timed out")?
-        .map_err(|_| "Provider output could not be read")?;
-    if bytes.len() > MAX_OUTPUT {
-        return Err("Provider response was too large".into());
-    }
-    let raw = String::from_utf8(bytes).map_err(|_| "Provider response was not UTF-8")?;
+    let program = ai_oneshot::program(provider);
+    let raw = ai_oneshot::run(&ai_oneshot::Request {
+        provider,
+        model,
+        system: None,
+        prompt: &prompt,
+        cwd: &cwd,
+        timeout: TIMEOUT,
+        max_output: MAX_OUTPUT,
+    })
+    .map_err(|error| match error {
+        LaunchError::Unavailable => format!("{program} CLI is unavailable"),
+        LaunchError::Failed => format!("{program} could not generate a theme"),
+        LaunchError::Timeout => "Theme provider timed out".into(),
+        LaunchError::TooLarge => "Provider response was too large".into(),
+    })?;
     parse_reply(&raw)
 }
 
