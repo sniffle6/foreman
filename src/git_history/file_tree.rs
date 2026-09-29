@@ -169,6 +169,29 @@ impl FileTree {
 
 /// Draw the file tree; returns the file clicked this frame, already selected.
 pub(super) fn show(ui: &mut egui::Ui, tree: &mut FileTree, scale: f32) -> Option<usize> {
+    match show_with(ui, tree, scale, &|_| None) {
+        Some(Click::Open(file)) => Some(file),
+        _ => None,
+    }
+}
+
+/// A file row's click this frame.
+#[derive(Debug, PartialEq)]
+pub(super) enum Click {
+    /// The row itself: already selected.
+    Open(usize),
+    /// Its action (`action` named it), from the hover button or context menu.
+    Act(usize),
+}
+
+/// `show`, with an optional per-file action: `action(file)` names it, and
+/// the row gets a button on hover and a right-click menu item for it.
+pub(super) fn show_with(
+    ui: &mut egui::Ui,
+    tree: &mut FileTree,
+    scale: f32,
+    action: &dyn Fn(usize) -> Option<&'static str>,
+) -> Option<Click> {
     ui.spacing_mut().item_spacing.y = 0.0;
     let row_height = 20.0 * scale;
     let th = crate::theme::live(ui.ctx());
@@ -202,7 +225,10 @@ pub(super) fn show(ui: &mut egui::Ui, tree: &mut FileTree, scale: f32) -> Option
                 let (rect, response) =
                     ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
                 let selected = row.file.is_some() && tree.selected == row.file;
-                if selected || response.hovered() {
+                let act = row.file.and_then(action);
+                // The action button sits over the row and takes its hover.
+                let hot = response.hovered() || (act.is_some() && ui.rect_contains_pointer(rect));
+                if selected || hot {
                     ui.painter().rect_filled(
                         rect,
                         2.0,
@@ -274,7 +300,18 @@ pub(super) fn show(ui: &mut egui::Ui, tree: &mut FileTree, scale: f32) -> Option
                     );
                     if response.clicked() {
                         tree.selected = Some(file_index);
-                        clicked = Some(file_index);
+                        clicked = Some(Click::Open(file_index));
+                    }
+                    if let Some(act) = act {
+                        response.context_menu(|ui| {
+                            if ui.button(act).clicked() {
+                                clicked = Some(Click::Act(file_index));
+                                ui.close();
+                            }
+                        });
+                        if hot && row_button(ui, rect, act, scale, index) {
+                            clicked = Some(Click::Act(file_index));
+                        }
                     }
                     response.on_hover_text(match &file.previous {
                         Some(old) => format!(
@@ -315,6 +352,33 @@ pub(super) fn show(ui: &mut egui::Ui, tree: &mut FileTree, scale: f32) -> Option
         tree.rebuild_visible();
     }
     clicked
+}
+
+/// A small button at the row's visible right edge, painted and hit-tested
+/// by hand: `ui.put` would move the `show_rows` cursor.
+fn row_button(ui: &egui::Ui, row: egui::Rect, label: &str, scale: f32, index: usize) -> bool {
+    let th = crate::theme::live(ui.ctx());
+    let font = egui::FontId::proportional(12.0 * scale);
+    let text = ui.painter().layout_no_wrap(label.to_owned(), font, th.text);
+    let right = row.right().min(ui.clip_rect().right()) - 4.0 * scale;
+    let size = egui::vec2(text.size().x + 12.0 * scale, row.height() - 4.0 * scale);
+    let rect = egui::Rect::from_min_size(egui::pos2(right - size.x, row.top() + 2.0 * scale), size);
+    let response = ui.interact(
+        rect,
+        ui.id().with(("row-action", index)),
+        egui::Sense::click(),
+    );
+    let fill = if response.hovered() { th.sel_bg } else { th.bg };
+    ui.painter().rect(
+        rect,
+        3.0 * scale,
+        fill,
+        egui::Stroke::new(scale, th.border),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - text.size() * 0.5, text, th.text);
+    response.clicked()
 }
 
 pub(super) fn display_path(path: &str) -> String {

@@ -63,4 +63,5 @@ let text = ai_oneshot::run(&ai_oneshot::Request {
 - `src/ai_oneshot.rs` — flag lists, process run, tests
 - `src/terminal_titles.rs` — Session-title caller (`generate_title`)
 - `src/theme_expert.rs` — theme-expert caller (`generate`)
+- `src/git_history/commit.rs` — commit-message caller (`draft`)
 - `src/agent_command.rs` — `npm_codex` shim resolution

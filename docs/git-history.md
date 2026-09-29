@@ -239,10 +239,12 @@ Gotchas:
 
 ## Git Changes window
 
-Each Project can open a read-only Git Changes window: Leader then U, or
+Each Project can open a Git Changes window: Leader then U, or
 **Open project Git changes** in the bindings help. It's the JetBrains Commit
-tool window's change list without anything that writes: no checkboxes, commit
-message, stage, rollback, or push. Opening again surfaces the existing window.
+tool window, minus per-file checkboxes and rollback: you stage and unstage
+files, write a message, and commit (and push). Opening again surfaces the
+existing window. It is the only Git window that writes; History and Diff
+stay read-only.
 
 The header shows the branch ("On main", or "Detached HEAD") and the change
 count. Files sit under collapsible sections, each a directory tree in the same
@@ -278,7 +280,56 @@ the selected file carry over.
 
 Without a watch (a network share, or the watched root was deleted) it falls
 back to the old rule: re-read when the window becomes active, at most once
-per second.
+per second. A finished write (stage, commit) also re-reads then; with a live
+watch the index change does it.
+
+### Staging and committing
+
+**What gets committed is exactly the Staged section.** No per-file checkboxes:
+the index already is that list, and a second selection on top of it would be
+two sources of truth.
+
+- **Stage / Unstage**: hover a file row for its button at the right edge, or
+  right-click it. Changes and Unversioned files get **Stage** (`git add`),
+  conflicts get **Mark Resolved** (also `git add`), Staged files get
+  **Unstage** (`git reset -q -- <path>`, plus the old path for a staged
+  rename). `reset` instead of `restore --staged` because it also works
+  before the first commit, when there is no HEAD. Paths go through
+  `--literal-pathspecs`, so a file named `[a].txt` is only that file.
+- **Message box** pinned at the bottom. **Commit** and **Commit and Push**
+  are disabled until something is staged and the message isn't blank.
+  Ctrl+Enter in the box commits. The commit is `git commit -F -` with the
+  message on stdin. Success clears the box and shows Git's
+  `[main 1a2b3c4] subject` line; failure keeps the box and shows everything
+  Git and the hooks printed (a failing `pre-commit` shows its output).
+- **Commit and Push**: commit, then `git push`, or `git push -u origin HEAD`
+  when the branch has no upstream. A rejected push (the remote moved) says
+  REJECTED with Git's output, and says the commit itself landed, so nobody
+  commits twice. The message box is cleared either way once the commit lands.
+- **AI message**: one click, no chat. It reads the staged diff (`git diff
+  --cached`, capped at 32 KB; over that it sends `--stat` instead) and
+  `git log --oneline -10` for style, and sends them to the session-title
+  provider and model from Settings through the shared one-shot launcher
+  (`docs/ai-oneshot.md`). The reply replaces the message box. It must be
+  non-empty plain text: a code fence or control characters are rejected
+  with an error instead. Spinner and Cancel while it runs; Cancel drops the
+  result, but the CLI process itself runs to its 90 s deadline in the
+  background (the launcher has no cancel).
+
+Gotchas:
+- **Writes go through `git::write`, never `git::output`.** The read helper
+  sets `GIT_OPTIONAL_LOCKS=0` so our reads never wake the watch; writes
+  take real locks and are supposed to wake it.
+- **Commits and `add` are never killed.** A commit killed mid-write leaves
+  `index.lock` behind and every later Git command fails until someone deletes
+  it. So no timeout and no cancel; closing the window leaves the write
+  running to completion. Only a push has a timeout (5 min), because killing
+  a push leaves nothing locked locally.
+- **One write at a time.** While one runs, the row buttons disappear and the
+  commit buttons disable, so two writes never race for `index.lock`.
+- `GIT_TERMINAL_PROMPT=0`: a push needing a password fails with Git's error
+  instead of hanging on a terminal nobody can see. A GUI credential helper
+  (Git Credential Manager) can still pop up its own window.
 
 It is a whole-tree `git status`, not JetBrains' dirty-path-scoped one: about
 76 ms on this repo, almost all Windows process spawn. Revisit only if a big
@@ -294,9 +345,9 @@ Gotchas:
 - Staged T/R/C diffs use the blob form (`HEAD:old` vs `:new`, resolved to ids),
   for the same mode-split reason as commit diffs. An unstaged type change
   (file ↔ symlink) still splits and shows the too-large notice.
-- Reads are repository-read-only: the shared helper sets
-  `GIT_OPTIONAL_LOCKS=0`, so `git status` doesn't refresh the index as it
-  normally would.
+- Reads never write: the shared read helper sets `GIT_OPTIONAL_LOCKS=0`, so
+  `git status` doesn't refresh the index as it normally would. Only the
+  explicit stage / commit / push actions above write.
 
 ## Diff window
 
@@ -500,11 +551,15 @@ No native screenshot of the pill yet.
   `status_color`.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
   parser, and the watch-driven refresh (refresh-on-activate as fallback).
+- `src/git_history/commit.rs`: `CommitPanel` (message box, Commit / Commit
+  and Push, AI message), the `Write` ops and their worker `run`, `push`
+  (upstream check, rejection text), and the AI prompt / `clean_message`.
 - `src/git_history/watch.rs`: `RepoWatch`, the registry and `open`, the
   pure `classify` / `Debounce` core, the `ReadDirectoryChangesW` thread, and
   `Follow` (a view's lazily opened handle on the watch).
-- `src/git_history/git.rs`: the shared Git subprocess helper (spawn, capped
-  drains, cancel/timeout watchdog) used by the history stream, details, and diff.
+- `src/git_history/git.rs`: the shared Git subprocess helper: reads (spawn,
+  capped drains, cancel/timeout watchdog) used by the history stream,
+  details, diff, and status, and `write` for the Changes window's writes.
 - `src/git_history/diff.rs`: pure unified-diff parser into aligned rows and blocks.
 - `src/git_history/diff_view.rs`: `DiffTarget` and its `Stage`, the diff reads
   (commit and working tree, plus the untracked-file synthesis), and `DiffView`.

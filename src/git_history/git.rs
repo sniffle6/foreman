@@ -1,6 +1,7 @@
-//! Read-only Git subprocesses: command setup, capped pipe drains, and a
-//! watchdog that kills and reaps the child on cancel or timeout.
-use std::io::Read;
+//! Git subprocesses. Reads (`spawn`, `output`): capped pipe drains and a
+//! watchdog that kills and reaps the child on cancel or timeout. Writes
+//! (`write`): the Changes window's stage, commit and push, run to completion.
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{
@@ -12,6 +13,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const STDERR_CAP: usize = 16 * 1024;
+/// Each of a write's stdout and stderr: room for a chatty hook.
+const WRITE_OUTPUT_CAP: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub(super) enum GitError {
@@ -74,6 +77,24 @@ fn drain(mut pipe: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> 
     Ok((bytes, overflow))
 }
 
+/// `git --no-pager <args>` in `cwd`, piped, with no console window and no
+/// credential prompt on the (absent) terminal.
+fn command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cwd)
+        .arg("--no-pager")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Start `git --no-pager <args>` in `cwd`. A watchdog thread owns the child:
 /// it kills and reaps it when `cancel` is set or `timeout` passes, so a reader
 /// blocked on stdout is released. The GUI thread never calls this.
@@ -86,20 +107,10 @@ pub(super) fn spawn(
     if cancel.load(Ordering::Relaxed) {
         return Err(GitError::Cancelled);
     }
-    let mut cmd = Command::new("git");
-    cmd.current_dir(cwd)
-        .arg("--no-pager")
-        .args(args)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
+    let mut cmd = command(cwd, args);
+    // Reads never take the index lock or refresh the index, so they never
+    // wake the repository watch.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0").stdin(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
     let stdout = child.stdout.take().unwrap();
     let pipe = child.stderr.take().unwrap();
@@ -147,6 +158,72 @@ pub(super) fn output(
         return Err(GitError::TooLarge);
     }
     Ok(bytes)
+}
+
+/// Worker-only write: run `git <args>` to completion, feeding `stdin` if any.
+/// Returns stdout then stderr, trimmed; a non-zero exit is `Failed` with the
+/// same text, since hooks and "nothing to commit" print to stdout.
+///
+/// No cancel, and a timeout only where killing is harmless (a push): a commit
+/// or `add` killed mid-write leaves `index.lock` behind and wedges the repo.
+pub(super) fn write(
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<String, GitError> {
+    let mut cmd = command(cwd, args);
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let text = text.to_owned();
+        // Its own thread: a large message must not deadlock against the
+        // output pipes. Dropping the pipe closes stdin.
+        std::thread::spawn(move || pipe.write_all(text.as_bytes()));
+    }
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let stdout = std::thread::spawn(move || {
+        drain(out, WRITE_OUTPUT_CAP)
+            .map(|(b, _)| b)
+            .unwrap_or_default()
+    });
+    let stderr = std::thread::spawn(move || {
+        drain(err, WRITE_OUTPUT_CAP)
+            .map(|(b, _)| b)
+            .unwrap_or_default()
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if timeout.is_some_and(|t| start.elapsed() > t) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GitError::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(GitError::Io(e.to_string())),
+        }
+    };
+    let mut text = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let stderr = stderr.join().unwrap_or_default();
+    if !stderr.is_empty() {
+        if !text.trim().is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&stderr));
+    }
+    let text = text.trim().to_owned();
+    if status.success() {
+        Ok(text)
+    } else {
+        Err(GitError::Failed(text))
+    }
 }
 
 #[cfg(test)]

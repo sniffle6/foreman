@@ -1,6 +1,7 @@
 //! Read-only Git history: a demand-driven Git stream, pure lane layout, and virtualized native rows.
 use eframe::egui;
 mod changes;
+mod commit;
 mod details;
 mod diff;
 mod diff_view;

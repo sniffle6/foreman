@@ -1,7 +1,9 @@
-//! Git Changes: the working tree's uncommitted files in a read-only window.
-//! One `git status` read per refresh, on a cancellable worker; clicking a file
-//! opens it in the Project's Diff window. While shown, the repository watch
-//! (`watch.rs`) triggers the refreshes; without one, becoming active does.
+//! Git Changes: the working tree's uncommitted files. One `git status` read
+//! per refresh, on a cancellable worker; clicking a file opens it in the
+//! Project's Diff window. While shown, the repository watch (`watch.rs`)
+//! triggers the refreshes; without one, becoming active does. Stage /
+//! unstage per file and the commit panel are `commit.rs`.
+use super::commit::{CommitPanel, Write};
 use super::file_tree::{self, ChangedFile, FileTree};
 use super::{DiffTarget, HistoryAct, Stage, git, watch};
 use eframe::egui;
@@ -234,6 +236,7 @@ pub struct ChangesView {
     seen: Option<u64>,
     /// The watch fired during a read: read again when it lands.
     again: bool,
+    commit: CommitPanel,
     #[cfg(test)]
     tree_top: f32,
 }
@@ -258,6 +261,7 @@ impl ChangesView {
             follow: watch::Follow::default(),
             seen: None,
             again: false,
+            commit: CommitPanel::new(),
             #[cfg(test)]
             tree_top: 0.0,
         }
@@ -357,13 +361,47 @@ impl ChangesView {
         let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
         let scale = zoom.factor();
         ui.painter().rect_filled(rect, 0.0, th.bg);
+        let inner = rect.shrink(zoom.px(8.0));
+        // The commit panel is pinned to the bottom; the tree takes the rest.
+        let staged = match &self.status {
+            Some(Ok(status)) => status
+                .targets
+                .iter()
+                .filter(|t| t.stage == Stage::Staged)
+                .count(),
+            _ => 0,
+        };
+        let panel_used = {
+            let mut panel = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+            panel.set_clip_rect(inner.intersect(ui.clip_rect()));
+            zoom.apply(&mut panel);
+            let (used, outcome) =
+                self.commit
+                    .show(&mut panel, inner, self.cwd.as_deref(), staged, base);
+            // The watch sees the index change; without one, re-read now.
+            if outcome.wrote && generation.is_none() {
+                if self.request.is_none() {
+                    self.refresh(panel.ctx(), true);
+                } else {
+                    self.again = true;
+                }
+            }
+            used
+        };
+        let tree_rect = egui::Rect::from_min_max(
+            inner.min,
+            egui::pos2(
+                inner.right(),
+                (inner.bottom() - panel_used - zoom.px(6.0)).max(inner.top()),
+            ),
+        );
         let mut ui = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(base)
-                .max_rect(rect.shrink(zoom.px(8.0)))
+                .max_rect(tree_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        ui.set_clip_rect(tree_rect.intersect(ui.clip_rect()));
         zoom.apply(&mut ui);
         let mut refresh = false;
         ui.horizontal(|ui| {
@@ -419,9 +457,35 @@ impl ChangesView {
                 {
                     self.tree_top = ui.cursor().top();
                 }
-                if let Some(file) = file_tree::show(&mut ui, &mut status.tree, scale) {
-                    self.acts
-                        .push(HistoryAct::OpenDiff(status.targets[file].clone()));
+                let targets = &status.targets;
+                let busy = self.commit.busy();
+                let action = |file: usize| match targets[file].stage {
+                    _ if busy => None,
+                    Stage::Staged => Some("Unstage"),
+                    // Conflicts sit in the Unstaged stage too; adding marks them resolved.
+                    _ if targets[file].status == 'U' => Some("Mark Resolved"),
+                    _ => Some("Stage"),
+                };
+                match file_tree::show_with(&mut ui, &mut status.tree, scale, &action) {
+                    Some(file_tree::Click::Open(file)) => {
+                        self.acts
+                            .push(HistoryAct::OpenDiff(status.targets[file].clone()));
+                    }
+                    Some(file_tree::Click::Act(file)) => {
+                        let target = &status.targets[file];
+                        let mut paths = vec![target.path.clone()];
+                        let write = if target.stage == Stage::Staged {
+                            // A staged rename unstages both of its sides.
+                            paths.extend(target.old_path.clone());
+                            Write::Unstage(paths)
+                        } else {
+                            Write::Stage(paths)
+                        };
+                        if let Some(cwd) = &self.cwd {
+                            self.commit.start(ui.ctx(), cwd, write);
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -645,6 +709,91 @@ mod tests {
         view.started = Some(Instant::now());
         frame(&ctx, &mut view, true, vec![]);
         assert!(view.request.is_none());
+    }
+
+    fn click(ctx: &egui::Context, view: &mut ChangesView, pos: egui::Pos2) {
+        frame(ctx, view, true, vec![egui::Event::PointerMoved(pos)]);
+        // One frame so the hover button exists before it is pressed.
+        frame(ctx, view, true, vec![]);
+        for pressed in [true, false] {
+            let event = egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(ctx, view, true, vec![event]);
+        }
+    }
+    /// Until the write and the re-read after it have both landed.
+    fn settle_write(ctx: &egui::Context, view: &mut ChangesView) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while (view.commit.busy() || view.request.is_some()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            frame(ctx, view, true, vec![]);
+        }
+        assert!(
+            !view.commit.busy() && view.request.is_none(),
+            "write did not finish"
+        );
+    }
+
+    #[test]
+    fn row_button_stages_and_ctrl_enter_commits_only_the_staged_file() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.name", "Changes Test"],
+            &["config", "user.email", "changes@example.test"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            git(dir, args);
+        }
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut view = ChangesView::new(Some(dir.to_path_buf()));
+        // No watch: the write itself must trigger the re-read.
+        view.follow = watch::Follow::off();
+        frame(&ctx, &mut view, true, vec![]);
+        settle(&ctx, &mut view, true);
+        // The hover button sits at the row's right edge.
+        let row = view_row_y(&view, "a.txt");
+        click(&ctx, &mut view, egui::pos2(480.0, row));
+        assert!(view.acts.is_empty(), "the button must not open the diff");
+        settle_write(&ctx, &mut view);
+        assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "a.txt");
+        let Some(Ok(status)) = &view.status else {
+            panic!()
+        };
+        assert_eq!(status.targets[0].stage, Stage::Staged);
+        // Type a message, focus it, Ctrl+Enter.
+        view.commit.message = "feat: add a".into();
+        let id = egui::Id::new("changes-test").with("commit-message");
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut view, true, vec![]);
+        frame(
+            &ctx,
+            &mut view,
+            true,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        assert!(view.commit.busy(), "Ctrl+Enter must start the commit");
+        settle_write(&ctx, &mut view);
+        assert_eq!(git(dir, &["log", "-1", "--format=%s"]), "feat: add a");
+        assert_eq!(git(dir, &["show", "--name-only", "--format="]), "a.txt");
+        assert!(
+            view.commit.message.is_empty(),
+            "a commit clears the message"
+        );
+        assert_eq!(files(&view), ["b.txt"]);
     }
 
     /// Screen y of the visible tree row labelled `label` (20px rows at scale 1).
