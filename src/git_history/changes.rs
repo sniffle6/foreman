@@ -236,15 +236,19 @@ fn load(
     }))
 }
 
-// Context-menu items, by index into `menu`. JetBrains' names.
-const SHOW_DIFF: usize = 0;
-const ADD: usize = 1;
-const RESOLVE: usize = 2;
-const ROLLBACK: usize = 3;
-const DELETE: usize = 4;
-const IGNORE: usize = 5;
-const COPY: usize = 6;
-const EXPLORER: usize = 7;
+/// The tree's context-menu actions. Labels (JetBrains' names) and menu
+/// order are in `menu`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    ShowDiff,
+    Add,
+    Resolve,
+    Rollback,
+    Delete,
+    Ignore,
+    CopyPath,
+    Reveal,
+}
 
 fn changed(t: &DiffTarget) -> bool {
     t.stage == Stage::Local
@@ -262,18 +266,26 @@ fn deletable(t: &DiffTarget) -> bool {
 
 /// The tree's context menu for the selected `files`. Every item is always
 /// listed; each is enabled only if it applies to something selected.
-fn menu(targets: &[DiffTarget], files: &[usize], busy: bool) -> Vec<MenuItem> {
+fn menu(targets: &[DiffTarget], files: &[usize], busy: bool) -> Vec<MenuItem<Action>> {
     let any = |kind: fn(&DiffTarget) -> bool| files.iter().any(|&f| kind(&targets[f]));
-    let item = |label, enabled| MenuItem { label, enabled };
+    let item = |action, label, enabled| MenuItem {
+        action,
+        label,
+        enabled,
+    };
     vec![
-        item("Show Diff", files.len() == 1),
-        item("Add to VCS", !busy && any(unversioned)),
-        item("Mark Resolved", !busy && any(conflict)),
-        item("Rollback…", !busy && any(changed)),
-        item("Delete…", !busy && any(deletable)),
-        item("Add to .gitignore", !busy && any(unversioned)),
-        item("Copy Path", !files.is_empty()),
-        item("Show in Explorer", files.len() == 1),
+        item(Action::ShowDiff, "Show Diff", files.len() == 1),
+        item(Action::Add, "Add to VCS", !busy && any(unversioned)),
+        item(Action::Resolve, "Mark Resolved", !busy && any(conflict)),
+        item(Action::Rollback, "Rollback…", !busy && any(changed)),
+        item(Action::Delete, "Delete…", !busy && any(deletable)),
+        item(
+            Action::Ignore,
+            "Add to .gitignore",
+            !busy && any(unversioned),
+        ),
+        item(Action::CopyPath, "Copy Path", !files.is_empty()),
+        item(Action::Reveal, "Show in Explorer", files.len() == 1),
     ]
 }
 
@@ -290,16 +302,16 @@ fn paths_of(targets: &[DiffTarget], files: &[usize], kind: fn(&DiffTarget) -> bo
     paths
 }
 
-/// The write menu `item` starts, over just the selected files it applies
+/// The write `action` starts, over just the selected files it applies
 /// to. Rollback and Delete are confirmed first (`Confirm`).
-fn write(targets: &[DiffTarget], item: usize, files: &[usize]) -> Option<Write> {
+fn write(targets: &[DiffTarget], action: Action, files: &[usize]) -> Option<Write> {
     let paths = |kind| paths_of(targets, files, kind);
-    let write = match item {
-        ADD => Write::Track(paths(unversioned)),
-        RESOLVE => Write::Resolve(paths(conflict)),
-        DELETE => Write::Delete(paths(deletable)),
-        IGNORE => Write::Ignore(paths(unversioned)),
-        ROLLBACK => {
+    let write = match action {
+        Action::Add => Write::Track(paths(unversioned)),
+        Action::Resolve => Write::Resolve(paths(conflict)),
+        Action::Delete => Write::Delete(paths(deletable)),
+        Action::Ignore => Write::Ignore(paths(unversioned)),
+        Action::Rollback => {
             // A new file leaves the index (kept on disk); a rename's new
             // side does too, while its old side comes back from HEAD.
             let (mut untrack, mut restore) = (Vec::new(), Vec::new());
@@ -642,31 +654,31 @@ impl ChangesView {
         }
     }
     /// A context-menu choice over `files` (indices into the shown targets).
-    fn act(&mut self, ctx: &egui::Context, item: usize, files: &[usize]) {
+    fn act(&mut self, ctx: &egui::Context, action: Action, files: &[usize]) {
         let Some(Ok(status)) = &self.status else {
             return;
         };
         let targets = &status.targets;
-        match item {
-            SHOW_DIFF => {
+        match action {
+            Action::ShowDiff => {
                 if let [file] = files {
                     self.acts.push(HistoryAct::OpenDiff(targets[*file].clone()));
                 }
             }
-            COPY => {
+            Action::CopyPath => {
                 let paths: Vec<_> = files.iter().map(|&f| targets[f].path.as_str()).collect();
                 ctx.copy_text(paths.join("\n"));
             }
-            EXPLORER => {
+            Action::Reveal => {
                 if let ([file], Some(cwd)) = (files, &self.cwd) {
                     reveal(&cwd.join(&targets[*file].path));
                 }
             }
-            ROLLBACK | DELETE => {
-                self.confirm = write(targets, item, files).and_then(Confirm::new);
+            Action::Rollback | Action::Delete => {
+                self.confirm = write(targets, action, files).and_then(Confirm::new);
             }
-            _ => {
-                if let Some(write) = write(targets, item, files) {
+            Action::Add | Action::Resolve | Action::Ignore => {
+                if let Some(write) = write(targets, action, files) {
                     self.start(ctx, write);
                 }
             }
@@ -786,8 +798,8 @@ impl ChangesView {
             }
         }
         match event {
-            Some(TreeEvent::Open(file)) => self.act(ui.ctx(), SHOW_DIFF, &[file]),
-            Some(TreeEvent::Act { item, files }) => self.act(ui.ctx(), item, &files),
+            Some(TreeEvent::Open(file)) => self.act(ui.ctx(), Action::ShowDiff, &[file]),
+            Some(TreeEvent::Act { action, files }) => self.act(ui.ctx(), action, &files),
             Some(TreeEvent::Check { files, on }) => {
                 if let Some(Ok(status)) = &self.status {
                     for f in files {
@@ -1103,22 +1115,22 @@ mod tests {
         let all: Vec<usize> = (0..targets.len()).collect();
         let strings = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            write(&targets, ADD, &all),
+            write(&targets, Action::Add, &all),
             Some(Write::Track(strings(&["notes.txt"])))
         );
         assert_eq!(
-            write(&targets, RESOLVE, &all),
+            write(&targets, Action::Resolve, &all),
             Some(Write::Resolve(strings(&["clash.rs"])))
         );
         assert_eq!(
-            write(&targets, ROLLBACK, &all),
+            write(&targets, Action::Rollback, &all),
             Some(Write::Rollback {
                 untrack: strings(&["fresh.rs", "new.rs"]),
                 restore: strings(&["a.rs", "gone.rs", "old.rs"]),
             })
         );
         assert_eq!(
-            write(&targets, DELETE, &all),
+            write(&targets, Action::Delete, &all),
             Some(Write::Delete(strings(&[
                 "a.rs",
                 "fresh.rs",
@@ -1127,12 +1139,12 @@ mod tests {
             ])))
         );
         assert_eq!(
-            write(&targets, IGNORE, &all),
+            write(&targets, Action::Ignore, &all),
             Some(Write::Ignore(strings(&["notes.txt"])))
         );
-        assert!(write(&targets, ADD, &[2]).is_none());
-        assert!(write(&targets, SHOW_DIFF, &all).is_none());
-        let confirm = Confirm::new(write(&targets, ROLLBACK, &[1]).unwrap()).unwrap();
+        assert!(write(&targets, Action::Add, &[2]).is_none());
+        assert!(write(&targets, Action::ShowDiff, &all).is_none());
+        let confirm = Confirm::new(write(&targets, Action::Rollback, &[1]).unwrap()).unwrap();
         assert_eq!(confirm.paths, ["new.rs", "old.rs"]);
         assert!(Confirm::new(Write::Resolve(Vec::new())).is_none());
     }

@@ -326,7 +326,7 @@ impl FileTree {
     }
     /// Tick `files` unless all already are; then untick them. Only files on
     /// checkable rows count. Returns what changed, for the owner.
-    fn toggle_checks(&mut self, files: Vec<usize>) -> Option<TreeEvent> {
+    fn toggle_checks<A>(&mut self, files: Vec<usize>) -> Option<TreeEvent<A>> {
         let checkable: HashSet<usize> = self
             .rows
             .iter()
@@ -460,18 +460,20 @@ impl FileTree {
 }
 
 /// One context-menu entry, built by the owning view from the selection.
-pub(super) struct MenuItem {
+/// `action` is the owner's own type; the tree hands it back unread.
+pub(super) struct MenuItem<A> {
+    pub(super) action: A,
     pub(super) label: &'static str,
     pub(super) enabled: bool,
 }
 
 /// What the tree asks its owner to do this frame.
 #[derive(Debug, PartialEq)]
-pub(super) enum TreeEvent {
+pub(super) enum TreeEvent<A> {
     /// Open this file's diff: a double-click or Enter.
     Open(usize),
-    /// Menu item `item` (an index into the owner's items) for `files`.
-    Act { item: usize, files: Vec<usize> },
+    /// The chosen menu item's action, for `files`.
+    Act { action: A, files: Vec<usize> },
     /// A checkbox click or Space ticked (`on`) or unticked these files. The
     /// tree has already updated its own checks.
     Check { files: Vec<usize>, on: bool },
@@ -482,13 +484,13 @@ pub(super) enum TreeEvent {
 /// tree reads the keyboard (its window is active); it still yields to any
 /// focused egui widget, such as the commit message box. Checkboxes (rows in
 /// a checkable section) toggle on click or, for the selection, on Space.
-pub(super) fn show(
+pub(super) fn show<A: Copy>(
     ui: &mut egui::Ui,
     tree: &mut FileTree,
     scale: f32,
     keys: bool,
-    menu: &dyn Fn(&[usize]) -> Vec<MenuItem>,
-) -> Option<TreeEvent> {
+    menu: &dyn Fn(&[usize]) -> Vec<MenuItem<A>>,
+) -> Option<TreeEvent<A>> {
     ui.spacing_mut().item_spacing.y = 0.0;
     let row_height = 20.0 * scale;
     let th = crate::theme::live(ui.ctx());
@@ -783,13 +785,13 @@ pub(super) fn show(
         .style(egui::containers::menu::menu_style)
         .open_memory(None)
         .show(|ui| {
-            for (item, m) in items.iter().enumerate() {
+            for m in &items {
                 if ui
                     .add_enabled(m.enabled, egui::Button::new(m.label))
                     .clicked()
                 {
                     event = Some(TreeEvent::Act {
-                        item,
+                        action: m.action,
                         files: files.clone(),
                     });
                 }
@@ -962,7 +964,7 @@ mod tests {
                 ui_id: None,
             }
         }
-        fn frame(&mut self, events: Vec<egui::Event>) -> Option<TreeEvent> {
+        fn frame(&mut self, events: Vec<egui::Event>) -> Option<TreeEvent<&'static str>> {
             self.frame_with(events, NONE)
         }
         /// One frame; `modifiers` held, as egui-winit reports them.
@@ -970,7 +972,7 @@ mod tests {
             &mut self,
             events: Vec<egui::Event>,
             modifiers: egui::Modifiers,
-        ) -> Option<TreeEvent> {
+        ) -> Option<TreeEvent<&'static str>> {
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 300.0));
             let mut out = None;
             let asked = &self.asked;
@@ -978,10 +980,12 @@ mod tests {
                 asked.borrow_mut().push(files.to_vec());
                 vec![
                     MenuItem {
+                        action: "first",
                         label: "First",
                         enabled: true,
                     },
                     MenuItem {
+                        action: "second",
                         label: "Second",
                         enabled: files.len() > 1,
                     },
@@ -1007,7 +1011,7 @@ mod tests {
             pos: egui::Pos2,
             button: egui::PointerButton,
             modifiers: egui::Modifiers,
-        ) -> Option<TreeEvent> {
+        ) -> Option<TreeEvent<&'static str>> {
             let mut out = self.frame_with(vec![egui::Event::PointerMoved(pos)], modifiers);
             for pressed in [true, false] {
                 let event = egui::Event::PointerButton {
@@ -1021,15 +1025,23 @@ mod tests {
             out
         }
         /// A primary click on visible row `row`, on its label.
-        fn click(&mut self, row: usize, modifiers: egui::Modifiers) -> Option<TreeEvent> {
+        fn click(
+            &mut self,
+            row: usize,
+            modifiers: egui::Modifiers,
+        ) -> Option<TreeEvent<&'static str>> {
             let pos = egui::pos2(200.0, 20.0 * row as f32 + 10.0);
             self.press(pos, egui::PointerButton::Primary, modifiers)
         }
-        fn right_click(&mut self, row: usize) -> Option<TreeEvent> {
+        fn right_click(&mut self, row: usize) -> Option<TreeEvent<&'static str>> {
             let pos = egui::pos2(200.0, 20.0 * row as f32 + 10.0);
             self.press(pos, egui::PointerButton::Secondary, NONE)
         }
-        fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) -> Option<TreeEvent> {
+        fn key(
+            &mut self,
+            key: egui::Key,
+            modifiers: egui::Modifiers,
+        ) -> Option<TreeEvent<&'static str>> {
             let event = egui::Event::Key {
                 key,
                 physical_key: None,
@@ -1181,7 +1193,7 @@ mod tests {
         assert_eq!(
             h.press(pos, egui::PointerButton::Primary, NONE),
             Some(TreeEvent::Act {
-                item: 1,
+                action: "second",
                 files: vec![1, 2, 3]
             })
         );

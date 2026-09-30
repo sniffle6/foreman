@@ -176,12 +176,16 @@ Both file trees (commit details, Git Changes) share one selection model in
   selected row it keeps the whole group. The menu then acts on the group.
 
 **The menu seam.** The tree doesn't know any actions. Its owner passes
-`menu(files) -> Vec<MenuItem>`; the tree calls it with the selection when the
-menu opens and draws the items, and reports the choice back as
-`TreeEvent::Act { item, files }`. Each item is always listed and enabled only
-when it applies to something selected, so the menu doesn't shuffle. There
-are no hover buttons on rows; every action is in the menu. New actions go in
-the owner's `menu`, not in `file_tree.rs`.
+`menu(files) -> Vec<MenuItem<A>>`; the tree calls it with the selection when
+the menu opens and draws the items, and reports the choice back as
+`TreeEvent::Act { action, files }`. `A` is the owner's own `Action` enum
+(`changes.rs`, `details.rs`): each item carries its action, so the tree
+never deals in positions and reordering the menu can't misfire a write.
+Each item is always listed and enabled only when it applies to something
+selected, so the menu doesn't shuffle. There are no hover buttons on rows;
+every action is in the menu. A new action is an `Action` variant plus an
+item in the owner's `menu`; the compiler then points at the `match` that
+needs a new arm. Nothing changes in `file_tree.rs`.
 
 **Checkboxes** (Git Changes only: `FileTree::grouped` with a section's
 check flag). A box sits between the disclosure arrow and the icon. Clicking

@@ -144,17 +144,22 @@ fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, Str
     })
 }
 
-// Context-menu items, by index into `menu`.
-const OPEN: usize = 0;
+/// The tree's context-menu actions: a commit's files are read-only.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    OpenDiff,
+    CopyPath,
+}
 
-/// The tree's context menu: a commit's files are read-only.
-fn menu(files: &[usize]) -> Vec<MenuItem> {
+fn menu(files: &[usize]) -> Vec<MenuItem<Action>> {
     vec![
         MenuItem {
+            action: Action::OpenDiff,
             label: "Open Diff",
             enabled: files.len() == 1,
         },
         MenuItem {
+            action: Action::CopyPath,
             label: "Copy Path",
             enabled: !files.is_empty(),
         },
@@ -323,20 +328,23 @@ impl DetailsView {
         } else {
             match file_tree::show(&mut tree_ui, &mut details.tree, scale, active, &menu) {
                 Some(TreeEvent::Open(file)) => self.open = Some(details.target(file)),
-                Some(TreeEvent::Act { item: OPEN, files }) => {
+                Some(TreeEvent::Act {
+                    action: Action::OpenDiff,
+                    files,
+                }) => {
                     if let [file] = files[..] {
                         self.open = Some(details.target(file));
                     }
                 }
-                Some(TreeEvent::Act { files, .. }) => {
+                Some(TreeEvent::Act {
+                    action: Action::CopyPath,
+                    files,
+                }) => {
                     let paths: Vec<_> = files
                         .iter()
                         .map(|&f| details.tree.files[f].path.as_str())
                         .collect();
-                    tree_ui.ctx().copy_text(paths.join(
-                        "
-",
-                    ));
+                    tree_ui.ctx().copy_text(paths.join("\n"));
                 }
                 // A commit's files have no checkboxes.
                 Some(TreeEvent::Check { .. }) | None => {}
