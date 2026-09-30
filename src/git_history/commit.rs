@@ -4,6 +4,7 @@
 //! draft of the message). Every write runs on a worker through `git::write`;
 //! one at a time, so two never race for `index.lock`.
 use super::git::{self, GitError};
+use super::push::{self, Target};
 use crate::ai_oneshot::{self, LaunchError};
 use crate::config::NamingProvider;
 use eframe::egui;
@@ -19,8 +20,6 @@ use std::time::Duration;
 const DIFF_CAP: usize = 32 * 1024;
 const AI_TIMEOUT: Duration = Duration::from_secs(90);
 const AI_MAX_OUTPUT: usize = 16 * 1024;
-/// Killing a push is harmless (no local lock), unlike a commit.
-const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// More checked paths than this and the AI draft reads the whole diff.
 const DRAFT_PATHS: usize = 500;
@@ -61,7 +60,8 @@ pub(super) enum Write {
         push: bool,
         merge: bool,
     },
-    Push,
+    /// Push exactly where the push dialog showed.
+    Push(Target),
 }
 impl Write {
     /// A write over no files does nothing; don't start it.
@@ -69,7 +69,7 @@ impl Write {
         match self {
             Self::Track(p) | Self::Resolve(p) | Self::Delete(p) | Self::Ignore(p) => p.is_empty(),
             Self::Rollback { untrack, restore } => untrack.is_empty() && restore.is_empty(),
-            Self::Commit { .. } | Self::Push => false,
+            Self::Commit { .. } | Self::Push(_) => false,
         }
     }
 }
@@ -176,7 +176,7 @@ pub(super) fn run(cwd: &Path, write: &Write) -> Report {
                 ..Report::new(Ok(summary))
             }
         }
-        Write::Push => Report::new(self::push(cwd)),
+        Write::Push(target) => Report::new(push::push(cwd, target)),
     }
 }
 
@@ -286,38 +286,6 @@ fn ignore(cwd: &Path, paths: &[String]) -> Result<String, String> {
     }
     std::fs::write(&file, text).map_err(|e| format!("Cannot write .gitignore: {e}"))?;
     Ok(String::new())
-}
-
-/// Push the current branch; with no upstream, publish it to `origin` and
-/// track it there.
-fn push(cwd: &Path) -> Result<String, String> {
-    let never = Arc::new(AtomicBool::new(false));
-    let upstream = git::output(
-        cwd,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        &never,
-        4096,
-        READ_TIMEOUT,
-    )
-    .is_ok();
-    let args: &[&str] = if upstream {
-        &["push"]
-    } else {
-        &["push", "-u", "origin", "HEAD"]
-    };
-    match git::write(cwd, args, None, Some(PUSH_TIMEOUT)) {
-        Ok(_) => Ok("Pushed".into()),
-        Err(GitError::Failed(text)) if rejected(&text) => Err(format!(
-            "Push REJECTED: the remote has commits this branch does not. \
-             Pull (or rebase), then push again.\n{text}"
-        )),
-        Err(GitError::TimedOut) => Err("The push timed out after 5 minutes".into()),
-        Err(e) => Err(failure("Push failed", e)),
-    }
-}
-
-fn rejected(text: &str) -> bool {
-    text.contains("[rejected]") || text.contains("non-fast-forward") || text.contains("fetch first")
 }
 
 /// Worker-only: the prompt for an AI draft, from the diff against HEAD of
@@ -812,17 +780,6 @@ mod tests {
         assert!(clean_message("feat: x\u{1b}[31m").is_err());
     }
 
-    #[test]
-    fn rejected_push_is_recognised() {
-        assert!(rejected(" ! [rejected]        main -> main (fetch first)"));
-        assert!(rejected(
-            "error: failed to push some refs\nhint: ... non-fast-forward"
-        ));
-        assert!(!rejected(
-            "fatal: 'origin' does not appear to be a git repository"
-        ));
-    }
-
     fn ok(report: Report) {
         assert!(!report.error, "{report:?}");
     }
@@ -1038,12 +995,15 @@ mod tests {
                 },
             );
             assert!(report.committed && report.push, "{report:?}");
-            run(dir, &Write::Push)
+            let never = Arc::new(AtomicBool::new(false));
+            run(dir, &Write::Push(push::target(dir, &never).unwrap()))
         };
         let one = repo();
         git(one.path(), &["remote", "add", "origin", &url]);
-        // No upstream: push -u origin HEAD publishes and tracks.
-        ok(commit_and_push(one.path(), "one.txt"));
+        // No upstream: publishes to origin/main and tracks it.
+        let pushed = commit_and_push(one.path(), "one.txt");
+        assert_eq!(pushed.text, "Pushed main → origin/main");
+        ok(pushed);
         assert_eq!(
             git(one.path(), &["rev-parse", "--abbrev-ref", "@{u}"]),
             "origin/main"

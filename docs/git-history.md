@@ -447,17 +447,24 @@ Windows' command-line limit.
 Opened by Commit and Push… once the commit lands, or by **Push…** in the
 header. It shows `branch → target` and the outgoing commits (hash and
 subject, newest first, 200 listed at most), then **Push** / **Cancel**
-(Enter / Esc). The target is the branch's upstream (`@{u}..HEAD`), or with
-no upstream `origin/<branch>`, marked **New** when that remote branch
-doesn't exist yet (commits not on any `origin` branch are listed). Push is
-disabled when nothing would leave. Detached HEAD and "no upstream and no
-`origin`" show as errors in the dialog.
+(Enter / Esc). The target is the branch's upstream when it's on a remote,
+even under another name (`topic` tracking `origin/main` goes to
+`origin/main`), or with no upstream `origin/<branch>`, tagged "sets
+upstream". It's marked **New** when that remote branch doesn't exist yet
+(then the commits on no branch of that remote are listed). Push is disabled
+when nothing would leave. Detached HEAD, "no upstream and no `origin`", and
+an upstream that is a local branch show as errors in the dialog.
 
-Push runs `git push`, or `git push -u origin HEAD` with no upstream. A
+**One target, decided once.** `push::target` works it out (one
+`for-each-ref` for the upstream's remote and branch) and returns a `Target`.
+The dialog lists commits from it, and Push hands that same `Target` to the
+write (`Write::Push(Target)`), which names both refs:
+`git push [-u] <remote> refs/heads/<branch>:refs/heads/<remote branch>`. So
+the push goes exactly where the dialog said. `push.default` can't redirect
+it (a bare `git push` refuses the differently named upstream above), and
+neither can a checkout between opening the dialog and clicking Push. A
 rejected push (the remote moved) says REJECTED with Git's output; the commit
-already stands either way. Pushing reads the outgoing list in `push.rs` and
-pushes in `commit.rs` (`push`); both pick the target the same way, so keep
-them in step.
+already stands either way.
 
 Gotchas:
 - **Writes go through `git::write`, never `git::output`.** The read helper
@@ -713,9 +720,10 @@ No native screenshot of the pill yet.
 - `src/git_history/commit.rs`: `CommitPanel` (message box, Amend, Commit /
   Commit and Push…, AI message), the `Write` ops and their worker `run`
   (`--only` commits, the merge case, Recycle Bin, `.gitignore` patterns),
-  `push` (upstream check, rejection text), and the AI prompt /
-  `clean_message`.
-- `src/git_history/push.rs`: `PushDialog` and `outgoing` (target and
+  and the AI prompt / `clean_message`.
+- `src/git_history/push.rs`: `Target` and `target` (where a push goes),
+  `push` (the write, with the rejection text), `PushDialog` and `outgoing`
+  (target and
   outgoing commits).
 - `src/git_history/watch.rs`: `RepoWatch`, the registry and `open`, the
   pure `classify` / `Debounce` core, the `ReadDirectoryChangesW` thread, and

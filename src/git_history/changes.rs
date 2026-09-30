@@ -816,9 +816,9 @@ impl ChangesView {
         }
         if let Some(dialog) = &mut self.push {
             match dialog.show(ui.ctx(), base.with("push")) {
-                push::Choice::Push => {
+                push::Choice::Push(target) => {
                     self.push = None;
-                    self.start(ui.ctx(), Write::Push);
+                    self.start(ui.ctx(), Write::Push(target));
                 }
                 push::Choice::Cancel => self.push = None,
                 push::Choice::Pending => {}
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(write(&targets, SHOW_DIFF, &all).is_none());
         let confirm = Confirm::new(write(&targets, ROLLBACK, &[1]).unwrap()).unwrap();
         assert_eq!(confirm.paths, ["new.rs", "old.rs"]);
-        assert!(Confirm::new(Write::Push).is_none());
+        assert!(Confirm::new(Write::Resolve(Vec::new())).is_none());
     }
 
     fn frame(ctx: &egui::Context, view: &mut ChangesView, active: bool, events: Vec<egui::Event>) {
