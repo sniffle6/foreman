@@ -1,5 +1,5 @@
 //! Selected-commit details: cancellable read-only Git queries and a virtualized file tree.
-use super::file_tree::{self, ChangedFile, FileTree};
+use super::file_tree::{self, ChangedFile, FileTree, MenuItem, TreeEvent};
 use super::*;
 use std::path::Path;
 
@@ -144,6 +144,25 @@ fn load(cwd: &Path, hash: &str, cancel: &Arc<AtomicBool>) -> Result<Details, Str
     })
 }
 
+// Context-menu items, by index into `menu`.
+const OPEN: usize = 0;
+
+/// The tree's context menu: a commit's files are read-only.
+fn menu(files: &[usize]) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: "Open Diff",
+            enabled: files.len() == 1,
+            quick: false,
+        },
+        MenuItem {
+            label: "Copy Path",
+            enabled: !files.is_empty(),
+            quick: false,
+        },
+    ]
+}
+
 struct Request {
     hash: String,
     cancel: Arc<AtomicBool>,
@@ -159,7 +178,7 @@ pub(super) struct DetailsView {
     request: Option<Request>,
     result: Option<Result<Details, String>>,
     tree_fraction: Option<f32>,
-    /// A file row clicked this frame, taken by `HistoryView` after the draw.
+    /// A file opened this frame, taken by `HistoryView` after the draw.
     open: Option<super::DiffTarget>,
 }
 impl Drop for DetailsView {
@@ -181,7 +200,7 @@ impl DetailsView {
             });
         }
     }
-    /// A file row clicked this frame, for `HistoryView` to forward.
+    /// A file opened this frame, for `HistoryView` to forward.
     pub(super) fn take_open(&mut self) -> Option<super::DiffTarget> {
         self.open.take()
     }
@@ -210,7 +229,14 @@ impl DetailsView {
             receiver,
         });
     }
-    pub(super) fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
+    /// `active`: the History window is, so the file tree reads the keyboard.
+    pub(super) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        base: egui::Id,
+        active: bool,
+    ) {
         let th = crate::theme::live(ui.ctx());
         let zoom = crate::view_scale::ViewScale::from_ctx(ui.ctx());
         let scale = zoom.factor();
@@ -296,8 +322,26 @@ impl DetailsView {
         });
         if details.tree.files.is_empty() {
             tree_ui.colored_label(th.dim, "No changed files.");
-        } else if let Some(file) = file_tree::show(&mut tree_ui, &mut details.tree, scale) {
-            self.open = Some(details.target(file));
+        } else {
+            match file_tree::show(&mut tree_ui, &mut details.tree, scale, active, &menu) {
+                Some(TreeEvent::Open(file)) => self.open = Some(details.target(file)),
+                Some(TreeEvent::Act { item: OPEN, files }) => {
+                    if let [file] = files[..] {
+                        self.open = Some(details.target(file));
+                    }
+                }
+                Some(TreeEvent::Act { files, .. }) => {
+                    let paths: Vec<_> = files
+                        .iter()
+                        .map(|&f| details.tree.files[f].path.as_str())
+                        .collect();
+                    tree_ui.ctx().copy_text(paths.join(
+                        "
+",
+                    ));
+                }
+                None => {}
+            }
         }
         let mut metadata_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -383,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn file_clicks_select_one_and_directories_preserve_selection() {
+    fn double_click_opens_directories_select_their_files_and_scrolling_keeps_them() {
         let ctx = egui::Context::default();
         let mut details = fixture();
         assert_eq!(details.tree.rows[0].file_count, 2);
@@ -396,7 +440,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| clicked = file_tree::show(ui, &mut details.tree, 1.0),
+                |ui| clicked = file_tree::show(ui, &mut details.tree, 1.0, true, &menu),
             );
             clicked
         };
@@ -416,16 +460,23 @@ mod tests {
             }
             clicked
         };
-        assert_eq!(click(&mut details, egui::pos2(170.0, 30.0)), Some(0));
-        assert_eq!(details.tree.selected, Some(0));
-        assert_eq!(click(&mut details, egui::pos2(170.0, 50.0)), Some(1));
-        assert_eq!(details.tree.selected, Some(1));
-        assert_eq!(click(&mut details, egui::pos2(170.0, 11.0)), None);
-        assert!(details.tree.rows[0].collapsed);
-        assert_eq!(details.tree.selected, Some(1));
+        // One click selects; the second of a double-click opens.
+        assert_eq!(click(&mut details, egui::pos2(170.0, 30.0)), None);
+        assert_eq!(details.tree.selected(), [0]);
+        assert_eq!(
+            click(&mut details, egui::pos2(170.0, 30.0)),
+            Some(TreeEvent::Open(0))
+        );
+        click(&mut details, egui::pos2(170.0, 50.0));
+        assert_eq!(details.tree.selected(), [1]);
+        // The folder row selects both files under it.
         click(&mut details, egui::pos2(170.0, 11.0));
+        assert_eq!(details.tree.selected(), [0, 1]);
         assert!(!details.tree.rows[0].collapsed);
-        assert_eq!(details.tree.selected, Some(1));
+        // Open Diff needs exactly one file; Copy Path takes any.
+        let enabled = |files: &[usize]| menu(files).iter().map(|m| m.enabled).collect::<Vec<_>>();
+        assert_eq!(enabled(&[0, 1]), [false, true]);
+        assert_eq!(enabled(&[1]), [true, true]);
         frame(
             &mut details,
             vec![egui::Event::MouseWheel {
@@ -435,7 +486,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }],
         );
-        assert_eq!(details.tree.selected, Some(1));
+        assert_eq!(details.tree.selected(), [0, 1]);
     }
 
     #[test]
@@ -449,7 +500,7 @@ mod tests {
             receiver,
         });
         let mut details = fixture();
-        details.tree.selected = Some(1);
+        details.tree.select_files([1]);
         view.result = Some(Ok(details));
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0));
         let frame = |view: &mut DetailsView, events| {
@@ -459,7 +510,7 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| view.show(ui, rect, egui::Id::new("details-test")),
+                |ui| view.show(ui, rect, egui::Id::new("details-test"), true),
             );
         };
         frame(&mut view, vec![]);
@@ -486,8 +537,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .tree
-                .selected,
-            Some(1)
+                .selected(),
+            [1]
         );
         view.select(PathBuf::new(), "different".into(), ctx.clone());
         assert!(view.result.is_none());

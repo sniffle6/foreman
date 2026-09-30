@@ -1348,8 +1348,12 @@ impl HistoryView {
         {
             self.details.select(cwd.clone(), hash, ui.ctx().clone());
         }
-        self.details
-            .show(ui, detail_rect, base.with(("details", self.generation)));
+        self.details.show(
+            ui,
+            detail_rect,
+            base.with(("details", self.generation)),
+            active,
+        );
         if let Some(target) = self.details.take_open() {
             self.acts.push(HistoryAct::OpenDiff(target));
         }

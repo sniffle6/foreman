@@ -1,10 +1,11 @@
 //! Git Changes: the working tree's uncommitted files. One `git status` read
-//! per refresh, on a cancellable worker; clicking a file opens it in the
-//! Project's Diff window. While shown, the repository watch (`watch.rs`)
-//! triggers the refreshes; without one, becoming active does. Stage /
-//! unstage per file and the commit panel are `commit.rs`.
+//! per refresh, on a cancellable worker; double-clicking a file opens it in
+//! the Project's Diff window. While shown, the repository watch (`watch.rs`)
+//! triggers the refreshes; without one, becoming active does. The tree's
+//! context menu (`menu`) acts on the selection; the writes it starts and the
+//! commit panel are `commit.rs`.
 use super::commit::{CommitPanel, Write};
-use super::file_tree::{self, ChangedFile, FileTree};
+use super::file_tree::{self, ChangedFile, FileTree, MenuItem, TreeEvent};
 use super::{DiffTarget, HistoryAct, Stage, git, watch};
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -210,6 +211,66 @@ fn load(
     }))
 }
 
+// Context-menu items, by index into `menu`.
+const OPEN: usize = 0;
+const STAGE: usize = 1;
+const RESOLVE: usize = 2;
+const UNSTAGE: usize = 3;
+const COPY: usize = 4;
+
+fn staged(t: &DiffTarget) -> bool {
+    t.stage == Stage::Staged
+}
+// Conflicts sit in the Unstaged stage; adding marks them resolved.
+fn conflict(t: &DiffTarget) -> bool {
+    !staged(t) && t.status == 'U'
+}
+fn stageable(t: &DiffTarget) -> bool {
+    !staged(t) && t.status != 'U'
+}
+
+/// The tree's context menu for the selected `files`. Every item is always
+/// listed; each is enabled only if it applies to something selected. The
+/// three writes double as a row's hover button.
+fn menu(targets: &[DiffTarget], files: &[usize], busy: bool) -> Vec<MenuItem> {
+    let any = |kind: fn(&DiffTarget) -> bool| files.iter().any(|&f| kind(&targets[f]));
+    let item = |label, enabled, quick| MenuItem {
+        label,
+        enabled,
+        quick,
+    };
+    vec![
+        item("Open Diff", files.len() == 1, false),
+        item("Stage", !busy && any(stageable), true),
+        item("Mark Resolved", !busy && any(conflict), true),
+        item("Unstage", !busy && any(staged), true),
+        item("Copy Path", !files.is_empty(), false),
+    ]
+}
+
+/// The write menu `item` starts: over just the selected files it applies to.
+fn write(targets: &[DiffTarget], item: usize, files: &[usize]) -> Option<Write> {
+    let paths = |kind: fn(&DiffTarget) -> bool| {
+        let mut paths: Vec<String> = files
+            .iter()
+            .map(|&f| &targets[f])
+            .filter(|t| kind(t))
+            // A staged rename unstages both of its sides.
+            .flat_map(|t| std::iter::once(t.path.clone()).chain(t.old_path.clone()))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    };
+    match item {
+        STAGE => Some(Write::Stage(paths(stageable))),
+        RESOLVE => Some(Write::Stage(paths(conflict))),
+        UNSTAGE => Some(Write::Unstage(paths(staged))),
+        _ => None,
+    }
+    .filter(|w| !matches!(w, Write::Stage(p) | Write::Unstage(p) if p.is_empty()))
+}
+
 struct Request {
     cancel: Arc<AtomicBool>,
     receiver: mpsc::Receiver<Result<Option<Status>, String>>,
@@ -314,11 +375,10 @@ impl ChangesView {
             Err(mpsc::TryRecvError::Disconnected) => Err("Git status worker stopped".into()),
         };
         self.request = None;
-        // Carry collapse state and the selected file across the re-read.
+        // Carry collapse state and the selection across the re-read.
         if let (Some(Ok(old)), Ok(new)) = (&self.status, &mut next) {
             new.tree.collapse(&old.tree.collapsed_keys());
-            let selected = old.tree.selected.map(|i| &old.targets[i]);
-            new.tree.selected = selected.and_then(|t| new.targets.iter().position(|n| n == t));
+            new.tree.keep_selection(&old.tree);
         }
         let old = std::mem::replace(&mut self.status, Some(next));
         std::thread::spawn(move || drop(old));
@@ -459,29 +519,27 @@ impl ChangesView {
                 }
                 let targets = &status.targets;
                 let busy = self.commit.busy();
-                let action = |file: usize| match targets[file].stage {
-                    _ if busy => None,
-                    Stage::Staged => Some("Unstage"),
-                    // Conflicts sit in the Unstaged stage too; adding marks them resolved.
-                    _ if targets[file].status == 'U' => Some("Mark Resolved"),
-                    _ => Some("Stage"),
-                };
-                match file_tree::show_with(&mut ui, &mut status.tree, scale, &action) {
-                    Some(file_tree::Click::Open(file)) => {
-                        self.acts
-                            .push(HistoryAct::OpenDiff(status.targets[file].clone()));
+                let menu = |files: &[usize]| menu(targets, files, busy);
+                match file_tree::show(&mut ui, &mut status.tree, scale, active, &menu) {
+                    Some(TreeEvent::Open(file)) => {
+                        self.acts.push(HistoryAct::OpenDiff(targets[file].clone()));
                     }
-                    Some(file_tree::Click::Act(file)) => {
-                        let target = &status.targets[file];
-                        let mut paths = vec![target.path.clone()];
-                        let write = if target.stage == Stage::Staged {
-                            // A staged rename unstages both of its sides.
-                            paths.extend(target.old_path.clone());
-                            Write::Unstage(paths)
-                        } else {
-                            Write::Stage(paths)
-                        };
-                        if let Some(cwd) = &self.cwd {
+                    Some(TreeEvent::Act { item: OPEN, files }) => {
+                        if let [file] = files[..] {
+                            self.acts.push(HistoryAct::OpenDiff(targets[file].clone()));
+                        }
+                    }
+                    Some(TreeEvent::Act { item: COPY, files }) => {
+                        let paths: Vec<_> =
+                            files.iter().map(|&f| targets[f].path.as_str()).collect();
+                        ui.ctx().copy_text(paths.join(
+                            "
+",
+                        ));
+                    }
+                    Some(TreeEvent::Act { item, files }) => {
+                        if let (Some(write), Some(cwd)) = (write(targets, item, &files), &self.cwd)
+                        {
                             self.commit.start(ui.ctx(), cwd, write);
                         }
                     }
@@ -600,6 +658,58 @@ mod tests {
         assert!(load(dir, &Arc::new(AtomicBool::new(true)), None).is_err());
     }
 
+    #[test]
+    fn menu_items_follow_the_selection_and_writes_take_only_their_files() {
+        let target = |stage, status, path: &str, old: Option<&str>| DiffTarget {
+            stage,
+            commit: String::new(),
+            parent: None,
+            status,
+            old_path: old.map(Into::into),
+            path: path.into(),
+            merge: false,
+        };
+        let targets = [
+            target(Stage::Unstaged, 'U', "clash.rs", None),
+            target(Stage::Staged, 'R', "new.rs", Some("old.rs")),
+            target(Stage::Unstaged, 'M', "a.rs", None),
+            target(Stage::Untracked, '?', "notes.txt", None),
+        ];
+        let enabled = |files: &[usize], busy| -> Vec<bool> {
+            menu(&targets, files, busy)
+                .iter()
+                .map(|m| m.enabled)
+                .collect()
+        };
+        // Open Diff, Stage, Mark Resolved, Unstage, Copy Path.
+        assert_eq!(enabled(&[1], false), [true, false, false, true, true]);
+        assert_eq!(enabled(&[2, 3], false), [false, true, false, false, true]);
+        assert_eq!(enabled(&[0, 1, 2], false), [false, true, true, true, true]);
+        assert_eq!(
+            enabled(&[0, 1, 2], true),
+            [false, false, false, false, true]
+        );
+        assert_eq!(enabled(&[], false), [false; 5]);
+        // A mixed selection: each write takes just the files it applies to.
+        let all = [0, 1, 2, 3];
+        let paths = |item| match write(&targets, item, &all) {
+            Some(Write::Stage(p)) => ("stage", p),
+            Some(Write::Unstage(p)) => ("unstage", p),
+            _ => panic!("no write for {item}"),
+        };
+        assert_eq!(
+            paths(STAGE),
+            ("stage", vec!["a.rs".into(), "notes.txt".into()])
+        );
+        assert_eq!(paths(RESOLVE), ("stage", vec!["clash.rs".into()]));
+        assert_eq!(
+            paths(UNSTAGE),
+            ("unstage", vec!["new.rs".into(), "old.rs".into()])
+        );
+        assert!(write(&targets, UNSTAGE, &[2]).is_none());
+        assert!(write(&targets, OPEN, &all).is_none());
+    }
+
     fn frame(ctx: &egui::Context, view: &mut ChangesView, active: bool, events: Vec<egui::Event>) {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 300.0));
         let _ = ctx.run_ui(
@@ -654,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn refocus_rereads_keeps_selection_and_clicks_open_the_diff() {
+    fn refocus_rereads_keeps_selection_and_double_clicks_open_the_diff() {
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git(dir, &["init", "-b", "main"]);
@@ -669,18 +779,22 @@ mod tests {
         let row = view_row_y(&view, "b.txt");
         let pos = egui::pos2(200.0, row);
         frame(&ctx, &mut view, true, vec![egui::Event::PointerMoved(pos)]);
-        for pressed in [true, false] {
-            frame(
-                &ctx,
-                &mut view,
-                true,
-                vec![egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-            );
+        // A single click only selects; the second click of a double opens.
+        for click in 0..2 {
+            assert!(view.acts.is_empty(), "click {click} opened early");
+            for pressed in [true, false] {
+                frame(
+                    &ctx,
+                    &mut view,
+                    true,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
         }
         let [HistoryAct::OpenDiff(target)] = view.acts.as_slice() else {
             panic!("expected one OpenDiff act");
@@ -701,7 +815,7 @@ mod tests {
         let Some(Ok(status)) = &view.status else {
             panic!()
         };
-        assert_eq!(status.tree.selected, Some(1));
+        assert_eq!(status.tree.selected(), [1]);
         // Staying active never re-reads; a quick refocus inside the debounce doesn't either.
         frame(&ctx, &mut view, true, vec![]);
         frame(&ctx, &mut view, false, vec![]);

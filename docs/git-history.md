@@ -136,16 +136,66 @@ Hover a rename for both paths. Roots compare against the empty tree; merges comp
 against their first parent, as labeled in the pane. Empty changes have an
 explicit placeholder. The tree sits above the subject-led commit details, with a
 draggable divider and independent scrolling. Folders reuse the Sessions panel
-icon; files have a folded-page icon. Clicking a file selects it;
-directory expansion and scrolling preserve that selection. Status meanings and
+icon; files have a folded-page icon. Selection works as in the next section;
+directory expansion and scrolling preserve it. Status meanings and
 rename paths are available on hover, without a permanent legend. Compact
 metadata includes containing-branch badges and a short hash that copies the
 full object id when clicked.
 Selecting another row cancels the previous read. Refresh clears the selection.
 
-Click a file in the changed-file tree to open it in the project's Diff window.
-Checkout, search, context menus, and other Git operations are outside this
-viewer's scope.
+Double-click a file (or press Enter on it) to open it in the project's Diff
+window. The right-click menu has **Open Diff** (one file selected) and **Copy
+Path** (newline-separated). Checkout, search, and other Git operations are
+outside this viewer's scope.
+
+### Selecting files and the context menu
+
+Both file trees (commit details, Git Changes) share one selection model in
+`file_tree.rs`:
+
+- **Click** selects just that row. **Ctrl+click** toggles it. **Shift+click**
+  selects from the anchor (the last plain or Ctrl click) to here, replacing
+  the selection; **Ctrl+Shift+click** adds the range instead.
+- **A folder or section row stands for every file under it**: clicking it
+  selects them all, Ctrl+click toggles them all. A folder row shows as
+  selected when all its files are. A Shift range takes the file rows it
+  covers plus the hidden files of collapsed folders in it; an *open*
+  heading inside the range does not drag in the rest of its section.
+- **The disclosure arrow** (the strip left of the folder icon) collapses and
+  expands without touching the selection. Double-clicking a folder row
+  toggles it too.
+- **Double-click opens** a file's diff; a single click only selects. Decided
+  so that Ctrl/Shift clicks never fire an open, and so a click doesn't hand
+  focus to the Diff window and strand the keyboard there.
+- **Keyboard**, while the tree's window is active and no text box has focus:
+  Up/Down move the cursor row and select it, Shift+Up/Down extend from the
+  anchor, Ctrl+A selects all, Enter opens the file (or toggles a folder),
+  Left/Right collapse/expand the folder under the cursor, Shift+F10 opens the
+  context menu at the cursor. The cursor row gets a thin outline.
+- **Right-click** on a row that isn't selected selects just it first; on a
+  selected row it keeps the whole group. The menu then acts on the group.
+
+**The menu seam.** The tree doesn't know any actions. Its owner passes
+`menu(files) -> Vec<MenuItem>`; the tree calls it with the selection when the
+menu opens and draws the items, and reports the choice back as
+`TreeEvent::Act { item, files }`. Each item is always listed and enabled only
+when it applies to something selected, so the menu doesn't shuffle. An item
+marked `quick` is also the hover button on a single row (the first enabled
+one wins); that button acts on that row's file only, even inside a group.
+New actions go in the owner's `menu`, not in `file_tree.rs`.
+
+Gotchas:
+- **The Menu key doesn't work, only Shift+F10.** egui-winit 0.34 has no
+  `egui::Key` for it and drops the press before egui sees it.
+- **Keys go to the tree via the window's `active` flag, not egui focus.**
+  A focused egui widget suppresses the leader key (`pump_commands`), so the
+  tree deliberately never takes focus. It yields to any focused widget (the
+  commit message box), and consumes its keys so nothing behind sees them.
+- **Selection survives a re-read by row key** (section + path), so a file
+  that moved from Changes to Staged is not selected any more: it's a
+  different row. Cursor and anchor carry the same way (`keep_selection`).
+- egui reports a quick third click as another double-click, whatever row it
+  lands on. Tests that double-click twice need a fresh `Context` between.
 
 ### Live updates: the "↻ N new commits" pill
 
@@ -263,8 +313,10 @@ once in Changes, and each opens its own diff. That split is the reason for the
 Staged section: JetBrains merges them, which hides what a commit would contain.
 Empty sections are hidden. A clean tree says so.
 
-Click a file to open it in the Diff window. Clicking the same working-tree file
-again re-reads it; a commit diff with an unchanged target does not.
+Double-click a file (or Enter) to open it in the Diff window; selecting and
+the menu work as in "Selecting files and the context menu" above. Opening the
+same working-tree file again re-reads it; a commit diff with an unchanged
+target does not.
 
 **Refresh model:** one `git status --porcelain=v2 -z --branch
 --untracked-files=all` read per refresh, on a worker. It runs when the
@@ -276,7 +328,7 @@ once more when the current one lands. Those reads show no spinner, and when
 the status bytes hash the same as last time, the shown tree is kept as is.
 The Refresh button shows only without a live watch or after a failed read.
 The previous list stays up while a re-read runs, and collapsed folders and
-the selected file carry over.
+the selection carry over.
 
 Without a watch (a network share, or the watched root was deleted) it falls
 back to the old rule: re-read when the window becomes active, at most once
@@ -290,7 +342,10 @@ the index already is that list, and a second selection on top of it would be
 two sources of truth.
 
 - **Stage / Unstage**: hover a file row for its button at the right edge, or
-  right-click it. Changes and Unversioned files get **Stage** (`git add`),
+  right-click the selection. The menu is Open Diff, Stage, Mark Resolved,
+  Unstage, Copy Path; each write takes only the selected files it applies
+  to, so a mixed selection can be staged and unstaged in two clicks.
+  Changes and Unversioned files get **Stage** (`git add`),
   conflicts get **Mark Resolved** (also `git add`), Staged files get
   **Unstage** (`git reset -q -- <path>`, plus the old path for a staged
   rename). `reset` instead of `restore --staged` because it also works
@@ -416,8 +471,10 @@ and restrained separators while using JetBrains' information hierarchy.
   Keep its status color and letter readable. Hover has a lighter treatment
   distinct from selection. File clicks only select; they do not open a diff.
 - Preserve file selection through scrolling and directory collapse/expansion.
-  Directory clicks only toggle expansion. Selecting another commit or
-  refreshing clears file selection.
+  Directory clicks only toggle expansion (superseded: a directory click now
+  selects its files and the arrow toggles; see "Selecting files and the
+  context menu"). Selecting another commit or refreshing clears file
+  selection.
 
 Validate the layout, divider, scrolling, hover/selection distinction, and
 status-color readability with native screenshots. Verify selection persistence
@@ -547,10 +604,12 @@ No native screenshot of the pill yet.
 - `src/git_history/details.rs`: `DetailsView`, cancellable commit queries, and
   changed-file parsing.
 - `src/git_history/file_tree.rs`: `FileTree`, the virtualized status-colored
-  tree (with sections) shared by the details pane and Git Changes, and
+  tree (with sections) shared by the details pane and Git Changes: the
+  multi-select model, keyboard, the `MenuItem` / `TreeEvent` menu seam, and
   `status_color`.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
-  parser, and the watch-driven refresh (refresh-on-activate as fallback).
+  parser, the tree's context menu (`menu`, and `write` for its items), and
+  the watch-driven refresh (refresh-on-activate as fallback).
 - `src/git_history/commit.rs`: `CommitPanel` (message box, Commit / Commit
   and Push, AI message), the `Write` ops and their worker `run`, `push`
   (upstream check, rejection text), and the AI prompt / `clean_message`.
