@@ -127,7 +127,36 @@ impl ChatMsg {
             self.text
         )
     }
+
+    /// [`Self::frame`] with an age stamp once the post is older than
+    /// [`STAMP_AFTER`]: `[chat p6 #12 · 14m ago] t2: text`. Fresh posts are
+    /// byte-identical to `frame`.
+    pub fn frame_at(&self, project: &str, now: SystemTime) -> String {
+        let age = now.duration_since(self.at).unwrap_or_default();
+        if age < STAMP_AFTER {
+            return self.frame(project);
+        }
+        let (label, _) = age_label(age, Duration::MAX);
+        format!(
+            "[chat {project} #{} · {label} ago] {}{}: {}",
+            self.seq,
+            self.from_tag(),
+            self.re_suffix(),
+            self.text
+        )
+    }
 }
+
+/// Posts older than this at delivery time carry an age stamp, so a replayed
+/// or queued handoff can't pass for a fresh instruction.
+pub const STAMP_AFTER: Duration = Duration::from_secs(60);
+
+/// Strict-path (CLI) post length cap, in chars. The norm is 1-3 sentences;
+/// every member pays the tokens for a long one. Detail belongs in a file.
+pub const MAX_POST_CHARS: usize = 1200;
+
+/// How many leading tokens a stray `@tX` still counts as a botched mention.
+const MENTION_WINDOW: usize = 4;
 
 /// Append-only room log. Seq is `len + 1` — messages are never removed in v1,
 /// so no separate counter to drift.
@@ -361,6 +390,23 @@ pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
     out
 }
 
+/// A `@t<digits>` / `@you` that sits within the first few tokens but NOT in
+/// the leading run — so it parsed as prose and the post would broadcast. The
+/// classic slip is a stray word first (`post @t6 ...`). Trailing punctuation
+/// (`@t6,`) still counts. `None` when the text has no such near-miss.
+pub fn misplaced_mention(text: &str) -> Option<String> {
+    let lead = leading_mentions(text).len();
+    text.split_whitespace()
+        .take(MENTION_WINDOW)
+        .skip(lead)
+        .find_map(|tok| {
+            let id = tok
+                .strip_prefix('@')?
+                .trim_end_matches(|c: char| ",:;.!?".contains(c));
+            valid_chat_target(id).then(|| id.to_string())
+        })
+}
+
 /// One crew-board row. Identity is the Member id (`"t4"` / `"you"`); the viewer
 /// renders by id/name/exited/last and resolves a click back to its window by id,
 /// so a row carries no window coordinates.
@@ -524,7 +570,18 @@ impl ChatRoom {
         if text.trim().is_empty() {
             return Err("empty message".to_string());
         }
+        let len = text.chars().count();
+        if len > MAX_POST_CHARS {
+            return Err(format!(
+                "post is {len} chars (max {MAX_POST_CHARS}) - keep it to 1-3 sentences, put detail in a file and cite the path"
+            ));
+        }
         let targets = effective_targets(to, text);
+        if let Some(id) = misplaced_mention(text).filter(|id| !targets.contains(id)) {
+            return Err(format!(
+                "@{id} is not at the start, so it reads as prose and this would broadcast to everyone - lead with @{id}, or pass --to {id}"
+            ));
+        }
         // Validate ALL targets before mutating anything (all-or-nothing).
         for t in &targets {
             if t == from {
@@ -599,6 +656,16 @@ impl ChatRoom {
     /// current window-manager tag, supplied per-frame so the framed inject
     /// line (`[chat p1 #N] ...`) always reflects the live tag.
     pub fn tick(&mut self, project: &str, live: &[LiveMember]) -> Vec<Delivery> {
+        self.tick_at(project, live, SystemTime::now())
+    }
+
+    /// [`Self::tick`] with an injected clock (age stamps on stale posts).
+    pub fn tick_at(
+        &mut self,
+        project: &str,
+        live: &[LiveMember],
+        now: SystemTime,
+    ) -> Vec<Delivery> {
         // --- Refresh names: a present, non-human member tracks its live
         // display name (terminal renames flow to the crew board). The human
         // seat is never in `live` and is never touched.
@@ -653,7 +720,7 @@ impl ChatRoom {
                 .deliver_after(&l.id, cursor)
                 .into_iter()
                 .filter(|m| m.from != l.id)
-                .map(|m| m.frame(project))
+                .map(|m| m.frame_at(project, now))
                 .collect();
             if let Some(m) = self.member_mut(&l.id) {
                 m.cursor = tail; // advance even if nothing was addressed
@@ -1067,6 +1134,71 @@ mod tests {
         // human is never in `live`; it must never be marked exited.
         room.tick("p1", &[live("t1", true, false)]);
         assert!(!room.member("you").unwrap().exited);
+    }
+
+    #[test]
+    fn frame_at_stamps_only_stale_posts() {
+        let mut log = ChatLog::new();
+        let m = log.post("t2", "a", "old handoff").clone();
+        let t = m.at;
+        assert_eq!(m.frame_at("p6", t + Duration::from_secs(59)), m.frame("p6"));
+        assert_eq!(
+            m.frame_at("p6", t + Duration::from_secs(14 * 60 + 5)),
+            "[chat p6 #1 \u{b7} 14m ago] t2: old handoff"
+        );
+        assert!(
+            m.frame_at("p6", t + Duration::from_secs(7300))
+                .contains("2h ago")
+        );
+    }
+
+    #[test]
+    fn misplaced_mention_catches_near_leading_only() {
+        assert_eq!(misplaced_mention("post @t6 go").as_deref(), Some("t6"));
+        assert_eq!(
+            misplaced_mention("ok so @you, look").as_deref(),
+            Some("you")
+        );
+        assert_eq!(misplaced_mention("@t6 go"), None);
+        assert_eq!(misplaced_mention("a b c d @t6"), None); // beyond the window
+        assert_eq!(misplaced_mention("no mention here"), None);
+    }
+
+    #[test]
+    fn room_post_rejects_misplaced_mention_unless_targeted_by_flag() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "a");
+        room.join("t2", "b");
+        let e = room.post("t1", "post @t2 go", &[], None).unwrap_err();
+        assert!(e.contains("@t2"), "{e}");
+        assert!(
+            room.post("t1", "post @t2 go", &["t2".to_string()], None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn room_post_rejects_overlong_but_human_is_exempt() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "a");
+        let long = "x".repeat(MAX_POST_CHARS + 1);
+        assert!(room.post("t1", &long, &[], None).is_err());
+        assert!(
+            room.post("t1", &"x".repeat(MAX_POST_CHARS), &[], None)
+                .is_ok()
+        );
+        assert!(room.post_human(&long).is_some());
+    }
+
+    #[test]
+    fn tick_at_ages_a_replayed_post() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "a");
+        room.join("t2", "b");
+        room.post("t1", "handoff", &[], None).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(600);
+        let d = room.tick_at("p6", &[live("t2", true, false)], later);
+        assert!(d[0].lines[0].contains("10m ago"), "{:?}", d[0].lines);
     }
 
     #[test]

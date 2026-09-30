@@ -97,6 +97,21 @@ The engine adapter (`src/wm.rs`):
 - **`post` is strict, `post_human` is lenient.** Two methods, two policies, one
   owner. Don't fold them — the CLI agent needs the error; the pane input can't
   show one.
+- **One post = one turn.** `ReadyGate` queues every post and writes the next
+  paste only after the previous post's deferred Enter has fired (~150ms each).
+  Posts never fold into one paste, so a receiver never reads two instructions
+  as one line.
+- **Stale posts get an age stamp.** At delivery, a post older than
+  `STAMP_AFTER` (60s) is framed `[chat p6 #12 · 14m ago] t2: ...` so a replayed
+  handoff can't pass for a fresh one. Fresh posts keep the v1 frame byte-for-byte.
+- **Strict `post` guards the sender's mistakes.** It rejects (exit 1) a post
+  over `MAX_POST_CHARS` (1200) and a post whose `@tX` sits in the first few
+  tokens but not at the start (it would parse as prose and broadcast). `--to`
+  covering that id lifts the mention check. `post_human` is exempt from both.
+- **Delivery is still blind to the receiver's state.** Posts inject as soon as
+  the session is `ready()`, even mid-turn. Idle-aware delivery and a `--now`
+  urgency flag need the per-Session agent-state signal
+  (`foreman-agent-state-campaign`), which is not built yet.
 - **Not yet persistent.** The log is still in memory; a restart wipes it and the
   cursors. That's the next transport piece (feature #2). Independent of this —
   on restart there are no live members to deliver to anyway (PTYs don't survive).

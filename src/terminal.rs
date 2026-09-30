@@ -1206,10 +1206,9 @@ impl Session {
     /// Claude Code's burst detection and lands as a literal newline (live
     /// failure 2026-06-10 — message sat unsubmitted in the input box).
     /// pump() fires it once the deadline passes; the frame loop pumps every
-    /// session every ~16ms, so no extra repaint plumbing is needed. Accepted
-    /// quirks: two posts inside the window merge into one submitted turn for
-    /// the receiver, and bytes buffered through a member's entire boot can
-    /// still coalesce (residual; revisit with age-gating if it bites).
+    /// session every ~16ms, so no extra repaint plumbing is needed. Each post
+    /// is its own paste+submit turn: a second post inside the window queues in
+    /// the gate and goes out after the first one's submit.
     pub fn inject_input(&mut self, text: &str) {
         let now = std::time::Instant::now();
         if let Some(crate::ready::Action::Write(bytes)) = self.ready_gate.try_inject(text, now) {
@@ -4751,15 +4750,18 @@ mod tests {
         // Before deadline: pump must not fire \r.
         s.pump_at(due - std::time::Duration::from_millis(1));
         assert!(s.ready_gate.pending_submit.is_some());
-        // Second post refreshes the deadline (accepted merge quirk).
+        // Second post queues behind the first; it does not move the deadline.
         s.inject_input("world");
-        let due2 = s.ready_gate.pending_submit.expect("still armed");
-        s.pump_at(due2 - std::time::Duration::from_millis(1));
-        assert!(s.ready_gate.pending_submit.is_some());
-        s.pump_at(due2 + std::time::Duration::from_millis(1));
+        assert_eq!(s.ready_gate.pending_submit, Some(due));
+        assert_eq!(s.ready_gate.pending_inject, ["world"]);
+        s.pump_at(due + std::time::Duration::from_millis(1));
         assert!(
-            s.ready_gate.pending_submit.is_none(),
-            "a pump past the deadline fires the submit exactly once"
+            s.ready_gate.pending_inject.is_empty(),
+            "the queued post goes out once the first is submitted"
+        );
+        assert!(
+            s.ready_gate.pending_submit.is_some(),
+            "the second post gets its own submit"
         );
         let recorded = writes.lock().unwrap().clone();
         assert!(

@@ -151,38 +151,44 @@ impl ReadyGate {
         }
     }
 
-    /// Queue or emit chat text. Empty text is a no-op. When not Ready, holds
-    /// the post; when Ready, returns paste bytes and arms the deferred submit.
+    /// Queue or emit chat text. Empty text is a no-op. Every post is its own
+    /// paste + submit turn: a post is written only when Ready and no earlier
+    /// post's submit is still pending, otherwise it waits in the queue (the
+    /// next [`Self::poll`] sends it). Folding posts into one paste merged them
+    /// into a single garbled instruction for the receiver.
     pub fn try_inject(&mut self, text: &str, now: Instant) -> Option<Action> {
         if text.is_empty() {
             return None;
         }
-        if !self.ready {
-            self.pending_inject.push(text.to_string());
-            return None;
-        }
-        self.pending_submit = Some(now + SUBMIT_DELAY);
-        Some(Action::Write(paste_wrap(text)))
+        self.pending_inject.push(text.to_string());
+        self.next_paste(now)
     }
 
-    /// Drain queued injects (once Ready) and fire a due deferred submit.
+    /// Drain queued injects one turn at a time and fire a due deferred submit.
     /// Call every pump after rx/DSR updates with the same `now`.
     pub fn poll(&mut self, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
-        if self.ready && !self.pending_inject.is_empty() {
-            for text in std::mem::take(&mut self.pending_inject) {
-                if let Some(a) = self.try_inject(&text, now) {
-                    out.push(a);
-                }
-            }
-        }
         if let Some(due) = self.pending_submit
             && now >= due
         {
             self.pending_submit = None;
             out.push(Action::Write(b"\r".to_vec()));
         }
+        if let Some(a) = self.next_paste(now) {
+            out.push(a);
+        }
         out
+    }
+
+    /// Emit the oldest queued post as a paste and arm its submit — only when
+    /// Ready and the previous post has been submitted.
+    fn next_paste(&mut self, now: Instant) -> Option<Action> {
+        if !self.ready || self.pending_submit.is_some() || self.pending_inject.is_empty() {
+            return None;
+        }
+        let text = self.pending_inject.remove(0);
+        self.pending_submit = Some(now + SUBMIT_DELAY);
+        Some(Action::Write(paste_wrap(&text)))
     }
 
     fn recompute_ready(&mut self) {
@@ -302,16 +308,29 @@ mod tests {
         assert_eq!(paste, Action::Write(paste_wrap("hello")));
         assert!(g.poll(t0).is_empty(), "before deadline: no submit");
 
-        // Second post inside the window refreshes the deadline (posts merge).
+        // A second post inside the window WAITS; it never folds into the
+        // first paste or refreshes its deadline.
         let t1 = t0 + Duration::from_millis(50);
-        let _ = g.try_inject("world", t1);
+        assert!(g.try_inject("world", t1).is_none());
         assert!(g.poll(t1).is_empty());
+        assert_eq!(g.pending_inject, ["world"]);
 
-        let t2 = t1 + SUBMIT_DELAY + Duration::from_millis(1);
+        // First submit fires at its own deadline; the queued post goes out
+        // right behind it and gets its own submit.
+        let t2 = t0 + SUBMIT_DELAY + Duration::from_millis(1);
         let acts = g.poll(t2);
-        assert_eq!(acts, vec![Action::Write(b"\r".to_vec())]);
+        assert_eq!(
+            acts,
+            vec![
+                Action::Write(b"\r".to_vec()),
+                Action::Write(paste_wrap("world"))
+            ]
+        );
+        assert!(g.pending_inject.is_empty());
+        let t3 = t2 + SUBMIT_DELAY + Duration::from_millis(1);
+        assert_eq!(g.poll(t3), vec![Action::Write(b"\r".to_vec())]);
         assert!(g.pending_submit.is_none());
-        assert!(g.poll(t2 + Duration::from_secs(1)).is_empty(), "once only");
+        assert!(g.poll(t3 + Duration::from_secs(1)).is_empty(), "once only");
     }
 
     #[test]
