@@ -407,10 +407,11 @@ cancellable background request and a private reply channel so stale results
 cannot replace the current selection. Merge changes use the first parent.
 
 **Git Changes**:
-The per-Project read-only window listing uncommitted files in Conflicts,
-Staged, Changes, and Unversioned Files sections. Owned by
-`src/git_history/changes.rs`; it re-reads `git status` on Refresh and when it
-becomes active, never on a timer.
+The per-Project commit window (JetBrains' Commit tool window, no staging
+area) listing uncommitted files in Conflicts, Changes, and Unversioned Files
+sections. Its checkboxes are its own selection, not Git's index. Owned by
+`src/git_history/changes.rs`; it re-reads `git status` when the repository
+watch fires (or, without a watch, when it becomes active), never on a timer.
 
 **Diff window**:
 The per-Project, reused side-by-side view of one changed file, either at one

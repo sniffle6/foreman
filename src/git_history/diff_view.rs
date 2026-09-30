@@ -26,6 +26,9 @@ pub enum Stage {
     Unstaged,
     /// A file Git does not track, shown whole as added.
     Untracked,
+    /// HEAD against the working copy, staged or not (Git Changes' one
+    /// Changes section). A new file is read from disk, shown whole as added.
+    Local,
 }
 
 /// One file's change: at one commit, or in the working tree. Built by the
@@ -65,6 +68,9 @@ impl DiffTarget {
             (Stage::Unstaged, 'D') => return "Deleted from working copy".into(),
             (Stage::Unstaged, _) => return "Working copy vs index".into(),
             (Stage::Untracked, _) => return "Untracked · new file".into(),
+            (Stage::Local, 'A') => return "New file".into(),
+            (Stage::Local, 'D') => return "Deleted · vs HEAD".into(),
+            (Stage::Local, _) => return "Working copy vs HEAD".into(),
         }
         match (self.status, &self.parent) {
             ('A', _) | (_, None) => format!("{} · new file", short(&self.commit)),
@@ -115,6 +121,15 @@ impl DiffTarget {
                 return Ok(args);
             }
             (Stage::Untracked, _) => return Err("Untracked files are not read through Git".into()),
+            (Stage::Local, _) => {
+                args.push("diff".into());
+                args.extend(flags);
+                // Both sides of a rename, paired by rename detection.
+                args.extend(["-M".into(), "HEAD".into()]);
+                args.extend(path());
+                args.extend(self.old_path.clone());
+                return Ok(args);
+            }
         }
         if !is_object_id(&self.commit) || self.parent.as_deref().is_some_and(|p| !is_object_id(p)) {
             return Err("Invalid commit id".into());
@@ -154,7 +169,8 @@ pub(super) fn load(
     target: &DiffTarget,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Diff, String> {
-    if target.stage == Stage::Untracked {
+    // A new file has no HEAD side (and before the first commit, no HEAD).
+    if target.stage == Stage::Untracked || (target.stage == Stage::Local && target.status == 'A') {
         return untracked(cwd, &target.path);
     }
     let mut args = target.args()?;
@@ -1122,6 +1138,31 @@ mod tests {
             &flag(),
         ));
         assert_eq!(texts(&unstaged)[2], (Added, None, Some("three")));
+        // Changes: HEAD against the working copy, staged and unstaged at once.
+        let local = doc(load(
+            dir,
+            &worktree(Stage::Local, 'M', None, "a.txt"),
+            &flag(),
+        ));
+        assert_eq!(
+            texts(&local),
+            [
+                (Same, Some("one"), Some("one")),
+                (Modified, Some("two"), Some("TWO")),
+                (Added, None, Some("three"))
+            ]
+        );
+        let moved = worktree(Stage::Local, 'R', Some("old.txt"), "new.txt");
+        assert_eq!(
+            load(dir, &moved, &flag()).unwrap(),
+            Diff::Notice(Notice::Unchanged)
+        );
+        let added = doc(load(
+            dir,
+            &worktree(Stage::Local, 'A', None, "u.txt"),
+            &flag(),
+        ));
+        assert_eq!(texts(&added)[0], (Added, None, Some("hello")));
         let renamed = worktree(Stage::Staged, 'R', Some("old.txt"), "new.txt");
         assert_eq!(
             load(dir, &renamed, &flag()).unwrap(),

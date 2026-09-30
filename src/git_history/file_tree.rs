@@ -1,8 +1,10 @@
 //! The status-colored changed-file tree shared by the commit details pane and
 //! the Git Changes window: pure row building off-thread, virtualized painting,
-//! multi-select, and a context-menu seam whose items the owning view builds.
+//! multi-select, optional per-row checkboxes, and a context-menu seam whose
+//! items the owning view builds.
 use eframe::egui;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Range;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct ChangedFile {
@@ -23,6 +25,8 @@ pub(super) struct TreeRow {
     pub(super) section: bool,
     /// Stable identity (section + directory path) so a re-read keeps collapse state.
     pub(super) key: String,
+    /// Draws a checkbox: the row sits in a checkable section.
+    pub(super) check: bool,
 }
 
 #[derive(Default)]
@@ -62,6 +66,7 @@ impl Directory {
                 file_count: 0,
                 section: false,
                 key: key.clone(),
+                check: false,
             });
             let descendants = dir.flatten(depth + 1, &key, rows);
             count += descendants;
@@ -78,10 +83,73 @@ impl Directory {
                 collapsed: false,
                 file_count: 1,
                 section: false,
+                check: false,
             });
         }
         count
     }
+}
+
+/// A section: its heading, its files (indices run through the sections in
+/// order), and whether its rows carry checkboxes.
+struct Group {
+    name: String,
+    files: Range<usize>,
+    check: bool,
+}
+
+/// Rows for `groups`: a heading each (empty groups skipped), over a directory
+/// tree, or with `flat` over the bare files by name.
+fn group_rows(files: &[ChangedFile], groups: &[Group], flat: bool) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for group in groups.iter().filter(|g| !g.files.is_empty()) {
+        let index = rows.len();
+        rows.push(TreeRow {
+            label: group.name.clone(),
+            depth: 0,
+            file: None,
+            end: 0,
+            collapsed: false,
+            file_count: group.files.len(),
+            section: true,
+            key: group.name.clone(),
+            check: false,
+        });
+        if flat {
+            let mut sorted: Vec<usize> = group.files.clone().collect();
+            // By name, as the rows read; the directory breaks ties.
+            let name = |f: usize| {
+                let path = files[f].path.as_str();
+                (path.rsplit('/').next().unwrap_or(path), path)
+            };
+            sorted.sort_by(|&a, &b| name(a).cmp(&name(b)));
+            for f in sorted {
+                let path = &files[f].path;
+                rows.push(TreeRow {
+                    label: path.rsplit('/').next().unwrap_or(path).to_owned(),
+                    depth: 1,
+                    file: Some(f),
+                    end: rows.len() + 1,
+                    collapsed: false,
+                    file_count: 1,
+                    section: false,
+                    key: format!("{}/{path}", group.name),
+                    check: false,
+                });
+            }
+        } else {
+            let mut root = Directory::default();
+            for f in group.files.clone() {
+                root.insert(&files[f].path, f);
+            }
+            root.flatten(1, &group.name, &mut rows);
+        }
+        rows[index].end = rows.len();
+        for row in &mut rows[index..] {
+            row.check = group.check;
+        }
+    }
+    rows
 }
 
 #[derive(Default)]
@@ -105,6 +173,13 @@ pub(super) struct FileTree {
     reveal: bool,
     /// Where the open context menu is anchored.
     menu_at: egui::Pos2,
+    /// Sections, when built by `grouped`; empty for a plain tree.
+    groups: Vec<Group>,
+    /// Files listed bare under their section instead of in directories.
+    pub(super) flat: bool,
+    /// Checked files, and per row how many sit at or before it (as `picked`).
+    checked: BTreeSet<usize>,
+    ticked: Vec<u32>,
 }
 impl FileTree {
     /// One directory tree over all `files`.
@@ -119,33 +194,56 @@ impl FileTree {
     }
     /// A collapsible heading per non-empty section, each over its own tree.
     /// File indices run through the sections in order.
+    #[cfg(test)]
     pub(super) fn sections(sections: Vec<(&str, Vec<ChangedFile>)>) -> Self {
+        Self::grouped(
+            sections.into_iter().map(|(n, f)| (n, f, false)).collect(),
+            false,
+        )
+    }
+    /// `sections`, with a checkbox flag per section, in directories or `flat`.
+    pub(super) fn grouped(sections: Vec<(&str, Vec<ChangedFile>, bool)>, flat: bool) -> Self {
         let mut files = Vec::new();
-        let mut rows = Vec::new();
-        for (name, section) in sections {
-            if section.is_empty() {
-                continue;
-            }
-            let mut root = Directory::default();
-            for file in section {
-                root.insert(&file.path, files.len());
-                files.push(file);
-            }
-            let index = rows.len();
-            rows.push(TreeRow {
-                label: name.into(),
-                depth: 0,
-                file: None,
-                end: 0,
-                collapsed: false,
-                file_count: 0,
-                section: true,
-                key: name.into(),
+        let mut groups = Vec::new();
+        for (name, section, check) in sections {
+            let start = files.len();
+            files.extend(section);
+            groups.push(Group {
+                name: name.into(),
+                files: start..files.len(),
+                check,
             });
-            rows[index].file_count = root.flatten(1, name, &mut rows);
-            rows[index].end = rows.len();
         }
-        Self::from_rows(files, rows)
+        let rows = group_rows(&files, &groups, flat);
+        let mut tree = Self::from_rows(files, rows);
+        tree.groups = groups;
+        tree.flat = flat;
+        tree
+    }
+    /// Switch between directories and a flat list. Collapse state, the
+    /// selection, the checks, cursor and anchor all carry over.
+    pub(super) fn set_flat(&mut self, flat: bool) {
+        if flat == self.flat || self.groups.is_empty() {
+            return;
+        }
+        let collapsed = self.collapsed_keys();
+        let key = |row: Option<usize>| row.map(|r| self.rows[r].key.clone());
+        let (cursor, anchor) = (key(self.cursor), key(self.anchor));
+        self.flat = flat;
+        self.rows = group_rows(&self.files, &self.groups, flat);
+        let find =
+            |key: Option<String>| key.and_then(|k| self.rows.iter().position(|r| r.key == k));
+        self.cursor = find(cursor);
+        self.anchor = find(anchor);
+        self.collapse(&collapsed);
+        self.recount();
+    }
+    /// Expand All / Collapse All: every folder and section.
+    pub(super) fn set_all_collapsed(&mut self, collapsed: bool) {
+        for row in &mut self.rows {
+            row.collapsed = collapsed && row.file.is_none();
+        }
+        self.rebuild_visible();
     }
     fn from_rows(files: Vec<ChangedFile>, rows: Vec<TreeRow>) -> Self {
         let visible = (0..rows.len()).collect();
@@ -194,13 +292,64 @@ impl FileTree {
         self.recount();
     }
     fn recount(&mut self) {
-        self.picked.clear();
-        self.picked.push(0);
-        let mut n = 0;
-        for row in &self.rows {
-            n += row.file.is_some_and(|f| self.selected.contains(&f)) as u32;
-            self.picked.push(n);
+        let prefix = |set: &BTreeSet<usize>| {
+            let mut n = 0;
+            std::iter::once(0)
+                .chain(self.rows.iter().map(|row| {
+                    n += row.file.is_some_and(|f| set.contains(&f)) as u32;
+                    n
+                }))
+                .collect()
+        };
+        self.picked = prefix(&self.selected);
+        self.ticked = prefix(&self.checked);
+    }
+
+    /// The checked files, in file order.
+    #[cfg(test)]
+    pub(super) fn checked(&self) -> Vec<usize> {
+        self.checked.iter().copied().collect()
+    }
+    /// Replace the checks with `files`.
+    pub(super) fn set_checked(&mut self, files: impl IntoIterator<Item = usize>) {
+        self.checked = files.into_iter().collect();
+        self.recount();
+    }
+    /// A row's checkbox: all its files checked, none, or `None` for some.
+    pub(super) fn row_checked(&self, row: usize) -> Option<bool> {
+        let r = &self.rows[row];
+        match (self.ticked[r.end] - self.ticked[row]) as usize {
+            0 => Some(false),
+            n if n == r.file_count => Some(true),
+            _ => None,
         }
+    }
+    /// Tick `files` unless all already are; then untick them. Only files on
+    /// checkable rows count. Returns what changed, for the owner.
+    fn toggle_checks(&mut self, files: Vec<usize>) -> Option<TreeEvent> {
+        let checkable: HashSet<usize> = self
+            .rows
+            .iter()
+            .filter(|r| r.check)
+            .filter_map(|r| r.file)
+            .collect();
+        let files: Vec<usize> = files
+            .into_iter()
+            .filter(|f| checkable.contains(f))
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        let on = !files.iter().all(|f| self.checked.contains(f));
+        for &f in &files {
+            if on {
+                self.checked.insert(f);
+            } else {
+                self.checked.remove(&f);
+            }
+        }
+        self.recount();
+        Some(TreeEvent::Check { files, on })
     }
     fn files_under(&self, row: usize) -> impl Iterator<Item = usize> + '_ {
         self.rows[row..self.rows[row].end]
@@ -314,9 +463,6 @@ impl FileTree {
 pub(super) struct MenuItem {
     pub(super) label: &'static str,
     pub(super) enabled: bool,
-    /// Also the hover button on a single row, when enabled for that row.
-    /// The first such item wins.
-    pub(super) quick: bool,
 }
 
 /// What the tree asks its owner to do this frame.
@@ -324,15 +470,18 @@ pub(super) struct MenuItem {
 pub(super) enum TreeEvent {
     /// Open this file's diff: a double-click or Enter.
     Open(usize),
-    /// Menu item `item` (an index into the owner's items) for `files`, from
-    /// the context menu or a row's hover button.
+    /// Menu item `item` (an index into the owner's items) for `files`.
     Act { item: usize, files: Vec<usize> },
+    /// A checkbox click or Space ticked (`on`) or unticked these files. The
+    /// tree has already updated its own checks.
+    Check { files: Vec<usize>, on: bool },
 }
 
 /// Draw the tree and run its selection gestures. `menu(files)` builds the
 /// context menu for those files; an empty list means no menu. `keys`: this
 /// tree reads the keyboard (its window is active); it still yields to any
-/// focused egui widget, such as the commit message box.
+/// focused egui widget, such as the commit message box. Checkboxes (rows in
+/// a checkable section) toggle on click or, for the selection, on Space.
 pub(super) fn show(
     ui: &mut egui::Ui,
     tree: &mut FileTree,
@@ -355,8 +504,10 @@ pub(super) fn show(
     // Where to open the menu this frame: the pointer, or the cursor row.
     let mut open_menu: Option<Option<egui::Pos2>> = None;
     if keys && !menu_open && ui.memory(|m| m.focused().is_none()) {
-        for (key, modifiers) in take_keys(ui) {
+        let checks = tree.rows.iter().any(|r| r.check);
+        for (key, modifiers) in take_keys(ui, checks) {
             match key {
+                egui::Key::Space => event = tree.toggle_checks(tree.selected()),
                 egui::Key::ArrowUp | egui::Key::ArrowDown => {
                     tree.step(key == egui::Key::ArrowDown, modifiers)
                 }
@@ -412,29 +563,29 @@ pub(super) fn show(
                 .painter()
                 .layout_no_wrap(display_path(&row.label), font.clone(), color);
             let indent = row.depth as f32 * 18.0 * scale;
+            // A checkbox sits right of the disclosure strip and pushes the rest over.
+            let boxed = if row.check { 18.0 * scale } else { 0.0 };
             // Sections have no icon, so their label sits where the icon would.
-            let label_x = if row.section { 16.0 } else { 58.0 } * scale;
-            let width =
-                (indent + label_x + label.size().x + 60.0 * scale).max(ui.available_width());
+            let label_x = if row.section { 16.0 } else { 58.0 } * scale + boxed;
+            // Flat: the file's directory, dim, after its name.
+            let detail = row
+                .file
+                .filter(|_| tree.flat)
+                .and_then(|f| tree.files[f].path.rsplit_once('/'))
+                .map(|(dir, _)| {
+                    ui.painter()
+                        .layout_no_wrap(display_path(dir), font.clone(), th.dim)
+                });
+            let detail_w = detail.as_ref().map_or(0.0, |d| d.size().x + 8.0 * scale);
+            let width = (indent + label_x + label.size().x + detail_w + 60.0 * scale)
+                .max(ui.available_width());
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(width, row_height), egui::Sense::click());
             if tree.cursor == Some(index) {
                 cursor_rect = Some(rect);
             }
             let selected = tree.row_selected(index);
-            let quick = row
-                .file
-                .filter(|_| ui.rect_contains_pointer(rect))
-                .and_then(|f| {
-                    menu(&[f])
-                        .into_iter()
-                        .enumerate()
-                        .find(|(_, m)| m.quick && m.enabled)
-                        .map(|(item, m)| (f, item, m.label))
-                });
-            // The quick button sits over the row and takes its hover.
-            let hot = response.hovered() || quick.is_some();
-            if selected || hot {
+            if selected || response.hovered() {
                 ui.painter().rect_filled(
                     rect,
                     2.0,
@@ -456,9 +607,13 @@ pub(super) fn show(
                 );
             }
             let painter = ui.painter();
+            if row.check {
+                let state = tree.row_checked(index);
+                check_box(painter, egui::pos2(x + 22.0 * scale, cy), scale, state, &th);
+            }
             // Reuse the Sessions folder asset; draw a folded page for files.
             // Neither icon nor disclosure relies on platform font glyphs.
-            let center = egui::pos2(x + 26.0 * scale, cy);
+            let center = egui::pos2(x + 26.0 * scale + boxed, cy);
             if row.file.is_none() {
                 let arrow = egui::pos2(x + 7.0 * scale, cy);
                 let points = if row.collapsed {
@@ -506,7 +661,7 @@ pub(super) fn show(
             if let Some(file_index) = row.file {
                 let file = &tree.files[file_index];
                 painter.text(
-                    egui::pos2(x + 44.0 * scale, cy),
+                    egui::pos2(x + 44.0 * scale + boxed, cy),
                     egui::Align2::CENTER_CENTER,
                     file.status,
                     font.clone(),
@@ -525,29 +680,32 @@ pub(super) fn show(
                     th.dim,
                 );
             }
+            let label_w = label.size().x;
             painter.galley(
                 egui::pos2(x + label_x, cy - label.size().y * 0.5),
                 label,
                 color,
             );
-            let quick_clicked = quick.is_some_and(|(file, item, label)| {
-                let clicked = row_button(ui, rect, label, scale, index);
-                if clicked {
-                    event = Some(TreeEvent::Act {
-                        item,
-                        files: vec![file],
-                    });
-                }
-                clicked
-            });
+            if let Some(detail) = detail {
+                painter.galley(
+                    egui::pos2(
+                        x + label_x + label_w + 8.0 * scale,
+                        cy - detail.size().y * 0.5,
+                    ),
+                    detail,
+                    th.dim,
+                );
+            }
             // Both clicks of a double-click also report `clicked`: the first
             // selects (or toggles, on the arrow), the second opens or toggles.
-            let on_arrow = response
-                .interact_pointer_pos()
-                .is_some_and(|p| p.x < x + 16.0 * scale);
+            // Each click on a checkbox toggles it, and nothing else.
+            let press_x = response.interact_pointer_pos().map(|p| p.x - x);
+            let on_arrow = press_x.is_some_and(|px| px < 16.0 * scale);
+            let on_box =
+                row.check && press_x.is_some_and(|px| (14.0 * scale..30.0 * scale).contains(&px));
             let modifiers = ui.input(|i| i.modifiers);
-            let pressed = if quick_clicked {
-                None
+            let pressed = if on_box && (response.clicked() || response.double_clicked()) {
+                Some(Gesture::Check)
             } else if response.double_clicked() {
                 Some(match row.file {
                     Some(file) => Gesture::Open(file),
@@ -588,6 +746,7 @@ pub(super) fn show(
     match gesture {
         Some((row, Gesture::Select(modifiers))) => tree.click(row, modifiers),
         Some((row, Gesture::Toggle)) => tree.toggle(row),
+        Some((row, Gesture::Check)) => event = tree.toggle_checks(tree.files_under(row).collect()),
         Some((_, Gesture::Open(file))) => event = Some(TreeEvent::Open(file)),
         // Right-click keeps a selected group; anything else selects just it.
         Some((row, Gesture::Menu(at))) => {
@@ -644,6 +803,8 @@ pub(super) fn show(
 enum Gesture {
     Select(egui::Modifiers),
     Toggle,
+    /// A click on the row's checkbox.
+    Check,
     Open(usize),
     /// Right-click, at this position.
     Menu(Option<egui::Pos2>),
@@ -651,7 +812,7 @@ enum Gesture {
 
 /// Drain the tree's key presses. Taken from the event list so nothing
 /// behind the tree sees them too.
-fn take_keys(ui: &egui::Ui) -> Vec<(egui::Key, egui::Modifiers)> {
+fn take_keys(ui: &egui::Ui, checks: bool) -> Vec<(egui::Key, egui::Modifiers)> {
     use egui::{Key, Modifiers};
     ui.ctx().input_mut(|i| {
         let mut keys = Vec::new();
@@ -672,6 +833,7 @@ fn take_keys(ui: &egui::Ui) -> Vec<(egui::Key, egui::Modifiers)> {
                 Key::ArrowLeft | Key::ArrowRight | Key::Enter => *modifiers == Modifiers::NONE,
                 Key::A => modifiers.command && !modifiers.shift && !modifiers.alt,
                 Key::F10 => *modifiers == Modifiers::SHIFT,
+                Key::Space => checks && *modifiers == Modifiers::NONE,
                 _ => false,
             };
             if ours {
@@ -683,31 +845,42 @@ fn take_keys(ui: &egui::Ui) -> Vec<(egui::Key, egui::Modifiers)> {
     })
 }
 
-/// A small button at the row's visible right edge, painted and hit-tested
-/// by hand: `ui.put` would move the `show_rows` cursor.
-fn row_button(ui: &egui::Ui, row: egui::Rect, label: &str, scale: f32, index: usize) -> bool {
-    let th = crate::theme::live(ui.ctx());
-    let font = egui::FontId::proportional(12.0 * scale);
-    let text = ui.painter().layout_no_wrap(label.to_owned(), font, th.text);
-    let right = row.right().min(ui.clip_rect().right()) - 4.0 * scale;
-    let size = egui::vec2(text.size().x + 12.0 * scale, row.height() - 4.0 * scale);
-    let rect = egui::Rect::from_min_size(egui::pos2(right - size.x, row.top() + 2.0 * scale), size);
-    let response = ui.interact(
+/// A row's checkbox, painted (the row's own response takes the click):
+/// ticked, empty, or `None` for a folder whose files are partly ticked.
+fn check_box(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    scale: f32,
+    state: Option<bool>,
+    th: &crate::theme::Theme,
+) {
+    let rect = egui::Rect::from_center_size(center, egui::vec2(12.0, 12.0) * scale);
+    let fill = if state == Some(false) {
+        th.bg
+    } else {
+        th.sel_bg
+    };
+    painter.rect(
         rect,
-        ui.id().with(("row-action", index)),
-        egui::Sense::click(),
-    );
-    let fill = if response.hovered() { th.sel_bg } else { th.bg };
-    ui.painter().rect(
-        rect,
-        3.0 * scale,
+        2.0 * scale,
         fill,
-        egui::Stroke::new(scale, th.border),
+        egui::Stroke::new(scale, th.dim),
         egui::StrokeKind::Inside,
     );
-    ui.painter()
-        .galley(rect.center() - text.size() * 0.5, text, th.text);
-    response.clicked()
+    let point = |x, y| center + egui::vec2(x, y) * scale;
+    let stroke = egui::Stroke::new(1.5 * scale, th.text);
+    match state {
+        Some(true) => {
+            painter.add(egui::Shape::line(
+                vec![point(-3.0, 0.0), point(-1.0, 2.5), point(3.5, -2.5)],
+                stroke,
+            ));
+        }
+        None => {
+            painter.line_segment([point(-3.0, 0.0), point(3.0, 0.0)], stroke);
+        }
+        Some(false) => {}
+    }
 }
 
 pub(super) fn display_path(path: &str) -> String {
@@ -807,12 +980,10 @@ mod tests {
                     MenuItem {
                         label: "First",
                         enabled: true,
-                        quick: false,
                     },
                     MenuItem {
                         label: "Second",
                         enabled: files.len() > 1,
-                        quick: false,
                     },
                 ]
             };
@@ -1066,6 +1237,69 @@ mod tests {
         h.click(row, SHIFT);
         // Anchor Changes/src/a.rs (f2) through 0.rs (f4), which sorts before c.rs.
         assert_eq!(h.tree.selected(), [2, 4]);
+    }
+
+    #[test]
+    fn checkboxes_tick_folders_show_partial_and_space_toggles_the_selection() {
+        // Rows: 0 Staged (no boxes), 1 src, 2 a.rs, 3 Changes, 4 src,
+        // 5 a.rs (f1), 6 b.rs (f2), 7 c.rs (f3).
+        let tree = FileTree::grouped(
+            vec![
+                ("Staged", vec![file('M', "src/a.rs")], false),
+                (
+                    "Changes",
+                    vec![file('M', "src/a.rs"), file('D', "b.rs"), file('A', "c.rs")],
+                    true,
+                ),
+            ],
+            false,
+        );
+        let mut h = Harness::new(tree);
+        let tick = |h: &mut Harness, row: usize| {
+            let pos = egui::pos2(
+                18.0 * h.tree.rows[row].depth as f32 + 22.0,
+                20.0 * row as f32 + 10.0,
+            );
+            h.press(pos, egui::PointerButton::Primary, NONE)
+        };
+        // The folder's box ticks everything under it, and nothing else:
+        // the selection stays as it was.
+        assert_eq!(
+            tick(&mut h, 4),
+            Some(TreeEvent::Check {
+                files: vec![1],
+                on: true
+            })
+        );
+        assert!(h.tree.selected().is_empty());
+        assert_eq!(h.tree.row_checked(3), None, "Changes is partly ticked");
+        assert_eq!(h.tree.row_checked(4), Some(true));
+        // A section without boxes ignores the click as a box.
+        tick(&mut h, 1);
+        assert_eq!(h.tree.checked(), [1]);
+        // Space ticks the selected checkable files; again unticks them.
+        h.click(3, NONE);
+        let space = h.key(egui::Key::Space, NONE);
+        assert_eq!(
+            space,
+            Some(TreeEvent::Check {
+                files: vec![1, 2, 3],
+                on: true
+            })
+        );
+        assert_eq!(h.tree.row_checked(3), Some(true));
+        h.key(egui::Key::Space, NONE);
+        assert!(h.tree.checked().is_empty());
+        // Flat keeps the checks and the selection.
+        h.tree.set_checked([2]);
+        h.tree.set_flat(true);
+        let labels: Vec<_> = h.tree.rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Staged", "a.rs", "Changes", "a.rs", "b.rs", "c.rs"]
+        );
+        assert_eq!(h.tree.checked(), [2]);
+        assert_eq!(h.tree.selected(), [1, 2, 3]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! The Git Changes window's writes: stage / unstage one file, and the commit
-//! panel pinned under the tree (message box, Commit, Commit and Push, and a
-//! one-click AI draft of the message). Every write runs on a worker through
-//! `git::write`; one at a time, so two never race for `index.lock`.
+//! The Git Changes window's writes (Add to VCS, Mark Resolved, Rollback,
+//! Delete, Add to .gitignore, commit, push) and the commit panel pinned under
+//! the tree (message box, Amend, Commit, Commit and Push…, and a one-click AI
+//! draft of the message). Every write runs on a worker through `git::write`;
+//! one at a time, so two never race for `index.lock`.
 use super::git::{self, GitError};
 use crate::ai_oneshot::{self, LaunchError};
 use crate::config::NamingProvider;
@@ -14,13 +15,15 @@ use std::sync::{
 };
 use std::time::Duration;
 
-/// Staged diff sent to the AI; over this, only `--stat` goes.
+/// Diff sent to the AI; over this, only `--stat` goes.
 const DIFF_CAP: usize = 32 * 1024;
 const AI_TIMEOUT: Duration = Duration::from_secs(90);
 const AI_MAX_OUTPUT: usize = 16 * 1024;
 /// Killing a push is harmless (no local lock), unlike a commit.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// More checked paths than this and the AI draft reads the whole diff.
+const DRAFT_PATHS: usize = 500;
 
 const AI_RULES: &str = "You write Git commit messages. Reply with ONLY the commit \
 message as plain text: a subject line of at most 72 characters, then optionally a \
@@ -28,62 +31,138 @@ blank line and a short body wrapped at 72 columns explaining why. Match the styl
 of the recent commits shown (for example a `type(scope): subject` prefix). No code \
 fences, no quotes around the message, no commentary before or after it.";
 
-/// What a write does. Paths are repository-relative, as `git status` gave them.
+/// What a write does. Paths are as `git status` gave them: relative to the
+/// window's directory.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Write {
-    Stage(Vec<String>),
-    Unstage(Vec<String>),
-    Commit { message: String, push: bool },
+    /// Add to VCS: `git add --intent-to-add`. Versioned, nothing staged.
+    Track(Vec<String>),
+    /// Mark Resolved: `git add`.
+    Resolve(Vec<String>),
+    /// Rollback: `untrack` (files new since HEAD) leave the index and become
+    /// unversioned again, kept on disk; `restore` go back to HEAD, index and
+    /// working copy both.
+    Rollback {
+        untrack: Vec<String>,
+        restore: Vec<String>,
+    },
+    /// Delete: to the Recycle Bin.
+    Delete(Vec<String>),
+    /// Add to .gitignore: one anchored pattern per path.
+    Ignore(Vec<String>),
+    /// `git commit --only` of `paths` (their working-copy content); nothing
+    /// else in the index goes in. `push`: open the push dialog after.
+    /// `merge`: Git refuses a partial commit while merging, so `paths` are
+    /// added and the whole index is committed.
+    Commit {
+        message: String,
+        paths: Vec<String>,
+        amend: bool,
+        push: bool,
+        merge: bool,
+    },
+    Push,
+}
+impl Write {
+    /// A write over no files does nothing; don't start it.
+    pub(super) fn is_empty(&self) -> bool {
+        match self {
+            Self::Track(p) | Self::Resolve(p) | Self::Delete(p) | Self::Ignore(p) => p.is_empty(),
+            Self::Rollback { untrack, restore } => untrack.is_empty() && restore.is_empty(),
+            Self::Commit { .. } | Self::Push => false,
+        }
+    }
 }
 
 /// A finished write, for the notice area.
 #[derive(Debug, PartialEq)]
-struct Report {
-    text: String,
-    error: bool,
-    /// A commit landed (even if its push then failed): clear the message.
-    committed: bool,
+pub(super) struct Report {
+    pub(super) text: String,
+    pub(super) error: bool,
+    /// A commit landed: clear the message.
+    pub(super) committed: bool,
+    /// ... and it was Commit and Push…: open the push dialog.
+    pub(super) push: bool,
+}
+impl Report {
+    fn new(result: Result<String, String>) -> Self {
+        let (text, error) = match result {
+            Ok(text) => (text, false),
+            Err(text) => (text, true),
+        };
+        Self {
+            text,
+            error,
+            committed: false,
+            push: false,
+        }
+    }
+}
+
+/// `git --literal-pathspecs <args>` over `paths`, fed NUL-separated on stdin
+/// so a long list never hits the command-line limit. No paths: no pathspec.
+fn over_paths(cwd: &Path, args: &[&str], paths: &[String]) -> Result<String, GitError> {
+    let mut all = vec!["--literal-pathspecs"];
+    all.extend(args);
+    if paths.is_empty() {
+        return git::write(cwd, &all, None, None);
+    }
+    all.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+    git::write(cwd, &all, Some(&paths.join("\0")), None)
 }
 
 /// Worker-only: run one write.
-fn run(cwd: &Path, write: &Write) -> Report {
-    let report = |result: Result<String, String>, committed| match result {
-        Ok(text) => Report {
-            text,
-            error: false,
-            committed,
-        },
-        Err(text) => Report {
-            text,
-            error: true,
-            committed,
-        },
-    };
-    let with_paths = |head: &[&str], files: &[String]| -> Vec<String> {
-        head.iter()
-            .map(|a| (*a).to_owned())
-            .chain(files.iter().cloned())
-            .collect()
+pub(super) fn run(cwd: &Path, write: &Write) -> Report {
+    let quiet = |r: Result<String, GitError>, what| {
+        Report::new(r.map(|_| String::new()).map_err(|e| failure(what, e)))
     };
     match write {
-        Write::Stage(files) => {
-            let args = with_paths(&["--literal-pathspecs", "add", "--"], files);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = git::write(cwd, &args, None, None).map(|_| String::new());
-            report(result.map_err(|e| failure("Cannot stage", e)), false)
+        Write::Track(paths) => quiet(
+            over_paths(cwd, &["add", "--intent-to-add"], paths),
+            "Cannot add to Git",
+        ),
+        Write::Resolve(paths) => quiet(over_paths(cwd, &["add"], paths), "Cannot mark resolved"),
+        Write::Rollback { untrack, restore } => {
+            // `reset` rather than `rm --cached`: it also works before the
+            // first commit, and on intent-to-add entries.
+            if !untrack.is_empty()
+                && let Err(e) = over_paths(cwd, &["reset", "-q"], untrack)
+            {
+                return quiet(Err(e), "Rollback failed");
+            }
+            let args = ["restore", "--source=HEAD", "--staged", "--worktree"];
+            if restore.is_empty() {
+                return Report::new(Ok(String::new()));
+            }
+            quiet(over_paths(cwd, &args, restore), "Rollback failed")
         }
-        Write::Unstage(files) => {
-            // `reset -- <paths>` rather than `restore --staged`: it also
-            // works before the first commit, where there is no HEAD.
-            let args = with_paths(&["--literal-pathspecs", "reset", "-q", "--"], files);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            let result = git::write(cwd, &args, None, None).map(|_| String::new());
-            report(result.map_err(|e| failure("Cannot unstage", e)), false)
-        }
-        Write::Commit { message, push } => {
-            let out = match git::write(cwd, &["commit", "-F", "-"], Some(message), None) {
+        Write::Delete(paths) => Report::new(recycle(cwd, paths)),
+        Write::Ignore(paths) => Report::new(ignore(cwd, paths)),
+        Write::Commit {
+            message,
+            paths,
+            amend,
+            push,
+            merge,
+        } => {
+            if *merge
+                && !paths.is_empty()
+                && let Err(e) = over_paths(cwd, &["add"], paths)
+            {
+                return Report::new(Err(failure("Commit failed", e)));
+            }
+            let mut args = vec!["commit"];
+            if *amend {
+                args.push("--amend");
+            }
+            if !*merge {
+                args.push("--only");
+            }
+            args.extend(["-m", message]);
+            let paths: &[String] = if *merge { &[] } else { paths };
+            let out = match over_paths(cwd, &args, paths) {
                 Ok(out) => out,
-                Err(e) => return report(Err(failure("Commit failed", e)), false),
+                Err(e) => return Report::new(Err(failure("Commit failed", e))),
             };
             // "[main 1a2b3c4] subject"; hooks may print lines before it.
             let summary = out
@@ -91,19 +170,17 @@ fn run(cwd: &Path, write: &Write) -> Report {
                 .find(|l| l.starts_with('['))
                 .unwrap_or("Committed")
                 .to_owned();
-            if !push {
-                return report(Ok(summary), true);
-            }
-            match self::push(cwd) {
-                Ok(()) => report(Ok(format!("{summary} — pushed")), true),
-                // The commit stands; say so, so nobody commits it twice.
-                Err(e) => report(Err(format!("{summary} — committed, but {e}")), true),
+            Report {
+                committed: true,
+                push: *push,
+                ..Report::new(Ok(summary))
             }
         }
+        Write::Push => Report::new(self::push(cwd)),
     }
 }
 
-fn failure(what: &str, error: GitError) -> String {
+pub(super) fn failure(what: &str, error: GitError) -> String {
     match error {
         GitError::Failed(text) if text.is_empty() => format!("{what}: Git exited with an error"),
         GitError::Failed(text) => format!("{what}:\n{text}"),
@@ -111,9 +188,109 @@ fn failure(what: &str, error: GitError) -> String {
     }
 }
 
+/// A status path joined onto `cwd`, or `None` if it would leave it.
+fn inside(cwd: &Path, path: &str) -> Option<PathBuf> {
+    let relative = Path::new(path.trim_end_matches('/'));
+    let normal = relative
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (normal && !relative.as_os_str().is_empty()).then(|| cwd.join(relative))
+}
+
+/// Move `paths` to the Recycle Bin. On a drive without one, Windows deletes
+/// them outright.
+fn recycle(cwd: &Path, paths: &[String]) -> Result<String, String> {
+    let mut full = Vec::new();
+    for path in paths {
+        let p = inside(cwd, path).ok_or_else(|| format!("Cannot delete {path}: invalid path"))?;
+        full.push(p);
+    }
+    to_recycle_bin(&full).map(|()| String::new())
+}
+
+#[cfg(windows)]
+fn to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
+        SHFileOperationW,
+    };
+    // Double-NUL-terminated list; the shell wants backslashes.
+    let mut from: Vec<u16> = Vec::new();
+    for path in paths {
+        let path = path.to_string_lossy().replace('/', "\\");
+        from.extend(std::ffi::OsStr::new(&path).encode_wide());
+        from.push(0);
+    }
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        ..Default::default()
+    };
+    // SAFETY: `op` and the `from` buffer it points into outlive the call.
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 {
+        return Err(format!("Delete failed (shell error {code:#x})"));
+    }
+    if op.fAnyOperationsAborted != 0 {
+        return Err("Delete was cancelled".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn to_recycle_bin(_paths: &[PathBuf]) -> Result<(), String> {
+    Err("Deleting to the trash is only supported on Windows".into())
+}
+
+/// A `.gitignore` line matching exactly `path`: anchored with `/`, with
+/// glob characters, a backslash, and trailing spaces escaped.
+pub(super) fn ignore_pattern(path: &str) -> String {
+    let mut out = String::from("/");
+    let (body, dir) = match path.strip_suffix('/') {
+        Some(body) => (body, "/"),
+        None => (path, ""),
+    };
+    let keep = body.trim_end_matches(' ').len();
+    for (i, c) in body.char_indices() {
+        if matches!(c, '*' | '?' | '[' | '\\') || (c == ' ' && i >= keep) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str(dir);
+    out
+}
+
+/// Append a pattern per path to the `.gitignore` in `cwd`.
+fn ignore(cwd: &Path, paths: &[String]) -> Result<String, String> {
+    if let Some(bad) = paths.iter().find(|p| inside(cwd, p).is_none()) {
+        return Err(format!("Cannot ignore {bad}: invalid path"));
+    }
+    let file = cwd.join(".gitignore");
+    let mut text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Cannot read .gitignore: {e}")),
+    };
+    // Keep the file's own line ending.
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push_str(eol);
+    }
+    for path in paths {
+        text.push_str(&ignore_pattern(path));
+        text.push_str(eol);
+    }
+    std::fs::write(&file, text).map_err(|e| format!("Cannot write .gitignore: {e}"))?;
+    Ok(String::new())
+}
+
 /// Push the current branch; with no upstream, publish it to `origin` and
 /// track it there.
-fn push(cwd: &Path) -> Result<(), String> {
+fn push(cwd: &Path) -> Result<String, String> {
     let never = Arc::new(AtomicBool::new(false));
     let upstream = git::output(
         cwd,
@@ -129,13 +306,13 @@ fn push(cwd: &Path) -> Result<(), String> {
         &["push", "-u", "origin", "HEAD"]
     };
     match git::write(cwd, args, None, Some(PUSH_TIMEOUT)) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok("Pushed".into()),
         Err(GitError::Failed(text)) if rejected(&text) => Err(format!(
-            "the push was REJECTED: the remote has commits this branch does not. \
+            "Push REJECTED: the remote has commits this branch does not. \
              Pull (or rebase), then push again.\n{text}"
         )),
-        Err(GitError::TimedOut) => Err("the push timed out after 5 minutes".into()),
-        Err(e) => Err(failure("the push failed", e)),
+        Err(GitError::TimedOut) => Err("The push timed out after 5 minutes".into()),
+        Err(e) => Err(failure("Push failed", e)),
     }
 }
 
@@ -143,29 +320,52 @@ fn rejected(text: &str) -> bool {
     text.contains("[rejected]") || text.contains("non-fast-forward") || text.contains("fetch first")
 }
 
-/// Worker-only: the prompt for an AI draft, from the staged diff (or its
-/// `--stat` when too large) and recent subjects for style.
-fn draft_prompt(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<String, String> {
+/// Worker-only: the prompt for an AI draft, from the diff against HEAD of
+/// `paths` (all changes when `None`), or its `--stat` when too large, and
+/// recent subjects for style.
+fn draft_prompt(
+    cwd: &Path,
+    paths: Option<&[String]>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
     let read = |args: &[&str], cap| git::output(cwd, args, cancel, cap, READ_TIMEOUT);
-    let diff = match read(
-        &["diff", "--cached", "--no-color", "--no-ext-diff", "-M"],
-        DIFF_CAP,
-    ) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    let born = read(&["rev-parse", "--verify", "-q", "HEAD"], 4096).is_ok();
+    // Before the first commit there is no HEAD: staged adds, then
+    // intent-to-add files (which only the index-to-worktree diff shows).
+    let bases: &[&[&str]] = if born {
+        &[&["HEAD"]]
+    } else {
+        &[&["--cached"], &[]]
+    };
+    let diff = |extra: &[&str], cap| -> Result<String, GitError> {
+        let mut text = String::new();
+        for base in bases {
+            let mut args = vec!["diff", "--no-color", "--no-ext-diff", "-M"];
+            args.extend(*base);
+            args.extend(extra);
+            if let Some(paths) = paths.filter(|p| p.len() <= DRAFT_PATHS) {
+                args.push("--");
+                args.extend(paths.iter().map(String::as_str));
+            }
+            text.push_str(&String::from_utf8_lossy(&read(&args, cap)?));
+            if text.len() > cap {
+                return Err(GitError::TooLarge);
+            }
+        }
+        Ok(text)
+    };
+    let diff = match diff(&[], DIFF_CAP) {
+        Ok(text) => text,
         Err(GitError::TooLarge) => {
-            let stat = read(
-                &["diff", "--cached", "--no-color", "--stat=200", "-M"],
-                4 << 20,
-            )
-            .map_err(|e| format!("Cannot read the staged changes: {e}"))?;
-            let mut stat = String::from_utf8_lossy(&stat).into_owned();
+            let mut stat = diff(&["--stat=200"], 4 << 20)
+                .map_err(|e| format!("Cannot read the changes: {e}"))?;
             truncate(&mut stat, DIFF_CAP);
             format!("(The full diff is too large; this is its summary.)\n{stat}")
         }
-        Err(e) => return Err(format!("Cannot read the staged changes: {e}")),
+        Err(e) => return Err(format!("Cannot read the changes: {e}")),
     };
     if diff.trim().is_empty() {
-        return Err("Nothing is staged".into());
+        return Err("Nothing to commit".into());
     }
     // A repository with no commits yet has no log; that's fine.
     let log = read(&["log", "--oneline", "--no-color", "-10"], 64 * 1024)
@@ -173,7 +373,7 @@ fn draft_prompt(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<String, String> 
         .unwrap_or_default();
     Ok(format!(
         "Recent commits, for style:\n<recent_commits>\n{log}</recent_commits>\n\n\
-         Staged changes to describe:\n<staged_diff>\n{diff}\n</staged_diff>"
+         Changes to describe:\n<diff>\n{diff}\n</diff>"
     ))
 }
 
@@ -209,11 +409,12 @@ pub(super) fn clean_message(raw: &str) -> Result<String, String> {
 
 fn draft(
     cwd: &Path,
+    paths: Option<&[String]>,
     provider: NamingProvider,
     model: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<String, String> {
-    let prompt = draft_prompt(cwd, cancel)?;
+    let prompt = draft_prompt(cwd, paths, cancel)?;
     // The CLI runs outside the repository: the diff is all it needs.
     let scratch = crate::config::config_dir()
         .ok_or("No settings directory")?
@@ -238,14 +439,27 @@ fn draft(
     clean_message(&raw)
 }
 
-/// A worker's single reply; dropping it cancels (AI) or just stops
+/// Worker-only: the last commit's message, for Amend.
+fn last_message(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<String, String> {
+    let bytes = git::output(
+        cwd,
+        &["log", "-1", "--format=%B"],
+        cancel,
+        64 * 1024,
+        READ_TIMEOUT,
+    )
+    .map_err(|e| format!("Cannot read the last commit: {e}"))?;
+    Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
+}
+
+/// A worker's single reply; dropping it cancels (reads) or just stops
 /// listening (writes, which always run to completion).
-struct Job<T> {
+pub(super) struct Job<T> {
     receiver: mpsc::Receiver<T>,
     cancel: Arc<AtomicBool>,
 }
 impl<T: Send + 'static> Job<T> {
-    fn start(
+    pub(super) fn start(
         ctx: &egui::Context,
         work: impl FnOnce(&Arc<AtomicBool>) -> T + Send + 'static,
     ) -> Self {
@@ -263,7 +477,7 @@ impl<T: Send + 'static> Job<T> {
         Self { receiver, cancel }
     }
     /// `Some` once, when the worker replies (or dies).
-    fn poll(&self) -> Option<Option<T>> {
+    pub(super) fn poll(&self) -> Option<Option<T>> {
         match self.receiver.try_recv() {
             Ok(v) => Some(Some(v)),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -282,19 +496,42 @@ struct Notice {
     error: bool,
 }
 
+/// What the next commit takes, as the Changes window sees it.
+#[derive(Default)]
+pub(super) struct Scope {
+    /// The checked Changes files, or all of them when none is checked; a
+    /// rename brings both of its paths.
+    pub(super) paths: Vec<String>,
+    /// How many files that is.
+    pub(super) files: usize,
+    /// Some file is checked (otherwise Commit takes everything).
+    pub(super) checked: bool,
+    /// A merge has unresolved files: no commit until they're resolved.
+    pub(super) conflicts: bool,
+    /// A merge is in progress: Commit takes every change, checked or not.
+    pub(super) merging: bool,
+    /// No commit yet, so nothing to amend.
+    pub(super) unborn: bool,
+}
+
 /// What the panel did this frame, for the Changes window to act on.
 #[derive(Default)]
 pub(super) struct Outcome {
     /// A write finished: re-read the status (unless the watch will).
     pub(super) wrote: bool,
+    /// Commit and Push… committed: open the push dialog.
+    pub(super) push: bool,
 }
 
 pub(super) struct CommitPanel {
     pub(super) message: String,
+    pub(super) amend: bool,
     write: Option<Job<Report>>,
-    /// While a commit runs: whether it also pushes.
+    /// While a commit runs: whether it's Commit and Push….
     committing: Option<bool>,
     ai: Option<Job<Result<String, String>>>,
+    /// Amend was ticked over a blank message: the last one, loading.
+    last: Option<Job<Result<String, String>>>,
     notice: Option<Notice>,
 }
 impl Drop for CommitPanel {
@@ -310,9 +547,11 @@ impl CommitPanel {
     pub(super) fn new() -> Self {
         Self {
             message: String::new(),
+            amend: false,
             write: None,
             committing: None,
             ai: None,
+            last: None,
             notice: None,
         }
     }
@@ -321,23 +560,23 @@ impl CommitPanel {
     }
     /// Start a write unless one is running. Returns whether it started.
     pub(super) fn start(&mut self, ctx: &egui::Context, cwd: &Path, write: Write) -> bool {
-        if self.busy() {
+        if self.busy() || write.is_empty() {
             return false;
         }
         let cwd = cwd.to_path_buf();
+        self.notice = None;
         if let Write::Commit { push, .. } = write {
-            self.notice = None;
             self.committing = Some(push);
         }
         self.write = Some(Job::start(ctx, move |_| run(&cwd, &write)));
         true
     }
-    fn start_draft(&mut self, ctx: &egui::Context, cwd: PathBuf) {
+    fn start_draft(&mut self, ctx: &egui::Context, cwd: PathBuf, paths: Option<Vec<String>>) {
         let settings = crate::config::live(ctx);
         let (provider, model) = (settings.title_provider, settings.title_model.clone());
         self.notice = None;
         self.ai = Some(Job::start(ctx, move |cancel| {
-            draft(&cwd, provider, &model, cancel)
+            draft(&cwd, paths.as_deref(), provider, &model, cancel)
         }));
     }
     fn poll(&mut self) -> Outcome {
@@ -346,14 +585,12 @@ impl CommitPanel {
             self.write = None;
             self.committing = None;
             outcome.wrote = true;
-            let report = reply.unwrap_or(Report {
-                text: "Git worker stopped".into(),
-                error: true,
-                committed: false,
-            });
+            let report = reply.unwrap_or(Report::new(Err("Git worker stopped".into())));
             if report.committed {
                 self.message.clear();
+                self.amend = false;
             }
+            outcome.push = report.push;
             self.notice = (!report.text.is_empty()).then_some(Notice {
                 text: report.text,
                 error: report.error,
@@ -363,6 +600,17 @@ impl CommitPanel {
             self.ai = None;
             match reply.unwrap_or_else(|| Err("AI worker stopped".into())) {
                 Ok(message) => self.message = message,
+                Err(text) => self.notice = Some(Notice { text, error: true }),
+            }
+        }
+        if let Some(reply) = self.last.as_ref().and_then(Job::poll) {
+            self.last = None;
+            match reply.unwrap_or_else(|| Err("Git worker stopped".into())) {
+                // Only into a box still blank: never over what was typed meanwhile.
+                Ok(message) if self.amend && self.message.trim().is_empty() => {
+                    self.message = message
+                }
+                Ok(_) => {}
                 Err(text) => self.notice = Some(Notice { text, error: true }),
             }
         }
@@ -376,7 +624,7 @@ impl CommitPanel {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         cwd: Option<&Path>,
-        staged: usize,
+        scope: &Scope,
         base: egui::Id,
     ) -> (f32, Outcome) {
         let outcome = self.poll();
@@ -402,12 +650,22 @@ impl CommitPanel {
                     );
                 });
         }
+        let amend = self.amend && !scope.unborn && !scope.merging;
         let blank = self.message.trim().is_empty();
         let writing = self.write.is_some();
+        // Amend with nothing picked rewrites just the message.
+        let something = scope.files > 0 || amend;
+        let ready = cwd.is_some()
+            && !scope.conflicts
+            && something
+            && !blank
+            && !writing
+            && self.ai.is_none();
         ui.horizontal(|ui| {
-            let ready = cwd.is_some() && staged > 0 && !blank && !writing && self.ai.is_none();
-            let why = if staged == 0 {
-                "Nothing is staged — stage files first"
+            let why = if scope.conflicts {
+                "Resolve the conflicts first"
+            } else if !something {
+                "Nothing to commit"
             } else if blank {
                 "Write a commit message"
             } else {
@@ -420,22 +678,35 @@ impl CommitPanel {
                     r.on_disabled_hover_text(why)
                 }
             };
-            let staged_files = if staged == 1 {
-                "the 1 staged file".to_owned()
-            } else {
-                format!("the {staged} staged files")
+            let what = match (scope.files, scope.checked) {
+                (0, _) => "the message only".to_owned(),
+                (1, true) => "the 1 checked file".to_owned(),
+                (n, true) => format!("the {n} checked files"),
+                (1, false) => "the 1 changed file".to_owned(),
+                (n, false) => format!("all {n} changed files"),
             };
+            let verb = if amend {
+                "Amend the last commit with"
+            } else {
+                "Commit"
+            };
+            let label = if amend { "Amend Commit" } else { "Commit" };
             if hint(
-                ui.add_enabled(ready, egui::Button::new("Commit")),
-                &format!("Commit {staged_files} (Ctrl+Enter)"),
+                ui.add_enabled(ready, egui::Button::new(label)),
+                &format!("{verb} {what} (Ctrl+Enter)"),
             )
             .clicked()
             {
                 commit = Some(false);
             }
+            let label = if amend {
+                "Amend Commit and Push…"
+            } else {
+                "Commit and Push…"
+            };
             if hint(
-                ui.add_enabled(ready, egui::Button::new("Commit and Push")),
-                &format!("Commit {staged_files}, then push the branch"),
+                ui.add_enabled(ready, egui::Button::new(label)),
+                &format!("{verb} {what}, then review the push"),
             )
             .clicked()
             {
@@ -443,7 +714,7 @@ impl CommitPanel {
             }
             if let Some(push) = self.committing {
                 ui.spinner();
-                let doing = if push { "Committing and pushing…" } else { "Committing…" };
+                let doing = if push { "Committing, then push…" } else { "Committing…" };
                 ui.label(egui::RichText::new(doing).color(th.dim));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -455,18 +726,19 @@ impl CommitPanel {
                     ui.label(egui::RichText::new("Writing message…").color(th.dim));
                 } else {
                     let provider = crate::config::live(ui.ctx()).title_provider;
-                    let can = cwd.is_some() && staged > 0 && !writing;
+                    let can = cwd.is_some() && scope.files > 0 && !writing;
                     let r = ui
                         .add_enabled(can, egui::Button::new("AI message"))
                         .on_hover_text(format!(
-                            "Draft a message from the staged diff with {} (Settings: session-title provider). Replaces the text below.",
+                            "Draft a message from the diff of {what} with {} (Settings: session-title provider). Replaces the text below.",
                             ai_oneshot::program(provider)
                         ))
-                        .on_disabled_hover_text("Stage files first");
+                        .on_disabled_hover_text("Nothing to commit");
                     if r.clicked()
                         && let Some(cwd) = cwd
                     {
-                        self.start_draft(ui.ctx(), cwd.to_path_buf());
+                        let paths = scope.checked.then(|| scope.paths.clone());
+                        self.start_draft(ui.ctx(), cwd.to_path_buf(), paths);
                     }
                 }
             });
@@ -476,10 +748,7 @@ impl CommitPanel {
         // otherwise see the Enter first.
         if ui.memory(|m| m.has_focus(id))
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
-            && staged > 0
-            && !blank
-            && !writing
-            && self.ai.is_none()
+            && ready
         {
             commit = Some(false);
         }
@@ -492,9 +761,36 @@ impl CommitPanel {
                 .font(egui::TextStyle::Monospace)
                 .interactive(!writing),
         );
+        ui.horizontal(|ui| {
+            let r = ui
+                .add_enabled(
+                    !scope.unborn && !scope.merging && !writing,
+                    egui::Checkbox::new(&mut self.amend, "Amend"),
+                )
+                .on_hover_text("Rewrite the last commit instead of adding a new one")
+                .on_disabled_hover_text(if scope.merging {
+                    "Not while merging"
+                } else {
+                    "No commit to amend yet"
+                });
+            if r.changed()
+                && self.amend
+                && self.message.trim().is_empty()
+                && let Some(cwd) = cwd
+            {
+                let cwd = cwd.to_path_buf();
+                self.last = Some(Job::start(ui.ctx(), move |c| last_message(&cwd, c)));
+            }
+        });
         if let (Some(push), Some(cwd)) = (commit, cwd) {
-            let message = self.message.clone();
-            self.start(ui.ctx(), cwd, Write::Commit { message, push });
+            let write = Write::Commit {
+                message: self.message.clone(),
+                paths: scope.paths.clone(),
+                amend,
+                push,
+                merge: scope.merging,
+            };
+            self.start(ui.ctx(), cwd, write);
         }
         (ui.min_rect().height(), outcome)
     }
@@ -544,57 +840,170 @@ mod tests {
         repo
     }
 
+    fn commit(dir: &Path, message: &str, paths: &[&str], amend: bool) -> Report {
+        run(
+            dir,
+            &Write::Commit {
+                message: message.into(),
+                paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+                amend,
+                push: false,
+                merge: false,
+            },
+        )
+    }
+    fn strings(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| (*p).to_owned()).collect()
+    }
+
     #[test]
-    fn stage_unstage_and_commit_before_and_after_the_first_commit() {
+    fn commit_only_takes_the_given_paths_and_leaves_the_rest_of_the_index() {
         let repo = repo();
         let dir = repo.path();
         // Pathspec magic characters are literal file names.
-        std::fs::write(dir.join("[a].txt"), "a\n").unwrap();
-        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
-        let staged = || git(dir, &["diff", "--cached", "--name-only"]);
-        ok(run(dir, &Write::Stage(vec!["[a].txt".into()])));
-        assert_eq!(staged(), "[a].txt");
-        // No HEAD yet: unstaging still works.
-        ok(run(dir, &Write::Unstage(vec!["[a].txt".into()])));
-        assert_eq!(staged(), "");
-        ok(run(dir, &Write::Stage(vec!["a.txt".into()])));
-        let message = "feat: first\n\nBody line.".to_owned();
-        let report = run(
+        for f in ["[a].txt", "a.txt", "b.txt"] {
+            std::fs::write(dir.join(f), "one\n").unwrap();
+        }
+        // Add to VCS before the first commit: tracked, nothing staged.
+        ok(run(
             dir,
-            &Write::Commit {
-                message,
-                push: false,
-            },
-        );
-        assert!(report.committed && !report.error);
+            &Write::Track(strings(&["[a].txt", "a.txt", "b.txt"])),
+        ));
+        assert_eq!(git(dir, &["ls-files"]), "[a].txt\na.txt\nb.txt");
+        let report = commit(dir, "feat: first\n\nBody line.", &["[a].txt"], false);
+        assert!(report.committed && !report.error, "{report:?}");
         assert!(report.text.starts_with("[main (root-commit)"), "{report:?}");
+        assert_eq!(git(dir, &["show", "--name-only", "--format="]), "[a].txt");
         assert_eq!(
             git(dir, &["log", "-1", "--format=%B"]),
             "feat: first\n\nBody line."
         );
-        // Born HEAD: unstage restores the committed version.
-        std::fs::write(dir.join("a.txt"), "b\n").unwrap();
-        ok(run(dir, &Write::Stage(vec!["a.txt".into()])));
-        ok(run(dir, &Write::Unstage(vec!["a.txt".into()])));
-        assert_eq!(staged(), "");
-        // Nothing staged: the failure carries Git's own words.
+        // An agent staged b.txt; committing a.txt leaves b.txt staged as it was.
+        git(dir, &["add", "b.txt"]);
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        ok(commit(dir, "feat: a", &["a.txt"], false));
+        assert_eq!(git(dir, &["show", "--name-only", "--format="]), "a.txt");
+        assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "b.txt");
+        // The working copy is what's committed, staged or not.
+        assert_eq!(git(dir, &["show", "HEAD:a.txt"]), "two");
+        // Amend with no paths rewrites the message only.
+        ok(commit(dir, "feat: a, amended", &[], true));
+        assert_eq!(git(dir, &["log", "-1", "--format=%s"]), "feat: a, amended");
+        assert_eq!(git(dir, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "b.txt");
+        // Nothing to commit: the failure carries Git's own words.
+        let report = commit(dir, "x", &["a.txt"], false);
+        assert!(report.error && !report.committed);
+        assert!(report.text.starts_with("Commit failed:"), "{report:?}");
+    }
+
+    #[test]
+    fn rollback_restores_versioned_files_and_untracks_new_ones() {
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("old.txt"), "old\n").unwrap();
+        std::fs::write(dir.join("gone.txt"), "gone\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "base"]);
+        std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
+        git(dir, &["add", "a.txt"]);
+        std::fs::write(dir.join("a.txt"), "edited again\n").unwrap();
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        git(dir, &["mv", "old.txt", "new.txt"]);
+        std::fs::write(dir.join("n.txt"), "new\n").unwrap();
+        ok(run(dir, &Write::Track(strings(&["n.txt"]))));
+        ok(run(
+            dir,
+            &Write::Rollback {
+                untrack: strings(&["n.txt", "new.txt"]),
+                restore: strings(&["a.txt", "gone.txt", "old.txt"]),
+            },
+        ));
+        // Back to HEAD; new files kept on disk, unversioned.
+        assert_eq!(
+            git(dir, &["status", "--porcelain", "--untracked-files=all"]),
+            "?? n.txt\n?? new.txt"
+        );
+        // Trimmed: core.autocrlf may check it out with CRLF.
+        let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        assert_eq!(a.trim_end(), "a");
+        assert!(dir.join("gone.txt").exists());
+    }
+
+    #[test]
+    fn a_merge_commits_the_resolved_index_not_a_partial_commit() {
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("f.txt"), "base\n").unwrap();
+        git(dir, &["add", "f.txt"]);
+        git(dir, &["commit", "-m", "base"]);
+        git(dir, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(dir.join("f.txt"), "other\n").unwrap();
+        git(dir, &["commit", "-qam", "other"]);
+        git(dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "main\n").unwrap();
+        git(dir, &["commit", "-qam", "main"]);
+        let merge = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["merge", "other"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge must conflict");
+        std::fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+        ok(run(dir, &Write::Resolve(strings(&["f.txt"]))));
+        // Git refuses `commit --only <paths>` mid-merge.
+        let partial = commit(dir, "merge", &["f.txt"], false);
+        assert!(
+            partial.error && partial.text.contains("partial commit"),
+            "{partial:?}"
+        );
         let report = run(
             dir,
             &Write::Commit {
-                message: "x".into(),
+                message: "Merge other".into(),
+                paths: strings(&["f.txt"]),
+                amend: false,
                 push: false,
+                merge: true,
             },
         );
-        assert!(report.error && !report.committed);
-        assert!(report.text.starts_with("Commit failed:"), "{report:?}");
+        assert!(report.committed && !report.error, "{report:?}");
+        let parents = git(dir, &["rev-list", "--parents", "-1", "HEAD"]);
+        assert_eq!(parents.split(' ').count(), 3, "a merge commit");
+        assert_eq!(git(dir, &["show", "HEAD:f.txt"]), "resolved");
+    }
+
+    #[test]
+    fn ignore_appends_escaped_anchored_patterns() {
+        assert_eq!(ignore_pattern("a/b.txt"), "/a/b.txt");
+        assert_eq!(ignore_pattern("x[1]*?.log"), "/x\\[1]\\*\\?.log");
+        assert_eq!(ignore_pattern("nested/"), "/nested/");
+        assert_eq!(ignore_pattern("trail "), "/trail\\ ");
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join(".gitignore"), "target").unwrap();
+        for f in ["x[1].log", "keep.txt"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        ok(run(dir, &Write::Ignore(strings(&["x[1].log"]))));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".gitignore")).unwrap(),
+            "target\n/x\\[1].log\n"
+        );
+        assert_eq!(
+            git(dir, &["status", "--porcelain", "--untracked-files=all"]),
+            "?? .gitignore\n?? keep.txt"
+        );
+        assert!(run(dir, &Write::Ignore(strings(&["../out"]))).error);
+        assert!(run(dir, &Write::Delete(strings(&["../out"]))).error);
     }
 
     #[test]
     fn a_failing_hook_reports_its_output_and_keeps_the_index() {
         let repo = repo();
         let dir = repo.path();
-        let hooks = dir.join(".git/hooks");
-        let hook = hooks.join("pre-commit");
+        let hook = dir.join(".git/hooks/pre-commit");
         std::fs::write(&hook, "#!/bin/sh\necho 'lint says no' >&2\nexit 1\n").unwrap();
         #[cfg(unix)]
         {
@@ -602,14 +1011,8 @@ mod tests {
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
-        ok(run(dir, &Write::Stage(vec!["a.txt".into()])));
-        let report = run(
-            dir,
-            &Write::Commit {
-                message: "x".into(),
-                push: false,
-            },
-        );
+        git(dir, &["add", "a.txt"]);
+        let report = commit(dir, "x", &["a.txt"], false);
         assert!(report.error && !report.committed);
         assert!(report.text.contains("lint says no"), "{report:?}");
         assert_eq!(git(dir, &["diff", "--cached", "--name-only"]), "a.txt");
@@ -621,39 +1024,35 @@ mod tests {
         let remote = tempfile::tempdir().unwrap();
         git(remote.path(), &["init", "--bare", "-b", "main"]);
         let url = remote.path().to_string_lossy().into_owned();
-        let push_commit = |dir: &Path, file: &str| {
+        let commit_and_push = |dir: &Path, file: &str| {
             std::fs::write(dir.join(file), file).unwrap();
-            ok(run(dir, &Write::Stage(vec![file.into()])));
-            run(
+            ok(run(dir, &Write::Track(vec![file.into()])));
+            let report = run(
                 dir,
                 &Write::Commit {
                     message: format!("add {file}"),
+                    paths: vec![file.into()],
+                    amend: false,
                     push: true,
+                    merge: false,
                 },
-            )
+            );
+            assert!(report.committed && report.push, "{report:?}");
+            run(dir, &Write::Push)
         };
         let one = repo();
         git(one.path(), &["remote", "add", "origin", &url]);
         // No upstream: push -u origin HEAD publishes and tracks.
-        let pushed = push_commit(one.path(), "one.txt");
-        assert!(
-            !pushed.error && pushed.text.ends_with("— pushed"),
-            "{pushed:?}"
-        );
+        ok(commit_and_push(one.path(), "one.txt"));
         assert_eq!(
             git(one.path(), &["rev-parse", "--abbrev-ref", "@{u}"]),
             "origin/main"
         );
         let two = repo();
         git(two.path(), &["remote", "add", "origin", &url]);
-        let rejected = push_commit(two.path(), "two.txt");
-        assert!(rejected.error && rejected.committed);
-        assert!(
-            rejected
-                .text
-                .contains("committed, but the push was REJECTED"),
-            "{rejected:?}"
-        );
+        let rejected = commit_and_push(two.path(), "two.txt");
+        assert!(rejected.error);
+        assert!(rejected.text.starts_with("Push REJECTED"), "{rejected:?}");
         // The local commit still landed.
         assert_eq!(
             git(two.path(), &["log", "-1", "--format=%s"]),
@@ -662,19 +1061,33 @@ mod tests {
     }
 
     #[test]
-    fn draft_prompt_carries_the_staged_diff_or_its_stat() {
+    fn draft_prompt_carries_the_diff_against_head_or_its_stat() {
         let repo = repo();
         let dir = repo.path();
         let never = Arc::new(AtomicBool::new(false));
-        assert_eq!(draft_prompt(dir, &never), Err("Nothing is staged".into()));
+        assert_eq!(
+            draft_prompt(dir, None, &never),
+            Err("Nothing to commit".into())
+        );
+        // No HEAD yet: an Add to VCS file (intent-to-add) is in the draft.
         std::fs::write(dir.join("small.txt"), "hello\n").unwrap();
-        git(dir, &["add", "small.txt"]);
-        let prompt = draft_prompt(dir, &never).unwrap();
+        git(dir, &["add", "-N", "small.txt"]);
+        let prompt = draft_prompt(dir, None, &never).unwrap();
         assert!(prompt.contains("+hello"), "{prompt}");
+        git(dir, &["add", "small.txt"]);
         git(dir, &["commit", "-m", "style: sample subject"]);
+        // Unstaged edits count; the checked paths narrow it.
+        std::fs::write(dir.join("small.txt"), "changed\n").unwrap();
+        std::fs::write(dir.join("other.txt"), "x\n").unwrap();
+        git(dir, &["add", "-N", "other.txt"]);
+        let prompt = draft_prompt(dir, Some(&["small.txt".into()]), &never).unwrap();
+        assert!(
+            prompt.contains("+changed") && !prompt.contains("other.txt"),
+            "{prompt}"
+        );
         std::fs::write(dir.join("big.txt"), "line\n".repeat(20_000)).unwrap();
         git(dir, &["add", "big.txt"]);
-        let prompt = draft_prompt(dir, &never).unwrap();
+        let prompt = draft_prompt(dir, None, &never).unwrap();
         assert!(prompt.contains("style: sample subject"));
         assert!(prompt.contains("too large"));
         assert!(prompt.contains("big.txt"));

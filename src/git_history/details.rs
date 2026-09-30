@@ -153,12 +153,10 @@ fn menu(files: &[usize]) -> Vec<MenuItem> {
         MenuItem {
             label: "Open Diff",
             enabled: files.len() == 1,
-            quick: false,
         },
         MenuItem {
             label: "Copy Path",
             enabled: !files.is_empty(),
-            quick: false,
         },
     ]
 }
@@ -340,7 +338,8 @@ impl DetailsView {
 ",
                     ));
                 }
-                None => {}
+                // A commit's files have no checkboxes.
+                Some(TreeEvent::Check { .. }) | None => {}
             }
         }
         let mut metadata_ui = ui.new_child(

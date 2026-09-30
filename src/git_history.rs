@@ -7,6 +7,7 @@ mod diff;
 mod diff_view;
 mod file_tree;
 mod git;
+mod push;
 mod scope;
 pub(crate) mod watch;
 pub use changes::ChangesView;

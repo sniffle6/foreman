@@ -179,10 +179,18 @@ Both file trees (commit details, Git Changes) share one selection model in
 `menu(files) -> Vec<MenuItem>`; the tree calls it with the selection when the
 menu opens and draws the items, and reports the choice back as
 `TreeEvent::Act { item, files }`. Each item is always listed and enabled only
-when it applies to something selected, so the menu doesn't shuffle. An item
-marked `quick` is also the hover button on a single row (the first enabled
-one wins); that button acts on that row's file only, even inside a group.
-New actions go in the owner's `menu`, not in `file_tree.rs`.
+when it applies to something selected, so the menu doesn't shuffle. There
+are no hover buttons on rows; every action is in the menu. New actions go in
+the owner's `menu`, not in `file_tree.rs`.
+
+**Checkboxes** (Git Changes only: `FileTree::grouped` with a section's
+check flag). A box sits between the disclosure arrow and the icon. Clicking
+it ticks or unticks that row's files (a folder or section: all of them) and
+never touches the selection. A folder's box is ticked, empty, or a dash
+when only some of its files are. Space ticks the selected files, or unticks
+them if all are already ticked. The tree keeps its own checks for painting
+and reports each change as `TreeEvent::Check { files, on }`; the owner holds
+the real set.
 
 Gotchas:
 - **The Menu key doesn't work, only Shift+F10.** egui-winit 0.34 has no
@@ -192,8 +200,10 @@ Gotchas:
   tree deliberately never takes focus. It yields to any focused widget (the
   commit message box), and consumes its keys so nothing behind sees them.
 - **Selection survives a re-read by row key** (section + path), so a file
-  that moved from Changes to Staged is not selected any more: it's a
-  different row. Cursor and anchor carry the same way (`keep_selection`).
+  that moved from Unversioned Files to Changes is not selected any more: it's
+  a different row. Cursor and anchor carry the same way (`keep_selection`).
+  Grouping by directory vs flat doesn't change file keys, so the selection
+  and checks survive that switch too (`set_flat`).
 - egui reports a quick third click as another double-click, whatever row it
   lands on. Tests that double-click twice need a fresh `Context` between.
 
@@ -291,27 +301,50 @@ Gotchas:
 
 Each Project can open a Git Changes window: Leader then U, or
 **Open project Git changes** in the bindings help. It's the JetBrains Commit
-tool window, minus per-file checkboxes and rollback: you stage and unstage
-files, write a message, and commit (and push). Opening again surfaces the
-existing window. It is the only Git window that writes; History and Diff
-stay read-only.
+tool window, non-modal, with the staging area turned off (JetBrains'
+changelists mode). JetBrains is the spec: where this doc is silent, do what
+JetBrains does. Opening again surfaces the existing window. It is the only
+Git window that writes; History and Diff stay read-only.
 
-The header shows the branch ("On main", or "Detached HEAD") and the change
-count. Files sit under collapsible sections, each a directory tree in the same
-status colors as the commit details:
+The header shows the branch ("On main", or "Detached HEAD"), the change
+count, and **Merging** while a merge is in progress. On its right: **Add to
+VCS (N)** (only when unversioned files are checked), **Push…**,
+**Directories** (group by directory, or a flat list sorted by file name with
+the folder dimmed after it), **Expand All**, **Collapse All**.
 
-- **Conflicts**: unmerged files (`U`). Their diff is working copy vs HEAD,
-  because a conflicted index has no single version to compare against.
-- **Staged**: what the next commit would contain (HEAD vs index), including
-  staged renames.
-- **Changes**: edits not yet staged (index vs working copy).
+Files sit under collapsible sections, in the same status colors as the
+commit details:
+
+- **Conflicts**: unmerged files (`U`), only while a merge has them. Their
+  diff is working copy vs HEAD, because a conflicted index has no single
+  version to compare against. No checkboxes.
+- **Changes**: every versioned file that differs from HEAD, once, whether
+  its change is staged, unstaged, or both. The letter is the whole change
+  since HEAD (`combined`): a file added and then edited is `A`, a staged
+  rename is `R`, anything gone from disk is `D`. Its diff is HEAD vs the
+  working copy (`Stage::Local`); a new file is read from disk.
 - **Unversioned Files**: untracked files (`?`). Every file inside a new
   directory is listed, not just the directory. Ignored files are not shown.
 
-A file that is staged and then edited again shows up twice, once in Staged and
-once in Changes, and each opens its own diff. That split is the reason for the
-Staged section: JetBrains merges them, which hides what a commit would contain.
-Empty sections are hidden. A clean tree says so.
+There is no Staged section. What an agent staged is still in the index;
+this window just doesn't show the split, the same as JetBrains. Empty
+sections are hidden. A clean tree says so.
+
+### Checkboxes
+
+The checkboxes are this window's own selection, **not Git's index**, as in
+JetBrains: ticking a box never runs Git. They are kept in memory by path,
+so they survive every live re-read; a path that leaves the list (committed,
+rolled back, deleted) drops out.
+
+- **Changes**: the boxes pick what Commit takes. **Nothing ticked means
+  everything** in Changes.
+- **Unversioned Files**: the boxes pick what **Add to VCS (N)** in the
+  header puts under version control. A ticked unversioned file is never
+  committed.
+
+Files that change section because of a write (Add to VCS, rolling back a new
+file) come back unticked.
 
 Double-click a file (or Enter) to open it in the Diff window; selecting and
 the menu work as in "Selecting files and the context menu" above. Opening the
@@ -332,44 +365,99 @@ the selection carry over.
 
 Without a watch (a network share, or the watched root was deleted) it falls
 back to the old rule: re-read when the window becomes active, at most once
-per second. A finished write (stage, commit) also re-reads then; with a live
-watch the index change does it.
+per second. A finished write also re-reads then; with a live watch the
+index change does it. The status read also stats `MERGE_HEAD` in the git
+dir (found once per window with `rev-parse --absolute-git-dir`), which is
+how the window knows a merge is in progress.
 
-### Staging and committing
+### The context menu
 
-**What gets committed is exactly the Staged section.** No per-file checkboxes:
-the index already is that list, and a second selection on top of it would be
-two sources of truth.
+Right-click the selection (see "Selecting files and the context menu").
+JetBrains' names; each write takes only the selected files it applies to:
 
-- **Stage / Unstage**: hover a file row for its button at the right edge, or
-  right-click the selection. The menu is Open Diff, Stage, Mark Resolved,
-  Unstage, Copy Path; each write takes only the selected files it applies
-  to, so a mixed selection can be staged and unstaged in two clicks.
-  Changes and Unversioned files get **Stage** (`git add`),
-  conflicts get **Mark Resolved** (also `git add`), Staged files get
-  **Unstage** (`git reset -q -- <path>`, plus the old path for a staged
-  rename). `reset` instead of `restore --staged` because it also works
-  before the first commit, when there is no HEAD. Paths go through
-  `--literal-pathspecs`, so a file named `[a].txt` is only that file.
-- **Message box** pinned at the bottom. **Commit** and **Commit and Push**
-  are disabled until something is staged and the message isn't blank.
-  Ctrl+Enter in the box commits. The commit is `git commit -F -` with the
-  message on stdin. Success clears the box and shows Git's
+- **Show Diff**: one file. Same as double-click.
+- **Add to VCS**: unversioned files. `git add --intent-to-add`: the file is
+  versioned and shows in Changes as new (`A`), unticked, with nothing staged.
+- **Mark Resolved**: conflicts. `git add`.
+- **Rollback…**: Changes files, after a dialog listing them. A modified or
+  deleted file goes back to HEAD, index and working copy (`git restore
+  --source=HEAD --staged --worktree`). A new file (`A`, including Add to
+  VCS ones) leaves the index and becomes unversioned again, **kept on disk**
+  (`git reset`, which also works before the first commit). A rename does
+  both: the old path comes back, the new file stays as unversioned.
+  JetBrains deletes the new-name file; we keep it, since nothing else here
+  can bring it back.
+- **Delete…**: unversioned files and Changes files still on disk, after a
+  dialog listing them. To the Recycle Bin (`SHFileOperationW` with
+  `FOF_ALLOWUNDO`). A versioned file then shows as deleted (`D`). On a drive
+  with no Recycle Bin (a network share) Windows deletes outright.
+- **Add to .gitignore**: unversioned files. Appends one pattern per file to
+  the `.gitignore` in the project folder, anchored and escaped so it matches
+  only that file (`[a].txt` → `/\[a].txt`). JetBrains asks which ignore file;
+  this always uses that one.
+- **Copy Path**: newline-separated.
+- **Show in Explorer**: one file, selected in its folder (a deleted file
+  opens the folder).
+
+Mark Resolved stays in the menu; the old hover Stage / Unstage / Mark
+Resolved row buttons are gone. Paths go through `--literal-pathspecs` and
+are fed on stdin (`--pathspec-from-file=- --pathspec-file-nul`), so a
+file named `[a].txt` is only that file and a thousand-file commit never hits
+Windows' command-line limit.
+
+### Committing
+
+- **Message box** pinned at the bottom, with **Amend** under it. Ctrl+Enter
+  in the box commits.
+- **Commit** takes the ticked Changes files, or all of Changes when none is
+  ticked: `git commit --only -m <message> -- <paths>` (a rename brings both
+  of its paths). `--only` commits those paths' **working-copy** content,
+  staged or not, and leaves everything else in the index where it was:
+  anything an agent staged for other files stays staged and uncommitted.
+  Paths are always the ones the window shows, never `git add -A`.
+  Unversioned files are never committed.
+- **Disabled** while there are conflicts, with nothing to commit, or with a
+  blank message; the hover says which.
+- **During a merge** Git refuses a partial commit ("cannot do a partial
+  commit during a merge"), so Commit adds every Changes path and commits the
+  whole index, ticks or not (JetBrains does the same). The header says
+  Merging.
+- **Amend**: `--amend`. Ticking it over a blank message fills in the last
+  commit's message (read on a worker; never over text typed meanwhile). With
+  nothing to commit, Amend rewrites just the message. Off before the first
+  commit and during a merge.
+- Success clears the box, unticks Amend, and shows Git's
   `[main 1a2b3c4] subject` line; failure keeps the box and shows everything
   Git and the hooks printed (a failing `pre-commit` shows its output).
-- **Commit and Push**: commit, then `git push`, or `git push -u origin HEAD`
-  when the branch has no upstream. A rejected push (the remote moved) says
-  REJECTED with Git's output, and says the commit itself landed, so nobody
-  commits twice. The message box is cleared either way once the commit lands.
-- **AI message**: one click, no chat. It reads the staged diff (`git diff
-  --cached`, capped at 32 KB; over that it sends `--stat` instead) and
-  `git log --oneline -10` for style, and sends them to the session-title
-  provider and model from Settings through the shared one-shot launcher
-  (`docs/ai-oneshot.md`). The reply replaces the message box. It must be
-  non-empty plain text: a code fence or control characters are rejected
-  with an error instead. Spinner and Cancel while it runs; Cancel drops the
-  result, but the CLI process itself runs to its 90 s deadline in the
-  background (the launcher has no cancel).
+- **Commit and Push…**: commit, then the push dialog. Push is a separate
+  step, as in JetBrains.
+- **AI message**: one click, no chat. It reads the diff against HEAD of
+  what Commit would take (the ticked files, or everything; before the first
+  commit, the staged and intent-to-add files), capped at 32 KB; over that it
+  sends `--stat` instead, plus `git log --oneline -10` for style, to the
+  session-title provider and model from Settings through the shared one-shot
+  launcher (`docs/ai-oneshot.md`). The reply replaces the message box. It
+  must be non-empty plain text: a code fence or control characters are
+  rejected with an error instead. Spinner and Cancel while it runs; Cancel
+  drops the result, but the CLI process itself runs to its 90 s deadline in
+  the background (the launcher has no cancel).
+
+### The push dialog
+
+Opened by Commit and Push… once the commit lands, or by **Push…** in the
+header. It shows `branch → target` and the outgoing commits (hash and
+subject, newest first, 200 listed at most), then **Push** / **Cancel**
+(Enter / Esc). The target is the branch's upstream (`@{u}..HEAD`), or with
+no upstream `origin/<branch>`, marked **New** when that remote branch
+doesn't exist yet (commits not on any `origin` branch are listed). Push is
+disabled when nothing would leave. Detached HEAD and "no upstream and no
+`origin`" show as errors in the dialog.
+
+Push runs `git push`, or `git push -u origin HEAD` with no upstream. A
+rejected push (the remote moved) says REJECTED with Git's output; the commit
+already stands either way. Pushing reads the outgoing list in `push.rs` and
+pushes in `commit.rs` (`push`); both pick the target the same way, so keep
+them in step.
 
 Gotchas:
 - **Writes go through `git::write`, never `git::output`.** The read helper
@@ -380,8 +468,10 @@ Gotchas:
   it. So no timeout and no cancel; closing the window leaves the write
   running to completion. Only a push has a timeout (5 min), because killing
   a push leaves nothing locked locally.
-- **One write at a time.** While one runs, the row buttons disappear and the
-  commit buttons disable, so two writes never race for `index.lock`.
+- **One write at a time.** While one runs, the menu's writes and the commit
+  and push buttons disable, so two writes never race for `index.lock`.
+- **The dialogs own the keyboard.** While Rollback / Delete / Push is up,
+  the tree reads no keys, so Enter confirms instead of opening a diff.
 - `GIT_TERMINAL_PROMPT=0`: a push needing a password fails with Git's error
   instead of hanging on a terminal nobody can see. A GUI credential helper
   (Git Credential Manager) can still pop up its own window.
@@ -397,12 +487,19 @@ Gotchas:
   copies Git's (a NUL in the first 8000 bytes), and the size cap is 16 MiB. A
   nested repository (`dir/` in status) shows the submodule notice. Paths from a
   restored workspace are rejected if they're absolute or contain `..`.
-- Staged T/R/C diffs use the blob form (`HEAD:old` vs `:new`, resolved to ids),
-  for the same mode-split reason as commit diffs. An unstaged type change
-  (file ↔ symlink) still splits and shows the too-large notice.
+- Changes diffs (`Stage::Local`) are `git diff -M HEAD -- <new> <old>`, so a
+  rename pairs up by rename detection. If the working copy has drifted too far
+  for Git to still call it a rename, that is two file diffs and the window
+  shows a malformed-diff error. A type change (file ↔ symlink) splits the
+  same way and shows the too-large notice.
+- `Stage::Staged` and `Stage::Unstaged` (index splits) are no longer produced
+  by the Changes window except for conflicts, but still load for Diff
+  windows restored from an older workspace. Staged T/R/C diffs use the blob
+  form (`HEAD:old` vs `:new`, resolved to ids), for the same mode-split
+  reason as commit diffs.
 - Reads never write: the shared read helper sets `GIT_OPTIONAL_LOCKS=0`, so
   `git status` doesn't refresh the index as it normally would. Only the
-  explicit stage / commit / push actions above write.
+  explicit menu, commit and push actions above write.
 
 ## Diff window
 
@@ -414,7 +511,7 @@ changed middle of a modified line tinted stronger. A gutter band links each
 change across the panes; a strip on the right marks every change in the file
 and outlines the viewport (click it to jump). The header shows the path
 (`old → new` for renames), the commits compared (or, for a Git Changes file,
-"Staged vs HEAD", "Working copy vs index", and so on), and "N differences".
+"Working copy vs HEAD", "New file", and so on), and "N differences".
 
 Keys while the window is focused: F7 / Shift+F7 next/previous difference;
 Up/Down/PgUp/PgDn/Home/End scroll. Shift+wheel scrolls both sides
@@ -605,14 +702,21 @@ No native screenshot of the pill yet.
   changed-file parsing.
 - `src/git_history/file_tree.rs`: `FileTree`, the virtualized status-colored
   tree (with sections) shared by the details pane and Git Changes: the
-  multi-select model, keyboard, the `MenuItem` / `TreeEvent` menu seam, and
-  `status_color`.
+  multi-select model, checkboxes (`grouped`, `toggle_checks`), flat vs
+  directory grouping (`set_flat`), keyboard, the `MenuItem` / `TreeEvent`
+  menu seam, and `status_color`.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
-  parser, the tree's context menu (`menu`, and `write` for its items), and
-  the watch-driven refresh (refresh-on-activate as fallback).
-- `src/git_history/commit.rs`: `CommitPanel` (message box, Commit / Commit
-  and Push, AI message), the `Write` ops and their worker `run`, `push`
-  (upstream check, rejection text), and the AI prompt / `clean_message`.
+  parser (`combined` for the one-letter status), the path-keyed checks and
+  `scope` (what Commit takes), the tree's context menu (`menu`, and `write`
+  for its items), the Rollback / Delete `Confirm` dialog, the header
+  toolbar, and the watch-driven refresh (refresh-on-activate as fallback).
+- `src/git_history/commit.rs`: `CommitPanel` (message box, Amend, Commit /
+  Commit and Push…, AI message), the `Write` ops and their worker `run`
+  (`--only` commits, the merge case, Recycle Bin, `.gitignore` patterns),
+  `push` (upstream check, rejection text), and the AI prompt /
+  `clean_message`.
+- `src/git_history/push.rs`: `PushDialog` and `outgoing` (target and
+  outgoing commits).
 - `src/git_history/watch.rs`: `RepoWatch`, the registry and `open`, the
   pure `classify` / `Debounce` core, the `ReadDirectoryChangesW` thread, and
   `Follow` (a view's lazily opened handle on the watch).
