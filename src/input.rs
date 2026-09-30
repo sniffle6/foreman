@@ -775,6 +775,9 @@ pub(crate) fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Vec<u8> {
         Key::F12 => tilde(b"24"),
         Key::Enter => vec![b'\r'],
         Key::Tab => vec![b'\t'],
+        // Alt+Backspace → meta DEL (`ESC 0x7f`), which readline, zsh, and
+        // agent TUIs bind to backward-kill-word.
+        Key::Backspace if mods.alt && !ctrl => vec![0x1b, 0x7f],
         Key::Backspace => vec![0x7f],
         Key::Escape => vec![0x1b],
         _ => {
@@ -950,6 +953,28 @@ mod tests {
             encode_key(Key::B, mods(false, true, true), TermMode::empty()),
             vec![0x1b, b'B']
         );
+    }
+    #[test]
+    fn alt_backspace_is_meta_del() {
+        assert_eq!(
+            encode_key(Key::Backspace, mods(false, true, false), TermMode::empty()),
+            vec![0x1b, 0x7f]
+        );
+        // Through the full frame path, alongside any stray Text event.
+        let m = mods(false, true, false);
+        let out = process_input(
+            &[Event::Key {
+                key: Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: m,
+            }],
+            m,
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, vec![0x1b, 0x7f]);
     }
     #[test]
     fn plain_control_keys() {
