@@ -50,6 +50,50 @@ foreman send --keys "Escape F1" --keys "Enter"
 # equivalent to: Escape, F1, Enter
 ```
 
+## Ctrl+Delete live verification
+
+Verified on 2026-09-30 at revision `f949401`, using an isolated
+`cargo build --target-dir target/agent` debug instance. Its `APPDATA` pointed
+to a scratch directory, `FOREMAN_NO_LANDING=1`, and skill installation and
+update checking were disabled in scratch settings. All commands below targeted
+that instance's `FOREMAN_PIPE`, project `p2`; the running host was untouched.
+
+| Client | Input and cursor setup | Snapshot after `Ctrl+Delete` | Result |
+|---|---|---|---|
+| PowerShell 7.6.6 / PSReadLine 2.4.5 (`pwsh -NoLogo -NoProfile`) | `alpha beta gamma`, `Home Ctrl+Right` | `PS> alpha  gamma` | Deletes `beta`; the live binding reports `Ctrl+Delete KillWord`. |
+| Claude Code 2.1.286 (plan mode, no prompt submitted) | `alpha beta gamma`, `Home Ctrl+Right` | `❯ alpha beta gamma` becomes `❯ alphabeta gamma` | Deletes only the space. Ctrl+Right stops at the end of `alpha` in this client. |
+| Same Claude Code Session | Fresh input, `Home` followed by six `Right` keys (start of `beta`) | `❯ alpha eta gamma` | Deletes only `b`, not the next word. |
+
+Reproduction with the test instance's executable and pipe selected:
+
+```powershell
+& $exe send --project p2 --terminal t2 --text 'alpha beta gamma' --keys 'Home Ctrl+Right'
+& $exe snapshot --project p2 --terminal t2 --cursor
+& $exe send --project p2 --terminal t2 --keys 'Ctrl+Delete'
+& $exe snapshot --project p2 --terminal t2 --cursor
+```
+
+For the unwrapped PowerShell snapshot, the test Session used
+`function prompt { 'PS> ' }`. Before and after deletion its cursor was
+`row:20, col:10`, at the start of `beta`. Claude's cursor was `row:19, col:7`
+on the space after `alpha`, or `col:8` at the start of `beta`; deletion kept
+the cursor in place. Repeating the Claude test with literal bytes
+`--text ([string][char]27 + '[3;5~')` also produced `alpha eta gamma`.
+
+The existing `input::encode_key` mapping remains `ESC[3;5~`
+(hex `1b 5b 33 3b 35 7e`). It matches Windows Terminal's standard ANSI
+encoding: its `TerminalInput::_encodeRegular` assigns Delete code 3 and
+final `~`; Ctrl sets modifier bit 4, and `_formatEncodingHelper` adds 1
+to produce parameter 5. See the
+[Windows Terminal implementation](https://github.com/microsoft/terminal/blob/main/src/terminal/input/terminalInput.cpp)
+(checked on the verification date). This comparison is against upstream
+source, not a live Windows Terminal capture.
+
+Conclusion: next-word deletion already works in PSReadLine. This Claude Code
+version handles the same sequence as character deletion. Foreman needs no
+encoding change to match Windows Terminal; an alternative sequence would be
+a client-specific workaround. WSL/readline was not tested.
+
 ## `--tail N`
 
 Default snapshot is the **displayed viewport** — if the pane is 30 rows, you
