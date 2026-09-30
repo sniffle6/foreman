@@ -1,6 +1,6 @@
 ---
 name: foreman-dispatch
-description: Use when running inside foreman (the FOREMAN env var is 1) and you need to launch an agent or command in a new visible terminal — dispatch/spawn a worker, open a terminal with a prompt, run a task in its own pane.
+description: Use when running inside foreman (the FOREMAN env var is 1) and you need to launch an agent or command in a new visible terminal — dispatch/spawn a worker, open a terminal with a prompt, run a task in its own pane. NOT for kanban cards or plans — dispatching a card uses foreman-kanban (`kanban dispatch`), never this.
 ---
 
 # Dispatch a visible agent into foreman
@@ -10,6 +10,12 @@ dispatch mechanics — every fact you need (including quoting safety) is
 below.** Researching your task's subject matter is separate and fine.
 Precondition:
 `$env:FOREMAN` is `1`; if not, tell the user this needs to run inside foreman.
+
+**Is the work a kanban card, or part of a plan (cards tagged with a plan and
+wave)? Stop — use the foreman-kanban skill and `kanban dispatch <id> --agent
+…`.** `open` is a bare terminal: no card claim, no worktree, no `Card:`
+trailer, no integration queue, and the board never learns the worker exists.
+`kanban dispatch` is exactly what the board's "Start with" button does.
 
 ## The two commands (PowerShell)
 

@@ -50,7 +50,14 @@ Targeting rules:
 Interactive workers can receive chat. `codex exec` workers cannot, because they
 are non-interactive and exit on completion.
 
-Provider mix rule: when dispatching agents into a Foreman chat room, use BOTH
+**Workers for kanban cards or a plan are not dispatched this way.** Use
+`kanban dispatch` (foreman-kanban skill) — `open` below skips the card claim,
+worktree, and integration queue. Card workers still auto-join the room, but
+their card prompt says nothing about chat, so none of the etiquette below
+reaches them: expect no replies from them, and post to one only with a
+targeted `--to tN` when you must steer it.
+
+Provider mix rule (for chat teams of free-form `open` workers, not cards): when dispatching agents into a Foreman chat room, use BOTH
 providers by default no matter whether the orchestrator is Codex or Claude.
 Codex workers own research and review. Claude workers own implementation and
 verification. Depart from this only if the user explicitly requests one provider

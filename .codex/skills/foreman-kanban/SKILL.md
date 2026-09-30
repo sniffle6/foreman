@@ -1,6 +1,6 @@
 ---
 name: foreman-kanban
-description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, dispatching a worker onto a card, creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
+description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, dispatching a worker onto a card, orchestrating or running a plan (dispatching its cards wave by wave), creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
 ---
 
 # The Foreman Project Kanban Board
@@ -134,6 +134,56 @@ the detail itself.
 
 Body convention: a few lines of task statement plus the paths or issue
 numbers a worker needs to start — not a full brief crammed into the card.
+But a dispatched worker's prompt is ONLY the card's title, body, and the
+close-out lines — it sees nothing you know. So a card you will dispatch needs a
+body that starts a cold worker: what to do, the doc/issue/file pointers,
+the acceptance criteria, and the gate commands. The detail still lives in the
+doc; the body is what makes the pointer findable.
+
+## Orchestrating a plan
+
+"Run / orchestrate the plan" means every worker is a card started with
+`kanban dispatch`. Never `open`, never `git worktree add` by hand — those skip
+the card claim, the `Card:` trailer, the integration queue, and the board.
+
+1. **Find the plan.** `list --json`: a card's plan is `planned.name` and
+   `planned.wave` (absent = unplanned). Copy the name from a card.
+2. **Current wave** = the lowest `planned.wave` among the plan's cards that
+   are not `done`. Cards in a wave are a set: any order, may run together.
+   Dispatch only that wave's `backlog` cards; never start a later wave early.
+3. **Dispatch one at a time**, keeping each reply's `terminal`:
+
+   ```powershell
+   & $env:FOREMAN_EXE kanban dispatch <id> --agent claude
+   ```
+
+   `--agent` is required and cards have no agent field: follow the user's
+   instruction, else `claude` (workers implement; the chat skill's
+   Codex-research/Claude-implement split is for chat rooms, not cards).
+4. **Wait**: `kanban wait --any --timeout 600`, then `list --json` — `--any`
+   does not say which card moved. The wave is finished when every card in it
+   is `done`; then start the next wave. Do not run `integrate` or `done` for a
+   worker — its prompt already does.
+5. **Stop and tell the human** when a wave card is `blocked` (read
+   `blocked_reason`) or `orphaned` (its terminal died). `dispatch` only starts
+   backlog cards and restart is a board action — do not route around it with
+   `open`.
+
+Dispatch errors:
+
+- `foreman did not respond` or a bring-up error: worktree bring-up must finish
+  inside Foreman's 5 s reply window. A slow one spawns nothing and keeps the
+  tree; a reply lost after a spawn is undone and the card returns to Backlog.
+  Check `list`, then retry the same dispatch once.
+- `held by live Session`, `integration is …`, not Backlog, cmd-shim: a real
+  refusal. Report it. Do not retry blindly and do not fall back to `open`.
+
+Expect: workers are interactive agents, and one stuck on a permission prompt
+looks exactly like a working one — `wait` only times out (exit 2). On a
+timeout, read the pane:
+`& $env:FOREMAN_EXE snapshot --terminal tN --tail 30`. Each worktree card
+cold-builds its own `target/` (minutes) and lands through one integration
+queue a card at a time, so a wave fans out and lands slowly.
 
 ## Worktrees: where a dispatched card runs
 
