@@ -778,6 +778,10 @@ pub(crate) fn encode_key(key: Key, mods: Modifiers, mode: TermMode) -> Vec<u8> {
         // Alt+Backspace → meta DEL (`ESC 0x7f`), which readline, zsh, and
         // agent TUIs bind to backward-kill-word.
         Key::Backspace if mods.alt && !ctrl => vec![0x1b, 0x7f],
+        // Ctrl+Backspace → ^H (0x08), matching Windows Terminal; PSReadLine
+        // and many readline/agent configs bind it to backward-kill-word.
+        // Ctrl+Alt stays plain DEL: AltGr arrives as Ctrl+Alt on Windows.
+        Key::Backspace if ctrl && !mods.alt => vec![0x08],
         Key::Backspace => vec![0x7f],
         Key::Escape => vec![0x1b],
         _ => {
@@ -975,6 +979,32 @@ mod tests {
             false,
         );
         assert_eq!(out.pty_bytes, vec![0x1b, 0x7f]);
+    }
+    #[test]
+    fn ctrl_backspace_is_ctrl_h() {
+        assert_eq!(
+            encode_key(Key::Backspace, mods(true, false, false), TermMode::empty()),
+            vec![0x08]
+        );
+        // Ctrl+Alt (AltGr on Windows) stays plain DEL.
+        assert_eq!(
+            encode_key(Key::Backspace, mods(true, true, false), TermMode::empty()),
+            vec![0x7f]
+        );
+        let m = mods(true, false, false);
+        let out = process_input(
+            &[Event::Key {
+                key: Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: m,
+            }],
+            m,
+            TermMode::empty(),
+            false,
+        );
+        assert_eq!(out.pty_bytes, vec![0x08]);
     }
     #[test]
     fn plain_control_keys() {
