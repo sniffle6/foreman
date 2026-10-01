@@ -179,7 +179,13 @@ sibling — read those for *why*, this doc for *how*.
 board — one per project; reopening surfaces the existing one. Quick-add at the
 top of Backlog creates title-only cards. Click a column header to collapse it
 into a rail with its name and count; click the rail to expand it. Expanded
-columns share the remaining width. Collapse and scroll positions belong to
+columns share the remaining width. Below the minimum lane width multiplied
+by the column count (`src/board.rs`, `stacked_columns`), the board stacks
+full-width columns in one vertically scrollable list. The breakpoint follows
+view zoom. Collapsed columns become single-line headers in this layout;
+card actions and the detail page use the same controls in either orientation.
+Wide-layout column scroll positions survive switching orientation.
+Collapse and scroll positions belong to
 the open board view and are not persisted across app restarts.
 
 Cards have a stable action footer: Start or Restart opens the agent picker;

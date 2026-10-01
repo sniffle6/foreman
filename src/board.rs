@@ -21,6 +21,8 @@ const CARD_GAP: f32 = 6.0;
 const HEADER_H: f32 = 30.0;
 const QUICK_ADD_H: f32 = 24.0;
 const PAD: f32 = 6.0;
+/// Four readable 200px lanes fit at 800 logical px, before view zoom.
+const COLUMN_MIN_W: f32 = 200.0;
 const BTN_W: f32 = 46.0;
 const BTN_H: f32 = 22.0;
 const BTN_GAP: f32 = 4.0;
@@ -143,6 +145,10 @@ fn column_widths(width: f32, collapsed: [bool; 4]) -> [f32; 4] {
         (width - rail * count as f32) / (4 - count) as f32
     };
     collapsed.map(|c| if c { rail } else { expanded })
+}
+
+fn stacked_columns(width: f32, scale: f32) -> bool {
+    width < COLUMN_MIN_W * COLUMNS.len() as f32 * scale
 }
 
 fn detail_text(ui: &mut egui::Ui, text: &str) {
@@ -289,6 +295,8 @@ pub struct BoardView {
     /// the clamp to the column.
     #[cfg(test)]
     pub(crate) uncut_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    column_rects: [egui::Rect; 4],
     /// Test probe: the text last painted on a collapsed Done rail.
     #[cfg(test)]
     pub(crate) rail_text: Option<String>,
@@ -347,6 +355,8 @@ impl BoardView {
             dropdown_btn: None,
             #[cfg(test)]
             uncut_rect: None,
+            #[cfg(test)]
+            column_rects: [egui::Rect::NOTHING; 4],
             #[cfg(test)]
             rail_text: None,
             #[cfg(test)]
@@ -539,32 +549,118 @@ impl BoardView {
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let over = resp.hovered() || resp.contains_pointer();
 
-        for (i, &state) in COLUMNS.iter().enumerate() {
-            let col_rect = egui::Rect::from_min_size(
-                egui::pos2(left, rect.min.y),
-                egui::vec2(widths[i], rect.height()),
+        if stacked_columns(rect.width(), self.scale) {
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(base.with("stacked-columns"))
+                    .max_rect(rect),
             );
-            left += widths[i];
-            if i > 0 {
-                p.line_segment(
-                    [col_rect.min, egui::pos2(col_rect.min.x, col_rect.max.y)],
-                    egui::Stroke::new(1.0, border_col),
+            child.set_clip_rect(rect.intersect(ui.clip_rect()));
+            egui::ScrollArea::vertical()
+                .id_salt(base.with("stacked-scroll"))
+                .auto_shrink([false, false])
+                .show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, &state) in COLUMNS.iter().enumerate() {
+                        let count = cards
+                            .iter()
+                            .filter(|c| {
+                                c.state == state
+                                    && (state != crate::kanban::CardState::Done
+                                        || match &self.version {
+                                            None => c.shipped.is_none(),
+                                            Some(v) => c.shipped.as_ref().is_some_and(|s| {
+                                                crate::kanban::same_name(&s.name, v)
+                                            }),
+                                        })
+                            })
+                            .count();
+                        let extra = match state {
+                            crate::kanban::CardState::Backlog => QUICK_ADD_H,
+                            crate::kanban::CardState::Done => {
+                                (if self.cut_field.is_some() {
+                                    QUICK_ADD_H
+                                } else {
+                                    0.0
+                                }) + (if self.version.is_some() {
+                                    QUICK_ADD_H
+                                } else {
+                                    0.0
+                                }) + self.release.as_ref().map_or(0.0, |r| {
+                                    HEADER_H + (r.steps.len() as f32 + 12.0) * 18.0
+                                })
+                            }
+                            _ => 0.0,
+                        };
+                        let height = if self.collapsed[i] {
+                            HEADER_H
+                        } else {
+                            HEADER_H + extra + count.max(1) as f32 * (CARD_H + CARD_GAP)
+                        } * self.scale;
+                        let (lane, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter_at(lane);
+                        // `put` in a column updates its Ui's cursor. Keep it
+                        // out of the stack's allocator or the next lane starts
+                        // at the quick-add row and overlaps the previous card.
+                        let mut lane_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(base.with((i, "stacked-lane")))
+                                .max_rect(lane),
+                        );
+                        lane_ui.set_clip_rect(lane.intersect(ui.clip_rect()));
+                        self.show_column(
+                            &mut lane_ui,
+                            &painter,
+                            lane,
+                            i,
+                            state,
+                            &cards,
+                            &orphans,
+                            pointer,
+                            over,
+                            base,
+                            &th,
+                            &mut picker_click_consumed,
+                            true,
+                        );
+                        painter.line_segment(
+                            [lane.left_bottom(), lane.right_bottom()],
+                            egui::Stroke::new(1.0, border_col),
+                        );
+                    }
+                });
+        } else {
+            for (i, &state) in COLUMNS.iter().enumerate() {
+                let col_rect = egui::Rect::from_min_size(
+                    egui::pos2(left, rect.min.y),
+                    egui::vec2(widths[i], rect.height()),
+                );
+                left += widths[i];
+                if i > 0 {
+                    p.line_segment(
+                        [col_rect.min, egui::pos2(col_rect.min.x, col_rect.max.y)],
+                        egui::Stroke::new(1.0, border_col),
+                    );
+                }
+                self.show_column(
+                    ui,
+                    &p,
+                    col_rect,
+                    i,
+                    state,
+                    &cards,
+                    &orphans,
+                    pointer,
+                    over,
+                    base,
+                    &th,
+                    &mut picker_click_consumed,
+                    false,
                 );
             }
-            self.show_column(
-                ui,
-                &p,
-                col_rect,
-                i,
-                state,
-                &cards,
-                &orphans,
-                pointer,
-                over,
-                base,
-                &th,
-                &mut picker_click_consumed,
-            );
         }
 
         // Picker dismiss: any click this frame that wasn't one of the
@@ -714,7 +810,12 @@ impl BoardView {
         base: egui::Id,
         th: &crate::theme::Theme,
         picker_click_consumed: &mut bool,
+        stacked: bool,
     ) {
+        #[cfg(test)]
+        {
+            self.column_rects[col_idx] = col_rect;
+        }
         let is_done = state == crate::kanban::CardState::Done;
         let matching: Vec<&crate::kanban::Card> = cards
             .iter()
@@ -757,13 +858,20 @@ impl BoardView {
                 true,
                 th.dim,
             );
-            let text = match (&self.version, is_done) {
-                (Some(v), true) => format!("Done\n{v}\n{}", matching.len()),
-                _ => format!(
-                    "{}\n{}",
-                    column_title(state).replace(' ', "\n"),
-                    matching.len()
-                ),
+            let text = if stacked {
+                match (&self.version, is_done) {
+                    (Some(v), true) => format!("Done · {v}  ({})", matching.len()),
+                    _ => format!("{}  ({})", column_title(state), matching.len()),
+                }
+            } else {
+                match (&self.version, is_done) {
+                    (Some(v), true) => format!("Done\n{v}\n{}", matching.len()),
+                    _ => format!(
+                        "{}\n{}",
+                        column_title(state).replace(' ', "\n"),
+                        matching.len()
+                    ),
+                }
             };
             #[cfg(test)]
             if is_done {
@@ -776,7 +884,12 @@ impl BoardView {
                 col_rect.width(),
             );
             p.galley(
-                col_rect.min + egui::vec2(4.0 * self.scale, HEADER_H * self.scale),
+                col_rect.min
+                    + if stacked {
+                        egui::vec2(22.0, 7.0) * self.scale
+                    } else {
+                        egui::vec2(4.0 * self.scale, HEADER_H * self.scale)
+                    },
                 galley,
                 th.dim,
             );
@@ -1107,15 +1220,17 @@ impl BoardView {
 
         let content_h = matching.len() as f32 * (CARD_H * self.scale + CARD_GAP * self.scale);
         let max_scroll = (content_h - body_rect.height()).max(0.0);
-        let wheel = if gated_by_pointer(over, pointer, body_rect) {
+        let wheel = if !stacked && gated_by_pointer(over, pointer, body_rect) {
             ui.input(|i| i.smooth_scroll_delta.y)
         } else {
             0.0
         };
-        self.scroll[col_idx] = (self.scroll[col_idx] - wheel).clamp(0.0, max_scroll);
+        if !stacked {
+            self.scroll[col_idx] = (self.scroll[col_idx] - wheel).clamp(0.0, max_scroll);
+        }
 
         let cp = ui.painter_at(body_rect);
-        let mut y = body_rect.min.y - self.scroll[col_idx];
+        let mut y = body_rect.min.y - if stacked { 0.0 } else { self.scroll[col_idx] };
         for card in matching {
             let card_rect = egui::Rect::from_min_size(
                 egui::pos2(body_rect.min.x + PAD * self.scale, y),
@@ -1126,7 +1241,7 @@ impl BoardView {
             );
             // Cull cards scrolled fully out of the visible body — keeps
             // interact() hit-regions from bleeding above/below the column.
-            if card_rect.max.y >= body_rect.min.y && card_rect.min.y <= body_rect.max.y {
+            if card_rect.intersects(body_rect.intersect(ui.clip_rect())) {
                 self.show_card(
                     ui,
                     &cp,
@@ -1995,6 +2110,83 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn orientation_uses_readable_column_widths_and_view_zoom() {
+        for scale in [0.5, 1.0, 2.0] {
+            assert!(stacked_columns(799.0 * scale, scale));
+            assert!(!stacked_columns(800.0 * scale, scale));
+            assert!(!stacked_columns(1200.0 * scale, scale));
+        }
+    }
+
+    #[test]
+    fn stacked_board_scrolls_to_later_columns_and_keeps_wide_scroll_positions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = add_done(&store, "Finished task");
+        let mut board = BoardView::new(store);
+        board.scroll = [80.0, 40.0, 20.0, 10.0];
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("stacked-wheel");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let pos = egui::pos2(100.0, 100.0);
+        run_frame(&ctx, &mut board, rect, base, vec![moved(pos)]);
+        let top = board.column_rects[3].min.y;
+        for _ in 0..8 {
+            run_frame(
+                &ctx,
+                &mut board,
+                rect,
+                base,
+                vec![
+                    moved(pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        phase: egui::TouchPhase::Move,
+                        delta: egui::vec2(0.0, -200.0),
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+        assert!(board.column_rects[3].min.y < top);
+        assert_eq!(board.scroll, [80.0, 40.0, 20.0, 10.0]);
+        let pos = board.column_rects[3].min + egui::vec2(20.0, HEADER_H + 10.0);
+        click_at(&ctx, &mut board, rect, base, pos);
+        assert_eq!(board.selected.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn stacked_headers_actions_and_details_survive_resizing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let id = store
+            .borrow_mut()
+            .add("Narrow task", Some("Full details".into()))
+            .unwrap();
+        let mut board = BoardView::new(store);
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("stacked-interaction");
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0));
+        click_at(&ctx, &mut board, narrow, base, egui::pos2(40.0, 12.0));
+        assert_eq!(board.collapsed, [true, false, false, false]);
+        click_at(&ctx, &mut board, narrow, base, egui::pos2(40.0, 12.0));
+        assert_eq!(board.collapsed, [false; 4]);
+        click_at(&ctx, &mut board, narrow, base, go_button_center(narrow));
+        assert_eq!(
+            board.picker.as_deref(),
+            Some(id.as_str()),
+            "lanes: {:?}",
+            board.column_rects
+        );
+        click_at(&ctx, &mut board, narrow, base, card_body_pos(narrow));
+        assert_eq!(board.selected.as_deref(), Some(id.as_str()));
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0));
+        run_frame(&ctx, &mut board, wide, base, vec![]);
+        assert_eq!(board.selected.as_deref(), Some(id.as_str()));
+        assert!(board.acts.is_empty());
+    }
+
+    #[test]
     fn live_font_changes_scale_card_action_hit_regions() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store_at(tmp.path());
@@ -2534,13 +2726,7 @@ mod tests {
         let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 400.0));
         board.version = Some("v1".into());
         run_frame(&ctx, &mut board, narrow, base, vec![]);
-        let done_col = egui::Rect::from_min_size(
-            egui::pos2(
-                narrow.max.x - narrow.width() / COLUMNS.len() as f32,
-                narrow.min.y,
-            ),
-            egui::vec2(narrow.width() / COLUMNS.len() as f32, narrow.height()),
-        );
+        let done_col = board.column_rects[3];
         let uncut = board
             .uncut_rect
             .expect("Uncut is still drawn, just clipped");
@@ -2590,10 +2776,8 @@ mod tests {
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.0));
             run_frame(&ctx, &mut board, rect, base, vec![]);
             run_frame(&ctx, &mut board, rect, base, vec![]);
-            let header = egui::Rect::from_min_size(
-                egui::pos2(width * 0.75, 0.0),
-                egui::vec2(width * 0.25, HEADER_H),
-            );
+            let lane = board.column_rects[3];
+            let header = egui::Rect::from_min_size(lane.min, egui::vec2(lane.width(), HEADER_H));
             let (_, slot, _) = done_header_rects(header, 1.0, false);
             let slot = slot.expect("dropdown fits");
             let button = board.dropdown_btn.expect("dropdown drawn");
