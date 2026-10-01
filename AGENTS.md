@@ -77,7 +77,7 @@ Paths below are files to read, not skills to invoke.
 | Writing a doc, epic, spec, or commit message | `.claude/skills/foreman-docs-and-writing/SKILL.md` |
 | Tempted to retry a settled battle (resize reflow, vsync, snap zones) | `.claude/skills/foreman-failure-archaeology/SKILL.md` |
 | Forming a theory or designing an experiment | `.claude/skills/foreman-research-methodology/SKILL.md` |
-| Implementing per-Session agent-state (needs-input / working / done) | `.claude/skills/foreman-agent-state-campaign/SKILL.md` |
+| Touching per-Session agent state (working / needs you / idle badges, hook events, anything built on top) | `docs/agent-state.md` first, then `.claude/skills/foreman-agent-state-campaign/SKILL.md` |
 | Proving a claim with evidence, splitting our bug from ConPTY, wire-compat | `.claude/skills/foreman-proof-and-analysis-toolkit/SKILL.md` |
 | Asking whether work is novel, preparing an external claim, reopening ConPTY | `.claude/skills/foreman-research-frontier/SKILL.md` |
 | Verifying GUI behavior with a screenshot | `.codex/skills/build-screenshot` |

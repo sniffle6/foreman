@@ -301,7 +301,7 @@ child's device-status scan. Details: **terminal-emulation-reference**.
   re-litigating the outbox — the delivery model has now been proven correct
   twice. Known edge: a child that never prints anything never latches ready;
   posts queue instead of being eaten (READY_GRACE remains the designed
-  remedy — **foreman-agent-state-campaign** Phase 0).
+  remedy — a standalone hardening item; **foreman-agent-state-campaign** §6).
 
 ## 9. GPU device loss killed the app — the renderer, not the geometry (2026-08-25)
 

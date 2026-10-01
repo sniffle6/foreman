@@ -27,7 +27,7 @@ domain pack.
 
 | # | Frontier | Status | Full detail lives in |
 |---|----------|--------|----------------------|
-| 1 | Agent-state detection | open (PRIMARY) | **foreman-agent-state-campaign** |
+| 1 | Agent-state detection | shipped via provider hooks (`docs/agent-state.md`); passive detection is a hookless fallback only | **foreman-agent-state-campaign** |
 | 2 | Headless agent self-verification | candidate; inspection layer built, gaps below | this skill |
 | 3 | Multi-agent coordination measurement (A/B) | designed-not-built, never executed | this skill |
 | 4 | Session persistence (daemon/client split) | open, listed in HANDOFF | this skill |
@@ -60,9 +60,12 @@ every byte with emulator-level structure, and it already has:
 - structured Snapshots (`snapshot --attrs --cursor`, commit `ec0af05`),
 - the Control plane + per-Session env identity for labeling real sessions.
 
-**First steps.** Do not improvise: the executable, decision-gated campaign —
-taxonomy, labeled real-session fixtures, classifier, declared precision/recall
-gates — is **foreman-agent-state-campaign**. Start at its first gate.
+**First steps.** Shipped 2026-10-01: the agent CLIs report their own turn
+state through lifecycle hooks (`docs/agent-state.md`). The passive classifier
+framed here is now a fallback for agents with no hooks; its evidence protocol
+and fences live in **foreman-agent-state-campaign**. The research question that
+remains is extending state to hookless agents, not detecting it for Claude,
+Codex, or Grok.
 
 **You have a result when:** a classifier meets its *pre-declared*
 precision/recall targets on labeled fixtures captured from real agent Sessions

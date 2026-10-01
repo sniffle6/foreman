@@ -230,12 +230,12 @@ Genuinely still open:
    Per-terminal model/token/state lines were **rejected**: the CLIs already
    render that in-pane (`docs/epics/keyboard-control-epic.md` decision
    history). Do not re-open that half.
-2. **Agent-state detection** — the unbuilt half of "AI-agent integration".
-   Running the claude/codex CLIs in terminals works, and `proc.rs::agent_for`
-   already identifies which agent owns a Session (it drives the tab icons). What
-   is missing is needs-input / working / done / idle state and surfacing it: a
-   badge on the terminal or project titlebar, "jump to next needs-you". Design
-   notes: `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
+2. **Agent state** — shipped: working / needs you / idle per agent Session,
+   from the provider CLIs' lifecycle hooks, shown in the Sessions panel
+   (`docs/agent-state.md`; `proc.rs::agent_for` supplies the identity gate).
+   Still open on top of it: "jump to next needs-you", a fleet overview, and
+   idle-aware chat delivery. Why hooks and not a PTY detector:
+   `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
 3. **`Content::Browser`** — a new enum variant plus a `Content::show` arm; the
    rest of the engine is reused. Read `enum Content` in `src/wm.rs` for what
    exists today.

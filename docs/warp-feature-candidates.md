@@ -22,32 +22,32 @@ Fig completion specs (MIT).
 
 | # | Candidate | Verdict | Effort | Gate / next step |
 |---|-----------|---------|--------|------------------|
-| 1 | OSC 133 semantic prompt marks (blocks-lite) | **SPIKE-FIRST** | M (spike: 1 day) | Verify vendored OpenConsole passes OSC 133 through; detect-only MVP; route via agent-state campaign |
+| 1 | OSC 133 semantic prompt marks (blocks-lite) | **SPIKE-FIRST** | M (spike: 1 day) | Verify vendored OpenConsole passes OSC 133 through; detect-only MVP; a plain-shell signal only, agent state itself is shipped (#7) |
 | 2 | Command/output addressability in control plane | **ADOPT-LATER** (standalone `--tail` slice: **SHIPPED**) | M full | Full block model hard-depends on #1 + honest answer on alt-screen coverage |
 | 3 | Renderer: custom GPU framework (warpui-style) | **REJECT** (egui optimizations: ADOPT-LATER, gated) | S–M (opts) / L–XL (renderer) | 4K perf measurement; real bottleneck is VTE parsing, not rendering |
 | 4 | Fig completion specs (autocomplete) | **REJECT for now** | L | Reconsider only if composer ships AND humans demonstrably type raw shell |
 | 5 | Keybinding enablement predicates | **REJECT** (20-line `keyboard_owner` extraction: worthwhile) | M | Revisit only if non-leader globals or rebindable modal keys arrive |
 | 6 | Per-terminal composer/input pane | **OPTIONAL** (not equal to the S fixes above) | S | Only if multi-line *unframed* draft is wanted; chat multiline is a cheaper partial sub |
-| 7 | Fleet dashboard / agent-state badges | **ADOPT-LATER** | M + M | Campaign phases 0–2 first; badges = phase 3. No lying dots. |
+| 7 | Fleet dashboard / agent-state badges | **badges: SHIPPED** (hook-driven, `docs/agent-state.md`); fleet overview **ADOPT-LATER** | M (overview) | Overview builds on the shipped state slot; no lying dots still holds |
 | 8 | Warp's dependency stack (Tokio/font-kit/fork) | **KEEP-AS-IS** — except **font fallback: SHIPPED** | — | `docs/font-fallback.md`; the async/font-kit/fork verdicts still stand |
 
 ### Goal vs do-next (do not confuse)
 
 | | What | Meaning |
 |---|------|---------|
-| **Product goal** | Agent-state detector | "Which pane needs me" — HANDOFF differentiator. Hard. Research. Not badges first. |
+| **Product goal** | Agent state per pane — **SHIPPED** via provider lifecycle hooks (`docs/agent-state.md`) | "Which pane needs me" — HANDOFF differentiator. Solved by agent self-report through hooks, not by a PTY detector; the passive detector is now a fallback for hookless agents only. |
 | **Do next** | Ranked shovel list below | Small, real gaps. No research theater. |
-| **Not yet** | Fleet / badges / block model | Need honest detector (or self-report) first. |
+| **Not yet** | Fleet overview / block model | Build on the shipped state slot; badges are done. |
 
 **Do next (ranked — not equal):**
 
 1. **Font fallback** — **SHIPPED** (`docs/font-fallback.md`). CJK/emoji glyphs via YaHei + Segoe fallbacks; `src/terminal_font.rs` owns registration, `src/emoji_raster.rs` the color-emoji path.
 2. **snapshot `--tail N`** — **SHIPPED** (`docs/terminal-inspection.md`). `inspect::snapshot_tail` / `snapshot_cells_tail` walk the buffer, not the viewport.
-3. **READY_GRACE** (agent-state campaign Phase 0) — inject/chat can stick forever if DSR never latches. Foundation for state later.
+3. **READY_GRACE** (separate hardening item; not a gate on state) — inject/chat can stick forever if DSR never latches.
 4. **`keyboard_owner()`** — ~20-line cleanup when touching keymap/wm. Lowest product value.
 5. **Composer** — optional human multi-line draft. Not the fleet problem. Soft adopt only.
 
-Then: OSC 133 spike (signal experiment) → campaign Phase 1 audit → detector or `foreman state` verb → badges last.
+Then: OSC 133 spike (plain-shell signal experiment). Agent state itself shipped 2026-10-01 from hooks; what remains on top of it is the fleet overview and idle-aware chat delivery.
 
 ---
 
@@ -87,11 +87,12 @@ equivalent consumed by Windows Terminal, WezTerm, and Kitty.
    OpenConsole (`src/conpty_install.rs`) because in-box conhost strips kitty
    APC. Modern OpenConsole understands FTCS, so passthrough is plausible — but
    the in-box-conhost fallback path may strip marks. Must spike.
-4. OSC 133 is **absent** from the agent-state campaign's signal inventory
-   (`.claude/skills/foreman-agent-state-campaign/SKILL.md` §3) — a genuinely
-   new candidate signal. Also serves the unsolved chat quiescence-gating
-   problem (`docs/superpowers/specs/2026-06-10-chat-mentions-design.md`), at
-   shell level only.
+4. OSC 133 is a plain-shell signal only. Agent state inside a TUI agent is
+   shipped from provider hooks (`docs/agent-state.md`), so marks would feed
+   the hookless fallback in the campaign skill, not the product route. Also
+   serves the unsolved chat quiescence-gating problem
+   (`docs/superpowers/specs/2026-06-10-chat-mentions-design.md`), at shell
+   level only.
 
 **Effort:** M. Parser tap itself is S (~150 lines + tests, mirrors
 `graphics.feed`); the M is per-shell snippets + injection policy +
@@ -131,8 +132,8 @@ reflow-safe mark bookkeeping + badge/status surfaces + ConPTY verification.
 
 **Verdict: SPIKE-FIRST** — seam is proven and cheap, but ConPTY passthrough is
 unverified and value for agent-internal state is bounded. Run the one-day
-passthrough + detect-only spike; route the design through the
-foreman-agent-state-campaign gates.
+passthrough + detect-only spike; it is a shell-level signal and does not
+reopen the hook decision.
 
 ---
 
@@ -505,16 +506,25 @@ that draft UX; primary typists are agents that never use a composer.
 
 ## 7. Fleet dashboard / per-pane agent-state badges
 
+> **Update 2026-10-01:** per-pane state badges **SHIPPED**, driven by the
+> provider CLIs' lifecycle hooks rather than a PTY detector —
+> `docs/agent-state.md` for the feature,
+> `docs/superpowers/specs/2026-09-25-agent-state-design.md` for the decision.
+> The analysis below predates that and argued from "foreman must infer from
+> PTY bytes"; the hook route is the Oz-parity mechanism it anticipated under
+> "agent self-reporting". Still open: the fleet overview surface and the
+> `foreman status` state column.
+
 **What Warp does:** Oz dashboard shows every agent across sessions with live
 status (working / awaiting input / done), triage + click-through. Warp *is*
 the agent host, so state is ground truth — foreman must infer from PTY bytes.
 
 **How it maps to foreman:**
 - **A full design campaign already exists:**
-  `.claude/skills/foreman-agent-state-campaign/SKILL.md` — decision-gated
-  runbook for exactly this (needs-input/working/done/idle, badge, "jump to
-  next needs-you"). Status: design-stage, nothing built (no `AgentState` in
-  src/). HANDOFF.md §5 calls state detection "the differentiator."
+  `.claude/skills/foreman-agent-state-campaign/SKILL.md` — now the why and
+  the evidence protocol behind the shipped hook route (`src/agent_state.rs`,
+  `AgentStateSlot`); its output-based detector is a fallback for hookless
+  agents. HANDOFF.md §5 calls state detection "the differentiator."
 - Existing signals: `Session::ready` + `Session::output_gen`
   (`src/terminal.rs`); quiescence settle machinery (`wm::advance_settles` +
   the pure `settle_tick`, whose quiet window is the user-editable
@@ -579,10 +589,10 @@ cross-project plumbing + a Content variant). Pointless before detection works.
 - Grow `foreman status` a state column in the same change (additive serde
   field)?
 
-**Verdict: ADOPT-LATER** — the UI is cheap and templated, but badges before
-the detector passes the campaign's own gates = a lying dashboard. Execute
-foreman-agent-state-campaign phases 0-2 first; badges/overview are its
-already-planned phase 3.
+**Verdict (as written): ADOPT-LATER** — the UI is cheap and templated, but
+badges before a trustworthy state source = a lying dashboard. **Resolved**: the
+hook route supplied the trustworthy source and badges shipped; the overview
+surface is the part still ADOPT-LATER.
 
 ---
 
@@ -642,6 +652,11 @@ font discovery, and only if foreman ever leaves Windows.
 
 ## Product goal vs first shovel (2026-07-10)
 
+> **Update 2026-10-01:** the goal below is met. Agent state per pane shipped
+> from provider hooks (`docs/agent-state.md`), which is the "self-report" exit
+> this section names. The campaign order no longer applies; READY_GRACE stands
+> alone as a hardening item.
+
 **Product goal (not "code this tomorrow"):** agent-state *detector* —
 needs-input / working / done / idle per pane. Not badges. Not fleet UI.
 Runbook: `.claude/skills/foreman-agent-state-campaign/SKILL.md`.
@@ -678,12 +693,13 @@ Features "fall out" only if the detector is trustworthy.
 ## Suggested sequencing
 
 1. **Now (ranked):** ~~font fallback~~ (shipped) → ~~snapshot `--tail N`~~
-   (shipped) → READY_GRACE (Phase 0) → `keyboard_owner()` when convenient →
-   composer only if wanted.
+   (shipped) → READY_GRACE (standalone hardening) → `keyboard_owner()` when
+   convenient → composer only if wanted.
 2. **Spike:** OSC 133 ConPTY passthrough + detect-only (1 day). Gates block
    model (#2); feeds campaign as a signal candidate.
-3. **Campaign:** Phase 1 audit → Phase 2 detector or `foreman state` →
-   Phase 3 badges/fleet (#7); full command addressability after marks.
+3. **On top of shipped state:** ~~badges~~ (shipped, hook-driven) → fleet
+   overview (#7) → idle-aware chat delivery; full command addressability after
+   marks.
 4. **Dormant:** custom renderer (#3 — only if 4K perf gate fails), Fig (#4 —
    after composer + real demand), keybind predicates (#5 — non-leader globals).
 

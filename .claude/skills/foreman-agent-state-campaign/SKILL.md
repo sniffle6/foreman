@@ -1,387 +1,212 @@
 ---
 name: foreman-agent-state-campaign
-description: Use when implementing or planning per-Session agent-state detection (needs-input / working / done / idle), a state badge, "jump to next needs-you", quiescence gating for injection, READY_GRACE or Ready-latch fallback work, or when a Member never latches Ready and chat posts sit queued forever. Also when tempted to sniff screen text or parse an agent's private state files for status. Signals: src/terminal.rs ready/output_gen, src/chat.rs Outbox, src/proc.rs, docs/HANDOFF.md §5.
+description: Use when touching per-Session agent state (working / needs you / idle, the done marker, the Sessions-panel badge), adding a provider's hook events, building anything on top of state (idle-aware chat delivery, "jump to next needs-you", a fleet overview), proving a state claim with evidence, or when tempted to detect state from PTY output, screen text, or an agent's private files. Also READY_GRACE / a Member that never latches Ready. Read docs/agent-state.md first; this skill holds the why, the evidence protocol, and the fenced wrong paths.
 ---
 
-# Agent-State Campaign: needs-input / working / done / idle per Session
+# Agent state per Session: why hooks won, how to prove a claim, what not to try
 
-> **SUPERSEDED (2026-09-25):** Agent state ships from provider lifecycle hooks,
-> not passive PTY detection. See `docs/agent-state.md` and
-> `docs/superpowers/specs/2026-09-25-agent-state-design.md`. Kept for the
-> Ready/READY_GRACE material and decision history.
+**Status: built and merged.** Agent state ships from the provider CLIs' own
+lifecycle hooks (`foreman title-event --event <Name>` over the title pipe),
+not from reading PTY bytes. Confirm with `rg -n "fn apply_hook_event" src/wm.rs`
+and `rg -n "AgentStateSlot" src/agent_state.rs` — hits mean the feature is in
+the tree. Read in this order:
 
-**Status: DESIGN-STAGE. Nothing in this campaign is built.** Confirm with
-`rg -n "READY_GRACE|agentstate" src/` — no hits means this is still a runbook,
-not a description of shipped code. Every phase has an exit gate; do not skip
-gates. Nothing here authorizes routing around **foreman-change-control** —
-thresholds, state names, and any new Control-plane verb are user sign-off
-items.
+1. `docs/agent-state.md` — what it does, the event-to-state table, how to turn
+   it on, the gotchas, and `## Key files`. **The feature doc wins** over
+   anything here.
+2. `docs/superpowers/specs/2026-09-25-agent-state-design.md` — the decision,
+   the rejected alternatives, and the hook-capture evidence it rests on. Read
+   it for *why*; never edit it to match later reality.
 
-**Roadmap cross-link:** `docs/warp-feature-candidates.md` treats this campaign
-as the **product goal**, not the next shovel. Two of the shovels it listed
-ahead of this work have since shipped: terminal font fallback
-(`src/terminal_font.rs`) and `snapshot --tail N` (`src/control.rs`, commit
-`43e86d3`). That leaves **Phase 0 READY_GRACE** as the next thing to build,
-before any detector or badges. The task-manager panel (`src/panel.rs`) now
-exists and is the badge landing site. OSC 133 (warp doc #1) is a Phase 1
-*signal candidate*, not a parallel track.
+This skill keeps only what the feature doc does not carry: the reasoning that
+rules out passive detection, the identity gate, the evidence protocol for any
+state claim, the injection-timing gotchas, the fenced wrong paths, and
+READY_GRACE as a separate hardening item. The earlier output-based campaign
+(signal audit, composite state machine, numeric gates) is demoted to the
+fallback section at the end; it is a plan for agents with no hooks, not the
+product route.
 
 Citations name a file and a symbol, never a line number.
 
-## 1. The problem, and why it is hard
+## 1. Why PTY bytes cannot show turn state
 
-HANDOFF names this the differentiator: *"detect 'needs input' / done / idle and
-surface it (badge on the terminal/project titlebar, a 'jump to next needs-you')"*
-— `docs/HANDOFF.md` §5 "Next phases".
+Foreman sees PTY bytes, not turn state. A *PTY* (pseudo-terminal) is the OS
+byte pipe a program reads and writes; on Windows the layer is ConPTY. A
+`Session` owns one PTY plus an emulated screen (`src/terminal.rs`; depth in
+**terminal-emulation-reference**).
 
-Why it is hard, in one sentence: **foreman sees PTY bytes, not turn state.**
+From that byte stream, "working" is visible (bytes flowing) and "exited" is
+visible (`Session::exited`). The three states a human actually needs
+separated — needs you, idle, done — all look the same from outside: a quiet
+screen with the cursor parked at the agent's input box. Spinners make it
+worse by keeping the screen changing while the agent is parked at a prompt.
+That is the reason the spec rejected passive detection, and it is not a
+matter of better thresholds: the information is not in the bytes.
 
-- A *PTY* (pseudo-terminal) is the OS byte pipe a terminal program reads and
-  writes; on Windows the OS layer is ConPTY. Foreman's `Session` owns one PTY
-  plus an emulated screen. Full domain background: **terminal-emulation-reference**.
-- From that byte stream you cannot directly see whether an agent is mid-tool-call,
-  parked at a permission prompt, or idle at its input box. The chat-mentions
-  design flags this exact gap as an **unsolved problem**:
-  *"'Between turns' is not observable from where foreman sits… Any gate is a
-  heuristic… and heuristics here fail in the worst direction: inject at the wrong
-  moment and you corrupt an agent's in-flight work"* —
-  `docs/superpowers/specs/2026-06-10-chat-mentions-design.md` (the ⚠ section
-  and open question 1). Quiescence gating (decision-table row 5 there) is
-  design-settled but its core mechanism is explicitly UNSOLVED.
-- The incident proving the fragility: a `\r` written back-to-back with a chat
-  paste got folded into Claude Code's paste-burst detection and never
-  submitted; the fix is a deferred submit, `SUBMIT_DELAY` in `src/ready.rs`
-  (commit `45f4725`). That failure took a live session to discover.
+The chat-mentions design names the same gap for injection timing:
+*"'Between turns' is not observable from where foreman sits… inject at the
+wrong moment and you corrupt an agent's in-flight work"*
+(`docs/superpowers/specs/2026-06-10-chat-mentions-design.md`, the ⚠ section).
+Hook events are the first signal that actually observes turn boundaries,
+which is what makes idle-aware chat delivery possible at all.
 
-Consequence: this campaign is **passive-first**. Phases 0-2 write zero bytes
-into any agent's Session for detection purposes. Anything active is fenced
-(see "Fenced wrong paths") or deferred to the explicit-cooperation option in
-the solution menu.
+Hooks are not free of blind spots. The feature doc's gotchas list them: Claude
+Esc fires nothing, Codex sends a late `PostToolUse` after `Interrupt`, Grok
+has no permission event. Design on top of state with those in mind; a badge
+can be late or stale, never wrong about the direction it moved.
 
-### Target states (proposal, not vocabulary yet)
+## 2. The identity gate
 
-| State (candidate name) | Meaning |
-|---|---|
-| needs-input | Agent is blocked on the human/dispatcher (permission prompt, question) |
-| working | Agent is mid-turn (streaming output or mid-tool-call) |
-| done | Agent finished its task; process may still be alive at its input box |
-| idle | Alive, at its input box, no task in flight |
+An event only lands on a Session when three things match: the Foreman project
+ID, the terminal ID (terminal IDs repeat across projects), and the provider
+of the event against `Session::icon_kind` (`WindowManager::apply_hook_event`,
+`src/wm.rs`).
 
-Naming is a **promotion gate** (see "Promotion path"): the chosen names must
-enter CONTEXT.md's glossary with user sign-off. Note "done vs idle" may prove
-observationally indistinguishable without option (d) — Phase 1 decides.
+The icon comes from the process scan. `proc::agent_for` refreshes the OS
+process table every `REFRESH_EVERY`, and the pure `detect_agent`
+(`src/proc.rs`) ranks every agent process under the shell by depth and picks
+the one closest to the shell. So a `codex exec` launched from Claude's Bash
+tool is deeper, the pane keeps its Claude identity, and Codex's events are
+dropped. Two consequences:
 
-## 2. Vocabulary
+- **Process-tree identity is load-bearing, not corroborating.** The earlier
+  campaign treated the process scan as a weak side signal. It is now the gate
+  that decides which provider owns a pane. A wrong icon means dropped or
+  misapplied state events, so a tab-icon bug is also a state bug
+  (**foreman-diagnostics-and-tooling** covers debugging a wrong icon).
+- **Same-provider children still overwrite the parent.** A `claude -p` inside
+  a Claude Session shares the icon and the terminal ID, so its events change
+  the pane's state. Accepted limitation; do not try to fix it with text
+  sniffing.
 
-DSR, Ready, Quiescence settle, Inspection, OSC title — all defined in
-`CONTEXT.md`, which is the glossary of record. VT/ConPTY depth:
-**terminal-emulation-reference**.
+The scan is WSL-blind (module docs in `src/proc.rs`): an agent inside a WSL
+pane gets no icon, so it gets no state either.
 
-## 3. Ground truth: the observation substrate that already exists
+## 3. Proving a state claim
 
-These are the raw materials:
+Success is measured, never judged by eye. The shape:
 
-| Signal | Where | What it tells you | Grain |
-|---|---|---|---|
-| Ready latch | `Session::ready` field + `ready()` getter, `src/terminal.rs`; latched in `pump()` when the first DSR reply is flushed back. Gate logic lives in `src/ready.rs` (`ReadyGate`) | Startup DSR scan resolved; injection is safe to land | one-shot boolean, per Session |
-| Output generation | `Session::output_gen` + getter, `src/terminal.rs`; bumped per PTY batch in `pump()` | "New bytes arrived since I last looked" — the freshness counter the settle machinery polls | per-frame delta, per Session |
-| Quiescence settle | `settle_tick` + `PendingSettle` + `advance_settles`, `src/wm.rs`; driven per frame from `App::ui`. The default window is `Settings::send_settle_ms` (`src/config.rs`, user-editable, clamped); `MAX_SETTLE_MS` (`src/wm.rs`) is the hard cap | Output-silence detection already exists as a pure, unit-tested function | window over output_gen |
-| Cursor position/shape | `snapshot --cursor` → `CursorInfo {row, col, shape}`, `src/inspect.rs` | Where the program's cursor rests; TUIs park it at their input box | per Snapshot |
-| Cursor stability | RETIRED signal: the Caret gate was deleted 2026-07-15 (caret now tracks the model cursor directly; docs/cursor-rendering.md). Its cursor-rest concept — distinct from output quiescence — remains a valid detection idea; reimplement pure if the campaign needs it (`git show 7fda1c2:src/caret.rs`) | The retired code is still the worked example of "resting vs mid-redraw" discrimination | n/a (would be per frame) |
-| OSC title | `Session::osc_title`, `src/terminal.rs`; consumed ONLY by `icon_kind` today | Which agent is running — Claude sets `claude`; **Codex sets your username** (docs/tab-icons.md, "Detection" step 2) | identity, not state |
-| Process tree | `proc::agent_for` / pure `detect_agent` (`src/proc.rs`); refresh throttle `REFRESH_EVERY`; **WSL-blind** (module docs) | Which agent runs under the shell; running vs exited truth is `Session::exited()` | coarse, one refresh interval of lag |
-| Outbox Ready gate | `ChatRoom::tick` skips non-Ready Members (cursor stays, catch-up later), `src/chat.rs`; `LiveMember.ready` | The delivery layer already keys on the one state bit that exists | consumer of Ready |
+1. **Label regimes by construction, never by reading the screen.** You know
+   the agent is working because you submitted the prompt; you know it needs
+   you because you asked for something that opens a permission dialog; you
+   know it is idle because the turn finished and you waited. Drive a real
+   agent from a PowerShell *outside* foreman using the Control plane
+   (**foreman-run-and-operate** for the verbs).
+2. **Pure mapping first.** `AgentStateSlot` (`src/agent_state.rs`) is a pure
+   event-to-state function with tests. A new event, provider, or ranking rule
+   gets a test there before anything touches the GUI. The exhaustive
+   state-table shape is in **foreman-proof-and-analysis-toolkit**.
+3. **End to end with evidence.** Screenshot the Sessions panel per regime
+   (**build-screenshot**, user-run). Hook arrival itself is provable without
+   the GUI: the capture recipe is in the spec's Evidence section.
+4. **Asymmetric cost.** A false "needs you" interrupts a human for nothing and
+   trains them to ignore the badge. A late one costs seconds. Any change to
+   the mapping is judged by that asymmetry, not by overall accuracy.
+5. **Zero bytes into any Session.** State is read from hook events only; the
+   GUI only ever `try_recv`s. Any proposal that writes to a Session to learn
+   its state is fenced below.
 
-**The one state bit that exists today is Ready.** Everything else is raw signal.
-That is why Phase 0 hardens Ready before anything new is invented.
+Vocabulary: Working, Needs you, Idle, and the done marker are in `CONTEXT.md`.
+Use those names in code, docs, and commits.
 
-## 4. Campaign map
+## 4. Injection-timing gotchas
 
-| Phase | Deliverable | Exit gate |
-|---|---|---|
-| 0 | READY_GRACE fallback latch (already-designed, unbuilt) | A Member that never answers DSR still latches Ready by timeout; deterministic test green |
-| 1 | Signal audit: measured discrimination table across labeled regimes | Every signal marked keep/strike with recorded evidence |
-| 2 | One solution from the ranked menu, built as a pure module + fixture tests | Numeric gates of the validation protocol pass on fixtures |
-| 3 | UI surfacing + (optionally) explicit-cooperation verb | Promotion checklist complete, user signed off |
+These bite anyone building on state (idle-aware delivery, "send when
+ready") and anyone driving an agent for a fixture:
 
-## 5. Phase 0 — harden the observation layer (READY_GRACE)
+- **Prompt and Enter in two calls.** `foreman send` writes text then keys in
+  one frame (`WindowManager::handle_ctrl`, `src/wm.rs`). Claude Code folds
+  same-burst input into a paste and never submits. On the chat path the fix
+  is the deferred submit, `SUBMIT_DELAY` in `src/ready.rs`; from the CLI,
+  send `--text` and `--keys Enter` as two calls. The incident is in the
+  const's doc comment and in **foreman-debugging-playbook**.
+- **Expect `send` to wait.** While the agent streams, each reply takes up to
+  `MAX_SETTLE_MS` (`src/wm.rs`); the settle deadline caps the wait.
+- **Ready gates every injection.** `inject_input` queues until the Session
+  latches Ready (`ReadyGate`, `src/ready.rs`); the Outbox skips non-Ready
+  Members (`ChatRoom::tick`, `src/chat.rs`). State events do not change that:
+  Idle means the agent is at its input box, not that the Session is Ready.
+- **Idle is not "safe to type".** A late `Stop` or an invisible Claude Esc
+  means Idle can lag reality. Treat state as advisory for delivery timing and
+  keep the existing settle-based path as the floor.
 
-**Rationale: the Ready latch IS state-detection v0.** Today a Session that never
-emits a DSR never latches Ready: `inject_input` queues forever
-(`src/terminal.rs` / `src/ready.rs`) and the Outbox never delivers
-(`ChatRoom::tick`, `src/chat.rs`). A state machine built on a latch that can
-wedge inherits the wedge.
-
-The design already exists — `docs/followups-latency-and-control.md` §2 ("Grace
-fallback for ready-gated injection"): add a `spawned: Instant` field plus a
-generous `READY_GRACE` (1.5-2s, comfortably longer than real DSR latency); in
-`pump()`, latch Ready by timeout as a fallback. **Make the grace injectable**
-so the fallback is deterministically testable; otherwise it is untestable
-without a contrived non-DSR program.
-
-**Verified unbuilt** — both must return nothing:
-
-```powershell
-rg -n "READY_GRACE" src/
-rg -n "spawned:\s*(std::time::)?Instant" src/terminal.rs
-```
-
-### Build checklist (TDD; route the change through foreman-change-control)
-
-1. `Session` gains `spawned: Instant` + an injectable grace (constructor
-   parameter or a test-settable field — mirror how `settle_tick` was made pure
-   in `src/wm.rs` rather than inventing a new pattern).
-2. In `Session::pump`: if `!self.ready` and `spawned.elapsed() >= grace`, latch
-   `ready = true`. The existing flush-queued-injects block then fires
-   unchanged.
-3. Tests, modeled on the existing recipes in `src/terminal.rs`
-   (`session_latches_ready_after_dsr_is_answered`,
-   `inject_before_ready_is_queued_then_flushed`):
-   - **Grace path:** a child that never sends DSR, tiny injected grace
-     (e.g. 50ms) → `ready()` latches by timeout and a pre-Ready
-     `inject_input` flushes.
-   - **Pre-check that your child really never DSRs:** with a HUGE grace,
-     assert `!ready()` holds across ~1s of pumping. The existing tests use
-     `cmd.exe /c pause`, which DOES emit DSR (that is the point of those
-     tests) — you need a non-shell child. Candidate: a bare exe like
-     `ping -n 30 127.0.0.1` via `Session::spawn_argv` (`src/terminal.rs`;
-     read its signature there — it has changed). **Unverified which Windows
-     exes skip DSR — the pre-check is mandatory, not optional.**
-   - **Non-regression:** the two existing DSR tests stay green (real DSR must
-     still latch before the grace fires).
-
-**GATE — EXPECTED:** grace-path test green; existing DSR tests green.
-**If instead** `ready()` latches immediately even with a huge grace → your
-child answered DSR (or ConPTY produced early output your Listener echoed);
-pick a different child and re-run the pre-check.
-**If instead** the queued inject flushes but the paste is eaten → you latched
-before the DSR scan actually resolved on a real shell; the grace is too small
-or you latched outside `pump()` — re-read
-`docs/followups-latency-and-control.md` §2.
-
-## 6. Phase 1 — signal audit (pure observation, no code changes)
-
-Goal: a measured discrimination table. **Rule: a signal that does not
-discriminate two regimes is struck from the menu.** Predict first, then
-measure (discipline: **foreman-research-methodology**).
-
-### Setup
-
-Run foreman with one Project and one real agent Session (Claude Code or
-Codex). Dispatch it from inside foreman (the **foreman-dispatch** skill is the
-user-facing way) or type `claude` at a shell Session by hand. Then drive the
-audit from an ordinary PowerShell *outside* foreman — any built foreman.exe
-acts as the Control-plane client (full verb ground truth:
-**foreman-run-and-operate**):
-
-```powershell
-$fe = "H:/claude code/foreman/target/debug/foreman.exe"
-& $fe status          # note your pN / tN; state column is running|exited(code)
-```
-
-### The polling loop (Inspection, read-only)
-
-`output_gen` is not exposed over the pipe; its external proxy is "did the
-screen text change between polls". Snapshot is *"a read, never a side effect"*
-(CONTEXT.md) — it pumps parser state but writes nothing to the child.
-
-```powershell
-$fe = "H:/claude code/foreman/target/debug/foreman.exe"
-$P = "p1"; $T = "t2"    # <- your ids from `foreman status`
-$prev = ""
-while ($true) {
-  $r = & $fe snapshot --project $P --terminal $T --cursor | ConvertFrom-Json
-  $txt  = ($r.history -join "`n")
-  $hash = [BitConverter]::ToString(
-            [System.Security.Cryptography.SHA1]::HashData(
-              [Text.Encoding]::UTF8.GetBytes($txt))).Replace("-","").Substring(0,8)
-  $flag = if ($hash -ne $prev) { "CHANGED" } else { "quiet  " }
-  "{0:HH:mm:ss.fff}  screen={1} {2}  cursor=({3},{4}) {5}" -f (Get-Date),
-      $hash, $flag, $r.cursor.row, $r.cursor.col, $r.cursor.shape
-  $prev = $hash
-  Start-Sleep -Milliseconds 250
-}
-```
-
-Redirect to a file per regime (`… *> phase1-R1.log`). 4 Hz is safe: the pipe
-server is thread-per-connection with a `MAX_INFLIGHT` cap and a
-`CONNECT_TIMEOUT` client deadline (`src/control.rs`).
-
-### Regimes (label by construction, never by eye)
-
-| Regime | How to construct it | You know you're in it because |
-|---|---|---|
-| R1 working/streaming | Give the agent a long-output task: `& $fe send --project $P --terminal $T --text "explain this repo file by file"` then, in a SECOND call, `& $fe send --project $P --terminal $T --keys Enter` | You issued the prompt; output is flowing |
-| R2 mid-tool-call | Prompt it to run a slow command ("run `git log -200` and summarize") | Between your Enter and the summary appearing |
-| R3 needs-input | Prompt something that triggers a permission dialog | The dialog is on screen (confirm in the Snapshot text) |
-| R4 resting (done/idle) | Wait for the turn to finish; poll for ≥60s after | Task provably complete |
-
-**Why two `send` calls for prompt+Enter:** `send` writes text then keys
-back-to-back in one frame (`WindowManager::handle_ctrl`, `src/wm.rs`). Claude
-Code folds same-burst input into a paste — the exact failure `SUBMIT_DELAY`
-(`src/ready.rs`, commit `45f4725`) exists to dodge on the chat path. The
-single-request fold is inferred, not re-measured — two calls cost nothing and
-sidestep it. Also EXPECT each `send` reply to take up to `MAX_SETTLE_MS` while
-the agent still streams: the settle deadline caps the wait (`src/wm.rs`).
-
-### What to record per regime (the audit sheet)
-
-For each signal, write a PREDICTION before running, then the measurement:
-
-| Signal | R1 stream | R2 tool-call | R3 needs-input | R4 resting |
-|---|---|---|---|---|
-| screen-hash change rate (per 10s) | | | | |
-| cursor resting (same cell ≥8 consecutive polls = 2s)? | | | | |
-| cursor shape | | | | |
-| tab icon / OSC title change? (screenshot — **build-screenshot** skill; `osc_title` has no pipe surface today, `Session::icon_kind` is its only consumer) | | | | |
-| `status` state column | | | | |
-
-**GATE — EXPECTED:** at least one signal (or a pair) separates R3 from
-{R1, R2}, and something separates {R1, R2} from R4.
-**If a signal ties across two regimes** → strike it from the solution menu’s inputs and
-record the evidence line in your notes.
-**If R3 is indistinguishable from R4 by every passive signal** (both quiet,
-cursor parked) → the composite (a) cannot deliver needs-input alone; promote
-option (d) from phase-3 candidate to required, and stop to get user sign-off
-(scope change).
-**If nothing separates R2 from R4** (tool runs silently) → accept "working"
-detection latency = tool duration, or same escalation as above. Do not invent
-a text-sniffing fallback (see "Fenced wrong paths").
-**If Claude/Codex spinners keep the screen hash changing while parked at a
-prompt** → your quiet-threshold must key on *region* or *rate*, not any-change;
-note it as a composite-design obligation, don't hand-tune live.
-
-## 7. Phase 2 — solution menu (ranked; each option's theory obligations)
-
-### (a) RECOMMENDED: composite pure state machine over (output quiescence × cursor-rest × recent-injection)
-
-A new pure module (e.g. `src/agentstate.rs`), Outbox-style: fed plain
-observations per frame, returns a state; no egui, no PTY handles — exactly the
-seam pattern of `settle_tick` (`src/wm.rs`), the retired Caret gate
-(`git show 7fda1c2:src/caret.rs`), and `ChatRoom::tick` (`src/chat.rs`).
-Unit-tested against **recorded fixtures** from Phase 1 logs.
-
-Inputs (all already obtainable inside the GUI process, zero new plumbing):
-`output_gen` delta, cursor cell/shape stability (Caret-gate-style, distinct
-constants), time since the last `inject_input`/`feed` into that Session,
-`Session::exited()`, Ready.
-
-**Theory obligations — BEFORE any code (predict, then measure):**
-1. Write the state lattice: states, and which transitions are legal
-   (e.g. working→needs-input yes; done→working only via new injection).
-2. Write the transition evidence table: for every edge, which observation
-   combination triggers it and with what hysteresis constant — filled from the
-   Phase 1 audit sheet, not from intuition.
-3. Name every constant, make each injectable for tests (the `settle_tick` and
-   READY_GRACE precedent).
-4. State the confusion costs asymmetrically: a false "needs-you" (human
-   interrupted for nothing) is the expensive error; a late one is cheap.
-   The validation protocol’s gates encode this.
-
-### (b) OSC-title heuristics — corroborating signal only
-
-Cheap but partial and identity-flavored: Claude sets a useful title, **Codex
-sets your username** (docs/tab-icons.md "Detection" step 2; `Session::icon_kind`,
-`src/terminal.rs`).
-Also unplumbed for state: `osc_title` feeds only `icon_kind` today. Acceptable
-as a corroborating input to (a); never the primary discriminator. Some agent
-CLIs mutate the title per activity — if Phase 1 shows that, record it as a
-bonus column, but the composite must not require it.
-
-### (c) Process-tree signals — corroborating only
-
-`Session::exited()` gives running-vs-exited truth (`src/terminal.rs`);
-`proc::agent_for` says *which* agent, stale by up to `REFRESH_EVERY`
-(`src/proc.rs`) and **WSL-blind** (its module docs). Coarse: it can prove "done because the
-process died", never "needs input". Feed exited into (a); nothing more.
-
-### (d) Explicit agent cooperation — strongest signal, phase-3 candidate, NOT phase 2
-
-A new Control-plane verb (sketch: `foreman state working|blocked|done`) the
-agent calls to declare its own state. Strongest possible signal; costs:
-- Cross-provider: every agent must be taught to call it — updates to the
-  user-facing skills in `.claude/skills/` and `.codex/skills/`, kept in sync
-  and re-embedded via `src/skills_install.rs` (CLAUDE.md documents this sync
-  duty). Uncooperative or crashed agents still need (a) as the floor.
-- Wire compatibility: new request/reply fields must keep v1 replies
-  byte-identical via the established serde skip pattern (`src/control.rs`; the
-  proof shape is **foreman-proof-and-analysis-toolkit** Recipe 8).
-- Cousin precedent: typed chat message kinds, docs/chat-missing-features.md §4.
-Build only after (a) ships as the baseline, and only through
-**foreman-change-control** (new verb = wire surface = sign-off).
-
-## 8. Fenced wrong paths — do not attempt
+## 5. Fenced wrong paths — do not attempt
 
 | Fenced path | Why | Citation |
 |---|---|---|
-| Keyword-sniffing screen/output text for state ("Working…", "Allow?") | Rejected for chat kinds — keying behavior off literal words is fragile; same fragility here, worse: agent UIs restyle across versions | docs/chat-missing-features.md § "Explicitly NOT recommended" |
-| Parsing another tool's private state files (Claude/Codex session files) | Agent-teams integration rejected for exactly this: another tool's private format rots under you | docs/chat-missing-features.md, same section |
-| Active interrogation — writing bytes (cursor queries, test keys) into the agent's Session to see how it reacts | Injecting mid-turn can corrupt in-flight work; the WHEN gate is the unsolved problem, so an interrogator cannot know when it's safe — circular | 2026-06-10-chat-mentions-design.md ⚠ section; the `45f4725` incident |
-| Re-deriving ConPTY resize/reflow behavior because state polling coincides with resize artifacts | Settled; ConPTY's bug, not ours; "let ConPTY own the redraw" already tested and failed | docs/conpty-resize-reflow.md; CLAUDE.md gotcha |
+| Keyword-sniffing screen or output text for state ("Working…", "Allow?") | Agent UIs restyle across versions; the same fragility was rejected for chat kinds | `docs/chat-missing-features.md` "Explicitly NOT recommended" |
+| Parsing an agent's private state or session files | Another tool's private format rots under you; agent-teams integration was rejected for exactly this | same section |
+| Active interrogation — writing bytes into a Session to see how it reacts | You cannot know it is safe to write without the state you are trying to learn | mentions-design ⚠ section; the `SUBMIT_DELAY` incident |
+| Driving the agent through a structured protocol instead of the TUI | Foreman hosts the real interactive TUI; that route only works when you own the conversation | spec, Rejected alternatives |
+| Reading a provider's hook config to decide whether hooks are trusted | The icon check already covers "not installed", "not trusted", and "exited to shell" without reading private config | spec, States |
 
-## 9. Validation protocol — success is measured, never judged by eye
+## 6. READY_GRACE — a separate hardening item
 
-1. **Fixture set:** script real sessions end-to-end over the Control plane —
-   `foreman open` a claude and a codex worker, drive them with two-call `send`
-   (§6), label regimes by construction, capture the timestamped
-   snapshot/cursor series (the §6 loop with `*>` redirection) as fixture
-   files. Minimum: ≥20 labeled transitions per agent CLI, including ≥5
-   needs-input events.
-2. **Numeric gates — PROPOSALS pending user sign-off (get the numbers signed
-   before coding to them, per foreman-change-control):**
-   - G1: **zero** false needs-input during one continuous 10-minute streaming
-     run, polled at 4 Hz.
-   - G2: needs-input latched within **2s** of the permission prompt appearing
-     on ≥**95%** of labeled transitions in the fixture set.
-   - G3: flap bound — at most **1** state change per constructed transition
-     (hysteresis actually works; no strobing badge).
-   - G4 acid test: one full real Claude task and one full Codex task run to
-     completion with detection enabled and behave identically to a control
-     run. For the passive composite this must be trivially true — the
-     detector writes **zero bytes** into any Session, provable by code review
-     of the module's inputs, and that invariant is the design's core selling
-     point. State it in the module docs.
-3. Classifier changes re-run the whole fixture set; a fixture that flakes gets
-   investigated, not deleted. Evidence standards and what counts as proof:
-   **foreman-validation-and-qa**. Measurement tooling (probe loops, screenshot
-   verification, latency harness patterns): **foreman-diagnostics-and-tooling**.
+A Session whose child never answers the startup DSR never latches Ready, so
+`inject_input` queues forever and the Outbox never delivers. The remedy is a
+timeout fallback latch, `READY_GRACE`, designed in
+`docs/followups-latency-and-control.md` §2 and still unbuilt. It is **not a
+gate on agent-state work** and never was a dependency of the hook design.
 
-## 10. Promotion path (in order; each step gated)
+What a builder needs to know:
 
-1. **Pure module + fixture tests** land first — no UI, no behavior change to
-   injection or delivery. Gates G1-G3 green on fixtures.
-2. **UI badge** behind the existing per-frame flow: the badge paints during
-   the draw pass; any interaction it triggers ("jump to next needs-you",
-   focus changes) is recorded and applied as a **Deferred action** — the draw
-   pass must not mutate nested window managers mid-render. Threading model
-   and seam map: **foreman-architecture-contract**.
-3. **Docs + vocabulary:** a feature doc under `docs/` (per the house docs
-   system — **foreman-docs-and-writing**) and a CONTEXT.md glossary entry
-   naming the states with their avoid-synonyms. The state names are ubiquitous
-   language from that moment on.
-4. **User sign-off gates** per **foreman-change-control**: state vocabulary,
-   the G1-G3 numbers, any Outbox/delivery coupling (making chat delivery wait
-   on "not working" would finally solve mentions-design row 5 — that is a
-   separate, explicitly gated change, not a freebie), and any new
-   Control-plane verb from option (d). Commit only when asked.
+- **Placement is ruled.** `src/ready.rs`'s module doc says the grace is
+  deliberately not in the pure gate, because the gate never reads the clock.
+  It belongs in the caller that owns the clock, feeding the gate an injected
+  `now`. Make the grace injectable so the path is deterministically testable.
+- **The pre-check is mandatory.** The existing Ready tests use `cmd.exe /c
+  pause`, which *does* emit DSR. A grace-path test needs a child that
+  provably never DSRs; prove that first with a huge grace and assert
+  `ready()` stays false.
+- **Probe carefully.** Plain `rg READY_GRACE src/` false-passes because the
+  comment names it. Use `rg -n "const READY_GRACE" src/` — expect nothing
+  until it is built.
+
+Route the change through **foreman-change-control**; the frontier framing is
+in **foreman-research-frontier**.
+
+## 7. Fallback: output-based detection for agents with no hooks
+
+Only for an agent CLI that exposes no lifecycle hooks. Not the product route,
+and it cannot deliver Needs you (section 1). What it can honestly deliver is a
+three-bin detector: working (bytes flowing), quiet, exited.
+
+- **Inputs that already exist in-process:** `Session::output_gen`
+  (`src/terminal.rs`), the pure quiescence `settle_tick` (`src/wm.rs`) with
+  its user-editable window `Settings::send_settle_ms` (`src/config.rs`), the
+  cursor from `snapshot --cursor` (`src/inspect.rs`), and `Session::exited`.
+  The old cursor-rest gate was deleted; `git show 7fda1c2:src/caret.rs` is the
+  worked example if you need resting-vs-redrawing again.
+- **Shape:** a pure module fed observations per frame, unit-tested against
+  recorded fixtures from labeled regimes (section 3), with every constant
+  injectable. Predict first, then measure (**foreman-research-methodology**).
+- **Gates before it paints anything:** zero false "needs you" over a long
+  streaming run, a flap bound of one transition per constructed transition,
+  and an acid run that behaves identically to a control run — trivially true
+  because the detector writes zero bytes. Numbers are user sign-off items.
+- **OSC 133 prompt marks** are a candidate signal for plain shells only
+  (`docs/warp-feature-candidates.md` #1); they stop flowing the moment a TUI
+  agent starts.
+
+If the fallback ever grows a "needs you" bin, that is a scope change: stop
+and get sign-off.
 
 ## When NOT to use this skill
 
 - Running `send`/`snapshot`/`status` or looking up CLI flags →
-  **foreman-run-and-operate** (this skill uses those verbs as instruments; it
-  is not their reference).
-- Debugging a Session that is actually broken (black pane, swallowed input) →
+  **foreman-run-and-operate**.
+- A Session that is actually broken (black pane, swallowed input) →
   **foreman-debugging-playbook**.
+- Hook file layout, `CLAUDE_CONFIG_DIR`, or the installer setting →
+  **foreman-config-and-flags**.
 
 ## Provenance and maintenance
 
-The campaign is design-stage. The claims worth re-checking before you build on
-them:
-
 | Claim | Re-verify |
 |---|---|
-| Still unbuilt — no grace latch, no state module, no state verb | `rg -n "const READY_GRACE" src/; rg -ni "agent_state" src/; rg -ni "agentstate" src/` — no output from any of them. (Plain `rg -n "READY_GRACE" src/` false-passes: `src/ready.rs`'s module docs name it as a *future* fallback.) |
-| The settle default is a user setting, not a constant, and stays under the caps | `rg -n "send_settle_ms" src/config.rs; rg -n "MAX_SETTLE_MS" src/wm.rs` |
-| Ready latch + inject queue still the only state bit | `rg -n "ready" src/ready.rs; rg -n "self.ready = true" src/terminal.rs` |
-| Quiescence gating still UNSOLVED in the mentions design | `rg -n "unsolved" docs/superpowers/specs/2026-06-10-chat-mentions-design.md` |
-| Codex-sets-username title quirk still holds | `rg -n "username" docs/tab-icons.md` |
+| Hook-driven state is in the tree | `rg -n "fn apply_hook_event" src/wm.rs; rg -n "AgentStateSlot" src/agent_state.rs` — hits expected |
+| The icon gate ranks by depth under the shell | `rg -n "fn detect_agent" src/proc.rs` and read its doc comment |
+| READY_GRACE still unbuilt | `rg -n "const READY_GRACE" src/` — expect nothing |
+| The settle default is a setting under a hard cap | `rg -n "send_settle_ms" src/config.rs; rg -n "MAX_SETTLE_MS" src/wm.rs` |
+| Quiescence gating still unsolved in the mentions design | `rg -n "unsolved" docs/superpowers/specs/2026-06-10-chat-mentions-design.md` |
+| Codex-sets-username title quirk | `rg -n "username" docs/tab-icons.md` |
