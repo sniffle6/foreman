@@ -24,16 +24,18 @@ supported source agent:
 Claude and Codex files are merged semantically. Unrelated hooks are preserved,
 Foreman's entry is deduplicated, malformed configuration is refused, and the
 original gets a one-time `.pre-foreman.bak` backup. Grok gets its own file.
-Disabling naming leaves these guarded entries installed. They may still launch
-the small local helper, but Foreman discards the event and never starts a naming
-provider while the setting is off. Claude and Codex run the passive hook
+The same hook command also serves the agent-state badges
+(`docs/agent-state.md`): the installer derives the event set from both settings
+and reruns when either changes. Disabling naming removes the managed handlers
+from events no longer wanted; with both settings off none remain. Foreman never
+starts a naming provider while the setting is off. Claude and Codex run the passive hook
 asynchronously; Grok documents `UserPromptSubmit` itself as non-blocking. This
 is separate from **Install agent skills on launch**.
 
 The hook sends at most 2,000 characters of the current meaningful prompt, the
 source Session identity, and the agent-provided transcript path over a bounded,
 one-way local pipe. It never reads the transcript or calls a model. Listener
-connections have a one-second read deadline and at most eight may be active. The GUI
+connections have a one-second read deadline and at most 32 may be active. The GUI
 accepts at most one naming attempt per upstream agent session, then a single
 background worker may add up to three 600-character opening prompts and one
 prior title from a bounded transcript prefix. At most 3,800 user-prompt

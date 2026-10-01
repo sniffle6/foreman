@@ -50,7 +50,9 @@ which is a plain shell, the way browser favicons tell tabs apart.
   4. **Shell type** — a plain shell falls back to its `Shell`'s glyph.
 
   Each layer reverts cleanly: when the agent exits, its argv/title/process all
-  go away and the icon falls back to the shell glyph.
+  go away and the icon falls back to the shell glyph. The icon also gates the
+  Sessions-panel agent-state badge: a badge shows only while the detected icon
+  matches the hook event's provider (`docs/agent-state.md`).
 - **Drawing.** The tab paint in `src/wm.rs` asks each tab's `Content` for an
   `IconKind`, gets the texture from `icons::texture`, and paints it left of the
   label via `painter.image(..)`.

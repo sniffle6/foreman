@@ -84,6 +84,21 @@ Session (not the Win); a single app-wide preference can silence all Bell
 attention (visual now; sound/push later).
 _Avoid_: alert, notification, toast (reserve those for later supervision push).
 
+**Agent state**:
+Working / Needs you / Idle of an agent Session, derived from the provider's
+lifecycle hooks and shown as a label on its Sessions-panel row.
+_Avoid_: status, activity.
+
+**Needs you**:
+The agent state in which the agent is blocked on the human: a permission prompt
+or a question.
+_Avoid_: waiting, blocked, needs-input.
+
+**Done marker**:
+Set on an agent Session when a turn ends; cleared when the Session gets keyboard
+focus, in the same place the Bell clears.
+_Avoid_: finished, complete, unread.
+
 ### Input & control
 
 **Leader**:

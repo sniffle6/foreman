@@ -5,6 +5,11 @@ description: Use when implementing or planning per-Session agent-state detection
 
 # Agent-State Campaign: needs-input / working / done / idle per Session
 
+> **SUPERSEDED (2026-09-25):** Agent state ships from provider lifecycle hooks,
+> not passive PTY detection. See `docs/agent-state.md` and
+> `docs/superpowers/specs/2026-09-25-agent-state-design.md`. Kept for the
+> Ready/READY_GRACE material and decision history.
+
 **Status: DESIGN-STAGE. Nothing in this campaign is built.** Confirm with
 `rg -n "READY_GRACE|agentstate" src/` — no hits means this is still a runbook,
 not a description of shipped code. Every phase has an exit gate; do not skip
