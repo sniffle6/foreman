@@ -6344,6 +6344,38 @@ impl WindowManager {
         None
     }
 
+    /// Apply a hook event to the Session it names. Terminal ids repeat across
+    /// projects, so the project tag must match too. A provider that does not
+    /// match the pane's icon is another agent running inside this one; its
+    /// events are dropped so they cannot overwrite the pane's state.
+    pub fn apply_hook_event(&mut self, event: &crate::title_notify::TitlePromptEvent) -> bool {
+        if self.tag.as_deref() == event.project_id.as_deref() {
+            for window in &mut self.windows {
+                for tab in &mut window.tabs {
+                    let Content::Terminal(session) = &mut tab.content else {
+                        continue;
+                    };
+                    if term_tag(session.term_id()) != event.terminal_id {
+                        continue;
+                    }
+                    if !source_matches_icon(event.source_agent, session.icon_kind()) {
+                        return false;
+                    }
+                    session
+                        .agent_state_mut()
+                        .apply(event.source_agent, event.hook_event);
+                    return true;
+                }
+            }
+        }
+        self.windows.iter_mut().any(|window| {
+            window.tabs.iter_mut().any(|tab| match &mut tab.content {
+                Content::Project(child) => child.apply_hook_event(event),
+                _ => false,
+            })
+        })
+    }
+
     /// Apply a worker result only if its complete identity still names the
     /// pending request. A stale result is indistinguishable from no result.
     pub fn apply_title_result(&mut self, result: crate::terminal_titles::TitleResult) -> bool {
@@ -10350,6 +10382,63 @@ mod tests {
             snapshot.windows[0].tabs[0].title,
             format!("Claude  ·  #{id}")
         );
+    }
+
+    #[test]
+    fn hook_events_reach_only_the_matching_project_terminal_and_provider() {
+        use crate::agent_state::{AgentState, HookEvent};
+        use crate::terminal_titles::SourceAgent;
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p9".into());
+        let id = wm.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        {
+            let window = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session.set_osc_title_for_test(Some("claude".into()));
+        }
+        let event = |source: SourceAgent, project: &str, hook_event: HookEvent| {
+            crate::title_notify::TitlePromptEvent {
+                source_agent: source,
+                hook_event,
+                vendor_session_id: "s1".into(),
+                transcript_path: None,
+                project_id: Some(project.into()),
+                terminal_id: term_tag(id),
+                prompt: None,
+            }
+        };
+        let state = |wm: &mut WindowManager| {
+            let window = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session
+                .agent_state()
+                .badge(session.icon_kind(), false)
+                .map(|b| b.state)
+        };
+        assert!(
+            !wm.apply_hook_event(&event(
+                SourceAgent::Claude,
+                "p1",
+                HookEvent::UserPromptSubmit
+            )),
+            "terminal ids repeat across projects"
+        );
+        assert_eq!(state(&mut wm), None);
+        assert!(wm.apply_hook_event(&event(
+            SourceAgent::Claude,
+            "p9",
+            HookEvent::PermissionRequest
+        )));
+        assert_eq!(state(&mut wm), Some(AgentState::NeedsYou));
+        // Codex launched from this Claude pane's Bash tool shares its terminal
+        // id. Its events must not overwrite the pane's state.
+        assert!(!wm.apply_hook_event(&event(SourceAgent::Codex, "p9", HookEvent::Stop)));
+        assert_eq!(state(&mut wm), Some(AgentState::NeedsYou));
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub enum Field {
     InstallSkills,
     DispatchWorktrees,
     AutoNameAgentSessions,
+    AgentStateBadges,
     TitleProvider,
     TitleModel,
     CrewStale,
@@ -197,6 +198,12 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 field: Field::AutoNameAgentSessions,
                 label: "Automatically name agent Sessions",
                 desc: "Enabling installs guarded global hooks; Codex may ask you to trust its hook",
+                kind: Kind::Toggle,
+            },
+            RowSpec {
+                field: Field::AgentStateBadges,
+                label: "Show agent state in the Sessions panel",
+                desc: "Installs guarded global hooks on a few lifecycle events; Codex may ask you to trust them",
                 kind: Kind::Toggle,
             },
             RowSpec {
@@ -358,6 +365,7 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::InstallSkills => flip(&mut s.install_skills),
         Field::DispatchWorktrees => flip(&mut s.dispatch_worktrees),
         Field::AutoNameAgentSessions => flip(&mut s.auto_name_agent_sessions),
+        Field::AgentStateBadges => flip(&mut s.agent_state_badges),
         Field::TitleProvider => {
             let next = match (s.title_provider, a) {
                 (NamingProvider::Codex, Adjust::Inc | Adjust::Toggle) => NamingProvider::Claude,
@@ -403,6 +411,7 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::InstallSkills => s.install_skills.to_string(),
         Field::DispatchWorktrees => s.dispatch_worktrees.to_string(),
         Field::AutoNameAgentSessions => s.auto_name_agent_sessions.to_string(),
+        Field::AgentStateBadges => s.agent_state_badges.to_string(),
         Field::TitleProvider => s.title_provider.label().to_string(),
         Field::TitleModel => s.title_model.clone(),
         Field::CrewStale => {

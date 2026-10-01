@@ -323,6 +323,9 @@ pub struct Settings {
     /// Generate one title from the first meaningful prompt in each new agent
     /// Session. Off by default because the prompt crosses a provider boundary.
     pub auto_name_agent_sessions: bool,
+    /// Show Working / Needs you / Idle on agent rows in the Sessions panel.
+    /// Enabling installs guarded global lifecycle hooks; disabling removes them.
+    pub agent_state_badges: bool,
     /// Installed CLI used for Session-title generation.
     pub title_provider: NamingProvider,
     /// Provider model id. Blank means that CLI's configured default.
@@ -367,6 +370,7 @@ impl Default for Settings {
             install_skills: true,
             dispatch_worktrees: true,
             auto_name_agent_sessions: false,
+            agent_state_badges: false,
             title_provider: NamingProvider::Codex,
             title_model: "gpt-5.6-luna".into(),
             crew_stale_secs: 300,
@@ -564,6 +568,7 @@ mod tests {
         assert_eq!(s.crew_stale_secs, 300);
         assert_eq!(s.send_settle_ms, 120);
         assert!(!s.auto_name_agent_sessions);
+        assert!(!s.agent_state_badges);
         assert_eq!(s.title_provider, NamingProvider::Codex);
         assert_eq!(s.title_model, "gpt-5.6-luna");
         assert!(s.restore_workspace);
@@ -627,6 +632,7 @@ mod tests {
         s.copy_on_select = true;
         s.default_project_dir = "H:\\claude code".into();
         s.auto_name_agent_sessions = true;
+        s.agent_state_badges = true;
         s.title_provider = NamingProvider::Grok;
         s.title_model = "grok-code-fast-1".into();
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
@@ -634,6 +640,7 @@ mod tests {
         assert!(back.copy_on_select);
         assert_eq!(back.default_project_dir, "H:\\claude code");
         assert!(back.auto_name_agent_sessions);
+        assert!(back.agent_state_badges);
         assert_eq!(back.title_provider, NamingProvider::Grok);
         assert_eq!(back.title_model, "grok-code-fast-1");
     }

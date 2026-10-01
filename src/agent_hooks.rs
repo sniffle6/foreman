@@ -23,8 +23,7 @@ impl HookWants {
     pub fn from_settings(settings: &crate::config::Settings) -> Self {
         Self {
             naming: settings.auto_name_agent_sessions,
-            // Task 4 wires the setting.
-            state: false,
+            state: settings.agent_state_badges,
         }
     }
 }

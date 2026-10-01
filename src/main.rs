@@ -101,6 +101,8 @@ struct App {
     title_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// At most one background hook installation/update at a time.
     hook_install: Option<std::sync::mpsc::Receiver<agent_hooks::InstallReport>>,
+    /// A hook install was requested while one was running; rerun when it ends.
+    hook_reinstall: bool,
     /// Content-free, rate-limited GUI diagnostic for the title lane. Release
     /// builds have no useful stderr surface, so provider failures must not be
     /// invisible to the user.
@@ -251,6 +253,7 @@ impl App {
             title_results: title.results,
             title_epoch: title.epoch,
             hook_install: title.hook_install,
+            hook_reinstall: false,
             last_title_error: None,
             update_rx,
             update_fx,
@@ -309,7 +312,10 @@ impl App {
         let mut activity = false;
         while let Ok(event) = self.title_events.try_recv() {
             activity = true;
-            if !self.settings.auto_name_agent_sessions {
+            // State applies even while badges are hidden, so enabling the
+            // setting shows the current state instead of waiting for a turn.
+            self.desktop.apply_hook_event(&event);
+            if event.prompt.is_none() || !self.settings.auto_name_agent_sessions {
                 continue;
             }
             let epoch = self.title_epoch.load(std::sync::atomic::Ordering::Acquire);
@@ -360,7 +366,19 @@ impl App {
         }
     }
 
-    fn poll_hook_install(&mut self) {
+    /// At most one installer runs at a time; a request during a run is kept
+    /// and replayed when it finishes, so a quick on-off-on never loses the
+    /// final state.
+    fn request_hook_install(&mut self, ctx: &egui::Context) {
+        if self.hook_install.is_some() {
+            self.hook_reinstall = true;
+            return;
+        }
+        let wants = agent_hooks::HookWants::from_settings(&self.settings);
+        self.hook_install = Some(agent_hooks::spawn_install(ctx.clone(), wants));
+    }
+
+    fn poll_hook_install(&mut self, ctx: &egui::Context) {
         let Some(receiver) = &self.hook_install else {
             return;
         };
@@ -370,19 +388,20 @@ impl App {
         self.hook_install = None;
         if report.errors.is_empty() {
             let detail = if report.changed == 0 {
-                "Agent naming hooks are up to date".to_string()
+                "Agent hooks are up to date".to_string()
             } else {
-                format!("Agent naming hooks installed ({})", report.changed)
+                format!("Agent hooks installed ({})", report.changed)
             };
             self.notify.push(notify::Level::Success, detail);
         } else {
             self.notify.push(
                 notify::Level::Error,
-                format!(
-                    "Agent naming hook install failed: {}",
-                    report.errors.join("; ")
-                ),
+                format!("Agent hook install failed: {}", report.errors.join("; ")),
             );
+        }
+        if self.hook_reinstall {
+            self.hook_reinstall = false;
+            self.request_hook_install(ctx);
         }
     }
 
@@ -407,7 +426,7 @@ impl App {
         if self.drain_title_events() {
             ctrl_activity = true;
         }
-        self.poll_hook_install();
+        self.poll_hook_install(ctx);
         ctrl_activity
     }
 
@@ -998,7 +1017,7 @@ impl eframe::App for App {
         // their own fields below — the menu never touches those, so live_cfg's
         // copies of them equal this frame's seed and won't stomp a live zoom.
         let live_cfg = config::live(&ctx);
-        let naming_was_enabled = self.settings.auto_name_agent_sessions;
+        let wants_before = agent_hooks::HookWants::from_settings(&self.settings);
         let naming_changed = self.settings.auto_name_agent_sessions
             != live_cfg.auto_name_agent_sessions
             || self.settings.title_provider != live_cfg.title_provider
@@ -1011,15 +1030,9 @@ impl eframe::App for App {
             self.title_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             self.desktop.invalidate_title_requests();
-            if !naming_was_enabled
-                && self.settings.auto_name_agent_sessions
-                && self.hook_install.is_none()
-            {
-                self.hook_install = Some(agent_hooks::spawn_install(
-                    ctx.clone(),
-                    agent_hooks::HookWants::from_settings(&self.settings),
-                ));
-            }
+        }
+        if agent_hooks::HookWants::from_settings(&self.settings) != wants_before {
+            self.request_hook_install(&ctx);
         }
         let live = terminal::font_size(&ctx);
         if live != self.settings.font_size {
@@ -1440,19 +1453,18 @@ fn main() -> eframe::Result {
             // carry FOREMAN_PIPE pointing here, so their CLI calls reach THIS
             // host even when another foreman also serves the well-known name.
             std::thread::spawn(move || control::serve(control::instance_pipe(), inst_tx, inst_ctx));
-            let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(16);
+            // Tool-heavy turns across several panes send more than one hook
+            // event between frames.
+            let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(64);
             let title_ctx = cc.egui_ctx.clone();
             let title_pipe = title_pipe.clone();
             std::thread::spawn(move || title_notify::serve(&title_pipe, title_event_tx, title_ctx));
             let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
             let (title_request_tx, title_result_rx) =
                 terminal_titles::spawn_worker(title_epoch.clone(), cc.egui_ctx.clone());
-            let hook_install = startup_settings.auto_name_agent_sessions.then(|| {
-                agent_hooks::spawn_install(
-                    cc.egui_ctx.clone(),
-                    agent_hooks::HookWants::from_settings(&startup_settings),
-                )
-            });
+            let wants = agent_hooks::HookWants::from_settings(&startup_settings);
+            let hook_install = (wants != agent_hooks::HookWants::default())
+                .then(|| agent_hooks::spawn_install(cc.egui_ctx.clone(), wants));
             let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
             let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
             // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch

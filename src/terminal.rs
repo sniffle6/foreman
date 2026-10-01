@@ -663,6 +663,9 @@ pub struct Session {
     /// `spawn_argv`); `None` for a plain interactive shell. Drives the tab's
     /// agent logo (claude/codex) — see `icon_kind`.
     dispatch_argv: Option<Vec<String>>,
+    /// Hook-driven agent state for the Sessions panel badge. Pure; fed by
+    /// `WindowManager::apply_hook_event`, never by the PTY.
+    agent_state: crate::agent_state::AgentStateSlot,
     /// PID of the process we spawned into the PTY (the shell, or a dispatched
     /// command). Root for the process-tree agent scan that catches a hand-typed
     /// `claude`/`codex` — see `icon_kind`.
@@ -969,6 +972,14 @@ impl Session {
         }
     }
 
+    pub fn agent_state(&self) -> &crate::agent_state::AgentStateSlot {
+        &self.agent_state
+    }
+
+    pub fn agent_state_mut(&mut self) -> &mut crate::agent_state::AgentStateSlot {
+        &mut self.agent_state
+    }
+
     /// Test hook: latch the Bell without parsing a real BEL (wm paint
     /// helpers). Production rings only via the `Listener`.
     #[cfg(test)]
@@ -1088,6 +1099,7 @@ impl Session {
             exit_noted: false,
             shell,
             dispatch_argv: None,
+            agent_state: Default::default(),
             root_pid,
             term_id: 0,
             cols,
@@ -2004,6 +2016,7 @@ impl Session {
         // the focused pane never flickers the chrome for one frame).
         if active {
             self.clear_bell();
+            self.agent_state.clear_finished();
         }
         let metrics = crate::geom::CellMetrics::new(rect, cw, rh, cols, rows);
         let search_was_open = self.search.is_open();
