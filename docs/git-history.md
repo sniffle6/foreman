@@ -310,11 +310,20 @@ changelists mode). JetBrains is the spec: where this doc is silent, do what
 JetBrains does. Opening again surfaces the existing window. It is the only
 Git window that writes; History and Diff stay read-only.
 
-The header shows the branch ("On main", or "Detached HEAD"), the change
-count, and **Merging** while a merge is in progress. On its right: **Add to
-VCS (N)** (only when unversioned files are checked), **Push…**,
-**Directories** (group by directory, or a flat list sorted by file name with
-the folder dimmed after it), **Expand All**, **Collapse All**.
+The top is an icon toolbar (`toolbar.rs`), then one line with the branch
+("On main", or "Detached HEAD"), the change count, and **Merging** while a
+merge is in progress; that line truncates. Buttons, in order: **Refresh**
+(only when the watch can't follow), **Add to VCS (N)** (only when unversioned
+files are checked), **Push…**, **Directories** (group by directory, or a flat
+list sorted by file name with the folder dimmed after it), **Expand All**,
+**Collapse All**. Names and explanations are in the tooltips.
+
+**Narrow window:** nothing overlaps, like JetBrains. Toolbar buttons that
+don't fit fold behind a **>** button, which opens a menu with them as labeled
+rows. In the commit row, **Commit** stays and **Commit and Push…** and **AI
+message** move behind a **⋯** menu. The file tree scrolls sideways on its own.
+Whether the commit row fits is measured from the real button text each frame,
+so a longer label (Amend) or a font change needs no constant edited.
 
 Files sit under collapsible sections, in the same status colors as the
 commit details:
@@ -716,6 +725,8 @@ No native screenshot of the pill yet.
   multi-select model, checkboxes (`grouped`, `toggle_checks`), flat vs
   directory grouping (`set_flat`), keyboard, the `MenuItem` / `TreeEvent`
   menu seam, and `status_color`.
+- `src/git_history/toolbar.rs`: the icon toolbar with its ">" overflow menu; also the
+  painted icons and the `⋯` button the commit row reuses.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
   parser (`combined` for the one-letter status), the path-keyed checks and
   `scope` (what Commit takes), the tree's context menu (`menu`, and `write`

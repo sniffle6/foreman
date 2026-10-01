@@ -9,6 +9,7 @@ mod file_tree;
 mod git;
 mod push;
 mod scope;
+mod toolbar;
 pub(crate) mod watch;
 pub use changes::ChangesView;
 pub use diff_view::{DiffTarget, DiffView, Stage};

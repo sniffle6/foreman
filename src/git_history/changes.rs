@@ -10,6 +10,7 @@
 use super::commit::{CommitPanel, Scope, Write};
 use super::file_tree::{self, ChangedFile, FileTree, MenuItem, TreeEvent};
 use super::push::{self, PushDialog};
+use super::toolbar::{self, Glyph, Tool};
 use super::{DiffTarget, HistoryAct, Stage, git, watch};
 use eframe::egui;
 use std::collections::HashSet;
@@ -24,6 +25,17 @@ use std::time::{Duration, Instant};
 /// Without a live watch, becoming active re-reads the status unless the last
 /// read started this recently.
 const REFOCUS_DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// What a toolbar button does.
+#[derive(Clone, Copy, PartialEq)]
+enum Bar {
+    Refresh,
+    Add,
+    Push,
+    Directories,
+    Expand,
+    Collapse,
+}
 
 /// Section headings in display order, each file's diff, and whether its rows
 /// carry checkboxes. Conflicts only appear while a merge has them.
@@ -769,7 +781,7 @@ impl ChangesView {
         );
         ui.set_clip_rect(tree_rect.intersect(ui.clip_rect()));
         zoom.apply(&mut ui);
-        self.toolbar(&mut ui);
+        self.toolbar(&mut ui, scale);
         let busy = self.commit.busy();
         // A dialog owns Enter and Esc while it's up.
         let keys = active && self.confirm.is_none() && self.push.is_none();
@@ -837,101 +849,127 @@ impl ChangesView {
             }
         }
     }
-    /// The header: branch and count on the left; Add to VCS (checked
-    /// unversioned files), Push…, grouping and expand/collapse on the right.
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    /// The header: an icon toolbar (Refresh when the watch can't, Add to VCS
+    /// for checked unversioned files, Push…, Directories, Expand/Collapse All)
+    /// that folds what doesn't fit behind a ">" menu, then the branch and
+    /// change count on one truncating line.
+    fn toolbar(&mut self, ui: &mut egui::Ui, scale: f32) {
         let th = crate::theme::live(ui.ctx());
-        let (mut refresh, mut add_now) = (false, false);
         let add = self.checked_unversioned();
         let busy = self.commit.busy();
+        let (mut cmds, mut tools) = (Vec::new(), Vec::new());
+        let mut tool = |cmd, glyph, label: &str, hint: &str, enabled, on| {
+            let (label, hint) = (label.to_owned(), hint.to_owned());
+            cmds.push(cmd);
+            tools.push(Tool {
+                glyph,
+                label,
+                hint,
+                enabled,
+                on,
+            });
+        };
+        // A live watch re-reads on every change; Refresh is only for when it
+        // can't.
+        if self.follow.down() || matches!(self.status, Some(Err(_))) {
+            let hint = super::refresh_hint(self.follow.down());
+            tool(Bar::Refresh, Glyph::Refresh, "Refresh", hint, true, false);
+        }
+        if let Some(Ok(status)) = &self.status {
+            if !add.is_empty() {
+                let label = format!("Add to VCS ({})", add.len());
+                let hint = "Put the checked unversioned files under version control";
+                tool(Bar::Add, Glyph::Add, &label, hint, !busy, false);
+            }
+            let can_push = !busy
+                && self.push.is_none()
+                && status.branch.as_deref().is_some_and(|b| b != "(detached)");
+            let hint = "Review the outgoing commits, then push";
+            tool(Bar::Push, Glyph::Push, "Push…", hint, can_push, false);
+            let hint = "Group files by directory, or list them flat";
+            tool(
+                Bar::Directories,
+                Glyph::Directories,
+                "Directories",
+                hint,
+                true,
+                !self.flat,
+            );
+            let hint = "Expand every section and folder";
+            tool(Bar::Expand, Glyph::Expand, "Expand All", hint, true, false);
+            let hint = "Collapse every section and folder";
+            tool(
+                Bar::Collapse,
+                Glyph::Collapse,
+                "Collapse All",
+                hint,
+                true,
+                false,
+            );
+        }
+        let clicked = toolbar::show(ui, &tools, scale).map(|i| cmds[i]);
         ui.horizontal(|ui| {
+            if self.request.as_ref().is_some_and(|r| !r.quiet) {
+                ui.spinner();
+            }
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let part = |color| egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            };
+            let mut job = egui::text::LayoutJob::default();
+            let mut merging = false;
             match &self.status {
                 Some(Ok(status)) => {
                     let branch = match status.branch.as_deref() {
                         Some("(detached)") | None => "Detached HEAD".to_owned(),
                         Some(name) => format!("On {name}"),
                     };
-                    ui.label(egui::RichText::new(branch).color(th.text).strong());
+                    job.append(&branch, 0.0, part(th.text));
                     let n = status.tree.files.len();
                     let count = if n == 1 {
-                        "1 change".into()
+                        "1 change".to_owned()
                     } else {
                         format!("{n} changes")
                     };
-                    ui.label(egui::RichText::new(count).color(th.dim));
+                    job.append(&count, 8.0 * scale, part(th.dim));
                     if status.merging {
-                        ui.label(egui::RichText::new("Merging").color(th.caret))
-                            .on_hover_text(
-                                "A merge is in progress: Commit takes every change, checked or not",
-                            );
+                        merging = true;
+                        job.append("Merging", 8.0 * scale, part(th.caret));
                     }
                 }
-                _ => {
-                    ui.label(egui::RichText::new("Working tree").color(th.text).strong());
-                }
+                _ => job.append("Working tree", 0.0, part(th.text)),
             }
-            if self.request.as_ref().is_some_and(|r| !r.quiet) {
-                ui.spinner();
+            let label = ui.add(egui::Label::new(job).truncate());
+            if merging {
+                label.on_hover_text(
+                    "A merge is in progress: Commit takes every change, checked or not",
+                );
             }
-            // A live watch re-reads on every change; Refresh is only for
-            // when it can't.
-            if self.follow.down() || matches!(self.status, Some(Err(_))) {
-                refresh = ui
-                    .button("Refresh")
-                    .on_hover_text(super::refresh_hint(self.follow.down()))
-                    .clicked();
-            }
-            let Some(Ok(status)) = &mut self.status else {
-                return;
-            };
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Collapse All")
-                    .on_hover_text("Collapse every section and folder")
-                    .clicked()
-                {
-                    status.tree.set_all_collapsed(true);
-                }
-                if ui
-                    .small_button("Expand All")
-                    .on_hover_text("Expand every section and folder")
-                    .clicked()
-                {
-                    status.tree.set_all_collapsed(false);
-                }
-                let mut grouped = !self.flat;
-                if ui
-                    .checkbox(&mut grouped, "Directories")
-                    .on_hover_text("Group files by directory, or list them flat")
-                    .changed()
-                {
-                    self.flat = !grouped;
-                    status.tree.set_flat(self.flat);
-                }
-                let can_push = !busy
-                    && self.push.is_none()
-                    && status.branch.as_deref().is_some_and(|b| b != "(detached)");
-                if ui
-                    .add_enabled(can_push, egui::Button::new("Push…").small())
-                    .on_hover_text("Review the outgoing commits, then push")
-                    .clicked()
-                    && let Some(cwd) = &self.cwd
-                {
+        });
+        let (mut refresh, mut add_now) = (false, false);
+        match clicked {
+            Some(Bar::Refresh) => refresh = true,
+            Some(Bar::Add) => add_now = true,
+            Some(Bar::Push) => {
+                if let Some(cwd) = &self.cwd {
                     self.push = Some(PushDialog::open(ui.ctx(), cwd));
                 }
-                if !add.is_empty()
-                    && ui
-                        .add_enabled(
-                            !busy,
-                            egui::Button::new(format!("Add to VCS ({})", add.len())).small(),
-                        )
-                        .on_hover_text("Put the checked unversioned files under version control")
-                        .clicked()
-                {
-                    add_now = true;
+            }
+            Some(Bar::Directories) => {
+                self.flat = !self.flat;
+                if let Some(Ok(status)) = &mut self.status {
+                    status.tree.set_flat(self.flat);
                 }
-            });
-        });
+            }
+            Some(bar @ (Bar::Expand | Bar::Collapse)) => {
+                if let Some(Ok(status)) = &mut self.status {
+                    status.tree.set_all_collapsed(bar == Bar::Collapse);
+                }
+            }
+            None => {}
+        }
         if add_now {
             self.start(ui.ctx(), Write::Track(add));
         }
@@ -1150,7 +1188,16 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, view: &mut ChangesView, active: bool, events: Vec<egui::Event>) {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 400.0));
+        frame_wide(ctx, view, active, events, 700.0);
+    }
+    fn frame_wide(
+        ctx: &egui::Context,
+        view: &mut ChangesView,
+        active: bool,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 400.0));
         let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(rect),
@@ -1200,6 +1247,26 @@ mod tests {
         }
         assert_eq!(files(&view), ["a.txt", "b.txt"]);
         assert!(quiet, "watch reads show no spinner");
+    }
+
+    #[test]
+    fn any_width_lays_out_without_panicking_and_keeps_the_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join("a.txt"),
+            "a
+",
+        )
+        .unwrap();
+        git(repo.path(), &["init", "-b", "main"]);
+        let ctx = egui::Context::default();
+        let mut view = ChangesView::new(Some(repo.path().to_path_buf()));
+        frame(&ctx, &mut view, true, vec![]);
+        settle(&ctx, &mut view, true);
+        for width in [700.0, 300.0, 140.0, 40.0, 0.0] {
+            frame_wide(&ctx, &mut view, true, vec![], width);
+        }
+        assert_eq!(files(&view), ["a.txt"]);
     }
 
     fn click_at(ctx: &egui::Context, view: &mut ChangesView, pos: egui::Pos2) {

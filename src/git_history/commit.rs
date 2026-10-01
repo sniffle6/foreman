@@ -5,6 +5,7 @@
 //! one at a time, so two never race for `index.lock`.
 use super::git::{self, GitError};
 use super::push::{self, Target};
+use super::toolbar::{self, Glyph, Tool};
 use crate::ai_oneshot::{self, LaunchError};
 use crate::config::NamingProvider;
 use eframe::egui;
@@ -629,6 +630,59 @@ impl CommitPanel {
             && !blank
             && !writing
             && self.ai.is_none();
+        let what = match (scope.files, scope.checked) {
+            (0, _) => "the message only".to_owned(),
+            (1, true) => "the 1 checked file".to_owned(),
+            (n, true) => format!("the {n} checked files"),
+            (1, false) => "the 1 changed file".to_owned(),
+            (n, false) => format!("all {n} changed files"),
+        };
+        let verb = if amend {
+            "Amend the last commit with"
+        } else {
+            "Commit"
+        };
+        let commit_label = if amend { "Amend Commit" } else { "Commit" };
+        let push_label = if amend {
+            "Amend Commit and Push…"
+        } else {
+            "Commit and Push…"
+        };
+        let provider = crate::config::live(ui.ctx()).title_provider;
+        let can_draft = cwd.is_some() && scope.files > 0 && !writing;
+        let draft_hint = format!(
+            "Draft a message from the diff of {what} with {} (Settings: session-title provider). Replaces the text below.",
+            ai_oneshot::program(provider)
+        );
+        // The full row, or just Commit and a "⋯" menu when it won't fit.
+        let compact = {
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let pad = ui.spacing().button_padding.x * 2.0;
+            let gap = ui.spacing().item_spacing.x;
+            let text = |t: &str| {
+                ui.painter()
+                    .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            };
+            let button = |t: &str| text(t) + pad + gap;
+            let spinner = ui.spacing().interact_size.y + gap;
+            let mut need = button(commit_label) + button(push_label);
+            if let Some(push) = self.committing {
+                let doing = if push {
+                    "Committing, then push…"
+                } else {
+                    "Committing…"
+                };
+                need += spinner + text(doing) + gap;
+            }
+            need += if self.ai.is_some() {
+                button("Cancel") + spinner + text("Writing message…")
+            } else {
+                button("AI message")
+            };
+            need > ui.available_width()
+        };
         ui.horizontal(|ui| {
             let why = if scope.conflicts {
                 "Resolve the conflicts first"
@@ -646,35 +700,54 @@ impl CommitPanel {
                     r.on_disabled_hover_text(why)
                 }
             };
-            let what = match (scope.files, scope.checked) {
-                (0, _) => "the message only".to_owned(),
-                (1, true) => "the 1 checked file".to_owned(),
-                (n, true) => format!("the {n} checked files"),
-                (1, false) => "the 1 changed file".to_owned(),
-                (n, false) => format!("all {n} changed files"),
-            };
-            let verb = if amend {
-                "Amend the last commit with"
-            } else {
-                "Commit"
-            };
-            let label = if amend { "Amend Commit" } else { "Commit" };
+            let ok_commit = format!("{verb} {what} (Ctrl+Enter)");
+            let ok_push = format!("{verb} {what}, then review the push");
             if hint(
-                ui.add_enabled(ready, egui::Button::new(label)),
-                &format!("{verb} {what} (Ctrl+Enter)"),
+                ui.add_enabled(ready, egui::Button::new(commit_label)),
+                &ok_commit,
             )
             .clicked()
             {
                 commit = Some(false);
             }
-            let label = if amend {
-                "Amend Commit and Push…"
-            } else {
-                "Commit and Push…"
-            };
+            if compact {
+                if self.committing.is_some() || self.ai.is_some() {
+                    ui.spinner();
+                }
+                let side = ui.spacing().interact_size.y;
+                let more = toolbar::button(ui, Glyph::Dots, side, true, false, "More actions");
+                let tool = |label: &str, hint: &str, enabled| Tool {
+                    glyph: Glyph::Dots,
+                    label: label.to_owned(),
+                    hint: hint.to_owned(),
+                    enabled,
+                    on: false,
+                };
+                let ai = self.ai.is_some();
+                let tools = [
+                    tool(push_label, if ready { &ok_push } else { why }, ready),
+                    if ai {
+                        tool("Cancel", "Stop writing the message", true)
+                    } else {
+                        tool("AI message", &draft_hint, can_draft)
+                    },
+                ];
+                match toolbar::overflow(&more, &tools) {
+                    Some(0) => commit = Some(true),
+                    Some(_) if ai => self.ai = None,
+                    Some(_) => {
+                        if let Some(cwd) = cwd {
+                            let paths = scope.checked.then(|| scope.paths.clone());
+                            self.start_draft(ui.ctx(), cwd.to_path_buf(), paths);
+                        }
+                    }
+                    None => {}
+                }
+                return;
+            }
             if hint(
-                ui.add_enabled(ready, egui::Button::new(label)),
-                &format!("{verb} {what}, then review the push"),
+                ui.add_enabled(ready, egui::Button::new(push_label)),
+                &ok_push,
             )
             .clicked()
             {
@@ -682,7 +755,11 @@ impl CommitPanel {
             }
             if let Some(push) = self.committing {
                 ui.spinner();
-                let doing = if push { "Committing, then push…" } else { "Committing…" };
+                let doing = if push {
+                    "Committing, then push…"
+                } else {
+                    "Committing…"
+                };
                 ui.label(egui::RichText::new(doing).color(th.dim));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -693,14 +770,9 @@ impl CommitPanel {
                     ui.spinner();
                     ui.label(egui::RichText::new("Writing message…").color(th.dim));
                 } else {
-                    let provider = crate::config::live(ui.ctx()).title_provider;
-                    let can = cwd.is_some() && scope.files > 0 && !writing;
                     let r = ui
-                        .add_enabled(can, egui::Button::new("AI message"))
-                        .on_hover_text(format!(
-                            "Draft a message from the diff of {what} with {} (Settings: session-title provider). Replaces the text below.",
-                            ai_oneshot::program(provider)
-                        ))
+                        .add_enabled(can_draft, egui::Button::new("AI message"))
+                        .on_hover_text(&draft_hint)
                         .on_disabled_hover_text("Nothing to commit");
                     if r.clicked()
                         && let Some(cwd) = cwd
