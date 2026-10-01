@@ -103,6 +103,9 @@ pub struct TabEntry {
     pub exited: bool,
     /// Terminal has a latched Bell (rang, not yet focused). Chat rows: false.
     pub bell: bool,
+    /// Hook-driven agent state; `None` = no badge (not an agent, no event yet,
+    /// or exited). Not gated by the setting here: the panel gates at paint.
+    pub agent: Option<crate::agent_state::AgentBadge>,
     /// Panel presentation rank (drives row order; `None` = unranked).
     pub rank: Option<u64>,
     /// Stable identity for drag-drop resolution across frames: the row's
@@ -400,6 +403,7 @@ impl PanelView {
         // session (minimized window, collapsed rail), so it drives its own
         // breathe repaint. Gated here like every other Bell paint site.
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
+        let state_gate = crate::config::live(ui.ctx()).agent_state_badges;
         if bell_gate && self.model.projects.iter().any(|pr| pr.bell) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(30));
@@ -495,6 +499,7 @@ impl PanelView {
                             background_tab: false,
                             exited: false,
                             bell: folded && bell_gate && proj.bell,
+                            agent: None,
                             project_row: true,
                             folder_collapsed: Some(folded),
                             drag_ref: Some(PanelRowRef {
@@ -529,6 +534,7 @@ impl PanelView {
                                 background_tab: !t.active_tab,
                                 exited: t.exited,
                                 bell: bell_gate && t.bell,
+                                agent: state_gate.then_some(t.agent).flatten(),
                                 project_row: false,
                                 folder_collapsed: None,
                                 drag_ref: Some(PanelRowRef {
@@ -962,6 +968,7 @@ impl PanelView {
     fn paint_columns(&mut self, ui: &mut egui::Ui, rect: egui::Rect, base: egui::Id) {
         let th = crate::theme::live(ui.ctx());
         let bell_gate = crate::terminal::bell_enabled(ui.ctx());
+        let state_gate = crate::config::live(ui.ctx()).agent_state_badges;
         let row_h = 22.0;
         let gap = 9.0; // pad + hairline + pad between groups
         let n = self.model.projects.len();
@@ -1005,6 +1012,7 @@ impl PanelView {
                     background_tab: false,
                     exited: false,
                     bell: folded && bell_gate && proj.bell,
+                    agent: None,
                     project_row: true,
                     folder_collapsed: Some(folded),
                     drag_ref: Some(PanelRowRef {
@@ -1038,6 +1046,7 @@ impl PanelView {
                         background_tab: !t.active_tab,
                         exited: t.exited,
                         bell: bell_gate && t.bell,
+                        agent: state_gate.then_some(t.agent).flatten(),
                         project_row: false,
                         folder_collapsed: None,
                         drag_ref: Some(PanelRowRef {
@@ -1748,8 +1757,15 @@ impl PanelView {
             54.0 // add + min + close buttons
         } else if over {
             38.0 // min + close buttons
+        } else if rp
+            .agent
+            .is_some_and(|b| b.state == crate::agent_state::AgentState::NeedsYou)
+        {
+            58.0 // "needs you" label outranks the bell dot
         } else if rp.bell {
             20.0 // pulsing bell dot
+        } else if rp.agent.is_some() {
+            50.0 // "working" / "idle" / "done" label
         } else if rp.minimized || rp.background_tab {
             26.0 // "min"/"tab" label
         } else {
@@ -1859,6 +1875,12 @@ impl PanelView {
                     plus_clicked = true;
                 }
             }
+        } else if let Some(badge) = rp
+            .agent
+            .filter(|b| b.state == crate::agent_state::AgentState::NeedsYou)
+        {
+            // Needs you blocks work, so it outranks the Bell.
+            paint_state_label(&p, row, badge, th.bell);
         } else if rp.bell {
             // Latched Bell: pulsing amber dot in the right-edge slot — the
             // attention cue outranks the "min"/"tab" state labels.
@@ -1871,6 +1893,9 @@ impl PanelView {
                     th.bell,
                 ),
             );
+        } else if let Some(badge) = rp.agent {
+            let color = if badge.finished { th.text } else { th.dim };
+            paint_state_label(&p, row, badge, color);
         } else if rp.minimized {
             p.text(
                 egui::pos2(row.max.x - 8.0, row.center().y),
@@ -1940,12 +1965,31 @@ struct RowPaintOwned {
     exited: bool,
     /// Latched Bell on this terminal row (already gated by the master switch).
     bell: bool,
+    /// Agent state label for this terminal row (already gated by the setting).
+    agent: Option<crate::agent_state::AgentBadge>,
     project_row: bool,
     /// `Some` on project rows: whether nested session rows are hidden.
     folder_collapsed: Option<bool>,
     /// Some = this row is a drag-reorder source (expanded modes). Rail rows
     /// stay None/non-draggable.
     drag_ref: Option<PanelRowRef>,
+}
+
+/// Agent state in the right-edge slot. Read-only: the draw pass never
+/// mutates state (focus clears the done marker in `Session::show`).
+fn paint_state_label(
+    p: &egui::Painter,
+    row: egui::Rect,
+    badge: crate::agent_state::AgentBadge,
+    color: egui::Color32,
+) {
+    p.text(
+        egui::pos2(row.max.x - 8.0, row.center().y),
+        egui::Align2::RIGHT_CENTER,
+        crate::agent_state::badge_label(badge),
+        egui::FontId::proportional(10.0),
+        color,
+    );
 }
 
 /// An up/down chevron as two line segments. The default egui fonts have no

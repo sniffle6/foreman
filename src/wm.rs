@@ -3969,6 +3969,12 @@ impl WindowManager {
                                 _ => false,
                             },
                             bell: t.content.bell_active(),
+                            agent: match &t.content {
+                                Content::Terminal(s) => {
+                                    s.agent_state().badge(s.icon_kind(), s.has_exited())
+                                }
+                                _ => None,
+                            },
                             rank: t.panel_order,
                             uid: t.tab_uid,
                         });
@@ -10723,6 +10729,56 @@ mod tests {
             m.focused = None;
         }
         m
+    }
+
+    #[test]
+    fn agent_state_reaches_the_panel_row() {
+        use crate::agent_state::{AgentState, HookEvent};
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        m.tag = Some("p1".into());
+        let id = m.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        m.add_terminal(Shell::Cmd, &ctx).expect("second shell");
+        {
+            let window = m.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session.set_osc_title_for_test(Some("claude".into()));
+        }
+        let ask = crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Claude,
+            hook_event: HookEvent::PermissionRequest,
+            vendor_session_id: "s1".into(),
+            transcript_path: None,
+            project_id: Some("p1".into()),
+            terminal_id: term_tag(id),
+            prompt: None,
+        };
+        assert!(m.apply_hook_event(&ask));
+
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let mut desk = WindowManager::new();
+        desk.push_win(7, Tab::fixed("proj", Content::Project(Box::new(m))), r);
+        let pm = desk.panel_model();
+        let states: Vec<Option<AgentState>> = pm.projects[0]
+            .tabs
+            .iter()
+            .map(|t| t.agent.map(|b| b.state))
+            .collect();
+        assert_eq!(
+            states
+                .iter()
+                .filter(|s| **s == Some(AgentState::NeedsYou))
+                .count(),
+            1,
+            "{states:?}"
+        );
+        assert_eq!(
+            states.iter().filter(|s| s.is_none()).count(),
+            1,
+            "plain shell shows nothing"
+        );
     }
 
     #[test]
