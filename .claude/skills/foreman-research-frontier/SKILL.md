@@ -1,6 +1,6 @@
 ---
 name: foreman-research-frontier
-description: Use when asking whether foreman work is novel or state-of-the-art, planning research-grade efforts (agent-state detection, headless agent self-verification, the chat-room A/B experiment, session persistence / daemon-client split, per-Session panic isolation, READY_GRACE), preparing any external claim, benchmark, blog post, or release, or when someone proposes reopening ConPTY resize reflow. Everything here is open or candidate — none of it is built.
+description: Use when asking whether foreman work is novel or state-of-the-art, planning research-grade efforts (agent state for hookless agents, headless agent self-verification, the chat-room A/B experiment, session persistence / daemon-client split, per-Session panic isolation, READY_GRACE), preparing any external claim, benchmark, blog post, or release, or when someone proposes reopening ConPTY resize reflow. Agent state for Claude/Codex/Grok shipped from provider hooks; everything else here is open or candidate and not built.
 ---
 
 # Foreman research frontier
