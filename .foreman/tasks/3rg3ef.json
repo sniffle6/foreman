@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "3rg3ef",
+  "title": "feat(git): commit panel with stage/unstage, commit+push, AI message",
+  "body": "Git Changes window: commit panel, Commit / Commit and Push, AI commit message. Design settled with the user (option A, no per-file checkboxes):\n- Commit = exactly what is in the Staged section. Disabled when nothing is staged.\n- Stage / Unstage per file from the Changes window (git add / git restore --staged). Row button or context menu.\n- Multi-line message box pinned at the bottom of src/git_history/changes.rs. git commit -F - on a worker. No timeout-kill (a killed commit leaves index.lock). Show hook stderr on failure; clear the message on success.\n- Commit and Push: git push with GIT_TERMINAL_PROMPT=0. With no upstream, push -u origin HEAD. Show a rejected push clearly.\n- Writes go through a new helper next to git::output. Do not bend the read-only helper (GIT_OPTIONAL_LOCKS=0; our reads must never wake the watch).\n- AI message button: one click, no chat. Uses the shared launcher from the refactor card and the persisted title_provider/model. Prompt = staged diff capped at ~32 KB (fall back to --stat) + git log --oneline -10 for style. Plain-text output, sanity-checked (non-empty, no code fence). Spinner + cancel.\n- Update docs/git-history.md: the \"without anything that writes\" line becomes false.\nDepends on the shared launcher refactor card.",
+  "state": "done",
+  "planned": {
+    "name": "Git commit panel",
+    "wave": 2
+  },
+  "created": "2026-09-29T03:56:22Z",
+  "updated": "2026-09-29T21:55:14Z"
+}

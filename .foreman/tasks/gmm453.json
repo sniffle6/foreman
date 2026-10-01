@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "gmm453",
+  "title": "Chat: idle-aware delivery gated on agent state, with --now urgency",
+  "body": "Follow-up to 1n3dmw (item 2 there, deferred). Chat injects as soon as ready() is true, even while the receiver is mid-turn, so a steer or blocker waits out a whole agent turn and can be stale by the time it is read. Gate injection on the per-Session agent state (working / needs-input / idle) and let a sender bypass the gate with an urgency flag (--now) for steers that must interrupt.\n\nDEPENDS ON the agent-state work, which is docs only so far: spec docs/superpowers/specs/2026-09-25-agent-state-design.md, plan docs/superpowers/plans/2026-09-25-agent-state.md. Nothing is built (no AgentState in src/). This card is an EXPANSION of that plan, not a duplicate: the plan only shows badges and promises zero bytes written into a Session. Gating injection is a new consumer of its AgentStateSlot. Do not start until the slot exists on Session.\n\nOpen design points: (1) what delivery does for a member with no state yet (badge hidden, hook not installed, non-Claude/Codex/Grok agent): fall back to today's ready()-only behaviour. (2) Whether a needs-input member (parked at a permission prompt) should receive posts at all: a paste there lands in the approval prompt. (3) --now is a wire change on the control plane (ChatRequest): skip_serializing_if, v1 byte-identical, see foreman-change-control. (4) Held posts keep the age stamp added in 1n3dmw (frame_at), so a held post shows how long it waited. (5) ReadyGate already queues one post per turn (ready.rs next_paste): the idle gate belongs there or in ChatRoom::tick, not in a second queue.\n\nPointers: docs/chat-delivery.md, src/ready.rs, src/chat.rs (tick_at), src/wm.rs chat_tick, foreman-agent-state-campaign skill.",
+  "state": "backlog",
+  "created": "2026-09-30T22:03:49Z",
+  "updated": "2026-09-30T22:03:49Z"
+}

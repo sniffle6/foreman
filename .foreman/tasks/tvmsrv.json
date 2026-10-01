@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "tvmsrv",
+  "title": "Agent state in the Sessions panel: Working / Needs you / Idle badges from provider hooks",
+  "body": "Implement docs/superpowers/plans/2026-09-25-agent-state.md against docs/superpowers/specs/2026-09-25-agent-state-design.md. Both are merged; no code exists yet (no src/agent_state.rs).\n\nGoal: show Working / Needs you / Idle (plus a done marker) for Claude, Codex and Grok Sessions in the Sessions panel, driven by provider lifecycle hooks. Foreman installs guarded global hooks that run 'foreman title-event --agent X --kind state'; events ride the existing private title pipe into a bounded channel; the GUI drains it into a pure AgentStateSlot on the matching Session; the panel reads a badge from the slot.\n\nPlan tasks (6): 1 pure state slot (src/agent_state.rs); 2 state lane on the title pipe (src/title_notify.rs); 3 state hook installer (src/agent_hooks.rs); 4 setting agent_state_badges (default false), install trigger, GUI drain; 5 panel badges (src/wm.rs, src/panel.rs); 6 live verification, docs, cleanup.\n\nConstraints from the plan: writes zero bytes into any Session; never blocks the GUI thread (try_recv only); events carry kind and IDs, never prompt or tool text; hooks are async; reinstall must leave hook files byte-identical or Codex demands re-trust. Read its Review Focus section first (huge PostToolUse payloads, subagent events, pane reuse, agent exiting without SessionEnd).\n\nUnblocks: card gmm453 (idle-aware chat delivery) consumes the AgentStateSlot this builds. Also read the foreman-agent-state-campaign skill, but note it is stale: it says nothing is built and lists READY_GRACE as Phase 0, while this plan takes the hook-driven route instead of screen sniffing. Reconcile the skill when this lands.",
+  "state": "backlog",
+  "created": "2026-09-30T22:24:17Z",
+  "updated": "2026-09-30T22:24:17Z"
+}

@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "jxayli",
+  "title": "fix(git): push can freeze the commit panel; timeout leaves GCM running",
+  "body": "Fix: a push can freeze the Git Changes commit panel for up to 5 minutes, and its timeout leaves Git Credential Manager running. Found by the grug review of b17a049; the push path was since reworked by b422ce9 (push dialog, src/git_history/push.rs), so re-locate it there.\nProblem:\n- GIT_TERMINAL_PROMPT=0 does not stop a GCM sign-in window, which can open behind foreman while the panel shows \"pushing\".\n- The push holds the panel's single write slot for up to PUSH_TIMEOUT (300 s): commit, add, rollback all wait, and there is no Cancel.\n- On timeout, git::write kills only git.exe (child.kill in src/git_history/git.rs). GCM is a grandchild and survives with its window open.\nFix:\n- Run push under crate::job::Job (as ai_oneshot does) so timeout/cancel kills the whole process tree.\n- Add a Cancel button while a push runs, wired to a cancel flag that the write path actually honors (the panel's Job currently ignores it for writes). Never cancel a commit or add (index.lock), only push.\n- Free the write slot as soon as the commit lands; run the push separately so a slow push never blocks the rest of the panel.\n- Timed-out or cancelled push: say the commit landed and the push can be retried.\nCleanups from the same review, if still present after b422ce9: CommitPanel's Drop that spawns a thread just to drop a Job (delete it); near-duplicate Report/Notice types, Outcome wrapping one bool, committing: Option<bool> just for spinner text (collapse); git::write's 20 ms try_wait loop when there is no timeout (call child.wait()).\nTests: a push that hangs is cancelled and its child tree is gone; the panel can commit again while a push is still running.\nUpdate docs/git-history.md.",
+  "state": "backlog",
+  "planned": {
+    "name": "Git commit panel",
+    "wave": 5
+  },
+  "created": "2026-09-30T04:15:37Z",
+  "updated": "2026-09-30T04:15:37Z"
+}

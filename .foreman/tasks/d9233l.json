@@ -3,7 +3,7 @@
   "id": "d9233l",
   "title": "Theme expert chat in Settings",
   "body": "Add a dedicated theme-expert chat inside Settings > Appearance, alongside the current editor and live preview. The user describes and refines a theme in multiple turns; show each validated proposal as a reversible preview, then Save & Apply through the existing user-theme flow. Accept structured Theme values only, without shell or arbitrary file edits. Offer Foreman-supported providers/models, defaulting to Codex with its configured default model unless the user chooses one. Start at docs/theme-system.md, docs/settings-menu.md, src/appearance.rs, src/theme.rs, src/config.rs.",
-  "state": "backlog",
+  "state": "done",
   "created": "2026-09-26T21:05:40Z",
-  "updated": "2026-09-26T21:34:50Z"
+  "updated": "2026-09-28T23:12:09Z"
 }

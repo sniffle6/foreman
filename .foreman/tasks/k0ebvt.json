@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "k0ebvt",
+  "title": "Sixel inline image support",
+  "body": "Gap from competitor review: only a kitty-graphics subset today (src/graphics.rs, src/icat.rs). Add sixel decode + render; check whether our bundled OpenConsole conpty.dll passes sixel through (src/conpty_install.rs).",
+  "state": "backlog",
+  "planned": {
+    "name": "Terminal basics",
+    "wave": 2
+  },
+  "created": "2026-09-28T04:29:35Z",
+  "updated": "2026-09-28T04:29:41Z"
+}

@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "6e5ukv",
+  "title": "Clickable URLs: OSC 8 hyperlinks + plain-URL detection",
+  "body": "Gap from competitor review: no OSC 8 and no plain-URL detection in terminal panes. Ctrl+Click (or similar) opens in browser; hover underline. Start: src/terminal.rs, src/input.rs; alacritty_terminal 0.26 exposes hyperlinks on cells.",
+  "state": "done",
+  "planned": {
+    "name": "Terminal basics",
+    "wave": 1
+  },
+  "created": "2026-09-28T04:29:35Z",
+  "updated": "2026-09-28T23:10:47Z"
+}

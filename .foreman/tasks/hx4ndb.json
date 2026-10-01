@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "hx4ndb",
+  "title": "Font ligatures",
+  "body": "Gap from competitor review: no ligature shaping. Start: src/terminal_font.rs. Must be opt-in and must not regress frame time — measure before/after.",
+  "state": "backlog",
+  "planned": {
+    "name": "Terminal basics",
+    "wave": 3
+  },
+  "created": "2026-09-28T04:29:36Z",
+  "updated": "2026-09-28T04:29:41Z"
+}

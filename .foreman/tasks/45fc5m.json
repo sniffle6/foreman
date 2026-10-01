@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "45fc5m",
+  "title": "iTerm2 inline images (OSC 1337 File=)",
+  "body": "Gap from competitor review: no iTerm2 image protocol. Likely reuses the kitty image placement path in src/graphics.rs. Verify ConPTY passthrough of OSC 1337.",
+  "state": "backlog",
+  "planned": {
+    "name": "Terminal basics",
+    "wave": 2
+  },
+  "created": "2026-09-28T04:29:36Z",
+  "updated": "2026-09-28T04:29:41Z"
+}
