@@ -312,8 +312,9 @@ impl App {
         let mut activity = false;
         while let Ok(event) = self.title_events.try_recv() {
             activity = true;
-            // State applies even while badges are hidden, so enabling the
-            // setting shows the current state instead of waiting for a turn.
+            // State applies even while badges are hidden; the slots are reset
+            // when the setting flips (see the settings-change block), so a
+            // state frozen while the state hooks were absent is never shown.
             self.desktop.apply_hook_event(&event);
             if event.prompt.is_none() || !self.settings.auto_name_agent_sessions {
                 continue;
@@ -1033,6 +1034,12 @@ impl eframe::App for App {
         }
         if agent_hooks::HookWants::from_settings(&self.settings) != wants_before {
             self.request_hook_install(&ctx);
+        }
+        if self.settings.agent_state_badges != wants_before.state {
+            // With only the naming hook installed, every prompt left a slot
+            // at Working with no Stop to follow. Start clean instead of
+            // painting that on every named Session the moment badges turn on.
+            self.desktop.reset_agent_state();
         }
         let live = terminal::font_size(&ctx);
         if live != self.settings.font_size {

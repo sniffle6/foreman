@@ -6382,6 +6382,22 @@ impl WindowManager {
         })
     }
 
+    /// Forget every Session's hook state. Run when the badges setting flips:
+    /// while state hooks were not installed, a slot could freeze at a state
+    /// with no event to follow it (a prompt with no Stop), so enabling must
+    /// start clean rather than paint that stale state.
+    pub fn reset_agent_state(&mut self) {
+        for window in &mut self.windows {
+            for tab in &mut window.tabs {
+                match &mut tab.content {
+                    Content::Terminal(session) => *session.agent_state_mut() = Default::default(),
+                    Content::Project(child) => child.reset_agent_state(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Apply a worker result only if its complete identity still names the
     /// pending request. A stale result is indistinguishable from no result.
     pub fn apply_title_result(&mut self, result: crate::terminal_titles::TitleResult) -> bool {
@@ -10729,6 +10745,40 @@ mod tests {
             m.focused = None;
         }
         m
+    }
+
+    #[test]
+    fn resetting_agent_state_clears_every_session_in_nested_projects() {
+        use crate::agent_state::HookEvent;
+        let ctx = egui::Context::default();
+        let mut m = WindowManager::new();
+        m.tag = Some("p1".into());
+        let id = m.add_terminal(Shell::Cmd, &ctx).expect("shell");
+        {
+            let window = m.windows.iter_mut().find(|w| w.id == id).unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("expected terminal");
+            };
+            session.set_osc_title_for_test(Some("claude".into()));
+        }
+        let prompt = crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Claude,
+            hook_event: HookEvent::UserPromptSubmit,
+            vendor_session_id: "s1".into(),
+            transcript_path: None,
+            project_id: Some("p1".into()),
+            terminal_id: term_tag(id),
+            prompt: None,
+        };
+        assert!(m.apply_hook_event(&prompt));
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let mut desk = WindowManager::new();
+        desk.push_win(7, Tab::fixed("proj", Content::Project(Box::new(m))), r);
+        assert!(desk.panel_model().projects[0].tabs[0].agent.is_some());
+        // Flipping the badges setting must not reveal a state frozen while the
+        // state hooks were not installed (a prompt with no Stop to follow it).
+        desk.reset_agent_state();
+        assert_eq!(desk.panel_model().projects[0].tabs[0].agent, None);
     }
 
     #[test]

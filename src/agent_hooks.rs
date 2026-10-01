@@ -40,8 +40,10 @@ const KNOWN_EVENTS: [&str; 6] = [
 ];
 
 /// `PostToolUse` has no matcher: which tools prompt depends on the user's
-/// permission mode. Grok has no `PermissionRequest`; Codex has no
-/// `StopFailure` and is the only provider with `Interrupt`.
+/// permission mode. It only ever leaves Needs you, so Grok, which has no
+/// `PermissionRequest`, gets no `PostToolUse` hook: it would launch a helper
+/// per tool call and change nothing. Codex has no `StopFailure` and is the only
+/// provider with `Interrupt`.
 fn wanted_events(agent: &str, wants: HookWants) -> &'static [&'static str] {
     if wants.state {
         match agent {
@@ -59,7 +61,7 @@ fn wanted_events(agent: &str, wants: HookWants) -> &'static [&'static str] {
                 "Stop",
                 "Interrupt",
             ],
-            _ => &["UserPromptSubmit", "PostToolUse", "Stop", "StopFailure"],
+            _ => &["UserPromptSubmit", "Stop", "StopFailure"],
         }
     } else if wants.naming {
         &["UserPromptSubmit"]
@@ -451,6 +453,18 @@ mod tests {
                 .get("PermissionRequest")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn grok_gets_no_post_tool_use_hook_because_it_can_never_be_needs_you() {
+        // PostToolUse only leaves Needs you, and Grok has no PermissionRequest,
+        // so the hook would launch PowerShell on every tool call for nothing.
+        assert_eq!(
+            wanted_events("grok", STATE),
+            &["UserPromptSubmit", "Stop", "StopFailure"]
+        );
+        assert!(wanted_events("claude", STATE).contains(&"PostToolUse"));
+        assert!(wanted_events("codex", STATE).contains(&"PostToolUse"));
     }
 
     #[test]

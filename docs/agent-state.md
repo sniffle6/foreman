@@ -59,7 +59,9 @@ fires nothing and its rows show no badge.
 - **Same-provider children overwrite the parent.** A `claude -p` launched inside
   a Claude Session inherits the pane's terminal ID, so its events change the
   pane's state.
-- **Grok has no Needs you.** Grok has no `PermissionRequest` event.
+- **Grok has no Needs you.** Grok has no `PermissionRequest` event, so Foreman
+  also installs no `PostToolUse` hook for Grok: that event only leaves Needs
+  you, and a helper launch per tool call would buy nothing.
 - **Grok fires every event twice** (it also runs `~/.claude/settings.json`
   hooks). The Claude-under-Grok drop in `normalize_event` removes the copy; the
   mapping is idempotent anyway.
@@ -74,9 +76,14 @@ fires nothing and its rows show no badge.
 - **Nothing is written into any Session.** The feature only reads hook events,
   and the GUI only ever `try_recv`s; a late or lost event makes a badge late or
   stale, never blocks typing.
-- **State is tracked even while the setting is off.** The panel gates at paint,
-  so enabling the setting shows the current state instead of waiting for a turn
-  (only once hooks are installed, of course).
+- **Flipping the setting resets every Session's state.** While badges are off
+  only the naming hook runs, so each prompt would leave a Session at `working`
+  with no `Stop` to follow. Enabling starts every slot clean; a row shows a badge
+  again after its next hook event.
+- **The icon decides which provider owns the pane.** When several agents run
+  under one shell (Claude's Bash tool running `codex exec`), the process scan
+  picks the one closest to the shell, so the pane keeps its Claude identity and
+  Codex's events are dropped.
 
 ## Key files
 

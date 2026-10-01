@@ -46,31 +46,41 @@ fn agent_of_row(row: &ProcRow) -> Option<IconKind> {
     })
 }
 
-/// Does `pid` descend from `root` within `table`? Walks the parent chain up,
-/// bounded against cycles / a corrupt snapshot.
-fn descends_from(table: &[ProcRow], pid: u32, root: u32) -> bool {
+/// How many parent hops from `pid` up to `root` within `table`; `None` when
+/// `pid` does not descend from `root`. Bounded against cycles / a corrupt
+/// snapshot.
+fn depth_below(table: &[ProcRow], pid: u32, root: u32) -> Option<usize> {
     let mut cur = pid;
-    for _ in 0..64 {
+    for depth in 0..64 {
         if cur == root {
-            return true;
+            return Some(depth);
         }
-        match table.iter().find(|r| r.pid == cur) {
-            Some(r) => cur = r.parent,
-            None => return false,
-        }
+        cur = table.iter().find(|r| r.pid == cur)?.parent;
     }
-    false
+    None
+}
+
+/// Does `pid` descend from `root` within `table`?
+fn descends_from(table: &[ProcRow], pid: u32, root: u32) -> bool {
+    depth_below(table, pid, root).is_some()
 }
 
 /// The agent running under `root_pid` in this process table, if any. Pure: the
-/// unit-test surface. Finds an agent-named process and confirms it descends from
-/// the shell — so a tool the agent itself spawns (a `bash` for a command) never
-/// counts, and an agent under a *different* terminal never leaks in.
+/// unit-test surface. Finds agent-named processes that descend from the shell
+/// — so an agent under a *different* terminal never leaks in — and picks the
+/// one closest to the shell. An agent launched by another agent's tool
+/// (`codex exec` from Claude's Bash) is deeper, so it never flips the icon; the
+/// table comes from a HashMap, so first-found would be arbitrary.
 fn detect_agent(table: &[ProcRow], root_pid: u32) -> Option<IconKind> {
-    table.iter().find_map(|row| {
-        let kind = agent_of_row(row)?;
-        descends_from(table, row.pid, root_pid).then_some(kind)
-    })
+    table
+        .iter()
+        .filter_map(|row| {
+            let kind = agent_of_row(row)?;
+            let depth = depth_below(table, row.pid, root_pid)?;
+            Some((depth, row.pid, kind))
+        })
+        .min_by_key(|(depth, pid, _)| (*depth, *pid))
+        .map(|(_, _, kind)| kind)
 }
 
 /// One top-level process the shell launched, for the close-confirm list. Plain
@@ -297,6 +307,32 @@ mod tests {
             row(500, 1, "powershell.exe", &["powershell"]),
         ];
         assert_eq!(detect_agent(&t, 500), None);
+    }
+
+    #[test]
+    fn closest_agent_wins_over_a_deeper_one_regardless_of_table_order() {
+        // Claude's Bash tool runs `codex exec`: shell -> claude -> bash -> codex.
+        // sysinfo's table is a HashMap, so the deeper agent may be listed first.
+        let t = vec![
+            row(100, 1, "powershell.exe", &["powershell"]),
+            row(
+                400,
+                300,
+                "node.exe",
+                &["node", r"C:\npm\node_modules\@openai\codex\bin\codex.js"],
+            ),
+            row(
+                300,
+                200,
+                "bash.exe",
+                &["bash", "-c", "codex exec 'echo hi'"],
+            ),
+            row(200, 100, "claude.exe", &["claude"]),
+        ];
+        assert_eq!(detect_agent(&t, 100), Some(IconKind::Claude));
+        let mut reversed = t;
+        reversed.reverse();
+        assert_eq!(detect_agent(&reversed, 100), Some(IconKind::Claude));
     }
 
     #[test]
