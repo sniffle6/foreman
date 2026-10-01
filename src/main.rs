@@ -7,6 +7,7 @@
 
 mod agent_command;
 mod agent_hooks;
+mod agent_state;
 mod ai_oneshot;
 mod appearance;
 mod board;
