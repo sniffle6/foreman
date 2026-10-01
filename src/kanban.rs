@@ -1638,7 +1638,8 @@ pub fn closeout_style() -> CloseoutStyle {
 /// form, by [`CloseoutStyle`] (installed-on-PATH vs. dev-fleet), and — only
 /// when the card carries a worktree — a `# Workspace` section plus the
 /// style-independent integration lines (spec: dispatch-worktrees). A card
-/// without a worktree renders exactly the pre-worktree text.
+/// without a worktree renders exactly the pre-worktree text. A Restart (card
+/// Blocked or orphaned) adds a `# Previous attempt` section before those.
 pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
     let mut out = format!(
         "You are a worker Session dispatched from card {id} on this project's board.\n\
@@ -1651,6 +1652,26 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         title = card.title,
         body = card.body.as_deref().unwrap_or(""),
     );
+    // A Restart reaches here with the card still Blocked (board only) or
+    // In Progress with a dead claim (orphaned): `claim_for_dispatch` has not
+    // run yet, so state and reason are the previous attempt's. A fresh
+    // Backlog card renders nothing here, so its text is unchanged.
+    match card.state {
+        CardState::Blocked => out.push_str(&format!(
+            "# Previous attempt\n\
+             A previous worker blocked this card: {reason}\n\
+             Its work is still here: run git log and git status first and read what it left. Check whether the blocker still applies; if it does and you cannot resolve it, block again with the reason.\n\
+             \n",
+            reason = card.blocked_reason.as_deref().unwrap_or("(no reason recorded)"),
+        )),
+        CardState::InProgress => out.push_str(
+            "# Previous attempt\n\
+             A previous worker on this card ended without closing it out; its terminal is gone.\n\
+             Whatever it finished is still here: run git log and git status first and continue from there instead of starting over.\n\
+             \n",
+        ),
+        CardState::Backlog | CardState::Done => {}
+    }
     if let Some(wt) = &card.worktree
         && wt.in_place
     {
@@ -3025,6 +3046,75 @@ mod tests {
              (bash: write \"$FOREMAN_EXE\" in place of & $env:FOREMAN_EXE)\n\
              Do not end the session without running one of these."
         );
+    }
+
+    #[test]
+    fn dispatch_prompt_for_a_blocked_card_carries_the_blocker_reason() {
+        let mut card = sample_card(Some("Resize flickers on Up-arrow."));
+        card.state = CardState::Blocked;
+        card.blocked_reason = Some("needs a design decision".into());
+        let s = dispatch_prompt(&card, CloseoutStyle::Path);
+        assert_eq!(
+            s,
+            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+             \n\
+             # Task: Fix resize flicker\n\
+             \n\
+             Resize flickers on Up-arrow.\n\
+             \n\
+             # Previous attempt\n\
+             A previous worker blocked this card: needs a design decision\n\
+             Its work is still here: run git log and git status first and read what it left. Check whether the blocker still applies; if it does and you cannot resolve it, block again with the reason.\n\
+             \n\
+             # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
+             When the work is complete, run:    foreman kanban done a3f8k2\n\
+             If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
+             Do not end the session without running one of these."
+        );
+    }
+
+    #[test]
+    fn dispatch_prompt_for_an_orphaned_card_says_the_last_worker_never_closed_out() {
+        let mut card = sample_card(Some("Resize flickers on Up-arrow."));
+        card.state = CardState::InProgress;
+        let s = dispatch_prompt(&card, CloseoutStyle::Path);
+        assert_eq!(
+            s,
+            "You are a worker Session dispatched from card a3f8k2 on this project's board.\n\
+             \n\
+             # Task: Fix resize flicker\n\
+             \n\
+             Resize flickers on Up-arrow.\n\
+             \n\
+             # Previous attempt\n\
+             A previous worker on this card ended without closing it out; its terminal is gone.\n\
+             Whatever it finished is still here: run git log and git status first and continue from there instead of starting over.\n\
+             \n\
+             # Close-out (required)\n\
+             End every commit message with the trailer line:    Card: a3f8k2\n\
+             When the work is complete, run:    foreman kanban done a3f8k2\n\
+             If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
+             Do not end the session without running one of these."
+        );
+    }
+
+    #[test]
+    fn dispatch_prompt_puts_the_previous_attempt_before_the_workspace() {
+        let mut card = sample_card(None);
+        card.state = CardState::Blocked;
+        card.blocked_reason = Some("tests red".into());
+        card.worktree = Some(Worktree {
+            path: "C:/repo/.foreman/worktrees/a3f8k2".into(),
+            branch: "card/a3f8k2".into(),
+            base: "main".into(),
+            in_place: false,
+        });
+        let s = dispatch_prompt(&card, CloseoutStyle::Path);
+        let prev = s.find("# Previous attempt").expect("previous attempt");
+        let ws = s.find("# Workspace").expect("workspace");
+        let close = s.find("# Close-out").expect("close-out");
+        assert!(prev < ws && ws < close, "{s}");
     }
 
     #[test]

@@ -16,7 +16,12 @@ sibling — read those for *why*, this doc for *how*.
   picker. Picking one spawns a new Session in the
   project cwd whose prompt embeds the card body and the exact close-out
   commands, then claims the card and moves it to In Progress in the same
-  action — a card-spawned agent never runs `start` itself.
+  action — a card-spawned agent never runs `start` itself. A Restart (a
+  Blocked or orphaned card) adds a `# Previous attempt` section to the prompt:
+  the blocker reason for a Blocked card, or "ended without closing out" for an
+  orphaned one, plus a nudge to read `git log` / `git status` first. A card
+  returned to Backlog with **Return to backlog** loses both (release clears the
+  reason and claim), so its next dispatch reads as a fresh start.
   Failed board actions show an error toast. A failed spawn leaves the card
   unchanged; if claiming fails after spawning, Foreman closes the new Session.
   npm-installed Codex launches through Node and its package entry point, preserving
