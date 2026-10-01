@@ -6291,6 +6291,9 @@ impl WindowManager {
         model: &str,
         epoch: u64,
     ) -> Option<crate::terminal_titles::TitleRequest> {
+        let Some(prompt) = event.prompt.as_deref() else {
+            return None;
+        };
         if self.tag.as_deref() == event.project_id.as_deref() {
             for window in &mut self.windows {
                 for tab in &mut window.tabs {
@@ -6305,7 +6308,7 @@ impl WindowManager {
                     }
                     let accepted =
                         tab.agent_title
-                            .begin(&event.vendor_session_id, &event.prompt, epoch)?;
+                            .begin(&event.vendor_session_id, prompt, epoch)?;
                     if accepted.new_session {
                         tab.title =
                             format!("{}  ·  #{}", event.source_agent.label(), session.term_id());
@@ -10304,11 +10307,12 @@ mod tests {
         }
         let event = crate::title_notify::TitlePromptEvent {
             source_agent: crate::terminal_titles::SourceAgent::Claude,
+            hook_event: crate::agent_state::HookEvent::UserPromptSubmit,
             vendor_session_id: "claude-session-1".into(),
             transcript_path: None,
             project_id: Some("p9".into()),
             terminal_id: term_tag(id),
-            prompt: "fix the authentication race".into(),
+            prompt: Some("fix the authentication race".into()),
         };
         let request = wm
             .prepare_title_request(
@@ -10367,11 +10371,12 @@ mod tests {
         }
         let event = crate::title_notify::TitlePromptEvent {
             source_agent: crate::terminal_titles::SourceAgent::Claude,
+            hook_event: crate::agent_state::HookEvent::UserPromptSubmit,
             vendor_session_id: "claude-session-exit".into(),
             transcript_path: None,
             project_id: Some("p9".into()),
             terminal_id: term_tag(id),
-            prompt: "diagnose the failed worker".into(),
+            prompt: Some("diagnose the failed worker".into()),
         };
         let request = wm
             .prepare_title_request(
@@ -11265,11 +11270,12 @@ mod tests {
 
         let event = crate::title_notify::TitlePromptEvent {
             source_agent: crate::terminal_titles::SourceAgent::Codex,
+            hook_event: crate::agent_state::HookEvent::UserPromptSubmit,
             vendor_session_id: "codex-second".into(),
             transcript_path: None,
             project_id: Some("p2".into()),
             terminal_id: "t1".into(),
-            prompt: "repair the second project".into(),
+            prompt: Some("repair the second project".into()),
         };
         let request = desktop
             .prepare_title_request(

@@ -1,5 +1,8 @@
-//! Passive hook-to-GUI notification lane for first user prompts.
+//! Passive hook-to-GUI notification lane: one message per provider lifecycle
+//! hook, carrying the event name and routing IDs. A `UserPromptSubmit` from a
+//! main agent also carries the prompt, which starts Session naming.
 
+use crate::agent_state::HookEvent;
 use crate::terminal_titles::SourceAgent;
 use interprocess::ConnectWaitMode;
 use interprocess::local_socket::{ConnectOptions, GenericNamespaced, ListenerOptions, prelude::*};
@@ -8,21 +11,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const INPUT_BYTES: u64 = 64 * 1024;
+/// Helper stdin cap. `PostToolUse` payloads include the tool's full output.
+const HELPER_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Pipe-server read cap. The forwarded message is the event and IDs only.
+const MESSAGE_BYTES: u64 = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_INFLIGHT: usize = 8;
+/// Tool-heavy turns across several panes, doubled by Grok replaying Claude's
+/// hooks, must not get a `Stop` turned away.
+const MAX_INFLIGHT: usize = 32;
 
 static PIPE: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TitlePromptEvent {
     pub source_agent: SourceAgent,
+    pub hook_event: HookEvent,
     pub vendor_session_id: String,
     pub transcript_path: Option<String>,
     pub project_id: Option<String>,
     pub terminal_id: String,
-    pub prompt: String,
+    /// Present only for a main agent's `UserPromptSubmit` with a prompt worth
+    /// naming from. State needs nothing but the event and the IDs.
+    pub prompt: Option<String>,
 }
 
 pub fn new_pipe_name() -> String {
@@ -44,24 +55,37 @@ pub fn pipe_name() -> Option<&'static str> {
 /// Internal hook command. A hook must never interfere with the agent's prompt:
 /// malformed input, a busy/missing Foreman, and transport failure are all quiet
 /// success. The GUI is the only process that may start title generation.
+fn parse_args(args: &[String]) -> Option<(SourceAgent, HookEvent)> {
+    let value_of = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    };
+    let source = SourceAgent::parse(value_of("--agent")?)?;
+    // A missing `--event` is a handler written by an older Foreman; it keeps
+    // naming until the installer rewrites it.
+    let event = match value_of("--event") {
+        Some(name) => HookEvent::parse(name)?,
+        None => HookEvent::UserPromptSubmit,
+    };
+    Some((source, event))
+}
+
 pub fn client_main(args: &[String]) -> i32 {
-    let Some(source) = args
-        .windows(2)
-        .find(|pair| pair[0] == "--agent")
-        .and_then(|pair| SourceAgent::parse(&pair[1]))
-    else {
+    let Some((source, event)) = parse_args(args) else {
         return 0;
     };
     let mut input = Vec::new();
     if std::io::stdin()
-        .take(INPUT_BYTES + 1)
+        .take(HELPER_INPUT_BYTES + 1)
         .read_to_end(&mut input)
         .is_err()
-        || input.len() as u64 > INPUT_BYTES
+        || input.len() as u64 > HELPER_INPUT_BYTES
     {
         return 0;
     }
-    let Some(event) = normalize_event(source, &input, |name| std::env::var(name).ok()) else {
+    let Some(event) = normalize_event(source, event, &input, |name| std::env::var(name).ok())
+    else {
         return 0;
     };
     let Some(pipe) = std::env::var("FOREMAN_TITLE_PIPE").ok() else {
@@ -73,6 +97,7 @@ pub fn client_main(args: &[String]) -> i32 {
 
 fn normalize_event(
     source: SourceAgent,
+    event: HookEvent,
     input: &[u8],
     getenv: impl Fn(&str) -> Option<String>,
 ) -> Option<TitlePromptEvent> {
@@ -91,7 +116,7 @@ fn normalize_event(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
     };
-    if [
+    let subagent = [
         "agent_id",
         "agentId",
         "agent_type",
@@ -100,14 +125,20 @@ fn normalize_event(
         "subagentType",
     ]
     .into_iter()
-    .any(nonempty)
-    {
+    .any(nonempty);
+    // A subagent's turn is not the Session's turn, but its permission prompt
+    // waits on the human and its tool finishing is what leaves Needs you.
+    if subagent && !matches!(event, HookEvent::PermissionRequest | HookEvent::PostToolUse) {
         return None;
     }
-    let prompt = value
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .and_then(crate::terminal_titles::meaningful_prompt)?;
+    let prompt = if event == HookEvent::UserPromptSubmit && !subagent {
+        value
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::terminal_titles::meaningful_prompt)
+    } else {
+        None
+    };
     let vendor_session_id = match source {
         SourceAgent::Grok => getenv("GROK_SESSION_ID").or_else(|| {
             value
@@ -140,6 +171,7 @@ fn normalize_event(
     }
     Some(TitlePromptEvent {
         source_agent: source,
+        hook_event: event,
         vendor_session_id,
         transcript_path,
         project_id: getenv("FOREMAN_PROJECT_ID").filter(|value| !value.trim().is_empty()),
@@ -166,7 +198,7 @@ fn read_event_bytes(reader: &mut impl Read, timeout: Duration) -> Option<Vec<u8>
         if Instant::now() >= deadline {
             return None;
         }
-        let remaining = (INPUT_BYTES as usize + 1).saturating_sub(bytes.len());
+        let remaining = (MESSAGE_BYTES as usize + 1).saturating_sub(bytes.len());
         if remaining == 0 {
             return None;
         }
@@ -177,7 +209,7 @@ fn read_event_bytes(reader: &mut impl Read, timeout: Duration) -> Option<Vec<u8>
             Ok(0) => std::thread::sleep(Duration::from_millis(2)),
             Ok(read) => {
                 bytes.extend_from_slice(&buffer[..read]);
-                if bytes.len() as u64 > INPUT_BYTES {
+                if bytes.len() as u64 > MESSAGE_BYTES {
                     return None;
                 }
                 if serde_json::from_slice::<TitlePromptEvent>(&bytes).is_ok() {
@@ -237,6 +269,7 @@ pub fn serve(pipe: &str, tx: mpsc::SyncSender<TitlePromptEvent>, ctx: eframe::eg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_state::HookEvent;
     use std::collections::HashMap;
 
     struct WouldBlockForever;
@@ -279,6 +312,7 @@ mod tests {
         ]);
         let event = normalize_event(
             SourceAgent::Claude,
+            HookEvent::UserPromptSubmit,
             br#"{"session_id":"claude-7","transcript_path":"C:\\Users\\me\\.claude\\projects\\s.jsonl","prompt":" fix the auth race "}"#,
             |name| vars.get(name).cloned(),
         )
@@ -290,7 +324,143 @@ mod tests {
         );
         assert_eq!(event.terminal_id, "t4");
         assert_eq!(event.project_id.as_deref(), Some("p2"));
-        assert_eq!(event.prompt, "fix the auth race");
+        assert_eq!(event.prompt.as_deref(), Some("fix the auth race"));
+        assert_eq!(event.hook_event, HookEvent::UserPromptSubmit);
+    }
+
+    fn env_fn(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map = env(pairs);
+        move |name| map.get(name).cloned()
+    }
+
+    const IN_FOREMAN: &[(&str, &str)] = &[
+        ("FOREMAN", "1"),
+        ("FOREMAN_PROJECT_ID", "p9"),
+        ("FOREMAN_TERMINAL_ID", "t7"),
+    ];
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn event_arg_defaults_to_prompt_submit_and_rejects_unknown_names() {
+        assert_eq!(
+            parse_args(&args(&["--agent", "claude"])),
+            Some((SourceAgent::Claude, HookEvent::UserPromptSubmit))
+        );
+        assert_eq!(
+            parse_args(&args(&["--agent", "codex", "--event", "Interrupt"])),
+            Some((SourceAgent::Codex, HookEvent::Interrupt))
+        );
+        assert_eq!(
+            parse_args(&args(&["--agent", "grok", "--event", "SessionStart"])),
+            None
+        );
+        assert_eq!(parse_args(&args(&["--event", "Stop"])), None);
+    }
+
+    #[test]
+    fn state_events_carry_the_event_and_ids_but_no_payload_text() {
+        let input = br#"{"session_id":"s1","prompt":"secret","last_assistant_message":"secret","tool_response":"secret"}"#;
+        let event = normalize_event(
+            SourceAgent::Claude,
+            HookEvent::Stop,
+            input,
+            env_fn(IN_FOREMAN),
+        )
+        .expect("state event");
+        assert_eq!(event.hook_event, HookEvent::Stop);
+        assert_eq!(event.prompt, None, "prompt rides only on UserPromptSubmit");
+        assert_eq!(event.vendor_session_id, "s1");
+        assert_eq!(event.project_id.as_deref(), Some("p9"));
+        assert_eq!(event.terminal_id, "t7");
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("secret"), "{wire}");
+    }
+
+    #[test]
+    fn a_slash_command_prompt_is_a_state_event_without_naming() {
+        let input = br#"{"session_id":"s1","prompt":"/help"}"#;
+        let event = normalize_event(
+            SourceAgent::Claude,
+            HookEvent::UserPromptSubmit,
+            input,
+            env_fn(IN_FOREMAN),
+        )
+        .expect("the turn still starts");
+        assert_eq!(event.hook_event, HookEvent::UserPromptSubmit);
+        assert_eq!(event.prompt, None, "nothing worth naming from");
+    }
+
+    #[test]
+    fn subagent_events_are_dropped_except_permission_and_tool_done() {
+        let payload = |event: &str| {
+            format!(
+                r#"{{"session_id":"s1","agent_id":"a1","hook_event_name":"{event}","prompt":"child work"}}"#
+            )
+        };
+        let drop = [
+            HookEvent::UserPromptSubmit,
+            HookEvent::Stop,
+            HookEvent::StopFailure,
+            HookEvent::Interrupt,
+        ];
+        for event in drop {
+            assert!(
+                normalize_event(
+                    SourceAgent::Claude,
+                    event,
+                    payload(event.name()).as_bytes(),
+                    env_fn(IN_FOREMAN)
+                )
+                .is_none(),
+                "{event:?}"
+            );
+        }
+        for event in [HookEvent::PermissionRequest, HookEvent::PostToolUse] {
+            let got = normalize_event(
+                SourceAgent::Claude,
+                event,
+                payload(event.name()).as_bytes(),
+                env_fn(IN_FOREMAN),
+            )
+            .unwrap_or_else(|| panic!("{event:?}"));
+            assert_eq!(got.hook_event, event);
+            assert_eq!(got.prompt, None);
+        }
+    }
+
+    #[test]
+    fn grok_duplicate_of_a_claude_state_hook_is_suppressed() {
+        let mut pairs = IN_FOREMAN.to_vec();
+        pairs.push(("GROK_SESSION_ID", "g1"));
+        let input = br#"{"sessionId":"g1"}"#;
+        assert!(
+            normalize_event(SourceAgent::Claude, HookEvent::Stop, input, env_fn(&pairs)).is_none()
+        );
+        let event =
+            normalize_event(SourceAgent::Grok, HookEvent::Stop, input, env_fn(&pairs)).unwrap();
+        assert_eq!(event.vendor_session_id, "g1");
+    }
+
+    #[test]
+    fn helper_accepts_a_tool_payload_larger_than_one_message() {
+        let big = "x".repeat(MESSAGE_BYTES as usize * 4);
+        let input = format!(r#"{{"session_id":"s1","tool_response":"{big}"}}"#);
+        assert!(input.len() as u64 > MESSAGE_BYTES);
+        assert!(input.len() as u64 <= HELPER_INPUT_BYTES);
+        let event = normalize_event(
+            SourceAgent::Claude,
+            HookEvent::PostToolUse,
+            input.as_bytes(),
+            env_fn(IN_FOREMAN),
+        )
+        .expect("large tool output must not drop the event");
+        assert!(
+            serde_json::to_vec(&event).unwrap().len() < 1024,
+            "the forwarded message stays small"
+        );
     }
 
     #[test]
@@ -299,6 +469,7 @@ mod tests {
         assert!(
             normalize_event(
                 SourceAgent::Codex,
+                HookEvent::UserPromptSubmit,
                 br#"{"session_id":"s1","agent_id":"child","prompt":"do work"}"#,
                 |name| vars.get(name).cloned(),
             )
@@ -308,6 +479,7 @@ mod tests {
         assert!(
             normalize_event(
                 SourceAgent::Claude,
+                HookEvent::UserPromptSubmit,
                 br#"{"session_id":"s1","prompt":"do work"}"#,
                 |name| vars.get(name).cloned(),
             )
@@ -322,6 +494,7 @@ mod tests {
         assert!(
             normalize_event(
                 SourceAgent::Grok,
+                HookEvent::UserPromptSubmit,
                 br#"{"sessionId":"g1","subagentType":"explore","prompt":"do child work"}"#,
                 |name| grok_vars.get(name).cloned(),
             )
@@ -351,11 +524,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let event = TitlePromptEvent {
             source_agent: SourceAgent::Codex,
+            hook_event: HookEvent::UserPromptSubmit,
             vendor_session_id: "delayed-session".into(),
             transcript_path: None,
             project_id: Some("p3".into()),
             terminal_id: "t8".into(),
-            prompt: "fix delayed delivery".into(),
+            prompt: Some("fix delayed delivery".into()),
         };
         let payload = serde_json::to_vec(&event).unwrap();
         // The broken reader may already have closed the connection.
@@ -371,11 +545,12 @@ mod tests {
         std::thread::spawn(move || serve(&server_pipe, tx, eframe::egui::Context::default()));
         let event = TitlePromptEvent {
             source_agent: SourceAgent::Grok,
+            hook_event: HookEvent::UserPromptSubmit,
             vendor_session_id: "grok-session".into(),
             transcript_path: None,
             project_id: Some("p3".into()),
             terminal_id: "t8".into(),
-            prompt: "trace the rendering regression".into(),
+            prompt: Some("trace the rendering regression".into()),
         };
         // Retry only connection establishment while the listener binds. Once
         // connected, send exactly one event: ordinary delivery must not race.
@@ -407,7 +582,7 @@ mod tests {
                 Ok(chunk.len())
             }
         }
-        let payload = br#"{"source_agent":"codex","vendor_session_id":"s1","terminal_id":"t1","prompt":"fix it"}"#;
+        let payload = br#"{"source_agent":"codex","hook_event":"UserPromptSubmit","vendor_session_id":"s1","terminal_id":"t1","prompt":"fix it"}"#;
         let mut reader = PausedChunks {
             chunks: [payload[..30].to_vec(), vec![], payload[30..].to_vec()].into(),
         };
