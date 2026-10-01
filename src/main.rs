@@ -1015,7 +1015,10 @@ impl eframe::App for App {
                 && self.settings.auto_name_agent_sessions
                 && self.hook_install.is_none()
             {
-                self.hook_install = Some(agent_hooks::spawn_install(ctx.clone()));
+                self.hook_install = Some(agent_hooks::spawn_install(
+                    ctx.clone(),
+                    agent_hooks::HookWants::from_settings(&self.settings),
+                ));
             }
         }
         let live = terminal::font_size(&ctx);
@@ -1444,9 +1447,12 @@ fn main() -> eframe::Result {
             let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
             let (title_request_tx, title_result_rx) =
                 terminal_titles::spawn_worker(title_epoch.clone(), cc.egui_ctx.clone());
-            let hook_install = startup_settings
-                .auto_name_agent_sessions
-                .then(|| agent_hooks::spawn_install(cc.egui_ctx.clone()));
+            let hook_install = startup_settings.auto_name_agent_sessions.then(|| {
+                agent_hooks::spawn_install(
+                    cc.egui_ctx.clone(),
+                    agent_hooks::HookWants::from_settings(&startup_settings),
+                )
+            });
             let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
             let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
             // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch

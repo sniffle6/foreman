@@ -137,14 +137,33 @@ mod tests {
         slot.badge(icon, false)
     }
 
-    const WORKING: Option<AgentBadge> = Some(AgentBadge { state: AgentState::Working, finished: false });
-    const NEEDS: Option<AgentBadge> = Some(AgentBadge { state: AgentState::NeedsYou, finished: false });
-    const IDLE: Option<AgentBadge> = Some(AgentBadge { state: AgentState::Idle, finished: false });
-    const DONE: Option<AgentBadge> = Some(AgentBadge { state: AgentState::Idle, finished: true });
+    const WORKING: Option<AgentBadge> = Some(AgentBadge {
+        state: AgentState::Working,
+        finished: false,
+    });
+    const NEEDS: Option<AgentBadge> = Some(AgentBadge {
+        state: AgentState::NeedsYou,
+        finished: false,
+    });
+    const IDLE: Option<AgentBadge> = Some(AgentBadge {
+        state: AgentState::Idle,
+        finished: false,
+    });
+    const DONE: Option<AgentBadge> = Some(AgentBadge {
+        state: AgentState::Idle,
+        finished: true,
+    });
 
     #[test]
     fn hook_event_names_round_trip_and_unknown_names_are_rejected() {
-        for event in [UserPromptSubmit, PermissionRequest, PostToolUse, Stop, StopFailure, Interrupt] {
+        for event in [
+            UserPromptSubmit,
+            PermissionRequest,
+            PostToolUse,
+            Stop,
+            StopFailure,
+            Interrupt,
+        ] {
             assert_eq!(HookEvent::parse(event.name()), Some(event));
         }
         assert_eq!(HookEvent::parse("SessionStart"), None);
@@ -155,7 +174,11 @@ mod tests {
     #[test]
     fn a_turn_goes_working_then_done_and_focus_clears_done() {
         let mut slot = AgentStateSlot::default();
-        assert_eq!(badge(&slot, IconKind::Claude), None, "no event yet = no badge");
+        assert_eq!(
+            badge(&slot, IconKind::Claude),
+            None,
+            "no event yet = no badge"
+        );
         run(&mut slot, Claude, &[UserPromptSubmit, PostToolUse]);
         assert_eq!(badge(&slot, IconKind::Claude), WORKING);
         run(&mut slot, Claude, &[Stop]);
@@ -163,7 +186,11 @@ mod tests {
         slot.clear_finished();
         assert_eq!(badge(&slot, IconKind::Claude), IDLE);
         run(&mut slot, Claude, &[StopFailure, UserPromptSubmit]);
-        assert_eq!(badge(&slot, IconKind::Claude), WORKING, "a new prompt clears done");
+        assert_eq!(
+            badge(&slot, IconKind::Claude),
+            WORKING,
+            "a new prompt clears done"
+        );
     }
 
     #[test]
@@ -179,8 +206,16 @@ mod tests {
     fn post_tool_use_never_wakes_an_idle_session() {
         // Codex delivers PostToolUse ~1.5 s after Interrupt (captured 2026-09-25).
         let mut slot = AgentStateSlot::default();
-        run(&mut slot, Codex, &[UserPromptSubmit, Interrupt, PostToolUse]);
-        assert_eq!(badge(&slot, IconKind::Codex), IDLE, "interrupt is not a finished turn");
+        run(
+            &mut slot,
+            Codex,
+            &[UserPromptSubmit, Interrupt, PostToolUse],
+        );
+        assert_eq!(
+            badge(&slot, IconKind::Codex),
+            IDLE,
+            "interrupt is not a finished turn"
+        );
         run(&mut slot, Codex, &[Stop, PostToolUse]);
         assert_eq!(badge(&slot, IconKind::Codex), DONE);
     }
@@ -199,8 +234,16 @@ mod tests {
         run(&mut slot, Claude, &[UserPromptSubmit]);
         assert_eq!(badge(&slot, IconKind::Claude), WORKING);
         assert_eq!(slot.badge(IconKind::Claude, true), None, "exited process");
-        assert_eq!(badge(&slot, IconKind::PowerShell), None, "agent exited back to the shell");
-        assert_eq!(badge(&slot, IconKind::Codex), None, "a different agent now runs here");
+        assert_eq!(
+            badge(&slot, IconKind::PowerShell),
+            None,
+            "agent exited back to the shell"
+        );
+        assert_eq!(
+            badge(&slot, IconKind::Codex),
+            None,
+            "a different agent now runs here"
+        );
     }
 
     #[test]
