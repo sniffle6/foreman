@@ -4,6 +4,13 @@
   "title": "Verify Ctrl+Delete deletes the next word",
   "body": "Question: Windows users expect Ctrl+Delete to mirror Ctrl+Backspace (delete the NEXT word). Does it already work in foreman?\n\nToday encode_key (src/input.rs) sends Ctrl+Delete as ESC[3;5~ (the xterm modifier form via tilde()). Windows Terminal sends the same ESC[3;5~, so this may already work end to end. Verify before changing anything.\n\nCheck first (live, isolated build or the running host):\n- PowerShell/PSReadLine: type \"alpha beta gamma\", Home, Ctrl+Right, then foreman send --keys \"Ctrl+Delete\" and snapshot. Expect \"beta\" deleted (KillWord).\n- Claude Code: same check in the prompt.\n- Optionally bash/readline under WSL, where ESC[3;5~ is often unbound (a readline config question, not a foreman bug).\n\nOnly if it fails in PSReadLine or Claude Code: compare with the bytes Windows Terminal sends and match them. Don't invent a non-standard sequence (e.g. ESC d) unless WT sends it.\n\nRelated: card 56l1al made Ctrl+Backspace send 0x08. Isolated live-test recipe: launch target/agent/debug/foreman.exe with APPDATA=<scratch dir> and FOREMAN_NO_LANDING=1, find its pipe (\\\\.\\pipe\\foreman-ctl-<pid>-*), and set FOREMAN_PIPE to it for send/snapshot.\n\nDone when: a documented live result for PSReadLine + Claude Code. If a change was needed: an encode_key unit test + a process_input test.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z",
+    "commits": [
+      "02ba7d5"
+    ]
+  },
   "created": "2026-09-30T04:18:38Z",
-  "updated": "2026-09-30T22:02:49Z"
+  "updated": "2026-10-02T04:38:36Z"
 }

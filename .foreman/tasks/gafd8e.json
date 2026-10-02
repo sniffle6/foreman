@@ -4,6 +4,10 @@
   "title": "refactor(git): file-tree menu items carry an Action enum",
   "body": "Land already-written commit 1bdb8dc (on branch card/roppgq; card roppgq is Done so the queue refuses it). Steps: git cherry-pick 1bdb8dc; amend the message so its trailer reads 'Card: <this card id>' instead of 'Card: roppgq'; cargo build + cargo test; then integrate + wait as your close-out says. No other changes. If the cherry-pick conflicts, block with the conflict.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z"
+  },
   "created": "2026-09-30T04:20:39Z",
-  "updated": "2026-09-30T20:45:48Z"
+  "updated": "2026-10-02T04:38:36Z"
 }

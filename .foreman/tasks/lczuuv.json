@@ -4,10 +4,14 @@
   "title": "refactor: shared one-shot AI CLI launcher (titles + theme expert)",
   "body": "Extract one shared one-shot AI CLI launcher (claude -p / codex exec / grok) used by both src/terminal_titles.rs (command_spec) and src/theme_expert.rs (generate). Today the provider flag lists are duplicated and already differ; the commit-message button (next card) would be a third copy.\n- Base it on terminal_titles.rs command_spec (persisted title_provider + model, per-provider tests).\n- Keep: bounded output, timeout, restricted tools, npm_codex resolution, CREATE_NO_WINDOW, background thread.\n- Callers pass prompt + cwd; the launcher returns text. Each caller keeps its own output validation.\n- No behavior change for title naming or the theme expert; existing tests stay green.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z"
+  },
   "planned": {
     "name": "Git commit panel",
     "wave": 1
   },
   "created": "2026-09-29T03:56:22Z",
-  "updated": "2026-09-29T21:55:22Z"
+  "updated": "2026-10-02T04:38:36Z"
 }

@@ -4,10 +4,17 @@
   "title": "refactor(git): push preview and push share one Target",
   "body": "Land commit 035e9d1 (branch card/7rh2p1), already written and tested; 7rh2p1 is Done so it can't be re-integrated. Only job: git cherry-pick 035e9d1 onto your branch, change its 'Card: 7rh2p1' trailer to this card's id (git commit --amend, message otherwise unchanged), run cargo test --target-dir target/agent (all must pass) and cargo fmt --check, then integrate and wait as your close-out says. Do not change the code; if the pick conflicts or a test fails, block with the reason.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z",
+    "commits": [
+      "386824b"
+    ]
+  },
   "planned": {
     "name": "Git commit panel",
     "wave": 5
   },
   "created": "2026-09-30T04:14:41Z",
-  "updated": "2026-09-30T04:21:23Z"
+  "updated": "2026-10-02T04:38:36Z"
 }

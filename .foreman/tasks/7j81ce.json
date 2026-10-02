@@ -4,6 +4,13 @@
   "title": "Kanban board: vertical layout below a width threshold",
   "body": "The board lays its columns out horizontally. When the window (or pane) width drops below a threshold, stack the columns vertically instead so narrow panes stay usable. Pick the breakpoint from column min-width x column count; keep card drag/drop and the detail page working in both orientations. Start in the kanban view code under src/.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z",
+    "commits": [
+      "ce8fcb5"
+    ]
+  },
   "created": "2026-10-01T19:42:59Z",
-  "updated": "2026-10-01T21:37:11Z"
+  "updated": "2026-10-02T04:38:36Z"
 }

@@ -4,6 +4,13 @@
   "title": "Make Ctrl+Backspace send 0x08 for previous-word delete",
   "body": "Foreman sends Ctrl+Backspace as plain Backspace (0x7f), dropping Ctrl. Windows Terminal sends 0x08 (^H) for Ctrl+Backspace, and many TUIs and shells (PSReadLine, some readline/zsh configs, agent CLIs) bind ^H to backward-kill-word, so Windows users expect Ctrl+Backspace to delete the previous word.\n\nStart in src/input.rs: encode_key's Key::Backspace arms. Alt+Backspace already sends ESC 0x7f (card d68wo1).\n\nDecide before coding:\n- Ctrl+Alt+Backspace: keep 0x7f or send ESC 0x08? AltGr arrives as Ctrl+Alt on Windows, so be conservative.\n- Risk: apps that treat 0x08 as a plain backspace (not word-delete) will see Ctrl+Backspace act like Backspace. That's fine; it matches Windows Terminal.\n\nDone when: encode_key unit test + process_input test for Ctrl+Backspace -> [0x08], and a live check (foreman send/snapshot) that it deletes a word in PowerShell/PSReadLine and in Claude Code.",
   "state": "done",
+  "shipped": {
+    "name": "v0.6.0",
+    "at": "2026-10-02T04:38:36Z",
+    "commits": [
+      "191412d"
+    ]
+  },
   "created": "2026-09-30T04:08:48Z",
-  "updated": "2026-09-30T04:20:55Z"
+  "updated": "2026-10-02T04:38:36Z"
 }
