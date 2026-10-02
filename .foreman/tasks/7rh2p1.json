@@ -4,15 +4,10 @@
   "title": "feat(git): JetBrains-style commit window - checkboxes, rollback, push preview",
   "body": "Make Git Changes behave like the JetBrains Commit tool window (non-modal commit, staging area OFF / changelists mode). JetBrains is the spec: when this card is silent or unclear, copy what JetBrains does rather than inventing. Builds on roppgq (multi-select + context-menu seam); do not start before it lands.\nThe user's description of that model:\n- Two sections: Changes (versioned files) and Unversioned Files. No Staged section.\n- Unversioned Files: the checkbox picks files to put under version control (Add to VCS). They then move to Changes. Checked unversioned files are not committed by Commit.\n- Changes: the checkbox picks what Commit commits. Nothing checked = everything.\n- Push is a separate step after commit (Commit and Push…).\nImplementation notes (not shown to the user):\n- Checkboxes are the window's OWN selection, not git's index - exactly like JetBrains, where ticking a box does not git add. Hold it in memory keyed by path; it survives live re-reads. Checking never writes to git.\n- Commit = git commit --only -- <checked paths> (or all paths the window shows when nothing is checked). --only commits those paths' working-tree content and leaves anything else an agent staged in the index, uncommitted and untouched. Use the paths the window shows, never `git add -A`. Disabled while conflicts exist.\n- Add to VCS = git add --intent-to-add (-N): versioned, shows in Changes as new (A), unchecked. (--only needs the path tracked, which -N does.)\n- Conflicts section stays while a merge is in progress.\nRight-click on a selection (via roppgq's seam), JetBrains names: Add to VCS; Rollback (confirm listing files); Delete (confirm listing files; Recycle Bin); Add to .gitignore; Show Diff; Copy Path; Show in Explorer.\nCommit area: Amend checkbox. Toolbar: expand all / collapse all, group by directory vs flat.\nCommit and Push…: commit, then JetBrains-style push dialog listing outgoing commits and the target (main -> origin/main, or new branch); Push / Cancel.\nRemove the hover Stage/Unstage/Mark Resolved row buttons from b17a049 (keep Mark Resolved in the menu).\nUpdate docs/git-history.md.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/7rh2p1",
-    "branch": "card/7rh2p1",
-    "base": "main"
-  },
   "planned": {
     "name": "Git commit panel",
     "wave": 4
   },
   "created": "2026-09-30T03:08:05Z",
-  "updated": "2026-09-30T04:03:49Z"
+  "updated": "2026-10-02T03:08:36Z"
 }

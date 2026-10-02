@@ -4,15 +4,10 @@
   "title": "feat(git): multi-select + context-menu seam for file trees",
   "body": "Groundwork for acting on groups of files in the Git file trees (Changes window + History details pane). No new git actions in this card, only the plumbing the next card builds on.\n- Multi-select in src/git_history/file_tree.rs: today `selected: Option<usize>`. Needs click, Ctrl+click, Shift+click range, Ctrl+A, and clicking a folder or section row selects everything under it. Selection survives live re-reads (match by path + section, as changes.rs already does for the single selection).\n- Right-click on a row that is not selected: select just that row first. Right-click on a selected row keeps the group.\n- One context-menu seam: the tree reports \"menu requested for these files\"; the owning view (ChangesView, DetailsView) builds the items from the selection, and each item is enabled or disabled by what is selected (e.g. Unstage only if something staged is selected). Replace the hard-coded per-row Stage/Unstage closure in file_tree.rs with this.\n- Keyboard: Up/Down move, Shift+Up/Down extend, Enter opens the diff, Menu key / Shift+F10 opens the context menu.\n- Double-click opens the diff, single click selects only (today a single click opens it; decide and document).\n- Tests: pointer-event tests for each selection gesture and for selection surviving a re-read.\n- Update docs/git-history.md.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/roppgq",
-    "branch": "card/roppgq",
-    "base": "main"
-  },
   "planned": {
     "name": "Git commit panel",
     "wave": 3
   },
   "created": "2026-09-29T22:16:09Z",
-  "updated": "2026-09-30T03:39:32Z"
+  "updated": "2026-10-02T03:08:41Z"
 }
