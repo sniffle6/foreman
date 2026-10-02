@@ -34,6 +34,17 @@ posts through the project's chat window.
   exit 1). On a stale id, re-read `--history` — a respawned worker has a
   new id. Client parse errors exit 2.
 
+Delivery timing:
+
+- With agent state enabled, normal posts wait until the receiver is Idle.
+- Use `--now` before the message for a steer that must reach a Working agent:
+  `foreman chat --now --to t3 "stop editing that file; ownership changed"`.
+  It may pass earlier held posts. It uses paste plus Enter, not Esc/cancellation.
+- Needs you (permission prompts) holds every post, including `--now`.
+- No state yet or state disabled keeps Ready-only delivery. Hooks can be late;
+  Claude Esc leaves stale Working, so `--now` also releases steers in that case.
+- `--now` is post-only. Old servers ignore it and keep their delivery behavior.
+
 ## Recipe: dispatch a team that discusses in chat
 
 **Workers for kanban cards or a plan are not dispatched this way.** Use

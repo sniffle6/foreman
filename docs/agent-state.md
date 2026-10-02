@@ -73,9 +73,10 @@ fires nothing and its rows show no badge.
 - **Big tool output.** The helper reads up to 16 MB of hook stdin because a
   `PostToolUse` payload includes the tool's full output; the forwarded message
   stays small (event name and IDs). The pipe server's read cap stays at 64 KB.
-- **Nothing is written into any Session.** The feature only reads hook events,
-  and the GUI only ever `try_recv`s; a late or lost event makes a badge late or
-  stale, never blocks typing.
+- **State detection writes nothing into any Session.** It only reads hook
+  events. Chat delivery consumes the slot to hold posts while Working or Needs
+  you when this setting is enabled; `--now` bypasses Working. See
+  `docs/chat-delivery.md` for the delivery policy and hook limitations.
 - **Flipping the setting resets every Session's state.** While badges are off
   only the naming hook runs, so each prompt would leave a Session at `working`
   with no `Stop` to follow. Enabling starts every slot clean; a row shows a badge

@@ -1163,6 +1163,11 @@ impl Session {
         self.ready_gate.ready()
     }
 
+    /// The chat outbox retains held posts until the previous paste is submitted.
+    pub fn chat_input_available(&self) -> bool {
+        self.ready() && self.ready_gate.chat_input_available()
+    }
+
     /// Exit code of the child process, once it has ended. Cached — `try_wait`
     /// is a cheap non-blocking poll until then.
     pub fn exited(&mut self) -> Option<u32> {

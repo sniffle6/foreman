@@ -133,6 +133,11 @@ impl ReadyGate {
         self.ready
     }
 
+    /// Can the outbox hand off a post without leaving it in a second queue?
+    pub fn chat_input_available(&self) -> bool {
+        self.ready && self.pending_submit.is_none() && self.pending_inject.is_empty()
+    }
+
     /// Feed a raw PTY rx chunk for the paint half of Ready (InkScan).
     pub fn on_rx_chunk(&mut self, bytes: &[u8]) {
         if !self.painted && self.ink.saw_ink(bytes) {
@@ -211,6 +216,30 @@ impl Default for ReadyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbox_waits_for_ready_queue_and_deferred_submit() {
+        let now = Instant::now();
+        let mut gate = ReadyGate::new();
+        assert!(!gate.chat_input_available());
+        gate.try_inject("first", now);
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        assert!(
+            !gate.chat_input_available(),
+            "queued paste still owns the lane"
+        );
+        assert_eq!(gate.poll(now), [Action::Write(paste_wrap("first"))]);
+        assert!(
+            !gate.chat_input_available(),
+            "deferred submit still owns the lane"
+        );
+        assert_eq!(
+            gate.poll(now + SUBMIT_DELAY),
+            [Action::Write(b"\r".to_vec())]
+        );
+        assert!(gate.chat_input_available());
+    }
 
     #[test]
     fn paste_wrap_brackets_text_without_submitting() {

@@ -389,9 +389,11 @@ selection paints nothing.
 _Avoid_: clip (pixel-flavored), conversion (any coord math), re-anchoring.
 
 **Outbox**:
-The Chat room's per-frame delivery decision: given which Members are Ready, it
-returns exactly the framed lines each one still needs and advances their delivery
-cursors — a pure step, so the delivery guarantee can be tested without a terminal.
+The Chat room's per-frame delivery decision: given Member readiness and agent
+state, it returns the eligible framed lines each one still needs. Held posts
+retain their place; urgent posts may overtake them. It advances delivery cursors
+and remembers overtakes so every post lands once — a pure step testable without
+a terminal.
 The engine only injects what the Outbox hands back; it never decides what to send.
 _Avoid_: queue, buffer, broadcast (broadcast is a targeting mode, not the delivery
 step).

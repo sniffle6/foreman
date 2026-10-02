@@ -45,6 +45,17 @@ Targeting rules:
   targets return exit 1. Re-read `--history` after stale ids.
 - Client parse errors exit 2.
 
+Delivery timing:
+
+- With agent state enabled, normal posts wait until the receiver is Idle.
+- Use `--now` before the message for a steer that must reach a Working agent:
+  `foreman chat --now --to t3 "stop editing that file; ownership changed"`.
+  It may pass earlier held posts. It uses paste plus Enter, not Esc/cancellation.
+- Needs you (permission prompts) holds every post, including `--now`.
+- No state yet or state disabled keeps Ready-only delivery. Hooks can be late;
+  Claude Esc leaves stale Working, so `--now` also releases steers in that case.
+- `--now` is post-only. Old servers ignore it and keep their delivery behavior.
+
 ## Dispatching a Chat-Capable Team
 
 Interactive workers can receive chat. `codex exec` workers cannot, because they

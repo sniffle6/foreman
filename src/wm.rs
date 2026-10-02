@@ -1892,7 +1892,8 @@ impl WindowManager {
                     .from
                     .as_deref()
                     .ok_or("posting requires a sender (FOREMAN_TERMINAL_ID)")?;
-                let seq = child.chat_post(from, text, &req.to, req.re)?;
+                let seq =
+                    child.chat_post_now(from, text, &req.to, req.re, req.now == Some(true))?;
                 Ok(ChatOutcome::Posted { seq: Some(seq) })
             }
             _ => Err("chat needs exactly one of text/history".into()),
@@ -4541,12 +4542,24 @@ impl WindowManager {
     /// refreshed to the live tab title by the next `chat_tick`. All mutation
     /// lives in the frozen [`ChatRoom`]; nothing is injected here (the per-frame
     /// `chat_tick` delivers, spec §3: reply-before-inject).
+    #[cfg(test)]
     fn chat_post(
         &mut self,
         from: &str,
         text: &str,
         to: &[String],
         re: Option<u64>,
+    ) -> Result<u64, String> {
+        self.chat_post_now(from, text, to, re, false)
+    }
+
+    fn chat_post_now(
+        &mut self,
+        from: &str,
+        text: &str,
+        to: &[String],
+        re: Option<u64>,
+        now: bool,
     ) -> Result<u64, String> {
         // The sender must be a live terminal (history reads are anonymous, but
         // a post names its origin). Resolve by stable Member id.
@@ -4558,7 +4571,7 @@ impl WindowManager {
         if !exists {
             return Err(format!("no such terminal: {from}"));
         }
-        self.chat.borrow_mut().post(from, text, to, re)
+        self.chat.borrow_mut().post_now(from, text, to, re, now)
     }
 
     /// Append a post from the chat pane's input line. The room owns the lenient
@@ -4571,15 +4584,16 @@ impl WindowManager {
 
     /// Per-frame presence reconcile + catch-up delivery (chat handshake
     /// contract). Walks the whole manager tree; in each project manager it
-    /// gathers the live members (id/name/ready/exited), hands them to the
+    /// gathers live members (identity/readiness/state/exit), hands them to the
     /// room's [`ChatRoom::tick`] (which reconciles exits, refreshes names, and
     /// returns the per-member outbox), then injects each delivered line into
     /// its terminal. `tick`'s ready-gating + cursor is the whole DSR point: a
     /// post appended while a member was still answering its startup device-
     /// status query lands on the first frame the member is ready, exactly once.
     /// Call once after the top-level `show()`, so every session pumped this
-    /// frame reports its current `ready()` state.
-    pub fn chat_tick(&mut self) {
+    /// frame reports current readiness and paste availability. State gating is
+    /// enabled only with the full lifecycle hooks, not naming-only hooks.
+    pub fn chat_tick(&mut self, agent_state_enabled: bool) {
         // First pass: recurse into projects and collect this manager's live
         // members (the `&mut s` for exited()/ready() forces a borrow we drop
         // before touching the room).
@@ -4587,11 +4601,18 @@ impl WindowManager {
         for w in self.windows.iter_mut() {
             for tab in w.tabs.iter_mut() {
                 match &mut tab.content {
-                    Content::Project(child) => child.chat_tick(), // each room owns its log
+                    Content::Project(child) => child.chat_tick(agent_state_enabled), // each room owns its log
                     Content::Terminal(s) => live.push(crate::chat::LiveMember {
                         id: term_tag(s.term_id()),
                         name: display_name(&tab.title).to_string(),
-                        ready: s.ready(),
+                        ready: s.chat_input_available(),
+                        agent_state: if agent_state_enabled {
+                            s.agent_state()
+                                .badge(s.icon_kind(), s.has_exited())
+                                .map(|b| b.state)
+                        } else {
+                            None
+                        },
                         exited: s.exited().is_some(),
                     }),
                     Content::Chat(_)
@@ -11635,7 +11656,7 @@ mod tests {
                 s.keepalive();
             }
         }
-        wm.chat_tick();
+        wm.chat_tick(false);
         // exactly one Exited line — the member's — and none for the non-member.
         assert_eq!(sys_lines(&wm, &term_tag(member), "exited"), 1);
         assert_eq!(sys_lines(&wm, &term_tag(outsider), "exited"), 0);
@@ -12196,7 +12217,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_tick();
+            wm.chat_tick(false);
             let mut done = 0;
             for id in [a, b] {
                 let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
@@ -12581,6 +12602,73 @@ mod tests {
     }
 
     #[test]
+    fn chat_hook_state_holds_live_stdin_then_releases_on_idle_urgency_or_disable() {
+        use crate::agent_state::HookEvent;
+        use crate::terminal_titles::SourceAgent;
+        fn terminal(desk: &mut WindowManager, target: WinId) -> &mut Session {
+            let child = desk.project_child_mut(1).unwrap();
+            let window = child.windows.iter_mut().find(|w| w.id == target).unwrap();
+            let Content::Terminal(session) = &mut window.tabs[0].content else {
+                panic!("terminal")
+            };
+            session
+        }
+        for (urgent, enabled, release) in [
+            (false, true, HookEvent::Stop),
+            (true, true, HookEvent::PostToolUse),
+            (false, false, HookEvent::PermissionRequest),
+        ] {
+            let ctx = egui::Context::default();
+            let (mut desk, sender, target) = chat_fixture(&ctx);
+            // Resolve startup DSR/paint before judging the state gate.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !terminal(&mut desk, target).ready() {
+                desk.keepalive();
+                assert!(std::time::Instant::now() < deadline, "receiver never Ready");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            terminal(&mut desk, target).set_osc_title_for_test(Some("claude".into()));
+            terminal(&mut desk, target)
+                .agent_state_mut()
+                .apply(SourceAgent::Claude, HookEvent::PermissionRequest);
+            let mut req = chat_req(sender, Some("steer"), None);
+            req.to = vec![term_tag(target)];
+            req.now = urgent.then_some(true);
+            desk.chat_dispatch(&req).unwrap();
+            let held_until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < held_until {
+                desk.keepalive();
+                desk.chat_tick(true);
+                assert!(
+                    terminal(&mut desk, target).chat_input_available(),
+                    "permission prompt consumed a paste"
+                );
+                assert!(
+                    terminal(&mut desk, target).exited().is_none(),
+                    "paste reached permission prompt"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            terminal(&mut desk, target)
+                .agent_state_mut()
+                .apply(SourceAgent::Claude, release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                desk.keepalive();
+                desk.chat_tick(enabled);
+                if terminal(&mut desk, target).exited().is_some() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "eligible post never reached stdin"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
     fn chat_broadcast_hits_members_only_excluding_sender() {
         let ctx = egui::Context::default();
         let mut wm = WindowManager::new();
@@ -12621,7 +12709,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_tick();
+            wm.chat_tick(false);
             // positive signal: the member exits because bytes hit its stdin
             let w = wm.windows.iter_mut().find(|w| w.id == member).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
@@ -12691,6 +12779,7 @@ mod tests {
             text: text.map(str::to_string),
             history,
             re: None,
+            now: None,
         }
     }
 
@@ -12739,7 +12828,7 @@ mod tests {
                 }
             }
             // Drop the &mut d.windows borrow before ticking, then re-borrow.
-            d.chat_tick();
+            d.chat_tick(false);
             let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
             let Content::Project(child) = &mut win.tabs[win.active].content else {
                 panic!()
@@ -13568,7 +13657,7 @@ mod tests {
                     }
                 }
             }
-            wm.chat_tick();
+            wm.chat_tick(false);
             // positive signal: the background member tab exits
             let w = wm.windows.iter_mut().find(|w| w.id == host).unwrap();
             let Content::Terminal(s) = &mut w.tabs[0].content else {
@@ -13634,7 +13723,7 @@ mod tests {
                     s.keepalive();
                 }
             }
-            wm.chat_tick();
+            wm.chat_tick(false);
             let w = wm.windows.iter_mut().find(|w| w.id == target).unwrap();
             let Content::Terminal(s) = &mut w.tabs[w.active].content else {
                 panic!()
@@ -13660,7 +13749,7 @@ mod tests {
                 }
             }
             // tick on a ready frame: the @you post must deliver to nobody
-            wm.chat_tick();
+            wm.chat_tick(false);
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         for (id, who) in [(sender, "sender"), (bystander, "member bystander")] {
@@ -13834,7 +13923,7 @@ mod tests {
                 s.keepalive();
             }
         }
-        wm.chat_tick();
+        wm.chat_tick(false);
         let e = wm
             .chat_post(&term_tag(sender), "go", &[term_tag(victim)], None)
             .unwrap_err();

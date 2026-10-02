@@ -132,6 +132,9 @@ pub struct ChatRequest {
     /// be a `Post` whose to-set includes `from`). Skipped when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub re: Option<u64>,
+    /// Bypass Working for urgent steers; omitted on ordinary v1 requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<bool>,
 }
 
 /// List projects and their terminals. `project` is an explicit opt-in filter;
@@ -508,6 +511,7 @@ pub fn parse_chat_args(
     let mut history: Option<usize> = None;
     let mut to: Vec<String> = Vec::new();
     let mut re: Option<u64> = None;
+    let mut now = None;
     let mut words: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -537,6 +541,10 @@ pub fn parse_chat_args(
                 }
                 to.push(id.to_string());
                 i += 2;
+            }
+            "--now" => {
+                now = Some(true);
+                i += 1;
             }
             "--re" => {
                 let v = args.get(i + 1).ok_or("--re needs a seq number")?;
@@ -578,11 +586,15 @@ pub fn parse_chat_args(
                 text: Some(text),
                 history: None,
                 re,
+                now,
             })
         }
         (true, Some(n)) => {
             if !to.is_empty() {
                 return Err("--to and --history are mutually exclusive".into());
+            }
+            if now.is_some() {
+                return Err("--now is post-only, not valid with --history".into());
             }
             if re.is_some() {
                 return Err("--re is post-only, not valid with --history".into());
@@ -597,6 +609,7 @@ pub fn parse_chat_args(
                 text: None,
                 history: Some(n),
                 re: None,
+                now: None,
             })
         }
         (true, None) => Err("nothing to do: give a message or --history".into()),
@@ -1511,7 +1524,7 @@ or \" in arguments — foreman refuses such dispatches loudly.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_CHAT: &str = "\
-foreman chat [--project P] [--to T]... [--re N] [--] <message...>
+foreman chat [--project P] [--to T]... [--re N] [--now] [--] <message...>
 foreman chat [--project P] --history [N]
 
 Post <message...> to project P's chat room (default: FOREMAN_PROJECT_ID), or
@@ -1521,6 +1534,7 @@ terminal); --history works for any caller and never joins the room.
   --to tN|you   deliver-interrupt only those members (repeatable); a leading
                 @tN/@you run in the message does the same
   --re N        mark the post as a reply to room seq N
+  --now         bypass Working; still wait for Ready and through Needs you
   --            end flag parsing (post a message that starts with -)
 Replies: a post prints {\"ok\":true,\"seq\":N}; history prints line per line.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
@@ -1737,7 +1751,9 @@ pub fn client_main(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
-            eprintln!("       foreman chat [--project P] [--to T]... [--re N] [--] <message...>");
+            eprintln!(
+                "       foreman chat [--project P] [--to T]... [--re N] [--now] [--] <message...>"
+            );
             eprintln!("       foreman chat [--project P] --history [N]");
             eprintln!("       foreman status [--project P]");
             eprintln!("       foreman close [tN ...] [--project P]");
@@ -2052,6 +2068,39 @@ fn report(label: &str, res: std::io::Result<OpenReply>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_now_is_post_only_and_v1_wire_compatible() {
+        let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hello","history":null}"#;
+        let req: ChatRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.now, None);
+        assert_eq!(serde_json::to_string(&req).unwrap(), v1);
+        let args = vec![
+            "--now".into(),
+            "--to".into(),
+            "t3".into(),
+            "--re".into(),
+            "7".into(),
+            "steer".into(),
+        ];
+        let req = parse_chat_args(&args, Some("p1".into()), Some("t2".into())).unwrap();
+        assert_eq!(req.now, Some(true));
+        assert_eq!(req.to, ["t3"]);
+        assert_eq!(req.re, Some(7));
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains(r#""now":true"#));
+        assert_eq!(serde_json::from_str::<ChatRequest>(&encoded).unwrap(), req);
+        let args = vec!["--now".into(), "--history".into()];
+        assert!(
+            parse_chat_args(&args, None, None)
+                .unwrap_err()
+                .contains("post-only")
+        );
+        let args = vec!["--".into(), "--now".into()];
+        let req = parse_chat_args(&args, None, Some("t2".into())).unwrap();
+        assert_eq!(req.now, None);
+        assert_eq!(req.text.as_deref(), Some("--now"));
+    }
 
     #[test]
     fn request_parses_with_optional_fields_missing() {
@@ -3021,6 +3070,7 @@ mod tests {
             text: Some("hello".into()),
             history: None,
             re: None,
+            now: None,
         };
         let mut reply = None;
         for _ in 0..100 {

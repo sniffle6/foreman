@@ -81,6 +81,8 @@ pub struct ChatMsg {
     /// `seq` stays the leading authoritative id. None on plain posts.
     pub re: Option<u64>,
     pub kind: ChatKind,
+    /// Urgent posts may pass a Working member, but never Needs you.
+    pub now: bool,
 }
 
 impl ChatMsg {
@@ -224,6 +226,7 @@ impl ChatLog {
             to,
             re,
             kind,
+            now: false,
         };
         self.msgs.push(msg);
         self.msgs.last().expect("just pushed")
@@ -269,6 +272,7 @@ impl ChatLog {
     /// first. System entries are never delivered. `after` is the member's
     /// delivery cursor (`Tab::last_delivered_seq`); this is both the catch-up
     /// replay source and the dedup boundary (chat handshake contract).
+    #[cfg(test)]
     pub fn deliver_after(&self, member_id: &str, after: u64) -> Vec<&ChatMsg> {
         self.msgs
             .iter()
@@ -482,8 +486,10 @@ impl ChatView {
 /// One member's room-side state, keyed by the `tN`/`you` id.
 struct MemberState {
     name: String,
-    /// Delivery cursor: the highest seq this member has been handed.
+    /// Delivery cursor: every entry through this seq is delivered or irrelevant.
     cursor: u64,
+    /// Urgent posts delivered beyond a held cursor; dedup metadata, not a queue.
+    delivered: std::collections::BTreeSet<u64>,
     exited: bool,
     is_human: bool,
 }
@@ -494,6 +500,8 @@ pub struct LiveMember {
     pub id: String,
     pub name: String,
     pub ready: bool,
+    /// None preserves Ready-only delivery (disabled, no hooks, or no identity).
+    pub agent_state: Option<crate::agent_state::AgentState>,
     pub exited: bool,
 }
 
@@ -504,7 +512,7 @@ pub struct Delivery {
 }
 
 /// The validated, presence-aware room: a [`ChatLog`] plus a member registry.
-/// Composition over the log — all posting goes through [`ChatRoom::post`]
+/// Composition over the log — all posting goes through [`ChatRoom::post_now`]
 /// (validation, auto-join) and all injection through [`ChatRoom::tick`]
 /// (presence reconcile + per-member outbox). The room owns no window ids;
 /// the wiring phase re-attaches window coordinates to the [`CrewRow`]s.
@@ -536,6 +544,7 @@ impl ChatRoom {
             MemberState {
                 name: HUMAN_ID.to_string(),
                 cursor: 0,
+                delivered: Default::default(),
                 exited: false,
                 is_human: true,
             },
@@ -554,18 +563,31 @@ impl ChatRoom {
             .map(|(_, v)| v)
     }
 
-    /// The single validated post path. Resolves delivery targets from `to`
-    /// + leading `@mentions`, validates them all-or-nothing (registered, not
-    /// self, not exited), auto-joins a new sender (with a `Joined` line
-    /// ordered before the post), then appends. Returns the new seq.
-    /// Strict: any bad target is an `Err` and mutates nothing — the human's
-    /// prose-fallback demotion is caller policy, not the model's.
+    /// Normal-post shorthand for room fixtures.
+    #[cfg(test)]
     pub fn post(
         &mut self,
         from: &str,
         text: &str,
         to: &[String],
         re: Option<u64>,
+    ) -> Result<u64, String> {
+        self.post_now(from, text, to, re, false)
+    }
+
+    /// The single validated post path. Resolves delivery targets from `to`
+    /// + leading `@mentions`, validates them all-or-nothing (registered, not
+    /// self, not exited), auto-joins a new sender (with a `Joined` line
+    /// ordered before the post), then appends. Returns the new seq.
+    /// Strict: any bad target is an `Err` and mutates nothing — the human's
+    /// prose-fallback demotion is caller policy, not the model's.
+    pub fn post_now(
+        &mut self,
+        from: &str,
+        text: &str,
+        to: &[String],
+        re: Option<u64>,
+        now: bool,
     ) -> Result<u64, String> {
         if text.trim().is_empty() {
             return Err("empty message".to_string());
@@ -603,6 +625,7 @@ impl ChatRoom {
             .map(|m| m.name.clone())
             .unwrap_or_else(|| from.to_string());
         let seq = self.log.post_re(from, &name, text, targets, re).seq;
+        self.log.msgs.last_mut().expect("just posted").now = now;
         Ok(seq)
     }
 
@@ -618,6 +641,7 @@ impl ChatRoom {
             MemberState {
                 name: name.to_string(),
                 cursor: 0,
+                delivered: Default::default(),
                 exited: false,
                 is_human: false,
             },
@@ -651,9 +675,9 @@ impl ChatRoom {
 
     /// Per-frame reconcile + outbox. Marks vanished/exited members exited
     /// (one `Exited` line each), then for every ready live member hands it
-    /// the posts addressed to it since its cursor (excluding its own), as
-    /// framed lines, advancing its cursor to the tail. `project` is the
-    /// current window-manager tag, supplied per-frame so the framed inject
+    /// eligible posts addressed to it since its cursor (excluding its own), as
+    /// framed lines. Held posts stop the cursor; urgent overtakes are deduped.
+    /// `project` is the current window-manager tag, supplied per-frame so the framed inject
     /// line (`[chat p1 #N] ...`) always reflects the live tag.
     pub fn tick(&mut self, project: &str, live: &[LiveMember]) -> Vec<Delivery> {
         self.tick_at(project, live, SystemTime::now())
@@ -701,30 +725,46 @@ impl ChatRoom {
 
         // --- Outbox: deliver to each ready, non-exited, registered live
         // member the posts addressed to it past its cursor (skipping its own),
-        // then advance its cursor to the tail regardless.
-        let tail = self.log.last_seq();
+        // retaining held posts and remembering urgent overtakes.
         let mut out = Vec::new();
         for l in live {
             if !l.ready || l.exited {
                 continue; // not ready / exited: cursor stays (catch-up later)
             }
-            let Some(state) = self.member(&l.id) else {
+            let Some((_, state)) = self.members.iter_mut().find(|(id, _)| id == &l.id) else {
                 continue; // unknown to the room
             };
             if state.exited {
                 continue; // just reconciled exited this tick
             }
-            let cursor = state.cursor;
-            let lines: Vec<String> = self
-                .log
-                .deliver_after(&l.id, cursor)
-                .into_iter()
-                .filter(|m| m.from != l.id)
-                .map(|m| m.frame_at(project, now))
-                .collect();
-            if let Some(m) = self.member_mut(&l.id) {
-                m.cursor = tail; // advance even if nothing was addressed
+            let mut cursor = state.cursor;
+            let delivered = &mut state.delivered;
+            let mut lines = Vec::new();
+            // Hold in the log, so framing uses the actual delivery time. Urgent
+            // posts can overtake held normal posts without losing or replaying them.
+            for msg in self.log.msgs.iter().skip(cursor as usize) {
+                let addressed = msg.kind == ChatKind::Post
+                    && msg.from != l.id
+                    && (msg.to.is_empty() || msg.to.contains(&l.id));
+                let allowed = match l.agent_state {
+                    None | Some(crate::agent_state::AgentState::Idle) => true,
+                    Some(crate::agent_state::AgentState::Working) => msg.now,
+                    Some(crate::agent_state::AgentState::NeedsYou) => false,
+                };
+                if addressed && !delivered.contains(&msg.seq) {
+                    // With state, hand off only one paste; recheck state after
+                    // its deferred Enter instead of queuing the whole backlog.
+                    if !allowed || (l.agent_state.is_some() && !lines.is_empty()) {
+                        continue;
+                    }
+                    lines.push(msg.frame_at(project, now));
+                    delivered.insert(msg.seq);
+                }
+                if msg.seq == cursor + 1 && (!addressed || delivered.remove(&msg.seq)) {
+                    cursor = msg.seq;
+                }
             }
+            state.cursor = cursor;
             if !lines.is_empty() {
                 out.push(Delivery {
                     id: l.id.clone(),
@@ -805,8 +845,98 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             ready,
+            agent_state: None,
             exited,
         }
+    }
+
+    #[test]
+    fn delivery_obeys_state_and_urgency_table() {
+        use crate::agent_state::AgentState::*;
+        for state in [None, Some(Working), Some(NeedsYou), Some(Idle)] {
+            for urgent in [false, true] {
+                for ready in [false, true] {
+                    let mut room = ChatRoom::new();
+                    room.join("t2", "receiver");
+                    room.post_now("t1", "steer", &[], None, urgent).unwrap();
+                    let mut receiver = live("t2", ready, false);
+                    receiver.agent_state = state;
+                    let got = room.tick("p1", &[receiver]);
+                    let expected = ready
+                        && match state {
+                            None | Some(Idle) => true,
+                            Some(Working) => urgent,
+                            Some(NeedsYou) => false,
+                        };
+                    assert_eq!(
+                        !got.is_empty(),
+                        expected,
+                        "{state:?}, urgent={urgent}, ready={ready}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn urgent_overtakes_held_posts_once_then_idle_drains_in_order_with_age() {
+        use crate::agent_state::AgentState::*;
+        let mut room = ChatRoom::new();
+        room.join("t2", "receiver");
+        let first = room.post("t1", "normal one", &[], None).unwrap();
+        room.post("t1", "normal two", &[], None).unwrap();
+        let urgent = room
+            .post_now("t1", "steer", &[], Some(first), true)
+            .unwrap();
+        let at = room.log.msgs.last().unwrap().at;
+        let mut receiver = live("t2", true, false);
+        receiver.agent_state = Some(Working);
+        let got = room.tick_at("p1", &[receiver], at);
+        assert_eq!(got[0].lines.len(), 1);
+        assert!(got[0].lines[0].contains(&format!("#{urgent}]")));
+        for _ in 0..3 {
+            let mut receiver = live("t2", true, false);
+            receiver.agent_state = Some(Working);
+            assert!(room.tick("p1", &[receiver]).is_empty());
+        }
+        for expected in ["normal one", "normal two"] {
+            let mut receiver = live("t2", true, false);
+            receiver.agent_state = Some(Idle);
+            let got = room.tick_at("p1", &[receiver], at + Duration::from_secs(120));
+            assert_eq!(got[0].lines.len(), 1);
+            assert!(got[0].lines[0].ends_with(expected));
+            assert!(got[0].lines[0].contains("2m ago"));
+        }
+        let mut receiver = live("t2", true, false);
+        receiver.agent_state = Some(Idle);
+        assert!(room.tick("p1", &[receiver]).is_empty());
+        assert!(room.member("t2").unwrap().delivered.is_empty());
+        assert_eq!(room.member("t2").unwrap().cursor, room.last_seq());
+    }
+
+    #[test]
+    fn held_posts_resume_when_state_becomes_unknown_and_exits_never_deliver() {
+        use crate::agent_state::AgentState::*;
+        let mut room = ChatRoom::new();
+        room.join("t2", "receiver");
+        room.join("t3", "other");
+        room.post("t1", "@t2 normal", &[], None).unwrap();
+        room.post_now("t1", "@t2 urgent", &[], None, true).unwrap();
+        let mut receiver = live("t2", true, false);
+        receiver.agent_state = Some(NeedsYou);
+        assert!(
+            room.tick("p1", &[receiver, live("t3", true, false)])
+                .is_empty()
+        );
+        let got = room.tick("p1", &[live("t2", true, false), live("t3", true, false)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "t2");
+        assert_eq!(got[0].lines.len(), 2);
+        room.post_now("t1", "urgent broadcast", &[], None, true)
+            .unwrap();
+        let got = room.tick("p1", &[live("t2", true, true), live("t3", true, false)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "t3");
     }
 
     #[test]
@@ -999,6 +1129,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "worker A".to_string(),
                 ready: true,
+                agent_state: None,
                 exited: false,
             }],
         );
@@ -1392,6 +1523,7 @@ mod tests {
             to: Vec::new(),
             re: None,
             kind,
+            now: false,
         }
     }
 
