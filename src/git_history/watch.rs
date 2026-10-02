@@ -1118,8 +1118,10 @@ mod tests {
         let dir = repo.path().to_path_buf();
         let w = open(&dir, &egui::Context::default()).unwrap();
         quiet(&w);
-        // The watch never blocks the delete.
-        std::fs::remove_dir_all(&dir).unwrap();
+        // The watch shares deletion, but startup's ignored-path Git child
+        // can still hold its cwd after the generation counters go quiet.
+        // Wait for that transient handle just like the Follow deletion test.
+        patiently("remove the watch root", || std::fs::remove_dir_all(&dir));
         wait_until("the thread to exit", || !w.alive());
         assert!(!dir.exists());
         // A dead watch is replaced, not shared.
