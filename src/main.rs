@@ -1157,6 +1157,8 @@ impl eframe::App for App {
                         if t != *self.active_theme {
                             self.active_theme = std::sync::Arc::new(t);
                             crate::theme::seed_live(&ctx, &self.active_theme);
+                            // The desktop already drew this frame; show it now.
+                            ctx.request_repaint();
                             self.notify.push(
                                 notify::Level::Info,
                                 format!("Reloaded theme \"{}\" from disk", self.settings.theme),

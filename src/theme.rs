@@ -811,7 +811,9 @@ impl Theme {
         if Self::is_builtin(name) {
             return None;
         }
-        crate::config::themes_dir().map(|d| d.join(format!("{}.json", slug(name))))
+        // Pure path math — no `create_dir_all` (this runs from the once-a-second
+        // disk poll; `themes_dir` creates on demand for the writers).
+        crate::config::config_dir().map(|d| d.join("themes").join(format!("{}.json", slug(name))))
     }
 
     /// Last-modified time of a user theme's file; `None` for the built-in or a
