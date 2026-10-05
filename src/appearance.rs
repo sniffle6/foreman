@@ -96,6 +96,8 @@ pub struct AppearanceView {
     presets: Vec<String>,
     /// True while the delete-confirmation modal is open.
     confirm_delete: bool,
+    /// True while the theme dropdown list is open.
+    preset_open: bool,
     expert: crate::theme_expert::ThemeExpert,
 }
 
@@ -109,6 +111,7 @@ impl AppearanceView {
             model_edit: None,
             presets: vec![BUILTIN.to_string()],
             confirm_delete: false,
+            preset_open: false,
             expert: crate::theme_expert::ThemeExpert::new(),
         };
         v.refresh_presets();
@@ -367,7 +370,6 @@ impl AppearanceView {
         let mut x = strip.right() - PAD;
         let mut actions: Vec<(&str, &str)> = vec![("Folder", "Open the themes folder")];
         if !builtin {
-            actions.push(("Delete", "Delete this theme"));
             actions.push(("Reload", "Re-read this theme's file"));
         }
         actions.push(("Duplicate", "Copy this theme into a new editable one"));
@@ -382,7 +384,6 @@ impl AppearanceView {
             if resp.clicked() {
                 match label {
                     "Folder" => out.open_folder = true,
-                    "Delete" => self.confirm_delete = true,
                     "Reload" => out.reload = true,
                     _ => out.duplicate = true,
                 }
@@ -391,34 +392,41 @@ impl AppearanceView {
         }
         let actions_left = x;
 
-        // Preset chips, left-to-right, clipped before the actions.
-        let mut px = strip.left() + PAD;
-        let clip = egui::Rect::from_min_max(
-            egui::pos2(strip.left(), strip.top()),
-            egui::pos2(actions_left - 6.0, strip.bottom()),
+        // Theme dropdown (active name + caret) with a `−` delete button beside it.
+        let room = (actions_left - 6.0 - CHIP_H - 6.0 - (strip.left() + PAD)).max(80.0);
+        let dd_w = (chip_width(ui, &self.active_name) + 18.0).clamp(140.0, room.min(260.0));
+        let dd = egui::Rect::from_min_size(
+            egui::pos2(strip.left() + PAD, cy1 - CHIP_H / 2.0),
+            egui::vec2(dd_w, CHIP_H),
         );
-        let presets = self.presets.clone();
-        for p in &presets {
-            let w = chip_width(ui, p);
-            if px + w > clip.right() {
-                ui.painter_at(clip).text(
-                    egui::pos2(px + 2.0, cy1),
-                    egui::Align2::LEFT_CENTER,
-                    "…",
-                    egui::FontId::proportional(FONT_CHIP),
-                    t.dim,
-                );
-                break;
-            }
-            let r = egui::Rect::from_min_size(
-                egui::pos2(px, cy1 - CHIP_H / 2.0),
-                egui::vec2(w, CHIP_H),
+        if let Some(p) = self.preset_dropdown(ui, dd, strip, t) {
+            out.preset_switch = Some(p);
+        }
+        let del = egui::Rect::from_min_size(
+            egui::pos2(dd.right() + 6.0, cy1 - CHIP_H / 2.0),
+            egui::vec2(CHIP_H, CHIP_H),
+        );
+        if builtin {
+            // Disabled look: the built-in cannot be deleted.
+            let p = ui.painter();
+            p.rect_stroke(
+                del,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, t.border),
+                egui::StrokeKind::Inside,
             );
-            let active = *p == self.active_name;
-            if chip(ui, r, ("appearance_preset", p.as_str()), p, t, active).clicked() && !active {
-                out.preset_switch = Some(p.clone());
-            }
-            px = r.right() + 6.0;
+            p.text(
+                del.center(),
+                egui::Align2::CENTER_CENTER,
+                "−",
+                egui::FontId::proportional(FONT_CHIP + 1.0),
+                t.dim,
+            );
+        } else if chip(ui, del, "appearance_delete", "−", t, false)
+            .on_hover_text("Delete this theme")
+            .clicked()
+        {
+            self.confirm_delete = true;
         }
 
         // Status line.
@@ -530,6 +538,161 @@ impl AppearanceView {
             }
         }
         out
+    }
+
+    /// The theme selector: a chip showing the active name with a caret that opens
+    /// a hand-painted list (built-in first, then user themes) in a Foreground
+    /// `Area`, like `hover_menu` but click-toggled and with dynamic names. Click
+    /// outside or Esc closes it. Returns the picked name when it differs.
+    fn preset_dropdown(
+        &mut self,
+        ui: &mut egui::Ui,
+        anchor: egui::Rect,
+        area: egui::Rect,
+        t: &Theme,
+    ) -> Option<String> {
+        let resp = ui.interact(
+            anchor,
+            egui::Id::new("appearance_preset_dd"),
+            egui::Sense::click(),
+        );
+        if resp.clicked() {
+            self.preset_open = !self.preset_open;
+        }
+        let cr = egui::CornerRadius::same(4);
+        let p = ui.painter();
+        if self.preset_open {
+            p.rect_filled(anchor, cr, t.title_bg_focus);
+        } else if resp.hovered() {
+            p.rect_filled(anchor, cr, t.sel_bg);
+        }
+        p.rect_stroke(
+            anchor,
+            cr,
+            egui::Stroke::new(
+                1.0,
+                if self.preset_open || resp.hovered() {
+                    t.border_focus
+                } else {
+                    t.border
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let caret_w = 16.0;
+        let g = truncated(
+            ui,
+            &self.active_name,
+            egui::FontId::proportional(FONT_CHIP),
+            t.text,
+            anchor.width() - 10.0 - caret_w,
+        );
+        p.galley(
+            egui::pos2(anchor.left() + 8.0, anchor.center().y - g.size().y / 2.0),
+            g,
+            t.text,
+        );
+        p.text(
+            egui::pos2(anchor.right() - 8.0, anchor.center().y),
+            egui::Align2::RIGHT_CENTER,
+            if self.preset_open { "▴" } else { "▾" },
+            egui::FontId::proportional(FONT_SMALL),
+            t.dim,
+        );
+        if !self.preset_open {
+            return None;
+        }
+
+        // The list.
+        let font = egui::FontId::proportional(FONT_CHIP);
+        let row_h = 24.0;
+        let pad = 10.0;
+        let label_w = self
+            .presets
+            .iter()
+            .map(|n| {
+                ui.painter()
+                    .layout_no_wrap(n.clone(), font.clone(), t.text)
+                    .size()
+                    .x
+            })
+            .fold(0.0f32, f32::max);
+        let w = (label_w + pad * 2.0 + 22.0).max(anchor.width());
+        let h = self.presets.len() as f32 * row_h + 8.0;
+        let below = anchor.bottom() + 2.0;
+        let oy = if below + h > area.max.y {
+            (anchor.top() - 2.0 - h).max(area.min.y)
+        } else {
+            below
+        };
+        let panel = egui::Rect::from_min_size(egui::pos2(anchor.left(), oy), egui::vec2(w, h));
+        let menu_id = egui::Id::new("appearance_preset_menu");
+        let mut picked: Option<String> = None;
+        let mut clicked_inside = false;
+        egui::Area::new(menu_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel.min)
+            .constrain(false)
+            .default_size(panel.size())
+            .movable(false)
+            .show(ui.ctx(), |mui| {
+                let mp = mui.painter();
+                mp.rect_filled(panel, cr, t.win_bg);
+                mp.rect_stroke(
+                    panel,
+                    cr,
+                    egui::Stroke::new(1.0, t.border),
+                    egui::StrokeKind::Inside,
+                );
+                let mut y = panel.top() + 4.0;
+                for (i, name) in self.presets.iter().enumerate() {
+                    let rr = egui::Rect::from_min_size(
+                        egui::pos2(panel.left(), y),
+                        egui::vec2(w, row_h),
+                    );
+                    let r = mui.interact(rr, menu_id.with(("row", i)), egui::Sense::click());
+                    let active = *name == self.active_name;
+                    if r.hovered() {
+                        mui.painter()
+                            .rect_filled(rr.shrink2(egui::vec2(3.0, 1.0)), cr, t.sel_bg);
+                    }
+                    mui.painter().text(
+                        egui::pos2(rr.left() + pad, rr.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        font.clone(),
+                        if active { t.border_focus } else { t.text },
+                    );
+                    if active {
+                        mui.painter().text(
+                            egui::pos2(rr.right() - pad, rr.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            "●",
+                            egui::FontId::proportional(FONT_SMALL - 2.0),
+                            t.dim,
+                        );
+                    }
+                    if r.clicked() {
+                        clicked_inside = true;
+                        if !active {
+                            picked = Some(name.clone());
+                        }
+                    }
+                    y += row_h;
+                }
+            });
+        // Close on pick, Esc, or a click anywhere outside the list and the chip.
+        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let outside = ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|pos| !panel.contains(pos) && !anchor.contains(pos))
+        });
+        if picked.is_some() || clicked_inside || esc || outside {
+            self.preset_open = false;
+        }
+        picked
     }
 
     // ---------------------------------------------------------------- tokens
