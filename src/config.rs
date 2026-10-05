@@ -168,10 +168,31 @@ pub fn load_json_from<T: DeserializeOwned + Default>(dir: &std::path::Path, file
 pub fn parse_json_from<T: DeserializeOwned>(
     dir: &std::path::Path,
     file: &str,
-) -> Result<T, String> {
+) -> Result<T, ParseError> {
     let path = dir.join(file);
-    let text = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))
+    let text =
+        std::fs::read(&path).map_err(|e| ParseError::Io(format!("{}: {e}", path.display())))?;
+    // Editors on Windows like to prepend a UTF-8 BOM; serde_json rejects it.
+    let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&text);
+    serde_json::from_slice(text)
+        .map_err(|e| ParseError::Invalid(format!("{}: {e}", path.display())))
+}
+
+/// Why [`parse_json_from`] could not produce a value. `Io` is usually
+/// transient (an editor holding the file, a sharing violation mid-write) and
+/// worth retrying; `Invalid` is the user's problem to fix and worth a toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    Io(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Io(s) | ParseError::Invalid(s) => f.write_str(s),
+        }
+    }
 }
 
 /// Write a JSON file atomically into `dir`: serialize, write a sibling `.tmp`,

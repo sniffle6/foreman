@@ -375,7 +375,17 @@ mod tests {
         let path = dir.join("broken.json");
         std::fs::write(&path, b"{ \"bg\": \"#fff\" }").unwrap();
         let r = Theme::try_load_in(&dir, "broken");
-        assert!(r.is_err(), "3-digit hex must be rejected");
+        assert!(
+            matches!(r, Err(crate::config::ParseError::Invalid(_))),
+            "3-digit hex must be rejected as Invalid, got {r:?}"
+        );
+        // A BOM-prefixed but otherwise valid file parses (Windows editors add one).
+        std::fs::write(dir.join("bom.json"), b"\xEF\xBB\xBF{ \"bg\": \"#010203\" }").unwrap();
+        assert_eq!(
+            Theme::try_load_in(&dir, "bom").unwrap().bg,
+            egui::Color32::from_rgb(1, 2, 3)
+        );
+        let _ = std::fs::remove_file(dir.join("bom.json"));
         assert!(path.exists(), "invalid file must not be renamed or removed");
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
@@ -392,7 +402,13 @@ mod tests {
         t.bg = egui::Color32::from_rgb(1, 2, 3);
         crate::config::save_json_in(&dir, "mine.json", &t).unwrap();
         assert_eq!(Theme::try_load_in(&dir, "mine").unwrap().bg, t.bg);
-        assert!(Theme::try_load_in(&dir, "missing").is_err());
+        assert!(
+            matches!(
+                Theme::try_load_in(&dir, "missing"),
+                Err(crate::config::ParseError::Io(_))
+            ),
+            "a missing file is an Io error (retryable), not Invalid"
+        );
         assert_eq!(
             Theme::try_load(crate::appearance::BUILTIN).unwrap(),
             Theme::foreman_warm()
@@ -813,17 +829,21 @@ impl Theme {
     /// missing or invalid file is an `Err` with the reason. Unlike [`load`](Self::load)
     /// this never backs up, renames, or otherwise touches the file — an editor
     /// mid-write must be left alone, and the caller keeps the current theme.
-    pub fn try_load(name: &str) -> Result<Theme, String> {
+    pub fn try_load(name: &str) -> Result<Theme, crate::config::ParseError> {
         if Self::is_builtin(name) {
             return Ok(Self::foreman_warm());
         }
-        let dir = crate::config::themes_dir().ok_or_else(|| "no themes dir".to_string())?;
+        let dir = crate::config::themes_dir()
+            .ok_or_else(|| crate::config::ParseError::Io("no themes dir".to_string()))?;
         Self::try_load_in(&dir, name)
     }
 
     /// Dir-parameterized core of [`try_load`](Self::try_load) (tests point it at
     /// a scratch dir).
-    pub(crate) fn try_load_in(dir: &std::path::Path, name: &str) -> Result<Theme, String> {
+    pub(crate) fn try_load_in(
+        dir: &std::path::Path,
+        name: &str,
+    ) -> Result<Theme, crate::config::ParseError> {
         crate::config::parse_json_from(dir, &format!("{}.json", slug(name)))
     }
 

@@ -70,13 +70,6 @@ pub enum Outcome {
     Pending,
 }
 
-/// Whether a preset switch should write the OUTGOING theme first. Only a dirty
-/// user theme has anything to persist; writing a clean one would clobber a hand
-/// edit made on disk since it was loaded.
-pub fn persist_outgoing(is_builtin: bool, dirty: bool) -> bool {
-    !is_builtin && dirty
-}
-
 /// What the top strip + token list reported this frame (collected, then folded
 /// into an [`Outcome`] after the whole pane is drawn).
 #[derive(Default)]
@@ -161,7 +154,9 @@ impl AppearanceView {
             .unwrap_or(base)
     }
 
-    /// The currently-active theme name (matches `Settings.theme`).
+    /// The currently-active theme name (matches `Settings.theme`). The shell
+    /// decides resync through `needs_resync`; this is for tests.
+    #[cfg(test)]
     pub fn active_name(&self) -> &str {
         &self.active_name
     }
@@ -187,7 +182,8 @@ impl AppearanceView {
         &self.working
     }
 
-    /// Mutable access for the controls (and tests).
+    /// Mutable access for tests (the view edits `working` directly).
+    #[cfg(test)]
     pub fn working_mut(&mut self) -> &mut Theme {
         &mut self.working
     }
@@ -264,7 +260,11 @@ impl AppearanceView {
         out.changed |= self.draw_tokens(ui, tokens_rect, &t);
 
         let side_inner = side.shrink2(egui::vec2(PAD * 0.7, 10.0));
-        let hero_h = (side_inner.height() * 0.42).clamp(170.0, 260.0);
+        // Never taller than the column itself (a very short Settings window would
+        // otherwise push the hero past the footer and under the chat).
+        let hero_h = (side_inner.height() * 0.42)
+            .clamp(170.0, 260.0)
+            .min(side_inner.height().max(0.0));
         let hero =
             egui::Rect::from_min_size(side_inner.min, egui::vec2(side_inner.width(), hero_h));
         if Self::draw_hero(ui, hero, &preview, previewing, &t) {
@@ -878,8 +878,8 @@ impl AppearanceView {
         let mut log_ui = panel.new_child(egui::UiBuilder::new().max_rect(log));
         log_ui.set_clip_rect(log);
         let busy = self.expert.busy();
-        let error = self.expert.error.clone();
-        let turns = self.expert.turns.clone();
+        let error = self.expert.error.as_deref();
+        let turns = &self.expert.turns;
         let proposals = &self.expert.proposals;
         let selected = self.expert.selected;
         egui::ScrollArea::vertical()
@@ -1037,7 +1037,7 @@ impl AppearanceView {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(400));
                 }
-                if let Some(err) = &error {
+                if let Some(err) = error {
                     let short = err.lines().next().unwrap_or("").to_string();
                     row(ui, width, 24.0, |ui, r| {
                         let g = truncated(
@@ -1057,7 +1057,7 @@ impl AppearanceView {
                             egui::Id::new("theme_expert_error"),
                             egui::Sense::hover(),
                         )
-                        .on_hover_text(err.clone());
+                        .on_hover_text(err);
                     });
                 }
             });
@@ -1286,13 +1286,15 @@ fn token_row(
         let text_w = (sw.left() - 10.0 - kg.size().x - 12.0 - (r.left() + PAD)).max(40.0);
         row_text(ui, r, spec.label, spec.desc, text_w, t);
         let mut c = (spec.get)(working);
-        let hover = format!(
-            "{} · {}\n{}",
-            spec.key,
-            crate::theme::color_hex::to_hex(c),
-            spec.desc
-        );
-        if swatch(ui, sw, spec.key, &mut c, spec.alpha, t, &hover) {
+        let hover = move || {
+            format!(
+                "{} · {}\n{}",
+                spec.key,
+                crate::theme::color_hex::to_hex(c),
+                spec.desc
+            )
+        };
+        if swatch(ui, sw, spec.key, &mut c, spec.alpha, t, hover) {
             (spec.set)(working, c);
             true
         } else {
@@ -1342,12 +1344,14 @@ fn palette_rows(
                     egui::vec2(sw, sh),
                 );
                 let mut c = palette[i];
-                let hover = format!(
-                    "palette[{i}] · {}\n{}",
-                    crate::theme::color_hex::to_hex(c),
-                    PALETTE_NAMES[i]
-                );
-                if swatch(ui, s, ("palette", i), &mut c, false, t, &hover) {
+                let hover = move || {
+                    format!(
+                        "palette[{i}] · {}\n{}",
+                        crate::theme::color_hex::to_hex(c),
+                        PALETTE_NAMES[i]
+                    )
+                };
+                if swatch(ui, s, ("palette", i), &mut c, false, t, hover) {
                     palette[i] = c;
                     changed = true;
                 }
@@ -1387,8 +1391,9 @@ fn member_colour_row(
                 egui::vec2(sw, sh),
             );
             let mut c = colours[i];
-            let hover = format!("chat_colors[{i}] · {}", crate::theme::color_hex::to_hex(c));
-            if swatch(ui, s, ("chat_colors", i), &mut c, false, t, &hover) {
+            let hover =
+                move || format!("chat_colors[{i}] · {}", crate::theme::color_hex::to_hex(c));
+            if swatch(ui, s, ("chat_colors", i), &mut c, false, t, hover) {
                 colours[i] = c;
                 changed = true;
             }
@@ -1412,7 +1417,7 @@ fn swatch(
     c: &mut egui::Color32,
     alpha: bool,
     t: &Theme,
-    hover: &str,
+    hover: impl FnOnce() -> String,
 ) -> bool {
     let mut changed = false;
     let resp = ui
@@ -1459,7 +1464,11 @@ fn swatch(
         ),
         egui::StrokeKind::Inside,
     );
-    resp.on_hover_text(hover);
+    // Built only while hovered — ~65 swatches would otherwise format a string
+    // (with a hex encode) every frame the pane is open.
+    resp.on_hover_ui(|ui| {
+        ui.label(hover());
+    });
     changed
 }
 
@@ -1588,16 +1597,6 @@ mod tests {
             !v.needs_resync("mine", &disk),
             "live == working after our edit"
         );
-    }
-
-    #[test]
-    fn outgoing_theme_is_only_persisted_when_dirty() {
-        assert!(!persist_outgoing(true, true), "built-in never written");
-        assert!(
-            !persist_outgoing(false, false),
-            "clean user theme: leave the file alone"
-        );
-        assert!(persist_outgoing(false, true));
     }
 
     #[test]

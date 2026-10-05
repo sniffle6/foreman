@@ -888,20 +888,18 @@ impl SettingsMenu {
                             s.theme = name;
                             bump(outcome, MenuOutcome::Changed);
                         }
-                        Err(e) => eprintln!("foreman: could not create theme: {e}"),
+                        Err(e) => crate::notify::queue(
+                            ui.ctx(),
+                            crate::notify::Level::Error,
+                            format!("Could not create theme: {e}"),
+                        ),
                     }
                 }
                 crate::appearance::Outcome::SelectPreset(name) => {
-                    // Persist a pending edit to the OUTGOING user theme before
-                    // switching, so a switch within the save-debounce never drops
-                    // it — but only when dirty: writing a clean theme would clobber
-                    // a hand edit made on disk since it was loaded.
-                    if crate::appearance::persist_outgoing(
-                        crate::theme::Theme::is_builtin(&s.theme),
-                        self.appearance.is_dirty(),
-                    ) {
-                        let _ = self.appearance.working().save(&s.theme);
-                    }
+                    // Just switch the name. The App is the only writer of theme
+                    // files: on the name change it flushes an edit still inside
+                    // the save debounce to the outgoing file (and only then), so a
+                    // clean theme whose file was hand-edited is never clobbered.
                     s.theme = name;
                     bump(outcome, MenuOutcome::Changed);
                 }
@@ -934,13 +932,21 @@ impl SettingsMenu {
                             s.theme = new_slug;
                             bump(outcome, MenuOutcome::Changed);
                         }
-                        Err(e) => eprintln!("foreman: could not rename theme: {e}"),
+                        Err(e) => crate::notify::queue(
+                            ui.ctx(),
+                            crate::notify::Level::Error,
+                            format!("Could not rename theme: {e}"),
+                        ),
                     }
                 }
                 crate::appearance::Outcome::Delete(name) => {
                     // Remove the user theme file and fall back to the built-in.
                     if let Err(e) = crate::theme::Theme::delete(&name) {
-                        eprintln!("foreman: could not delete theme: {e}");
+                        crate::notify::queue(
+                            ui.ctx(),
+                            crate::notify::Level::Error,
+                            format!("Could not delete theme: {e}"),
+                        );
                     }
                     s.theme = crate::appearance::BUILTIN.to_string();
                     bump(outcome, MenuOutcome::Changed);

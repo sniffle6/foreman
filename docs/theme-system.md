@@ -100,11 +100,14 @@ theme. The rules, all in `src/main.rs` (`App`) and `src/theme.rs`:
   editor mid-write) toasts the serde error once and keeps the current theme;
   fix the file and it applies on the next tick. The destructive
   `.corrupt-*` backup path belongs to the tolerant startup loader only.
-- **The app never clobbers a clean theme.** A preset switch writes the outgoing
-  file only when the pane has unsaved edits (`appearance::persist_outgoing`).
-  The one window where the app's write wins is the ~400 ms save debounce after
-  an in-app edit; the poll is paused while a save is pending and the mtime is
-  re-recorded after it lands.
+- **The app never clobbers a clean theme.** The App is the only writer of
+  theme files. On a preset switch it flushes an edit still inside the save
+  debounce to the outgoing file, and only then (`flush_outgoing` in
+  `src/main.rs`; a renamed or deleted file is never resurrected). The one
+  window where the app's write wins is the ~400 ms save debounce after an
+  in-app edit; the poll is paused while a save is pending and the mtime is
+  re-recorded after it lands. A transient read failure (an editor holding the
+  file) is retried silently on the next tick.
 - **Alpha is premultiplied.** `#rrggbbaa` stores egui's premultiplied bytes, so
   a hand-written `#ffffff80` is not "50 % white". Prefer the in-app picker for
   translucent tokens (it edits straight alpha). Fixing the format needs a

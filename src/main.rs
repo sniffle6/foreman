@@ -1089,55 +1089,28 @@ impl eframe::App for App {
         // re-seed the ctx so the read-back sees the reloaded theme (equal → not
         // marked dirty — a reload must not masquerade as an edit to persist).
         if self.settings.theme != self.active_theme_name {
-            // A name change is a preset switch / rename / duplicate — the settings
-            // menu already persisted the outgoing edit to the right file BEFORE
-            // changing the name, so just drop the pending flag and load the new one
-            // (no flush here, which would otherwise re-create a just-renamed file).
+            // A name change is a preset switch / rename / duplicate / delete. An
+            // edit still inside the save debounce is flushed to the OUTGOING file
+            // first — but only when that file still exists: after a rename or
+            // delete it is gone and writing would resurrect it. The App is the only
+            // writer, so a clean theme is never touched (a hand edit survives).
+            let old = std::mem::replace(&mut self.active_theme_name, self.settings.theme.clone());
+            let old_exists = crate::theme::Theme::file_path(&old).is_some_and(|p| p.exists());
+            if flush_outgoing(
+                self.theme_dirty_at.is_some(),
+                crate::theme::Theme::is_builtin(&old),
+                old_exists,
+            ) {
+                if let Err(e) = self.active_theme.save(&old) {
+                    eprintln!("foreman: could not save theme: {e}");
+                }
+            }
             self.theme_dirty_at = None;
             self.active_theme =
                 std::sync::Arc::new(crate::theme::Theme::load(&self.settings.theme));
-            self.active_theme_name = self.settings.theme.clone();
             self.theme_file_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
             self.theme_bad_mtime = None;
             crate::theme::seed_live(&ctx, &self.active_theme);
-        }
-        // Disk poll: a hand-edited theme file applies within a second. Skipped
-        // while a debounced save is pending so our own write (whose mtime is
-        // re-recorded right after it lands) is never mistaken for a foreign edit.
-        // The strict loader never renames an invalid file — an editor mid-write
-        // just toasts once and the current theme stays.
-        if self.theme_dirty_at.is_none()
-            && !crate::theme::Theme::is_builtin(&self.settings.theme)
-            && self.theme_poll_at.elapsed() >= THEME_POLL_EVERY
-        {
-            self.theme_poll_at = std::time::Instant::now();
-            let now_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
-            if theme_disk_action(self.theme_file_mtime, now_mtime, self.theme_bad_mtime)
-                == DiskAction::Reload
-            {
-                match crate::theme::Theme::try_load(&self.settings.theme) {
-                    Ok(t) => {
-                        self.theme_file_mtime = now_mtime;
-                        self.theme_bad_mtime = None;
-                        if t != *self.active_theme {
-                            self.active_theme = std::sync::Arc::new(t);
-                            crate::theme::seed_live(&ctx, &self.active_theme);
-                            self.notify.push(
-                                notify::Level::Info,
-                                format!("Reloaded theme \"{}\" from disk", self.settings.theme),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        self.theme_bad_mtime = now_mtime;
-                        self.notify.push(
-                            notify::Level::Warning,
-                            format!("Theme file not applied: {e}"),
-                        );
-                    }
-                }
-            }
-            ctx.request_repaint_after(THEME_POLL_EVERY);
         }
         // Adopt any Appearance-pane theme edit published this frame (theme::seed_live
         // in wm) so the preview and every real terminal repaint live, and mark it
@@ -1160,6 +1133,47 @@ impl eframe::App for App {
                 }
                 self.theme_dirty_at = None;
             }
+        }
+        // Disk poll: a hand-edited theme file applies within a second. Runs AFTER
+        // the live read-back and the debounced save so a pane edit published this
+        // frame has already closed the `theme_dirty_at` gate, and our own write
+        // (whose mtime is re-recorded right after it lands) is never mistaken for
+        // a foreign edit. The strict loader never renames an invalid file — an
+        // editor mid-write toasts once and the current theme stays; a transient
+        // read error (sharing violation) is retried silently next tick.
+        if self.theme_dirty_at.is_none()
+            && !crate::theme::Theme::is_builtin(&self.settings.theme)
+            && self.theme_poll_at.elapsed() >= THEME_POLL_EVERY
+        {
+            self.theme_poll_at = std::time::Instant::now();
+            let now_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
+            if theme_disk_action(self.theme_file_mtime, now_mtime, self.theme_bad_mtime)
+                == DiskAction::Reload
+            {
+                match crate::theme::Theme::try_load(&self.settings.theme) {
+                    Ok(t) => {
+                        self.theme_file_mtime = now_mtime;
+                        self.theme_bad_mtime = None;
+                        if t != *self.active_theme {
+                            self.active_theme = std::sync::Arc::new(t);
+                            crate::theme::seed_live(&ctx, &self.active_theme);
+                            self.notify.push(
+                                notify::Level::Info,
+                                format!("Reloaded theme \"{}\" from disk", self.settings.theme),
+                            );
+                        }
+                    }
+                    Err(config::ParseError::Io(_)) => {}
+                    Err(config::ParseError::Invalid(e)) => {
+                        self.theme_bad_mtime = now_mtime;
+                        self.notify.push(
+                            notify::Level::Warning,
+                            format!("Theme file not applied: {e}"),
+                        );
+                    }
+                }
+            }
+            ctx.request_repaint_after(THEME_POLL_EVERY);
         }
         // Workspace layout: poll structural dirty, debounce write to workspace.json.
         if self.desktop.poll_workspace_dirty() {
@@ -1605,6 +1619,15 @@ fn theme_disk_action(
     }
 }
 
+/// On an active-theme name change, should the pending edit be written to the
+/// OUTGOING theme first? Only when there is one (`dirty`), the outgoing theme
+/// is a user theme, and its file still exists (after a rename or delete it is
+/// gone and a write would resurrect it). A clean theme is never written, so a
+/// hand edit made on disk since it was loaded survives the switch.
+fn flush_outgoing(dirty: bool, old_is_builtin: bool, old_file_exists: bool) -> bool {
+    dirty && !old_is_builtin && old_file_exists
+}
+
 fn pending_preferences(
     settings_dirty: Option<std::time::Instant>,
     theme_dirty: Option<std::time::Instant>,
@@ -1647,6 +1670,26 @@ mod app_logic_tests {
             theme_disk_action(Some(t0), None, None),
             DiskAction::Nothing,
             "deleted file: keep the current theme"
+        );
+    }
+
+    #[test]
+    fn outgoing_theme_is_flushed_only_when_dirty_user_and_still_on_disk() {
+        assert!(
+            flush_outgoing(true, false, true),
+            "preset switch mid-debounce"
+        );
+        assert!(
+            !flush_outgoing(false, false, true),
+            "clean: never clobber a hand edit"
+        );
+        assert!(
+            !flush_outgoing(true, true, true),
+            "built-in is never written"
+        );
+        assert!(
+            !flush_outgoing(true, false, false),
+            "renamed/deleted: don't resurrect"
         );
     }
 
