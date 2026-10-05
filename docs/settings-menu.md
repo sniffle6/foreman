@@ -43,7 +43,7 @@ on purpose — a user slider on those creates support tickets, not value).
 
 | Pane | Settings (default) |
 |---|---|
-| Appearance | The live theme editor and theme-expert chat beside a reversible preview (see `docs/theme-system.md`): preset select + Duplicate; background / foreground / selection / focus-border / cursor colors + the 16 ANSI swatches; font size. Chat proposals apply only through Save & Apply. Editing the built-in "Foreman Warm" forks an editable copy |
+| Appearance | The live theme editor and theme-expert chat beside a preview (see `docs/theme-system.md`): preset chips + Duplicate / Reload / Delete / Folder; every colour token in grouped rows with its JSON key; the 16 ANSI swatches and chat member colours; font size. Chat proposals apply only through a card's Apply chip. Editing the built-in "Foreman Warm" forks an editable copy; hand edits to the theme file apply live |
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
 | Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
@@ -99,12 +99,14 @@ on purpose — a user slider on those creates support tickets, not value).
   typing in a terminal beside it can't drive the hidden editor.
 - **The Appearance pane is a custom-body pane** (like Keybindings) that edits the
   *live* theme through the `theme::seed_live`/`live` seam — a color change
-  repaints every terminal instantly. Editing the built-in transparently forks an
-  editable copy saved under `%APPDATA%\foreman\themes\` (the built-in stays a
-  pristine preset); **Duplicate** makes an explicit copy. Full write-up + the two
-  known gaps (OSC
-  color-query answers and headless `--attrs` still report the *default* palette):
-  `docs/theme-system.md`.
+  repaints every terminal instantly. Its rows are generated from
+  `theme::TOKENS`, so every colour field is editable and labelled with its JSON
+  key. Editing the built-in transparently forks an editable copy saved under
+  `%APPDATA%\foreman\themes\` (the built-in stays a pristine preset);
+  **Duplicate** makes an explicit copy. Hand edits to that file apply within a
+  second and are never overwritten by a clean pane. Full write-up + the two
+  known gaps (OSC color-query answers and headless `--attrs` still report the
+  *default* palette): `docs/theme-system.md`.
 
 ## Key files
 

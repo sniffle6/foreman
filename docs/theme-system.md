@@ -56,22 +56,60 @@ controls too, one frame behind — the same lag every terminal repaint already h
 ## How to use it
 
 - Open settings (`Ctrl+B` then `Ctrl+,`), select **Appearance** (top of the rail).
-- Just edit the colors — background / foreground / selection / focus-border /
-  cursor and the 16 ANSI swatches. Edits apply live and auto-save.
+- The top strip is a row of **preset chips** (the built-in first, then your
+  themes) plus **Duplicate**, **Reload**, **Delete** and **Folder**. The status
+  line under it names the file and says whether it auto-saves; a user theme's
+  name is editable inline there, and **Revert** appears while there are unsaved
+  edits.
+- The left column lists **every colour token**, grouped (Terminal, Windows, Text
+  & accents, App bar, Chat, Search, then the ANSI palette and chat member
+  colours). Each row shows the label, what it paints, and the **JSON key** in
+  dim text beside the swatch; hover for key · hex · description. Click a swatch
+  to pick. Edits apply live and auto-save.
 - Editing the built-in **Foreman Warm** transparently **forks an editable copy**
-  (the built-in stays a pristine preset you can switch back to via the dropdown);
-  the preset name flips to the new copy. **Duplicate** makes an explicit copy.
-- **Revert to saved** undoes edits back to the baseline (the theme as it was when
-  you opened/selected it). The preset dropdown switches themes.
-- **Theme expert** sits beside the color editor and sample terminal. Describe a
-  palette or ask for a refinement in the chat. Each valid answer becomes a numbered
-  preview; switch between earlier proposals or discard the preview without changing
-  the active theme. **Save & Apply** saves the selected proposal through the user
-  theme flow. When Foreman Warm is active, this creates a user copy first.
-- The chat offers Codex, Claude, and Grok. Codex is selected initially; a blank
-  model field uses that CLI's default model (Codex ignores its user
-  `config.toml`, so that is Codex's built-in default). Enter a provider model ID
+  (the built-in stays a pristine preset you can switch back to); the active chip
+  flips to the new copy. **Duplicate** makes an explicit copy.
+- **Revert** undoes edits back to the baseline (the theme as it was when you
+  opened/selected it, or as last reloaded from disk).
+- The preview on the right mocks a window — title bar, tab chips, focus border —
+  around a sample terminal, so the Windows tokens visibly do something.
+- **Theme expert** is the chat under the preview. Describe a palette or ask for
+  a refinement; starter chips fill the box when it is empty. Enter sends,
+  Shift+Enter inserts a newline. Each answer that produced a theme renders a
+  **proposal card** under that reply with a swatch strip and two chips:
+  **Preview** toggles the hero to the proposal (the caption says so, with
+  Discard), **Apply** saves it through the user theme flow. When Foreman Warm
+  is active, Apply creates a user copy first.
+- The chat offers Codex, Claude, and Grok via the provider chip. Codex is
+  selected initially; a blank model uses that CLI's default (Codex ignores its
+  user `config.toml`, so that is Codex's built-in default). Click the model text
   to override it. Changing provider clears the override.
+
+## Hand-editing the file
+
+The file under `%APPDATA%\foreman\themes\` is a first-class way to edit a
+theme. The rules, all in `src/main.rs` (`App`) and `src/theme.rs`:
+
+- **Edits apply live.** While a user theme is active the App stats its file
+  once a second (`THEME_POLL_EVERY`) and, when the mtime moved, re-reads it
+  with the strict `Theme::try_load`. A valid file is adopted and seeded; the
+  open Appearance pane resyncs to it (`AppearanceView::needs_resync`) and a
+  toast says it reloaded.
+- **An invalid file is left alone.** `try_load` never backs up, renames or
+  rewrites. A bad value (a 3-digit hex, a missing `#`, truncated JSON from an
+  editor mid-write) toasts the serde error once and keeps the current theme;
+  fix the file and it applies on the next tick. The destructive
+  `.corrupt-*` backup path belongs to the tolerant startup loader only.
+- **The app never clobbers a clean theme.** A preset switch writes the outgoing
+  file only when the pane has unsaved edits (`appearance::persist_outgoing`).
+  The one window where the app's write wins is the ~400 ms save debounce after
+  an in-app edit; the poll is paused while a save is pending and the mtime is
+  re-recorded after it lands.
+- **Alpha is premultiplied.** `#rrggbbaa` stores egui's premultiplied bytes, so
+  a hand-written `#ffffff80` is not "50 % white". Prefer the in-app picker for
+  translucent tokens (it edits straight alpha). Fixing the format needs a
+  version field and a migration; it is deliberately not done yet.
+- **Reload** in the pane forces the same strict re-read on demand.
 
 ## Theme expert boundary
 
@@ -110,12 +148,16 @@ remain intact. Conversation and previews live only as long as the Settings windo
   `Settings` field, not a theme token) — it persists in `settings.json`, not the
   theme file. Changing it resizes the grid (cols/rows change), with the same
   ConPTY reflow caveat as zoom (`Ctrl+L` heals residuals).
-- **Window chrome tokens are file-only.** The tab chips (`tab_bg`,
-  `tab_bg_hover`), title-bar control hovers (`win_btn_hover`,
-  `win_btn_danger_hover`) and the help-sheet `scrim` are theme tokens like any
-  other, but the Appearance pane does not expose them — edit them in the theme
-  JSON. The hover-revealed OS bar keeps its own neutral `chrome_*` tokens; the
-  in-window chrome is warm by default and deliberately separate.
+- **Every token is in the pane, from one table.** `theme::TOKENS` is the single
+  list of scalar colour tokens (key, label, description, group, alpha flag,
+  accessors); the pane is generated from it and a test asserts the table keys
+  equal the serialized `Theme` keys. Adding a `Theme` field without a row fails
+  that test. The hover-revealed OS bar keeps its own neutral `chrome_*` tokens
+  (the App bar group); the in-window chrome is warm by default and deliberately
+  separate.
+- **A hand edit while previewing a proposal** shows the proposal in the hero and
+  the file in every real terminal. The caption says "Proposal preview"; Discard
+  the preview to see the file.
 - **Colors-first scope:** font family, line spacing, and cursor shape/blink are
   deliberately NOT here (they are separate subsystems — a later phase).
 
@@ -123,16 +165,22 @@ remain intact. Conversation and previews live only as long as the Settings windo
 
 - `src/theme.rs` — the `Theme` struct, `foreman_warm()` (built from the legacy
   consts), the `seed_live`/`live` seam, `visuals()` (the egui `Visuals` bridge),
-  hex serde (`color_hex`), and `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
+  hex serde (`color_hex`), the `TOKENS` table (`TokenSpec`, `TokenGroup`,
+  `PALETTE_NAMES`), the strict `try_load`/`file_mtime`, and
+  `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
 - `src/appearance.rs` — the Appearance pane (`AppearanceView`): the pure model
-  (working/saved/dirty/revert/presets), the split-preview view + live sample, and
-  the color pickers and theme chat.
+  (working/saved/dirty/revert/presets, `needs_resync`, `persist_outgoing`), the
+  house-style view generated from `TOKENS`, the preview, and the theme chat.
 - `src/theme_expert.rs` — the bounded conversation, prompt, strict proposal
-  parser, and preview history. The CLI call itself is `src/ai_oneshot.rs`.
+  parser, and proposal history (each reply links to its proposal). The CLI call
+  itself is `src/ai_oneshot.rs`.
 - `src/settings_menu.rs` — the custom-body `Pane::Appearance`, and the
-  Duplicate / preset-switch / resync coordination in `draw_pane`.
+  Duplicate / preset-switch / Reload / resync coordination in `draw_pane`.
 - `src/main.rs` — `App` owns/seeds/reads-back `active_theme`, installs the egui
-  `Visuals` bridge (`ctx.set_visuals`) each frame + pins dark, and debounce-saves.
+  `Visuals` bridge (`ctx.set_visuals`) each frame + pins dark, debounce-saves,
+  and runs the disk poll (`THEME_POLL_EVERY`, `theme_disk_action`).
+- `src/config.rs` — `parse_json_from`, the strict non-destructive reader the
+  poll uses (versus the tolerant, backing-up `load_json_from`).
 - `src/config.rs` — `themes_dir()`, the dir-parameterized JSON helpers
   (`load_json_from`/`save_json_in`), and the `Settings.theme` name field.
 - `src/terminal.rs` / `src/frame.rs` — `GridColors` parameterizes the color
