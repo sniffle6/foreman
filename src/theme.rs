@@ -402,6 +402,43 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_color_has_exactly_one_token_row() {
+        let json = serde_json::to_value(Theme::foreman_warm()).unwrap();
+        let mut file_keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|k| *k != "palette" && *k != "chat_colors")
+            .collect();
+        file_keys.sort_unstable();
+        let mut table: Vec<&str> = TOKENS.iter().map(|t| t.key).collect();
+        table.sort_unstable();
+        let mut dedup = table.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), table.len(), "duplicate key in TOKENS");
+        assert_eq!(table, file_keys, "TOKENS must list every colour field once");
+    }
+
+    #[test]
+    fn token_accessors_round_trip_and_groups_are_all_used() {
+        let mut t = Theme::foreman_warm();
+        for spec in TOKENS {
+            let c = egui::Color32::from_rgba_premultiplied(7, 8, 9, 255);
+            (spec.set)(&mut t, c);
+            assert_eq!((spec.get)(&t), c, "{} get/set mismatch", spec.key);
+            assert!(
+                !spec.label.is_empty() && !spec.desc.is_empty(),
+                "{} needs a label and a description",
+                spec.key
+            );
+        }
+        for g in TokenGroup::ALL {
+            assert!(TOKENS.iter().any(|s| s.group == g), "{g:?} has no rows");
+        }
+    }
+
+    #[test]
     fn slug_is_filesystem_safe() {
         assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
         assert_eq!(slug("Test  Theme!!"), "test-theme-");
@@ -887,6 +924,337 @@ impl Default for Theme {
         Self::foreman_warm()
     }
 }
+
+/// Which section of the Appearance pane a token is listed under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TokenGroup {
+    Terminal,
+    Windows,
+    Text,
+    AppBar,
+    Chat,
+    Search,
+}
+
+impl TokenGroup {
+    /// Display order of the sections.
+    pub const ALL: [TokenGroup; 6] = [
+        TokenGroup::Terminal,
+        TokenGroup::Windows,
+        TokenGroup::Text,
+        TokenGroup::AppBar,
+        TokenGroup::Chat,
+        TokenGroup::Search,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TokenGroup::Terminal => "Terminal",
+            TokenGroup::Windows => "Windows",
+            TokenGroup::Text => "Text & accents",
+            TokenGroup::AppBar => "App bar",
+            TokenGroup::Chat => "Chat",
+            TokenGroup::Search => "Search",
+        }
+    }
+}
+
+/// One editable colour token: its JSON key, how the pane labels and describes
+/// it, where it is listed, whether it carries alpha, and typed accessors. The
+/// Appearance pane is generated from [`TOKENS`], and a test pins that every
+/// colour field of [`Theme`] has exactly one row — add a field, add a row.
+pub struct TokenSpec {
+    /// The key as it appears in the theme JSON file (`"title_bg_focus"`).
+    pub key: &'static str,
+    pub label: &'static str,
+    /// One line on what it paints.
+    pub desc: &'static str,
+    pub group: TokenGroup,
+    /// Edited with an alpha channel (a wash/overlay) rather than opaque.
+    pub alpha: bool,
+    pub get: fn(&Theme) -> egui::Color32,
+    pub set: fn(&mut Theme, egui::Color32),
+}
+
+macro_rules! tok {
+    ($key:ident, $label:expr, $desc:expr, $group:ident, $alpha:expr) => {
+        TokenSpec {
+            key: stringify!($key),
+            label: $label,
+            desc: $desc,
+            group: TokenGroup::$group,
+            alpha: $alpha,
+            get: |t| t.$key,
+            set: |t, c| t.$key = c,
+        }
+    };
+}
+
+/// Every scalar colour token, in pane display order (grouped). The two arrays
+/// (`palette`, `chat_colors`) are swatch grids, not rows — see
+/// [`PALETTE_NAMES`] and [`CHAT_COLOR_DESC`].
+pub const TOKENS: &[TokenSpec] = &[
+    // Terminal
+    tok!(bg, "Background", "Terminal pane surface", Terminal, false),
+    tok!(fg, "Text", "Default terminal text", Terminal, false),
+    tok!(caret, "Cursor", "The text cursor block", Terminal, true),
+    tok!(
+        selection,
+        "Selection",
+        "Wash over selected terminal text",
+        Terminal,
+        true
+    ),
+    tok!(
+        scroll_thumb,
+        "Scrollbar thumb",
+        "Scrollback thumb while scrolling",
+        Terminal,
+        true
+    ),
+    tok!(
+        dim_unfocused,
+        "Unfocused dim wash",
+        "Overlay on unfocused panes (when enabled)",
+        Terminal,
+        true
+    ),
+    // Windows
+    tok!(
+        desk_bg,
+        "Desktop",
+        "The desktop behind every window",
+        Windows,
+        false
+    ),
+    tok!(
+        win_bg,
+        "Window",
+        "Window body, chat, settings fill",
+        Windows,
+        false
+    ),
+    tok!(
+        title_bg,
+        "Title bar",
+        "Title band of an unfocused window",
+        Windows,
+        false
+    ),
+    tok!(
+        title_bg_focus,
+        "Title bar (focused)",
+        "Title band of the focused window",
+        Windows,
+        false
+    ),
+    tok!(tab_bg, "Tab", "Tab chip in a title bar", Windows, false),
+    tok!(
+        tab_bg_hover,
+        "Tab (hover)",
+        "Tab chip under the pointer",
+        Windows,
+        false
+    ),
+    tok!(
+        win_btn_hover,
+        "Window button (hover)",
+        "Title-bar buttons under the pointer",
+        Windows,
+        false
+    ),
+    tok!(
+        win_btn_danger_hover,
+        "Close button (hover)",
+        "Close button under the pointer",
+        Windows,
+        false
+    ),
+    tok!(border, "Border", "Window and panel edges", Windows, false),
+    tok!(
+        border_focus,
+        "Focus border",
+        "Edge of the focused terminal",
+        Windows,
+        false
+    ),
+    tok!(
+        proj_border_focus,
+        "Project focus border",
+        "Edge of the focused project",
+        Windows,
+        false
+    ),
+    tok!(
+        scrim,
+        "Modal scrim",
+        "Dims the desktop behind modals and help",
+        Windows,
+        true
+    ),
+    tok!(
+        snap_fill,
+        "Drag target fill",
+        "Drop zone while dragging a window",
+        Windows,
+        true
+    ),
+    tok!(
+        snap_stroke,
+        "Drag target outline",
+        "Drop zone edge while dragging",
+        Windows,
+        false
+    ),
+    // Text & accents
+    tok!(
+        text,
+        "UI text",
+        "Labels and body text outside terminals",
+        Text,
+        false
+    ),
+    tok!(
+        dim,
+        "Dim text",
+        "Secondary labels, hints, captions",
+        Text,
+        false
+    ),
+    tok!(
+        sel_bg,
+        "List row highlight",
+        "Selected row in lists and menus",
+        Text,
+        true
+    ),
+    tok!(
+        selection_text_bg,
+        "Text field selection",
+        "Selected text in input fields",
+        Text,
+        true
+    ),
+    tok!(
+        danger,
+        "Danger",
+        "Destructive actions and errors",
+        Text,
+        false
+    ),
+    tok!(
+        bell,
+        "Accent / bell",
+        "Toggles, the bell pulse, highlights",
+        Text,
+        false
+    ),
+    // App bar
+    tok!(chrome_bg, "Bar", "The hover-revealed OS bar", AppBar, false),
+    tok!(
+        chrome_border,
+        "Bar border",
+        "Edge of the OS bar",
+        AppBar,
+        false
+    ),
+    tok!(
+        chrome_btn_hover,
+        "Button (hover)",
+        "OS bar buttons under the pointer",
+        AppBar,
+        false
+    ),
+    tok!(
+        chrome_close_hover,
+        "Close (hover)",
+        "OS bar close button under the pointer",
+        AppBar,
+        false
+    ),
+    // Chat
+    tok!(
+        chat_live,
+        "Live member",
+        "A member heard from recently",
+        Chat,
+        false
+    ),
+    tok!(
+        chat_stale,
+        "Stale member",
+        "A member not heard from in a while",
+        Chat,
+        false
+    ),
+    tok!(
+        chat_edge,
+        "Mention edge",
+        "Left edge of a post that mentions you",
+        Chat,
+        false
+    ),
+    tok!(
+        chat_mention_bg,
+        "Mention background",
+        "Fill of a post that mentions you",
+        Chat,
+        false
+    ),
+    // Search
+    tok!(
+        search_match,
+        "Match",
+        "Every match in the terminal",
+        Search,
+        true
+    ),
+    tok!(
+        search_current,
+        "Current match",
+        "The match the cursor is on",
+        Search,
+        true
+    ),
+    tok!(search_bar_bg, "Bar", "The search bar fill", Search, false),
+    tok!(
+        search_bar_border,
+        "Bar border",
+        "The search bar edge",
+        Search,
+        false
+    ),
+    tok!(
+        search_error,
+        "Error",
+        "Search bar text on a bad pattern",
+        Search,
+        false
+    ),
+];
+
+/// Names of the 16 ANSI palette slots, index-aligned with `Theme::palette`.
+pub const PALETTE_NAMES: [&str; 16] = [
+    "Black",
+    "Red",
+    "Green",
+    "Yellow",
+    "Blue",
+    "Magenta",
+    "Cyan",
+    "White",
+    "Bright Black",
+    "Bright Red",
+    "Bright Green",
+    "Bright Yellow",
+    "Bright Blue",
+    "Bright Magenta",
+    "Bright Cyan",
+    "Bright White",
+];
+
+/// What `Theme::chat_colors` is for (shown beside its swatch row).
+pub const CHAT_COLOR_DESC: &str = "Member colours, assigned in join order";
 
 /// Publish the active theme into egui ctx data for this frame — the same seam as
 /// [`crate::config::seed_live`]/[`crate::keymap::seed_live`]. `App` calls this
