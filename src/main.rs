@@ -139,6 +139,14 @@ struct App {
     /// written to the user theme file only after a debounce (mirrors
     /// `font_dirty_at`). The built-in is never written.
     theme_dirty_at: Option<std::time::Instant>,
+    /// The active theme file's mtime as of our last load or save. The disk poll
+    /// compares against it so a hand edit applies live and our own write is
+    /// never mistaken for one (`THEME_POLL_EVERY`).
+    theme_file_mtime: Option<std::time::SystemTime>,
+    /// An mtime that failed to parse — toasted once, then ignored until the
+    /// file changes again.
+    theme_bad_mtime: Option<std::time::SystemTime>,
+    theme_poll_at: std::time::Instant,
     /// Last time anything happened (input, PTY output, control msg). Drives the
     /// adaptive repaint cadence: fast while recently active, slow when idle.
     last_activity: Option<std::time::Instant>,
@@ -166,6 +174,9 @@ struct App {
 /// Wait this long after the last settings change (zoom, panel prefs, or a menu
 /// edit) before writing `settings.json`.
 const FONT_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+/// How often the active user theme's file is stat'ed for a hand edit. One
+/// `metadata` call a second is noise; it only runs while no save is pending.
+const THEME_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 /// Wait this long after the last structural workspace change before writing
 /// `workspace.json` (slightly longer than font — capture walks the full tree).
 const WORKSPACE_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
@@ -240,6 +251,7 @@ impl App {
         let settings = config::Settings::load();
         let active_theme = std::sync::Arc::new(crate::theme::Theme::load(&settings.theme));
         let active_theme_name = settings.theme.clone();
+        let theme_file_mtime = crate::theme::Theme::file_mtime(&settings.theme);
         Self {
             desktop: WindowManager::new().as_desktop(),
             started: false,
@@ -265,6 +277,9 @@ impl App {
             active_theme,
             active_theme_name,
             theme_dirty_at: None,
+            theme_file_mtime,
+            theme_bad_mtime: None,
+            theme_poll_at: std::time::Instant::now(),
             last_activity: None,
             force_quit: false,
             landing: landing::Landing::new(
@@ -303,6 +318,7 @@ impl App {
             if let Err(e) = self.active_theme.save(&self.active_theme_name) {
                 eprintln!("foreman: could not save theme: {e}");
             }
+            self.theme_file_mtime = crate::theme::Theme::file_mtime(&self.active_theme_name);
         }
         self.theme_dirty_at = None;
         self.flush_workspace();
@@ -1081,7 +1097,47 @@ impl eframe::App for App {
             self.active_theme =
                 std::sync::Arc::new(crate::theme::Theme::load(&self.settings.theme));
             self.active_theme_name = self.settings.theme.clone();
+            self.theme_file_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
+            self.theme_bad_mtime = None;
             crate::theme::seed_live(&ctx, &self.active_theme);
+        }
+        // Disk poll: a hand-edited theme file applies within a second. Skipped
+        // while a debounced save is pending so our own write (whose mtime is
+        // re-recorded right after it lands) is never mistaken for a foreign edit.
+        // The strict loader never renames an invalid file — an editor mid-write
+        // just toasts once and the current theme stays.
+        if self.theme_dirty_at.is_none()
+            && !crate::theme::Theme::is_builtin(&self.settings.theme)
+            && self.theme_poll_at.elapsed() >= THEME_POLL_EVERY
+        {
+            self.theme_poll_at = std::time::Instant::now();
+            let now_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
+            if theme_disk_action(self.theme_file_mtime, now_mtime, self.theme_bad_mtime)
+                == DiskAction::Reload
+            {
+                match crate::theme::Theme::try_load(&self.settings.theme) {
+                    Ok(t) => {
+                        self.theme_file_mtime = now_mtime;
+                        self.theme_bad_mtime = None;
+                        if t != *self.active_theme {
+                            self.active_theme = std::sync::Arc::new(t);
+                            crate::theme::seed_live(&ctx, &self.active_theme);
+                            self.notify.push(
+                                notify::Level::Info,
+                                format!("Reloaded theme \"{}\" from disk", self.settings.theme),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.theme_bad_mtime = now_mtime;
+                        self.notify.push(
+                            notify::Level::Warning,
+                            format!("Theme file not applied: {e}"),
+                        );
+                    }
+                }
+            }
+            ctx.request_repaint_after(THEME_POLL_EVERY);
         }
         // Adopt any Appearance-pane theme edit published this frame (theme::seed_live
         // in wm) so the preview and every real terminal repaint live, and mark it
@@ -1100,6 +1156,7 @@ impl eframe::App for App {
                     if let Err(e) = self.active_theme.save(&self.settings.theme) {
                         eprintln!("foreman: could not save theme: {e}");
                     }
+                    self.theme_file_mtime = crate::theme::Theme::file_mtime(&self.settings.theme);
                 }
                 self.theme_dirty_at = None;
             }
@@ -1526,6 +1583,28 @@ mod crash_log_tests {
     }
 }
 
+/// What the theme disk poll should do this tick, from mtimes alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiskAction {
+    Nothing,
+    Reload,
+}
+
+/// `seen` is the mtime as of our last load/save, `now` the current stat, and
+/// `last_bad` an mtime that already failed to parse (toasted once). Reload only
+/// on a file that exists, differs from what we last touched, and is not the
+/// known-bad one — a deleted file keeps the current theme.
+fn theme_disk_action(
+    seen: Option<std::time::SystemTime>,
+    now: Option<std::time::SystemTime>,
+    last_bad: Option<std::time::SystemTime>,
+) -> DiskAction {
+    match now {
+        Some(m) if Some(m) != seen && Some(m) != last_bad => DiskAction::Reload,
+        _ => DiskAction::Nothing,
+    }
+}
+
 fn pending_preferences(
     settings_dirty: Option<std::time::Instant>,
     theme_dirty: Option<std::time::Instant>,
@@ -1540,6 +1619,36 @@ fn pending_preferences(
 #[cfg(test)]
 mod app_logic_tests {
     use super::*;
+
+    #[test]
+    fn theme_disk_poll_reloads_once_per_foreign_mtime() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t0 = UNIX_EPOCH + Duration::from_secs(10);
+        let t1 = UNIX_EPOCH + Duration::from_secs(20);
+        assert_eq!(
+            theme_disk_action(Some(t0), Some(t0), None),
+            DiskAction::Nothing
+        );
+        assert_eq!(
+            theme_disk_action(Some(t0), Some(t1), None),
+            DiskAction::Reload
+        );
+        assert_eq!(
+            theme_disk_action(Some(t0), Some(t1), Some(t1)),
+            DiskAction::Nothing,
+            "a bad mtime toasts once, then is ignored until the file changes"
+        );
+        assert_eq!(
+            theme_disk_action(None, Some(t1), None),
+            DiskAction::Reload,
+            "first sighting of a file counts"
+        );
+        assert_eq!(
+            theme_disk_action(Some(t0), None, None),
+            DiskAction::Nothing,
+            "deleted file: keep the current theme"
+        );
+    }
 
     #[test]
     fn quitting_flushes_recent_preferences_without_waiting_for_debounce() {
