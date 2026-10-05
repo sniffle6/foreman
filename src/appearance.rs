@@ -280,7 +280,7 @@ impl AppearanceView {
             egui::pos2(side_inner.left(), hero.bottom() + 8.0),
             side_inner.max,
         );
-        let apply = self.draw_expert(ui, chat, &t);
+        let (apply, save_new) = self.draw_expert(ui, chat, &t);
 
         // Delete-confirmation modal (opened by the Delete chip on a user theme).
         let mut delete: Option<String> = None;
@@ -312,6 +312,19 @@ impl AppearanceView {
 
         if let Some(name) = delete {
             return Outcome::Delete(name);
+        }
+        if save_new {
+            // A new user theme from the proposal, named by the expert when it
+            // offered a name. The active theme is untouched: `working` becomes the
+            // proposal only so the Duplicate arm writes it under the NEW name, and
+            // the live theme is not republished, so nothing is flushed to the old
+            // file on the name change.
+            if let Some(prop) = self.expert.preview_proposal() {
+                let name = self.fork_name_from(prop.name.as_deref());
+                self.working = prop.theme.clone();
+                self.expert.selected = None;
+                return Outcome::Duplicate(name);
+            }
         }
         if apply {
             if let Some(prop) = self.expert.preview_proposal() {
@@ -930,9 +943,10 @@ impl AppearanceView {
     /// The Theme Expert: header with provider/model, a bubble log with proposal
     /// cards, starter chips when empty, and a two-row input (Enter sends,
     /// Shift+Enter inserts a newline). Returns true when a card's Apply is hit.
-    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+    /// Returns `(apply, save_as_new)` for the proposal that was just selected.
+    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> (bool, bool) {
         if rect.width() < 120.0 || rect.height() < 90.0 {
-            return false;
+            return (false, false);
         }
         let mut panel = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         panel.set_clip_rect(rect);
@@ -1082,6 +1096,9 @@ impl AppearanceView {
             egui::pos2(rect.right(), scope_band.top() - 4.0),
         );
         let mut apply = false;
+        let mut save_new = false;
+        let builtin = self.active_is_builtin();
+        let active_name = self.active_name.clone();
         let mut select: Option<Option<usize>> = None;
         let mut starter: Option<&str> = None;
         let mut log_ui = panel.new_child(egui::UiBuilder::new().max_rect(log));
@@ -1166,7 +1183,7 @@ impl AppearanceView {
                     if let Some(i) = turn.proposal.filter(|i| *i < proposals.len()) {
                         let prop = &proposals[i];
                         let is_sel = selected == Some(i);
-                        let card_h = 56.0;
+                        let card_h = 80.0;
                         row(ui, width, card_h + 6.0, |ui, r| {
                             let card = egui::Rect::from_min_size(
                                 egui::pos2(r.left(), r.top() + 2.0),
@@ -1203,7 +1220,7 @@ impl AppearanceView {
                             p.galley(egui::pos2(card.left() + 8.0, card.top() + 6.0), hg, t.dim);
                             // Line 2: swatch strip — the changed tokens first (hover shows
                             // key and before → after), padded with bg/fg/palette to ten.
-                            let sy = card.bottom() - 8.0 - 14.0;
+                            let sy = card.top() + 26.0;
                             let mut sx = card.left() + 8.0;
                             let mut shown = 0usize;
                             for ch in prop.changes.iter().take(10) {
@@ -1257,44 +1274,78 @@ impl AppearanceView {
                                 );
                                 sx += 17.0;
                             }
-                            // Chips: Apply (right), Preview/Previewing (left of it).
-                            let aw = chip_width(ui, "Apply");
-                            let ar = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    card.right() - 6.0 - aw,
-                                    sy + 7.0 - (CHIP_H - 2.0) / 2.0,
-                                ),
-                                egui::vec2(aw, CHIP_H - 2.0),
-                            );
-                            if n == 0 {
-                                // Nothing to apply: disabled look, no interaction.
+                            // Line 3, right-aligned chips: Preview · Apply (user theme
+                            // only — it overwrites the active theme) · Save as new.
+                            let ch = CHIP_H - 2.0;
+                            let cy = card.bottom() - 6.0 - ch / 2.0;
+                            let disabled = |p: &egui::Painter, r: egui::Rect, label: &str| {
                                 p.rect_stroke(
-                                    ar,
+                                    r,
                                     egui::CornerRadius::same(4),
                                     egui::Stroke::new(1.0, t.border),
                                     egui::StrokeKind::Inside,
                                 );
                                 p.text(
-                                    ar.center(),
+                                    r.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "Apply",
+                                    label,
                                     egui::FontId::proportional(FONT_CHIP),
                                     t.dim,
                                 );
-                            } else if chip(ui, ar, ("theme_expert_apply", ti), "Apply", t, false)
-                                .on_hover_text("Save this proposal as the active theme")
+                            };
+                            let mut right = card.right() - 6.0;
+                            let nw = chip_width(ui, "Save as new");
+                            let nr = egui::Rect::from_min_size(
+                                egui::pos2(right - nw, cy - ch / 2.0),
+                                egui::vec2(nw, ch),
+                            );
+                            if n == 0 {
+                                disabled(ui.painter(), nr, "Save as new");
+                            } else if chip(ui, nr, ("theme_expert_new", ti), "Save as new", t, false)
+                                .on_hover_ui(|ui| {
+                                    ui.label(match &prop.name {
+                                        Some(name) => format!(
+                                            "Create a new theme \u{201c}{name}\u{201d} from this proposal; \u{201c}{active_name}\u{201d} is left as is"
+                                        ),
+                                        None => format!(
+                                            "Create a new theme from this proposal; \u{201c}{active_name}\u{201d} is left as is"
+                                        ),
+                                    });
+                                })
                                 .clicked()
                             {
                                 select = Some(Some(i));
-                                apply = true;
+                                save_new = true;
+                            }
+                            right = nr.left() - 6.0;
+                            if !builtin {
+                                let aw = chip_width(ui, "Apply");
+                                let ar = egui::Rect::from_min_size(
+                                    egui::pos2(right - aw, cy - ch / 2.0),
+                                    egui::vec2(aw, ch),
+                                );
+                                if n == 0 {
+                                    disabled(ui.painter(), ar, "Apply");
+                                } else if chip(ui, ar, ("theme_expert_apply", ti), "Apply", t, false)
+                                    .on_hover_ui(|ui| {
+                                        ui.label(format!(
+                                            "Apply to \u{201c}{active_name}\u{201d} (overwrites it)"
+                                        ));
+                                    })
+                                    .clicked()
+                                {
+                                    select = Some(Some(i));
+                                    apply = true;
+                                }
+                                right = ar.left() - 6.0;
                             }
                             let pl = if is_sel { "Previewing" } else { "Preview" };
                             let pw = chip_width(ui, pl);
                             let pr = egui::Rect::from_min_size(
-                                egui::pos2(ar.left() - 6.0 - pw, ar.top()),
-                                egui::vec2(pw, ar.height()),
+                                egui::pos2(right - pw, cy - ch / 2.0),
+                                egui::vec2(pw, ch),
                             );
-                            if pr.left() > sx
+                            if pr.left() > card.left()
                                 && chip(ui, pr, ("theme_expert_preview", ti), pl, t, is_sel)
                                     .clicked()
                             {
@@ -1399,7 +1450,7 @@ impl AppearanceView {
                 te.request_focus();
             }
         }
-        apply
+        (apply, save_new)
     }
 }
 

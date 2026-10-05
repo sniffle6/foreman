@@ -84,12 +84,13 @@ controls too, one frame behind — the same lag every terminal repaint already h
 - Each answer that produced a theme renders a **proposal card** under that
   reply. Its header says how many tokens changed and the name the expert
   suggests. The swatch strip shows the changed tokens first, each split
-  before/after with the key and both hex values on hover. **Preview** toggles
-  the hero to the proposal (the caption says so, with Discard); **Apply** saves
-  it through the user theme flow and is disabled on a no-change proposal. When
-  Foreman Warm is active, Apply creates a user copy named after the expert's
-  suggestion (numbered if that slug exists); applying to a user theme keeps its
-  name.
+  before/after with the key and both hex values on hover. Three chips:
+  **Preview** toggles the hero to the proposal (the caption says so, with
+  Discard); **Apply** overwrites the active user theme with it; **Save as new**
+  creates a new user theme from it, named after the expert's suggestion
+  (numbered if that slug exists), and leaves the active theme untouched. On the
+  built-in only Preview and Save as new are offered. Both save chips are
+  disabled on a no-change proposal.
 - The chat offers Codex, Claude, and Grok via the provider chip. Codex is
   selected initially; a blank model uses that CLI's default (Codex ignores its
   user `config.toml`, so that is Codex's built-in default). Click the model text
