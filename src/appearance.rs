@@ -1,25 +1,52 @@
 //! The Appearance settings pane: edits the live [`Theme`] with a live preview.
 //!
-//! The model here (`working`/`saved` + dirty/revert/presets) is pure and
-//! unit-tested; the egui view ([`AppearanceView::show`]) is responsive: a wide
-//! pane lays the control form beside the live-preview terminal (side by side); a
-//! tall/narrow pane stacks them (controls on top, terminal along the bottom, where
-//! a terminal's landscape shape fits). The control form scrolls vertically when the
-//! window is too short, and the terminal is always sized to fit its region, so
-//! nothing overlaps or spills. Verified by screenshot. `working` is the theme being
-//! edited; `saved` is the last persisted state, so `is_dirty` and `revert` need no
-//! extra bookkeeping.
+//! Painted in the settings-menu house style — hand-painted rows with a label and
+//! a dim description, bordered chips, controls anchored right — rather than
+//! egui's stock widgets. The one stock control left is the colour-picker popup,
+//! which `Theme::visuals` themes; it sits hidden under our swatch chip. The token
+//! rows are generated from [`crate::theme::TOKENS`], so every colour field is
+//! editable, labelled, and shows its JSON key.
+//!
+//! The model (`working`/`saved` + dirty/revert/presets) is pure and unit-tested:
+//! `working` is the theme being edited and `saved` the last synced state, so
+//! `is_dirty` and `revert` need no extra bookkeeping. The view is responsive: a
+//! wide pane lays the token list beside the preview + theme expert; a tall or
+//! narrow pane stacks them. Verified by screenshot.
+//!
+//! Allocation rule: the pane's own `ui` belongs to the settings shell, which
+//! allocates its footer after us. Everything here therefore paints via
+//! `ui.painter()` + `ui.interact` or draws inside `ui.new_child` children (which
+//! never move the shell's cursor); `put`/`scope_builder` only ever run inside
+//! those children.
 
 use eframe::egui;
 
-use crate::theme::Theme;
+use crate::theme::{CHAT_COLOR_DESC, PALETTE_NAMES, TOKENS, Theme, TokenGroup, TokenSpec};
 
 /// The built-in, read-only theme's name. User themes are everything else.
 pub const BUILTIN: &str = "Foreman Warm";
 
-/// The control form's natural height — used to decide side-by-side vs stacked
-/// (is there more room below the controls than to their right?).
-const CONTROLS_H: f32 = 340.0;
+/// House metrics (match `settings_menu::draw_pane`).
+const PAD: f32 = 18.0;
+const ROW_H: f32 = 46.0;
+const HEADER_H: f32 = 30.0;
+const CHIP_H: f32 = 22.0;
+const SWATCH_W: f32 = 44.0;
+const SWATCH_H: f32 = 20.0;
+/// Preset chips + status line at the top of the pane.
+const STRIP_H: f32 = 66.0;
+/// Token list's natural height — decides side-by-side vs stacked (is there
+/// more room below the list than to its right?).
+const TOKENS_MIN_H: f32 = 360.0;
+const FONT_SMALL: f32 = 11.0;
+const FONT_LABEL: f32 = 13.0;
+const FONT_CHIP: f32 = 12.5;
+
+const STARTERS: [&str; 3] = [
+    "Warmer, less orange",
+    "High-contrast dark",
+    "Soft pastel light",
+];
 
 /// What a `show` frame reports back to the settings shell.
 pub enum Outcome {
@@ -37,6 +64,8 @@ pub enum Outcome {
     /// Re-read the active theme from its file (the shell loads it strictly and
     /// republishes; an invalid file toasts and changes nothing).
     Reload,
+    /// Open the themes folder in the file manager.
+    OpenThemesFolder,
     /// Nothing happened this frame.
     Pending,
 }
@@ -48,14 +77,16 @@ pub fn persist_outgoing(is_builtin: bool, dirty: bool) -> bool {
     !is_builtin && dirty
 }
 
-/// What the control form reported this frame (collected, then folded into an
-/// [`Outcome`] after the whole pane is drawn).
+/// What the top strip + token list reported this frame (collected, then folded
+/// into an [`Outcome`] after the whole pane is drawn).
 #[derive(Default)]
 struct FormOut {
     changed: bool,
     preset_switch: Option<String>,
     rename: Option<String>,
-    duplicate: Option<String>,
+    duplicate: bool,
+    reload: bool,
+    open_folder: bool,
 }
 
 /// The Appearance pane's state.
@@ -64,9 +95,10 @@ pub struct AppearanceView {
     working: Theme,
     saved: Theme,
     active_name: String,
-    /// Editable buffer for the active user theme's name (the rename field), synced
-    /// to `active_name` on `set_active`.
-    name_edit: String,
+    /// The inline rename buffer while the name is being edited.
+    name_edit: Option<String>,
+    /// The theme-expert model field while it is being edited.
+    model_edit: Option<String>,
     /// Selectable presets: built-in first, then user themes.
     presets: Vec<String>,
     /// True while the delete-confirmation modal is open.
@@ -80,7 +112,8 @@ impl AppearanceView {
             working: Theme::foreman_warm(),
             saved: Theme::foreman_warm(),
             active_name: BUILTIN.to_string(),
-            name_edit: BUILTIN.to_string(),
+            name_edit: None,
+            model_edit: None,
             presets: vec![BUILTIN.to_string()],
             confirm_delete: false,
             expert: crate::theme_expert::ThemeExpert::new(),
@@ -93,7 +126,7 @@ impl AppearanceView {
     /// clean baseline (so the pane opens non-dirty on the newly-active theme).
     pub fn set_active(&mut self, name: &str, theme: Theme) {
         self.active_name = name.to_string();
-        self.name_edit = name.to_string();
+        self.name_edit = None;
         self.saved = theme.clone();
         self.working = theme;
         self.expert.selected = None;
@@ -169,12 +202,9 @@ impl AppearanceView {
         self.working = self.saved.clone();
     }
 
-    /// Render the pane into `rect`, responsively: a wide pane puts the control form
-    /// beside the live-preview terminal (a vertical divider between); a tall/narrow
-    /// pane stacks them (controls on top, terminal along the bottom). The form
-    /// scrolls vertically when short, with Duplicate/Revert pinned below it; the
-    /// terminal always fits its region. Editing the built-in transparently forks an
-    /// editable copy.
+    /// Render the pane into `rect`: the preset/status strip across the top, then
+    /// the token list beside (or above, when tall/narrow) the preview + theme
+    /// expert. Editing the built-in transparently forks an editable copy.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -182,76 +212,71 @@ impl AppearanceView {
         reads_input: bool,
         out_theme: &mut Theme,
     ) -> Outcome {
-        // Mouse-only pane: the color pickers are position-routed egui widgets, so
-        // they need no reads_input gate; keyboard is handled by the settings shell.
+        // Mouse-only pane: every control is position-routed, so there is no
+        // reads_input gate; keyboard is handled by the settings shell.
         let _ = reads_input;
         self.expert.poll();
         let t = self.working.clone();
-        let previewing = self.expert.preview().is_some();
+        let previewing = self
+            .expert
+            .selected
+            .filter(|i| *i < self.expert.proposals.len());
         let preview = self.expert.preview().cloned().unwrap_or_else(|| t.clone());
-        let pad = 16.0;
-        let inner = rect.shrink(pad);
 
-        // Side-by-side vs stacked: stack when a bottom terminal would get more room
-        // than a right-hand one (i.e. the pane is tall/narrow).
-        let sidebar_w = (inner.width() * 0.34).clamp(240.0, 340.0);
+        // --- top strip: preset chips, actions, status line ---
+        let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), STRIP_H));
+        let mut out = self.draw_strip(ui, strip, &t);
+        ui.painter().hline(
+            egui::Rangef::new(rect.left(), rect.right()),
+            strip.bottom(),
+            egui::Stroke::new(1.0, t.border),
+        );
+
+        // --- body: tokens | preview + expert (stacked when tall/narrow) ---
+        let inner =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom() + 1.0), rect.max);
+        let sidebar_w = (inner.width() * 0.48).clamp(300.0, 470.0);
         let right_room = inner.width() - sidebar_w;
-        let bottom_room = inner.height() - CONTROLS_H;
+        let bottom_room = inner.height() - TOKENS_MIN_H;
         let stacked = bottom_room > right_room;
-
-        let (out, apply) = if stacked {
-            // Controls on top (form capped + centred so wide rows don't stretch),
-            // a horizontal divider, then the terminal filling the bottom.
-            // Give the controls their full height when there's room (so the form
-            // doesn't scroll while the terminal region sits half-empty), but never
-            // more than ~60% of the pane, so the terminal keeps a fair share.
-            let ctrl_h = 340.0_f32.min(inner.height() * 0.42).max(180.0);
-            let fw = inner.width().min(480.0);
-            let fx = inner.left() + (inner.width() - fw) * 0.5;
-            let form_rect =
-                egui::Rect::from_min_size(egui::pos2(fx, inner.top()), egui::vec2(fw, ctrl_h));
-            let out = self.draw_form(ui, form_rect, &t);
-            let divider_y = inner.top() + ctrl_h + pad * 0.5;
+        let (tokens_rect, side) = if stacked {
+            let list_h = (inner.height() * 0.45).clamp(180.0, TOKENS_MIN_H);
+            let list = egui::Rect::from_min_size(inner.min, egui::vec2(inner.width(), list_h));
             ui.painter().hline(
                 egui::Rangef::new(inner.left(), inner.right()),
-                divider_y,
+                list.bottom(),
                 egui::Stroke::new(1.0, t.border),
             );
-            let term_region = egui::Rect::from_min_max(
-                egui::pos2(inner.left(), divider_y + pad * 0.5),
-                inner.max,
-            );
-            let hero_h = (term_region.height() * 0.43).clamp(110.0, 225.0);
-            let hero =
-                egui::Rect::from_min_size(term_region.min, egui::vec2(term_region.width(), hero_h));
-            Self::draw_hero(ui, hero, &preview, previewing);
-            let chat = egui::Rect::from_min_max(
-                egui::pos2(term_region.left(), hero.bottom()),
-                term_region.max,
-            );
-            (out, self.draw_expert(ui, chat, &t))
+            let side =
+                egui::Rect::from_min_max(egui::pos2(inner.left(), list.bottom() + 1.0), inner.max);
+            (list, side)
         } else {
-            // Control form on the left, terminal on the right, divider between.
-            let divider_x = inner.left() + sidebar_w + pad;
+            let list = egui::Rect::from_min_size(inner.min, egui::vec2(sidebar_w, inner.height()));
             ui.painter().vline(
-                divider_x,
+                list.right(),
                 egui::Rangef::new(inner.top(), inner.bottom()),
                 egui::Stroke::new(1.0, t.border),
             );
-            let sidebar =
-                egui::Rect::from_min_size(inner.min, egui::vec2(sidebar_w, inner.height()));
-            let out = self.draw_form(ui, sidebar, &t);
-            let hero =
-                egui::Rect::from_min_max(egui::pos2(divider_x + pad, inner.top()), inner.max);
-            let hero_h = (hero.height() * 0.43).clamp(110.0, 225.0);
-            let hero_top = egui::Rect::from_min_size(hero.min, egui::vec2(hero.width(), hero_h));
-            Self::draw_hero(ui, hero_top, &preview, previewing);
-            let chat =
-                egui::Rect::from_min_max(egui::pos2(hero.left(), hero_top.bottom()), hero.max);
-            (out, self.draw_expert(ui, chat, &t))
+            let side =
+                egui::Rect::from_min_max(egui::pos2(list.right() + 1.0, inner.top()), inner.max);
+            (list, side)
         };
+        out.changed |= self.draw_tokens(ui, tokens_rect, &t);
 
-        // Delete-confirmation modal (opened by the − button on a user theme).
+        let side_inner = side.shrink2(egui::vec2(PAD * 0.7, 10.0));
+        let hero_h = (side_inner.height() * 0.42).clamp(170.0, 260.0);
+        let hero =
+            egui::Rect::from_min_size(side_inner.min, egui::vec2(side_inner.width(), hero_h));
+        if Self::draw_hero(ui, hero, &preview, previewing, &t) {
+            self.expert.selected = None;
+        }
+        let chat = egui::Rect::from_min_max(
+            egui::pos2(side_inner.left(), hero.bottom() + 8.0),
+            side_inner.max,
+        );
+        let apply = self.draw_expert(ui, chat, &t);
+
+        // Delete-confirmation modal (opened by the Delete chip on a user theme).
         let mut delete: Option<String> = None;
         if self.confirm_delete {
             let m =
@@ -306,14 +331,20 @@ impl AppearanceView {
             *out_theme = self.working.clone();
             return Outcome::Duplicate(self.fork_name());
         }
-        if let Some(name) = out.duplicate {
-            return Outcome::Duplicate(name);
+        if out.duplicate {
+            return Outcome::Duplicate(self.fork_name());
         }
         if let Some(name) = out.preset_switch {
             return Outcome::SelectPreset(name);
         }
         if let Some(name) = out.rename {
             return Outcome::Rename(name);
+        }
+        if out.reload {
+            return Outcome::Reload;
+        }
+        if out.open_folder {
+            return Outcome::OpenThemesFolder;
         }
         if out.changed {
             *out_theme = self.working.clone();
@@ -322,289 +353,326 @@ impl AppearanceView {
         Outcome::Pending
     }
 
-    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
-        if rect.width() < 100.0 || rect.height() < 70.0 {
-            return false;
-        }
-        let mut panel =
-            ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(4.0, 2.0))));
-        egui::ScrollArea::vertical()
-            .id_salt("theme_expert_panel")
-            .auto_shrink([false, false])
-            .show(&mut panel, |panel| {
-                self.draw_expert_contents(panel, rect, t)
-            })
-            .inner
-    }
+    // ----------------------------------------------------------------- strip
 
-    fn draw_expert_contents(&mut self, panel: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
-        let mut apply = false;
-        panel.label(
-            egui::RichText::new("THEME EXPERT")
-                .size(11.0)
-                .color(t.dim)
-                .strong(),
-        );
-        panel.horizontal(|ui| {
-            let previous = self.expert.provider;
-            egui::ComboBox::from_id_salt("theme_expert_provider")
-                .selected_text(self.expert.provider.label())
-                .show_ui(ui, |ui| {
-                    for provider in [
-                        crate::config::NamingProvider::Codex,
-                        crate::config::NamingProvider::Claude,
-                        crate::config::NamingProvider::Grok,
-                    ] {
-                        ui.selectable_value(&mut self.expert.provider, provider, provider.label());
-                    }
-                });
-            if self.expert.provider != previous {
-                self.expert.model.clear();
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.expert.model)
-                    .hint_text("Model ID (blank = CLI default)")
-                    .desired_width(ui.available_width().max(70.0)),
-            );
-        });
-        if !self.expert.proposals.is_empty() {
-            panel.horizontal_wrapped(|ui| {
-                ui.label("Preview:");
-                for i in 0..self.expert.proposals.len() {
-                    ui.selectable_value(&mut self.expert.selected, Some(i), format!("{}", i + 1));
-                }
-                if self.expert.selected.is_some() && ui.button("Discard preview").clicked() {
-                    self.expert.selected = None;
-                }
-                apply = ui
-                    .add_enabled(
-                        self.expert.selected.is_some(),
-                        egui::Button::new("Save & Apply"),
-                    )
-                    .clicked();
-            });
-        }
-        let input_h = 65.0;
-        let log_h = (rect.height() - input_h - 90.0).max(30.0);
-        egui::ScrollArea::vertical().id_salt("theme_expert_turns")
-            .max_height(log_h).auto_shrink([false, false]).stick_to_bottom(true)
-            .show(panel, |ui| {
-                if self.expert.turns.is_empty() {
-                    ui.label("Describe colors, contrast, or a mood. Refine the proposal over multiple turns.");
-                }
-                for turn in &self.expert.turns {
-                    ui.label(format!("{}: {}", if turn.user { "You" } else { "Expert" }, turn.text));
-                }
-                if self.expert.busy() { ui.label("Generating proposal…"); }
-                if let Some(error) = &self.expert.error {
-                    ui.colored_label(t.danger, error);
-                }
-            });
-        panel.add(
-            egui::TextEdit::multiline(&mut self.expert.input)
-                .hint_text("Describe or refine your theme…")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
-        if panel
-            .add_enabled(
-                !self.expert.busy() && !self.expert.input.trim().is_empty(),
-                egui::Button::new("Send"),
-            )
-            .clicked()
-        {
-            self.expert.send(&self.working, panel.ctx());
-        }
-        apply
-    }
-
-    /// Draw the control form into `rect`: a vertically-scrolling body (preset ·
-    /// name/delete · the five named colours · font size · palette grid) with the
-    /// Duplicate/Revert actions pinned in a strip below it. Returns what changed.
-    fn draw_form(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> FormOut {
+    /// Band 1: preset chips (left) and action chips (right). Band 2: the status
+    /// line — inline-renamable name · file · auto-saves, plus Revert when dirty.
+    fn draw_strip(&mut self, ui: &mut egui::Ui, strip: egui::Rect, t: &Theme) -> FormOut {
         let mut out = FormOut::default();
-        let actions_h = 34.0;
-        let form_rect = egui::Rect::from_min_max(
-            rect.min,
-            egui::pos2(
-                rect.right(),
-                (rect.bottom() - actions_h - 6.0).max(rect.top()),
-            ),
-        );
-        let actions_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left(), (rect.bottom() - actions_h).max(rect.top())),
-            rect.max,
-        );
+        let builtin = self.active_is_builtin();
+        let cy1 = strip.top() + 8.0 + CHIP_H / 2.0;
+        let cy2 = strip.top() + 8.0 + CHIP_H + 10.0 + 9.0;
 
-        let mut form = ui.new_child(egui::UiBuilder::new().max_rect(form_rect));
-        egui::ScrollArea::vertical()
-            .id_salt("appearance_form")
-            .auto_shrink([false, false])
-            .show(&mut form, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-
-                ui.label(
-                    egui::RichText::new("THEME")
-                        .size(11.0)
-                        .color(t.dim)
-                        .strong(),
-                );
-
-                // Preset switcher.
-                ui.label(egui::RichText::new("Preset").size(11.0).color(t.dim));
-                let mut selected = self.active_name.clone();
-                egui::ComboBox::from_id_salt("appearance_preset")
-                    .width(ui.available_width())
-                    .selected_text(&self.active_name)
-                    .show_ui(ui, |ui| {
-                        for p in &self.presets {
-                            ui.selectable_value(&mut selected, p.clone(), p.as_str());
-                        }
-                    });
-                if selected != self.active_name {
-                    out.preset_switch = Some(selected);
-                }
-
-                // Name (user theme) or the built-in note.
-                if self.active_is_builtin() {
-                    ui.label(
-                        egui::RichText::new("Built-in — edits save as a copy")
-                            .size(12.0)
-                            .color(t.dim),
-                    );
-                } else {
-                    ui.label(egui::RichText::new("Name").size(11.0).color(t.dim));
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.name_edit)
-                                .desired_width((ui.available_width() - 30.0).max(60.0)),
-                        );
-                        if resp.lost_focus()
-                            && !self.name_edit.trim().is_empty()
-                            && crate::theme::slug(&self.name_edit) != self.active_name
-                        {
-                            out.rename = Some(self.name_edit.clone());
-                        }
-                        if ui.button("–").on_hover_text("Delete this theme").clicked() {
-                            self.confirm_delete = true;
-                        }
-                    });
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // The five named UI/terminal colours (label left, swatch right).
-                out.changed |= opaque_row(ui, "Background", &mut self.working.bg, t.text);
-                out.changed |= opaque_row(ui, "Foreground", &mut self.working.fg, t.text);
-                out.changed |=
-                    translucent_row(ui, "Selection", &mut self.working.selection, t.text);
-                out.changed |=
-                    opaque_row(ui, "Focus border", &mut self.working.border_focus, t.text);
-                out.changed |= translucent_row(ui, "Cursor", &mut self.working.caret, t.text);
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // Font size (shares the Ctrl+Scroll zoom seam), then the palette grid.
-                let mut fs = crate::terminal::font_size(ui.ctx());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Font size").size(13.0).color(t.text));
-                    if ui.small_button("–").clicked() {
-                        fs = (fs - 1.0).max(8.0);
-                    }
-                    ui.label(egui::RichText::new(format!("{fs:.0}")).color(t.text));
-                    if ui.small_button("+").clicked() {
-                        fs = (fs + 1.0).min(40.0);
-                    }
-                });
-                crate::terminal::set_font_size(ui.ctx(), fs);
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Terminal palette")
-                        .size(11.0)
-                        .color(t.dim),
-                );
-                ui.add_space(2.0);
-                out.changed |= palette_grid(ui, &mut self.working.palette, t);
-                ui.add_space(4.0);
-            });
-
-        // Pinned actions strip (always visible, below the scrolling form).
-        let mut act = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(actions_rect)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        if act.button("Duplicate…").clicked() {
-            out.duplicate = Some(self.fork_name());
+        // Action chips, right-anchored, laid right-to-left.
+        let mut x = strip.right() - PAD;
+        let mut actions: Vec<(&str, &str)> = vec![("Folder", "Open the themes folder")];
+        if !builtin {
+            actions.push(("Delete", "Delete this theme"));
+            actions.push(("Reload", "Re-read this theme's file"));
         }
-        if self.is_dirty() && act.button("Revert").clicked() {
-            self.revert();
-            out.changed = true;
+        actions.push(("Duplicate", "Copy this theme into a new editable one"));
+        for (label, tip) in actions {
+            let w = chip_width(ui, label);
+            let r = egui::Rect::from_min_size(
+                egui::pos2(x - w, cy1 - CHIP_H / 2.0),
+                egui::vec2(w, CHIP_H),
+            );
+            let resp =
+                chip(ui, r, ("appearance_action", label), label, t, false).on_hover_text(tip);
+            if resp.clicked() {
+                match label {
+                    "Folder" => out.open_folder = true,
+                    "Delete" => self.confirm_delete = true,
+                    "Reload" => out.reload = true,
+                    _ => out.duplicate = true,
+                }
+            }
+            x = r.left() - 6.0;
+        }
+        let actions_left = x;
+
+        // Preset chips, left-to-right, clipped before the actions.
+        let mut px = strip.left() + PAD;
+        let clip = egui::Rect::from_min_max(
+            egui::pos2(strip.left(), strip.top()),
+            egui::pos2(actions_left - 6.0, strip.bottom()),
+        );
+        let presets = self.presets.clone();
+        for p in &presets {
+            let w = chip_width(ui, p);
+            if px + w > clip.right() {
+                ui.painter_at(clip).text(
+                    egui::pos2(px + 2.0, cy1),
+                    egui::Align2::LEFT_CENTER,
+                    "…",
+                    egui::FontId::proportional(FONT_CHIP),
+                    t.dim,
+                );
+                break;
+            }
+            let r = egui::Rect::from_min_size(
+                egui::pos2(px, cy1 - CHIP_H / 2.0),
+                egui::vec2(w, CHIP_H),
+            );
+            let active = *p == self.active_name;
+            if chip(ui, r, ("appearance_preset", p.as_str()), p, t, active).clicked() && !active {
+                out.preset_switch = Some(p.clone());
+            }
+            px = r.right() + 6.0;
+        }
+
+        // Status line.
+        let small = egui::FontId::proportional(FONT_SMALL + 0.5);
+        let mut sx = strip.left() + PAD;
+        if builtin {
+            let r = ui.painter().text(
+                egui::pos2(sx, cy2),
+                egui::Align2::LEFT_CENTER,
+                "Built-in · edits save as a copy",
+                small.clone(),
+                t.dim,
+            );
+            sx = r.right();
+        } else {
+            // Name: click to rename inline (Enter commits, Esc / click-away cancels).
+            let name_w = 180.0_f32.min((actions_left - sx - 160.0).max(80.0));
+            if let Some(buf) = self.name_edit.as_mut() {
+                let te_rect = egui::Rect::from_min_size(
+                    egui::pos2(sx - 4.0, cy2 - 11.0),
+                    egui::vec2(name_w, 22.0),
+                );
+                let mut host = ui.new_child(egui::UiBuilder::new().max_rect(te_rect));
+                host.visuals_mut().selection.bg_fill = t.selection_text_bg;
+                let resp = host.put(
+                    te_rect,
+                    egui::TextEdit::singleline(buf)
+                        .font(egui::FontId::proportional(FONT_CHIP))
+                        .text_color(t.text)
+                        .desired_width(te_rect.width()),
+                );
+                if resp.lost_focus() {
+                    let committed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let buf = self.name_edit.take().unwrap_or_default();
+                    if committed
+                        && !buf.trim().is_empty()
+                        && crate::theme::slug(&buf) != self.active_name
+                    {
+                        out.rename = Some(buf);
+                    }
+                } else {
+                    resp.request_focus();
+                }
+                sx = te_rect.right() + 6.0;
+            } else {
+                let g = truncated(
+                    ui,
+                    &self.active_name,
+                    egui::FontId::proportional(FONT_CHIP),
+                    t.text,
+                    name_w,
+                );
+                let r = egui::Rect::from_min_size(egui::pos2(sx, cy2 - g.size().y / 2.0), g.size());
+                let resp = ui
+                    .interact(
+                        r.expand(3.0),
+                        egui::Id::new("appearance_name"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text("Rename");
+                ui.painter().galley(
+                    r.min,
+                    g,
+                    if resp.hovered() {
+                        t.border_focus
+                    } else {
+                        t.text
+                    },
+                );
+                if resp.hovered() {
+                    ui.painter().hline(
+                        egui::Rangef::new(r.left(), r.right()),
+                        r.bottom() + 1.0,
+                        egui::Stroke::new(1.0, t.border_focus),
+                    );
+                }
+                if resp.clicked() {
+                    self.name_edit = Some(self.active_name.clone());
+                }
+                sx = r.right() + 6.0;
+            }
+            let file = format!(
+                "· themes\\{}.json · auto-saves",
+                crate::theme::slug(&self.active_name)
+            );
+            let g = truncated(
+                ui,
+                &file,
+                small.clone(),
+                t.dim,
+                (actions_left - sx - 80.0).max(40.0),
+            );
+            let r = egui::Rect::from_min_size(egui::pos2(sx, cy2 - g.size().y / 2.0), g.size());
+            ui.painter().galley(r.min, g, t.dim);
+            sx = r.right() + 8.0;
+        }
+        if self.is_dirty() {
+            let w = chip_width(ui, "Revert");
+            let r = egui::Rect::from_min_size(
+                egui::pos2(sx, cy2 - CHIP_H / 2.0 + 1.0),
+                egui::vec2(w, CHIP_H - 2.0),
+            );
+            if chip(ui, r, "appearance_revert", "Revert", t, false)
+                .on_hover_text("Discard edits made since this theme was opened")
+                .clicked()
+            {
+                self.revert();
+                out.changed = true;
+            }
         }
         out
     }
 
-    /// Draw the live-preview terminal centred in `region`, with the caption below.
-    /// The terminal is sized to fit `region`, so it never spills over the divider
-    /// or the window edge.
-    fn draw_hero(ui: &mut egui::Ui, region: egui::Rect, t: &Theme, previewing: bool) {
-        if region.width() < 40.0 || region.height() < 40.0 {
-            return;
-        }
-        let term_w = (region.width() - 24.0).clamp(40.0, 720.0);
-        let term_h = 178.0_f32.min((region.height() - 44.0).max(80.0));
-        let cap_gap = 12.0;
-        let cap_h = 16.0;
-        let block_h = term_h + cap_gap + cap_h;
-        let block_top = region.top() + ((region.height() - block_h) * 0.5).max(0.0);
-        let cx = region.center().x;
-        let term_rect = egui::Rect::from_min_size(
-            egui::pos2(cx - term_w / 2.0, block_top),
-            egui::vec2(term_w, term_h),
-        );
-        Self::paint_preview(ui, term_rect, t);
-        // Clip the caption to the region so a narrow preview never spills the text.
-        ui.painter_at(region).text(
-            egui::pos2(cx, term_rect.bottom() + cap_gap),
-            egui::Align2::CENTER_TOP,
-            if previewing {
-                "Proposal preview · Save & Apply to make it active"
-            } else {
-                "Live preview · changes apply to every terminal instantly"
-            },
-            egui::FontId::proportional(12.0),
-            t.dim,
-        );
+    // ---------------------------------------------------------------- tokens
+
+    /// The grouped token list: one house-style row per [`TOKENS`] entry, plus the
+    /// font-size stepper and the palette / member-colour swatch grids. Scrolls.
+    fn draw_tokens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+        let mut changed = false;
+        let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        pane_ui.set_clip_rect(rect);
+        egui::ScrollArea::vertical()
+            .id_salt("appearance_tokens")
+            .auto_shrink([false, false])
+            .show(&mut pane_ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                let width = ui.available_width();
+                ui.set_min_width(width);
+                for g in TokenGroup::ALL {
+                    section_header(ui, width, g.label(), t);
+                    if g == TokenGroup::Terminal {
+                        font_size_row(ui, width, t);
+                    }
+                    for spec in TOKENS.iter().filter(|s| s.group == g) {
+                        changed |= token_row(ui, width, spec, &mut self.working, t);
+                    }
+                    if g == TokenGroup::Terminal {
+                        changed |= palette_rows(ui, width, &mut self.working.palette, t);
+                    }
+                    if g == TokenGroup::Chat {
+                        changed |= member_colour_row(ui, width, &mut self.working.chat_colors, t);
+                    }
+                }
+                row(ui, width, 10.0, |_, _| {});
+            });
+        changed
     }
 
-    /// A self-contained mini-terminal sample rendered with `t` — NO PTY. Shows the
-    /// surface, foreground text, several palette colours, a selection wash, and the
-    /// caret, so an edit is visible at a glance. The palette itself is edited in
-    /// the form grid; here the sample text exercises a few palette slots. Text is
-    /// clipped to `rect`, so a narrow preview never spills over its bounds.
-    fn paint_preview(ui: &egui::Ui, rect: egui::Rect, t: &Theme) {
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, egui::CornerRadius::same(6), t.bg);
+    // --------------------------------------------------------------- preview
+
+    /// The preview: a desktop patch holding a mock window — focused title bar
+    /// with tab chips and a close button, the focus border, and a terminal body
+    /// with sample text, selection wash and caret — so the Windows tokens visibly
+    /// do something. Returns true when the Discard chip (proposal preview) is hit.
+    fn draw_hero(
+        ui: &mut egui::Ui,
+        region: egui::Rect,
+        t: &Theme,
+        previewing: Option<usize>,
+        live: &Theme,
+    ) -> bool {
+        if region.width() < 60.0 || region.height() < 60.0 {
+            return false;
+        }
+        let p = ui.painter_at(region);
+        let cap_h = 22.0;
+        p.rect_filled(region, egui::CornerRadius::same(6), t.desk_bg);
         p.rect_stroke(
-            rect,
+            region,
             egui::CornerRadius::same(6),
-            egui::Stroke::new(1.0, t.border),
+            egui::Stroke::new(1.0, live.border),
             egui::StrokeKind::Inside,
         );
-        let mono = egui::FontId::monospace(13.0);
-        let x0 = rect.left() + 12.0;
-        let lh = 19.0;
-        let mut y = rect.top() + 12.0;
-        // Draw a left-to-right run of (text, colour) segments on one line.
+        let win = egui::Rect::from_min_max(
+            region.min + egui::vec2(12.0, 12.0),
+            egui::pos2(region.right() - 12.0, region.bottom() - 12.0 - cap_h),
+        );
+        let cr = egui::CornerRadius::same(5);
+        p.rect_filled(win, cr, t.bg);
+        // Title band with tab chips + close.
+        let title_h = 24.0;
+        let title = egui::Rect::from_min_size(win.min, egui::vec2(win.width(), title_h));
+        p.rect_filled(
+            title,
+            egui::CornerRadius {
+                nw: 5,
+                ne: 5,
+                sw: 0,
+                se: 0,
+            },
+            t.title_bg_focus,
+        );
+        let mono = egui::FontId::monospace(12.0);
+        let small = egui::FontId::proportional(11.0);
+        let mut tx = title.left() + 8.0;
+        for (i, (name, fill, col)) in [
+            ("foreman", t.tab_bg, t.text),
+            ("worker", t.tab_bg_hover, t.dim),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let w = 58.0;
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(tx, title.top() + 4.0),
+                egui::vec2(w, title_h - 8.0),
+            );
+            p.rect_filled(chip, egui::CornerRadius::same(3), fill);
+            if i == 0 {
+                p.rect_stroke(
+                    chip,
+                    egui::CornerRadius::same(3),
+                    egui::Stroke::new(1.0, t.border),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            p.text(
+                chip.center(),
+                egui::Align2::CENTER_CENTER,
+                name,
+                small.clone(),
+                col,
+            );
+            tx = chip.right() + 4.0;
+        }
+        let close = egui::Rect::from_min_size(
+            egui::pos2(title.right() - 8.0 - 16.0, title.top() + 4.0),
+            egui::vec2(16.0, title_h - 8.0),
+        );
+        p.rect_filled(close, egui::CornerRadius::same(3), t.win_btn_danger_hover);
+        p.text(
+            close.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            small,
+            t.text,
+        );
+        p.rect_stroke(
+            win,
+            cr,
+            egui::Stroke::new(1.0, t.border_focus),
+            egui::StrokeKind::Inside,
+        );
+
+        // Terminal body: sample lines (clipped to the window).
+        let body = egui::Rect::from_min_max(egui::pos2(win.left(), title.bottom()), win.max);
+        let bp = ui.painter_at(body);
+        let x0 = body.left() + 10.0;
+        let lh = 18.0;
+        let mut y = body.top() + 8.0;
         let line = |segs: &[(&str, egui::Color32)], y: f32| {
             let mut x = x0;
             for (s, c) in segs {
-                let r = p.text(
+                let r = bp.text(
                     egui::pos2(x, y),
                     egui::Align2::LEFT_TOP,
                     *s,
@@ -629,21 +697,19 @@ impl AppearanceView {
         y += lh;
         line(&[("  modified: ", t.palette[3]), ("src/theme.rs", t.fg)], y);
         y += lh;
-        // Selected line: wash then text.
         let sel_text = "  new file: src/appearance.rs";
-        let sel_w = p
+        let sel_w = bp
             .layout_no_wrap(sel_text.to_string(), mono.clone(), t.fg)
             .rect
             .width();
-        p.rect_filled(
+        bp.rect_filled(
             egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(sel_w, lh)),
             egui::CornerRadius::ZERO,
             t.selection,
         );
         line(&[(sel_text, t.fg)], y);
         y += lh;
-        // Prompt + caret block.
-        let after = p
+        let after = bp
             .text(
                 egui::pos2(x0, y),
                 egui::Align2::LEFT_TOP,
@@ -652,110 +718,841 @@ impl AppearanceView {
                 t.fg,
             )
             .right();
-        p.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(after, y + 1.0), egui::vec2(8.0, lh - 5.0)),
+        bp.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(after, y + 1.0), egui::vec2(8.0, lh - 4.0)),
             egui::CornerRadius::ZERO,
             t.caret,
+        );
+
+        // Caption (+ Discard chip while a proposal is previewed).
+        let cap_y = region.bottom() - 6.0 - cap_h / 2.0;
+        let mut discard = false;
+        match previewing {
+            Some(i) => {
+                let r = p.text(
+                    egui::pos2(region.left() + 12.0, cap_y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("Proposal {} preview · Apply from its card", i + 1),
+                    egui::FontId::proportional(11.5),
+                    live.dim,
+                );
+                let w = chip_width(ui, "Discard");
+                let cr = egui::Rect::from_min_size(
+                    egui::pos2(r.right() + 10.0, cap_y - (CHIP_H - 4.0) / 2.0),
+                    egui::vec2(w, CHIP_H - 4.0),
+                );
+                discard =
+                    chip(ui, cr, "appearance_discard_preview", "Discard", live, false).clicked();
+            }
+            None => {
+                p.text(
+                    egui::pos2(region.left() + 12.0, cap_y),
+                    egui::Align2::LEFT_CENTER,
+                    "Live preview · edits apply to every terminal instantly",
+                    egui::FontId::proportional(11.5),
+                    live.dim,
+                );
+            }
+        }
+        discard
+    }
+
+    // ---------------------------------------------------------------- expert
+
+    /// The Theme Expert: header with provider/model, a bubble log with proposal
+    /// cards, starter chips when empty, and a two-row input (Enter sends,
+    /// Shift+Enter inserts a newline). Returns true when a card's Apply is hit.
+    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+        if rect.width() < 120.0 || rect.height() < 90.0 {
+            return false;
+        }
+        let mut panel = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        panel.set_clip_rect(rect);
+        let p = panel.painter().clone();
+
+        // --- header: title left, model + provider right ---
+        let head = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), HEADER_H));
+        p.text(
+            egui::pos2(head.left(), head.center().y),
+            egui::Align2::LEFT_CENTER,
+            "THEME EXPERT",
+            egui::FontId::proportional(FONT_SMALL),
+            t.dim,
+        );
+        let prov_label = self.expert.provider.label();
+        let pw = chip_width(&panel, prov_label);
+        let prov_rect = egui::Rect::from_min_size(
+            egui::pos2(head.right() - pw, head.center().y - CHIP_H / 2.0),
+            egui::vec2(pw, CHIP_H),
+        );
+        if chip(
+            &mut panel,
+            prov_rect,
+            "theme_expert_provider",
+            prov_label,
+            t,
+            false,
+        )
+        .on_hover_text("Which CLI answers (click to cycle)")
+        .clicked()
+        {
+            use crate::config::NamingProvider as P;
+            self.expert.provider = match self.expert.provider {
+                P::Codex => P::Claude,
+                P::Claude => P::Grok,
+                P::Grok => P::Codex,
+            };
+            self.expert.model.clear();
+            self.model_edit = None;
+        }
+        // Model: dim click-to-edit text (house Kind::Text idiom).
+        let model_right = prov_rect.left() - 10.0;
+        if let Some(buf) = self.model_edit.as_mut() {
+            let w = (rect.width() * 0.45).clamp(90.0, 220.0);
+            let te_rect = egui::Rect::from_min_size(
+                egui::pos2(model_right - w, head.center().y - 11.0),
+                egui::vec2(w, 22.0),
+            );
+            panel.visuals_mut().selection.bg_fill = t.selection_text_bg;
+            let resp = panel.put(
+                te_rect,
+                egui::TextEdit::singleline(buf)
+                    .font(egui::FontId::proportional(FONT_CHIP))
+                    .text_color(t.text)
+                    .hint_text("model id")
+                    .desired_width(te_rect.width()),
+            );
+            if resp.lost_focus() {
+                let committed = panel.input(|i| i.key_pressed(egui::Key::Enter));
+                let buf = self.model_edit.take().unwrap_or_default();
+                if committed {
+                    self.expert.model = buf.trim().to_string();
+                }
+            } else {
+                resp.request_focus();
+            }
+        } else {
+            let shown = if self.expert.model.trim().is_empty() {
+                "(provider default)".to_string()
+            } else {
+                self.expert.model.clone()
+            };
+            let g = truncated(
+                &panel,
+                &shown,
+                egui::FontId::proportional(FONT_CHIP),
+                t.dim,
+                (rect.width() * 0.45).clamp(60.0, 220.0),
+            );
+            let r = egui::Rect::from_min_size(
+                egui::pos2(model_right - g.size().x, head.center().y - g.size().y / 2.0),
+                g.size(),
+            );
+            let resp = panel
+                .interact(
+                    r.expand(3.0),
+                    egui::Id::new("theme_expert_model"),
+                    egui::Sense::click(),
+                )
+                .on_hover_text("Model ID (blank = CLI default) · click to edit");
+            p.galley(r.min, g, if resp.hovered() { t.text } else { t.dim });
+            if resp.clicked() {
+                self.model_edit = Some(self.expert.model.clone());
+            }
+        }
+
+        // --- input well at the bottom ---
+        let input_h = 58.0;
+        let input = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom() - input_h),
+            egui::vec2(rect.width(), input_h),
+        );
+        // --- log between ---
+        let log = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), head.bottom()),
+            egui::pos2(rect.right(), input.top() - 6.0),
+        );
+        let mut apply = false;
+        let mut select: Option<Option<usize>> = None;
+        let mut starter: Option<&str> = None;
+        let mut log_ui = panel.new_child(egui::UiBuilder::new().max_rect(log));
+        log_ui.set_clip_rect(log);
+        let busy = self.expert.busy();
+        let error = self.expert.error.clone();
+        let turns = self.expert.turns.clone();
+        let proposals = &self.expert.proposals;
+        let selected = self.expert.selected;
+        egui::ScrollArea::vertical()
+            .id_salt("theme_expert_log")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(&mut log_ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                let width = ui.available_width();
+                ui.set_min_width(width);
+                if turns.is_empty() {
+                    row(ui, width, 30.0, |ui, r| {
+                        ui.painter().text(
+                            egui::pos2(r.left(), r.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "Describe colours, contrast or a mood.",
+                            egui::FontId::proportional(FONT_CHIP),
+                            t.dim,
+                        );
+                    });
+                    row(ui, width, CHIP_H + 8.0, |ui, r| {
+                        let mut x = r.left();
+                        for s in STARTERS {
+                            let w = chip_width(ui, s);
+                            if x + w > r.right() {
+                                break;
+                            }
+                            let cr = egui::Rect::from_min_size(
+                                egui::pos2(x, r.center().y - CHIP_H / 2.0),
+                                egui::vec2(w, CHIP_H),
+                            );
+                            if chip(ui, cr, ("theme_expert_starter", s), s, t, false).clicked() {
+                                starter = Some(s);
+                            }
+                            x = cr.right() + 6.0;
+                        }
+                    });
+                }
+                let bubble_w = (width * 0.8).max(60.0) - 20.0;
+                for (ti, turn) in turns.iter().enumerate() {
+                    let g = ui.painter().layout(
+                        turn.text.clone(),
+                        egui::FontId::proportional(FONT_CHIP),
+                        t.text,
+                        bubble_w,
+                    );
+                    let bw = g.size().x + 20.0;
+                    let bh = g.size().y + 14.0;
+                    row(ui, width, bh + 6.0, |ui, r| {
+                        let b = if turn.user {
+                            egui::Rect::from_min_size(
+                                egui::pos2(r.right() - bw, r.top() + 3.0),
+                                egui::vec2(bw, bh),
+                            )
+                        } else {
+                            egui::Rect::from_min_size(
+                                egui::pos2(r.left(), r.top() + 3.0),
+                                egui::vec2(bw, bh),
+                            )
+                        };
+                        let p = ui.painter();
+                        if turn.user {
+                            p.rect_filled(b, egui::CornerRadius::same(6), t.sel_bg);
+                        } else {
+                            p.rect_filled(b, egui::CornerRadius::same(6), t.win_bg);
+                            p.rect_stroke(
+                                b,
+                                egui::CornerRadius::same(6),
+                                egui::Stroke::new(1.0, t.border),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        p.galley(b.min + egui::vec2(10.0, 7.0), g, t.text);
+                    });
+                    if let Some(i) = turn.proposal.filter(|i| *i < proposals.len()) {
+                        let prop = &proposals[i];
+                        let is_sel = selected == Some(i);
+                        row(ui, width, 40.0, |ui, r| {
+                            let card = egui::Rect::from_min_size(
+                                egui::pos2(r.left(), r.top() + 2.0),
+                                egui::vec2(width.min(bw.max(240.0)), 34.0),
+                            );
+                            let p = ui.painter();
+                            p.rect_filled(card, egui::CornerRadius::same(5), t.title_bg);
+                            p.rect_stroke(
+                                card,
+                                egui::CornerRadius::same(5),
+                                egui::Stroke::new(
+                                    1.0,
+                                    if is_sel { t.border_focus } else { t.border },
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                            // Mini strip: bg, fg, then palette 1..=8.
+                            let mut sx = card.left() + 8.0;
+                            let swatches = [prop.bg, prop.fg]
+                                .into_iter()
+                                .chain(prop.palette[1..=8].iter().copied());
+                            for c in swatches {
+                                let s = egui::Rect::from_min_size(
+                                    egui::pos2(sx, card.center().y - 7.0),
+                                    egui::vec2(14.0, 14.0),
+                                );
+                                p.rect_filled(s, egui::CornerRadius::same(2), c);
+                                p.rect_stroke(
+                                    s,
+                                    egui::CornerRadius::same(2),
+                                    egui::Stroke::new(1.0, t.border),
+                                    egui::StrokeKind::Inside,
+                                );
+                                sx += 17.0;
+                            }
+                            // Chips: Apply (right), Preview/Previewing (left of it).
+                            let aw = chip_width(ui, "Apply");
+                            let ar = egui::Rect::from_min_size(
+                                egui::pos2(
+                                    card.right() - 6.0 - aw,
+                                    card.center().y - (CHIP_H - 2.0) / 2.0,
+                                ),
+                                egui::vec2(aw, CHIP_H - 2.0),
+                            );
+                            if chip(ui, ar, ("theme_expert_apply", ti), "Apply", t, false)
+                                .on_hover_text("Save this proposal as the active theme")
+                                .clicked()
+                            {
+                                select = Some(Some(i));
+                                apply = true;
+                            }
+                            let pl = if is_sel { "Previewing" } else { "Preview" };
+                            let pw = chip_width(ui, pl);
+                            let pr = egui::Rect::from_min_size(
+                                egui::pos2(ar.left() - 6.0 - pw, ar.top()),
+                                egui::vec2(pw, ar.height()),
+                            );
+                            if pr.left() > sx
+                                && chip(ui, pr, ("theme_expert_preview", ti), pl, t, is_sel)
+                                    .clicked()
+                            {
+                                select = Some(if is_sel { None } else { Some(i) });
+                            }
+                        });
+                    }
+                }
+                if busy {
+                    let dots = ((ui.input(|i| i.time) * 2.5) as usize % 3) + 1;
+                    row(ui, width, 24.0, |ui, r| {
+                        ui.painter().text(
+                            egui::pos2(r.left() + 2.0, r.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("Thinking{}", ".".repeat(dots)),
+                            egui::FontId::proportional(FONT_CHIP),
+                            t.dim,
+                        );
+                    });
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(400));
+                }
+                if let Some(err) = &error {
+                    let short = err.lines().next().unwrap_or("").to_string();
+                    row(ui, width, 24.0, |ui, r| {
+                        let g = truncated(
+                            ui,
+                            &short,
+                            egui::FontId::proportional(FONT_SMALL + 0.5),
+                            t.danger,
+                            r.width() - 4.0,
+                        );
+                        let gr = egui::Rect::from_min_size(
+                            egui::pos2(r.left() + 2.0, r.center().y - g.size().y / 2.0),
+                            g.size(),
+                        );
+                        ui.painter().galley(gr.min, g, t.danger);
+                        ui.interact(
+                            gr,
+                            egui::Id::new("theme_expert_error"),
+                            egui::Sense::hover(),
+                        )
+                        .on_hover_text(err.clone());
+                    });
+                }
+            });
+        if let Some(s) = starter {
+            self.expert.input = s.to_string();
+        }
+        if let Some(sel) = select {
+            self.expert.selected = sel;
+        }
+
+        // --- input ---
+        let send_w = chip_width(&panel, "Send");
+        let te_rect = egui::Rect::from_min_max(
+            input.min,
+            egui::pos2(input.right() - send_w - 8.0, input.bottom()),
+        );
+        p.rect_filled(te_rect, egui::CornerRadius::same(4), t.desk_bg);
+        p.rect_stroke(
+            te_rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, t.border),
+            egui::StrokeKind::Inside,
+        );
+        panel.visuals_mut().selection.bg_fill = t.selection_text_bg;
+        let te = panel.put(
+            te_rect.shrink2(egui::vec2(2.0, 2.0)),
+            egui::TextEdit::multiline(&mut self.expert.input)
+                .font(egui::FontId::proportional(FONT_CHIP))
+                .text_color(t.text)
+                .hint_text("Describe or refine your theme…  (Enter sends, Shift+Enter newline)")
+                .desired_rows(2)
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::symmetric(6, 4))
+                .return_key(Some(egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    egui::Key::Enter,
+                )))
+                .desired_width(te_rect.width()),
+        );
+        let can_send = !self.expert.busy() && !self.expert.input.trim().is_empty();
+        let enter = te.lost_focus()
+            && panel.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        let send_rect = egui::Rect::from_min_size(
+            egui::pos2(input.right() - send_w, input.center().y - CHIP_H / 2.0),
+            egui::vec2(send_w, CHIP_H),
+        );
+        let send_clicked = chip(
+            &mut panel,
+            send_rect,
+            "theme_expert_send",
+            "Send",
+            t,
+            can_send,
+        )
+        .clicked();
+        if (enter || send_clicked) && can_send {
+            self.expert.send(&self.working, panel.ctx());
+            if enter {
+                te.request_focus();
+            }
+        }
+        apply
+    }
+}
+
+// ------------------------------------------------------------- row helpers
+
+/// Allocate one `h`-tall row spanning `width` inside a child Ui so that any
+/// `put`/`scope_builder` placed within it (the colour picker) cannot drag the
+/// parent's cursor back up — the child's min_rect is the full row, and that is
+/// what the parent advances past.
+fn row<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    h: f32,
+    f: impl FnOnce(&mut egui::Ui, egui::Rect) -> R,
+) -> R {
+    let top_left = ui.cursor().min;
+    let rect = egui::Rect::from_min_size(top_left, egui::vec2(width, h));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+        f(ui, r)
+    })
+    .inner
+}
+
+/// A section header: small bold dim caps with a hairline beneath.
+fn section_header(ui: &mut egui::Ui, width: f32, label: &str, t: &Theme) {
+    row(ui, width, HEADER_H, |ui, r| {
+        ui.painter().text(
+            egui::pos2(r.left() + PAD, r.bottom() - 10.0),
+            egui::Align2::LEFT_CENTER,
+            label.to_uppercase(),
+            egui::FontId::proportional(FONT_SMALL),
+            t.dim,
+        );
+        ui.painter().hline(
+            egui::Rangef::new(r.left() + PAD, r.right() - PAD),
+            r.bottom() - 1.0,
+            egui::Stroke::new(1.0, t.border),
+        );
+    });
+}
+
+/// Paint the label (13pt) + description (11pt dim) of a row, truncated to
+/// `max_w` so a narrow pane never runs text under the controls.
+fn row_text(ui: &egui::Ui, r: egui::Rect, label: &str, desc: &str, max_w: f32, t: &Theme) {
+    let g = truncated(
+        ui,
+        label,
+        egui::FontId::proportional(FONT_LABEL),
+        t.text,
+        max_w,
+    );
+    ui.painter().galley(
+        egui::pos2(r.left() + PAD, r.top() + 16.0 - g.size().y / 2.0),
+        g,
+        t.text,
+    );
+    if !desc.is_empty() {
+        let g = truncated(
+            ui,
+            desc,
+            egui::FontId::proportional(FONT_SMALL),
+            t.dim,
+            max_w,
+        );
+        ui.painter().galley(
+            egui::pos2(r.left() + PAD, r.top() + 32.0 - g.size().y / 2.0),
+            g,
+            t.dim,
         );
     }
 }
 
-/// One row for an OPAQUE token: a left label with the swatch pushed to the right
-/// edge (a compact, aligned control that fits the form). Returns true on change.
-fn opaque_row(ui: &mut egui::Ui, label: &str, c: &mut egui::Color32, text: egui::Color32) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(13.0).color(text));
-        ui.add_space((ui.available_width() - 50.0).max(0.0));
-        ui.spacing_mut().interact_size = egui::vec2(50.0, 22.0);
-        let mut rgb = [c.r(), c.g(), c.b()];
-        let changed = ui.color_edit_button_srgb(&mut rgb).changed();
-        if changed {
-            *c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+/// The font-size stepper (a `Settings` field riding the Ctrl+Scroll zoom seam,
+/// not a theme token — it lives here because it is the one non-colour thing
+/// people reach for in Appearance).
+fn font_size_row(ui: &mut egui::Ui, width: f32, t: &Theme) {
+    row(ui, width, ROW_H, |ui, r| {
+        let anchor_x = r.right() - PAD;
+        let cy = r.center().y;
+        row_text(
+            ui,
+            r,
+            "Font size",
+            "Also Ctrl+Scroll · saved in settings",
+            (r.width() - 180.0).max(60.0),
+            t,
+        );
+        let mut fs = crate::terminal::font_size(ui.ctx());
+        let plus = egui::Rect::from_min_size(
+            egui::pos2(anchor_x - 20.0, cy - 10.0),
+            egui::vec2(20.0, 20.0),
+        );
+        let vw = 56.0;
+        let value_rect =
+            egui::Rect::from_min_size(egui::pos2(plus.min.x - vw, cy - 10.0), egui::vec2(vw, 20.0));
+        let minus = egui::Rect::from_min_size(
+            egui::pos2(value_rect.min.x - 20.0, cy - 10.0),
+            egui::vec2(20.0, 20.0),
+        );
+        let id = egui::Id::new("appearance_font_size");
+        let rp = ui.interact(plus, id.with("plus"), egui::Sense::click());
+        let rm = ui.interact(minus, id.with("minus"), egui::Sense::click());
+        if rp.clicked() {
+            fs = (fs + 1.0).min(crate::config::MAX_FONT_SIZE);
         }
-        changed
-    })
-    .inner
+        if rm.clicked() {
+            fs = (fs - 1.0).max(crate::config::MIN_FONT_SIZE);
+        }
+        crate::terminal::set_font_size(ui.ctx(), fs);
+        for (rc, sym, hov) in [(minus, "−", rm.hovered()), (plus, "+", rp.hovered())] {
+            ui.painter().rect_stroke(
+                rc,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, if hov { t.border_focus } else { t.border }),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rc.center(),
+                egui::Align2::CENTER_CENTER,
+                sym,
+                egui::FontId::proportional(14.0),
+                if hov { t.text } else { t.dim },
+            );
+        }
+        ui.painter().text(
+            egui::pos2(value_rect.max.x - 4.0, cy),
+            egui::Align2::RIGHT_CENTER,
+            format!("{fs:.0} pt"),
+            egui::FontId::proportional(FONT_CHIP),
+            t.text,
+        );
+    });
 }
 
-/// One row for a TRANSLUCENT token, edited in STRAIGHT (un-premultiplied) alpha
-/// via `color_edit_button_srgba_unmultiplied` — the egui path that avoids the
-/// low-alpha premultiplied round-trip drift.
-fn translucent_row(
+/// One token row: label + description left; the JSON key (dim mono) and the
+/// swatch chip right. Returns true when the swatch changed the theme.
+fn token_row(
     ui: &mut egui::Ui,
-    label: &str,
-    c: &mut egui::Color32,
-    text: egui::Color32,
+    width: f32,
+    spec: &TokenSpec,
+    working: &mut Theme,
+    t: &Theme,
 ) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(13.0).color(text));
-        ui.add_space((ui.available_width() - 50.0).max(0.0));
-        ui.spacing_mut().interact_size = egui::vec2(50.0, 22.0);
-        let mut a = c.to_srgba_unmultiplied();
-        let changed = ui.color_edit_button_srgba_unmultiplied(&mut a).changed();
-        if changed {
-            *c = egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
+    row(ui, width, ROW_H, |ui, r| {
+        let cy = r.center().y;
+        let sw = egui::Rect::from_min_size(
+            egui::pos2(r.right() - PAD - SWATCH_W, cy - SWATCH_H / 2.0),
+            egui::vec2(SWATCH_W, SWATCH_H),
+        );
+        let key_w = (r.width() * 0.3).clamp(60.0, 150.0);
+        let kg = truncated(
+            ui,
+            spec.key,
+            egui::FontId::monospace(FONT_SMALL),
+            t.dim,
+            key_w,
+        );
+        ui.painter().galley(
+            egui::pos2(sw.left() - 10.0 - kg.size().x, cy - kg.size().y / 2.0),
+            kg.clone(),
+            t.dim,
+        );
+        let text_w = (sw.left() - 10.0 - kg.size().x - 12.0 - (r.left() + PAD)).max(40.0);
+        row_text(ui, r, spec.label, spec.desc, text_w, t);
+        let mut c = (spec.get)(working);
+        let hover = format!(
+            "{} · {}\n{}",
+            spec.key,
+            crate::theme::color_hex::to_hex(c),
+            spec.desc
+        );
+        if swatch(ui, sw, spec.key, &mut c, spec.alpha, t, &hover) {
+            (spec.set)(working, c);
+            true
+        } else {
+            false
         }
-        changed
     })
-    .inner
 }
 
-/// The editable 16-swatch ANSI palette as a two-row grid (Base / Bright), sized
-/// to the form width. Returns true if any swatch changed.
-fn palette_grid(ui: &mut egui::Ui, palette: &mut [egui::Color32; 16], t: &Theme) -> bool {
-    const NAMES: [&str; 16] = [
-        "Black",
-        "Red",
-        "Green",
-        "Yellow",
-        "Blue",
-        "Magenta",
-        "Cyan",
-        "White",
-        "Bright Black",
-        "Bright Red",
-        "Bright Green",
-        "Bright Yellow",
-        "Bright Blue",
-        "Bright Magenta",
-        "Bright Cyan",
-        "Bright White",
-    ];
+/// The 16-colour ANSI palette: a caption row, then `Base` and `Bright` swatch
+/// rows. Returns true if any slot changed.
+fn palette_rows(
+    ui: &mut egui::Ui,
+    width: f32,
+    palette: &mut [egui::Color32; 16],
+    t: &Theme,
+) -> bool {
+    let mut changed = false;
+    row(ui, width, 36.0, |ui, r| {
+        row_text(
+            ui,
+            egui::Rect::from_min_size(r.min, egui::vec2(r.width(), ROW_H)),
+            "Palette",
+            "ANSI colours 0–15 used by programs in the terminal",
+            r.width() - 2.0 * PAD,
+            t,
+        );
+    });
+    let label_w = 48.0;
     let gap = 5.0;
-    let label_w = 44.0;
-    let sw = ((ui.available_width() - label_w - gap * 8.0) / 8.0).clamp(14.0, 40.0);
-    let sh = (sw * 0.62).clamp(12.0, 26.0);
-    let mut pal = *palette;
-    let prev = ui.spacing().interact_size;
-    ui.spacing_mut().interact_size = egui::vec2(sw, sh);
-    egui::Grid::new("appearance_palette")
-        .spacing([gap, gap])
-        .show(ui, |ui| {
-            for (base, label) in [(0usize, "Base"), (8usize, "Bright")] {
-                ui.label(egui::RichText::new(label).size(11.0).color(t.dim));
-                for cc in 0..8usize {
-                    let i = base + cc;
-                    ui.push_id(i, |ui| {
-                        let mut rgb = [pal[i].r(), pal[i].g(), pal[i].b()];
-                        if ui
-                            .color_edit_button_srgb(&mut rgb)
-                            .on_hover_text(format!("{} · color {i}", NAMES[i]))
-                            .changed()
-                        {
-                            pal[i] = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                        }
-                    });
+    let avail = width - 2.0 * PAD - label_w;
+    let sw = ((avail - 7.0 * gap) / 8.0).clamp(16.0, 40.0);
+    let sh = (sw * 0.6).clamp(14.0, 22.0);
+    for (base, label) in [(0usize, "Base"), (8usize, "Bright")] {
+        row(ui, width, sh + 8.0, |ui, r| {
+            ui.painter().text(
+                egui::pos2(r.left() + PAD, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(FONT_SMALL),
+                t.dim,
+            );
+            let mut x = r.left() + PAD + label_w;
+            for cc in 0..8usize {
+                let i = base + cc;
+                let s = egui::Rect::from_min_size(
+                    egui::pos2(x, r.center().y - sh / 2.0),
+                    egui::vec2(sw, sh),
+                );
+                let mut c = palette[i];
+                let hover = format!(
+                    "palette[{i}] · {}\n{}",
+                    crate::theme::color_hex::to_hex(c),
+                    PALETTE_NAMES[i]
+                );
+                if swatch(ui, s, ("palette", i), &mut c, false, t, &hover) {
+                    palette[i] = c;
+                    changed = true;
                 }
-                ui.end_row();
+                x += sw + gap;
             }
         });
-    ui.spacing_mut().interact_size = prev;
-    if pal != *palette {
-        *palette = pal;
-        true
-    } else {
-        false
     }
+    changed
+}
+
+/// The six chat member colours as one swatch row (with its caption above).
+fn member_colour_row(
+    ui: &mut egui::Ui,
+    width: f32,
+    colours: &mut [egui::Color32; 6],
+    t: &Theme,
+) -> bool {
+    let mut changed = false;
+    row(ui, width, 36.0, |ui, r| {
+        row_text(
+            ui,
+            egui::Rect::from_min_size(r.min, egui::vec2(r.width(), ROW_H)),
+            "Member colours",
+            CHAT_COLOR_DESC,
+            r.width() - 2.0 * PAD,
+            t,
+        );
+    });
+    let gap = 5.0;
+    let sw = ((width - 2.0 * PAD - 5.0 * gap) / 6.0).clamp(16.0, 44.0);
+    let sh = (sw * 0.55).clamp(14.0, 22.0);
+    row(ui, width, sh + 10.0, |ui, r| {
+        let mut x = r.left() + PAD;
+        for i in 0..6usize {
+            let s = egui::Rect::from_min_size(
+                egui::pos2(x, r.center().y - sh / 2.0),
+                egui::vec2(sw, sh),
+            );
+            let mut c = colours[i];
+            let hover = format!("chat_colors[{i}] · {}", crate::theme::color_hex::to_hex(c));
+            if swatch(ui, s, ("chat_colors", i), &mut c, false, t, &hover) {
+                colours[i] = c;
+                changed = true;
+            }
+            x += sw + gap;
+        }
+    });
+    changed
+}
+
+// ------------------------------------------------------------- primitives
+
+/// A colour swatch chip at `rect`: egui's colour-picker button is placed there
+/// (so its popup works) and our chip — checker under alpha, the colour, a
+/// bordered edge that brightens on hover — is painted over it. Returns true on
+/// change. Opaque tokens edit RGB; alpha tokens edit straight (un-premultiplied)
+/// RGBA, the egui path without low-alpha round-trip drift.
+fn swatch(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    salt: impl std::hash::Hash,
+    c: &mut egui::Color32,
+    alpha: bool,
+    t: &Theme,
+    hover: &str,
+) -> bool {
+    let mut changed = false;
+    let resp = ui
+        .push_id(salt, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.spacing_mut().interact_size = rect.size();
+                if alpha {
+                    let mut a = c.to_srgba_unmultiplied();
+                    let r = ui.color_edit_button_srgba_unmultiplied(&mut a);
+                    if r.changed() {
+                        *c = egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3]);
+                        changed = true;
+                    }
+                    r
+                } else {
+                    let mut rgb = [c.r(), c.g(), c.b()];
+                    let r = ui.color_edit_button_srgb(&mut rgb);
+                    if r.changed() {
+                        *c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                        changed = true;
+                    }
+                    r
+                }
+            })
+            .inner
+        })
+        .inner;
+    let p = ui.painter();
+    let cr = egui::CornerRadius::same(4);
+    if alpha {
+        checker(p, rect, t);
+    }
+    p.rect_filled(rect, cr, *c);
+    p.rect_stroke(
+        rect,
+        cr,
+        egui::Stroke::new(
+            1.0,
+            if resp.hovered() {
+                t.border_focus
+            } else {
+                t.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    resp.on_hover_text(hover);
+    changed
+}
+
+/// Two-tone checker (window / title fills) so a translucent swatch reads as
+/// translucent instead of as a darker opaque colour.
+fn checker(p: &egui::Painter, rect: egui::Rect, t: &Theme) {
+    p.rect_filled(rect, egui::CornerRadius::same(4), t.win_bg);
+    let s = 5.0;
+    let cols = (rect.width() / s).ceil() as i32;
+    let rows = (rect.height() / s).ceil() as i32;
+    let p = p.with_clip_rect(rect);
+    for y in 0..rows {
+        for x in 0..cols {
+            if (x + y) % 2 == 0 {
+                p.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + x as f32 * s, rect.top() + y as f32 * s),
+                        egui::vec2(s, s),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    t.title_bg,
+                );
+            }
+        }
+    }
+}
+
+/// Width a chip needs for `label` (text + padding).
+fn chip_width(ui: &egui::Ui, label: &str) -> f32 {
+    let g = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(FONT_CHIP),
+        egui::Color32::PLACEHOLDER,
+    );
+    g.size().x + 20.0
+}
+
+/// A bordered chip button (the house `Kind::Choice`/`Kind::Action` look). An
+/// `active` chip gets the focus border and the focused-title fill.
+fn chip(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    salt: impl std::hash::Hash,
+    label: &str,
+    t: &Theme,
+    active: bool,
+) -> egui::Response {
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("appearance_chip", salt)),
+        egui::Sense::click(),
+    );
+    let p = ui.painter();
+    let cr = egui::CornerRadius::same(4);
+    if active {
+        p.rect_filled(rect, cr, t.title_bg_focus);
+    } else if resp.hovered() {
+        p.rect_filled(rect, cr, t.sel_bg);
+    }
+    p.rect_stroke(
+        rect,
+        cr,
+        egui::Stroke::new(
+            1.0,
+            if active || resp.hovered() {
+                t.border_focus
+            } else {
+                t.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(FONT_CHIP),
+        t.text,
+    );
+    resp
+}
+
+/// Lay out one line of text truncated with an ellipsis at `max_w`.
+fn truncated(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(1.0));
+    ui.painter().layout_job(job)
 }
 
 #[cfg(test)]

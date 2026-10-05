@@ -54,6 +54,9 @@ pub fn parse_reply(raw: &str) -> Result<Reply, String> {
 pub struct Turn {
     pub user: bool,
     pub text: String,
+    /// For an expert reply: the index into `ThemeExpert::proposals` it produced,
+    /// so the pane can anchor the proposal card under that message.
+    pub proposal: Option<usize>,
 }
 
 /// Keeps provider history and previews separate from Appearance's persisted
@@ -102,6 +105,7 @@ impl ThemeExpert {
         self.turns.push(Turn {
             user: true,
             text: request,
+            proposal: None,
         });
         self.error = None;
         let history = self.turns.clone();
@@ -118,20 +122,26 @@ impl ThemeExpert {
         });
     }
 
+    /// Adopt a validated reply: its theme becomes the newest proposal (selected
+    /// for preview) and its message a turn linked to that proposal.
+    pub fn accept(&mut self, reply: Reply) {
+        self.proposals.push(reply.theme);
+        let idx = self.proposals.len() - 1;
+        self.turns.push(Turn {
+            user: false,
+            text: reply.message,
+            proposal: Some(idx),
+        });
+        self.selected = Some(idx);
+        self.pending = None;
+    }
+
     pub fn poll(&mut self) {
         let Some(rx) = &self.pending else {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok(reply)) => {
-                self.turns.push(Turn {
-                    user: false,
-                    text: reply.message,
-                });
-                self.proposals.push(reply.theme);
-                self.selected = Some(self.proposals.len() - 1);
-                self.pending = None;
-            }
+            Ok(Ok(reply)) => self.accept(reply),
             Ok(Err(error)) => {
                 self.error = Some(error);
                 self.pending = None;
@@ -204,6 +214,24 @@ mod tests {
         bad["theme"]["bg"] = Value::String("not a color".into());
         assert!(parse_reply(&bad.to_string()).is_err());
         assert!(parse_reply("```json\n{}\n```").is_err());
+    }
+
+    #[test]
+    fn expert_replies_link_to_their_proposal() {
+        let mut x = ThemeExpert::new();
+        x.turns.push(Turn {
+            user: true,
+            text: "warmer".into(),
+            proposal: None,
+        });
+        x.accept(Reply {
+            message: "done".into(),
+            theme: Theme::foreman_warm(),
+        });
+        assert_eq!(x.proposals.len(), 1);
+        assert_eq!(x.turns.last().unwrap().proposal, Some(0));
+        assert_eq!(x.selected, Some(0));
+        assert!(!x.busy());
     }
 
     #[test]

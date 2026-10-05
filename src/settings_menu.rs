@@ -921,6 +921,11 @@ impl SettingsMenu {
                         ),
                     }
                 }
+                crate::appearance::Outcome::OpenThemesFolder => {
+                    if let Some(dir) = crate::config::themes_dir() {
+                        std::process::Command::new("explorer").arg(dir).spawn().ok();
+                    }
+                }
                 crate::appearance::Outcome::Rename(name) => {
                     // Write the current content under the new name + drop the old
                     // file, then switch (the App reloads it and the pane resyncs).
