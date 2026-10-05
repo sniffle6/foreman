@@ -868,10 +868,12 @@ impl SettingsMenu {
             return;
         }
         if self.pane == Pane::Appearance {
-            // Resync the pane to the active theme when its name changed (preset
-            // switch / Duplicate / external) — never mid-edit, since the name is
-            // stable while editing, so this can't clobber in-progress edits.
-            if s.theme.as_str() != self.appearance.active_name() {
+            // Resync the pane to the live theme when its name changed (preset
+            // switch / Duplicate / rename) or when the live theme diverged from
+            // the pane's copy (the App adopted a hand edit from disk). Never
+            // mid-edit: the pane's own edits ARE the live theme, so they compare
+            // equal and are never clobbered.
+            if self.appearance.needs_resync(&s.theme, theme) {
                 self.appearance.set_active(&s.theme, theme.clone());
             }
             let reads_input = active && !self.in_rail && !just_entered;
@@ -890,13 +892,34 @@ impl SettingsMenu {
                     }
                 }
                 crate::appearance::Outcome::SelectPreset(name) => {
-                    // Persist any pending edit to the OUTGOING user theme before
-                    // switching, so a switch within the save-debounce never drops it.
-                    if !crate::theme::Theme::is_builtin(&s.theme) {
+                    // Persist a pending edit to the OUTGOING user theme before
+                    // switching, so a switch within the save-debounce never drops
+                    // it — but only when dirty: writing a clean theme would clobber
+                    // a hand edit made on disk since it was loaded.
+                    if crate::appearance::persist_outgoing(
+                        crate::theme::Theme::is_builtin(&s.theme),
+                        self.appearance.is_dirty(),
+                    ) {
                         let _ = self.appearance.working().save(&s.theme);
                     }
                     s.theme = name;
                     bump(outcome, MenuOutcome::Changed);
+                }
+                crate::appearance::Outcome::Reload => {
+                    // Strict re-read; the App adopts the republished theme and
+                    // re-records the file mtime after its (no-op) save.
+                    match crate::theme::Theme::try_load(&s.theme) {
+                        Ok(t) => {
+                            *theme = t.clone();
+                            self.appearance.set_active(&s.theme, t);
+                            bump(outcome, MenuOutcome::Changed);
+                        }
+                        Err(e) => crate::notify::queue(
+                            ui.ctx(),
+                            crate::notify::Level::Warning,
+                            format!("Theme file not applied: {e}"),
+                        ),
+                    }
                 }
                 crate::appearance::Outcome::Rename(name) => {
                     // Write the current content under the new name + drop the old

@@ -34,8 +34,18 @@ pub enum Outcome {
     Rename(String),
     /// Delete the active user theme (name given).
     Delete(String),
+    /// Re-read the active theme from its file (the shell loads it strictly and
+    /// republishes; an invalid file toasts and changes nothing).
+    Reload,
     /// Nothing happened this frame.
     Pending,
+}
+
+/// Whether a preset switch should write the OUTGOING theme first. Only a dirty
+/// user theme has anything to persist; writing a clean one would clobber a hand
+/// edit made on disk since it was loaded.
+pub fn persist_outgoing(is_builtin: bool, dirty: bool) -> bool {
+    !is_builtin && dirty
 }
 
 /// What the control form reported this frame (collected, then folded into an
@@ -121,6 +131,16 @@ impl AppearanceView {
     /// The currently-active theme name (matches `Settings.theme`).
     pub fn active_name(&self) -> &str {
         &self.active_name
+    }
+
+    /// Should the pane re-adopt the live theme as its working copy? Yes on a
+    /// name change (preset switch / Duplicate / rename) and whenever the live
+    /// theme differs from `working` — which only happens when something other
+    /// than this pane changed it (the App's disk poll). After the pane's own
+    /// edit the two are equal (the edit was published as the live theme), so
+    /// an in-progress edit is never clobbered.
+    pub fn needs_resync(&self, name: &str, live: &Theme) -> bool {
+        name != self.active_name || *live != self.working
     }
 
     /// True while the built-in theme is active — its controls are read-only, so
@@ -752,6 +772,35 @@ mod tests {
         v.revert();
         assert!(!v.is_dirty(), "revert restores the saved theme");
         assert_eq!(v.working().bg, Theme::foreman_warm().bg);
+    }
+
+    #[test]
+    fn resync_fires_on_name_change_or_foreign_live_theme_but_not_on_own_edit() {
+        let mut v = AppearanceView::new();
+        v.set_active("mine", Theme::foreman_warm());
+        assert!(!v.needs_resync("mine", &Theme::foreman_warm()));
+        assert!(
+            v.needs_resync("other", &Theme::foreman_warm()),
+            "name change"
+        );
+        let mut disk = Theme::foreman_warm();
+        disk.bg = egui::Color32::from_rgb(9, 9, 9);
+        assert!(v.needs_resync("mine", &disk), "disk changed under us");
+        v.working_mut().bg = disk.bg; // our own edit, already published as live
+        assert!(
+            !v.needs_resync("mine", &disk),
+            "live == working after our edit"
+        );
+    }
+
+    #[test]
+    fn outgoing_theme_is_only_persisted_when_dirty() {
+        assert!(!persist_outgoing(true, true), "built-in never written");
+        assert!(
+            !persist_outgoing(false, false),
+            "clean user theme: leave the file alone"
+        );
+        assert!(persist_outgoing(false, true));
     }
 
     #[test]
