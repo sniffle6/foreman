@@ -145,16 +145,19 @@ impl AppearanceView {
     /// A unique slug for a fork of the active theme, so an auto-fork (or an
     /// explicit Duplicate) never clobbers an existing user theme file.
     fn fork_name(&self) -> String {
+        self.fork_name_from(None)
+    }
+
+    /// Like [`fork_name`](Self::fork_name) but preferring `suggested` (the
+    /// expert's name for a proposal) when it slugs to something usable.
+    fn fork_name_from(&self, suggested: Option<&str>) -> String {
         let existing: std::collections::HashSet<String> =
             Theme::user_theme_names().into_iter().collect();
-        let base = crate::theme::slug(&format!("{} copy", self.active_name));
-        if !existing.contains(&base) {
-            return base;
-        }
-        (2..)
-            .map(|n| format!("{base}-{n}"))
-            .find(|c| !existing.contains(c))
-            .unwrap_or(base)
+        let base = suggested
+            .map(crate::theme::slug)
+            .filter(|s| !s.trim_matches('-').is_empty())
+            .unwrap_or_else(|| crate::theme::slug(&format!("{} copy", self.active_name)));
+        unique_slug(&base, &existing)
     }
 
     /// The currently-active theme name (matches `Settings.theme`). The shell
@@ -311,10 +314,12 @@ impl AppearanceView {
             return Outcome::Delete(name);
         }
         if apply {
-            if let Some(proposal) = self.expert.preview().cloned() {
+            if let Some(prop) = self.expert.preview_proposal() {
+                let proposal = prop.theme.clone();
+                let suggested = prop.name.clone();
                 if self.active_is_builtin() {
                     self.working = proposal;
-                    return Outcome::Duplicate(self.fork_name());
+                    return Outcome::Duplicate(self.fork_name_from(suggested.as_deref()));
                 }
                 match proposal.save(&self.active_name) {
                     Ok(()) => {
@@ -1030,10 +1035,51 @@ impl AppearanceView {
             egui::pos2(rect.left(), rect.bottom() - input_h),
             egui::vec2(rect.width(), input_h),
         );
+        // --- scope chips above the input (wrap into rows when narrow) ---
+        let scope_rows = scope_chip_rows(&panel, rect.width());
+        let scope_row_h = CHIP_H + 4.0;
+        let scope_h = scope_rows.len() as f32 * scope_row_h;
+        let scope_band = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), input.top() - 6.0 - scope_h),
+            egui::vec2(rect.width(), scope_h),
+        );
+        for (ri, row_chips) in scope_rows.iter().enumerate() {
+            let mut x = scope_band.left();
+            let cy = scope_band.top() + ri as f32 * scope_row_h + scope_row_h / 2.0;
+            for (scope, w) in row_chips {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(x, cy - (CHIP_H - 2.0) / 2.0),
+                    egui::vec2(*w, CHIP_H - 2.0),
+                );
+                let active = self.expert.scope == *scope;
+                if chip(
+                    &mut panel,
+                    r,
+                    ("theme_expert_scope", scope.label()),
+                    scope.label(),
+                    t,
+                    active,
+                )
+                .on_hover_text(match scope {
+                    crate::theme_expert::Scope::All => {
+                        "The expert may change any colour".to_string()
+                    }
+                    s => format!(
+                        "Only these keys may change; everything else is kept:\n{}",
+                        s.keys().join(", ")
+                    ),
+                })
+                .clicked()
+                {
+                    self.expert.scope = *scope;
+                }
+                x += w + 6.0;
+            }
+        }
         // --- log between ---
         let log = egui::Rect::from_min_max(
             egui::pos2(rect.left(), head.bottom()),
-            egui::pos2(rect.right(), input.top() - 6.0),
+            egui::pos2(rect.right(), scope_band.top() - 4.0),
         );
         let mut apply = false;
         let mut select: Option<Option<usize>> = None;
@@ -1120,10 +1166,11 @@ impl AppearanceView {
                     if let Some(i) = turn.proposal.filter(|i| *i < proposals.len()) {
                         let prop = &proposals[i];
                         let is_sel = selected == Some(i);
-                        row(ui, width, 40.0, |ui, r| {
+                        let card_h = 56.0;
+                        row(ui, width, card_h + 6.0, |ui, r| {
                             let card = egui::Rect::from_min_size(
                                 egui::pos2(r.left(), r.top() + 2.0),
-                                egui::vec2(width.min(bw.max(240.0)), 34.0),
+                                egui::vec2(width.min(bw.max(240.0)), card_h),
                             );
                             let p = ui.painter();
                             p.rect_filled(card, egui::CornerRadius::same(5), t.title_bg);
@@ -1136,14 +1183,69 @@ impl AppearanceView {
                                 ),
                                 egui::StrokeKind::Inside,
                             );
-                            // Mini strip: bg, fg, then palette 1..=8.
+                            // Line 1: the diff summary and the suggested name.
+                            let n = prop.changes.len();
+                            let mut head = match n {
+                                0 => "No changes".to_string(),
+                                1 => "1 change".to_string(),
+                                n => format!("{n} changes"),
+                            };
+                            if let Some(name) = &prop.name {
+                                head.push_str(&format!("  ·  \u{201c}{name}\u{201d}"));
+                            }
+                            let hg = truncated(
+                                ui,
+                                &head,
+                                egui::FontId::proportional(FONT_SMALL + 0.5),
+                                t.dim,
+                                card.width() - 16.0,
+                            );
+                            p.galley(egui::pos2(card.left() + 8.0, card.top() + 6.0), hg, t.dim);
+                            // Line 2: swatch strip — the changed tokens first (hover shows
+                            // key and before → after), padded with bg/fg/palette to ten.
+                            let sy = card.bottom() - 8.0 - 14.0;
                             let mut sx = card.left() + 8.0;
-                            let swatches = [prop.bg, prop.fg]
-                                .into_iter()
-                                .chain(prop.palette[1..=8].iter().copied());
-                            for c in swatches {
+                            let mut shown = 0usize;
+                            for ch in prop.changes.iter().take(10) {
                                 let s = egui::Rect::from_min_size(
-                                    egui::pos2(sx, card.center().y - 7.0),
+                                    egui::pos2(sx, sy),
+                                    egui::vec2(14.0, 14.0),
+                                );
+                                // Left half before, right half after: the change at a glance.
+                                let half = egui::Rect::from_min_max(
+                                    s.min,
+                                    egui::pos2(s.center().x, s.max.y),
+                                );
+                                p.rect_filled(s, egui::CornerRadius::same(2), ch.after);
+                                p.rect_filled(half, egui::CornerRadius::ZERO, ch.before);
+                                p.rect_stroke(
+                                    s,
+                                    egui::CornerRadius::same(2),
+                                    egui::Stroke::new(1.0, t.border_focus),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.interact(
+                                    s,
+                                    egui::Id::new(("theme_expert_change", ti, shown)),
+                                    egui::Sense::hover(),
+                                )
+                                .on_hover_ui(|ui| {
+                                    ui.label(format!(
+                                        "{}: {} → {}",
+                                        ch.key,
+                                        crate::theme::color_hex::to_hex(ch.before),
+                                        crate::theme::color_hex::to_hex(ch.after)
+                                    ));
+                                });
+                                sx += 17.0;
+                                shown += 1;
+                            }
+                            let filler = [prop.theme.bg, prop.theme.fg]
+                                .into_iter()
+                                .chain(prop.theme.palette[1..=8].iter().copied());
+                            for c in filler.take(10usize.saturating_sub(shown)) {
+                                let s = egui::Rect::from_min_size(
+                                    egui::pos2(sx, sy),
                                     egui::vec2(14.0, 14.0),
                                 );
                                 p.rect_filled(s, egui::CornerRadius::same(2), c);
@@ -1160,11 +1262,26 @@ impl AppearanceView {
                             let ar = egui::Rect::from_min_size(
                                 egui::pos2(
                                     card.right() - 6.0 - aw,
-                                    card.center().y - (CHIP_H - 2.0) / 2.0,
+                                    sy + 7.0 - (CHIP_H - 2.0) / 2.0,
                                 ),
                                 egui::vec2(aw, CHIP_H - 2.0),
                             );
-                            if chip(ui, ar, ("theme_expert_apply", ti), "Apply", t, false)
+                            if n == 0 {
+                                // Nothing to apply: disabled look, no interaction.
+                                p.rect_stroke(
+                                    ar,
+                                    egui::CornerRadius::same(4),
+                                    egui::Stroke::new(1.0, t.border),
+                                    egui::StrokeKind::Inside,
+                                );
+                                p.text(
+                                    ar.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Apply",
+                                    egui::FontId::proportional(FONT_CHIP),
+                                    t.dim,
+                                );
+                            } else if chip(ui, ar, ("theme_expert_apply", ti), "Apply", t, false)
                                 .on_hover_text("Save this proposal as the active theme")
                                 .clicked()
                             {
@@ -1714,6 +1831,34 @@ fn chip(
     resp
 }
 
+/// Wrap the scope chips into rows that fit `width` (each entry is the scope
+/// and its chip width).
+fn scope_chip_rows(ui: &egui::Ui, width: f32) -> Vec<Vec<(crate::theme_expert::Scope, f32)>> {
+    let mut rows: Vec<Vec<(crate::theme_expert::Scope, f32)>> = vec![Vec::new()];
+    let mut x = 0.0;
+    for scope in crate::theme_expert::Scope::ALL {
+        let w = chip_width(ui, scope.label()) - 6.0;
+        if x + w > width && !rows.last().unwrap().is_empty() {
+            rows.push(Vec::new());
+            x = 0.0;
+        }
+        rows.last_mut().unwrap().push((scope, w));
+        x += w + 6.0;
+    }
+    rows
+}
+
+/// `base` if free, else `base-2`, `base-3`, … — the first slug not in `existing`.
+fn unique_slug(base: &str, existing: &std::collections::HashSet<String>) -> String {
+    if !existing.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !existing.contains(c))
+        .unwrap_or_else(|| base.to_string())
+}
+
 /// Lay out one line of text truncated with an ellipsis at `max_w`.
 fn truncated(
     ui: &egui::Ui,
@@ -1760,6 +1905,27 @@ mod tests {
             !v.needs_resync("mine", &disk),
             "live == working after our edit"
         );
+    }
+
+    #[test]
+    fn expert_name_becomes_the_fork_slug_with_collision_fallback() {
+        let existing: std::collections::HashSet<String> =
+            ["ember-night".to_string(), "ember-night-2".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(unique_slug("ember-night", &existing), "ember-night-3");
+        assert_eq!(unique_slug("fresh", &existing), "fresh");
+        let v = AppearanceView::new();
+        // A usable suggestion is slugged; an unusable one falls back to "<name> copy".
+        assert!(
+            v.fork_name_from(Some("Ember Night"))
+                .starts_with("ember-night")
+        );
+        assert!(
+            v.fork_name_from(Some("!!!"))
+                .starts_with("foreman-warm-copy")
+        );
+        assert!(v.fork_name_from(None).starts_with("foreman-warm-copy"));
     }
 
     #[test]

@@ -75,11 +75,21 @@ controls too, one frame behind — the same lag every terminal repaint already h
   around a sample terminal, so the Windows tokens visibly do something.
 - **Theme expert** is the chat under the preview. Describe a palette or ask for
   a refinement; starter chips fill the box when it is empty. Enter sends,
-  Shift+Enter inserts a newline. Each answer that produced a theme renders a
-  **proposal card** under that reply with a swatch strip and two chips:
-  **Preview** toggles the hero to the proposal (the caption says so, with
-  Discard), **Apply** saves it through the user theme flow. When Foreman Warm
-  is active, Apply creates a user copy first.
+  Shift+Enter inserts a newline.
+- **Scope chips** above the input (`All`, one per token group, `Palette`)
+  limit what a request may change. The limit is enforced locally: the reply is
+  merged onto the theme the request was sent from and only the in-scope keys
+  are taken (`theme_expert::Scope::merge`), so an out-of-scope colour cannot
+  move even if the model ignores the instruction.
+- Each answer that produced a theme renders a **proposal card** under that
+  reply. Its header says how many tokens changed and the name the expert
+  suggests. The swatch strip shows the changed tokens first, each split
+  before/after with the key and both hex values on hover. **Preview** toggles
+  the hero to the proposal (the caption says so, with Discard); **Apply** saves
+  it through the user theme flow and is disabled on a no-change proposal. When
+  Foreman Warm is active, Apply creates a user copy named after the expert's
+  suggestion (numbered if that slug exists); applying to a user theme keeps its
+  name.
 - The chat offers Codex, Claude, and Grok via the provider chip. Codex is
   selected initially; a blank model uses that CLI's default (Codex ignores its
   user `config.toml`, so that is Codex's built-in default). Click the model text
@@ -118,11 +128,14 @@ theme. The rules, all in `src/main.rs` (`App`) and `src/theme.rs`:
 
 The provider runs on a background thread in a dedicated configuration directory,
 through the shared one-shot launcher (`docs/ai-oneshot.md`): Claude and Grok have
-their tools disabled, Codex runs read-only with its shell tools disabled. No provider response is treated as a command or file edit. The
-response must be one JSON object containing a short `message` and a complete
-`Theme` value with exactly the supported color keys and valid color values. Bad
-or incomplete output is shown as an error; the current proposal and saved theme
-remain intact. Conversation and previews live only as long as the Settings window.
+their tools disabled, Codex runs read-only with its shell tools disabled. No
+provider response is treated as a command or file edit. The response must be one
+JSON object containing a short `message`, a complete `Theme` value with exactly
+the supported color keys and valid color values, and optionally a `name` of 1 to
+40 characters. Bad or incomplete output is shown as an error; the current
+proposal and saved theme remain intact. The accepted theme is then scope-merged
+onto the request's base, so the model's answer never reaches a key the user did
+not open. Conversation and previews live only as long as the Settings window.
 
 ## User theme files
 
