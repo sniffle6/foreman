@@ -161,6 +161,19 @@ pub fn load_json_from<T: DeserializeOwned + Default>(dir: &std::path::Path, file
     }
 }
 
+/// Parse a JSON file from `dir` WITHOUT the recovery machinery of
+/// [`load_json_from`]: no backup, no rename, no protected-path bookkeeping.
+/// For readers that must leave a half-written file alone (the theme disk poll
+/// sees editors that truncate-then-write) and report the error instead.
+pub fn parse_json_from<T: DeserializeOwned>(
+    dir: &std::path::Path,
+    file: &str,
+) -> Result<T, String> {
+    let path = dir.join(file);
+    let text = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Write a JSON file atomically into `dir`: serialize, write a sibling `.tmp`,
 /// then rename it over the target. A crash mid-write leaves the previous good
 /// file intact (a bare `write` could truncate it). Errors are returned, never

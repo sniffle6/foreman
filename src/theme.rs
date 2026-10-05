@@ -354,6 +354,53 @@ mod tests {
         assert!(Theme::delete(crate::appearance::BUILTIN).is_err());
     }
 
+    /// A fresh scratch dir per test so the strict loader is exercised without
+    /// touching the real themes dir.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "foreman-theme-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn try_load_leaves_an_invalid_file_untouched() {
+        let dir = scratch_dir("invalid");
+        let path = dir.join("broken.json");
+        std::fs::write(&path, b"{ \"bg\": \"#fff\" }").unwrap();
+        let r = Theme::try_load_in(&dir, "broken");
+        assert!(r.is_err(), "3-digit hex must be rejected");
+        assert!(path.exists(), "invalid file must not be renamed or removed");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no .corrupt backup may be created by the strict loader"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_load_reads_a_valid_file_and_builtin_needs_no_file() {
+        let dir = scratch_dir("valid");
+        let mut t = Theme::foreman_warm();
+        t.bg = egui::Color32::from_rgb(1, 2, 3);
+        crate::config::save_json_in(&dir, "mine.json", &t).unwrap();
+        assert_eq!(Theme::try_load_in(&dir, "mine").unwrap().bg, t.bg);
+        assert!(Theme::try_load_in(&dir, "missing").is_err());
+        assert_eq!(
+            Theme::try_load(crate::appearance::BUILTIN).unwrap(),
+            Theme::foreman_warm()
+        );
+        assert!(Theme::file_mtime(crate::appearance::BUILTIN).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn slug_is_filesystem_safe() {
         assert_eq!(slug("Foreman Warm copy"), "foreman-warm-copy");
@@ -703,6 +750,44 @@ impl Theme {
             Some(d) => crate::config::load_json_from(&d, &format!("{}.json", slug(name))),
             None => Theme::default(),
         }
+    }
+
+    /// Where a user theme lives on disk; `None` for the built-in (code-only) or
+    /// when the themes dir is unavailable.
+    pub fn file_path(name: &str) -> Option<std::path::PathBuf> {
+        if Self::is_builtin(name) {
+            return None;
+        }
+        crate::config::themes_dir().map(|d| d.join(format!("{}.json", slug(name))))
+    }
+
+    /// Last-modified time of a user theme's file; `None` for the built-in or a
+    /// missing file. The App's disk poll compares this to decide when a hand
+    /// edit landed.
+    pub fn file_mtime(name: &str) -> Option<std::time::SystemTime> {
+        std::fs::metadata(Self::file_path(name)?)
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    /// Strict, NON-destructive load: the built-in resolves to
+    /// [`foreman_warm`](Self::foreman_warm); a user theme parses from disk and a
+    /// missing or invalid file is an `Err` with the reason. Unlike [`load`](Self::load)
+    /// this never backs up, renames, or otherwise touches the file — an editor
+    /// mid-write must be left alone, and the caller keeps the current theme.
+    pub fn try_load(name: &str) -> Result<Theme, String> {
+        if Self::is_builtin(name) {
+            return Ok(Self::foreman_warm());
+        }
+        let dir = crate::config::themes_dir().ok_or_else(|| "no themes dir".to_string())?;
+        Self::try_load_in(&dir, name)
+    }
+
+    /// Dir-parameterized core of [`try_load`](Self::try_load) (tests point it at
+    /// a scratch dir).
+    pub(crate) fn try_load_in(dir: &std::path::Path, name: &str) -> Result<Theme, String> {
+        crate::config::parse_json_from(dir, &format!("{}.json", slug(name)))
     }
 
     /// Persist this theme under `name` as `<slug>.json` in [`crate::config::themes_dir`].
