@@ -81,6 +81,23 @@ speed-bump in front of that.
   terminal never contributes a group, even if some unrelated process now owns its
   old PID. (`has_exited` is a cheap read of the exit latch the wm polls each
   frame.)
+- **Recycled parent PIDs: a child is never older than its parent.** Windows
+  reuses PIDs and never rewrites a process's recorded parent PID. When a
+  launcher dies but its child keeps running (common: `explorer.exe`, tray apps,
+  a detached `codex.exe`), and the launcher's old PID goes to a brand-new shell,
+  the orphan reads as that shell's child. An idle pane would then pop a modal
+  listing `nextcloud.exe`, which is real (seen 2026-10-06; it was the
+  `idle_terminals_produce_no_groups` flake). So `is_child_of` in `src/proc.rs`
+  accepts a parent link only when the child was created no earlier than the
+  process now holding that PID. Every hop of every walk goes through it,
+  covering top-level rows, `(+n)` rollups, and the tab-icon agent search.
+  Creation times come from `GetProcessTimes` at 100 ns resolution, not sysinfo's
+  `start_time`, which is whole seconds and can't order a same-second recycle. A
+  process the user can't open (SYSTEM, protected) reads as time 0 and is never
+  listed under a readable shell. That is deliberate, because SYSTEM orphans
+  (`csrss.exe`, `winlogon.exe`) are a large share of the traps. The cost: a real
+  child the user can't open goes unlisted. An elevated child might be one; that
+  has not been tested.
 - **WSL work is invisible.** A `SH`/WSL terminal runs its real process *inside*
   the WSL VM, which isn't a Windows process, so `top_children` can't see it — a
   long `sleep` in a WSL pane closes with no warning. Same platform blind spot the
@@ -134,7 +151,8 @@ speed-bump in front of that.
 ## Key files
 
 - `src/proc.rs` — `top_children(root_pid)` + the pure, tested `collect_top_level`
-  / `count_descendants` (the trigger policy and the `(+n)` rollup).
+  / `count_descendants` (the trigger policy and the `(+n)` rollup), and
+  `is_child_of` / `creation_time` (the recycled-PID guard).
 - `src/confirm.rs` — `ConfirmClose` modal view (`ProcGroup`, `ConfirmOutcome`,
   grouped/flat `Name │ Pid` list).
 - `src/wm.rs` — the gate (`request_close_*` + `overlay_blocks_close`), grouping

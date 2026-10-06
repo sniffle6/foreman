@@ -10920,7 +10920,18 @@ mod tests {
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         m.push_win(1, Tab::fixed("idle", Content::Terminal(s)), r);
         // An idle cmd.exe has no non-plumbing descendants → no group to warn about.
-        assert!(m.terminal_groups().is_empty());
+        // On failure, name what the scan found — the flake was undiagnosable
+        // until the message carried the rows.
+        let groups = m.terminal_groups();
+        let found: Vec<(&str, u32)> = groups
+            .iter()
+            .flat_map(|g| g.procs.iter().map(|p| (p.name.as_str(), p.pid)))
+            .collect();
+        assert!(
+            groups.is_empty(),
+            "idle cmd.exe (pid {:?}) listed children: {found:?}",
+            m.terminal_shells().first().map(|(_, pid)| *pid)
+        );
         // groups_in_tab agrees: the idle terminal contributes nothing.
         assert!(groups_in_tab(&m.windows[0].tabs[0]).is_empty());
     }

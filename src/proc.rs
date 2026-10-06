@@ -22,10 +22,16 @@ const REFRESH_EVERY: Duration = Duration::from_millis(1500);
 
 /// One process, flattened to just what detection needs. Plain data so the
 /// matching logic is unit-tested with synthetic tables (no real OS). Keep it to
-/// these four fields.
+/// these five fields.
 struct ProcRow {
     pid: u32,
+    /// The PID this process was created by. Windows never rewrites it, so after
+    /// that parent dies it can name an unrelated process that was handed the
+    /// recycled PID — check it with [`is_child_of`], never compare it bare.
     parent: u32,
+    /// Creation time in FILETIME ticks (100 ns), or 0 when the process can't be
+    /// opened (SYSTEM, protected, or elevated processes).
+    started: u64,
     /// Executable file name, e.g. `claude.exe`, `node.exe`, `powershell.exe`.
     name: String,
     /// Full command line; for an interpreter the script path carries the agent
@@ -46,23 +52,37 @@ fn agent_of_row(row: &ProcRow) -> Option<IconKind> {
     })
 }
 
-/// How many parent hops from `pid` up to `root` within `table`; `None` when
-/// `pid` does not descend from `root`. Bounded against cycles / a corrupt
-/// snapshot.
-fn depth_below(table: &[ProcRow], pid: u32, root: u32) -> Option<usize> {
-    let mut cur = pid;
+/// Is `row` really `parent`'s child, not an orphan whose dead parent's PID was
+/// recycled to `parent`? A child is never created before its parent. A row with
+/// an unreadable creation time (0) never passes under a readable parent, so a
+/// SYSTEM orphan like `csrss.exe` can't adopt a fresh shell. The cost: a real
+/// child the user can't open (possibly an elevated one) goes unlisted.
+fn is_child_of(row: &ProcRow, parent: &ProcRow) -> bool {
+    row.parent == parent.pid && row.started >= parent.started
+}
+
+/// How many parent hops from `row` up to `root` within `table`; `None` when
+/// `row` does not descend from `root`. Every hop is checked with
+/// [`is_child_of`], so a recycled PID breaks the chain. Bounded against cycles /
+/// a corrupt snapshot.
+fn depth_below(table: &[ProcRow], row: &ProcRow, root: u32) -> Option<usize> {
+    let mut cur = row;
     for depth in 0..64 {
-        if cur == root {
+        if cur.pid == root {
             return Some(depth);
         }
-        cur = table.iter().find(|r| r.pid == cur)?.parent;
+        let parent = table.iter().find(|r| r.pid == cur.parent)?;
+        if !is_child_of(cur, parent) {
+            return None;
+        }
+        cur = parent;
     }
     None
 }
 
-/// Does `pid` descend from `root` within `table`?
-fn descends_from(table: &[ProcRow], pid: u32, root: u32) -> bool {
-    depth_below(table, pid, root).is_some()
+/// Does `row` descend from `root` within `table`?
+fn descends_from(table: &[ProcRow], row: &ProcRow, root: u32) -> bool {
+    depth_below(table, row, root).is_some()
 }
 
 /// The agent running under `root_pid` in this process table, if any. Pure: the
@@ -76,7 +96,7 @@ fn detect_agent(table: &[ProcRow], root_pid: u32) -> Option<IconKind> {
         .iter()
         .filter_map(|row| {
             let kind = agent_of_row(row)?;
-            let depth = depth_below(table, row.pid, root_pid)?;
+            let depth = depth_below(table, row, root_pid)?;
             Some((depth, row.pid, kind))
         })
         .min_by_key(|(depth, pid, _)| (*depth, *pid))
@@ -107,7 +127,7 @@ fn count_descendants(table: &[ProcRow], root: u32) -> usize {
         .iter()
         .filter(|r| r.pid != root)
         .filter(|r| !is_plumbing(&r.name))
-        .filter(|r| descends_from(table, r.pid, root))
+        .filter(|r| descends_from(table, r, root))
         .count()
 }
 
@@ -115,11 +135,14 @@ fn count_descendants(table: &[ProcRow], root: u32) -> usize {
 /// actually launched (an agent, a build, a REPL, a server) — each carrying a
 /// count of its own subtree. Console-host plumbing is skipped. The test surface.
 /// An agent that spawns a fleet of MCP servers shows as one row with a big
-/// rollup, not one row per helper.
+/// rollup, not one row per helper. Empty when the shell isn't in the table.
 fn collect_top_level(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
+    let Some(shell) = table.iter().find(|r| r.pid == root) else {
+        return Vec::new();
+    };
     table
         .iter()
-        .filter(|r| r.parent == root)
+        .filter(|r| is_child_of(r, shell))
         .filter(|r| !is_plumbing(&r.name))
         .map(|r| ProcInfo {
             pid: r.pid,
@@ -184,6 +207,7 @@ impl Scanner {
             .map(|(pid, p)| ProcRow {
                 pid: pid.as_u32(),
                 parent: p.parent().map(|pp| pp.as_u32()).unwrap_or(0),
+                started: creation_time(pid.as_u32()),
                 name: p.name().to_string_lossy().into_owned(),
                 cmd: p
                     .cmd()
@@ -194,6 +218,35 @@ impl Scanner {
             .collect();
         self.memo.clear();
         self.last_refresh = Some(Instant::now());
+    }
+}
+
+/// `pid`'s creation time in FILETIME ticks, or 0 when it can't be opened.
+/// sysinfo's `start_time` is whole seconds, which can't order an orphan and a
+/// process that took its dead parent's PID within the same second — exactly the
+/// churn case. One open + query per process per refresh (~1 ms for ~430
+/// processes, measured 2026-10-06 in a debug build, against ~20 ms for the
+/// sysinfo refresh itself).
+fn creation_time(pid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return 0;
+        }
+        let [mut created, mut exited, mut kernel, mut user] = [FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }; 4];
+        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return 0;
+        }
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
     }
 }
 
@@ -224,12 +277,23 @@ pub fn agent_for(root_pid: u32) -> Option<IconKind> {
 mod tests {
     use super::*;
 
+    /// A fixture row born in pid order (`started = pid`), so a parent with a
+    /// lower pid is older — a real parent/child pair. Recycled-PID cases set
+    /// `started` explicitly with [`born`].
     fn row(pid: u32, parent: u32, name: &str, cmd: &[&str]) -> ProcRow {
         ProcRow {
             pid,
             parent,
+            started: u64::from(pid),
             name: name.to_string(),
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn born(started: u64, pid: u32, parent: u32, name: &str) -> ProcRow {
+        ProcRow {
+            started,
+            ..row(pid, parent, name, &[name])
         }
     }
 
@@ -413,6 +477,111 @@ mod tests {
         assert!(
             collect_top_level(&t, 500).is_empty(),
             "another shell's child leaked in"
+        );
+    }
+
+    // Windows recycles PIDs and never rewrites a child's parent PID, so an
+    // orphan reads as the child of whichever process later gets its dead
+    // parent's PID. Seen live 2026-10-06: an idle cmd.exe handed PID 7992 listed
+    // nextcloud.exe (whose launcher had been PID 7992) as its child — the
+    // idle_terminals_produce_no_groups flake.
+
+    #[test]
+    fn orphan_does_not_become_the_child_of_a_shell_that_took_its_dead_parents_pid() {
+        // nextcloud (born t=100) was launched by PID 7992, long dead; a new
+        // cmd.exe (born t=900, under foreman) now holds PID 7992.
+        let t = vec![
+            born(50, 40, 1, "foreman.exe"),
+            born(100, 2516, 7992, "nextcloud.exe"),
+            born(900, 7992, 40, "cmd.exe"),
+        ];
+        assert!(
+            collect_top_level(&t, 7992).is_empty(),
+            "an orphan older than the shell was listed as its child"
+        );
+    }
+
+    #[test]
+    fn orphaned_agent_does_not_badge_the_shell_that_took_its_parents_pid() {
+        // The tab-icon path: a codex.exe whose launcher died must not mark an
+        // unrelated new shell as running Codex.
+        let t = vec![
+            born(100, 3000, 4000, "codex.exe"),
+            born(900, 4000, 40, "powershell.exe"),
+        ];
+        assert_eq!(detect_agent(&t, 4000), None);
+    }
+
+    #[test]
+    fn recycled_pid_deep_in_the_tree_cuts_only_the_orphan() {
+        // shell -> node (PID 300, recycled from an old launcher). The orphan
+        // claude.exe the old launcher left behind is neither counted in node's
+        // rollup nor found as the shell's agent; node itself still lists.
+        let t = vec![
+            born(10, 100, 1, "powershell.exe"),
+            born(5, 400, 300, "claude.exe"),
+            born(20, 300, 100, "node.exe"),
+            born(30, 500, 300, "rg.exe"),
+        ];
+        let d = collect_top_level(&t, 100);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].name, "node.exe");
+        assert_eq!(d[0].background, 1, "only rg is node's real child");
+        assert_eq!(detect_agent(&t, 100), None);
+    }
+
+    #[test]
+    fn unreadable_orphan_does_not_become_the_child_of_a_readable_shell() {
+        // csrss.exe / winlogon.exe can't be opened by a normal user, so their
+        // creation time reads 0; their dead parent's recycled PID must not
+        // adopt them.
+        let t = vec![
+            born(0, 1800, 1784, "csrss.exe"),
+            born(0, 1944, 1784, "winlogon.exe"),
+            born(900, 1784, 40, "cmd.exe"),
+        ];
+        assert!(collect_top_level(&t, 1784).is_empty());
+    }
+
+    #[test]
+    fn a_child_born_in_the_same_tick_as_its_shell_still_counts() {
+        // Ties can't come from recycling (the orphan predates the new parent),
+        // so equal creation times keep the link.
+        let t = vec![
+            born(500, 100, 1, "powershell.exe"),
+            born(500, 200, 100, "claude.exe"),
+        ];
+        assert_eq!(collect_top_level(&t, 100).len(), 1);
+        assert_eq!(detect_agent(&t, 100), Some(IconKind::Claude));
+    }
+
+    #[test]
+    fn top_level_is_empty_when_the_shell_is_not_in_the_table() {
+        // Without the shell's own row its children's links can't be checked.
+        let t = vec![row(200, 100, "claude.exe", &["claude"])];
+        assert!(collect_top_level(&t, 100).is_empty());
+    }
+
+    #[test]
+    fn a_live_child_passes_the_creation_time_check() {
+        // End to end against the real OS: a process this test spawns is still
+        // listed under the test process once real creation times are compared.
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        refresh_now();
+        let listed = top_children(std::process::id())
+            .iter()
+            .any(|p| p.pid == child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            listed,
+            "a real child was dropped by the creation-time check"
         );
     }
 

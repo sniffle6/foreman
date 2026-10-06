@@ -80,6 +80,10 @@ which is a plain shell, the way browser favicons tell tabs apart.
   single-threaded) and refreshes at most every ~1.5 s, with the per-PID answer
   memoized between refreshes — so calling `icon_kind` per-tab per-frame is cheap.
   The icon can lag up to that interval after an agent starts/exits.
+- **A recycled PID can't badge a shell.** An orphaned agent (its launcher dead)
+  could otherwise read as the child of a new shell that was handed the
+  launcher's old PID. The walk checks creation times on every hop. The
+  mechanism is in `docs/close-confirm.md` (Gotchas, "Recycled parent PIDs").
 - **Trademarks.** The Claude/Codex marks are their owners' trademarks; foreman
   uses them descriptively to label what a terminal is running.
 - **The restyle is shared.** The same header code draws project tabs and terminal

@@ -1,6 +1,6 @@
 ---
 name: foreman-debugging-playbook
-description: Use when foreman misbehaves and you need the known-failure dictionary — a Session comes up black and never prompts, "rx 4 bytes", "Access is denied (os error 5)" on build, "cannot find -lgcc_eh", resize + Up-arrow prompt corruption, caret strobing in TUIs, dead unclickable UI regions, Ctrl+Scroll/Ctrl+0 zoom doing nothing, chat posts never arriving, "foreman did not respond", dispatch failures, washed-out TUI colors, the app vanishing (foreman_panic.log) — including after sleep or a display power transition (GPU device loss) — flaky PTY tests.
+description: Use when foreman misbehaves and you need the known-failure dictionary — a Session comes up black and never prompts, "rx 4 bytes", "Access is denied (os error 5)" on build, "cannot find -lgcc_eh", resize + Up-arrow prompt corruption, caret strobing in TUIs, dead unclickable UI regions, Ctrl+Scroll/Ctrl+0 zoom doing nothing, chat posts never arriving, "foreman did not respond", dispatch failures, washed-out TUI colors, the app vanishing (foreman_panic.log) — including after sleep or a display power transition (GPU device loss) — flaky PTY tests, a process-tree test or close-confirm listing processes that aren't the shell's (recycled PIDs).
 ---
 
 # Foreman Debugging Playbook
@@ -43,6 +43,7 @@ lands you on it.
 | Whole app vanishes, opaque exit code | Panic aborted across the winit callback — read `foreman_panic.log` | §11 |
 | A PTY test fails in the full suite, passes alone | Pre-Ready injection swallowed under load — re-send pattern | §12 |
 | A PTY test fails only on CI: blank grid at the deadline, child alive | Its first launch of a big binary pays cold-disk paging inside the deadline | §14 |
+| A process-tree scan lists a process the shell never launched; flakes only on a long-lived dev box, never CI | Recycled PID: an orphan's dead parent's PID went to the new shell | §15 |
 | App vanished after sleep, resume, or a display power transition | GPU device loss. Under wgpu that is an unconditional `panic!` + abort — SETTLED: foreman renders on glow | §13 |
 
 ---
@@ -397,6 +398,35 @@ every full release.yml-replica suite. Warming by a full-file read instead made
 the test take minutes under the loaders and longer than the unfixed test in
 the real suite. The probe workflows and per-run numbers are in the fixing
 commit's body (`git log -S "node.exe failed to start" -- src/terminal.rs`).
+
+## §15 Process-tree scan lists processes the shell never launched — recycled PIDs
+
+**Symptom.** `top_children` / `agent_for` (src/proc.rs) report a child for a
+shell that has none, such as an idle cmd.exe listing `nextcloud.exe`. In tests,
+`idle_terminals_produce_no_groups` failed about 1 in 11 full local runs and
+never on CI.
+
+**Immediate cause.** Windows recycles PIDs and never rewrites a process's
+recorded parent PID. Every live process whose launcher has died (`explorer.exe`,
+`csrss.exe`, tray apps, detached agents) leaves a "trap" PID. A new process
+that is handed a trap PID inherits phantom children through a bare
+`parent == pid` comparison. Fresh CI VMs have almost no orphans, so the trap
+only fires on a long-lived machine. Suite churn just makes a new shell more
+likely to land on one.
+
+**Fix / fence.** Every parent link goes through `is_child_of`: a child must be
+created no earlier than the process now holding its parent PID. Use exact
+`GetProcessTimes` ticks (`creation_time`), not sysinfo's whole-second
+`start_time`. Any new code that walks parent PIDs reuses it. No retry, sleep,
+or suite serialization touches this mechanism.
+
+**Evidence (2026-10-06).** Of 447 live processes, 19 had a dead or recycled
+parent. Spawning idle cmd.exe Sessions, the 380th landed on PID 7992, and the
+pre-fix `terminal_groups()` listed `nextcloud.exe`, the flake verbatim. On the
+live table the pre-fix rule also listed `csrss.exe` and `winlogon.exe` under a
+`crashpad_handler.exe` holding their dead parent's PID. The fixed scan lists
+neither. Pure-table tests in `src/proc.rs` pin the recycled cases (removing
+the time check turns exactly those red).
 
 ---
 
