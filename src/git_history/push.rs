@@ -316,8 +316,10 @@ mod tests {
     fn never() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
     }
-    /// A repo with one commit, and an empty bare remote (not yet added).
-    fn repo_and_remote() -> (tempfile::TempDir, tempfile::TempDir, String) {
+    /// A repo whose one commit is `first`, and an empty bare remote (not yet
+    /// added). The commit's dates are pinned, so the same `first` is always
+    /// the very same commit: repos meant to diverge need different ones.
+    fn repo_and_remote(first: &str) -> (tempfile::TempDir, tempfile::TempDir, String) {
         let remote = tempfile::tempdir().unwrap();
         git(remote.path(), &["init", "--bare", "-b", "main"]);
         let repo = tempfile::tempdir().unwrap();
@@ -327,10 +329,22 @@ mod tests {
             &["config", "user.name", "Push Test"],
             &["config", "user.email", "push@example.test"],
             &["config", "commit.gpgsign", "false"],
-            &["commit", "--allow-empty", "-m", "one"],
         ] {
             git(dir, args);
         }
+        let date = "2026-01-01T00:00:00Z";
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "--allow-empty", "-m", first])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let url = remote.path().to_string_lossy().into_owned();
         (repo, remote, url)
     }
@@ -348,7 +362,7 @@ mod tests {
 
     #[test]
     fn outgoing_lists_unpushed_commits_and_a_new_branch_target() {
-        let (repo, _remote, url) = repo_and_remote();
+        let (repo, _remote, url) = repo_and_remote("one");
         let dir = repo.path();
         let err = outgoing(dir, &never()).unwrap_err();
         assert!(err.contains("no remote named origin"), "{err}");
@@ -379,7 +393,7 @@ mod tests {
 
     #[test]
     fn an_upstream_under_another_name_is_where_both_preview_and_push_go() {
-        let (repo, remote, url) = repo_and_remote();
+        let (repo, remote, url) = repo_and_remote("one");
         let dir = repo.path();
         git(dir, &["remote", "add", "origin", &url]);
         git(dir, &["push", "-q", "-u", "origin", "main"]);
@@ -413,11 +427,13 @@ mod tests {
 
     #[test]
     fn a_rejected_push_says_so() {
-        let (one, _remote, url) = repo_and_remote();
+        let (one, _remote, url) = repo_and_remote("one");
         git(one.path(), &["remote", "add", "origin", &url]);
         let t = target(one.path(), &never()).unwrap();
         push(one.path(), &t, &never()).unwrap();
-        let (two, _other, _) = repo_and_remote();
+        // Another first commit: the same one would be the same commit, and
+        // pushing it is a no-op, not a rejection.
+        let (two, _other, _) = repo_and_remote("two");
         git(two.path(), &["remote", "add", "origin", &url]);
         let t = target(two.path(), &never()).unwrap();
         let err = push(two.path(), &t, &never()).unwrap_err();

@@ -164,6 +164,15 @@ reproduced in nearly every full run): **three consecutive green full runs** —
 1..3 | ForEach-Object { cargo test 2>&1 | Select-String 'test result' }
 ```
 
+The other cause is the wall clock: anything stamped to the second collides
+or straddles depending on when a slow runner lands. Two fixture repos making
+the same commit (identity, message, tree) in one second get one SHA, so the
+push meant to be rejected is "up to date" (`a_rejected_push_says_so`,
+`src/git_history/push.rs`); kanban's `created` ordering was the same class
+(2c78d62). Prove it by forcing the bad second (pin `GIT_AUTHOR_DATE` and
+`GIT_COMMITTER_DATE`), then make the difference explicit in the fixture,
+never a sleep.
+
 ## How to add a test
 
 1. Put it in the module's `#[cfg(test)] mod tests` block (bottom of the file).
