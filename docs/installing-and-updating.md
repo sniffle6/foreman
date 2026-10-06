@@ -15,9 +15,10 @@ version exists. Spec with the full decision history:
   irm https://raw.githubusercontent.com/sniffle6/foreman/main/install.ps1 | iex
   ```
 
-- **Release**: pushing a tag `vX.Y.Z` makes CI test, build, zip, checksum,
-  and publish a GitHub Release. That release IS the update manifest — there
-  is no update server, no manifest file.
+- **Release**: pushing a tag `vX.Y.Z` makes CI build, zip, checksum, and —
+  once `test.yml` has passed on the tagged commit — publish a GitHub
+  Release. That release IS the update manifest — there is no update server,
+  no manifest file.
 
 - **Update notify (Phase 3, current)**: a release build of foreman checks
   `releases/latest` 10 s after launch and every 6 h. If a strictly newer
@@ -66,14 +67,26 @@ remain the fallback.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. Write release notes by hand or from `git log <prev-tag>..HEAD`
    (`gh release`'s `--generate-notes` is empty for direct-to-main). CI refuses
-   if the tag and Cargo.toml disagree. Otherwise ~12 min later the release is
-   live and every running foreman ≥0.2.0 will chip within 6 h.
+   if the tag and Cargo.toml disagree, or if `test.yml` did not pass on the
+   tagged commit. Otherwise ~12 min later the release is live and every
+   running foreman ≥0.2.0 will chip within 6 h.
 
 Dry-run: PRs touching the workflow/installer upload the zip as an artifact
 instead of publishing.
 
 ## Gotchas
 
+- **The release does not run the tests; `test.yml` does.** Pushing main runs
+  `test.yml` on the commit the tag then points at, and `release.yml` waits for
+  that run (gate step "test.yml must pass on this commit", just before
+  Publish). It used to run `cargo test` again on the same commit and runner
+  image, which added no coverage and only gave a flaky test a second chance
+  to block a publish — v0.7.1 failed exactly that way (`test.yml` green,
+  release red, same commit). A failed or cancelled `test.yml` run fails the
+  gate (a newer push to main cancels a run in flight): re-run that run, then
+  re-run the release.
+  Re-running an old release run uses the workflow file from its own tag, so a
+  tag cut before this change still runs `cargo test`.
 - **Only CI writes asset names** (`foreman-vX.Y.Z-x86_64-windows.zip`).
   Consumers (install.ps1, `select_asset()`) match the `-x86_64-windows.zip`
   suffix — never rebuild the name from a version.
@@ -134,7 +147,10 @@ instead of publishing.
 ## Key files
 
 - `.github/workflows/release.yml` — tag-driven pipeline; sole writer of asset
-  names; tag==Cargo.toml check.
+  names; tag==Cargo.toml check; publishes only once `test.yml` passed on the
+  tagged commit.
+- `.github/workflows/test.yml` — the suite on every push to main and every
+  PR; the release's only test run.
 - `install.ps1` — the one-liner install: download, verify, extract, PATH.
 - `src/update.rs` — pure state machine (`step`/`parse_version`/
   `select_asset`), the full download/verify/swap worker (`spawn`), the

@@ -249,12 +249,16 @@ Select-String -Path "H:\claude code\foreman\Cargo.lock" -Pattern '^name = "(efra
 Two workflows, both on `windows-latest` with the GNU toolchain:
 
 - `.github/workflows/test.yml` runs `cargo test` on every push to `main` and
-  every PR (docs-, `*.md`- and `.foreman/`-only changes skipped). It is a
-  signal, not a lock: nothing blocks a push, and a red run does not stop you
-  tagging. Look at it before you Cut.
-- `.github/workflows/release.yml` runs `cargo test` + `cargo build --release`
-  on a `v*` tag push and publishes, refusing if the tag and the `Cargo.toml`
-  version disagree.
+  every PR (docs-, `*.md`- and `.foreman/`-only changes skipped). Nothing
+  blocks a push on it and a red run does not stop you tagging, but a tag
+  only publishes once this run passed on its commit (next bullet). Look at
+  it before you Cut.
+- `.github/workflows/release.yml` runs `cargo build --release` on a `v*` tag
+  push and publishes only once `test.yml` has passed on the tagged commit
+  (it waits for that run; failed or cancelled fails the release), refusing
+  too if the tag and the `Cargo.toml` version disagree. It does not run
+  `cargo test` itself. Why, and how to recover a gated release:
+  `docs/installing-and-updating.md`, Gotchas.
 
 **The runner is a clean machine: no global git identity, no w64devkit, none
 of your config.** A test that shells out to git and commits must put

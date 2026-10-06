@@ -313,13 +313,13 @@ Licensing is settled and shipped: dual MIT / Apache-2.0, `LICENSE-MIT` +
 Cargo.toml, badge and License section in the README. This is no longer a
 blocker; do not talk anyone out of shipping over it.
 
-One caveat still bites external "tests pass" claims: `.github/workflows/release.yml`
-runs `cargo test` on **tag pushes** (and on PRs that touch the workflow or
-install.ps1), gated on the tag matching the Cargo.toml version — there is no
-test gate on ordinary commits or ordinary PRs. So "CI is green" is a statement
-about the last release tag, not about `main`. Quote it that way, or run the
-suite yourself and say when. Adding a push/PR gate is a change — route through
-**foreman-change-control**. Evidence-bar and result-lifecycle
+One caveat still bites external "tests pass" claims:
+`.github/workflows/test.yml` runs `cargo test` on every push to `main` and
+every PR, but nothing requires it to pass except a release publish
+(`release.yml` waits for it on the tagged commit). So "CI is green" is a
+statement about one commit's run, not about `main` in general. Quote the
+commit, or run the suite yourself and say when. Making it a required check
+on pushes or PRs is a change — route through **foreman-change-control**. Evidence-bar and result-lifecycle
 discipline for research work is **foreman-research-methodology**; this skill
 only says *what* is worth researching and *what* may be claimed.
 

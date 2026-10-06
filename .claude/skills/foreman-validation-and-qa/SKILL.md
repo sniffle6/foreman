@@ -33,7 +33,7 @@ and "the code looks right" are never evidence (CLAUDE.md working agreement:
 
 Run these before calling any change done. What CI does and does not gate is
 **foreman-build-and-env**'s; the short version is that `test.yml` runs
-`cargo test` on a clean runner after a push, but blocks nothing, so these gates are
+`cargo test` on a clean runner after a push, but blocks nothing except a release's publish, so these gates are
 enforced by discipline, the repo hooks, and the `foreman-reviewer` agent
 (`.claude/agents/foreman-reviewer.md`). Do not claim "CI will catch it".
 

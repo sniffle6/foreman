@@ -2,7 +2,8 @@ name: test
 
 # Run the suite on every push to main and every PR, so a test that only
 # passes on a dev machine (e.g. one leaning on a global git identity) fails
-# here, before a release tag, not inside release.yml after it.
+# here, before a release tag. This is the release's only test run:
+# release.yml publishes a tag once this workflow has passed on its commit.
 on:
   push:
     branches: [main]
