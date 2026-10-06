@@ -25,6 +25,8 @@ const AI_MAX_OUTPUT: usize = 16 * 1024;
 pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// More checked paths than this and the AI draft reads the whole diff.
 const DRAFT_PATHS: usize = 500;
+/// The notice shows at most this many lines, then scrolls.
+const NOTICE_LINES: f32 = 5.0;
 /// The push slot's spinner text and its Cancel hint.
 const PUSHING: &str = "Pushing…";
 const CANCEL_PUSH: &str = "Stop the push; the commit stays and can be pushed again";
@@ -644,12 +646,26 @@ impl CommitPanel {
         );
         let mut commit = None;
         if let Some(notice) = &self.notice {
+            let color = if notice.error { th.danger } else { th.dim };
+            // A ScrollArea pins itself to the top of whatever space is
+            // free, which in this bottom-up ui is the top of the window; the
+            // rest of the panel would then land above it, off-screen, and
+            // the tree would get no room. So measure the text and give the
+            // area an exact rect at the bottom: at most five lines, scrolling.
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let width = ui.available_width();
+            let galley = ui.fonts_mut(|f| f.layout(notice.text.clone(), font, color, width));
+            let lines = ui.text_style_height(&egui::TextStyle::Body) * NOTICE_LINES;
+            let height = galley.size().y.min(lines);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            let mut area = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
             egui::ScrollArea::vertical()
                 .id_salt("notice")
-                .max_height(ui.text_style_height(&egui::TextStyle::Body) * 5.0)
-                .stick_to_bottom(false)
-                .show(&mut ui, |ui| {
-                    let color = if notice.error { th.danger } else { th.dim };
+                .show(&mut area, |ui| {
                     ui.add(
                         egui::Label::new(egui::RichText::new(&notice.text).color(color))
                             .wrap()
@@ -1317,6 +1333,54 @@ mod tests {
         let tree = watch_tree(&hang.chain);
         drop(panel);
         assert_all_dead(&tree);
+    }
+
+    /// One frame of the panel in a 400x600 window; the height it used.
+    fn show_once(ctx: &egui::Context, panel: &mut CommitPanel) -> f32 {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0));
+        let mut used = 0.0;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                let scope = Scope::default();
+                let base = egui::Id::new("commit-test");
+                used = panel.show(ui, rect, None, &scope, base).0;
+            },
+        );
+        used
+    }
+
+    /// A notice is a few lines at the bottom of the panel, not a scroll
+    /// area pinned to the top of the window with the panel pushed off
+    /// above it and no room left for the tree (seen after every commit).
+    #[test]
+    fn a_notice_adds_a_few_lines_to_the_panel_not_the_whole_window() {
+        let ctx = egui::Context::default();
+        let mut panel = CommitPanel::new();
+        show_once(&ctx, &mut panel);
+        let plain = show_once(&ctx, &mut panel);
+        assert!(plain > 0.0 && plain < 300.0, "{plain}");
+        let mut line = 0.0;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            line = ui.text_style_height(&egui::TextStyle::Body);
+        });
+        panel.notice = Some(Report::new(Ok("[main 1a2b3c4] subject".into())));
+        show_once(&ctx, &mut panel);
+        let short = show_once(&ctx, &mut panel);
+        assert!(
+            short > plain && short < plain + line * 2.5,
+            "one line: {plain} -> {short}"
+        );
+        panel.notice = Some(Report::new(Err("line\n".repeat(40))));
+        show_once(&ctx, &mut panel);
+        let long = show_once(&ctx, &mut panel);
+        assert!(
+            long > short && long < plain + line * (NOTICE_LINES + 1.5),
+            "capped: {plain} -> {long}"
+        );
     }
 
     #[test]
