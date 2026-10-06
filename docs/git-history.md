@@ -314,15 +314,14 @@ The top is an icon toolbar (`toolbar.rs`), then one line with the branch
 ("On main", or "Detached HEAD"), the change count, and **Merging** while a
 merge is in progress; that line truncates. Buttons, in order: **Refresh**
 (only when the watch can't follow), **Add to VCS (N)** (only when unversioned
-files are checked), **Push…**, **Directories** (group by directory, or a flat
-list sorted by file name with the folder dimmed after it), **Expand All**,
-**Collapse All**. Names and explanations are in the tooltips. The icons are
-Google's Material Symbols (`assets/icons/material/`, Apache 2.0; the README
-there says how they were fetched), rasterized and tinted by `icons.rs` at the
-device pixel size. **Push…** is the one button that also carries its name
-beside the icon, so the push notices ("push it again from Push… in the
-toolbar above the changes") point somewhere findable; the label shows while
-every button fits with it and drops to the bare icon when the window narrows.
+files are checked), **Push…**, the **eye** (hover it for the two views:
+**Group by directory**, or **Flat list** sorted by file name with the folder
+dimmed after it; the current one is highlighted), **Expand All**, **Collapse
+All**. Names and explanations are in the tooltips. The icons are Google's
+Material Symbols (`assets/icons/material/`, Apache 2.0; the README there says
+how they were fetched), rasterized and tinted by `icons.rs` at the device
+pixel size. The push notices say where to find the button ("push it again
+from Push… in the toolbar above the changes").
 
 **Narrow window:** nothing overlaps, like JetBrains. Toolbar buttons that
 don't fit fold behind a **>** button, which opens a menu with them as labeled
@@ -754,8 +753,8 @@ No native screenshot of the pill yet.
   menu seam, and `status_color`.
 - `src/git_history/toolbar.rs`: the icon toolbar with its ">" overflow menu,
   the Material Symbols it draws (`assets/icons/material/`, via
-  `icons::texture_svg`), the labeled Push… (`Tool::labeled`, `plan`), and the
-  `⋯` button the commit row reuses.
+  `icons::texture_svg`), the eye's hover popup (`Tool::choices`, `Click`),
+  and the `⋯` button the commit row reuses.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
   parser (`combined` for the one-letter status), the path-keyed checks and
   `scope` (what Commit takes), the tree's context menu (`menu`, and `write`

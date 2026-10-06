@@ -10,7 +10,7 @@
 use super::commit::{CommitPanel, Scope, Write};
 use super::file_tree::{self, ChangedFile, FileTree, MenuItem, TreeEvent};
 use super::push::{self, PushDialog};
-use super::toolbar::{self, Glyph, Tool};
+use super::toolbar::{self, Choice, Glyph, Tool};
 use super::{DiffTarget, HistoryAct, Stage, git, watch};
 use eframe::egui;
 use std::collections::HashSet;
@@ -32,7 +32,8 @@ enum Bar {
     Refresh,
     Add,
     Push,
-    Directories,
+    /// The eye: a chooser, so its click carries which view.
+    View,
     Expand,
     Collapse,
 }
@@ -850,15 +851,15 @@ impl ChangesView {
         }
     }
     /// The header: an icon toolbar (Refresh when the watch can't, Add to VCS
-    /// for checked unversioned files, Push…, Directories, Expand/Collapse All)
-    /// that folds what doesn't fit behind a ">" menu, then the branch and
-    /// change count on one truncating line.
+    /// for checked unversioned files, Push…, the eye with its view options,
+    /// Expand/Collapse All) that folds what doesn't fit behind a ">" menu,
+    /// then the branch and change count on one truncating line.
     fn toolbar(&mut self, ui: &mut egui::Ui, scale: f32) {
         let th = crate::theme::live(ui.ctx());
         let add = self.checked_unversioned();
         let busy = self.commit.busy();
         let (mut cmds, mut tools) = (Vec::new(), Vec::new());
-        let mut tool = |cmd, glyph, label: &str, hint: &str, enabled, on, labeled| {
+        let mut tool = |cmd, glyph, label: &str, hint: &str, enabled, on, choices| {
             let (label, hint) = (label.to_owned(), hint.to_owned());
             cmds.push(cmd);
             tools.push(Tool {
@@ -867,7 +868,7 @@ impl ChangesView {
                 hint,
                 enabled,
                 on,
-                labeled,
+                choices,
             });
         };
         // A live watch re-reads on every change; Refresh is only for when it
@@ -881,14 +882,14 @@ impl ChangesView {
                 hint,
                 true,
                 false,
-                false,
+                vec![],
             );
         }
         if let Some(Ok(status)) = &self.status {
             if !add.is_empty() {
                 let label = format!("Add to VCS ({})", add.len());
                 let hint = "Put the checked unversioned files under version control";
-                tool(Bar::Add, Glyph::Add, &label, hint, !busy, false, false);
+                tool(Bar::Add, Glyph::Add, &label, hint, !busy, false, vec![]);
             }
             // One push at a time; and none while a commit is landing, since
             // the dialog would list the outgoing commits without it.
@@ -896,20 +897,26 @@ impl ChangesView {
                 && !self.commit.pushing()
                 && self.push.is_none()
                 && status.branch.as_deref().is_some_and(|b| b != "(detached)");
-            // Labeled: the one button users go looking for by name (the push
-            // notices point at it).
             let hint = "Review the outgoing commits, then push";
-            tool(Bar::Push, Glyph::Push, "Push…", hint, can_push, false, true);
-            let hint = "Group files by directory, or list them flat";
             tool(
-                Bar::Directories,
-                Glyph::Directories,
-                "Directories",
+                Bar::Push,
+                Glyph::Push,
+                "Push…",
                 hint,
-                true,
-                !self.flat,
+                can_push,
                 false,
+                vec![],
             );
+            // The eye: hover for the two ways to show the files.
+            let choice = |label: &str, on| Choice {
+                label: label.to_owned(),
+                on,
+            };
+            let views = vec![
+                choice("Group by directory", !self.flat),
+                choice("Flat list", self.flat),
+            ];
+            tool(Bar::View, Glyph::View, "View", "", true, false, views);
             let hint = "Expand every section and folder";
             tool(
                 Bar::Expand,
@@ -918,7 +925,7 @@ impl ChangesView {
                 hint,
                 true,
                 false,
-                false,
+                vec![],
             );
             let hint = "Collapse every section and folder";
             tool(
@@ -928,10 +935,10 @@ impl ChangesView {
                 hint,
                 true,
                 false,
-                false,
+                vec![],
             );
         }
-        let clicked = toolbar::show(ui, &tools, scale).map(|i| cmds[i]);
+        let clicked = toolbar::show(ui, &tools, scale).map(|c| (cmds[c.tool], c.choice));
         ui.horizontal(|ui| {
             if self.request.as_ref().is_some_and(|r| !r.quiet) {
                 ui.spinner();
@@ -974,20 +981,24 @@ impl ChangesView {
         });
         let (mut refresh, mut add_now) = (false, false);
         match clicked {
-            Some(Bar::Refresh) => refresh = true,
-            Some(Bar::Add) => add_now = true,
-            Some(Bar::Push) => {
+            Some((Bar::Refresh, _)) => refresh = true,
+            Some((Bar::Add, _)) => add_now = true,
+            Some((Bar::Push, _)) => {
                 if let Some(cwd) = &self.cwd {
                     self.push = Some(PushDialog::open(ui.ctx(), cwd));
                 }
             }
-            Some(Bar::Directories) => {
-                self.flat = !self.flat;
-                if let Some(Ok(status)) = &mut self.status {
-                    status.tree.set_flat(self.flat);
+            Some((Bar::View, choice)) => {
+                // Choice 1 is the flat list; picking the current view is a no-op.
+                let flat = choice == Some(1);
+                if flat != self.flat {
+                    self.flat = flat;
+                    if let Some(Ok(status)) = &mut self.status {
+                        status.tree.set_flat(self.flat);
+                    }
                 }
             }
-            Some(bar @ (Bar::Expand | Bar::Collapse)) => {
+            Some((bar @ (Bar::Expand | Bar::Collapse), _)) => {
                 if let Some(Ok(status)) = &mut self.status {
                     status.tree.set_all_collapsed(bar == Bar::Collapse);
                 }

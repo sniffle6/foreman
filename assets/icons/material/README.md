@@ -18,7 +18,7 @@ rasterized by `src/icons.rs`.
 | `refresh.svg` | Refresh |
 | `upload.svg` | Push… |
 | `add.svg` | Add to VCS |
-| `account_tree.svg` | Directories |
+| `visibility.svg` | the eye: how the files are shown (Group by directory / Flat list) |
 | `unfold_more.svg` | Expand All |
 | `unfold_less.svg` | Collapse All |
 | `chevron_right.svg` | the ">" overflow button |

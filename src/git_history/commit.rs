@@ -776,7 +776,7 @@ impl CommitPanel {
                     hint: hint.to_owned(),
                     enabled,
                     on: false,
-                    labeled: false,
+                    choices: vec![],
                 };
                 let ai = self.ai.is_some();
                 let mut tools = vec![

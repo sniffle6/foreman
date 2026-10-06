@@ -31,9 +31,9 @@ pub mod material {
         "material-add",
         include_str!("../assets/icons/material/add.svg"),
     );
-    pub const ACCOUNT_TREE: (&str, &str) = (
-        "material-account_tree",
-        include_str!("../assets/icons/material/account_tree.svg"),
+    pub const VISIBILITY: (&str, &str) = (
+        "material-visibility",
+        include_str!("../assets/icons/material/visibility.svg"),
     );
     pub const UNFOLD_MORE: (&str, &str) = (
         "material-unfold_more",
@@ -57,7 +57,7 @@ pub mod material {
         REFRESH,
         UPLOAD,
         ADD,
-        ACCOUNT_TREE,
+        VISIBILITY,
         UNFOLD_MORE,
         UNFOLD_LESS,
         CHEVRON_RIGHT,
