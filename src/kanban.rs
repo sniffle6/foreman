@@ -5141,11 +5141,17 @@ mod tests {
         ];
         let rows = worktree_rows(store.cards(), &orphans, status, &strays);
         let names: Vec<String> = rows.iter().map(WorktreeRow::name).collect();
-        // The two In Progress cards keep the store's order (created, then
-        // id — same second here, so by id); Done follows; strays last by
-        // path; no row for the card without a worktree.
-        let mut in_progress = vec![live.clone(), orphan.clone()];
-        in_progress.sort();
+        // The two In Progress cards keep the store's order; Done follows;
+        // strays last by path; no row for the card without a worktree. The
+        // store orders by (created, id) with created to the second, and the
+        // two adds can straddle a second (a slow CI runner did), so read
+        // the expected order from the store rather than sorting by id.
+        let in_progress: Vec<String> = store
+            .cards()
+            .iter()
+            .filter(|c| c.id == live || c.id == orphan)
+            .map(|c| c.id.clone())
+            .collect();
         assert_eq!(
             names,
             vec![

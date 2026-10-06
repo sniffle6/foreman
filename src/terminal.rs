@@ -4312,12 +4312,18 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 let snapshot = s.snapshot_text(None).join("\n");
-                if snapshot.contains("NPM_PROMPT_PRESERVED") && s.exited() == Some(0) {
+                let exit = s.exited();
+                if snapshot.contains("NPM_PROMPT_PRESERVED") && exit == Some(0) {
                     break;
                 }
+                // Name the program and the exit state: a blank grid alone
+                // cannot tell a slow start from a child that exited and
+                // lost its output (seen once on CI, v0.7.1).
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "npm launch failed: {snapshot}"
+                    "npm launch failed: program {:?}, exit {exit:?}, screen:\n{}",
+                    argv[0],
+                    snapshot.trim_end()
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
