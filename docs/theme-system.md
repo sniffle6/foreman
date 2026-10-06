@@ -66,6 +66,17 @@ controls too, one frame behind — the same lag every terminal repaint already h
   colours). Each row shows the label, what it paints, and the **JSON key** in
   dim text beside the swatch; hover for key · hex · description. Click a swatch
   to pick. Edits apply live and auto-save.
+- **Contrast audit (WCAG 2).** The chip at the end of the status line reads
+  `Contrast: AA` when every audited pair clears its bar, else `Contrast: N
+  below AA`; hover it for the failing pairs with their ratios. Each swatch's
+  hover adds one line per pair that token is the *foreground* of (`on bg
+  13.8:1 AAA`, `on selection 9.2:1 AAA`); tokens that are never a foreground
+  get no extra line. Text pairs need 4.5:1 (AA; 7:1 is AAA), UI marks — the
+  caret, the focus border, the chat mention edge — need 3:1. Translucent tokens
+  are measured as painted: composited over `bg` first. It is a **report, never
+  a gate**: Apply and Save as new stay enabled whatever it says. The built-in
+  knowingly misses two pairs (`palette[8]` on `bg` 3.5:1, `dim` on
+  `title_bg_focus` 4.0:1); they are pinned by a snapshot test, not hidden.
 - Editing the built-in **Foreman Warm** transparently **forks an editable copy**
   (the built-in stays a pristine preset you can switch back to); the active chip
   flips to the new copy. **Duplicate** makes an explicit copy.
@@ -74,16 +85,20 @@ controls too, one frame behind — the same lag every terminal repaint already h
 - The preview on the right mocks a window — title bar, tab chips, focus border —
   around a sample terminal, so the Windows tokens visibly do something.
 - **Theme expert** is the chat under the preview. Describe a palette or ask for
-  a refinement; starter chips fill the box when it is empty. Enter sends,
-  Shift+Enter inserts a newline.
+  a refinement; starter chips fill the box when it is empty, with a **Fix
+  contrast** chip added while the request's base theme has failing pairs (the
+  prompt carries those pairs as context). Enter sends, Shift+Enter inserts a
+  newline.
 - **Scope chips** above the input (`All`, one per token group, `Palette`)
   limit what a request may change. The limit is enforced locally: the reply is
   merged onto the theme the request was sent from and only the in-scope keys
   are taken (`theme_expert::Scope::merge`), so an out-of-scope colour cannot
   move even if the model ignores the instruction.
 - Each answer that produced a theme renders a **proposal card** under that
-  reply. Its header says how many tokens changed and the name the expert
-  suggests. The swatch strip shows the changed tokens first, each split
+  reply. Its header says how many tokens changed, the contrast delta against
+  the request's base when it moved (`fixes 2 · breaks 1`, measured locally
+  from the scope-merged proposal, never taken from the model), and the name
+  the expert suggests. The swatch strip shows the changed tokens first, each split
   before/after with the key and both hex values on hover. Three chips:
   **Preview** toggles the hero to the proposal (the caption says so, with
   Discard); **Apply** overwrites the active user theme with it; **Save as new**
@@ -177,6 +192,14 @@ not open. Conversation and previews live only as long as the Settings window.
   the preview to see the file.
 - **Colors-first scope:** font family, line spacing, and cursor shape/blink are
   deliberately NOT here (they are separate subsystems — a later phase).
+- **The audit measures a fixed table, not every token.** `contrast::PAIRS`
+  lists the relationships; hover fills, the scrim, the snap overlay, the OS-bar
+  `chrome_*` tokens and the plain `border` are deliberately absent (transient,
+  decorative, or never carrying information alone), and `palette[0]` is a
+  background slot so it is not measured as text. Adding a token that paints
+  text on a surface means adding its pair there — nothing fails automatically.
+  Stored alpha is premultiplied, so the composite is `src + dst·(1 − a)`, not a
+  straight lerp; a straight-alpha blend would under-report every wash.
 
 ## Key files
 
@@ -185,6 +208,10 @@ not open. Conversation and previews live only as long as the Settings window.
   hex serde (`color_hex`), the `TOKENS` table (`TokenSpec`, `TokenGroup`,
   `PALETTE_NAMES`), the strict `try_load`/`file_mtime`, and
   `load`/`save`/`slug`/`is_builtin`/`user_theme_names`.
+- `src/contrast.rs` — the WCAG 2 audit: `PAIRS` (which token on which surface,
+  text or UI bar), `audit`/`Audit` (ratios, tiers, failing lines, the chip
+  summary), `Delta::between` (a proposal's fixes/breaks), and the pure
+  `ratio`/`luminance`/`over` maths.
 - `src/appearance.rs` — the Appearance pane (`AppearanceView`): the pure model
   (working/saved/dirty/revert/presets, `needs_resync`, `persist_outgoing`), the
   house-style view generated from `TOKENS`, the preview, and the theme chat.

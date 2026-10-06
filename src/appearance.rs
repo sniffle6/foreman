@@ -21,6 +21,7 @@
 
 use eframe::egui;
 
+use crate::contrast::{self, Audit, Slot};
 use crate::theme::{CHAT_COLOR_DESC, PALETTE_NAMES, TOKENS, Theme, TokenGroup, TokenSpec};
 
 /// The built-in, read-only theme's name. User themes are everything else.
@@ -47,6 +48,9 @@ const STARTERS: [&str; 3] = [
     "High-contrast dark",
     "Soft pastel light",
 ];
+/// Offered beside [`STARTERS`] only while the request's base theme has pairs
+/// below their WCAG bar (the prompt carries the failing pairs).
+const FIX_CONTRAST_STARTER: &str = "Fix contrast";
 
 /// What a `show` frame reports back to the settings shell.
 pub enum Outcome {
@@ -219,6 +223,9 @@ impl AppearanceView {
         let _ = reads_input;
         self.expert.poll();
         let t = self.working.clone();
+        // One audit per frame (~40 pairs) feeds the status chip, every token
+        // hover, and the expert's starter — never a gate on anything.
+        let audit = contrast::audit(&t);
         let previewing = self
             .expert
             .selected
@@ -227,7 +234,7 @@ impl AppearanceView {
 
         // --- top strip: preset chips, actions, status line ---
         let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), STRIP_H));
-        let mut out = self.draw_strip(ui, strip, &t);
+        let mut out = self.draw_strip(ui, strip, &t, &audit);
         ui.painter().hline(
             egui::Rangef::new(rect.left(), rect.right()),
             strip.bottom(),
@@ -263,7 +270,7 @@ impl AppearanceView {
                 egui::Rect::from_min_max(egui::pos2(list.right() + 1.0, inner.top()), inner.max);
             (list, side)
         };
-        out.changed |= self.draw_tokens(ui, tokens_rect, &t);
+        out.changed |= self.draw_tokens(ui, tokens_rect, &t, &audit);
 
         let side_inner = side.shrink2(egui::vec2(PAD * 0.7, 10.0));
         // Never taller than the column itself (a very short Settings window would
@@ -280,7 +287,7 @@ impl AppearanceView {
             egui::pos2(side_inner.left(), hero.bottom() + 8.0),
             side_inner.max,
         );
-        let (apply, save_new) = self.draw_expert(ui, chat, &t);
+        let (apply, save_new) = self.draw_expert(ui, chat, &t, &audit);
 
         // Delete-confirmation modal (opened by the Delete chip on a user theme).
         let mut delete: Option<String> = None;
@@ -378,7 +385,13 @@ impl AppearanceView {
 
     /// Band 1: preset chips (left) and action chips (right). Band 2: the status
     /// line — inline-renamable name · file · auto-saves, plus Revert when dirty.
-    fn draw_strip(&mut self, ui: &mut egui::Ui, strip: egui::Rect, t: &Theme) -> FormOut {
+    fn draw_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        strip: egui::Rect,
+        t: &Theme,
+        audit: &Audit,
+    ) -> FormOut {
         let mut out = FormOut::default();
         let builtin = self.active_is_builtin();
         let cy1 = strip.top() + 8.0 + CHIP_H / 2.0;
@@ -447,9 +460,12 @@ impl AppearanceView {
             self.confirm_delete = true;
         }
 
-        // Status line.
+        // Status line. The contrast chip and Revert sit after the file text, so
+        // the text's truncation width leaves room for both.
         let small = egui::FontId::proportional(FONT_SMALL + 0.5);
         let mut sx = strip.left() + PAD;
+        let contrast_label = audit.summary();
+        let trailing_w = chip_width(ui, &contrast_label) + 8.0 + chip_width(ui, "Revert") + 8.0;
         if builtin {
             let r = ui.painter().text(
                 egui::pos2(sx, cy2),
@@ -535,10 +551,41 @@ impl AppearanceView {
                 &file,
                 small.clone(),
                 t.dim,
-                (actions_left - sx - 80.0).max(40.0),
+                (actions_left - sx - trailing_w).max(40.0),
             );
             let r = egui::Rect::from_min_size(egui::pos2(sx, cy2 - g.size().y / 2.0), g.size());
             ui.painter().galley(r.min, g, t.dim);
+            sx = r.right() + 8.0;
+        }
+        // Contrast report chip (WCAG 2): a count, never a gate. Hover lists the
+        // failing pairs; the per-token ratios are on each swatch's hover.
+        {
+            let w = chip_width(ui, &contrast_label);
+            let r = egui::Rect::from_min_size(
+                egui::pos2(sx, cy2 - CHIP_H / 2.0 + 1.0),
+                egui::vec2(w, CHIP_H - 2.0),
+            );
+            let resp = info_chip(
+                ui,
+                r,
+                "appearance_contrast",
+                &contrast_label,
+                t,
+                audit.below() > 0,
+            );
+            resp.on_hover_ui(|ui| {
+                let lines = audit.failing_lines();
+                if lines.is_empty() {
+                    ui.label(
+                        "Every audited pair clears its WCAG 2 bar (text 4.5:1, UI marks 3:1).",
+                    );
+                } else {
+                    ui.label(format!(
+                        "Below the WCAG 2 bar (text 4.5:1, UI marks 3:1):\n{}",
+                        lines.join("\n")
+                    ));
+                }
+            });
             sx = r.right() + 8.0;
         }
         if self.is_dirty() {
@@ -717,7 +764,13 @@ impl AppearanceView {
 
     /// The grouped token list: one house-style row per [`TOKENS`] entry, plus the
     /// font-size stepper and the palette / member-colour swatch grids. Scrolls.
-    fn draw_tokens(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> bool {
+    fn draw_tokens(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        t: &Theme,
+        audit: &Audit,
+    ) -> bool {
         let mut changed = false;
         let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         pane_ui.set_clip_rect(rect);
@@ -734,13 +787,14 @@ impl AppearanceView {
                         font_size_row(ui, width, t);
                     }
                     for spec in TOKENS.iter().filter(|s| s.group == g) {
-                        changed |= token_row(ui, width, spec, &mut self.working, t);
+                        changed |= token_row(ui, width, spec, &mut self.working, t, audit);
                     }
                     if g == TokenGroup::Terminal {
-                        changed |= palette_rows(ui, width, &mut self.working.palette, t);
+                        changed |= palette_rows(ui, width, &mut self.working.palette, t, audit);
                     }
                     if g == TokenGroup::Chat {
-                        changed |= member_colour_row(ui, width, &mut self.working.chat_colors, t);
+                        changed |=
+                            member_colour_row(ui, width, &mut self.working.chat_colors, t, audit);
                     }
                 }
                 row(ui, width, 10.0, |_, _| {});
@@ -944,7 +998,13 @@ impl AppearanceView {
     /// cards, starter chips when empty, and a two-row input (Enter sends,
     /// Shift+Enter inserts a newline). Returns true when a card's Apply is hit.
     /// Returns `(apply, save_as_new)` for the proposal that was just selected.
-    fn draw_expert(&mut self, ui: &mut egui::Ui, rect: egui::Rect, t: &Theme) -> (bool, bool) {
+    fn draw_expert(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        t: &Theme,
+        audit: &Audit,
+    ) -> (bool, bool) {
         if rect.width() < 120.0 || rect.height() < 90.0 {
             return (false, false);
         }
@@ -1105,6 +1165,13 @@ impl AppearanceView {
         log_ui.set_clip_rect(log);
         let busy = self.expert.busy();
         let error = self.expert.error.as_deref();
+        // The request's base is the previewed proposal when there is one
+        // (`ThemeExpert::send`), else the working theme already audited.
+        let fix_starter = self.expert.turns.is_empty()
+            && match self.expert.preview() {
+                Some(p) => contrast::audit(p).below() > 0,
+                None => audit.below() > 0,
+            };
         let turns = &self.expert.turns;
         let proposals = &self.expert.proposals;
         let selected = self.expert.selected;
@@ -1128,7 +1195,11 @@ impl AppearanceView {
                     });
                     row(ui, width, CHIP_H + 8.0, |ui, r| {
                         let mut x = r.left();
-                        for s in STARTERS {
+                        let starters = STARTERS
+                            .iter()
+                            .copied()
+                            .chain(fix_starter.then_some(FIX_CONTRAST_STARTER));
+                        for s in starters {
                             let w = chip_width(ui, s);
                             if x + w > r.right() {
                                 break;
@@ -1207,6 +1278,11 @@ impl AppearanceView {
                                 1 => "1 change".to_string(),
                                 n => format!("{n} changes"),
                             };
+                            // The contrast delta vs the request's base, computed
+                            // locally from the scope-merged proposal.
+                            if let Some(delta) = prop.contrast.label() {
+                                head.push_str(&format!("  ·  {delta}"));
+                            }
                             if let Some(name) = &prop.name {
                                 head.push_str(&format!("  ·  \u{201c}{name}\u{201d}"));
                             }
@@ -1594,6 +1670,7 @@ fn token_row(
     spec: &TokenSpec,
     working: &mut Theme,
     t: &Theme,
+    audit: &Audit,
 ) -> bool {
     row(ui, width, ROW_H, |ui, r| {
         let cy = r.center().y;
@@ -1619,10 +1696,11 @@ fn token_row(
         let mut c = (spec.get)(working);
         let hover = move || {
             format!(
-                "{} · {}\n{}",
+                "{} · {}\n{}{}",
                 spec.key,
                 crate::theme::color_hex::to_hex(c),
-                spec.desc
+                spec.desc,
+                contrast_lines(audit, Slot::Token(spec.key))
             )
         };
         if swatch(ui, sw, spec.key, &mut c, spec.alpha, t, hover) {
@@ -1641,6 +1719,7 @@ fn palette_rows(
     width: f32,
     palette: &mut [egui::Color32; 16],
     t: &Theme,
+    audit: &Audit,
 ) -> bool {
     let mut changed = false;
     row(ui, width, 36.0, |ui, r| {
@@ -1677,9 +1756,10 @@ fn palette_rows(
                 let mut c = palette[i];
                 let hover = move || {
                     format!(
-                        "palette[{i}] · {}\n{}",
+                        "palette[{i}] · {}\n{}{}",
                         crate::theme::color_hex::to_hex(c),
-                        PALETTE_NAMES[i]
+                        PALETTE_NAMES[i],
+                        contrast_lines(audit, Slot::Palette(i))
                     )
                 };
                 if swatch(ui, s, ("palette", i), &mut c, false, t, hover) {
@@ -1699,6 +1779,7 @@ fn member_colour_row(
     width: f32,
     colours: &mut [egui::Color32; 6],
     t: &Theme,
+    audit: &Audit,
 ) -> bool {
     let mut changed = false;
     row(ui, width, 36.0, |ui, r| {
@@ -1722,8 +1803,13 @@ fn member_colour_row(
                 egui::vec2(sw, sh),
             );
             let mut c = colours[i];
-            let hover =
-                move || format!("chat_colors[{i}] · {}", crate::theme::color_hex::to_hex(c));
+            let hover = move || {
+                format!(
+                    "chat_colors[{i}] · {}{}",
+                    crate::theme::color_hex::to_hex(c),
+                    contrast_lines(audit, Slot::Chat(i))
+                )
+            };
             if swatch(ui, s, ("chat_colors", i), &mut c, false, t, hover) {
                 colours[i] = c;
                 changed = true;
@@ -1825,6 +1911,59 @@ fn checker(p: &egui::Painter, rect: egui::Rect, t: &Theme) {
             }
         }
     }
+}
+
+/// The hover lines for a token's contrast: one per pair it is the FOREGROUND
+/// of (`\non bg 13.8:1 AAA`); empty for tokens that are never a foreground.
+fn contrast_lines(audit: &Audit, slot: Slot) -> String {
+    let mut s = String::new();
+    for m in audit.with_foreground(slot) {
+        s.push_str(&format!("\non {} {}", m.pair.bg.key(), m.verdict()));
+    }
+    s
+}
+
+/// A read-only status chip: bordered like [`chip`] but hover-only (no click
+/// fill), so it reads as a report, not a button. `attention` lifts the label
+/// from the status line's dim tone to the normal text colour so a miss stands
+/// out without inventing a colour.
+fn info_chip(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    salt: impl std::hash::Hash,
+    label: &str,
+    t: &Theme,
+    attention: bool,
+) -> egui::Response {
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("appearance_info_chip", salt)),
+        egui::Sense::hover(),
+    );
+    let p = ui.painter();
+    let cr = egui::CornerRadius::same(4);
+    p.rect_filled(rect, cr, t.title_bg);
+    p.rect_stroke(
+        rect,
+        cr,
+        egui::Stroke::new(
+            1.0,
+            if resp.hovered() {
+                t.border_focus
+            } else {
+                t.border
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    p.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(FONT_CHIP),
+        if attention { t.text } else { t.dim },
+    );
+    resp
 }
 
 /// Width a chip needs for `label` (text + padding).

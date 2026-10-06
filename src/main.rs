@@ -17,6 +17,7 @@ mod chat_view;
 mod config;
 mod confirm;
 mod conpty_install;
+mod contrast;
 mod control;
 mod dirpicker;
 mod emoji_raster;

@@ -171,15 +171,20 @@ pub struct Proposal {
     pub theme: Theme,
     pub changes: Vec<Change>,
     pub name: Option<String>,
+    /// WCAG pairs this proposal fixes / breaks against its base — measured
+    /// locally from the scope-merged theme, never taken from the reply.
+    pub contrast: crate::contrast::Delta,
 }
 
 impl Proposal {
     pub fn new(base: &Theme, theme: Theme, name: Option<String>) -> Self {
         let changes = changes_between(base, &theme);
+        let contrast = crate::contrast::Delta::between(base, &theme);
         Self {
             theme,
             changes,
             name,
+            contrast,
         }
     }
 }
@@ -366,7 +371,8 @@ fn generate(
     let dialogue = serde_json::to_string(&recent.into_iter().rev().map(|t| {
         serde_json::json!({"role": if t.user { "user" } else { "assistant" }, "text": t.text})
     }).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
-    let prompt = build_prompt(&baseline, &dialogue, scope);
+    let failing = crate::contrast::audit(base).failing_lines();
+    let prompt = build_prompt(&baseline, &dialogue, scope, &failing);
     let cwd = crate::config::config_dir()
         .ok_or("No settings directory")?
         .join("theme-expert");
@@ -391,8 +397,11 @@ fn generate(
 }
 
 /// The instruction block. `scope` narrows what may change; the merge enforces
-/// it regardless, this just keeps the model from wasting its answer.
-fn build_prompt(baseline: &str, dialogue: &str, scope: Scope) -> String {
+/// it regardless, this just keeps the model from wasting its answer. `failing`
+/// is the base theme's WCAG 2 pairs below their bar
+/// (`crate::contrast::Audit::failing_lines`), appended as context so a "fix
+/// contrast" request has the numbers; omitted when clean.
+fn build_prompt(baseline: &str, dialogue: &str, scope: Scope, failing: &[String]) -> String {
     let scope_line = match scope {
         Scope::All => "You may change any color.".to_string(),
         other => format!(
@@ -400,8 +409,16 @@ fn build_prompt(baseline: &str, dialogue: &str, scope: Scope) -> String {
             other.keys().join(", ")
         ),
     };
+    let contrast = if failing.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nWCAG 2 contrast audit of the current theme, pairs below their bar (foreground on background, ratio, required):\n{}",
+            failing.join("\n")
+        )
+    };
     format!(
-        "You are Foreman's theme expert. Discuss and refine the user's theme. Return ONLY a JSON object with these keys: message (brief explanation), theme (a COMPLETE Foreman Theme object), and name (a short display name, at most {MAX_NAME_CHARS} characters, that fits the proposal). {scope_line} Change colors only. Preserve every field and every array length, using hex strings in the supplied format. No commands, file edits, markdown, or extra keys.\nCurrent theme JSON:\n{baseline}\nConversation JSON:\n{dialogue}"
+        "You are Foreman's theme expert. Discuss and refine the user's theme. Return ONLY a JSON object with these keys: message (brief explanation), theme (a COMPLETE Foreman Theme object), and name (a short display name, at most {MAX_NAME_CHARS} characters, that fits the proposal). {scope_line} Change colors only. Preserve every field and every array length, using hex strings in the supplied format. No commands, file edits, markdown, or extra keys.\nCurrent theme JSON:\n{baseline}\nConversation JSON:\n{dialogue}{contrast}"
     )
 }
 
@@ -477,9 +494,9 @@ mod tests {
 
     #[test]
     fn prompt_names_the_scope_keys() {
-        let p = build_prompt("{}", "[]", Scope::Palette);
+        let p = build_prompt("{}", "[]", Scope::Palette, &[]);
         assert!(p.contains("ONLY these keys: palette."));
-        let p = build_prompt("{}", "[]", Scope::All);
+        let p = build_prompt("{}", "[]", Scope::All, &[]);
         assert!(p.contains("any color"));
         assert!(p.contains("name ("));
     }
@@ -550,5 +567,35 @@ mod tests {
         assert_eq!(expert.preview(), Some(&next));
         expert.selected = None;
         assert_eq!(base, Theme::foreman_warm());
+    }
+
+    #[test]
+    fn a_proposal_carries_its_contrast_delta_measured_locally() {
+        let base = Theme::foreman_warm();
+        let mut next = base.clone();
+        next.palette[8] = egui::Color32::from_rgb(170, 165, 150);
+        let p = Proposal::new(&base, next, None);
+        assert_eq!((p.contrast.fixes, p.contrast.breaks), (1, 0));
+        assert_eq!(
+            p.contrast.label().as_deref(),
+            Some("fixes 1 \u{b7} breaks 0")
+        );
+        assert!(Proposal::new(&base, base.clone(), None).contrast.is_zero());
+    }
+
+    #[test]
+    fn prompt_appends_failing_pairs_only_when_there_are_some() {
+        let clean = build_prompt("{}", "[]", Scope::All, &[]);
+        assert!(!clean.contains("WCAG"));
+        assert!(clean.ends_with("Conversation JSON:\n[]"));
+        let lines = crate::contrast::audit(&Theme::foreman_warm()).failing_lines();
+        assert!(!lines.is_empty(), "the built-in has known misses");
+        let p = build_prompt("{}", "[]", Scope::Palette, &lines);
+        assert!(p.contains("WCAG 2 contrast audit"));
+        for l in &lines {
+            assert!(p.contains(l.as_str()), "{l}");
+        }
+        // The audit block is context after the dialogue, never ahead of the rules.
+        assert!(p.find("Conversation JSON").unwrap() < p.find("WCAG").unwrap());
     }
 }
