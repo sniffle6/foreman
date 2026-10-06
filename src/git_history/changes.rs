@@ -881,7 +881,10 @@ impl ChangesView {
                 let hint = "Put the checked unversioned files under version control";
                 tool(Bar::Add, Glyph::Add, &label, hint, !busy, false);
             }
+            // One push at a time; and none while a commit is landing, since
+            // the dialog would list the outgoing commits without it.
             let can_push = !busy
+                && !self.commit.pushing()
                 && self.push.is_none()
                 && status.branch.as_deref().is_some_and(|b| b != "(detached)");
             let hint = "Review the outgoing commits, then push";

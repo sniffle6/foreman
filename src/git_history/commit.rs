@@ -2,7 +2,8 @@
 //! Delete, Add to .gitignore, commit, push) and the commit panel pinned under
 //! the tree (message box, Amend, Commit, Commit and Push…, and a one-click AI
 //! draft of the message). Every write runs on a worker through `git::write`;
-//! one at a time, so two never race for `index.lock`.
+//! one at a time, so two never race for `index.lock`. A push takes no lock
+//! and runs in its own slot beside them, cancellable.
 use super::git::{self, GitError};
 use super::push::{self, Target};
 use super::toolbar::{self, Glyph, Tool};
@@ -24,6 +25,9 @@ const AI_MAX_OUTPUT: usize = 16 * 1024;
 pub(super) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// More checked paths than this and the AI draft reads the whole diff.
 const DRAFT_PATHS: usize = 500;
+/// The push slot's spinner text and its Cancel hint.
+const PUSHING: &str = "Pushing…";
+const CANCEL_PUSH: &str = "Stop the push; the commit stays and can be pushed again";
 
 const AI_RULES: &str = "You write Git commit messages. Reply with ONLY the commit \
 message as plain text: a subject line of at most 72 characters, then optionally a \
@@ -73,9 +77,19 @@ impl Write {
             Self::Commit { .. } | Self::Push(_) => false,
         }
     }
+    /// The spinner text while this holds the write slot, for the writes
+    /// slow enough to show one. (The push slot has its own, `PUSHING`.)
+    fn doing(&self) -> Option<&'static str> {
+        match self {
+            Self::Commit { push: true, .. } => Some("Committing, then push…"),
+            Self::Commit { .. } => Some("Committing…"),
+            _ => None,
+        }
+    }
 }
 
-/// A finished write, for the notice area.
+/// A finished write, for the notice area (which shows `text`, in red when
+/// `error`, and ignores the rest).
 #[derive(Debug, PartialEq)]
 pub(super) struct Report {
     pub(super) text: String,
@@ -106,14 +120,15 @@ fn over_paths(cwd: &Path, args: &[&str], paths: &[String]) -> Result<String, Git
     let mut all = vec!["--literal-pathspecs"];
     all.extend(args);
     if paths.is_empty() {
-        return git::write(cwd, &all, None, None);
+        return git::write(cwd, &all, None, None, None);
     }
     all.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-    git::write(cwd, &all, Some(&paths.join("\0")), None)
+    git::write(cwd, &all, Some(&paths.join("\0")), None, None)
 }
 
-/// Worker-only: run one write.
-pub(super) fn run(cwd: &Path, write: &Write) -> Report {
+/// Worker-only: run one write. `cancel` only reaches a push; every other
+/// write runs to completion (see `git::write`).
+pub(super) fn run(cwd: &Path, write: &Write, cancel: &Arc<AtomicBool>) -> Report {
     let quiet = |r: Result<String, GitError>, what| {
         Report::new(r.map(|_| String::new()).map_err(|e| failure(what, e)))
     };
@@ -177,7 +192,7 @@ pub(super) fn run(cwd: &Path, write: &Write) -> Report {
                 ..Report::new(Ok(summary))
             }
         }
-        Write::Push(target) => Report::new(push::push(cwd, target)),
+        Write::Push(target) => Report::new(push::push(cwd, target, cancel)),
     }
 }
 
@@ -421,8 +436,8 @@ fn last_message(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
 }
 
-/// A worker's single reply; dropping it cancels (reads) or just stops
-/// listening (writes, which always run to completion).
+/// A worker's single reply; dropping it cancels (reads and the push) or
+/// just stops listening (the other writes, which always run to completion).
 pub(super) struct Job<T> {
     receiver: mpsc::Receiver<T>,
     cancel: Arc<AtomicBool>,
@@ -460,9 +475,10 @@ impl<T> Drop for Job<T> {
     }
 }
 
-struct Notice {
-    text: String,
-    error: bool,
+/// A write in flight and the spinner text it shows, fixed when it started.
+struct Running {
+    job: Job<Report>,
+    doing: Option<&'static str>,
 }
 
 /// What the next commit takes, as the Changes window sees it.
@@ -492,25 +508,22 @@ pub(super) struct Outcome {
     pub(super) push: bool,
 }
 
+/// Dropping the panel (closing the Changes window) drops its jobs: a
+/// commit or `add` runs on to completion unheard, while the push's job
+/// flag kills the push and its process tree. Safe: a killed push leaves
+/// nothing locked locally, and the remote's ref update is atomic.
 pub(super) struct CommitPanel {
     pub(super) message: String,
     pub(super) amend: bool,
-    write: Option<Job<Report>>,
-    /// While a commit runs: whether it's Commit and Push….
-    committing: Option<bool>,
+    /// The one write holding the index, if any.
+    write: Option<Running>,
+    /// The one push in flight, if any: takes no lock, so it runs beside a
+    /// write. Dropping it cancels (kills) the push.
+    push: Option<Job<Report>>,
     ai: Option<Job<Result<String, String>>>,
     /// Amend was ticked over a blank message: the last one, loading.
     last: Option<Job<Result<String, String>>>,
-    notice: Option<Notice>,
-}
-impl Drop for CommitPanel {
-    fn drop(&mut self) {
-        // A running write finishes on its own; don't wait for it here.
-        let write = self.write.take();
-        if write.is_some() {
-            std::thread::spawn(move || drop(write));
-        }
-    }
+    notice: Option<Report>,
 }
 impl CommitPanel {
     pub(super) fn new() -> Self {
@@ -518,27 +531,48 @@ impl CommitPanel {
             message: String::new(),
             amend: false,
             write: None,
-            committing: None,
+            push: None,
             ai: None,
             last: None,
             notice: None,
         }
     }
+    /// A write holds the index: no other write, and no commit, until it lands.
     pub(super) fn busy(&self) -> bool {
         self.write.is_some()
     }
-    /// Start a write unless one is running. Returns whether it started.
+    /// A push is in flight: no second push until it lands or is cancelled.
+    pub(super) fn pushing(&self) -> bool {
+        self.push.is_some()
+    }
+    /// Start a write unless its slot is taken. Returns whether it started.
     pub(super) fn start(&mut self, ctx: &egui::Context, cwd: &Path, write: Write) -> bool {
-        if self.busy() || write.is_empty() {
+        let is_push = matches!(write, Write::Push(_));
+        let taken = if is_push { self.pushing() } else { self.busy() };
+        if taken || write.is_empty() {
             return false;
         }
         let cwd = cwd.to_path_buf();
         self.notice = None;
-        if let Write::Commit { push, .. } = write {
-            self.committing = Some(push);
+        let doing = write.doing();
+        let job = Job::start(ctx, move |cancel| run(&cwd, &write, cancel));
+        if is_push {
+            self.push = Some(job);
+        } else {
+            self.write = Some(Running { job, doing });
         }
-        self.write = Some(Job::start(ctx, move |_| run(&cwd, &write)));
         true
+    }
+    /// Kill a running push. Its reply never arrives (the job is gone), so
+    /// the notice is written here. Returns whether there was one to kill;
+    /// then the status wants a re-read, since the remote may have taken
+    /// the push before the kill landed.
+    fn cancel_push(&mut self) -> bool {
+        let was = self.push.take().is_some();
+        if was {
+            self.notice = Some(Report::new(Ok(format!("Push cancelled. {}", push::RETRY))));
+        }
+        was
     }
     fn start_draft(&mut self, ctx: &egui::Context, cwd: PathBuf, paths: Option<Vec<String>>) {
         let settings = crate::config::live(ctx);
@@ -550,26 +584,30 @@ impl CommitPanel {
     }
     fn poll(&mut self) -> Outcome {
         let mut outcome = Outcome::default();
-        if let Some(reply) = self.write.as_ref().and_then(Job::poll) {
+        let stopped = || Report::new(Err("Git worker stopped".into()));
+        if let Some(reply) = self.write.as_ref().and_then(|w| w.job.poll()) {
             self.write = None;
-            self.committing = None;
             outcome.wrote = true;
-            let report = reply.unwrap_or(Report::new(Err("Git worker stopped".into())));
+            let report = reply.unwrap_or_else(stopped);
             if report.committed {
                 self.message.clear();
                 self.amend = false;
             }
             outcome.push = report.push;
-            self.notice = (!report.text.is_empty()).then_some(Notice {
-                text: report.text,
-                error: report.error,
-            });
+            self.notice = (!report.text.is_empty()).then_some(report);
+        }
+        // A push moves refs/remotes: re-read, whether or not the watch
+        // also noticed.
+        if let Some(reply) = self.push.as_ref().and_then(Job::poll) {
+            self.push = None;
+            outcome.wrote = true;
+            self.notice = Some(reply.unwrap_or_else(stopped));
         }
         if let Some(reply) = self.ai.as_ref().and_then(Job::poll) {
             self.ai = None;
             match reply.unwrap_or_else(|| Err("AI worker stopped".into())) {
                 Ok(message) => self.message = message,
-                Err(text) => self.notice = Some(Notice { text, error: true }),
+                Err(text) => self.notice = Some(Report::new(Err(text))),
             }
         }
         if let Some(reply) = self.last.as_ref().and_then(Job::poll) {
@@ -580,7 +618,7 @@ impl CommitPanel {
                     self.message = message
                 }
                 Ok(_) => {}
-                Err(text) => self.notice = Some(Notice { text, error: true }),
+                Err(text) => self.notice = Some(Report::new(Err(text))),
             }
         }
         outcome
@@ -596,7 +634,7 @@ impl CommitPanel {
         scope: &Scope,
         base: egui::Id,
     ) -> (f32, Outcome) {
-        let outcome = self.poll();
+        let mut outcome = self.poll();
         let th = crate::theme::live(ui.ctx());
         let mut ui = ui.new_child(
             egui::UiBuilder::new()
@@ -622,6 +660,8 @@ impl CommitPanel {
         let amend = self.amend && !scope.unborn && !scope.merging;
         let blank = self.message.trim().is_empty();
         let writing = self.write.is_some();
+        let doing = self.write.as_ref().and_then(|w| w.doing);
+        let pushing = self.push.is_some();
         // Amend with nothing picked rewrites just the message.
         let something = scope.files > 0 || amend;
         let ready = cwd.is_some()
@@ -668,13 +708,11 @@ impl CommitPanel {
             let button = |t: &str| text(t) + pad + gap;
             let spinner = ui.spacing().interact_size.y + gap;
             let mut need = button(commit_label) + button(push_label);
-            if let Some(push) = self.committing {
-                let doing = if push {
-                    "Committing, then push…"
-                } else {
-                    "Committing…"
-                };
+            if let Some(doing) = doing {
                 need += spinner + text(doing) + gap;
+            }
+            if pushing {
+                need += spinner + text(PUSHING) + gap + button("Cancel");
             }
             need += if self.ai.is_some() {
                 button("Cancel") + spinner + text("Writing message…")
@@ -711,7 +749,7 @@ impl CommitPanel {
                 commit = Some(false);
             }
             if compact {
-                if self.committing.is_some() || self.ai.is_some() {
+                if doing.is_some() || pushing || self.ai.is_some() {
                     ui.spinner();
                 }
                 let side = ui.spacing().interact_size.y;
@@ -724,7 +762,7 @@ impl CommitPanel {
                     on: false,
                 };
                 let ai = self.ai.is_some();
-                let tools = [
+                let mut tools = vec![
                     tool(push_label, if ready { &ok_push } else { why }, ready),
                     if ai {
                         tool("Cancel", "Stop writing the message", true)
@@ -732,15 +770,19 @@ impl CommitPanel {
                         tool("AI message", &draft_hint, can_draft)
                     },
                 ];
+                if pushing {
+                    tools.push(tool("Cancel push", CANCEL_PUSH, true));
+                }
                 match toolbar::overflow(&more, &tools) {
                     Some(0) => commit = Some(true),
-                    Some(_) if ai => self.ai = None,
-                    Some(_) => {
+                    Some(1) if ai => self.ai = None,
+                    Some(1) => {
                         if let Some(cwd) = cwd {
                             let paths = scope.checked.then(|| scope.paths.clone());
                             self.start_draft(ui.ctx(), cwd.to_path_buf(), paths);
                         }
                     }
+                    Some(_) => outcome.wrote |= self.cancel_push(),
                     None => {}
                 }
                 return;
@@ -753,14 +795,16 @@ impl CommitPanel {
             {
                 commit = Some(true);
             }
-            if let Some(push) = self.committing {
+            if let Some(doing) = doing {
                 ui.spinner();
-                let doing = if push {
-                    "Committing, then push…"
-                } else {
-                    "Committing…"
-                };
                 ui.label(egui::RichText::new(doing).color(th.dim));
+            }
+            if pushing {
+                ui.spinner();
+                ui.label(egui::RichText::new(PUSHING).color(th.dim));
+                if ui.button("Cancel").on_hover_text(CANCEL_PUSH).clicked() {
+                    outcome.wrote |= self.cancel_push();
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.ai.is_some() {
@@ -840,6 +884,8 @@ impl CommitPanel {
 mod tests {
     use super::*;
     use crate::git_history::tests::git;
+    use crate::job::DeathWatch;
+    use std::time::Instant;
 
     #[test]
     fn ai_output_must_be_plain_non_empty_text() {
@@ -854,6 +900,13 @@ mod tests {
 
     fn ok(report: Report) {
         assert!(!report.error, "{report:?}");
+    }
+    fn never() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+    /// `super::run` with a flag nobody sets.
+    fn run(cwd: &Path, write: &Write) -> Report {
+        super::run(cwd, write, &never())
     }
 
     fn repo() -> tempfile::TempDir {
@@ -1090,6 +1143,180 @@ mod tests {
             git(two.path(), &["log", "-1", "--format=%s"]),
             "add two.txt"
         );
+    }
+
+    /// A repository whose push hangs for good: `core.sshCommand` is a
+    /// PowerShell sleeper, and the remote's ssh-style URL makes `git push`
+    /// run it. Before sleeping it records its process chain up to the
+    /// outermost `git.exe` (leaf first, `pid=name` each) in `chain`, so a
+    /// test can watch every process the push spawned.
+    struct HangingPush {
+        repo: tempfile::TempDir,
+        chain: PathBuf,
+    }
+    fn hanging_push() -> HangingPush {
+        let repo = repo();
+        let dir = repo.path();
+        git(dir, &["commit", "--allow-empty", "-m", "one"]);
+        git(dir, &["remote", "add", "origin", "nowhere:repo"]);
+        let script = dir.join("sleeper.ps1");
+        let chain = dir.join("chain.txt");
+        // Git for Windows' `git.exe` on PATH is a wrapper that runs the real
+        // one as a child: walk past a git.exe whose parent is one too.
+        let body = format!(
+            "$all = @{{}}\n\
+             Get-CimInstance Win32_Process | ForEach-Object {{ $all[[int]$_.ProcessId] = $_ }}\n\
+             $p = [int]$PID; $chain = @()\n\
+             for ($i = 0; $i -lt 8 -and $all.ContainsKey($p); $i++) {{\n\
+               $proc = $all[$p]; $chain += \"$p=$($proc.Name)\"\n\
+               $parent = $all[[int]$proc.ParentProcessId]\n\
+               if ($proc.Name -eq 'git.exe' -and $parent.Name -ne 'git.exe') {{ break }}\n\
+               $p = [int]$proc.ParentProcessId\n\
+             }}\n\
+             Set-Content -LiteralPath '{}' -Value ($chain -join ',')\n\
+             Start-Sleep 600\n",
+            chain.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        // Through `sh -c` (the spaces see to that): forward slashes and quotes.
+        let ssh = format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            script.display().to_string().replace('\\', "/")
+        );
+        git(dir, &["config", "core.sshCommand", &ssh]);
+        HangingPush { repo, chain }
+    }
+    /// The sleeper's tree once it has reported it, with a watch on each
+    /// process opened while it is alive (so pid reuse can't fool the test).
+    fn watch_tree(chain: &Path) -> Vec<(String, DeathWatch)> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let tree = loop {
+            let parsed: Option<Vec<(u32, String)>> =
+                std::fs::read_to_string(chain).ok().and_then(|text| {
+                    text.trim()
+                        .split(',')
+                        .map(|e| {
+                            let (pid, name) = e.split_once('=')?;
+                            Some((pid.parse().ok()?, name.to_owned()))
+                        })
+                        .collect()
+                });
+            if let Some(tree) = parsed
+                && tree.last().is_some_and(|(_, name)| name == "git.exe")
+            {
+                break tree;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the sleeper never reported its tree"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(tree.len() >= 2, "{tree:?}");
+        tree.into_iter()
+            .map(|(pid, name)| {
+                let watch = DeathWatch::open(pid).unwrap_or_else(|| panic!("cannot watch {name}"));
+                (format!("{name} ({pid})"), watch)
+            })
+            .collect()
+    }
+    fn assert_all_dead(tree: &[(String, DeathWatch)]) {
+        for (who, watch) in tree {
+            assert!(watch.dead_within_ms(5000), "{who} survived");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_push_takes_its_whole_process_tree_with_it() {
+        let hang = hanging_push();
+        let dir = hang.repo.path().to_path_buf();
+        let target = push::target(&dir, &never()).unwrap();
+        let cancel = never();
+        let flag = cancel.clone();
+        let worker = std::thread::spawn(move || super::run(&dir, &Write::Push(target), &flag));
+        let tree = watch_tree(&hang.chain);
+        assert!(
+            !tree[0].1.dead_within_ms(200),
+            "the sleeper died on its own"
+        );
+        assert!(
+            !worker.is_finished(),
+            "the push returned without being cancelled"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        let report = worker.join().unwrap();
+        assert!(
+            report.error && report.text.starts_with("Push cancelled"),
+            "{report:?}"
+        );
+        assert!(report.text.contains("already landed"), "{report:?}");
+        assert_all_dead(&tree);
+    }
+
+    #[test]
+    fn a_timed_out_push_takes_its_whole_process_tree_with_it() {
+        let hang = hanging_push();
+        let dir = hang.repo.path().to_path_buf();
+        // Long enough for the sleeper to report its tree first.
+        let timeout = Duration::from_secs(8);
+        let worker = std::thread::spawn(move || {
+            git::write(
+                &dir,
+                &["push", "origin", "refs/heads/main:refs/heads/main"],
+                None,
+                None,
+                Some(timeout),
+            )
+        });
+        let tree = watch_tree(&hang.chain);
+        assert!(
+            !worker.is_finished(),
+            "the push returned before its timeout"
+        );
+        assert_eq!(worker.join().unwrap(), Err(GitError::TimedOut));
+        assert_all_dead(&tree);
+    }
+
+    #[test]
+    fn the_panel_commits_beside_a_running_push_and_refuses_a_second_push() {
+        let hang = hanging_push();
+        let dir = hang.repo.path();
+        let ctx = egui::Context::default();
+        let target = push::target(dir, &never()).unwrap();
+        let mut panel = CommitPanel::new();
+        assert!(panel.start(&ctx, dir, Write::Push(target.clone())));
+        assert!(panel.pushing() && !panel.busy());
+        assert!(
+            !panel.start(&ctx, dir, Write::Push(target)),
+            "one push at a time"
+        );
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        git(dir, &["add", "-N", "a.txt"]);
+        let commit = Write::Commit {
+            message: "feat: a".into(),
+            paths: strings(&["a.txt"]),
+            amend: false,
+            push: false,
+            merge: false,
+        };
+        assert!(
+            panel.start(&ctx, dir, commit),
+            "a commit runs beside the push"
+        );
+        assert!(panel.busy() && panel.pushing());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut outcome = Outcome::default();
+        while panel.busy() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            outcome = panel.poll();
+        }
+        assert!(!panel.busy() && outcome.wrote, "the commit did not land");
+        assert_eq!(git(dir, &["log", "-1", "--format=%s"]), "feat: a");
+        assert!(panel.pushing(), "the push is still in flight");
+        // Closing the Changes window drops the panel: the push dies with it.
+        let tree = watch_tree(&hang.chain);
+        drop(panel);
+        assert_all_dead(&tree);
     }
 
     #[test]

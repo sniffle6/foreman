@@ -110,17 +110,30 @@ pub(super) fn target(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Target, Str
     })
 }
 
-/// Worker-only: push `target`, exactly as the dialog showed it.
-pub(super) fn push(cwd: &Path, target: &Target) -> Result<String, String> {
+/// The notice for a push that was cancelled or timed out: the commit it
+/// followed is in, only the push is missing.
+pub(super) const RETRY: &str = "The commit already landed; push it again from Push…";
+
+/// Worker-only: push `target`, exactly as the dialog showed it. `cancel`
+/// kills the push and its whole process tree; so does `PUSH_TIMEOUT`.
+pub(super) fn push(
+    cwd: &Path,
+    target: &Target,
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
     let args = target.push_args();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match git::write(cwd, &args, None, Some(PUSH_TIMEOUT)) {
+    match git::write(cwd, &args, None, Some(cancel), Some(PUSH_TIMEOUT)) {
         Ok(_) => Ok(format!("Pushed {} → {}", target.branch, target.label())),
         Err(GitError::Failed(text)) if rejected(&text) => Err(format!(
             "Push REJECTED: the remote has commits this branch does not. \
              Pull (or rebase), then push again.\n{text}"
         )),
-        Err(GitError::TimedOut) => Err("The push timed out after 5 minutes".into()),
+        Err(GitError::TimedOut) => Err(format!(
+            "The push timed out after {} minutes. {RETRY}",
+            PUSH_TIMEOUT.as_secs() / 60
+        )),
+        Err(GitError::Cancelled) => Err(format!("Push cancelled. {RETRY}")),
         Err(e) => Err(failure("Push failed", e)),
     }
 }
@@ -348,7 +361,7 @@ mod tests {
         assert_eq!(first.commits.len(), 1);
         assert_eq!(first.commits[0].1, "one");
         // The dialog's own target is what gets pushed: it publishes and tracks.
-        assert_eq!(push(dir, t).unwrap(), "Pushed main → origin/main");
+        assert_eq!(push(dir, t, &never()).unwrap(), "Pushed main → origin/main");
         assert_eq!(
             git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]),
             "origin/main"
@@ -380,7 +393,7 @@ mod tests {
         assert_eq!(preview.target.label(), "origin/main");
         assert_eq!(preview.commits.len(), 1);
         assert_eq!(
-            push(dir, &preview.target).unwrap(),
+            push(dir, &preview.target, &never()).unwrap(),
             "Pushed topic → origin/main"
         );
         let bare = remote.path();
@@ -389,7 +402,7 @@ mod tests {
         // A later checkout doesn't redirect a target already shown.
         git(dir, &["checkout", "-q", "-b", "other"]);
         git(dir, &["commit", "--allow-empty", "-m", "on other"]);
-        push(dir, &preview.target).unwrap();
+        push(dir, &preview.target, &never()).unwrap();
         assert_eq!(git(bare, &["log", "-1", "--format=%s", "main"]), "on topic");
         // Tracking a local branch has no remote to push to.
         git(dir, &["branch", "-q", "-u", "main"]);
@@ -402,11 +415,11 @@ mod tests {
         let (one, _remote, url) = repo_and_remote();
         git(one.path(), &["remote", "add", "origin", &url]);
         let t = target(one.path(), &never()).unwrap();
-        push(one.path(), &t).unwrap();
+        push(one.path(), &t, &never()).unwrap();
         let (two, _other, _) = repo_and_remote();
         git(two.path(), &["remote", "add", "origin", &url]);
         let t = target(two.path(), &never()).unwrap();
-        let err = push(two.path(), &t).unwrap_err();
+        let err = push(two.path(), &t, &never()).unwrap_err();
         assert!(err.starts_with("Push REJECTED"), "{err}");
     }
 }

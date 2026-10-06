@@ -1,6 +1,8 @@
 //! Git subprocesses. Reads (`spawn`, `output`): capped pipe drains and a
 //! watchdog that kills and reaps the child on cancel or timeout. Writes
-//! (`write`): the Changes window's stage, commit and push, run to completion.
+//! (`write`): the Changes window's stage, commit and push; a commit runs to
+//! completion, a push can be cancelled or timed out, taking its whole
+//! process tree (a credential helper's window included) with it.
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{ChildStdout, Command, ExitStatus, Stdio};
@@ -30,7 +32,7 @@ impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(e) => write!(f, "Cannot start Git: {e}"),
-            Self::Cancelled => f.write_str("Git read cancelled"),
+            Self::Cancelled => f.write_str("Git cancelled"),
             Self::TimedOut => f.write_str("Git timed out"),
             Self::TooLarge => f.write_str("Git output is too large to display"),
             Self::Failed(e) | Self::Io(e) => f.write_str(e),
@@ -160,18 +162,28 @@ pub(super) fn output(
     Ok(bytes)
 }
 
-/// Worker-only write: run `git <args>` to completion, feeding `stdin` if any.
-/// Returns stdout then stderr, trimmed; a non-zero exit is `Failed` with the
-/// same text, since hooks and "nothing to commit" print to stdout.
+/// Worker-only write: run `git <args>`, feeding `stdin` if any. Returns
+/// stdout then stderr, trimmed; a non-zero exit is `Failed` with the same
+/// text, since hooks and "nothing to commit" print to stdout.
 ///
-/// No cancel, and a timeout only where killing is harmless (a push): a commit
-/// or `add` killed mid-write leaves `index.lock` behind and wedges the repo.
+/// With a `cancel` flag or a `timeout` the child goes into a kill-on-close
+/// job object right after spawn, and cancel or timeout drops it: that kills
+/// `git.exe` and everything it spawned (an `ssh`, a credential helper and
+/// its sign-in window) in one stroke, where `Child::kill` alone would leave
+/// the grandchildren running. Only a push passes either, since killing a
+/// push leaves nothing locked locally. A commit or `add` passes neither and
+/// simply waits: killed mid-write it would leave `index.lock` behind and
+/// wedge the repository.
 pub(super) fn write(
     cwd: &Path,
     args: &[&str],
     stdin: Option<&str>,
+    cancel: Option<&Arc<AtomicBool>>,
     timeout: Option<Duration>,
 ) -> Result<String, GitError> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(GitError::Cancelled);
+    }
     let mut cmd = command(cwd, args);
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
@@ -179,6 +191,12 @@ pub(super) fn write(
         Stdio::null()
     });
     let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
+    let killable = cancel.is_some() || timeout.is_some();
+    // Best-effort (`None` when Windows refuses): then only git.exe itself
+    // dies on kill, the pre-job behavior.
+    let job = killable
+        .then(|| crate::job::Job::assign(child.id()))
+        .flatten();
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         let text = text.to_owned();
         // Its own thread: a large message must not deadlock against the
@@ -197,18 +215,33 @@ pub(super) fn write(
             .map(|(b, _)| b)
             .unwrap_or_default()
     });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if timeout.is_some_and(|t| start.elapsed() > t) => {
+    let status = if killable {
+        let start = Instant::now();
+        let verdict = loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break Err(GitError::Cancelled);
+            }
+            if timeout.is_some_and(|t| start.elapsed() > t) {
+                break Err(GitError::TimedOut);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => break Err(GitError::Io(e.to_string())),
+            }
+        };
+        match verdict {
+            Ok(status) => status,
+            Err(e) => {
+                // Kill-on-close takes the tree; `kill` covers a missing job.
+                drop(job);
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(GitError::TimedOut);
+                return Err(e);
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(GitError::Io(e.to_string())),
         }
+    } else {
+        child.wait().map_err(|e| GitError::Io(e.to_string()))?
     };
     let mut text = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
     let stderr = stderr.join().unwrap_or_default();

@@ -479,22 +479,43 @@ neither can a checkout between opening the dialog and clicking Push. A
 rejected push (the remote moved) says REJECTED with Git's output; the commit
 already stands either way.
 
+**The push has its own slot.** A push takes no lock, so it does not sit in
+the panel's single write slot: while it runs, Commit, Add to VCS and the
+other writes stay enabled, only **Push…** and the dialog are off (one push
+at a time). The commit row shows a spinner, "Pushing…", and a **Cancel**
+button (behind the ⋯ menu as "Cancel push" when the row is narrow). Cancel,
+the 5-minute timeout, and closing the Changes window all kill the push the
+same way: `git::write` put `git.exe` in a kill-on-close job object
+(`src/job.rs`, the same one a Session's shell gets) right after spawning
+it, and dropping the job kills `git.exe` and everything it spawned: `ssh`,
+and Git Credential Manager with its sign-in window, which `GIT_TERMINAL_PROMPT=0`
+does not stop and which killing `git.exe` alone would leave open. Killing a
+push is safe: nothing is locked locally and the remote's ref update is
+atomic, so either the remote took it or nothing changed. The notice says so
+("the commit already landed; push it again from Push…") and the status
+re-reads, since the tracking ref may have moved. This differs from commits,
+which the window never kills (next section).
+
 Gotchas:
 - **Writes go through `git::write`, never `git::output`.** The read helper
   sets `GIT_OPTIONAL_LOCKS=0` so our reads never wake the watch; writes
   take real locks and are supposed to wake it.
 - **Commits and `add` are never killed.** A commit killed mid-write leaves
   `index.lock` behind and every later Git command fails until someone deletes
-  it. So no timeout and no cancel; closing the window leaves the write
-  running to completion. Only a push has a timeout (5 min), because killing
-  a push leaves nothing locked locally.
+  it. So `git::write` gets no cancel flag and no timeout for them (and puts
+  them in no job object: it just waits); closing the window leaves the write
+  running to completion. Only a push passes both, because killing a push
+  leaves nothing locked locally; closing the window kills a running push.
 - **One write at a time.** While one runs, the menu's writes and the commit
-  and push buttons disable, so two writes never race for `index.lock`.
+  buttons disable, so two writes never race for `index.lock`. The push runs
+  in its own slot beside them; `CommitPanel::busy` means "a write holds the
+  index", `pushing` means "a push is in flight".
 - **The dialogs own the keyboard.** While Rollback / Delete / Push is up,
   the tree reads no keys, so Enter confirms instead of opening a diff.
 - `GIT_TERMINAL_PROMPT=0`: a push needing a password fails with Git's error
   instead of hanging on a terminal nobody can see. A GUI credential helper
-  (Git Credential Manager) can still pop up its own window.
+  (Git Credential Manager) can still pop up its own window, possibly behind
+  foreman; Cancel or the timeout closes it with the push (the job object).
 
 It is a whole-tree `git status`, not JetBrains' dirty-path-scoped one: about
 76 ms on this repo, almost all Windows process spawn. Revisit only if a big
@@ -733,13 +754,15 @@ No native screenshot of the pill yet.
   for its items), the Rollback / Delete `Confirm` dialog, the header
   toolbar, and the watch-driven refresh (refresh-on-activate as fallback).
 - `src/git_history/commit.rs`: `CommitPanel` (message box, Amend, Commit /
-  Commit and Push…, AI message), the `Write` ops and their worker `run`
-  (`--only` commits, the merge case, Recycle Bin, `.gitignore` patterns),
-  and the AI prompt / `clean_message`.
+  Commit and Push…, AI message, the write slot and the push slot with its
+  Cancel), the `Write` ops and their worker `run` (`--only` commits, the
+  merge case, Recycle Bin, `.gitignore` patterns), and the AI prompt /
+  `clean_message`.
 - `src/git_history/push.rs`: `Target` and `target` (where a push goes),
-  `push` (the write, with the rejection text), `PushDialog` and `outgoing`
-  (target and
-  outgoing commits).
+  `push` (the write, with the rejection, timeout and cancel text),
+  `PushDialog` and `outgoing` (target and outgoing commits).
+- `src/git_history/git.rs`: `spawn` / `output` (reads) and `write`, whose
+  cancel flag and timeout, and the job object behind them, only a push uses.
 - `src/git_history/watch.rs`: `RepoWatch`, the registry and `open`, the
   pure `classify` / `Debounce` core, the `ReadDirectoryChangesW` thread, and
   `Follow` (a view's lazily opened handle on the watch).
