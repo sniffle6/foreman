@@ -112,7 +112,8 @@ pub(super) fn target(cwd: &Path, cancel: &Arc<AtomicBool>) -> Result<Target, Str
 
 /// The notice for a push that was cancelled or timed out: the commit it
 /// followed is in, only the push is missing.
-pub(super) const RETRY: &str = "The commit already landed; push it again from Push…";
+pub(super) const RETRY: &str =
+    "The commit already landed; push it again from Push… in the toolbar above the changes";
 
 /// Worker-only: push `target`, exactly as the dialog showed it. `cancel`
 /// kills the push and its whole process tree; so does `PUSH_TIMEOUT`.

@@ -135,4 +135,5 @@ the gotchas — before substantial changes.
 Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option. Bundled third-party components keep
 their own licenses (Hack font: `assets/fonts/LICENSE-Hack.md`; ConPTY:
-`assets/conpty/LICENSE`).
+`assets/conpty/LICENSE`; Material Symbols icons:
+`assets/icons/material/LICENSE`).

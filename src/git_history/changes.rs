@@ -858,7 +858,7 @@ impl ChangesView {
         let add = self.checked_unversioned();
         let busy = self.commit.busy();
         let (mut cmds, mut tools) = (Vec::new(), Vec::new());
-        let mut tool = |cmd, glyph, label: &str, hint: &str, enabled, on| {
+        let mut tool = |cmd, glyph, label: &str, hint: &str, enabled, on, labeled| {
             let (label, hint) = (label.to_owned(), hint.to_owned());
             cmds.push(cmd);
             tools.push(Tool {
@@ -867,19 +867,28 @@ impl ChangesView {
                 hint,
                 enabled,
                 on,
+                labeled,
             });
         };
         // A live watch re-reads on every change; Refresh is only for when it
         // can't.
         if self.follow.down() || matches!(self.status, Some(Err(_))) {
             let hint = super::refresh_hint(self.follow.down());
-            tool(Bar::Refresh, Glyph::Refresh, "Refresh", hint, true, false);
+            tool(
+                Bar::Refresh,
+                Glyph::Refresh,
+                "Refresh",
+                hint,
+                true,
+                false,
+                false,
+            );
         }
         if let Some(Ok(status)) = &self.status {
             if !add.is_empty() {
                 let label = format!("Add to VCS ({})", add.len());
                 let hint = "Put the checked unversioned files under version control";
-                tool(Bar::Add, Glyph::Add, &label, hint, !busy, false);
+                tool(Bar::Add, Glyph::Add, &label, hint, !busy, false, false);
             }
             // One push at a time; and none while a commit is landing, since
             // the dialog would list the outgoing commits without it.
@@ -887,8 +896,10 @@ impl ChangesView {
                 && !self.commit.pushing()
                 && self.push.is_none()
                 && status.branch.as_deref().is_some_and(|b| b != "(detached)");
+            // Labeled: the one button users go looking for by name (the push
+            // notices point at it).
             let hint = "Review the outgoing commits, then push";
-            tool(Bar::Push, Glyph::Push, "Push…", hint, can_push, false);
+            tool(Bar::Push, Glyph::Push, "Push…", hint, can_push, false, true);
             let hint = "Group files by directory, or list them flat";
             tool(
                 Bar::Directories,
@@ -897,9 +908,18 @@ impl ChangesView {
                 hint,
                 true,
                 !self.flat,
+                false,
             );
             let hint = "Expand every section and folder";
-            tool(Bar::Expand, Glyph::Expand, "Expand All", hint, true, false);
+            tool(
+                Bar::Expand,
+                Glyph::Expand,
+                "Expand All",
+                hint,
+                true,
+                false,
+                false,
+            );
             let hint = "Collapse every section and folder";
             tool(
                 Bar::Collapse,
@@ -907,6 +927,7 @@ impl ChangesView {
                 "Collapse All",
                 hint,
                 true,
+                false,
                 false,
             );
         }

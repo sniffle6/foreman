@@ -1,8 +1,13 @@
 //! A row of icon buttons that folds what doesn't fit behind a ">" menu, like
-//! the JetBrains tool-window toolbars. Icons are painted from line segments,
-//! so they scale with view zoom and need no font glyphs.
+//! the JetBrains tool-window toolbars. The icons are Google Material Symbols
+//! (`assets/icons/material/`), rasterized and tinted by `crate::icons`, so
+//! they scale with view zoom and need no font glyphs. A `labeled` tool shows
+//! its name beside its icon, but only while every tool fits that way;
+//! otherwise the row is icons only and folds as usual.
 
+use crate::icons::{self, material};
 use eframe::egui;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum Glyph {
@@ -18,24 +23,69 @@ pub(super) enum Glyph {
     Dots,
 }
 
+impl Glyph {
+    /// The Material Symbol: its cache name and SVG.
+    fn svg(self) -> (&'static str, &'static str) {
+        match self {
+            Glyph::Refresh => material::REFRESH,
+            Glyph::Push => material::UPLOAD,
+            Glyph::Add => material::ADD,
+            Glyph::Directories => material::ACCOUNT_TREE,
+            Glyph::Expand => material::UNFOLD_MORE,
+            Glyph::Collapse => material::UNFOLD_LESS,
+            Glyph::Chevron => material::CHEVRON_RIGHT,
+            Glyph::Dots => material::MORE_HORIZ,
+        }
+    }
+}
+
 /// One toolbar button. `label` is its name in the overflow menu, `hint` its
-/// tooltip. `on`: a toggle that is currently on.
+/// tooltip. `on`: a toggle that is currently on. `labeled`: also show the
+/// name beside the icon when the whole row fits that way.
 pub(super) struct Tool {
     pub glyph: Glyph,
     pub label: String,
     pub hint: String,
     pub enabled: bool,
     pub on: bool,
+    pub labeled: bool,
 }
 
-/// How many of `n` buttons fit in `avail`; when they don't all, the last slot
-/// goes to the ">" button.
-fn visible(n: usize, avail: f32, side: f32, gap: f32) -> usize {
-    let width = |k: usize| k as f32 * side + k.saturating_sub(1) as f32 * gap;
-    if width(n) <= avail {
+/// The icon's share of a `side`-square button: a 16px glyph in a 22px button.
+const ICON_SHARE: f32 = 16.0 / 22.0;
+/// Padding after a labeled button's text, as a share of `side`.
+const LABEL_PAD_SHARE: f32 = 6.0 / 22.0;
+
+/// Width of a button whose label (`text` wide) sits beside its icon.
+fn labeled_width(side: f32, text: f32) -> f32 {
+    side + text + side * LABEL_PAD_SHARE
+}
+
+/// How many buttons fit in `avail`, given each one's width: all of them, or
+/// as many as leave room for the ">" button (`side` wide) after them.
+fn visible(widths: &[f32], avail: f32, side: f32, gap: f32) -> usize {
+    let n = widths.len();
+    let row = |k: usize| widths[..k].iter().sum::<f32>() + k.saturating_sub(1) as f32 * gap;
+    if row(n) <= avail {
         return n;
     }
-    (0..n).rev().find(|&k| width(k + 1) <= avail).unwrap_or(0)
+    // k buttons, each followed by a gap, then the chevron.
+    (0..n)
+        .rev()
+        .find(|&k| widths[..k].iter().sum::<f32>() + k as f32 * gap + side <= avail)
+        .unwrap_or(0)
+}
+
+/// How to draw the row: `(shown, labeled)`. `labeled` holds the buttons'
+/// widths with their labels beside the icons (`side` for an unlabeled one);
+/// when all of them fit that way, that's the row. Otherwise every button is
+/// `side` wide and the ones that don't fit fold behind the chevron.
+fn plan(labeled: &[f32], avail: f32, side: f32, gap: f32) -> (usize, bool) {
+    let n = labeled.len();
+    if visible(labeled, avail, side, gap) == n {
+        return (n, true);
+    }
+    (visible(&vec![side; n], avail, side, gap), false)
 }
 
 /// Draw `tools`; returns the index of the one clicked, from the row or from
@@ -43,12 +93,39 @@ fn visible(n: usize, avail: f32, side: f32, gap: f32) -> usize {
 pub(super) fn show(ui: &mut egui::Ui, tools: &[Tool], scale: f32) -> Option<usize> {
     let side = 22.0 * scale;
     let gap = 2.0 * scale;
-    let shown = visible(tools.len(), ui.available_width(), side, gap);
+    let font = egui::FontId::proportional(13.0 * scale);
+    let labels: Vec<Option<Arc<egui::Galley>>> = tools
+        .iter()
+        .map(|t| {
+            t.labeled.then(|| {
+                ui.painter().layout_no_wrap(
+                    t.label.clone(),
+                    font.clone(),
+                    egui::Color32::PLACEHOLDER,
+                )
+            })
+        })
+        .collect();
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|g| g.as_ref().map_or(side, |g| labeled_width(side, g.size().x)))
+        .collect();
+    let (shown, labeled) = plan(&widths, ui.available_width(), side, gap);
     let mut clicked = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for (i, tool) in tools.iter().take(shown).enumerate() {
-            if button(ui, tool.glyph, side, tool.enabled, tool.on, &tool.hint).clicked() {
+            let label = if labeled { labels[i].clone() } else { None };
+            let response = widget(
+                ui,
+                tool.glyph,
+                side,
+                label,
+                tool.enabled,
+                tool.on,
+                &tool.hint,
+            );
+            if response.clicked() {
                 clicked = Some(i);
             }
         }
@@ -93,14 +170,36 @@ pub(super) fn button(
     on: bool,
     hint: &str,
 ) -> egui::Response {
+    widget(ui, glyph, side, None, enabled, on, hint)
+}
+
+/// An icon button `side` high: square, or widened by `label` drawn after the
+/// icon. The icon is the tinted Material Symbol texture, rasterized at the
+/// device pixel size so it stays crisp at any zoom or DPI.
+fn widget(
+    ui: &mut egui::Ui,
+    glyph: Glyph,
+    side: f32,
+    label: Option<Arc<egui::Galley>>,
+    enabled: bool,
+    on: bool,
+    hint: &str,
+) -> egui::Response {
     let sense = if enabled {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), sense);
+    let width = label
+        .as_ref()
+        .map_or(side, |g| labeled_width(side, g.size().x));
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, side), sense);
     if ui.is_rect_visible(rect) {
         let th = crate::theme::live(ui.ctx());
+        let icon = side * ICON_SHARE;
+        let px = (icon * ui.ctx().pixels_per_point()).ceil().max(1.0) as u32;
+        let (name, svg) = glyph.svg();
+        let texture = icons::texture_svg(ui.ctx(), name, svg, px);
         let painter = ui.painter();
         if enabled && (response.hovered() || response.is_pointer_button_down_on()) {
             let fill = ui.style().interact(&response).weak_bg_fill;
@@ -109,83 +208,55 @@ pub(super) fn button(
             painter.rect_filled(rect, 3.0, ui.visuals().widgets.inactive.weak_bg_fill);
         }
         let color = if enabled { th.text } else { th.dim };
-        paint(painter, glyph, rect, color);
+        // The icon sits centered in the leading `side` square; the label, if
+        // any, follows it.
+        let square = egui::Rect::from_min_size(rect.min, egui::vec2(side, side));
+        painter.image(
+            texture.id(),
+            egui::Rect::from_center_size(square.center(), egui::vec2(icon, icon)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            color,
+        );
+        if let Some(galley) = label {
+            let pos = egui::pos2(square.right(), rect.center().y - galley.size().y / 2.0);
+            painter.galley(pos, galley, color);
+        }
     }
     response.on_hover_text(hint)
 }
 
-fn paint(painter: &egui::Painter, glyph: Glyph, rect: egui::Rect, color: egui::Color32) {
-    // Draw on a 22-unit grid centered in `rect`; `u` maps a unit to pixels.
-    let u = rect.width() / 22.0;
-    let c = rect.center();
-    let p = |x: f32, y: f32| c + egui::vec2(x * u, y * u);
-    let stroke = egui::Stroke::new((1.4 * u).max(1.0), color);
-    let line = |pts: &[(f32, f32)]| {
-        painter.add(egui::Shape::line(
-            pts.iter().map(|&(x, y)| p(x, y)).collect(),
-            stroke,
-        ));
-    };
-    match glyph {
-        Glyph::Refresh => {
-            // Three quarters of a circle, with an arrowhead at its end.
-            let arc: Vec<(f32, f32)> = (0..=18)
-                .map(|i| {
-                    let a = (40.0 + i as f32 * 15.0).to_radians();
-                    (6.0 * a.cos(), -6.0 * a.sin())
-                })
-                .collect();
-            line(&arc);
-            let (x, y) = arc[arc.len() - 1];
-            line(&[(x - 1.0, y - 4.5), (x, y), (x + 4.5, y - 1.0)]);
-        }
-        Glyph::Push => {
-            line(&[(0.0, 6.0), (0.0, -6.0)]);
-            line(&[(-4.5, -1.5), (0.0, -6.0), (4.5, -1.5)]);
-            line(&[(-6.0, 9.0), (6.0, 9.0)]);
-        }
-        Glyph::Add => {
-            line(&[(-6.0, 0.0), (6.0, 0.0)]);
-            line(&[(0.0, -6.0), (0.0, 6.0)]);
-        }
-        Glyph::Directories => {
-            line(&[(-6.0, -5.5), (6.0, -5.5)]);
-            line(&[(-1.0, 0.0), (6.0, 0.0)]);
-            line(&[(-1.0, 5.5), (6.0, 5.5)]);
-            line(&[(-4.5, -5.5), (-4.5, 5.5), (-2.0, 5.5)]);
-            line(&[(-4.5, 0.0), (-2.0, 0.0)]);
-        }
-        Glyph::Expand => {
-            // Chevrons pointing away from the middle.
-            line(&[(-4.5, -2.0), (0.0, -6.5), (4.5, -2.0)]);
-            line(&[(-4.5, 2.0), (0.0, 6.5), (4.5, 2.0)]);
-        }
-        Glyph::Collapse => {
-            // Chevrons pointing at the middle.
-            line(&[(-4.5, -6.5), (0.0, -2.0), (4.5, -6.5)]);
-            line(&[(-4.5, 6.5), (0.0, 2.0), (4.5, 6.5)]);
-        }
-        Glyph::Chevron => line(&[(-2.5, -5.0), (2.5, 0.0), (-2.5, 5.0)]),
-        Glyph::Dots => {
-            for x in [-5.0, 0.0, 5.0] {
-                painter.circle_filled(p(x, 0.0), 1.4 * u, color);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::visible;
+    use super::{labeled_width, plan, visible};
 
     #[test]
     fn everything_fits_or_the_last_slot_becomes_the_chevron() {
         // 22px buttons, 2px gaps: 6 need 6*22 + 5*2 = 142.
-        assert_eq!(visible(6, 142.0, 22.0, 2.0), 6);
-        assert_eq!(visible(6, 141.0, 22.0, 2.0), 4);
-        assert_eq!(visible(6, 100.0, 22.0, 2.0), 3);
-        assert_eq!(visible(6, 22.0, 22.0, 2.0), 0);
-        assert_eq!(visible(6, 0.0, 22.0, 2.0), 0);
-        assert_eq!(visible(0, 0.0, 22.0, 2.0), 0);
+        let six = [22.0; 6];
+        assert_eq!(visible(&six, 142.0, 22.0, 2.0), 6);
+        assert_eq!(visible(&six, 141.0, 22.0, 2.0), 4);
+        assert_eq!(visible(&six, 100.0, 22.0, 2.0), 3);
+        assert_eq!(visible(&six, 22.0, 22.0, 2.0), 0);
+        assert_eq!(visible(&six, 0.0, 22.0, 2.0), 0);
+        assert_eq!(visible(&[], 0.0, 22.0, 2.0), 0);
+        // A wide button counts its own width: 22 + 60 + 22 with two gaps.
+        let mixed = [22.0, 60.0, 22.0];
+        assert_eq!(visible(&mixed, 108.0, 22.0, 2.0), 3);
+        // One short: the wide one and the last fold, since 22+2+60+2+22 > 107.
+        assert_eq!(visible(&mixed, 107.0, 22.0, 2.0), 1);
+    }
+
+    #[test]
+    fn labels_show_only_when_the_whole_row_fits_with_them() {
+        // Three buttons, the middle one labeled ("Push…", 40px of text):
+        // 22 + (22 + 40 + 6) + 22, two gaps = 116.
+        let labeled = [22.0, labeled_width(22.0, 40.0), 22.0];
+        assert_eq!(plan(&labeled, 116.0, 22.0, 2.0), (3, true));
+        // A pixel short of that, and the row is icons only (70 wide): all fit.
+        assert_eq!(plan(&labeled, 115.0, 22.0, 2.0), (3, false));
+        assert_eq!(plan(&labeled, 70.0, 22.0, 2.0), (3, false));
+        // Narrower still, and icons fold behind the chevron as always.
+        assert_eq!(plan(&labeled, 69.0, 22.0, 2.0), (1, false));
+        assert_eq!(plan(&[], 0.0, 22.0, 2.0), (0, true));
     }
 }

@@ -316,7 +316,13 @@ merge is in progress; that line truncates. Buttons, in order: **Refresh**
 (only when the watch can't follow), **Add to VCS (N)** (only when unversioned
 files are checked), **Push…**, **Directories** (group by directory, or a flat
 list sorted by file name with the folder dimmed after it), **Expand All**,
-**Collapse All**. Names and explanations are in the tooltips.
+**Collapse All**. Names and explanations are in the tooltips. The icons are
+Google's Material Symbols (`assets/icons/material/`, Apache 2.0; the README
+there says how they were fetched), rasterized and tinted by `icons.rs` at the
+device pixel size. **Push…** is the one button that also carries its name
+beside the icon, so the push notices ("push it again from Push… in the
+toolbar above the changes") point somewhere findable; the label shows while
+every button fits with it and drops to the bare icon when the window narrows.
 
 **Narrow window:** nothing overlaps, like JetBrains. Toolbar buttons that
 don't fit fold behind a **>** button, which opens a menu with them as labeled
@@ -746,8 +752,10 @@ No native screenshot of the pill yet.
   multi-select model, checkboxes (`grouped`, `toggle_checks`), flat vs
   directory grouping (`set_flat`), keyboard, the `MenuItem` / `TreeEvent`
   menu seam, and `status_color`.
-- `src/git_history/toolbar.rs`: the icon toolbar with its ">" overflow menu; also the
-  painted icons and the `⋯` button the commit row reuses.
+- `src/git_history/toolbar.rs`: the icon toolbar with its ">" overflow menu,
+  the Material Symbols it draws (`assets/icons/material/`, via
+  `icons::texture_svg`), the labeled Push… (`Tool::labeled`, `plan`), and the
+  `⋯` button the commit row reuses.
 - `src/git_history/changes.rs`: `ChangesView`, the `git status` porcelain v2
   parser (`combined` for the one-letter status), the path-keyed checks and
   `scope` (what Commit takes), the tree's context menu (`menu`, and `write`

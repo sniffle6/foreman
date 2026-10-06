@@ -1,8 +1,9 @@
-//! Tab icons: official app/agent logos rasterized from embedded SVGs into cached
-//! egui textures. The embedded SVGs are monochrome white silhouettes, so callers
-//! tint them to a brand color at paint time. The texture for a given (kind,
-//! pixel-size) is rasterized once via resvg and cached in egui's per-context data
-//! — it costs nothing after the first frame and re-rasterizes crisply when the
+//! Icons rasterized from embedded SVGs into cached egui textures: the tab
+//! icons (official app/agent logos) and the Material Symbols the Changes
+//! toolbar draws. The embedded SVGs are monochrome white silhouettes, so
+//! callers tint them at paint time. The texture for a given (name, pixel-size)
+//! is rasterized once via resvg and cached in egui's per-context data — it
+//! costs nothing after the first frame and re-rasterizes crisply when the
 //! DPI/zoom asks for a new pixel size.
 
 use eframe::egui;
@@ -14,6 +15,55 @@ const CODEX_SVG: &str = include_str!("../assets/icons/codex.svg");
 const GROK_SVG: &str = include_str!("../assets/icons/grok.svg");
 const TERMINAL_SVG: &str = include_str!("../assets/icons/terminal.svg");
 const FOLDER_SVG: &str = include_str!("../assets/icons/folder.svg");
+
+/// Google Material Symbols Outlined (Apache 2.0; `assets/icons/material/README.md`).
+/// Each is `(name, svg)`: the name keys the texture cache.
+pub mod material {
+    pub const REFRESH: (&str, &str) = (
+        "material-refresh",
+        include_str!("../assets/icons/material/refresh.svg"),
+    );
+    pub const UPLOAD: (&str, &str) = (
+        "material-upload",
+        include_str!("../assets/icons/material/upload.svg"),
+    );
+    pub const ADD: (&str, &str) = (
+        "material-add",
+        include_str!("../assets/icons/material/add.svg"),
+    );
+    pub const ACCOUNT_TREE: (&str, &str) = (
+        "material-account_tree",
+        include_str!("../assets/icons/material/account_tree.svg"),
+    );
+    pub const UNFOLD_MORE: (&str, &str) = (
+        "material-unfold_more",
+        include_str!("../assets/icons/material/unfold_more.svg"),
+    );
+    pub const UNFOLD_LESS: (&str, &str) = (
+        "material-unfold_less",
+        include_str!("../assets/icons/material/unfold_less.svg"),
+    );
+    pub const CHEVRON_RIGHT: (&str, &str) = (
+        "material-chevron_right",
+        include_str!("../assets/icons/material/chevron_right.svg"),
+    );
+    pub const MORE_HORIZ: (&str, &str) = (
+        "material-more_horiz",
+        include_str!("../assets/icons/material/more_horiz.svg"),
+    );
+    /// All eight, for the rasterization test.
+    #[cfg(test)]
+    pub const ALL: [(&str, &str); 8] = [
+        REFRESH,
+        UPLOAD,
+        ADD,
+        ACCOUNT_TREE,
+        UNFOLD_MORE,
+        UNFOLD_LESS,
+        CHEVRON_RIGHT,
+        MORE_HORIZ,
+    ];
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IconKind {
@@ -30,13 +80,14 @@ pub enum IconKind {
 }
 
 impl IconKind {
-    fn svg(self) -> &'static str {
+    /// The SVG and its cache name; the three shells share one silhouette.
+    fn svg(self) -> (&'static str, &'static str) {
         match self {
-            IconKind::Claude => CLAUDE_SVG,
-            IconKind::Codex => CODEX_SVG,
-            IconKind::Grok => GROK_SVG,
-            IconKind::PowerShell | IconKind::Cmd | IconKind::Bash => TERMINAL_SVG,
-            IconKind::Folder => FOLDER_SVG,
+            IconKind::Claude => ("claude", CLAUDE_SVG),
+            IconKind::Codex => ("codex", CODEX_SVG),
+            IconKind::Grok => ("grok", GROK_SVG),
+            IconKind::PowerShell | IconKind::Cmd | IconKind::Bash => ("terminal", TERMINAL_SVG),
+            IconKind::Folder => ("folder", FOLDER_SVG),
         }
     }
 
@@ -113,7 +164,7 @@ impl IconKind {
     }
 }
 
-type Cache = Arc<Mutex<HashMap<(IconKind, u32), egui::TextureHandle>>>;
+type Cache = Arc<Mutex<HashMap<(&'static str, u32), egui::TextureHandle>>>;
 
 fn cache_id() -> egui::Id {
     egui::Id::new("foreman::icon_cache")
@@ -121,14 +172,26 @@ fn cache_id() -> egui::Id {
 
 /// Texture for `kind` rendered at `px`×`px` device pixels, cached per context.
 pub fn texture(ctx: &egui::Context, kind: IconKind, px: u32) -> egui::TextureHandle {
-    let key = (kind, px);
+    let (name, svg) = kind.svg();
+    texture_svg(ctx, name, svg, px)
+}
+
+/// Texture for an embedded white-silhouette `svg` rendered at `px`×`px`
+/// device pixels, cached per context under `name` (unique per SVG).
+pub fn texture_svg(
+    ctx: &egui::Context,
+    name: &'static str,
+    svg: &'static str,
+    px: u32,
+) -> egui::TextureHandle {
+    let key = (name, px);
     let cache: Cache = ctx.data_mut(|d| d.get_temp_mut_or_default::<Cache>(cache_id()).clone());
     if let Some(h) = cache.lock().unwrap().get(&key) {
         return h.clone();
     }
-    let img = rasterize(kind.svg(), px);
+    let img = rasterize(svg, px);
     let handle = ctx.load_texture(
-        format!("foreman-icon-{kind:?}-{px}"),
+        format!("foreman-icon-{name}-{px}"),
         img,
         egui::TextureOptions::LINEAR,
     );
@@ -172,22 +235,34 @@ mod tests {
     #[test]
     fn embedded_svgs_rasterize_to_nonblank_icons() {
         // One per SVG file: Claude, Codex, Grok, the shared terminal glyph
-        // (PowerShell), and the folder.
-        for kind in [
+        // (PowerShell), the folder, and the eight Material Symbols.
+        let tabs = [
             IconKind::Claude,
             IconKind::Codex,
             IconKind::Grok,
             IconKind::PowerShell,
             IconKind::Folder,
-        ] {
-            let img = rasterize(kind.svg(), 32);
+        ]
+        .map(IconKind::svg);
+        for (name, svg) in tabs.iter().chain(material::ALL.iter()) {
+            let img = rasterize(svg, 32);
             assert_eq!(img.size, [32, 32]);
-            // A parse failure or all-transparent fill would leave zero ink; the
-            // real logos cover a healthy chunk of the 1024-pixel canvas.
+            // A parse failure or all-transparent fill would leave zero ink; even
+            // the thinnest real glyph (the chevron, ~76 px) inks well over 40 of
+            // the 1024-pixel canvas.
             assert!(
-                opaque_pixels(&img) > 100,
-                "{kind:?} rendered nearly blank ({} opaque px)",
+                opaque_pixels(&img) > 40,
+                "{name} rendered nearly blank ({} opaque px)",
                 opaque_pixels(&img)
+            );
+            // The silhouette must be white so the tint multiplies cleanly; a
+            // Material path without `fill` would rasterize black.
+            assert!(
+                img.pixels
+                    .iter()
+                    .filter(|p| p.a() == 255)
+                    .all(|p| p.r() == 255 && p.g() == 255 && p.b() == 255),
+                "{name} is not a white silhouette"
             );
         }
     }
