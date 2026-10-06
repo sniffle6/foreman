@@ -282,6 +282,14 @@ its base (`docs/integration-queue.md`).
 
 ## Gotchas
 
+- **The npm Codex PTY test starts `node.exe` once before its deadline.**
+  `spawn_argv_npm_codex_preserves_card_prompt_through_pty` (src/terminal.rs)
+  launches the machine's real node. On a fresh CI runner, node's first launch
+  pages the binary in off a cold disk and can outlast the test's deadline
+  under the suite's tempdir I/O, leaving a blank grid. An untimed
+  `node -e ""` first makes the timed launch fast. Keep it when you touch the
+  test, and do not lengthen the deadline instead. The full story is in the
+  **foreman-debugging-playbook** skill, §14.
 - **Orphaned-ness is invisible in the JSON files.** It is derived at render
   time; only the board and `foreman kanban list` show it. Reading
   `.foreman/tasks/` by hand tells you the last written claim, not whether it

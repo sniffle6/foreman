@@ -42,6 +42,7 @@ lands you on it.
 | TUI colors flat/washed out (grey boxes) | Capability env vars or OSC color replies missing | §10 |
 | Whole app vanishes, opaque exit code | Panic aborted across the winit callback — read `foreman_panic.log` | §11 |
 | A PTY test fails in the full suite, passes alone | Pre-Ready injection swallowed under load — re-send pattern | §12 |
+| A PTY test fails only on CI: blank grid at the deadline, child alive | Its first launch of a big binary pays cold-disk paging inside the deadline | §14 |
 | App vanished after sleep, resume, or a display power transition | GPU device loss. Under wgpu that is an unconditional `panic!` + abort — SETTLED: foreman renders on glow | §13 |
 
 ---
@@ -352,6 +353,50 @@ the same panic). The side-by-side A/B through one real device-loss event, and
 the crash evidence from `%APPDATA%\foreman\foreman_panic.log`, are in
 `docs/gpu-device-loss.md`. Session persistence (PTYs outliving the GUI process)
 is still the only thing that would make a GUI death *survivable*; it is open.
+
+## §14 PTY test fails only on CI, blank grid at its deadline — cold first launch
+
+**Symptom.** A Session-level test that runs a large program the runner ships
+(canonical case: `spawn_argv_npm_codex_preserves_card_prompt_through_pty`,
+src/terminal.rs, which runs the system `node.exe`) fails on a GitHub runner
+with an empty screen at its deadline and the child still alive (`exit None`).
+It passes locally, passes on most CI runs, and reruns may go either way.
+
+**Immediate cause.** The deadline covers the program's *first* launch on a
+fresh VM. That launch demand-pages the binary off a cold disk, one slow
+random read per page fault. Alone it costs seconds. The suite's tempdirs and
+git fixtures live in `%TEMP%` on the same C: drive, and their writes queue in
+front of those reads, so the launch can outlast the deadline. A second launch
+on the same VM takes milliseconds. It is not the DSR trap (§1): byte dumps of
+slow first launches show conhost's `ESC[6n` arriving and answered within
+~60 ms, then nothing until node writes seconds later. The grid is blank
+because the child has not written anything yet.
+
+**Fix / fence.** Pay the cold start before the deadline starts: launch the
+program once, untimed, during test setup (the canonical test runs
+`node -e ""` through `std::process::Command`). The launch inside the deadline
+is then warm, and the deadline times only the PTY path. Do not lengthen the
+deadline, and do not retry: neither touches the mechanism. **Do not warm by
+reading the whole file instead.** It also works, but demand paging only reads
+the pages the program touches, while a full read pulls every byte through the
+same contended disk. Measured, it cost more than the launch it replaced. It
+cannot be reproduced locally, because your copy of the binary is already warm.
+
+**It is not release.yml.** The v0.7.1 release failure looked workflow-specific:
+a census of the runs from the test's introduction to v0.7.2 showed it failing
+in release.yml attempts only. The mechanism uses nothing release.yml-specific,
+and a test.yml replica reached a 12.3 s first launch on the 15 s deadline.
+
+**Evidence (measured 2026-10-06, fresh `windows-latest` runners, node 22,
+82.9 MB):** a cold `node -e 0` took 2.1–3.5 s, and a warm one 36–59 ms. A cold
+launch with one small-file writer running in `%TEMP%` took 3.1–24.1 s. The test
+itself, run as the VM's first node launch: with four write-through loaders the
+unfixed test failed every run with the CI signature, and with one loader it
+failed some. The launch-once fix passed every run under the same loads, and
+every full release.yml-replica suite. Warming by a full-file read instead made
+the test take minutes under the loaders and longer than the unfixed test in
+the real suite. The probe workflows and per-run numbers are in the fixing
+commit's body (`git log -S "node.exe failed to start" -- src/terminal.rs`).
 
 ---
 

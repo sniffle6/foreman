@@ -4277,6 +4277,16 @@ mod tests {
             eprintln!("node.exe not installed; skipping npm PTY test");
             return;
         };
+        // Pay node.exe's cold start here, outside the deadline below. On a
+        // fresh CI runner the first launch pages the binary in off a cold
+        // disk: seconds alone, past 15 s under the suite's concurrent tempdir
+        // I/O, which left a blank grid at the deadline. Every later launch
+        // takes milliseconds, so the deadline then times only the PTY path.
+        let warm = std::process::Command::new(&node)
+            .args(["-e", ""])
+            .output()
+            .unwrap();
+        assert!(warm.status.success(), "node.exe failed to start: {warm:?}");
         let dir = tempfile::tempdir().unwrap();
         let npm = dir.path().join("npm with spaces");
         let bin = npm.join("node_modules/@openai/codex/bin");
