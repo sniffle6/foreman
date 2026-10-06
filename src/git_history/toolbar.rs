@@ -2,8 +2,8 @@
 //! the JetBrains tool-window toolbars. The icons are Google Material Symbols
 //! (`assets/icons/material/`), rasterized and tinted by `crate::icons`, so
 //! they scale with view zoom and need no font glyphs. A tool with `choices`
-//! is not a click action: hovering it pops up its options, like the eye
-//! (View Options) button in JetBrains.
+//! is not a click action: hovering it pops up its options at once, like the
+//! eye (View Options) button in JetBrains.
 
 use crate::icons::{self, material};
 use eframe::egui;
@@ -96,16 +96,12 @@ pub(super) fn show(ui: &mut egui::Ui, tools: &[Tool], scale: f32) -> Option<Clic
                         choice: None,
                     });
                 }
-            } else {
-                // The popup stays while the pointer is in it, since it holds
-                // buttons (egui's interactive tooltips).
-                response.on_hover_ui(|ui| {
-                    if let Some(c) = choices(ui, &tool.choices) {
-                        clicked = Some(Click {
-                            tool: i,
-                            choice: Some(c),
-                        });
-                    }
+            } else if let Some(c) =
+                hover_popup(&response, |ui| choices(ui, &tool.choices)).flatten()
+            {
+                clicked = Some(Click {
+                    tool: i,
+                    choice: Some(c),
                 });
             }
         }
@@ -118,6 +114,32 @@ pub(super) fn show(ui: &mut egui::Ui, tools: &[Tool], scale: f32) -> Option<Clic
         }
     });
     clicked
+}
+
+/// Between a chooser and its popup; the popup also counts this margin as
+/// itself, so the pointer can cross it without the popup closing.
+const POPUP_GAP: f32 = 4.0;
+
+/// A popup under `anchor` that opens the moment it is hovered (not after
+/// egui's tooltip delay) and stays while the pointer is in it, so its
+/// buttons can be clicked. Returns what `content` returned, if shown.
+fn hover_popup<R>(anchor: &egui::Response, content: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let ctx = &anchor.ctx;
+    let id = anchor.id.with("hover-popup");
+    // Only a popup shown last frame can hold itself open; its area rect
+    // outlives it in memory, so that alone would reopen it later.
+    let shown = ctx.read_response(id).is_some();
+    let inside = shown
+        && egui::AreaState::load(ctx, id)
+            .zip(ctx.pointer_hover_pos())
+            .is_some_and(|(area, pos)| area.rect().expand(POPUP_GAP).contains(pos));
+    egui::Popup::from_response(anchor)
+        .id(id)
+        .kind(egui::PopupKind::Tooltip)
+        .gap(POPUP_GAP)
+        .open(anchor.hovered() || inside)
+        .show(content)
+        .map(|r| r.inner)
 }
 
 /// `choices` as selectable rows; returns the clicked one.
