@@ -4,11 +4,13 @@
   "title": "fix(git): commit panel notice pins to the top and hides the tree",
   "body": "Mechanical follow-up to card jxayli; the fix is already written and tested. Do not redo it.\n\nBug: any notice in the commit panel (a commit's '[main 1a2b3c4] subject' line, an error) made the Git Changes window show only that line. egui's ScrollArea pins to the top-left of free space, so inside the panel's bottom-up ui it sat at the top of the window, the buttons and message box were laid out above it off-screen, and the panel's reported height left the tree no room. Present since 84ac015.\n\nFix: commit 72ce727 on branch card/jxayli in this repository (src/git_history/commit.rs only: measure the notice text, allocate an exact rect at the bottom, show the ScrollArea in a top-down child; plus the test a_notice_adds_a_few_lines_to_the_panel_not_the_whole_window).\n\nSteps, in your worktree:\n1. git cherry-pick 72ce727\n2. Amend the message so its trailer block ends with your own 'Card: <this card id>' line (keep the Co-Authored-By line; replace 'Card: jxayli').\n3. cargo test --target-dir target/agent git_history::commit::tests  (all pass; the notice test is the guard)\n4. cargo fmt --check\n5. foreman kanban integrate <id>; foreman kanban wait <id> --timeout 1800; on exit 3 read the reason with foreman kanban list --json, fix, resubmit.\n\nIf 72ce727 is unreachable (branch card/jxayli gone), block the card with that reason; do not rewrite the fix from scratch.",
   "state": "done",
-  "worktree": {
-    "path": "H:/claude code/foreman/.foreman/worktrees/a001yn",
-    "branch": "card/a001yn",
-    "base": "main"
+  "shipped": {
+    "name": "v0.7.1",
+    "at": "2026-10-06T04:32:37Z",
+    "commits": [
+      "3ad93ec"
+    ]
   },
   "created": "2026-10-06T03:42:53Z",
-  "updated": "2026-10-06T03:45:38Z"
+  "updated": "2026-10-06T04:32:37Z"
 }

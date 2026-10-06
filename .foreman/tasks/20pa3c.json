@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "id": "20pa3c",
+  "title": "feat(git): Material Symbols icons in the Changes toolbar, Push… labeled",
+  "body": "Why: the Changes window toolbar (src/git_history/toolbar.rs) paints hand-drawn line glyphs on a 22-unit grid. The Push… icon is not recognizable: after cancelling a push the user could not find where to push again, though the cancel notice says \"push it again from Push…\". Replace the glyphs with Google Material Symbols (Apache 2.0), give Push… a text label when there is room, and make the notice say where Push… is.\n\nDo, in this order:\n1. Assets. Fetch eight Material Symbols Outlined 24px SVGs into assets/icons/material/: refresh (Refresh), upload (Push…), add (Add to VCS), account_tree (Directories), unfold_more (Expand All), unfold_less (Collapse All), chevron_right (the \">\" overflow button), more_horiz (the ⋯ button the commit row reuses). URL pattern: https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/<name>/default/24px.svg (viewBox \"0 -960 960 960\"; curl works). Add fill=\"#ffffff\" to each <path>: icons.rs tints a white silhouette at paint time. Add assets/icons/material/README.md (upstream, fetch date, the URL pattern, license) and a LICENSE copy of Apache 2.0, modelled on assets/fonts/README.md; add the pointer to the License paragraph at the end of README.md.\n2. src/icons.rs. Generalize the texture cache key from (IconKind, u32) to (&'static str, u32) and expose pub fn texture_svg(ctx, name: &'static str, svg: &'static str, px: u32) -> TextureHandle; texture(ctx, kind, px) delegates to it. Extend embedded_svgs_rasterize_to_nonblank_icons to the eight new SVGs.\n3. src/git_history/toolbar.rs. button() draws the tinted texture instead of paint(): texture px = icon size * ctx.pixels_per_point() (the folder icon in file_tree.rs is the pattern), icon size 16/22 of the button side, centered in the button rect, painter.image with uv (0,0)-(1,1) and th.text (enabled) or th.dim (disabled) as the tint. Delete paint(). Keep the Glyph enum and the button/show/overflow signatures: commit.rs calls toolbar::button(ui, Glyph::Dots, …) for the commit row's ⋯ menu.\n4. Push… label. Add labeled: bool to Tool (only Push… sets it, in changes.rs). In show(): if every tool fits with labeled ones drawn as icon + text, draw them that way; otherwise icons only and fold behind \">\" exactly as today. Rewrite visible() to take per-button widths and update everything_fits_or_the_last_slot_becomes_the_chevron.\n5. src/git_history/push.rs. RETRY becomes \"The commit already landed; push it again from Push… in the toolbar above the changes\".\n6. docs/git-history.md. Update the toolbar paragraph (\"The top is an icon toolbar\") and the toolbar.rs line under Key files: Material Symbols, the labeled Push…, where the assets live.\n\nDo not: add a crate (resvg is already a dependency and icons.rs already rasterizes SVGs); touch the push dialog, the commit flow, or the commit row's compact layout.\n\nGate: cargo test --target-dir target/agent icons:: ; cargo test --target-dir target/agent git_history:: ; cargo fmt --check ; cargo build --target-dir target/agent (the running app must not be touched: FOREMAN=1 means you are inside it). The GUI cannot be seen from a terminal: in your close-out say plainly that the icons were not screenshot-verified and ask the user to run build-screenshot on the Changes window at a wide and a narrow width.",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.1",
+    "at": "2026-10-06T04:32:37Z",
+    "commits": [
+      "769a303",
+      "c7c28a1",
+      "396476c"
+    ]
+  },
+  "created": "2026-10-06T04:00:48Z",
+  "updated": "2026-10-06T04:32:37Z"
+}
