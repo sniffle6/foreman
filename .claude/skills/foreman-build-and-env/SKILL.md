@@ -268,16 +268,20 @@ That exact gap failed the v0.5.1 release build. Reproduce the runner
 locally with `GIT_CONFIG_GLOBAL` pointed at an empty file (bash:
 `GIT_CONFIG_GLOBAL=$(mktemp) GIT_CONFIG_NOSYSTEM=1 cargo test --target-dir target/agent`).
 
-**Your tests may not even run on the runner's ConPTY.** portable-pty loads
-`conpty.dll` by bare name before falling back to the in-box host, so the
-Windows DLL search order applies, and it ends with PATH. `install.ps1` puts
-`%LOCALAPPDATA%\Programs\foreman` on the user PATH, and the installed app
-keeps its sideloaded `conpty.dll` + `OpenConsole.exe` there
-(`src/conpty_install.rs`). On a machine with foreman installed, every
-`cargo test` Session therefore runs on OpenConsole, while the runner (no such
-dir) runs on in-box conhost: different startup bytes, different timing. To
-test against the runner's host, drop that dir from PATH for the run (bash:
-`PATH=$(echo "$PATH" | tr ':' '\n' | grep -vi 'Programs/foreman' | paste -sd:) cargo test --target-dir target/agent`).
+**Tests select their ConPTY host explicitly.** Ordinary `cargo test` Sessions
+install, lease, and load the embedded OpenConsole pair beside the test exe;
+failure fails the test instead of silently selecting another host. To exercise
+the supported in-box fallback in PowerShell, set
+`$env:FOREMAN_TEST_CONPTY_HOST = 'inbox'`, run
+`cargo test --target-dir target/agent`, then
+`Remove-Item Env:FOREMAN_TEST_CONPTY_HOST`. `openconsole` explicitly selects
+the default; other values fail. CI runs both choices in separate jobs.
+The initializer in `src/conpty_install.rs::prepare_test_host` excludes PATH
+and the current directory from DLL lookup; in-box mode also excludes exe
+sidecars. Production excludes PATH/current-directory DLL lookup too, so
+`SideloadDisabled` cannot rediscover the installed Foreman's DLL via PATH.
+No PATH editing is needed. Host choice is deliberate; the in-box host's
+version still follows the Windows image. See `docs/adr/0005-conpty-host-selection-is-explicit.md`.
 
 **The runner's disk is cold.** The first launch of a large program on a
 fresh runner (the system `node.exe`, say) pays seconds of demand paging, and

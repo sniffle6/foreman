@@ -10,6 +10,7 @@
 //! ConPTY; startup aborts only when an unverified `conpty.dll` would stay
 //! loadable from Windows' DLL search path (disable failed, or the pair is
 //! locked by another process mid-update).
+//! DLL lookup excludes PATH and the current directory, including on fallback.
 
 use std::ffi::c_void;
 use std::io::Read;
@@ -25,6 +26,67 @@ const OPENCONSOLE_EXE: &[u8] = include_bytes!("../assets/conpty/OpenConsole.exe"
 type Asset<'a> = (&'a str, &'a [u8]);
 
 static CONPTY_LEASE: OnceLock<ConptyLease> = OnceLock::new();
+
+/// Bare-name loads must never discover another installation through PATH or
+/// the current directory. Run before portable-pty initializes its lazy API.
+fn restrict_dll_search(inbox_only: bool) -> std::io::Result<()> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    let flags = LOAD_LIBRARY_SEARCH_SYSTEM32
+        | if inbox_only {
+            0
+        } else {
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+        };
+    if unsafe { SetDefaultDllDirectories(flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn prepare_test_host() -> std::io::Result<()> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let init = || -> std::io::Result<()> {
+            match std::env::var("FOREMAN_TEST_CONPTY_HOST").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("openconsole") => {
+                    ensure_conpty()?;
+                    if CONPTY_LEASE.get().is_none() {
+                        return Err(std::io::Error::other("test requires embedded OpenConsole; installation fell back to in-box ConPTY"));
+                    }
+                    // Pin the verified DLL before another test can load a DLL
+                    // with the same basename. portable-pty reuses this module.
+                    use std::os::windows::ffi::OsStrExt;
+                    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+                    let path = std::env::current_exe()?.with_file_name("conpty.dll");
+                    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+                    if module.is_null() {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+                    if unsafe { GetModuleHandleW(windows_sys::w!("conpty.dll")) } != module {
+                        return Err(std::io::Error::other("another ConPTY DLL was loaded before test host initialization"));
+                    }
+                    // Deliberately retain the module for the process lifetime.
+                    Ok(())
+                }
+                Ok("inbox") => {
+                    restrict_dll_search(true)?;
+                    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+                    if !unsafe { GetModuleHandleW(windows_sys::w!("conpty.dll")) }.is_null() {
+                        return Err(std::io::Error::other("ConPTY DLL already loaded before in-box test host initialization"));
+                    }
+                    Ok(())
+                }
+                value => Err(std::io::Error::other(format!("invalid FOREMAN_TEST_CONPTY_HOST: {value:?}; expected openconsole or inbox"))),
+            }
+        };
+        init().map_err(|e| e.to_string())
+    }).as_ref().map(|_| ()).map_err(|e| std::io::Error::other(e.clone()))
+}
 
 struct InstallLock(*mut c_void);
 
@@ -152,6 +214,7 @@ enum InstallOutcome {
 /// that reached the no-sideload fallback returns `Ok` and Foreman degrades to
 /// the in-box ConPTY (text-only images).
 pub fn ensure_conpty() -> std::io::Result<()> {
+    restrict_dll_search(false)?;
     if CONPTY_LEASE.get().is_some() {
         return Ok(());
     }
@@ -580,6 +643,21 @@ mod tests {
 
     #[test]
     fn loaded_dll_blocks_a_pair_update() {
+        // Loading a second conpty.dll must not race portable-pty's process-wide
+        // lazy host selection in other tests.
+        if std::env::var_os("FOREMAN_DLL_LOCK_PROBE").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "conpty_install::tests::loaded_dll_blocks_a_pair_update",
+                    "--nocapture",
+                ])
+                .env("FOREMAN_DLL_LOCK_PROBE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::FreeLibrary;
         use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
@@ -626,5 +704,94 @@ mod tests {
 
         drop(lease);
         assert!(DllUpdateGuard::acquire(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn host_selection_ignores_path_and_current_directory() {
+        for host in ["openconsole", "inbox", "fallback"] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path().join("app");
+            let poison = dir.path().join("on-path");
+            std::fs::create_dir(&app).unwrap();
+            std::fs::create_dir(&poison).unwrap();
+            for (name, bytes) in assets() {
+                std::fs::write(poison.join(name), bytes).unwrap();
+                // The in-box selector must also ignore stale exe sidecars.
+                if host == "inbox" {
+                    std::fs::write(app.join(name), bytes).unwrap();
+                }
+            }
+            if host == "fallback" {
+                std::fs::create_dir(app.join("conpty.dll.new")).unwrap();
+                std::fs::write(app.join("conpty.dll.new/keep"), b"block staging").unwrap();
+            }
+            let exe = app.join("host-probe.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+            let mut command = std::process::Command::new(exe);
+            command
+                .args([
+                    "--exact",
+                    "conpty_install::tests::selected_host_probe",
+                    "--nocapture",
+                ])
+                .env("FOREMAN_HOST_PROBE", host)
+                .env("FOREMAN_TEST_CONPTY_HOST", host)
+                .env(
+                    "PATH",
+                    format!(
+                        "{};{}",
+                        poison.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .current_dir(&poison);
+            assert!(
+                command.status().unwrap().success(),
+                "host probe failed: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_host_probe() {
+        let Ok(host) = std::env::var("FOREMAN_HOST_PROBE") else {
+            return;
+        };
+        if host == "fallback" {
+            ensure_conpty().unwrap();
+            assert!(CONPTY_LEASE.get().is_none());
+        } else {
+            prepare_test_host().unwrap();
+        }
+        let _pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+        let module = unsafe { GetModuleHandleW(windows_sys::w!("conpty.dll")) };
+        if host == "openconsole" {
+            assert!(!module.is_null());
+            let mut buffer = [0u16; 32768];
+            let len =
+                unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) };
+            assert!(len > 0 && (len as usize) < buffer.len());
+            let actual =
+                std::path::PathBuf::from(String::from_utf16(&buffer[..len as usize]).unwrap());
+            assert_eq!(
+                actual.canonicalize().unwrap(),
+                std::env::current_exe()
+                    .unwrap()
+                    .with_file_name("conpty.dll")
+                    .canonicalize()
+                    .unwrap()
+            );
+        } else {
+            assert!(module.is_null(), "{host} loaded a sideloaded DLL");
+        }
+        println!("verified ConPTY host: {host}");
     }
 }

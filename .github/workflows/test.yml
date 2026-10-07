@@ -29,6 +29,12 @@ concurrency:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        conpty-host: [openconsole, inbox]
+    env:
+      FOREMAN_TEST_CONPTY_HOST: ${{ matrix.conpty-host }}
     defaults:
       run:
         shell: pwsh

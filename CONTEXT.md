@@ -290,6 +290,12 @@ _Avoid_: tag, footer, reference.
 These name deliberate seams — places where behaviour is isolated behind a small
 interface so it can be changed or tested in one spot.
 
+**ConPTY host selection**:
+Process-wide DLL search policy and test host initialization in
+`src/conpty_install.rs`. Tests default to the embedded OpenConsole pair;
+`FOREMAN_TEST_CONPTY_HOST=inbox` selects the Windows fallback. The choice
+precedes the first PTY and excludes PATH/current-directory DLL lookup.
+
 **Deferred action**:
 A window interaction recorded during the draw pass and applied after it, because
 the draw cannot mutate nested Window managers mid-render.

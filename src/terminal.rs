@@ -1021,6 +1021,8 @@ impl Session {
         shell: Shell,
         ctx: egui::Context,
     ) -> std::io::Result<Session> {
+        #[cfg(test)]
+        crate::conpty_install::prepare_test_host()?;
         let (cols, rows) = (80usize, 24usize);
         let pty = native_pty_system();
         let pair = pty
@@ -5663,7 +5665,7 @@ mod tests {
     /// relative to the kitty chunk chain? No prompt is submitted — ambient pet
     /// frames render on idle, so this consumes zero codex usage.
     /// Run: cargo test --release codex_pet_rx_capture -- --ignored --nocapture
-    /// (needs conpty.dll + OpenConsole.exe beside the test exe in deps/).
+    /// (the default test host initializer installs the embedded OpenConsole pair).
     #[test]
     #[ignore = "diagnostic: drives a real codex TUI"]
     fn codex_pet_rx_capture() {

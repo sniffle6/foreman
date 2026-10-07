@@ -52,8 +52,8 @@ the grid — selection/copy/snapshot stay pure text.
 conhost strips kitty APC sequences inside ConPTY, so no graphics bytes can ever
 reach foreman through the system PTY. Proof: the ignored canary test
 `conpty_passes_kitty_apc_through` (run with
-`cargo test --release conpty_passes -- --ignored`; needs the pair below beside
-the test exe in `target/release/deps`). Fix: `src/conpty_install.rs` embeds the
+`cargo test --release conpty_passes -- --ignored`; the default test initializer
+installs the embedded pair beside the test exe). Fix: `src/conpty_install.rs` embeds the
 official post-rearchitecture OpenConsole build (`assets/conpty/`, MIT, from
 Microsoft's ConPTY NuGet package) and drops `conpty.dll` + `OpenConsole.exe`
 beside foreman.exe at startup — portable-pty prefers a sideloaded pair over
@@ -62,6 +62,10 @@ before the GUI starts, refuses to replace a DLL mapped by another Foreman, and
 holds both sidecars open for the process lifetime. A failed update disables the
 sideloaded DLL and degrades to the in-box ConPTY (images just don't arrive);
 startup aborts only when an unverified `conpty.dll` would stay loadable.
+DLL lookup is restricted to the application directory and System32, so the
+fallback cannot rediscover another installation through PATH or the current
+directory. Tests default to the embedded host; CI also tests in-box mode
+(`docs/adr/0005-conpty-host-selection-is-explicit.md`).
 
 **Pin the pair to a good version.** The sideloaded host owns *every* PTY spawn,
 so a bad build slows the whole app. The WezTerm-vendored **1.22.2502** pair we
