@@ -56,10 +56,13 @@ const META_LOCK_WAIT: Duration = Duration::from_secs(3);
 /// is killed and reported as a process failure.
 const GIT_OP_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Lines of check output kept on the request for the worker to read.
+/// Lines of output kept on the request for the worker to read: in all for
+/// a git step, per stream for a check.
 const OUTPUT_TAIL_LINES: usize = 40;
-const FAILURE_LINES_MAX: usize = 12;
-const FAILURE_LINE_CHARS: usize = 240;
+/// A check output line longer than this is cut: long enough for an
+/// assertion's `left:`/`right:` values, short enough that a progress bar
+/// written with `\r` cannot grow the stored detail without bound.
+const OUTPUT_LINE_CHARS: usize = 400;
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -1014,18 +1017,33 @@ pub fn prepare_submission(
 
 struct ChildOutcome {
     ok: bool,
-    tail: String,
-    failure_lines: String,
+    stdout: String,
+    stderr: String,
     timed_out: bool,
     cancelled: bool,
+}
+
+impl ChildOutcome {
+    /// Both streams, stderr after stdout, cut to the last
+    /// [`OUTPUT_TAIL_LINES`]: what a git failure is reported and classified
+    /// by. A check's output is cut per stream instead ([`check_output`]).
+    fn tail(&self) -> String {
+        let mut combined = self.stdout.clone();
+        if !self.stderr.trim().is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&self.stderr);
+        }
+        tail_lines(&combined, OUTPUT_TAIL_LINES)
+    }
 }
 
 /// Run `cmd` to completion with a deadline and a cancel probe polled every
 /// 100 ms. The child joins a kill-on-close Job, so an owner that dies takes
 /// it (and its own children — a `cargo test` tree) along instead of leaving
-/// an orphan to overlap the next owner. Output is captured (both streams)
-/// and the last [`OUTPUT_TAIL_LINES`] returned. Potential failure lines are
-/// also kept separately so a noisy ending cannot bury the useful diagnosis.
+/// an orphan to overlap the next owner. Both streams are captured whole and
+/// kept apart; callers cut them to size.
 fn run_child(
     mut cmd: std::process::Command,
     timeout: Duration,
@@ -1079,19 +1097,12 @@ fn run_child(
     // Bounded: a lingering descendant that kept a pipe open must not hold
     // the repository's turn hostage. Whatever arrived is what we report;
     // the Job drop at return kills the straggler.
-    let (out, err) = collect_output(&out_rx, &err_rx, OUTPUT_GRACE);
+    let (stdout, stderr) = collect_output(&out_rx, &err_rx, OUTPUT_GRACE);
     drop(job);
-    let mut combined = out;
-    if !err.trim().is_empty() {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&err);
-    }
     Ok(ChildOutcome {
         ok: status.success() && !timed_out && !was_cancelled,
-        tail: tail_lines(&combined, OUTPUT_TAIL_LINES),
-        failure_lines: failure_lines(&combined),
+        stdout,
+        stderr,
         timed_out,
         cancelled: was_cancelled,
     })
@@ -1142,31 +1153,37 @@ fn tail_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n").trim().to_string()
 }
 
-fn failure_lines(text: &str) -> String {
-    text.lines()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower.contains("failed") || lower.contains("panicked at") || lower.contains("error:")
-        })
-        .take(FAILURE_LINES_MAX)
-        .map(|line| {
-            line.trim()
-                .chars()
-                .take(FAILURE_LINE_CHARS)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
+/// A check's output for the worker: the tail of each stream on its own,
+/// stdout last. A test runner prints its verdict (`... FAILED`, the panic
+/// and its message, the `failures:` list) to stdout and compiler warnings to
+/// stderr; one combined tail let a page of warnings push the failing test
+/// out entirely, and matching failure words instead lost it to passing tests
+/// with "failed" in their names. Each stream keeps [`OUTPUT_TAIL_LINES`] of
+/// at most [`OUTPUT_LINE_CHARS`] characters, so the detail stays bounded
+/// even when a tool writes one endless line.
 fn check_output(out: &ChildOutcome) -> String {
-    if !out.ok && !out.failure_lines.is_empty() {
-        format!(
-            "Failure lines:\n{}\n\nLast {OUTPUT_TAIL_LINES} lines:\n{}",
-            out.failure_lines, out.tail
-        )
-    } else {
-        out.tail.clone()
+    let stream_tail = |text: &str| {
+        tail_lines(text, OUTPUT_TAIL_LINES)
+            .lines()
+            .map(|line| {
+                if line.chars().count() > OUTPUT_LINE_CHARS {
+                    let cut: String = line.chars().take(OUTPUT_LINE_CHARS - 1).collect();
+                    format!("{cut}…")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (stderr, stdout) = (stream_tail(&out.stderr), stream_tail(&out.stdout));
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (true, _) => stdout,
+        (false, true) => stderr,
+        (false, false) => format!(
+            "stderr (last {OUTPUT_TAIL_LINES} lines):\n{stderr}\n\n\
+             stdout (last {OUTPUT_TAIL_LINES} lines):\n{stdout}"
+        ),
     }
 }
 
@@ -1379,7 +1396,7 @@ fn rebase(tree: &Path, onto: &str) -> Result<(), RebaseError> {
             .filter(|s| !s.is_empty())
             .collect();
         return Err(RebaseError::Conflict(if names.is_empty() {
-            format!("rebase stopped: {}", first_line(&out.tail))
+            format!("rebase stopped: {}", first_line(&out.tail()))
         } else {
             format!("conflicts in: {}", names.join(", "))
         }));
@@ -1387,7 +1404,7 @@ fn rebase(tree: &Path, onto: &str) -> Result<(), RebaseError> {
     Err(RebaseError::Other(if out.timed_out {
         "rebase timed out".into()
     } else {
-        out.tail
+        out.tail()
     }))
 }
 
@@ -1406,15 +1423,15 @@ fn fast_forward(dest: &Path, prepared: &str) -> Result<(), FfError> {
     if out.ok {
         return Ok(());
     }
-    let lower = out.tail.to_lowercase();
+    let lower = out.tail().to_lowercase();
     if lower.contains("not possible to fast-forward") || lower.contains("cannot fast-forward") {
         Err(FfError::Moved)
     } else if lower.contains("would be overwritten") {
-        Err(FfError::Dirty(out.tail))
+        Err(FfError::Dirty(out.tail()))
     } else if lower.contains(".lock") {
-        Err(FfError::Locked(out.tail))
+        Err(FfError::Locked(out.tail()))
     } else {
-        Err(FfError::Other(out.tail))
+        Err(FfError::Other(out.tail()))
     }
 }
 
@@ -2260,51 +2277,112 @@ mod tests {
         }
     }
 
+    /// A fake `cargo test` failure: a page of compiler warnings on stderr,
+    /// and on stdout more passing tests whose names say "failed" than any
+    /// keyword excerpt had room for, then the real verdict.
     #[test]
-    fn failed_check_puts_bounded_failure_lines_before_unchanged_tail() {
-        let output = format!(
-            "test queue::reports_name ... FAILED\nthread 'queue' panicked at src/queue.rs:12\nerror: check exited\n{}",
-            (0..50)
-                .map(|n| format!("warning {n}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+    fn a_failed_checks_verdict_survives_a_page_of_stderr_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("check.cmd");
+        std::fs::write(
+            &script,
+            [
+                "@echo off",
+                "for /L %%i in (1,1,60) do echo warning: unused variable `failed_%%i` 1>&2",
+                "for /L %%i in (1,1,12) do echo test tests::a_failed_push_%%i ... ok",
+                "echo test tests::queue_reports_the_name ... FAILED",
+                "echo failures:",
+                "echo ---- tests::queue_reports_the_name stdout ----",
+                "echo thread 'tests::queue_reports_the_name' panicked at src\\queue.rs:12:5:",
+                "echo window list was empty",
+                "echo failures:",
+                "echo     tests::queue_reports_the_name",
+                "echo test result: FAILED. 12 passed; 1 failed",
+                "echo error: test failed, to rerun pass `--bin foreman` 1>&2",
+                "exit /b 101",
+            ]
+            .join("\r\n"),
+        )
+        .unwrap();
+        let policy = CheckPolicy {
+            v: 1,
+            check: vec!["cmd".into(), "/c".into(), script.display().to_string()],
+            timeout_secs: 60,
+        };
+        let Ok(rec) = run_check(tmp.path(), Some(&policy), "p", "t", &|| false) else {
+            panic!("the check ran");
+        };
+        assert!(!rec.ok);
+        let detail = &rec.tail;
+        for wanted in [
+            "test tests::queue_reports_the_name ... FAILED",
+            "panicked at src\\queue.rs:12:5:",
+            "window list was empty",
+            "error: test failed, to rerun pass `--bin foreman`",
+        ] {
+            assert!(detail.contains(wanted), "{wanted:?} is in:\n{detail}");
+        }
+        assert!(
+            detail.ends_with("test result: FAILED. 12 passed; 1 failed"),
+            "stdout comes last:\n{detail}"
         );
-        let tail = tail_lines(&output, OUTPUT_TAIL_LINES);
-        assert!(!tail.contains("reports_name"));
-        let out = ChildOutcome {
+        assert!(!detail.contains("`failed_20`"), "stderr is cut to its tail");
+    }
+
+    fn outcome(stdout: &str, stderr: &str) -> ChildOutcome {
+        ChildOutcome {
             ok: false,
-            tail: tail.clone(),
-            failure_lines: failure_lines(&output),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
             timed_out: false,
             cancelled: false,
-        };
-        let detail = check_output(&out);
-        assert!(detail.starts_with("Failure lines:\ntest queue::reports_name ... FAILED\n"));
-        assert!(detail.contains("panicked at src/queue.rs:12\nerror: check exited"));
-        assert!(detail.ends_with(&format!("Last {OUTPUT_TAIL_LINES} lines:\n{tail}")));
+        }
     }
 
     #[test]
-    fn failure_excerpt_limits_lines_and_width_and_success_keeps_only_tail() {
-        let output = (0..20)
-            .map(|n| format!("error: {n} {}", "x".repeat(500)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let excerpt = failure_lines(&output);
-        assert_eq!(excerpt.lines().count(), FAILURE_LINES_MAX);
-        assert!(
-            excerpt
-                .lines()
-                .all(|line| line.chars().count() == FAILURE_LINE_CHARS)
-        );
-        let out = ChildOutcome {
-            ok: true,
-            tail: "ordinary output".into(),
-            failure_lines: excerpt,
-            timed_out: false,
-            cancelled: false,
+    fn check_output_is_bounded_per_stream_in_lines_and_width() {
+        let page = |tag: &str| {
+            (0..100)
+                .map(|n| format!("{tag} {n} {}", "x".repeat(1000)))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        assert_eq!(check_output(&out), "ordinary output");
+        let detail = check_output(&outcome(&page("out"), &page("err")));
+        // Each stream's tail, plus two headers and the blank between them.
+        assert_eq!(detail.lines().count(), 2 * OUTPUT_TAIL_LINES + 3);
+        assert!(
+            detail
+                .lines()
+                .all(|line| line.chars().count() <= OUTPUT_LINE_CHARS)
+        );
+        assert!(detail.contains(&format!("err 99 {}", "x".repeat(10))));
+        assert!(!detail.contains("err 59 "));
+        assert!(detail.lines().last().unwrap().starts_with("out 99 "));
+        assert!(detail.lines().last().unwrap().ends_with('…'));
+    }
+
+    #[test]
+    fn check_output_with_one_stream_is_just_its_tail() {
+        assert_eq!(
+            check_output(&outcome("ordinary output\n", "")),
+            "ordinary output"
+        );
+        assert_eq!(
+            check_output(&outcome("", "error[E0425]: cannot find value\n")),
+            "error[E0425]: cannot find value"
+        );
+    }
+
+    #[test]
+    fn a_git_failure_reads_both_streams_as_one_tail() {
+        let out = outcome(
+            "Auto-merging a.txt\nCONFLICT (content) in a.txt",
+            "error: could not apply\n",
+        );
+        assert_eq!(
+            out.tail(),
+            "Auto-merging a.txt\nCONFLICT (content) in a.txt\nerror: could not apply"
+        );
     }
 
     #[test]

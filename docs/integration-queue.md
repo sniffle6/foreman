@@ -43,17 +43,20 @@ against.
   "timeout_secs": 1800}` — argv, no shell, run in the prepared worktree.
   No file (or an empty `check`) means no checks; the request records
   `none configured` rather than pretending. The record stores the command,
-  result, output tail, prepared commit, and target commit together. On a
-  failed check, the detail starts with up to 12 lines containing generic
-  failure words (`failed`, `panicked at`, `error:`), each capped at 240
-  characters, followed by the last 40 output lines. This keeps the failure
-  name visible when later warnings fill the tail. Checks that pass keep just
-  the tail.
+  result, output tail, prepared commit, and target commit together. The
+  tail is cut per stream: the last 40 lines of stderr, then the last 40 of
+  stdout, each line capped at 400 characters (one stream alone gets no
+  headers). Stdout goes last on purpose. `cargo test` prints its verdict
+  (`... FAILED`, the panic and its message, the `failures:` name list) to
+  stdout and compiler warnings to stderr, and one combined tail let the
+  warnings push the failing test out. Gotcha: don't go back to grepping
+  for failure words. Passing tests with "failed" in their names fill any
+  such excerpt before the real failure.
 - **Hand-back** (`needs resolution`): a conflict leaves the worktree exactly
   as git stopped it (mid-rebase, conflict markers in place) and records the
-  conflicting files; a failed check records the failure lines and output
-  tail; a moved or dirty source (`source changed`), a git operation in
-  progress (`source busy`), or a missing worktree each say so. Every outcome
+  conflicting files; a failed check records its output tail; a moved or
+  dirty source (`source changed`), a git operation in progress
+  (`source busy`), or a missing worktree each say so. Every outcome
   carries a `next` action. The turn moves on to the next card. The worker
   resolves, commits, and resubmits.
 - **Held**: a destination checkout with uncommitted tracked changes outside
