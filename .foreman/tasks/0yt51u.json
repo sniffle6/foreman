@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "0yt51u",
+  "title": "Root-cause the flaky a_rejected_push_says_so test",
+  "body": "git_history::push::tests::a_rejected_push_says_so (src/git_history/push.rs) intermittently fails with: called `Result::unwrap_err()` on an `Ok` value: \"Pushed main → origin/main\". Seen in 3 of 20 probe runner VMs during card qlzq33 (2026-10-06) and in test.yml run 36965448827. Passes locally.\n\nLikely mechanism (fixture analysis, not yet proven): repo_and_remote() makes a root empty commit \"one\" with a fixed user.name/user.email. The test builds two such repos; when both commits land in the same second they are byte-identical, the same SHA, so the second push is \"up to date\" and returns Ok instead of being rejected. Prove it first: e.g. pin GIT_AUTHOR_DATE/GIT_COMMITTER_DATE equal on both repos and watch it fail every time, then fix the fixture so the two histories always differ (distinct message or date), not with sleeps or retries. Check the other tests that use repo_and_remote for the same assumption.\n\nAcceptance: the forced-collision repro fails before the fix and passes after; three consecutive green full runs; a line in the foreman-debugging-playbook or validation-and-qa skill only if the lesson generalises (fixture commits made in the same second collide). Precedent: 2c78d62 fixed the same class (created-to-the-second ordering) in kanban.rs.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "f4c54c6"
+    ]
+  },
+  "created": "2026-10-06T23:18:20Z",
+  "updated": "2026-10-07T02:22:03Z"
+}

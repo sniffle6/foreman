@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "8hjm85",
+  "title": "done and Cut refuse a worktree card whose branch is already gone",
+  "body": "Follow-up to card lugkyb (commit bb5969a). A worktree card whose card/<id> branch is gone (removed by hand) still breaks `done` and Cut. Both run kanban::worktree_status_now, whose `base...card/<id>` range fails with `unknown revision`. Both treat that as cannot verify: done is refused with no way forward, and every Cut holds the card back in Current indefinitely.\n\nFix: apply the rule lugkyb gave `rm`. A missing branch (kanban::branch_exists returns Ok(false), meaning git exit 1) leaves nothing to integrate or orphan, so done passes and Cut ships the card. Any other git failure still refuses or holds back (fail closed). An existing branch keeps today's ahead/dirty checks.\n\nRecommended shape: one helper in src/kanban.rs (a status for the guards that returns WorktreeStatus::default() when the branch is gone), called by kanban_rm, done_guard, and the `hold` closure in kanban_cut (all in src/wm.rs). It also removes the inline branch_exists check that lugkyb added to kanban_rm. Do NOT change worktree_status_now itself: the board's status poll and teardown also call it.\n\nAcceptance:\n- New test: in-progress worktree card, tree and branch both removed by hand -> done succeeds.\n- New test: Done worktree card, branch removed -> Cut ships it, not held back.\n- Still pass: rm_deletes_a_card_whose_worktree_and_branch_are_both_gone, rm_refuses_* tests, kanban_cut_holds_back_a_card_whose_worktree_is_ahead_of_base, kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed (non-repo = still held), done's ahead-of-base refusal.\n- docs/kanban-board.md: update wherever it describes done's guard or the Cut hold-back.\n\nTest gotcha (Windows): build the card with bring_up_worktree + claim_for_dispatch, as rm_deletes_a_card_whose_worktree_and_branch_are_both_gone does, not a dispatched pane. A live shell in the tree blocks `git worktree remove`.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "fc0e852"
+    ]
+  },
+  "created": "2026-10-07T02:12:21Z",
+  "updated": "2026-10-07T02:22:03Z"
+}

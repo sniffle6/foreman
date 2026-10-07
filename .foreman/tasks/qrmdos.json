@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "qrmdos",
+  "title": "Make cargo test pick its ConPTY host on purpose, not via PATH",
+  "body": "Found during card qlzq33 (2026-10-06); written up in the foreman-build-and-env skill (\"Your tests may not even run on the runner's ConPTY\"). portable-pty 0.9 loads conpty.dll by bare name (load_conpty in its win/psuedocon.rs) before falling back to the in-box host, so the Windows DLL search order applies, and it ends with PATH. install.ps1 adds %LOCALAPPDATA%\\Programs\\foreman to the user PATH, and the installed app keeps its sideloaded conpty.dll + OpenConsole.exe there (src/conpty_install.rs). Result: on any machine with foreman installed, every cargo test Session runs on OpenConsole, while CI (no such dir) runs on in-box conhost. The startup bytes differ (OpenConsole adds ESC[c and ESC[1t around the ESC[6n) and so does the timing. Which host a test gets is an accident of PATH.\n\nDecide first, then build. The tension: production runs on the sideloaded OpenConsole, so CI currently tests a host users never get, and local runs test the right host by accident. Options to weigh: (a) tests pin one host explicitly. For example, the test process calls SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) before the first PTY spawn so PATH is never searched, plus the vendored pair beside the test exe if OpenConsole is the choice. (b) CI runs the suite on both hosts. (c) Document only (the status quo). Also check a product edge: when ensure_conpty degrades to SideloadDisabled, does a dev build then pick up the installed foreman's conpty.dll from PATH instead of the in-box host?\n\nAcceptance: the decision and its reason recorded (an ADR in docs/adr/ if it is a lasting choice); local and CI runs get the same, deliberate host no matter what is on PATH; the foreman-build-and-env paragraph updated to match. Planning-mode work, so start it in a fresh session and confirm the decision with the user before implementing.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "1a2f06e"
+    ]
+  },
+  "created": "2026-10-06T23:25:48Z",
+  "updated": "2026-10-07T02:22:03Z"
+}

@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "4qkjdy",
+  "title": "Measure the process-scan refresh cost in a release build",
+  "body": "Process-scan refresh: proc::Scanner::refresh in src/proc.rs. agent_for calls it at most every REFRESH_EVERY (1.5 s) from the tab-icon path (Session::icon_kind), on the UI thread. Close requests also force it via refresh_now.\n\nKnown numbers (2026-10-06, debug build, about 430 processes): the sysinfo refresh_processes_specifics call with with_cmd(UpdateKind::Always) took about 20 ms. The creation_time sweep added in card o6kzlr cost about 1 ms. Both are debug numbers. Nobody has measured release, so it is unknown whether this is a visible frame hitch every 1.5 s.\n\nDo (predict, then measure; see foreman-proof-and-analysis-toolkit Recipe 4 and foreman-diagnostics-and-tooling for throwaway-harness patterns):\n1. Write the prediction down first.\n2. Time Scanner::refresh in a release build, split into the sysinfo call and the creation_time sweep. Use a temporary harness built with --release --target-dir target/agent. Never use cargo test --release, and never kill a running foreman.\n3. If it is over about 2 ms, fix the cost at its source. Options: re-read command lines only for new PIDs (UpdateKind::OnlyIfNotSet), or move the refresh off the UI thread. Re-measure after.\n4. If it is under that, record the number and close with no code change.\n\nAcceptance: before and after release numbers, dated, with the setup, in the commit body. Also add a line to docs/tab-icons.md under \"Process scan is throttled\". Any fix keeps the recycled-PID guard (is_child_of / creation_time; docs/close-confirm.md, \"Recycled parent PIDs\") working, and keeps the proc:: tests green.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "e10e055"
+    ]
+  },
+  "created": "2026-10-07T00:23:24Z",
+  "updated": "2026-10-07T02:22:03Z"
+}

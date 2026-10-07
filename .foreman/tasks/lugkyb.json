@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "lugkyb",
+  "title": "kanban rm refuses a card whose worktree and branch are both gone",
+  "body": "`foreman kanban rm <id>` refuses a card whose worktree folder AND card/<id> branch are both gone, even though no unmerged work is left to protect. Today the only way out is hand-editing the card JSON to delete its \"worktree\" key.\n\nRepro: a worktree card with a commit ahead of base, then\n  git worktree remove .foreman/worktrees/<id> && git branch -D card/<id>\n  foreman kanban rm <id>\nfails with:\n  foreman kanban: card <id>: cannot verify its worktree (fatal: ambiguous argument 'main...card/<id>': unknown revision or path not in the working tree.); retry or discard it first\nGrep that message to find the guard.\n\nFix: when the branch does not exist (check with git rev-parse --verify --quiet refs/heads/card/<id>, don't parse error text), treat it as nothing to lose and delete the card. Keep refusing on any other git failure, and keep the existing dirty/ahead refusals for a branch that does exist.\n\nAcceptance:\n- New test: card with worktree metadata, tree folder and branch both missing -> rm succeeds and the card file is gone.\n- Existing rm guard tests (dirty tree, ahead of base) still refuse.\n- docs/kanban-board.md updated if it describes rm's guard.\n\nPossibly related, not confirmed: the board's discard also failed on the same card (blocked, unclaimed, clean, +1 -2) before the branch was deleted. The symptom wasn't recorded, so don't chase it unless the same code path is obviously at fault.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "bb5969a"
+    ]
+  },
+  "created": "2026-10-07T01:52:32Z",
+  "updated": "2026-10-07T02:22:03Z"
+}

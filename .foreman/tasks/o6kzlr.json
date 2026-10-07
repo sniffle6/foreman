@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "id": "o6kzlr",
+  "title": "Root-cause the flaky idle_terminals_produce_no_groups test",
+  "body": "wm::tests::idle_terminals_produce_no_groups (src/wm.rs) failed once in 11 full local cargo test runs during card qlzq33 (2026-10-06), at its first assert: m.terminal_groups() was not empty for an idle cmd.exe Session. Never seen on CI (0 of ~65 runs in the qlzq33 census and probes). The failure message does not say which process was found, so the culprit is unknown.\n\nLeading hypothesis (unproven): PID reuse in the descendant scan. crate::proc::top_children / collect_top_level (src/proc.rs) build the tree from sysinfo parent PIDs with no creation-time check, so a process whose parent died, with that PID recycled to the new cmd.exe, reads as cmd's child. The full suite's process churn makes reuse plausible. Already ruled out: console-host plumbing. openconsole.exe and conhost.exe are in HOST_PLUMBING.\n\nFirst step: make the assert print the found ProcInfo rows (name, pid) so the next failure names the process, and try to reproduce under full-suite load (rerun the suite in a loop). If it is PID reuse, the fix belongs in the product (proc.rs): a child must not be older than its parent, so compare process start times (sysinfo exposes start_time). That also protects the close-confirm and tab-icon paths that use the same scan. Not allowed: retries, sleeps, or serializing the suite.\n\nAcceptance: a named mechanism with evidence (a repro or a pure-table unit test of the scan with a recycled PID); the fix at the mechanism; three consecutive green full runs. Add a playbook or validation-and-qa line only if the lesson generalises.\n\nGate: cargo build --target-dir target/agent; cargo test --target-dir target/agent; cargo fmt --check",
+  "state": "done",
+  "shipped": {
+    "name": "v0.7.3",
+    "at": "2026-10-07T02:22:03Z",
+    "commits": [
+      "5fce4b6"
+    ]
+  },
+  "created": "2026-10-06T23:22:35Z",
+  "updated": "2026-10-07T02:22:03Z"
+}
