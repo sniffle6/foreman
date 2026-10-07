@@ -1909,6 +1909,16 @@ pub fn wait_verdict(
 /// Run `git -C <cwd> <args>`; `Ok(stdout trimmed)` on exit 0, otherwise
 /// `Err(first stderr line)` (or a spawn error). Never opens a console window.
 pub(crate) fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = git_output(cwd, args)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(git_failure(args, &out))
+    }
+}
+
+/// `git` without the exit-status verdict, for callers that read the code.
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());
@@ -1917,25 +1927,43 @@ pub(crate) fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    cmd.output().map_err(|e| format!("cannot run git: {e}"))
+}
+
+/// The first stderr line of a failed `git`, or the exit status if silent.
+fn git_failure(args: &[&str], out: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr);
+    let first = err
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first.is_empty() {
+        format!(
+            "git {} failed ({})",
+            args.first().unwrap_or(&""),
+            out.status
+        )
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let first = err
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-        if first.is_empty() {
-            Err(format!(
-                "git {} failed ({})",
-                args.first().unwrap_or(&""),
-                out.status
-            ))
-        } else {
-            Err(first.to_string())
-        }
+        first.to_string()
+    }
+}
+
+/// Does `refs/heads/<branch>` exist? `rev-parse --verify --quiet` exits 1,
+/// silently, for a missing ref; any other failure (no git, not a
+/// repository) is `Err`, never a guess — `rm` deletes a card on `Ok(false)`.
+pub fn branch_exists(cwd: &std::path::Path, branch: &str) -> Result<bool, String> {
+    let args = [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ];
+    let out = git_output(cwd, &args)?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(git_failure(&args, &out)),
     }
 }
 
@@ -3275,6 +3303,17 @@ mod tests {
             in_place: false,
         };
         assert!(worktree_status_now(tmp.path(), &wt).is_err());
+    }
+
+    #[test]
+    fn branch_exists_tells_a_missing_branch_from_a_git_failure() {
+        // `rm` deletes a card whose branch is gone, so only git's own "no
+        // such ref" may read as gone; a git that cannot answer stays `Err`.
+        let Some(repo) = git_repo() else { return };
+        assert_eq!(branch_exists(repo.path(), "main"), Ok(true));
+        assert_eq!(branch_exists(repo.path(), "card/a1b2c3"), Ok(false));
+        let tmp = tempfile::tempdir().unwrap(); // not a repository
+        assert!(branch_exists(tmp.path(), "main").is_err());
     }
 
     #[test]

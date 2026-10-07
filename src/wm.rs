@@ -3270,9 +3270,10 @@ impl WindowManager {
 
     /// `rm` pre-check + delete + teardown (spec: dispatch-worktrees §Teardown,
     /// the `rm` row): refuse while the tree is dirty or ahead of base, so a
-    /// deleted card never orphans a branch nobody can find. The verdict is
-    /// synchronous (the status-probe commands, ~100 ms) because the card
-    /// file is gone before the asynchronous teardown reports.
+    /// deleted card never orphans a branch nobody can find. A branch already
+    /// gone (removed by hand) has nothing left to orphan: no probe, delete.
+    /// The verdict is synchronous (the status-probe commands, ~100 ms)
+    /// because the card file is gone before the asynchronous teardown reports.
     fn kanban_rm(&mut self, id: &str) -> Result<(), String> {
         if let Some(phase) = self.integration_owns(id) {
             return Err(format!(
@@ -3287,9 +3288,14 @@ impl WindowManager {
             .and_then(|c| c.worktree.clone());
         if let (Some(wt), Some(cwd)) = (&wt, self.cwd.as_deref()) {
             // Fail closed: if git cannot answer, the card stays.
-            let st = crate::kanban::worktree_status_now(cwd, wt).map_err(|e| {
+            let unverified = |e| {
                 format!("card {id}: cannot verify its worktree ({e}); retry or discard it first")
-            })?;
+            };
+            let st = if crate::kanban::branch_exists(cwd, &wt.branch).map_err(unverified)? {
+                crate::kanban::worktree_status_now(cwd, wt).map_err(unverified)?
+            } else {
+                crate::kanban::WorktreeStatus::default()
+            };
             if st.dirty || st.ahead > 0 {
                 return Err(format!(
                     "card {id} has unmerged work in its worktree; discard it first"
@@ -17249,6 +17255,74 @@ mod tests {
                 .get(&id)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn rm_refuses_a_card_whose_branch_is_ahead_of_base() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (id, _, _) = worktree_card_with_a_commit(&mut m, pid, &ctx, "ahead", "a.txt");
+        let mut rm = kanban_req("rm");
+        rm.id = Some(id.clone());
+        let e = m.kanban_dispatch(&rm).unwrap_err();
+        assert!(e.contains("unmerged work"), "{e}");
+        let child = m.project_child_mut(pid).unwrap();
+        assert!(child.kanban.borrow().get(&id).is_some());
+    }
+
+    #[test]
+    fn rm_deletes_a_card_whose_worktree_and_branch_are_both_gone() {
+        // Removed by hand (`git worktree remove` + `git branch -D`): no
+        // commit is left to protect, so the dead `base...card/<id>` range
+        // must not refuse rm — that left hand-editing the JSON as the only
+        // way out. No pane runs in the tree: Windows would hold the
+        // directory against the hand removal.
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let mut child = WindowManager::new();
+        child.tag = Some("p1".into());
+        child.cwd = Some(repo.path().to_path_buf());
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = child.kanban.borrow_mut().add("gone", None).unwrap();
+        let card = child.kanban.borrow().get(&id).unwrap().clone();
+        let crate::kanban::BringUp::Worktree(wt) =
+            crate::kanban::bring_up_worktree(repo.path(), &card).unwrap()
+        else {
+            panic!()
+        };
+        child
+            .kanban
+            .borrow_mut()
+            .claim_for_dispatch(
+                &id,
+                "t1",
+                "claude",
+                "OLD_RUN",
+                crate::kanban::TermState::Missing,
+                Some(wt.clone()),
+            )
+            .unwrap();
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("g.txt"), "gone\n").unwrap();
+        git_q(tree, &["add", "g.txt"]);
+        git_q(tree, &["commit", "-q", "-m", "gone"]);
+        git_q(repo.path(), &["worktree", "remove", &wt.path]);
+        git_q(repo.path(), &["branch", "-D", &wt.branch]);
+
+        child.kanban_rm(&id).unwrap();
+        assert!(child.kanban.borrow().get(&id).is_none());
+        let file = repo
+            .path()
+            .join(".foreman")
+            .join("tasks")
+            .join(format!("{id}.json"));
+        assert!(!file.exists(), "{}", file.display());
     }
 
     #[test]

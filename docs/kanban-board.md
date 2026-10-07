@@ -51,7 +51,10 @@ sibling — read those for *why*, this doc for *how*.
   once the worker's terminal is gone; a dirty tree or an unmerged branch is
   kept and the card says so. `rm` refuses outright while the tree is dirty or
   ahead of base, and also when git cannot answer (fail closed: an
-  uninspectable worktree is never deleted). Re-dispatching a released card
+  uninspectable worktree is never deleted). A card whose `card/<id>` branch
+  is already gone (removed by hand) has nothing left to lose: `rm` deletes
+  it without probing — only git's own "no such ref" counts as gone, never a
+  failed git. Re-dispatching a released card
   cancels its still-queued teardown and refuses while one is mid-removal.
   `block` and orphaned cards keep the tree so Restart resumes in it. Outside a git repository dispatch runs in place silently; on a
   detached HEAD it runs in place with a warning toast. **Discard worktree** on
