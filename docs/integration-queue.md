@@ -88,7 +88,8 @@ against.
   then marks it Done, queues the ordinary held teardown, and removes the
   request. `done` by hand on a worktree card is refused while the queue owns
   it and while the branch has commits not on its base; a branch already on
-  base (integrated by hand) passes on ancestry alone.
+  base (integrated by hand) passes on ancestry alone, and a branch already
+  gone (removed by hand) passes with nothing left to integrate.
 - **Ownership guards**: while a request is queued or integrating the queue
   owns the worktree — teardown waits, and `rm`, Discard, and re-dispatch
   are refused with the phase and the cancel command.

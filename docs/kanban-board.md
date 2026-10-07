@@ -52,9 +52,10 @@ sibling — read those for *why*, this doc for *how*.
   kept and the card says so. `rm` refuses outright while the tree is dirty or
   ahead of base, and also when git cannot answer (fail closed: an
   uninspectable worktree is never deleted). A card whose `card/<id>` branch
-  is already gone (removed by hand) has nothing left to lose: `rm` deletes
-  it without probing — only git's own "no such ref" counts as gone, never a
-  failed git. Re-dispatching a released card
+  is already gone (removed by hand) has nothing left to integrate or lose,
+  so all three guards let it through without probing: `rm` deletes it,
+  `done` passes it, and Cut ships it. Only git's own "no such ref" counts as
+  gone, never a failed git. Re-dispatching a released card
   cancels its still-queued teardown and refuses while one is mid-removal.
   `block` and orphaned cards keep the tree so Restart resumes in it. Outside a git repository dispatch runs in place silently; on a
   detached HEAD it runs in place with a warning toast. **Discard worktree** on
@@ -129,7 +130,8 @@ sibling — read those for *why*, this doc for *how*.
   Cut, and leaves the other three columns live. A Done card whose kept
   worktree is dirty, is ahead of base, or cannot be probed at all is not
   provably in the tip, so Cut leaves it in Current and says so; commit and
-  merge it, or Discard it, and it goes into the next Cut.
+  merge it, or Discard it, and it goes into the next Cut. A card whose
+  branch is already gone ships (see the worktree bullet above).
   Duplicate names (case-insensitive) and `Current` are refused. The
   selection is view state and resets to Current on restart. Why this shape
   and what was rejected: `docs/superpowers/specs/2026-09-16-kanban-cut-design.md`.
@@ -280,8 +282,9 @@ that already has a plan (and errors on one that does not), and `--plan ""`
 clears the plan. Plans read back through `list --json` as the card's
 `planned` object; there is no read verb and no new `cmd` on the wire.
 A worktree card's `done` is additionally refused while its integration
-request is queued or integrating, and while its branch has commits not on
-its base (`docs/integration-queue.md`).
+request is queued or integrating, while its branch has commits not on its
+base, and when git cannot answer (`docs/integration-queue.md`). A branch
+already gone (removed by hand) passes.
 
 ## Gotchas
 
@@ -417,7 +420,9 @@ its base (`docs/integration-queue.md`).
   / `is_orphaned` (derived orphan rule), `run_nonce`, `dispatch_prompt` +
   `CloseoutStyle`, `CardLine`, `wait_verdict`; the worktree half:
   `Worktree` / `WorktreeStatus`, `worktree_layout`, `worktree_summary`,
-  `bring_up_worktree`, `worktree_status_now`, `teardown_worktree` (+
+  `bring_up_worktree`, `worktree_status_now`, `guard_status` (the
+  `rm` / `done` / Cut probe: a gone branch reads clean) + `branch_exists`,
+  `teardown_worktree` (+
   `remove_tree` / `delete_branch`, the retry-safe steps) + `teardown_verdict`,
   `CardStore::take_status_poll`; the overview half:
   `parse_worktree_list`, `foreman_worktrees_now`, `strays_among`,

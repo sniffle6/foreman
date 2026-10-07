@@ -1951,7 +1951,8 @@ fn git_failure(args: &[&str], out: &std::process::Output) -> String {
 
 /// Does `refs/heads/<branch>` exist? `rev-parse --verify --quiet` exits 1,
 /// silently, for a missing ref; any other failure (no git, not a
-/// repository) is `Err`, never a guess — `rm` deletes a card on `Ok(false)`.
+/// repository) is `Err`, never a guess — on `Ok(false)` the guards
+/// (`guard_status`) let `rm` delete a card and `done` / Cut pass it.
 pub fn branch_exists(cwd: &std::path::Path, branch: &str) -> Result<bool, String> {
     let args = [
         "rev-parse",
@@ -2234,8 +2235,9 @@ fn checkout_changes_strict(root: &std::path::Path) -> Result<String, String> {
 }
 
 /// Live status probe (spec §Status poll): dirty from inside the tree,
-/// ahead/behind from any checkout of the repo. Also the synchronous `rm`
-/// pre-check. A vanished directory reads as `missing` with counts intact.
+/// ahead/behind from any checkout of the repo. The guards (`rm`, `done`,
+/// Cut) reach it through `guard_status`. A vanished directory reads as
+/// `missing` with counts intact.
 ///
 /// Fails CLOSED: a git error (no binary, lock contention, bad ref) is an
 /// `Err`, never a clean-looking zero status — `rm` refuses on it rather than
@@ -2272,6 +2274,23 @@ pub fn worktree_status_now(
         &["rev-list", "--left-right", "--count", &range],
     )?;
     Ok(parse_status(porcelain.as_deref(), &rev_list))
+}
+
+/// The status the guards judge a card by: `rm`'s pre-check, `done`, and
+/// Cut's hold-back. A `card/<id>` branch already gone (removed by hand)
+/// leaves nothing to integrate or orphan, so it reads clean instead of
+/// failing on the dead `base...card/<id>` range. Only git's own "no such
+/// ref" counts as gone (`branch_exists`); any other failure stays `Err`.
+/// The board's poll and teardown keep `worktree_status_now`'s error.
+pub fn guard_status(
+    project_cwd: &std::path::Path,
+    wt: &Worktree,
+) -> Result<WorktreeStatus, String> {
+    if branch_exists(project_cwd, &wt.branch)? {
+        worktree_status_now(project_cwd, wt)
+    } else {
+        Ok(WorktreeStatus::default())
+    }
 }
 
 /// Every foreman worktree git knows about, for the board's overview.
@@ -3314,6 +3333,31 @@ mod tests {
         assert_eq!(branch_exists(repo.path(), "card/a1b2c3"), Ok(false));
         let tmp = tempfile::tempdir().unwrap(); // not a repository
         assert!(branch_exists(tmp.path(), "main").is_err());
+    }
+
+    #[test]
+    fn guard_status_reads_a_gone_branch_as_clean_and_still_fails_closed() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("f.txt"), "two\n").unwrap();
+        git_in(tree, &["commit", "-q", "-am", "work"]);
+        // the branch exists: the full probe, ahead and all
+        assert_eq!(guard_status(repo.path(), &wt).unwrap().ahead, 1);
+        // removed by hand: the poll's probe errors, the guards read clean
+        git_in(repo.path(), &["worktree", "remove", &wt.path]);
+        git_in(repo.path(), &["branch", "-D", &wt.branch]);
+        assert!(worktree_status_now(repo.path(), &wt).is_err());
+        assert_eq!(
+            guard_status(repo.path(), &wt),
+            Ok(WorktreeStatus::default())
+        );
+        // git cannot answer at all: still an error, never "gone"
+        let tmp = tempfile::tempdir().unwrap(); // not a repository
+        assert!(guard_status(tmp.path(), &wt).is_err());
     }
 
     #[test]

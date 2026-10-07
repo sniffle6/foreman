@@ -3271,7 +3271,7 @@ impl WindowManager {
     /// `rm` pre-check + delete + teardown (spec: dispatch-worktrees §Teardown,
     /// the `rm` row): refuse while the tree is dirty or ahead of base, so a
     /// deleted card never orphans a branch nobody can find. A branch already
-    /// gone (removed by hand) has nothing left to orphan: no probe, delete.
+    /// gone (removed by hand) has nothing left to orphan (`guard_status`).
     /// The verdict is synchronous (the status-probe commands, ~100 ms)
     /// because the card file is gone before the asynchronous teardown reports.
     fn kanban_rm(&mut self, id: &str) -> Result<(), String> {
@@ -3288,14 +3288,9 @@ impl WindowManager {
             .and_then(|c| c.worktree.clone());
         if let (Some(wt), Some(cwd)) = (&wt, self.cwd.as_deref()) {
             // Fail closed: if git cannot answer, the card stays.
-            let unverified = |e| {
+            let st = crate::kanban::guard_status(cwd, wt).map_err(|e| {
                 format!("card {id}: cannot verify its worktree ({e}); retry or discard it first")
-            };
-            let st = if crate::kanban::branch_exists(cwd, &wt.branch).map_err(unverified)? {
-                crate::kanban::worktree_status_now(cwd, wt).map_err(unverified)?
-            } else {
-                crate::kanban::WorktreeStatus::default()
-            };
+            })?;
             if st.dirty || st.ahead > 0 {
                 return Err(format!(
                     "card {id} has unmerged work in its worktree; discard it first"
@@ -3318,14 +3313,15 @@ impl WindowManager {
     /// Cut (spec: kanban-cut §Cut). The store owns validation, the batch
     /// write, and the revert; this seam supplies the two facts that need
     /// the project: the worktree hold-back probe (the `rm` pre-check
-    /// verdict — fail closed, an unprobeable tree stays in Current) and the
+    /// verdict — fail closed, an unprobeable tree stays in Current; a
+    /// branch already gone ships) and the
     /// trailer walk, bounded by the oldest candidate's `created`.
     fn kanban_cut(&mut self, name: &str) -> Result<crate::kanban::CutOutcome, String> {
         let cwd = self.cwd.clone().ok_or("project has no working directory")?;
         let hold_cwd = cwd.clone();
         let hold = move |c: &crate::kanban::Card| -> Option<String> {
             let wt = c.worktree.as_ref()?;
-            match crate::kanban::worktree_status_now(&hold_cwd, wt) {
+            match crate::kanban::guard_status(&hold_cwd, wt) {
                 Err(e) => Some(format!("cannot verify worktree: {e}")),
                 Ok(st) if st.dirty || st.ahead > 0 => Some(format!("unmerged {}", wt.branch)),
                 Ok(_) => None,
@@ -4756,8 +4752,9 @@ impl WindowManager {
     /// queue): a worktree card is refused while the queue owns it, or while
     /// its branch carries commits not on its base — with the command to run
     /// instead. A branch already on base (integrated by hand, or by the
-    /// queue) passes: ancestry, not bookkeeping, is the proof. Fails closed
-    /// when git cannot answer. Cards without a worktree are untouched.
+    /// queue) passes: ancestry, not bookkeeping, is the proof. So does a
+    /// branch already gone (`guard_status`). Fails closed when git cannot
+    /// answer. Cards without a worktree are untouched.
     fn done_guard(&self, id: &str) -> Result<(), String> {
         let card = self.kanban.borrow().get(id).cloned();
         let Some(card) = card else {
@@ -4776,7 +4773,7 @@ impl WindowManager {
             .cwd
             .as_deref()
             .ok_or("project has no working directory")?;
-        let st = crate::kanban::worktree_status_now(cwd, wt)
+        let st = crate::kanban::guard_status(cwd, wt)
             .map_err(|e| format!("card {id}: cannot verify its worktree ({e}); retry"))?;
         if st.ahead > 0 {
             return Err(format!(
@@ -16198,8 +16195,9 @@ mod tests {
 
     /// The hold-back probe fails CLOSED: a Done card whose worktree git
     /// cannot answer about stays in Current, unstamped, while its merged
-    /// neighbour ships. The tempdir is not a repo, so `worktree_status_now`
-    /// errors — the same verdict a lock, a missing git, or a bad ref gives.
+    /// neighbour ships. The tempdir is not a repo, so `guard_status` errors —
+    /// the same verdict a lock, a missing git, or a bad ref gives. (Only a
+    /// branch git reports as missing ships: see the `_branch_is_gone` test.)
     #[test]
     fn kanban_cut_holds_back_a_card_whose_worktree_cannot_be_probed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -16338,6 +16336,28 @@ mod tests {
             "an unmerged card stays in Current, unstamped"
         );
         assert_eq!(s.get(&clean).unwrap().shipped.as_ref().unwrap().name, "v1");
+    }
+
+    /// A Done card whose branch was removed by hand has nothing left to
+    /// merge: Cut ships it rather than holding it back on every Cut over a
+    /// `base...card/<id>` range git can no longer resolve.
+    #[test]
+    fn kanban_cut_ships_a_done_card_whose_branch_is_gone() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = worktree_card_removed_by_hand(child, repo.path());
+        child.kanban.borrow_mut().done(&id).unwrap();
+
+        let out = child.kanban_cut("v1").unwrap();
+        assert_eq!(out.shipped, vec![id.clone()]);
+        assert!(out.held_back.is_empty(), "{out:?}");
+        let s = child.kanban.borrow();
+        assert_eq!(s.get(&id).unwrap().shipped.as_ref().unwrap().name, "v1");
     }
 
     /// The trailer walk's `--since` bound is the EARLIEST candidate's
@@ -17275,24 +17295,15 @@ mod tests {
         assert!(child.kanban.borrow().get(&id).is_some());
     }
 
-    #[test]
-    fn rm_deletes_a_card_whose_worktree_and_branch_are_both_gone() {
-        // Removed by hand (`git worktree remove` + `git branch -D`): no
-        // commit is left to protect, so the dead `base...card/<id>` range
-        // must not refuse rm — that left hand-editing the JSON as the only
-        // way out. No pane runs in the tree: Windows would hold the
-        // directory against the hand removal.
-        let Some(repo) = kanban_git_repo() else {
-            return;
-        };
-        let mut child = WindowManager::new();
-        child.tag = Some("p1".into());
-        child.cwd = Some(repo.path().to_path_buf());
-        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+    /// An In Progress worktree card that committed on its branch, after which
+    /// the tree and the branch were both removed by hand (`git worktree
+    /// remove` + `git branch -D`). Built with no pane: a live shell in the
+    /// tree would make Windows hold the directory against the hand removal.
+    fn worktree_card_removed_by_hand(child: &WindowManager, repo: &std::path::Path) -> String {
         let id = child.kanban.borrow_mut().add("gone", None).unwrap();
         let card = child.kanban.borrow().get(&id).unwrap().clone();
         let crate::kanban::BringUp::Worktree(wt) =
-            crate::kanban::bring_up_worktree(repo.path(), &card).unwrap()
+            crate::kanban::bring_up_worktree(repo, &card).unwrap()
         else {
             panic!()
         };
@@ -17312,8 +17323,24 @@ mod tests {
         std::fs::write(tree.join("g.txt"), "gone\n").unwrap();
         git_q(tree, &["add", "g.txt"]);
         git_q(tree, &["commit", "-q", "-m", "gone"]);
-        git_q(repo.path(), &["worktree", "remove", &wt.path]);
-        git_q(repo.path(), &["branch", "-D", &wt.branch]);
+        git_q(repo, &["worktree", "remove", &wt.path]);
+        git_q(repo, &["branch", "-D", &wt.branch]);
+        id
+    }
+
+    #[test]
+    fn rm_deletes_a_card_whose_worktree_and_branch_are_both_gone() {
+        // No commit is left to protect, so the dead `base...card/<id>` range
+        // must not refuse rm — that left hand-editing the JSON as the only
+        // way out.
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let mut child = WindowManager::new();
+        child.tag = Some("p1".into());
+        child.cwd = Some(repo.path().to_path_buf());
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = worktree_card_removed_by_hand(&child, repo.path());
 
         child.kanban_rm(&id).unwrap();
         assert!(child.kanban.borrow().get(&id).is_none());
@@ -17753,6 +17780,34 @@ mod tests {
         let mut done2 = kanban_req("done");
         done2.id = Some(plain);
         assert!(m.kanban_dispatch(&done2).unwrap().ok);
+    }
+
+    #[test]
+    fn done_passes_a_card_whose_worktree_and_branch_are_both_gone() {
+        // Nothing is left to integrate, so the dead `base...card/<id>` range
+        // must not refuse done — that left the card In Progress for good.
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = worktree_card_removed_by_hand(child, repo.path());
+
+        let mut done = kanban_req("done");
+        done.id = Some(id.clone());
+        assert!(m.kanban_dispatch(&done).unwrap().ok);
+        let child = m.project_child_mut(pid).unwrap();
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::Done
+        );
+        // teardown finds both steps already done and clears the record
+        drain_until(child, &ctx, |c| {
+            c.kanban.borrow().get(&id).unwrap().worktree.is_none()
+        });
     }
 
     #[test]
