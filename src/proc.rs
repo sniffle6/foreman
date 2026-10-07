@@ -5,15 +5,16 @@
 //!
 //! Interface: [`agent_for`] — give it the shell's PID, get back the agent
 //! running under it (or `None`). Everything else (the throttled `sysinfo`
-//! refresh, the per-PID memo, the descendant matching) is hidden.
+//! scan on its own thread, the per-PID memo, the descendant matching) is hidden.
 //!
 //! Windows-only blind spot: a WSL (`bash`) pane runs the agent *inside* the WSL
 //! VM, which isn't a Windows process, so it won't show here — those rely on the
 //! OSC-title path.
 
 use crate::icons::IconKind;
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 /// Refresh the process table at most this often. The scan is best-effort and the
@@ -23,6 +24,7 @@ const REFRESH_EVERY: Duration = Duration::from_millis(1500);
 /// One process, flattened to just what detection needs. Plain data so the
 /// matching logic is unit-tested with synthetic tables (no real OS). Keep it to
 /// these five fields.
+#[cfg_attr(test, derive(Clone))]
 struct ProcRow {
     pid: u32,
     /// The PID this process was created by. Windows never rewrites it, so after
@@ -91,11 +93,34 @@ fn descends_from(table: &[ProcRow], row: &ProcRow, root: u32) -> bool {
 /// one closest to the shell. An agent launched by another agent's tool
 /// (`codex exec` from Claude's Bash) is deeper, so it never flips the icon; the
 /// table comes from a HashMap, so first-found would be arbitrary.
+#[cfg(test)]
 fn detect_agent(table: &[ProcRow], root_pid: u32) -> Option<IconKind> {
+    closest_agent(table, &agent_rows(table), root_pid)
+}
+
+/// Index and kind of every agent-named row in `table`. The expensive half of
+/// detection — a path parse of every process name and argument, ~0.5 ms per
+/// table (release, ~425 processes, 2026-10-06) — so a scan does it once, off
+/// the UI thread, instead of once per shell.
+fn agent_rows(table: &[ProcRow]) -> Vec<(usize, IconKind)> {
     table
         .iter()
-        .filter_map(|row| {
-            let kind = agent_of_row(row)?;
+        .enumerate()
+        .filter_map(|(i, row)| Some((i, agent_of_row(row)?)))
+        .collect()
+}
+
+/// The agent closest to `root_pid` among `agents` (= [`agent_rows`] of `table`):
+/// `detect_agent`'s rule, with the expensive half already done by the scan.
+fn closest_agent(
+    table: &[ProcRow],
+    agents: &[(usize, IconKind)],
+    root_pid: u32,
+) -> Option<IconKind> {
+    agents
+        .iter()
+        .filter_map(|&(i, kind)| {
+            let row = &table[i];
             let depth = depth_below(table, row, root_pid)?;
             Some((depth, row.pid, kind))
         })
@@ -152,56 +177,107 @@ fn collect_top_level(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
         .collect()
 }
 
-/// The shell's live top-level children (with subtree rollups). Throttled through
-/// the same scanner as `agent_for`; empty for an idle shell.
+/// The shell's live top-level children (with subtree rollups); empty for an idle
+/// shell. Reads the table `refresh_now` just published; scans here, on the
+/// caller's thread, only when that table is missing or stale.
 pub fn top_children(root_pid: u32) -> Vec<ProcInfo> {
-    SCANNER.with(|s| {
-        let mut s = s.borrow_mut();
-        let stale = s.last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
-        if stale {
-            s.refresh();
+    collect_top_level(&scanner().fresh().table, root_pid)
+}
+
+/// Scan now, on the caller's thread, ignoring the throttle, so the following
+/// `top_children` calls read a table taken after this instant. Called once at
+/// the instant a close/quit is requested: without it, a child spawned inside the
+/// last throttle window (<`REFRESH_EVERY`) is invisible and the pane closes with
+/// no warning — the exact silent-kill the confirm exists to prevent. One ~15 ms
+/// stall on the closing click (not the modal); up to twice that when it has to
+/// wait out a background scan in flight.
+pub fn refresh_now() {
+    scanner().scan();
+}
+
+/// One finished scan. Published whole; readers share it through an `Arc`.
+struct Snapshot {
+    table: Vec<ProcRow>,
+    /// When the scan began, so staleness counts from the oldest data in it.
+    taken: Instant,
+    /// [`agent_rows`] of `table`, computed by the scan.
+    agent_rows: Vec<(usize, IconKind)>,
+    /// `agent_for`'s answer per shell PID against this table.
+    answers: Mutex<HashMap<u32, Option<IconKind>>>,
+}
+
+impl Snapshot {
+    fn new(table: Vec<ProcRow>, taken: Instant) -> Self {
+        Self {
+            agent_rows: agent_rows(&table),
+            table,
+            taken,
+            answers: Mutex::new(HashMap::new()),
         }
-        collect_top_level(&s.table, root_pid)
+    }
+}
+
+/// The OS process table, scanned on a background thread. A scan costs ~12–15 ms
+/// in a release build (2026-10-06, 375–425 processes), most of it the kernel's
+/// process snapshot, which no sysinfo setting avoids — so the UI thread never
+/// waits on one for a tab icon: it reads the last published table and kicks a
+/// rescan when that table is stale.
+struct Scanner {
+    /// Held for a whole scan. Scans are serialized, so each publish replaces an
+    /// older table, never a newer one.
+    sys: Mutex<sysinfo::System>,
+    latest: Mutex<Option<Arc<Snapshot>>>,
+    /// A background scan is queued or running; one kick per stale table, not one
+    /// per frame.
+    kicked: AtomicBool,
+    kick: mpsc::Sender<()>,
+}
+
+fn scanner() -> &'static Scanner {
+    static SCANNER: OnceLock<Scanner> = OnceLock::new();
+    SCANNER.get_or_init(|| {
+        let (kick, rx) = mpsc::channel::<()>();
+        // If the thread can't spawn, `rx` drops with the closure, the first kick
+        // fails to send, and `latest` falls back to scanning in place.
+        let _ = std::thread::Builder::new()
+            .name("proc-scan".into())
+            .spawn(move || {
+                for () in rx {
+                    let s = scanner();
+                    s.scan();
+                    s.kicked.store(false, Ordering::Release);
+                }
+            });
+        Scanner {
+            sys: Mutex::new(sysinfo::System::new()),
+            latest: Mutex::new(None),
+            kicked: AtomicBool::new(false),
+            kick,
+        }
     })
 }
 
-/// Force an immediate table refresh, ignoring the throttle, and reset it so the
-/// following `top_children` calls this frame reuse the fresh scan. Called once at
-/// the instant a close/quit is requested: without it, a child spawned inside the
-/// last throttle window (<`REFRESH_EVERY`) is invisible and the pane closes with
-/// no warning — the exact silent-kill the confirm exists to prevent. One
-/// synchronous scan on the caller's thread, on the closing click (not the modal);
-/// the icon detector already runs the same scan every `REFRESH_EVERY` anyway.
-pub fn refresh_now() {
-    SCANNER.with(|s| s.borrow_mut().refresh());
-}
-
-struct Scanner {
-    sys: sysinfo::System,
-    table: Vec<ProcRow>,
-    last_refresh: Option<Instant>,
-    /// Memoized answer per shell PID, valid until the next refresh.
-    memo: HashMap<u32, Option<IconKind>>,
+/// A lock that survives a panicked holder: the data is a cache, so a half-done
+/// scan is no reason to take the UI thread down with it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Scanner {
-    fn new() -> Self {
-        Self {
-            sys: sysinfo::System::new(),
-            table: Vec::new(),
-            last_refresh: None,
-            memo: HashMap::new(),
-        }
-    }
-
-    fn refresh(&mut self) {
-        self.sys.refresh_processes_specifics(
+    /// Scan and publish. Command lines are read once per process, not per scan:
+    /// re-reading every process's PEB each time (`UpdateKind::Always`) cost ~6 ms
+    /// of a ~19 ms scan. A process's command line doesn't change after launch,
+    /// and a recycled PID gets a fresh sysinfo entry (sysinfo compares start
+    /// times on its held handle), so its command line is read anew.
+    fn scan(&self) -> Arc<Snapshot> {
+        let mut sys = lock(&self.sys);
+        let taken = Instant::now();
+        sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
-            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
         );
-        self.table = self
-            .sys
+        let table = sys
             .processes()
             .iter()
             .map(|(pid, p)| ProcRow {
@@ -216,16 +292,40 @@ impl Scanner {
                     .collect(),
             })
             .collect();
-        self.memo.clear();
-        self.last_refresh = Some(Instant::now());
+        let snap = Arc::new(Snapshot::new(table, taken));
+        *lock(&self.latest) = Some(Arc::clone(&snap));
+        snap
+    }
+
+    /// The last published table, kicking a background scan when it is missing
+    /// or older than [`REFRESH_EVERY`]. Never waits on a scan.
+    fn latest(&self) -> Option<Arc<Snapshot>> {
+        let snap = lock(&self.latest).clone();
+        let stale = snap
+            .as_ref()
+            .is_none_or(|s| s.taken.elapsed() >= REFRESH_EVERY);
+        if stale && !self.kicked.swap(true, Ordering::AcqRel) && self.kick.send(()).is_err() {
+            self.kicked.store(false, Ordering::Release);
+            return Some(self.scan());
+        }
+        snap
+    }
+
+    /// The last published table if it is fresh, else a scan taken here.
+    fn fresh(&self) -> Arc<Snapshot> {
+        let snap = lock(&self.latest).clone();
+        match snap {
+            Some(s) if s.taken.elapsed() < REFRESH_EVERY => s,
+            _ => self.scan(),
+        }
     }
 }
 
 /// `pid`'s creation time in FILETIME ticks, or 0 when it can't be opened.
 /// sysinfo's `start_time` is whole seconds, which can't order an orphan and a
 /// process that took its dead parent's PID within the same second — exactly the
-/// churn case. One open + query per process per refresh (~1 ms for ~430
-/// processes, measured 2026-10-06 in a debug build, against ~20 ms for the
+/// churn case. One open + query per process per scan (~0.8–1 ms for ~375
+/// processes, measured 2026-10-06 in a release build, against ~12 ms for the
 /// sysinfo refresh itself).
 fn creation_time(pid: u32) -> u64 {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
@@ -250,27 +350,15 @@ fn creation_time(pid: u32) -> u64 {
     }
 }
 
-thread_local! {
-    static SCANNER: RefCell<Scanner> = RefCell::new(Scanner::new());
-}
-
 /// The agent running under `root_pid` (a terminal's shell PID), or `None`.
-/// Throttled: refreshes the OS process table at most every [`REFRESH_EVERY`] and
-/// memoizes per PID between refreshes, so calling it per-tab per-frame is cheap.
+/// Reads the last background scan (at most [`REFRESH_EVERY`] plus one scan old;
+/// `None` until the first lands) and memoizes per PID against it, so calling it
+/// per-tab per-frame is cheap and never waits on a scan.
 pub fn agent_for(root_pid: u32) -> Option<IconKind> {
-    SCANNER.with(|s| {
-        let mut s = s.borrow_mut();
-        let stale = s.last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
-        if stale {
-            s.refresh();
-        }
-        if let Some(&cached) = s.memo.get(&root_pid) {
-            return cached;
-        }
-        let result = detect_agent(&s.table, root_pid);
-        s.memo.insert(root_pid, result);
-        result
-    })
+    let snap = scanner().latest()?;
+    *lock(&snap.answers)
+        .entry(root_pid)
+        .or_insert_with(|| closest_agent(&snap.table, &snap.agent_rows, root_pid))
 }
 
 #[cfg(test)]
@@ -592,10 +680,55 @@ mod tests {
         // repopulates, so a just-spawned child would be visible.
         refresh_now();
         let me = std::process::id();
-        let seen = SCANNER.with(|s| s.borrow().table.iter().any(|r| r.pid == me));
+        let seen = lock(&scanner().latest)
+            .as_ref()
+            .is_some_and(|s| s.table.iter().any(|r| r.pid == me));
         assert!(
             seen,
             "a forced refresh should include the running test process"
         );
+    }
+
+    #[test]
+    fn the_icon_path_never_waits_on_a_scan() {
+        // Hold the scan lock the way an in-flight scan does. agent_for must still
+        // answer (from the last table, or None) instead of stalling the frame.
+        let _in_flight = lock(&scanner().sys);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || tx.send(agent_for(std::process::id())));
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "agent_for blocked on an in-flight scan"
+        );
+    }
+
+    #[test]
+    fn a_stale_table_is_rescanned_in_the_background_every_time() {
+        // Twice, so a kick that is never re-armed fails the second round: the
+        // icons would freeze on the last table forever. The stale table is a
+        // copy of a real one, so tests reading the scanner in parallel still
+        // find their processes in it.
+        let s = scanner();
+        for round in 0..2 {
+            let old = Instant::now() - REFRESH_EVERY * 2;
+            let real = s.fresh().table.clone();
+            *lock(&s.latest) = Some(Arc::new(Snapshot::new(real, old)));
+            agent_for(std::process::id());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock(&s.latest).as_ref().is_some_and(|l| l.taken == old) {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: a stale table was never rescanned"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while s.kicked.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round}: kick never re-armed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 }

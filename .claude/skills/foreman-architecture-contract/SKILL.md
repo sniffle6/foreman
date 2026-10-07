@@ -205,6 +205,7 @@ serves it.
 | Up to 8 short-lived title connection threads | `title_notify::serve` | Read one capped JSON event, then exit. Over the cap, the listener drops the connection fast |
 | 1 title worker | `terminal_titles::spawn_worker` | Waits on the four-item request queue, runs at most one provider child at a time, and sends one success/failure result. Provider stdout/stderr readers are short-lived and their waits share the process deadline |
 | 1 short-lived hook installer | `agent_hooks::spawn_install` | Reads/merges/writes the three user hook targets, then sends one content-free report to the GUI |
+| 1 process-scan thread (`proc-scan`) | `proc::scanner`, lazily on first use | Waits on a kick channel; each kick is one `sysinfo` scan, published as an `Arc` snapshot. The GUI kicks it when the tab-icon table goes stale and never waits on it |
 
 **Shared-state inventory:**
 
@@ -213,7 +214,7 @@ serves it.
 | `Session.resp`, `Session.osc_title` | `Arc<Mutex<…>>` (`src/terminal.rs`) | No — shared *ownership* between the `Term`-owned `Listener` and the Session; the Listener fires during `parser.advance` inside `pump()` on the GUI thread. Aliasing, not parallelism, in the current wiring |
 | `PTY_OUTPUT` | `static AtomicBool` (`src/terminal.rs`) | Yes — written by reader threads, swapped by the GUI thread for the adaptive repaint cadence (hot tick after input/output, slow idle tick; `App::ui`, `src/main.rs`). Scheduling only, never correctness |
 | Chat room | `Rc<RefCell<ChatRoom>>` (`src/wm.rs`) | No — single-threaded by construction; shared between the manager and `Content::Chat` viewers. Borrow discipline: `chat_tick` clones the Rc and drops the `borrow_mut` before injecting |
-| Process-table Scanner | `thread_local!` (`src/proc.rs`) | Per-thread; used from the GUI thread |
+| Process-table Scanner | `OnceLock<Scanner>` static: `Mutex<sysinfo::System>` + `Mutex<Option<Arc<Snapshot>>>` (`src/proc.rs`) | Yes — `proc-scan` scans and publishes; the GUI reads snapshots for icons, and `proc::refresh_now` (close/quit click) scans on the GUI thread under the same lock, the one place the GUI waits on a scan |
 | Channels | mpsc: PTY bytes (reader→Session), `CtrlMsg` (conn thread→GUI), `OpenReply` (GUI→conn thread), title event/request/result, hook-install report | Yes — the sanctioned cross-thread paths |
 
 **The request flow, in words** (Control plane CLI usage/verbs belong to

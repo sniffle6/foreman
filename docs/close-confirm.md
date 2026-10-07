@@ -66,15 +66,16 @@ speed-bump in front of that.
 - **The list is a snapshot** taken when the modal opens, not live. If a listed
   process exits while you're staring at the dialog, no big deal — confirming
   just closes, cancelling just keeps the pane.
-- **The scan is forced fresh at close time.** `top_children` normally reads the
-  shared `proc::SCANNER` throttled to ~1500 ms, so a child spawned inside that
-  window could otherwise be missed and the pane close with no warning. Each close
-  funnel calls `proc::refresh_now()` first, forcing an immediate scan (and
-  resetting the throttle so the rest of the request reuses it). Cost is one
-  synchronous `sysinfo` scan on the *closing click*, not on the modal — the modal
-  never lags — and the icon detector already runs the same scan every 1500 ms.
-  (A child spawned in the same instant as the click is still a theoretical miss,
-  but the kill-on-close Job cleans it up regardless.)
+- **The scan is forced fresh at close time.** The shared `proc` scanner is
+  refreshed on a background thread at most every ~1500 ms, so a child spawned
+  inside that window could otherwise be missed and the pane close with no
+  warning. Each close funnel calls `proc::refresh_now()` first, forcing an
+  immediate scan on the GUI thread that the following `top_children` calls
+  read. Scans share one lock, so a background scan that started earlier can't
+  publish over it afterwards. Cost is one synchronous `sysinfo` scan (~15 ms
+  release, 2026-10-06) on the *closing click*, not on the modal — the modal
+  never lags. (A child spawned in the same instant as the click is still a
+  theoretical miss, but the kill-on-close Job cleans it up regardless.)
 - **Exited terminals are skipped.** A shell that has died lingers as a tab (its
   title stamped `· exited`) until you close it. Its `root_pid` is stale and the
   OS may recycle it, so the scan gates on `Session::has_exited()` — a dead

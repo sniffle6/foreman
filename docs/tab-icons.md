@@ -75,11 +75,21 @@ which is a plain shell, the way browser favicons tell tabs apart.
 - **Process scan is Windows-only and WSL-blind.** It enumerates *Windows*
   processes (`sysinfo`), so an agent running inside a WSL (`bash`) pane — a
   process in the WSL VM, not Windows — isn't visible; those rely on the OSC title.
-- **Process scan is throttled (~1.5 s) and off the render path.** The shared
-  `sysinfo::System` lives in a `thread_local` in `proc.rs` (foreman's UI is
-  single-threaded) and refreshes at most every ~1.5 s, with the per-PID answer
-  memoized between refreshes — so calling `icon_kind` per-tab per-frame is cheap.
-  The icon can lag up to that interval after an agent starts/exits.
+- **Process scan is throttled (~1.5 s) and off the render path.** A `proc-scan`
+  thread owns the `sysinfo::System` and publishes each scan as a shared
+  snapshot. `agent_for` reads the latest one, memoizes the per-PID answer
+  against it, and when it is older than ~1.5 s kicks the thread for a rescan
+  instead of waiting — so calling `icon_kind` per-tab per-frame costs
+  microseconds. The icon can lag up to that interval (plus one scan) after an
+  agent starts/exits, and shows the shell glyph until the first scan lands
+  (within ~70 ms of launch).
+  Measured 2026-10-06 (release, Ryzen 9 5950X, ~375–480 processes): the scan
+  used to run on the UI thread at ~19–21 ms every 1.5 s, a dropped frame each
+  time; now the UI thread pays ~1–3 µs a call (≤0.15 ms on the first call
+  after a new table), and the background scan takes ~12–15 ms. Most of that is
+  the kernel's process snapshot (`NtQuerySystemInformation`, ~7 ms alone with a
+  right-sized buffer), so no sysinfo setting brings it under a frame budget.
+  Don't move it back onto the UI thread.
 - **A recycled PID can't badge a shell.** An orphaned agent (its launcher dead)
   could otherwise read as the child of a new shell that was handed the
   launcher's old PID. The walk checks creation times on every hop. The
@@ -99,8 +109,8 @@ which is a plain shell, the way browser favicons tell tabs apart.
 - `src/terminal.rs` — `Session.dispatch_argv`, `Session.osc_title`,
   `Session.root_pid`, the `Listener` title capture, and `Session::icon_kind` (the
   4-layer resolver).
-- `src/proc.rs` — `agent_for` (throttled, thread-local scanner) and the pure
-  `detect_agent` core + its tests.
+- `src/proc.rs` — `agent_for` (reads the background scanner's latest snapshot)
+  and the pure `detect_agent` core + its tests.
 - `src/wm.rs` — `Content::icon_kind` and the restyled tab-chip / single-window
   header painting.
 - `Cargo.toml` — the `resvg` (SVG raster) and `sysinfo` (process scan)
