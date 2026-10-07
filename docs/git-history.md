@@ -723,8 +723,10 @@ On 2026-09-27 the live updates were pinned by tests, not screenshots:
 `classify_sorts_paths_into_worktree_refs_and_ignore` (main checkout and
 linked worktree layouts, `*.lock`, `logs/`, ignored prefixes, case, short
 names), `debounce_trails_by_quiet_time_and_caps_at_max_wait`,
-`bursts_in_ignored_dirs_are_silent_and_source_bursts_report_once` (1000
-`target/` writes: no bump; 50 `src/` writes: exactly one),
+`bursts_in_ignored_dirs_are_silent_and_source_bursts_coalesce` (1000
+`target/` writes: no bump; 50 `src/` writes: coalesced, no refs bump. It
+asserted exactly one until a loaded CI runner split the burst on 2026-10-07;
+exactly-one lives on the debounce's fake clock),
 `our_own_reads_never_wake_the_watch`, `deleting_the_watch_root_stops_the_thread`,
 `a_watched_main_checkout_or_card_worktree_never_blocks_teardown` (both
 `TeardownOutcome::Removed`), `watched_edits_appear_while_shown_without_a_focus_change`,

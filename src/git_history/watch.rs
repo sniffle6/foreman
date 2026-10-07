@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn bursts_in_ignored_dirs_are_silent_and_source_bursts_report_once() {
+    fn bursts_in_ignored_dirs_are_silent_and_source_bursts_coalesce() {
         let repo = repo();
         let dir = repo.path();
         let ctx = egui::Context::default();
@@ -1058,7 +1058,14 @@ mod tests {
         }
         wait_until("a worktree bump", || w.worktree_gen() > before.0);
         let after = quiet(&w);
-        assert_eq!(after, (before.0 + 1, before.1), "one read per burst");
+        // Exactly one read per burst is pinned on a fake clock in
+        // debounce_trails_by_quiet_time_and_caps_at_max_wait. Here the clock
+        // is real: a loaded runner can stall delivery past QUIET mid-burst
+        // and split it in two. What holds under any load is that the burst
+        // coalesces and never reads as a refs move.
+        let reads = after.0 - before.0;
+        assert!(reads < 50, "{reads} reads for 50 writes: not coalesced");
+        assert_eq!(after.1, before.1, "source writes move no refs");
         // A commit moves a ref (and HEAD's target) and rewrites the index.
         git(dir, &["add", "."]);
         git(dir, &["commit", "-m", "more"]);
