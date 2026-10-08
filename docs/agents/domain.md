@@ -9,10 +9,7 @@ How the engineering skills should consume this repo's domain documentation when 
 ```
 /
 ├── CONTEXT.md                 ← domain glossary (terms + avoid-list)
-├── docs/adr/                  ← architectural decision records
-│   ├── 0001-control-reply-stays-a-presence-discriminated-bag.md
-│   ├── 0002-frame-and-inspect-walks-stay-separate.md
-│   └── 0003-windowmanager-stays-one-uniform-recursive-type.md
+├── docs/adr/                  ← architectural decision records (ls for the set)
 └── src/
 ```
 

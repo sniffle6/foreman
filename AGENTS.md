@@ -86,13 +86,15 @@ Vocabulary is `CONTEXT.md` (ubiquitous language). Decisions are `docs/adr/`.
 Feature docs are one-per-subsystem in `docs/`; check for an existing one before
 adding a new file.
 
-## Agent surfaces
+## Agent skills
 
 - **Tracked work:** specs in `docs/superpowers/specs/`, tickets as kanban cards,
   everything else as GitHub Issues on `sniffle6/foreman`. External PRs are not a
   triage surface. See `docs/agents/issue-tracker.md`.
 - **Triage labels:** `needs-triage`, `needs-info`, `ready-for-agent`,
   `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+- **Domain docs:** single-context — one `CONTEXT.md`, one `docs/adr/`. See
+  `docs/agents/domain.md`.
 
 ## Paired skill copies
 
