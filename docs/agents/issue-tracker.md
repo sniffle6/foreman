@@ -85,6 +85,25 @@ skill.
 - **Execution** is **foreman-kanban**'s "Orchestrating a plan": dispatch wave by
   wave, each worker on its own worktree, landing through the integration queue.
 
+## When `/triage` moves an issue to `ready-for-agent`
+
+Agents only pick up work from the board, so a triaged issue also gets a card.
+After posting the agent brief and applying the label, add an unplanned card
+(no `--plan`/`--wave`; it is dispatched on its own):
+
+    & $env:FOREMAN_EXE kanban add "<issue title>" --body "<body>"
+
+with this body, which starts a cold worker from the issue:
+
+    Issue: #<n> — read it first: gh issue view <n> --comments (the agent brief is the latest triage comment)
+    Done when: the brief's acceptance criteria hold
+    Gate: cargo test --target-dir target/agent <filter>
+    Commit body: Closes #<n>
+
+`Closes #<n>` closes the GitHub issue when the commit reaches `origin`, so the
+issue and the card finish together. One card per issue: before adding, search
+the card bodies in `kanban list --all --json` for `Issue: #<n>`.
+
 ## When a skill says "fetch the relevant ticket"
 
 - A card id (six characters, e.g. `a3f8k2`): `& $env:FOREMAN_EXE kanban list --all --json`
