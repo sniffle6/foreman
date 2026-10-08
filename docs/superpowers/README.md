@@ -1,4 +1,4 @@
-# docs/superpowers — specs, and the plans that have not run yet
+# docs/superpowers — specs, and the last plans that have not run yet
 
 ## What lives here
 
@@ -11,6 +11,9 @@
   the surviving record.
 - **`plans/`** — checkbox-executable implementation plans, and **only for work
   that has not shipped yet.** `ls docs/superpowers/plans/` is the live list.
+  **No new plans are written here.** New work goes spec → `/to-tickets` → kanban
+  cards (`docs/agents/issue-tracker.md`); the plans left here are the backlog
+  from before that switch.
 
 ## The rule: a plan is deleted when its work ships
 

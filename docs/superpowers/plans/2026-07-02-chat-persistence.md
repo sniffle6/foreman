@@ -1,6 +1,6 @@
 # Chat Persistence Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task with the `implementing-with-commit-reviewers` skill. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make each project's chat log survive foreman restarts/crashes as an append-only JSONL file, with seq monotonic across restarts.
 

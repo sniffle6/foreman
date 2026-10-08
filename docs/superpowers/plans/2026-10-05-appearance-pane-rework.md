@@ -1,6 +1,6 @@
 # Appearance Pane Rework Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task with the `implementing-with-commit-reviewers` skill. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Hand-edited theme JSON applies live and is never clobbered; every theme token is editable in-app from one table; the Appearance pane and its Theme Expert chat look like the rest of foreman's settings.
 

@@ -10,7 +10,7 @@ what you see, what actually causes it, the fix or fence, and the story with
 evidence so you don't re-run a dead investigation.
 
 **Route in:** general debugging discipline comes first — find the root cause,
-never patch the symptom (see the `superpowers:systematic-debugging` skill).
+never patch the symptom (see the `mattpocock-skills:diagnosing-bugs` skill).
 This playbook is the project-specific layer under it: check here **before**
 forming hypotheses, because several of these symptoms have already burned
 hours and two of them are settled do-not-re-investigate verdicts.
@@ -450,7 +450,7 @@ Session or pass `--project/--terminal` explicitly):
   — **foreman-failure-archaeology**; this playbook keeps only the actionable
   verdicts.
 - **A brand-new symptom not in the table** — that's a fresh investigation:
-  `superpowers:systematic-debugging` discipline, evidence per
+  `mattpocock-skills:diagnosing-bugs` discipline, evidence per
   **foreman-research-methodology**, and add the entry here once settled (via
   **foreman-change-control** if it touches a settled verdict).
 

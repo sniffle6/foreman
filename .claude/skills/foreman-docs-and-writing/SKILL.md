@@ -93,7 +93,7 @@ invalidates one section instead of the whole file.
 | `docs/epics/*.md` | Design + decision history | **Decision history reliable; status headers LAG code.** See below. |
 | `docs/contracts/` | Pinned seam agreements + status trackers | When a contract's header and its remaining-work tracker disagree, **the tracker wins over the contract header** — the tracker is edited as work lands, the header is written once. |
 | `docs/superpowers/specs/` | Design records — the decision AND its rejected alternatives | **Tier-D history: read for *why*, never for *how*.** Kept permanently; do not edit them to match later reality. Some `src/` module headers cite one by path (`rg -n 'docs/superpowers' src/`). |
-| `docs/superpowers/plans/`, `docs/plans/` | Checkbox-executable plans for work that has **not shipped yet** | A plan is deleted once its work lands (`docs/superpowers/README.md`), so anything still here is unbuilt — read it as a proposal, never as a description of the tree. |
+| `docs/superpowers/plans/`, `docs/plans/` | Checkbox-executable plans for work that has **not shipped yet** — none are written any more; new work is kanban tickets (`docs/agents/issue-tracker.md`) | A plan is deleted once its work lands (`docs/superpowers/README.md`), so anything still here is unbuilt — read it as a proposal, never as a description of the tree. |
 | Dated snapshot docs (`docs/YYYY-MM-DD-*.md`) | Point-in-time session findings | Historical by construction. The date in the filename is the claim's expiry warning. |
 | `docs/followups-latency-and-control.md`, `docs/chat-missing-features.md`, `docs/chat-persistence.md` | Gap lists and session snapshots that are *not* date-named | Historical — the filename carries no expiry warning, so check the date in the title line. Believe their own headers ("designed, not built"); do not read them as current state. Other skills cite `followups-…` as live evidence; it is a session snapshot, so re-verify against code before acting on it. |
 
@@ -270,7 +270,9 @@ The lifecycle itself (hunch → spec → plan → result) is owned by
   "design-it-twice … three parallel interface explorations → the hybrid" and the
   keyboard-control epic's "Decision history (settled with the user): …
   → **rejected**" blocks are the model.
-- **Plans** (`docs/superpowers/plans/`, `docs/plans/`) are checkbox-executable:
+- **Plans** (`docs/superpowers/plans/`, `docs/plans/`) are no longer written —
+  new work becomes kanban tickets via `/to-tickets` — but the ones left are
+  checkbox-executable:
   `- [ ] **Step N:** …` steps a cold session can run top-to-bottom. **A plan is
   scaffolding, and it is deleted when its work ships** — the code becomes the
   truth and `docs/<feature>.md` becomes the explanation, so a surviving plan

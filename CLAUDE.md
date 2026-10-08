@@ -79,8 +79,9 @@ adding a new file.
 
 ## Agent surfaces
 
-- **Issues:** GitHub Issues on `sniffle6/foreman` via `gh`. External PRs are not
-  a triage surface. See `docs/agents/issue-tracker.md`.
+- **Tracked work:** specs in `docs/superpowers/specs/`, tickets as kanban cards,
+  everything else as GitHub Issues on `sniffle6/foreman`. External PRs are not a
+  triage surface. See `docs/agents/issue-tracker.md`.
 - **Triage labels:** `docs/agents/triage-labels.md`.
 
 ## Working agreement

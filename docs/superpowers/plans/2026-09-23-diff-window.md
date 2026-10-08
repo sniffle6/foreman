@@ -1,6 +1,6 @@
 # Git History Diff Window Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task with the `implementing-with-commit-reviewers` skill. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Clicking a changed file in the Git History details pane opens a reusable per-Project side-by-side Diff window showing the whole file, old vs new.
 

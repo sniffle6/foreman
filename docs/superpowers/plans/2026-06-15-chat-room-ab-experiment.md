@@ -1,6 +1,6 @@
 # Chat Room A/B Experiment — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task-by-task with the `implementing-with-commit-reviewers` skill. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the measurement harness + fixtures to run a 3-arm A/B experiment (solo / team-no-chat / team+chat) that produces objective data on whether foreman's chat room improves result quality and token efficiency, then run it and rank improvements from the data.
 
