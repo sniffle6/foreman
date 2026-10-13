@@ -59,6 +59,7 @@ mod theme_expert;
 mod title_notify;
 mod update;
 mod view_scale;
+mod window_placement;
 mod wm;
 mod workspace;
 
@@ -126,6 +127,10 @@ struct App {
     /// or a settings-menu edit); the change is written to disk only after a short
     /// debounce so a whole scroll gesture or a burst of edits persists once.
     font_dirty_at: Option<std::time::Instant>,
+    /// A saved OS-window placement still being nudged into place after launch
+    /// (`window_placement::Restore`). Geometry capture is suspended until it
+    /// finishes so a pre-correction frame never overwrites the saved rect.
+    window_restore: Option<window_placement::Restore>,
     /// Set when the desktop workspace layout changed; written after debounce.
     workspace_dirty_at: Option<std::time::Instant>,
     /// The active color theme, resolved from `settings.theme` (the name) and
@@ -188,6 +193,7 @@ impl App {
         update_rx: std::sync::mpsc::Receiver<update::Event>,
         update_fx: std::sync::mpsc::Sender<update::Effect>,
         title: TitleRuntime,
+        window_restore: Option<window_placement::WindowGeometry>,
     ) -> Self {
         // Debug-only preview: FOREMAN_UPDATE_TEST picks an initial update::State
         // so every chip variant can be seen/screenshotted without a real newer
@@ -274,6 +280,7 @@ impl App {
             arm_deadline: None,
             settings,
             font_dirty_at: None,
+            window_restore: window_restore.map(window_placement::Restore::new),
             workspace_dirty_at: None,
             active_theme,
             active_theme_name,
@@ -1074,6 +1081,44 @@ impl eframe::App for App {
                 settings_dirty = true;
             }
         }
+        // OS window geometry. A pending restore is finished first: the builder's
+        // with_position is scaled by the DPI of wherever Windows first placed the
+        // window, so the exact physical rect is re-asserted here. Then the live
+        // placement is captured (never while minimized; only the flag while
+        // maximized) into the same debounced settings write as the zoom above.
+        // Decide inside the input lock (no per-frame ViewportInfo clone), act
+        // outside it: send_viewport_cmd takes the context's write side.
+        enum Geometry {
+            Nothing,
+            Step(window_placement::Step),
+            Capture(window_placement::WindowGeometry),
+        }
+        let prev = self.settings.window;
+        let decision = ctx.input(|i| {
+            let viewport = i.viewport();
+            match self.window_restore.as_mut() {
+                Some(restore) => Geometry::Step(restore.step(viewport)),
+                None => match window_placement::capture(viewport, prev.as_ref()) {
+                    Some(g) if window_placement::changed(prev.as_ref(), &g) => Geometry::Capture(g),
+                    _ => Geometry::Nothing,
+                },
+            }
+        });
+        match decision {
+            Geometry::Nothing | Geometry::Step(window_placement::Step::Wait) => {}
+            Geometry::Step(window_placement::Step::Correct { outer_pos, inner_size }) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer_pos));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner_size));
+            }
+            Geometry::Step(window_placement::Step::Maximize) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+            Geometry::Step(window_placement::Step::Done) => self.window_restore = None,
+            Geometry::Capture(g) => {
+                self.settings.window = Some(g);
+                settings_dirty = true;
+            }
+        }
         if settings_dirty {
             self.font_dirty_at = Some(std::time::Instant::now());
         }
@@ -1500,14 +1545,40 @@ fn main() -> eframe::Result {
     conpty_install::ensure_conpty().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 800.0])
+        .with_inner_size(window_placement::DEFAULT_INNER_SIZE)
         .with_decorations(false);
     match load_app_icon() {
         Some(icon) => viewport = viewport.with_icon(icon),
         None => eprintln!("foreman: using default window icon"),
     }
+    // Remembered OS-window placement. Decided inside eframe's window_builder
+    // hook, not here: the monitor rects must be read AFTER winit has made the
+    // process per-monitor-DPI aware (EventLoop::new), or Windows hands back
+    // 96-DPI-virtualized rects that never match the saved physical position.
+    // The hook runs before the app creator, so the decision is parked in a
+    // slot the App reads for its first-frame correction.
+    let saved_window = startup_settings.window;
+    let restore_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let hook_slot = restore_slot.clone();
+    let window_builder: eframe::WindowBuilderHook = Box::new(move |mut builder| {
+        let placement = window_placement::placement(
+            saved_window.as_ref(),
+            &window_placement::monitors(),
+        );
+        if let Some(g) = placement {
+            // winit applies with_maximized after CreateWindowExW, so the
+            // position/size below become the normal rect un-maximize returns to.
+            builder = builder
+                .with_inner_size(g.inner_size_points())
+                .with_position(g.position_points())
+                .with_maximized(g.maximized);
+        }
+        *hook_slot.lock().unwrap_or_else(|e| e.into_inner()) = placement;
+        builder
+    });
     let opts = eframe::NativeOptions {
         viewport,
+        window_builder: Some(window_builder),
         ..Default::default()
     };
     eframe::run_native(
@@ -1560,6 +1631,10 @@ fn main() -> eframe::Result {
             {
                 update::spawn(cc.egui_ctx.clone(), upd_event_tx, upd_effect_rx);
             }
+            let window_restore = restore_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             Ok(Box::new(App::new(
                 rx,
                 upd_event_rx,
@@ -1571,6 +1646,7 @@ fn main() -> eframe::Result {
                     epoch: title_epoch,
                     hook_install,
                 },
+                window_restore,
             )))
         }),
     )
@@ -1734,6 +1810,7 @@ mod app_logic_tests {
                 epoch: title_epoch,
                 hook_install: None,
             },
+            None,
         );
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         ctrl_tx
@@ -1775,6 +1852,7 @@ mod app_logic_tests {
                 epoch: title_epoch,
                 hook_install: None,
             },
+            None,
         );
         title_result_tx
             .send(terminal_titles::TitleResult {

@@ -380,6 +380,15 @@ pub struct Settings {
     /// theme file stem under `themes_dir()`. The Appearance pane sets this; the
     /// App resolves it to the live `Theme`.
     pub theme: String,
+    // -- os window --
+    /// Last OS main-window placement: outer position (physical px), inner
+    /// size (points), the scale it was captured at, and whether it was
+    /// maximized (the rect is then the normal rect un-maximize returns to).
+    /// Captured per frame in `App::update` (never while minimized) and
+    /// restored in `main`, after validating against the current monitors.
+    /// File-only by choice: no settings-menu row — the window itself is the
+    /// editor. `None` = default placement. See `src/window_placement.rs`.
+    pub window: Option<crate::window_placement::WindowGeometry>,
 }
 
 impl Default for Settings {
@@ -413,6 +422,7 @@ impl Default for Settings {
             default_project_dir: String::new(),
             update_check: true,
             theme: DEFAULT_THEME.into(),
+            window: None,
         }
     }
 }
@@ -453,6 +463,11 @@ impl Settings {
         // validated here; Duplicate creates a user theme, it does not check this.
         if self.theme.trim().is_empty() {
             self.theme = DEFAULT_THEME.into();
+        }
+        // Garbage geometry (0x0, 1e9, NaN, a bogus scale) means the default
+        // placement, never a window you cannot see or grab.
+        if self.window.is_some_and(|g| !g.is_sane()) {
+            self.window = None;
         }
     }
 }
@@ -609,6 +624,66 @@ mod tests {
         assert_eq!(s.default_project_dir, "");
         assert!(s.update_check);
         assert_eq!(s.theme, "Foreman Warm");
+        assert_eq!(s.window, None);
+    }
+
+    #[test]
+    fn window_geometry_round_trips_and_defaults_to_none() {
+        // Old file without the field: default placement.
+        let s: Settings = serde_json::from_str(r#"{"font_size": 13.0}"#).unwrap();
+        assert_eq!(s.window, None);
+        let json = r#"{"window": {"x": -1800, "y": 42, "w": 1280.0, "h": 800.0, "ppp": 1.25, "maximized": true}}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        let g = s.window.expect("field parses");
+        assert_eq!(
+            (g.x, g.y, g.w, g.h, g.ppp, g.maximized),
+            (-1800, 42, 1280.0, 800.0, 1.25, true)
+        );
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.window, Some(g));
+        // Unknown keys inside the nested object are ignored too.
+        let s: Settings = serde_json::from_str(
+            r#"{"window": {"x": 1, "y": 2, "w": 800.0, "h": 600.0, "ppp": 1.0, "maximized": false, "future": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.window.map(|g| g.x), Some(1));
+    }
+
+    #[test]
+    fn sanitize_drops_garbage_window_geometry() {
+        use crate::window_placement::WindowGeometry;
+        let bad = [
+            r#"{"x": 0, "y": 0, "w": 0.0, "h": 0.0, "ppp": 1.0, "maximized": false}"#,
+            r#"{"x": 0, "y": 0, "w": 1e9, "h": 800.0, "ppp": 1.0, "maximized": false}"#,
+            r#"{"x": 0, "y": 0, "w": -1280.0, "h": 800.0, "ppp": 1.0, "maximized": false}"#,
+            r#"{"x": 0, "y": 0, "w": 1280.0, "h": 800.0, "ppp": 0.0, "maximized": false}"#,
+            r#"{"x": 2000000000, "y": 0, "w": 1280.0, "h": 800.0, "ppp": 1.0, "maximized": false}"#,
+        ];
+        for b in bad {
+            let mut s: Settings = serde_json::from_str(&format!(r#"{{"window": {b}}}"#)).unwrap();
+            assert!(s.window.is_some(), "{b} should parse before sanitize");
+            s.sanitize();
+            assert_eq!(s.window, None, "{b} must sanitize to None");
+        }
+        // A fractional x fails to parse as i32 (NaN cannot even be encoded in
+        // JSON); the whole file then falls back to defaults via load_json.
+        assert!(
+            serde_json::from_str::<Settings>(
+                r#"{"window": {"x": 1.5, "y": 0, "w": 1280.0, "h": 800.0, "ppp": 1.0, "maximized": false}}"#
+            )
+            .is_err()
+        );
+        let mut ok = Settings::default();
+        ok.window = Some(WindowGeometry {
+            x: -5,
+            y: 7,
+            w: 1280.0,
+            h: 800.0,
+            ppp: 1.5,
+            maximized: false,
+        });
+        ok.sanitize();
+        assert!(ok.window.is_some(), "sane geometry survives sanitize");
     }
 
     #[test]

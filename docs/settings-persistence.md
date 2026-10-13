@@ -32,6 +32,9 @@ setting instead of hand-rolling file I/O again.
   Agent naming adds `auto_name_agent_sessions` (off), `title_provider` (Codex),
   and `title_model` (`gpt-5.6-luna`); model ids are trimmed and capped at 128
   characters on load.
+- `Settings::window` → the OS main window's last placement, so foreman reopens
+  where it was closed. File-only (no settings-menu row — the window is the
+  editor). See "OS window placement" below.
 
 ## Why it exists
 
@@ -81,11 +84,88 @@ Read with `Settings::load()`, write with `settings.save()`. That's it.
   Its parsed overrides still merge over defaults so new commands retain their
   default bindings when loading an older file.
 
+## OS window placement (`Settings::window`)
+
+`window` is an `Option<WindowGeometry>` (`src/window_placement.rs`):
+
+```json
+"window": { "x": 312, "y": 148, "w": 1280.0, "h": 800.0, "ppp": 1.25, "maximized": false }
+```
+
+- `x`/`y`: outer top-left in **physical px** (screen coordinates; negative on a
+  monitor left of or above the primary).
+- `w`/`h`: inner size in **logical points** — what egui lays out in and what
+  `with_inner_size` takes.
+- `ppp`: pixels-per-point at capture, so `x / ppp` is the point position the
+  builder wants.
+- `maximized`: the window was maximized; the rect is the **normal** rect
+  un-maximize returns to, not the maximized extent.
+
+**Capture** runs every frame in `App::update` from `ctx.input(|i| i.viewport())`
+(`window_placement::capture`) and feeds the same `FONT_SAVE_DEBOUNCE` write as
+zoom and panel prefs: a drag or resize writes once after it goes quiet, plus
+the `flush_all` on quit / update-restart. `changed` ignores sub-point size
+jitter so an idle window never dirties the file.
+
+**Restore** happens in `main` through eframe's `window_builder` hook:
+`window_placement::placement` keeps the saved rect only if it is sane and its
+top band lands on a current monitor, then sets `with_inner_size` +
+`with_position` + `with_maximized`. The App then runs a bounded first-frame
+correction (`window_placement::Restore`) that re-asserts the exact physical
+rect with `ViewportCommand::OuterPosition` / `InnerSize`.
+
+Gotchas, each one a bug that was designed around:
+
+- **Minimized sentinel.** winit's `outer_position` is a raw `GetWindowRect`, so
+  a minimized window reports Windows' iconic placement at -32000,-32000, and
+  `is_maximized` reads false while iconic. Geometry is never sampled while
+  `viewport().minimized == Some(true)`; while maximized only the flag changes
+  and the last normal rect is kept.
+- **`with_position` is scaled by the wrong DPI on mixed-DPI desktops.** winit
+  creates the window at `CW_USEDEFAULT`, then applies the builder's LOGICAL
+  position scaled by *that* monitor's DPI. If the saved rect lives on a
+  monitor with a different scale, the builder lands near, not on, it. The
+  first-frame `Restore` fixes that: `OuterPosition` takes points × the
+  window's *current* ppp, which egui-winit hands to winit as physical px. It
+  nudges for up to 30 frames and then stops (a size larger than its monitor
+  will never match). A **maximized** restore is checked instead of nudged:
+  the builder's `with_maximized` maximizes on whatever monitor the scaled
+  position landed on, so `Restore` waits for the flag, verifies the maximized
+  extent contains the saved normal rect's origin, and if not moves the
+  window there (`set_outer_position` clears winit's MAXIMIZED flag, so this
+  un-maximizes) and then sends `Maximized(true)` — a one-frame flash, only on
+  a mixed-DPI mismatch. Capture stays suspended until the flag is confirmed,
+  so a lagging maximize can never overwrite the normal rect with the
+  full-screen extent.
+- **Monitor rects must be read after winit is DPI-aware.** foreman has no DPI
+  manifest; winit's `EventLoop::new` makes the process per-monitor aware.
+  Before that, `EnumDisplayMonitors` returns 96-DPI-virtualized rects that
+  never match the saved physical position. That is why the decision lives in
+  the `window_builder` hook, not at the top of `main`.
+- **Off-screen clamp.** Neither winit nor Windows clamps a restored position,
+  so a monitor unplugged since the last run would leave the window invisible.
+  `placement` requires ≥160×64 px of the window's **top band** (where the drag
+  bar is) on some monitor's work area, else the default placement is used and
+  the stale value is overwritten by the next capture.
+- **`sanitize` drops garbage.** Non-finite, below 200 pt, above 16384 pt, a
+  `ppp` outside 0.5–8, or a coordinate beyond ±2^20 px → `None`. A hand-edited
+  file cannot produce a 0×0 or 1e9 window.
+- **Why not eframe's `persistence` feature.** It pulls in `ron`, writes
+  `app.ron` under the *real* RoamingAppData via `SHGetKnownFolderPath`
+  (ignoring the `APPDATA` override `scripts/run-dev.ps1` relies on, so a dev
+  build would clobber the user's position), autosaves from a 30 s thread
+  without `config.rs`'s atomic write + corrupt-file backup, and its Windows
+  clamp assumes a 32 px title bar this undecorated window does not have.
+
 ## Key files
 
 - `src/config.rs` — the whole thing: `config_dir`, `load_json`, `save_json`,
   `Settings`, and the font-size constants (`DEFAULT/MIN/MAX_FONT_SIZE`,
   `FONT_ZOOM_STEP`).
 - `src/main.rs` — `App` owns a `Settings`, loads it at startup, and saves it
-  (debounced) when the live font size changes.
+  (debounced) when the live font size changes. Also the `window_builder` hook
+  that applies the saved OS-window placement and the first-frame `Restore`.
+- `src/window_placement.rs` — `WindowGeometry`, the pure `placement` /
+  `capture` / `Restore::step` decisions and their table tests, and the Win32
+  `monitors()` enumeration.
 - `src/keymap.rs` — merges the protected config load over default bindings.

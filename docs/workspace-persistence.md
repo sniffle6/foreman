@@ -36,12 +36,13 @@ No agents are re-dispatched; no scrollback or Ready state is recovered.
 | Task-manager panel window | Always recreated via `ensure_panel` |
 | Panel collapse / width | `settings.json` only |
 | Font size, keybindings, recents MRU | Their own files under `%APPDATA%\foreman` |
-| OS main-window position/size | Out of v1 |
+| OS main-window position/size/maximized | `settings.json` (`Settings::window`) — see `docs/settings-persistence.md` |
 
 ## Persistence map
 
 ```text
-settings.json      → font_size, panel_collapsed, panel_width, panel_dock
+settings.json      → font_size, panel_collapsed, panel_width, panel_dock,
+                     window (OS main-window rect + maximized)
 keybindings.json   → leader + chords
 recents.json       → MRU open list
 workspace.json     → last desktop layout (this feature)
