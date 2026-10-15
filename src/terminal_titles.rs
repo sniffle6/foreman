@@ -693,7 +693,7 @@ fn generate_title(request: &TitleRequest) -> Result<String, TitleError> {
     })
     .map_err(|error| match error {
         LaunchError::Unavailable => TitleError::Unavailable,
-        LaunchError::Failed => TitleError::Failed,
+        LaunchError::Failed(_) => TitleError::Failed,
         LaunchError::Timeout => TitleError::Timeout,
         LaunchError::TooLarge => TitleError::InvalidOutput,
     })?;

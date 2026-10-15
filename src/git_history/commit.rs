@@ -418,7 +418,9 @@ fn draft(
     })
     .map_err(|e| match e {
         LaunchError::Unavailable => format!("{program} CLI is unavailable"),
-        LaunchError::Failed => format!("{program} could not write a message"),
+        LaunchError::Failed(detail) => {
+            ai_oneshot::failure_line(&format!("{program} could not write a message"), &detail)
+        }
         LaunchError::Timeout => format!("{program} timed out"),
         LaunchError::TooLarge => format!("{program} replied with too much text"),
     })?;

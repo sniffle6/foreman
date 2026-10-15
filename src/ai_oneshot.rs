@@ -41,10 +41,13 @@ pub struct Request<'a> {
     pub max_output: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchError {
+    /// The CLI could not be started at all (not installed or not on PATH).
     Unavailable,
-    Failed,
+    /// The CLI ran and exited non-zero. Carries its first stderr line, capped
+    /// to [`FAILURE_DETAIL_CHARS`], or an empty string when it said nothing.
+    Failed(String),
     Timeout,
     TooLarge,
 }
@@ -58,6 +61,19 @@ pub fn program(provider: NamingProvider) -> &'static str {
 }
 
 /// Run the provider CLI once and return its stdout.
+/// Longest stderr excerpt a [`LaunchError::Failed`] carries.
+pub const FAILURE_DETAIL_CHARS: usize = 160;
+
+/// A user-facing line for a non-zero exit: `summary`, then the CLI's own first
+/// stderr line after a colon when it printed one.
+pub fn failure_line(summary: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}: {detail}")
+    }
+}
+
 pub fn run(request: &Request) -> Result<String, LaunchError> {
     run_process(
         &command_spec(request),
@@ -180,7 +196,7 @@ fn run_process(
                 // shell-interpreted word conservative; prompts for Codex and
                 // Claude travel over stdin, never through this argv.
                 if argv.iter().any(|word| !cmd_fallback_word_is_safe(word)) {
-                    return Err(LaunchError::Failed);
+                    return Err(LaunchError::Failed(String::new()));
                 }
                 command = Command::new("cmd.exe");
                 command.args(["/d", "/c"]).args(&argv);
@@ -217,10 +233,13 @@ fn run_process(
         Ok(command)
     };
 
-    let mut child = match build(false)?.spawn() {
-        Ok(child) => child,
+    let (mut child, through_cmd) = match build(false)?.spawn() {
+        Ok(child) => (child, false),
         #[cfg(windows)]
-        Err(_) => build(true)?.spawn().map_err(|_| LaunchError::Unavailable)?,
+        Err(_) => (
+            build(true)?.spawn().map_err(|_| LaunchError::Unavailable)?,
+            true,
+        ),
         #[cfg(not(windows))]
         Err(_) => return Err(LaunchError::Unavailable),
     };
@@ -232,7 +251,7 @@ fn run_process(
             #[cfg(windows)]
             drop(child_job);
             let _ = child.wait();
-            return Err(LaunchError::Failed);
+            return Err(LaunchError::Failed(String::new()));
         };
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -243,8 +262,14 @@ fn run_process(
         None
     };
 
-    let stdout = child.stdout.take().ok_or(LaunchError::Failed)?;
-    let stderr = child.stderr.take().ok_or(LaunchError::Failed)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(LaunchError::Failed(String::new()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(LaunchError::Failed(String::new()))?;
     let (out_tx, out_rx) = mpsc::sync_channel(1);
     let (err_tx, err_rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -271,21 +296,26 @@ fn run_process(
                 #[cfg(windows)]
                 drop(child_job);
                 let _ = child.wait();
-                return Err(LaunchError::Failed);
+                return Err(LaunchError::Failed(String::new()));
             }
         }
     };
     #[cfg(windows)]
     drop(child_job);
     if !status.success() {
-        return Err(LaunchError::Failed);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let stderr = err_rx.recv_timeout(remaining).unwrap_or_default();
+        return Err(classify_failure(
+            &String::from_utf8_lossy(&stderr),
+            through_cmd,
+        ));
     }
     if let Some(stdin_result) = stdin_result {
         let remaining = timeout.saturating_sub(started.elapsed());
         stdin_result
             .recv_timeout(remaining)
             .map_err(|_| LaunchError::Timeout)?
-            .map_err(|_| LaunchError::Failed)?;
+            .map_err(|_| LaunchError::Failed(String::new()))?;
     }
     let remaining = timeout.saturating_sub(started.elapsed());
     let stdout = out_rx
@@ -299,6 +329,26 @@ fn run_process(
         return Err(LaunchError::TooLarge);
     }
     Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// cmd.exe's own complaint when the program it was asked to run does not
+/// exist. It exits 1 like a failing provider would, so the text is the only
+/// way to tell "not installed" from "ran and failed".
+const CMD_NOT_RECOGNIZED: &str = "is not recognized as an internal or external command";
+
+fn classify_failure(stderr: &str, through_cmd: bool) -> LaunchError {
+    if through_cmd && stderr.contains(CMD_NOT_RECOGNIZED) {
+        return LaunchError::Unavailable;
+    }
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(FAILURE_DETAIL_CHARS)
+        .collect();
+    LaunchError::Failed(detail)
 }
 
 #[cfg(windows)]
@@ -478,7 +528,39 @@ mod tests {
                 Duration::from_secs(10),
                 1024
             ),
-            Err(LaunchError::Failed)
+            Err(LaunchError::Failed(String::new()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_failure_carries_the_first_stderr_line() {
+        let cwd = tempfile::tempdir().unwrap();
+        let spec = cmd(
+            "echo. 1>&2 & echo Not signed in. Run grok login 1>&2 & echo second line 1>&2 & exit /b 1",
+            None,
+        );
+        assert_eq!(
+            run_process(&spec, cwd.path(), Duration::from_secs(10), 1024),
+            Err(LaunchError::Failed("Not signed in. Run grok login".into()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_reports_a_missing_program_as_unavailable() {
+        // Rust cannot spawn a bare name that is not on PATH, so the launcher
+        // retries through cmd.exe, which runs fine and then prints "is not
+        // recognized". That must not read as the provider failing.
+        let cwd = tempfile::tempdir().unwrap();
+        let spec = CommandSpec {
+            program: "foreman-no-such-provider-cli".into(),
+            args: vec!["--version".into()],
+            stdin: None,
+        };
+        assert_eq!(
+            run_process(&spec, cwd.path(), Duration::from_secs(10), 1024),
+            Err(LaunchError::Unavailable)
         );
     }
 
@@ -523,7 +605,7 @@ mod tests {
         };
         assert_eq!(
             run_process(&unsafe_spec, cwd.path(), Duration::from_secs(2), 1024),
-            Err(LaunchError::Failed)
+            Err(LaunchError::Failed(String::new()))
         );
     }
 }

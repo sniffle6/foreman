@@ -7,7 +7,7 @@ use std::time::Duration;
 use eframe::egui;
 use serde_json::Value;
 
-use crate::ai_oneshot::{self, LaunchError};
+use crate::ai_oneshot::{self, LaunchError, failure_line};
 use crate::config::NamingProvider;
 use crate::theme::Theme;
 
@@ -389,7 +389,9 @@ fn generate(
     })
     .map_err(|error| match error {
         LaunchError::Unavailable => format!("{program} CLI is unavailable"),
-        LaunchError::Failed => format!("{program} could not generate a theme"),
+        LaunchError::Failed(detail) => {
+            failure_line(&format!("{program} could not generate a theme"), &detail)
+        }
         LaunchError::Timeout => "Theme provider timed out".into(),
         LaunchError::TooLarge => "Provider response was too large".into(),
     })?;
