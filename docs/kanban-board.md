@@ -354,10 +354,27 @@ already gone (removed by hand) passes.
   leftover the rule above keeps forever. Before git runs, teardown renames
   the tree to a sibling and straight back; Windows refuses that while
   anything inside is open, so the toast says "worktree is in use" and
-  nothing is touched. Close the process: unlike other kept trees (one retry
-  per app run), a held one is retried every 30s while the board is shown,
-  toasted only the first time, so it clears on its own. The retry is
-  non-forcing even after a Discard — a dirty tree then needs Discard again.
+  nothing is touched. A held teardown re-queues itself, board shown or not:
+  every 5s for the first minute, then every 30s. Closing the worker's pane
+  often leaves the tree held for a few seconds more (by something outside
+  the pane's process tree: its own processes are gone within milliseconds),
+  so the first minute is silent; the "worktree is in use" toast fires once,
+  only for a hold that outlasts it. Close the process and the tree clears on
+  its own. The retry is non-forcing even after a Discard — a dirty tree then
+  needs Discard again.
+- **The move back from the probe name is retried, then recovered.** The
+  sibling is `<id>.teardown-probe`. A one-shot move back used to fail now
+  and then, and the next teardown found the registered path gone, pruned
+  it, deleted the branch, and reported success. That left the whole tree
+  orphaned under the probe name, where neither git nor the Worktrees page
+  could see it. The move back now retries for about 10 s, and every
+  teardown first moves a stranded `<id>.teardown-probe` back to `<id>`
+  before doing anything else.
+- **Untracked tool output keeps a merged tree.** `git worktree remove`
+  refuses untracked files, so a directory a tool drops in the worker's cwd
+  (Serena's `.serena/`, say) reads as Dirty and the tree is kept even
+  though the branch landed. Ignore it in the project's `.gitignore`;
+  ignored files do not block removal.
 - **Each worktree cold-builds.** It has its own `target/`; the first build
   costs minutes (`docs/dev-launcher.md` forbids sharing a target dir). Minutes
   of compile beat corrupted commits.

@@ -1106,7 +1106,10 @@ impl eframe::App for App {
         });
         match decision {
             Geometry::Nothing | Geometry::Step(window_placement::Step::Wait) => {}
-            Geometry::Step(window_placement::Step::Correct { outer_pos, inner_size }) => {
+            Geometry::Step(window_placement::Step::Correct {
+                outer_pos,
+                inner_size,
+            }) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer_pos));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner_size));
             }
@@ -1561,10 +1564,8 @@ fn main() -> eframe::Result {
     let restore_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let hook_slot = restore_slot.clone();
     let window_builder: eframe::WindowBuilderHook = Box::new(move |mut builder| {
-        let placement = window_placement::placement(
-            saved_window.as_ref(),
-            &window_placement::monitors(),
-        );
+        let placement =
+            window_placement::placement(saved_window.as_ref(), &window_placement::monitors());
         if let Some(g) = placement {
             // winit applies with_maximized after CreateWindowExW, so the
             // position/size below become the normal rect un-maximize returns to.

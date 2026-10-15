@@ -2486,6 +2486,13 @@ fn worktree_registered(project_cwd: &std::path::Path, path: &str) -> Result<bool
 ///   is kept and reported, `--force` or not.
 fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Result<(), String> {
     let tree = std::path::Path::new(&wt.path);
+    // A tree stranded under the hold probe's name goes back first: git's
+    // registration still names `tree`, and the prune below would otherwise
+    // drop it and orphan the whole tree under the probe name.
+    let probe = probe_path(tree);
+    if !tree.exists() && probe.is_dir() {
+        rename_retrying(&probe, tree)?;
+    }
     if worktree_registered(project_cwd, &wt.path)? {
         if !tree.is_dir() {
             return git(project_cwd, &["worktree", "prune"]).map(|_| ());
@@ -2521,27 +2528,48 @@ fn ensure_not_held(tree: &std::path::Path) -> Result<(), String> {
     if !cfg!(windows) {
         return Ok(());
     }
-    let mut probe = tree.as_os_str().to_owned();
-    probe.push(".teardown-probe");
-    let probe = std::path::PathBuf::from(probe);
+    let probe = probe_path(tree);
     let mut attempt = 0;
     loop {
         attempt += 1;
         match std::fs::rename(tree, &probe) {
-            Ok(()) => {
-                return std::fs::rename(&probe, tree).map_err(|e| {
-                    format!(
-                        "cannot move worktree back from {} to {}: {e}",
-                        probe.display(),
-                        tree.display()
-                    )
-                });
-            }
+            Ok(()) => return rename_retrying(&probe, tree),
             Err(_) if attempt < 5 => std::thread::sleep(std::time::Duration::from_millis(400)),
             Err(e) => {
                 return Err(format!(
                     "{HELD_REFUSAL} by a running process (a program started from inside it, or a shell whose directory is inside it); close it and teardown retries: {} ({e})",
                     tree.display()
+                ));
+            }
+        }
+    }
+}
+
+/// The sibling `ensure_not_held` renames the tree to: `<tree>.teardown-probe`.
+fn probe_path(tree: &std::path::Path) -> std::path::PathBuf {
+    let mut probe = tree.as_os_str().to_owned();
+    probe.push(".teardown-probe");
+    std::path::PathBuf::from(probe)
+}
+
+/// Move the tree back from the probe name. Unlike the probe's own rename,
+/// this one must not give up quickly: something that opens the freshly
+/// renamed directory (a scanner, an indexer) can refuse it for a moment,
+/// and a failure leaves the tree under a name git does not know. Retried
+/// for about 10 s; `remove_tree` recovers it on the next teardown if even
+/// that fails.
+fn rename_retrying(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 50 => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => {
+                return Err(format!(
+                    "cannot move worktree back from {} to {}: {e}",
+                    from.display(),
+                    to.display()
                 ));
             }
         }
@@ -3922,6 +3950,31 @@ mod tests {
             teardown_worktree(repo.path(), &wt, false),
             TeardownOutcome::Removed
         );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    /// The hold probe renames the tree to `<id>.teardown-probe` and back. A
+    /// failed move back used to strand the tree there: the next teardown saw
+    /// the registered path missing, pruned the registration, deleted the
+    /// branch, and reported Removed, leaving the whole tree orphaned under
+    /// the probe name where no listing could find it.
+    #[test]
+    fn teardown_recovers_a_tree_stranded_under_the_probe_name() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        let probe = probe_path(tree);
+        std::fs::rename(tree, &probe).unwrap();
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!probe.exists(), "nothing left under the probe name");
         assert!(!tree.exists());
         assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
     }
