@@ -343,9 +343,13 @@ already gone (removed by hand) passes.
   registered tree goes through git; an unregistered leftover is removed only
   if it is empty and sits under `<root>/.foreman/worktrees/`; a tree or
   branch that is already gone counts as that step done, so repeating a
-  teardown is harmless. A nonempty unregistered directory is never deleted
-  (git no longer tracks it, so nothing in it is provably ours) — the error
-  toast names it; inspect and delete it by hand.
+  teardown is harmless. A nonempty unregistered directory whose `.git` link
+  points into this repository's `.git/worktrees/` is provably ours (only
+  `git worktree add` writes that link): it is deleted once its branch is
+  merged, or under Discard — uncommitted changes in it are not protected,
+  because git's dirty check needs the registration that is gone. Any other
+  nonempty unregistered directory is never deleted — the error toast names
+  it; inspect and delete it by hand.
 - **A process running from inside the tree blocks teardown up front.** A
   hold deeper than the top directory — a debug build launched from the
   tree's `target/` (the screenshot flow leaves one running), a shell cd'd
@@ -363,13 +367,18 @@ already gone (removed by hand) passes.
   its own. The retry is non-forcing even after a Discard — a dirty tree then
   needs Discard again.
 - **The move back from the probe name is retried, then recovered.** The
-  sibling is `<id>.teardown-probe`. A one-shot move back used to fail now
-  and then, and the next teardown found the registered path gone, pruned
-  it, deleted the branch, and reported success. That left the whole tree
-  orphaned under the probe name, where neither git nor the Worktrees page
-  could see it. The move back now retries for about 10 s, and every
-  teardown first moves a stranded `<id>.teardown-probe` back to `<id>`
-  before doing anything else.
+  sibling is `<id>.teardown-probe`. Something on some machines (an indexer
+  or scanner) opens a freshly renamed directory for roughly 150 ms, so a
+  one-shot move back failed on every teardown there. The failed teardown's
+  own prune then dropped the registration of the missing path, leaving the
+  whole tree — with its `target/`, gigabytes per card — orphaned under the
+  probe name where neither git nor the Worktrees page could see it, and
+  the leftover rule kept it forever once found. Now: the move back retries
+  for about 10 s; a teardown never prunes while a tree sits under the probe
+  name, so the registration survives for the next attempt; every teardown
+  first moves a stranded `<id>.teardown-probe` back to `<id>`; and a
+  recovered tree whose registration is already gone is removed through the
+  `.git`-link rule above.
 - **Untracked tool output keeps a merged tree.** `git worktree remove`
   refuses untracked files, so a directory a tool drops in the worker's cwd
   (Serena's `.serena/`, say) reads as Dirty and the tree is kept even

@@ -2379,6 +2379,9 @@ pub fn teardown_verdict(
 ) -> TeardownOutcome {
     match remove {
         Err(e) if e.to_lowercase().contains("modified or untracked") => TeardownOutcome::Dirty,
+        Err(e) if e.to_lowercase().contains("not fully merged") => {
+            TeardownOutcome::Unmerged { ahead }
+        }
         Err(e) if e.starts_with(HELD_REFUSAL) => TeardownOutcome::Held(e),
         Err(e) => TeardownOutcome::Failed(e),
         Ok(()) => match branch {
@@ -2409,13 +2412,29 @@ pub fn teardown_worktree(
     // is decided by git's own refusal, not by this number.
     let ahead = worktree_status_now(project_cwd, wt)
         .map(|s| s.ahead)
+        // A tree stranded under the probe name has no status; the branch
+        // alone answers how far ahead of base it is.
+        .or_else(|_| branch_ahead(project_cwd, wt))
         .unwrap_or(0);
     let remove = remove_tree(project_cwd, wt, force);
     let branch = remove
         .is_ok()
         .then(|| delete_branch(project_cwd, &wt.branch, force));
-    let _ = git(project_cwd, &["worktree", "prune"]);
+    // Never prune while the tree sits under the probe name (the move back
+    // failed for good): the registration names the real path, and it is
+    // what lets the next teardown recover the tree through git instead of
+    // the leftover rule.
+    if !probe_path(std::path::Path::new(&wt.path)).exists() {
+        let _ = git(project_cwd, &["worktree", "prune"]);
+    }
     teardown_verdict(remove, branch, ahead)
+}
+
+/// Commits on the card's branch that base does not have.
+fn branch_ahead(project_cwd: &std::path::Path, wt: &Worktree) -> Result<u32, String> {
+    let range = format!("{}..{}", wt.base, wt.branch);
+    let out = git(project_cwd, &["rev-list", "--count", &range])?;
+    Ok(out.trim().parse().unwrap_or(0))
 }
 
 /// Branch-mode teardown (spec: dispatch-branch §Teardown): there is no tree
@@ -2480,10 +2499,13 @@ fn worktree_registered(project_cwd: &std::path::Path, path: &str) -> Result<bool
 ///   transient hold; a refusal that leaves the path unregistered falls
 ///   through to the leftover rule);
 /// - registered + directory gone → `git worktree prune`;
-/// - unregistered → the leftover rule: remove the directory only when it is
-///   EMPTY and sits under `<root>/.foreman/worktrees/`. Git no longer tracks
-///   it, so anything inside it is not ours to delete — a nonempty leftover
-///   is kept and reported, `--force` or not.
+/// - unregistered, but its `.git` link points into this repository's
+///   worktree admin dir → ours (`remove_recovered_tree`): removed when the
+///   branch is merged or under `--force`;
+/// - unregistered otherwise → the leftover rule: remove the directory only
+///   when it is EMPTY and sits under `<root>/.foreman/worktrees/`. Git no
+///   longer tracks it, so anything inside it is not ours to delete — a
+///   nonempty leftover is kept and reported, `--force` or not.
 fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Result<(), String> {
     let tree = std::path::Path::new(&wt.path);
     // A tree stranded under the hold probe's name goes back first: git's
@@ -2510,6 +2532,9 @@ fn remove_tree(project_cwd: &std::path::Path, wt: &Worktree, force: bool) -> Res
                 }
             }
         }
+    }
+    if tree.is_dir() && links_into_this_repo(project_cwd, tree)? {
+        return remove_recovered_tree(project_cwd, wt, tree, force);
     }
     remove_leftover_dir(project_cwd, tree)
 }
@@ -2610,6 +2635,77 @@ fn git_worktree_remove(
                 continue;
             }
             Err(e) => break Err(e),
+        }
+    }
+}
+
+/// Is `tree` a worktree this repository made? True when its `.git` is a
+/// link file whose gitdir sits under this repository's `<common>/worktrees/`
+/// — what `git worktree add` writes and nothing else does. A plain
+/// directory (no link), a nested repository (`.git` is a directory), or a
+/// tree from another repository all read false.
+fn links_into_this_repo(
+    project_cwd: &std::path::Path,
+    tree: &std::path::Path,
+) -> Result<bool, String> {
+    let Ok(link) = std::fs::read_to_string(tree.join(".git")) else {
+        return Ok(false);
+    };
+    let Some(gitdir) = link.trim().strip_prefix("gitdir:") else {
+        return Ok(false);
+    };
+    let common = git(
+        project_cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let admin = std::path::Path::new(common.trim()).join("worktrees");
+    Ok(std::path::Path::new(gitdir.trim())
+        .parent()
+        .is_some_and(|p| same_path(&p.to_string_lossy(), &admin.to_string_lossy())))
+}
+
+/// A tree whose registration is gone but whose `.git` link proves it is
+/// this repository's own worktree: an older build's failed teardown pruned
+/// the registration of a tree stranded under the probe name (see
+/// `teardown_removes_a_probe_stranded_tree_whose_registration_was_pruned`),
+/// or a hand-run `git worktree prune` did. Git cannot remove what it no
+/// longer tracks and will not re-register an existing directory, so the
+/// leftover rule would keep the whole tree — gigabytes per card — forever.
+/// The branch's merged-branch protection still applies: a non-forcing
+/// teardown refuses an unmerged branch and keeps the tree. Uncommitted
+/// changes are not protected — git's dirty check needs the registration
+/// that is gone.
+fn remove_recovered_tree(
+    project_cwd: &std::path::Path,
+    wt: &Worktree,
+    tree: &std::path::Path,
+    force: bool,
+) -> Result<(), String> {
+    let shown = tree.display();
+    if !force {
+        let branch_exists = !git(project_cwd, &["branch", "--list", &wt.branch])?.is_empty();
+        let merged = git(
+            project_cwd,
+            &["merge-base", "--is-ancestor", &wt.branch, &wt.base],
+        )
+        .is_ok();
+        if branch_exists && !merged {
+            return Err(format!(
+                "error: the branch '{}' is not fully merged; its worktree is kept at {shown}",
+                wt.branch
+            ));
+        }
+    }
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match std::fs::remove_dir_all(tree) {
+            Ok(()) => break Ok(()),
+            Err(_) if !tree.exists() => break Ok(()),
+            Err(_) if attempt < 5 => {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            Err(e) => break Err(format!("cannot remove recovered worktree {shown}: {e}")),
         }
     }
 }
@@ -3286,6 +3382,12 @@ mod tests {
         assert_eq!(
             teardown_verdict(Err(held.clone()), None, 0),
             TeardownOutcome::Held(held)
+        );
+        // the remove step itself refuses an unmerged branch (a recovered
+        // tree git no longer tracks)
+        assert_eq!(
+            teardown_verdict(unmerged, None, 3),
+            TeardownOutcome::Unmerged { ahead: 3 }
         );
         // a remove failure decides regardless of a (never-run) branch step
         assert_eq!(
@@ -3977,6 +4079,115 @@ mod tests {
         assert!(!probe.exists(), "nothing left under the probe name");
         assert!(!tree.exists());
         assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    /// Seen on a machine where the move back failed on every teardown: the
+    /// failed teardown's own `git worktree prune` had already dropped the
+    /// registration of the (now missing) path, so the recovered tree was an
+    /// unregistered nonempty directory the leftover rule kept forever —
+    /// gigabytes per card. A tree under the probe name is foreman's own, so
+    /// a merged one is removed outright.
+    #[test]
+    fn teardown_removes_a_probe_stranded_tree_whose_registration_was_pruned() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(tree.join("build.o"), "ignored output").unwrap();
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        let probe = probe_path(tree);
+        std::fs::rename(tree, &probe).unwrap();
+        git_in(repo.path(), &["worktree", "prune"]);
+        assert!(!worktree_registered(repo.path(), &wt.path).unwrap());
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!probe.exists(), "nothing left under the probe name");
+        assert!(!tree.exists(), "the recovered tree is gone too");
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    /// The branch's merged-branch protection still applies to a stranded,
+    /// pruned tree: unmerged commits keep the tree (moved back under its
+    /// real name so the Worktrees page can see it) until Discard.
+    #[test]
+    fn teardown_keeps_an_unmerged_probe_stranded_pruned_tree_until_discard() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        std::fs::write(
+            tree.join("g.txt"),
+            "work
+",
+        )
+        .unwrap();
+        git_in(tree, &["add", "g.txt"]);
+        git_in(tree, &["commit", "-q", "-m", "unmerged"]);
+        let probe = probe_path(tree);
+        std::fs::rename(tree, &probe).unwrap();
+        git_in(repo.path(), &["worktree", "prune"]);
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Unmerged { ahead: 1 }
+        );
+        assert!(tree.join("g.txt").exists(), "kept, under its real name");
+        assert!(!probe.exists());
+        assert!(!git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, true),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists());
+        assert!(git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty());
+    }
+
+    /// A move back that fails for good must not be followed by a prune: the
+    /// registration is what lets the next teardown recover the tree through
+    /// git rather than the leftover rule. Held the way the field saw it —
+    /// something with its cwd inside the freshly renamed directory.
+    #[cfg(windows)]
+    #[test]
+    fn failed_move_back_keeps_the_registration_for_the_next_teardown() {
+        let Some(repo) = git_repo() else { return };
+        let card = Card::new("a1b2c3".into(), "t".into(), None, now_stamp());
+        let BringUp::Worktree(wt) = bring_up_worktree(repo.path(), &card).unwrap() else {
+            panic!()
+        };
+        let tree = std::path::Path::new(&wt.path);
+        git_in(repo.path(), &["merge", "--ff-only", "card/a1b2c3"]);
+        let probe = probe_path(tree);
+        std::fs::rename(tree, &probe).unwrap();
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .current_dir(&probe)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let outcome = teardown_worktree(repo.path(), &wt, false);
+        let registered = worktree_registered(repo.path(), &wt.path).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            matches!(outcome, TeardownOutcome::Failed(_)),
+            "got {outcome:?}"
+        );
+        assert!(registered, "registration survives a failed move back");
+        assert!(probe.join("f.txt").exists(), "nothing deleted");
+        assert!(
+            !git_in(repo.path(), &["branch", "--list", "card/a1b2c3"]).is_empty(),
+            "the branch step does not run after a failed remove"
+        );
+        assert_eq!(
+            teardown_worktree(repo.path(), &wt, false),
+            TeardownOutcome::Removed
+        );
+        assert!(!tree.exists() && !probe.exists());
     }
 
     #[test]
