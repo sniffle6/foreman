@@ -18,6 +18,32 @@ pub fn session_path() -> std::ffi::OsString {
         .unwrap_or_default()
 }
 
+/// The first `git` on `path` alone. A bare `Command::new("git")` is not
+/// enough on Windows: `std` searches the process PATH after the child PATH,
+/// so a `path` with no git still runs the GUI's machine Git. A terminal
+/// does not do that fallback.
+pub(crate) fn git_program(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    // `.exe` before the batch shims, matching PATHEXT's order for the names
+    // Git actually ships. A bare `git` covers a Unix layout.
+    let names: &[&str] = if cfg!(windows) {
+        &["git.exe", "git.cmd", "git.bat", "git"]
+    } else {
+        &["git"]
+    };
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve before spawning: the PTY backend can silently wrap a bare npm
 /// command in cmd.exe, so a successful process creation is not sufficient.
 /// Invoke npm's JS entry point with Node so package updates, platform selection,

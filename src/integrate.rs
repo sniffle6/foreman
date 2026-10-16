@@ -1191,8 +1191,21 @@ fn check_output(out: &ChildOutcome) -> String {
 /// cancelled mid-way (cancellation is honored between stages so git state
 /// is never torn).
 fn run_git_long(cwd: &Path, args: &[&str]) -> Result<ChildOutcome, String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args);
+    run_git_long_on_path(cwd, args, &crate::agent_command::session_path())
+}
+
+/// `path` is the PATH `git` is resolved on and handed to the child. The GUI
+/// process PATH can miss a user-scoped Git the same way it misses cargo
+/// (`agent_command::session_path`).
+fn run_git_long_on_path(
+    cwd: &Path,
+    args: &[&str],
+    path: &std::ffi::OsStr,
+) -> Result<ChildOutcome, String> {
+    let program = crate::agent_command::git_program(path)
+        .ok_or_else(|| "cannot run git: program not found".to_string())?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("-C").arg(cwd).args(args).env("PATH", path);
     run_child(cmd, GIT_OP_TIMEOUT, &|| false)
 }
 
@@ -2398,6 +2411,24 @@ mod tests {
         };
         assert!(rec.ok, "{}", rec.tail);
         assert!(rec.tail.contains("FOUND_ON_SESSION_PATH"), "{}", rec.tail);
+    }
+
+    #[test]
+    fn run_git_long_reports_cannot_run_git_when_absent_from_the_supplied_path() {
+        // A user-scoped Git is on the session PATH and missing from the GUI
+        // process PATH. An empty directory is that case inverted: spawn must
+        // fail naming git, rather than succeed via the process PATH.
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("this machine resolves git on the process PATH");
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths(std::iter::once(empty.path())).unwrap();
+        let err = match run_git_long_on_path(std::path::Path::new("."), &["--version"], &path) {
+            Err(error) => error,
+            Ok(_) => panic!("git on an empty PATH succeeded"),
+        };
+        assert!(err.contains("cannot run git"), "{err}");
     }
 
     fn outcome(stdout: &str, stderr: &str) -> ChildOutcome {

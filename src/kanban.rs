@@ -1919,8 +1919,23 @@ pub(crate) fn git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String
 
 /// `git` without the exit-status verdict, for callers that read the code.
 fn git_output(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut cmd = std::process::Command::new("git");
+    git_output_on_path(cwd, args, &crate::agent_command::session_path())
+}
+
+/// `path` is the PATH `git` is resolved on and handed to the child. The GUI
+/// process PATH can miss a user-scoped Git the same way it misses cargo
+/// (`agent_command::session_path`). Callers are a dispatch, a request, or a
+/// worker thread, so the registry read in `session_path` is not per frame.
+fn git_output_on_path(
+    cwd: &std::path::Path,
+    args: &[&str],
+    path: &std::ffi::OsStr,
+) -> Result<std::process::Output, String> {
+    let program = crate::agent_command::git_program(path)
+        .ok_or_else(|| "cannot run git: program not found".to_string())?;
+    let mut cmd = std::process::Command::new(program);
     cmd.arg("-C").arg(cwd).args(args);
+    cmd.env("PATH", path);
     cmd.stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
@@ -3435,6 +3450,22 @@ mod tests {
         git_in(tmp.path(), &["add", "f.txt"]);
         git_in(tmp.path(), &["commit", "-q", "-m", "init"]);
         Some(tmp)
+    }
+
+    #[test]
+    fn git_output_reports_cannot_run_git_when_absent_from_the_supplied_path() {
+        // A user-scoped Git is on the session PATH and missing from the GUI
+        // process PATH. An empty directory is that case inverted: spawn must
+        // fail naming git, rather than succeed via the process PATH.
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .expect("this machine resolves git on the process PATH");
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths(std::iter::once(empty.path())).unwrap();
+        let err = git_output_on_path(std::path::Path::new("."), &["--version"], &path)
+            .expect_err("git on an empty PATH");
+        assert!(err.contains("cannot run git"), "{err}");
     }
 
     #[test]
