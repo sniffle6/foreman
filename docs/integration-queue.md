@@ -187,6 +187,13 @@ card once the worktree is clean.
 - **A card with no new commits integrates as a no-op** and goes Done.
 - **The check runs in the worker's worktree**, with that worktree's own
   `target/`. First runs cold-build.
+- **The check command resolves on the session PATH**, the registry-merged
+  PATH every terminal in the app gets (`agent_command::session_path`), not
+  on the GUI process's own PATH. An installer or updater launch chain can
+  leave the GUI with a machine-only PATH; before this, every integration
+  then failed at `cannot run cargo: program not found` while the worker's
+  own `cargo test` passed. The fix lives in the app binary: a running
+  older build keeps failing until it is updated.
 
 ## Key files
 
@@ -196,8 +203,8 @@ card once the worktree is clean.
   + `repo_identity` (the submission preflight and repository identity),
   `run_turn` (turn loop + `recover`), `integrate_one` (the stages),
   `dest_preflight` / `source_preflight`, `rebase` / `fast_forward` (git
-  refusal classification), `load_policy` + `run_check` + `run_child`
-  (bounded, cancellable, Job-owned subprocesses), `IntegrationView` /
+  refusal classification), `load_policy` + `run_check` + `run_check_on_path` +
+  `run_child` (bounded, cancellable, Job-owned subprocesses), `IntegrationView` /
   `views` (the wire projection), `TurnHooks` (test barriers).
 - `src/wm.rs` — `IntegrationDriver` (per-project coordinator state),
   `integration_tick` (re-read, bookkeeping, turn thread),

@@ -1246,6 +1246,27 @@ fn run_check(
     target: &str,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<CheckRecord, CheckError> {
+    run_check_on_path(
+        tree,
+        policy,
+        prepared,
+        target,
+        &crate::agent_command::session_path(),
+        cancelled,
+    )
+}
+
+/// `path` is the PATH the check command is resolved on and handed down. The
+/// GUI's own PATH may lack the user entries that hold cargo (see
+/// `agent_command::session_path`); a terminal in the app would find it.
+fn run_check_on_path(
+    tree: &Path,
+    policy: Option<&CheckPolicy>,
+    prepared: &str,
+    target: &str,
+    path: &std::ffi::OsStr,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CheckRecord, CheckError> {
     let Some(p) = policy else {
         return Ok(CheckRecord {
             command: Vec::new(),
@@ -1256,7 +1277,8 @@ fn run_check(
         });
     };
     let mut cmd = std::process::Command::new(&p.check[0]);
-    cmd.args(&p.check[1..]).current_dir(tree);
+    // std resolves a bare program name on the child's PATH when one is set.
+    cmd.args(&p.check[1..]).env("PATH", path).current_dir(tree);
     let out = run_child(cmd, Duration::from_secs(p.timeout_secs), cancelled)
         .map_err(CheckError::Failed)?;
     if out.cancelled {
@@ -2327,6 +2349,55 @@ mod tests {
             "stdout comes last:\n{detail}"
         );
         assert!(!detail.contains("`failed_20`"), "stderr is cut to its tail");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_resolves_its_command_on_the_session_path() {
+        // The GUI may run with a stripped PATH (installer / updater launch
+        // chain), while every PTY session gets the registry-merged PATH. A
+        // configured `cargo test` must resolve the way a terminal would, or
+        // every integration fails with "cannot run cargo: program not found"
+        // even though the worker's own tests passed.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        // A real executable, not a .cmd: the check has no shell fallback, so
+        // this exercises std's own lookup of a bare name on the child PATH.
+        let system32 =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        std::fs::copy(
+            system32.join("cmd.exe"),
+            bin.path().join("foreman-probe-check.exe"),
+        )
+        .unwrap();
+        let process_path = std::env::var_os("PATH").unwrap_or_default();
+        assert!(
+            !std::env::split_paths(&process_path).any(|d| d == bin.path()),
+            "probe dir must not already be on the process PATH"
+        );
+        let session_path = std::env::join_paths(
+            std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&process_path)),
+        )
+        .unwrap();
+        let policy = CheckPolicy {
+            v: 1,
+            check: vec![
+                "foreman-probe-check".into(),
+                "/c".into(),
+                "echo FOUND_ON_SESSION_PATH".into(),
+            ],
+            timeout_secs: 60,
+        };
+        let result = run_check_on_path(tmp.path(), Some(&policy), "p", "t", &session_path, &|| {
+            false
+        });
+        let rec = match result {
+            Ok(rec) => rec,
+            Err(CheckError::Failed(error)) => panic!("check failed to run: {error}"),
+            Err(CheckError::Cancelled) => panic!("check was unexpectedly cancelled"),
+        };
+        assert!(rec.ok, "{}", rec.tail);
+        assert!(rec.tail.contains("FOUND_ON_SESSION_PATH"), "{}", rec.tail);
     }
 
     fn outcome(stdout: &str, stderr: &str) -> ChildOutcome {
