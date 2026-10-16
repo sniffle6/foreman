@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "6h03fd",
+  "title": "Create project layouts from prompted previews",
+  "body": "Add Create Layout with conversational refinement, a labeled arrangement preview, Apply, Save & Apply, and Cancel. Reuse established arrangement/apply validation and bounded one-shot provider execution.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md\nBlocked by: cplsbf - Add project layout picker and Save controls\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Send only bounded target-Project inventory/labels and description; disclose provider input. No terminal output, chat history, file reading, new Content, or commands.\n- Strict provider proposals account for every item exactly once. Missing requested Content produces an explanation instead of process/viewer creation.\n- Target ownership/revisions, Project switches/closure, cancellation, superseded replies, caps/timeouts, unavailable providers, and invalid output cannot mutate live arrangements.\n- Refinement only updates preview. Save & Apply validates and persists before changing live geometry; failures preserve the candidate.\n- Test new behavior first, update the feature doc, inspect screenshots of Create/refinement/errors, and verify live Sessions remain usable after Apply/Revert.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
+  "state": "backlog",
+  "planned": {
+    "name": "project-layouts",
+    "wave": 5
+  },
+  "created": "2026-10-16T14:15:55Z",
+  "updated": "2026-10-16T14:15:55Z"
+}

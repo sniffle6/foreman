@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "cplsbf",
+  "title": "Add project layout picker and Save controls",
+  "body": "Build the Project-header Layout picker and visible Save button over the model/store/apply seams. Deliver usable manual layouts before adding AI creation.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md\nBlocked by: r9a5ju - Apply and revert layouts without replacing Content\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Project-only entries/diagrams, Custom/Modified, Save/Save As, rename/delete, replacement and errors follow the spec.\n- Exact inventory applies immediately; changed inventory gets a reconciliation preview using the same validated result as Apply.\n- Revert, no-active-project state, compact/zoomed Project access, and preservation on canceled dialogs work as specified.\n- Test assertable UI bindings first. Capture and inspect screenshots covering picker, names, reconciliation, errors, Modified, compact/zoomed cases and mixed applied Content.\n- Add/update the feature doc. This completes the manual-layout milestone; do not expose an inert Create action before wave 5.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
+  "state": "backlog",
+  "planned": {
+    "name": "project-layouts",
+    "wave": 4
+  },
+  "created": "2026-10-16T14:15:55Z",
+  "updated": "2026-10-16T14:15:55Z"
+}

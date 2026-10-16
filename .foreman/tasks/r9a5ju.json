@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "r9a5ju",
+  "title": "Apply and revert layouts without replacing Content",
+  "body": "Integrate validated arrangements with the active Project Window manager through deferred mutations. Move existing Content objects and implement one-level structural Revert with revision invalidation.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md\nBlocked by: cizr5k - Persist project-owned saved layout libraries\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Apply preserves Session instances/processes, grids/scrollback, Member ids, viewer targets/view state, and title/agent-state ownership.\n- Exact matching, reconciliation, focus, child zoom, minimized restore, floating bounds, Modified tracking, and workspace dirtiness follow the spec.\n- Other Projects and desktop geometry remain untouched. Invalid/stale transitions leave the current arrangement intact.\n- Revert restores geometry/selection without rewinding Content; structural edits invalidate it. Never use cold restore for live Apply.\n- Prove preservation through manager tests and supported Inspection where applicable. Update subsystem documentation.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
+  "state": "backlog",
+  "planned": {
+    "name": "project-layouts",
+    "wave": 3
+  },
+  "created": "2026-10-16T14:15:54Z",
+  "updated": "2026-10-16T14:15:55Z"
+}
