@@ -2,6 +2,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// The PATH a PTY session sees: `portable_pty` rebuilds it from the registry
+/// (machine entries, then user entries) on every spawn. The GUI's own PATH
+/// can lack the user entries entirely -- a launch from an installer or an
+/// elevated updater inherits a machine-only PATH, and every in-app restart
+/// inherits that. npm's codex.cmd and ~/.local/bin/claude.exe live in the
+/// user entries, so anything spawned with `std::process::Command` must
+/// resolve on this PATH rather than the process one. Falls back to the
+/// process PATH when the builder has none.
+pub fn session_path() -> std::ffi::OsString {
+    portable_pty::CommandBuilder::new("")
+        .get_env("PATH")
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default()
+}
+
 /// Resolve before spawning: the PTY backend can silently wrap a bare npm
 /// command in cmd.exe, so a successful process creation is not sufficient.
 /// Invoke npm's JS entry point with Node so package updates, platform selection,

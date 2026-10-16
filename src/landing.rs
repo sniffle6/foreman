@@ -417,7 +417,9 @@ impl SessionKind {
     pub fn installed(self) -> bool {
         match self.stem() {
             None => true,
-            Some(s) => on_path(s, std::env::var_os("PATH").as_deref(), &|p| p.exists()),
+            Some(s) => on_path(s, Some(&crate::agent_command::session_path()), &|p| {
+                p.exists()
+            }),
         }
     }
 }

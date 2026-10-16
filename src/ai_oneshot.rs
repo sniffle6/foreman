@@ -174,6 +174,24 @@ fn run_process(
     timeout: Duration,
     max_output: usize,
 ) -> Result<String, LaunchError> {
+    run_process_on_path(
+        spec,
+        cwd,
+        &crate::agent_command::session_path(),
+        timeout,
+        max_output,
+    )
+}
+
+/// `path` is the PATH the provider is resolved on and handed down; the GUI's
+/// own PATH may be stripped (see `agent_command::session_path`).
+fn run_process_on_path(
+    spec: &CommandSpec,
+    cwd: &Path,
+    path: &std::ffi::OsStr,
+    timeout: Duration,
+    max_output: usize,
+) -> Result<String, LaunchError> {
     use std::process::{Command, Stdio};
     // One wall-clock deadline covers spawn, stdin delivery, process execution,
     // and output drain. No individual pipe operation may hold the caller.
@@ -183,8 +201,7 @@ fn run_process(
         .collect::<Vec<_>>();
     // npm's codex.cmd shim would force the prompt through cmd.exe; run its
     // node entry point directly instead so argv needs no shell quoting.
-    let npm =
-        crate::agent_command::npm_codex(&argv, cwd, &std::env::var_os("PATH").unwrap_or_default());
+    let npm = crate::agent_command::npm_codex(&argv, cwd, path);
     let build = |through_cmd: bool| -> Result<Command, LaunchError> {
         let mut command;
         #[cfg(windows)]
@@ -213,7 +230,10 @@ fn run_process(
             command = Command::new(&argv[0]);
             command.args(&argv[1..]);
         }
+        // std resolves a bare program name on the child's PATH when one is
+        // set, and cmd.exe's fallback lookup inherits it too.
         command
+            .env("PATH", path)
             .current_dir(cwd)
             .stdin(if spec.stdin.is_some() {
                 Stdio::piped()
@@ -305,8 +325,11 @@ fn run_process(
     if !status.success() {
         let remaining = timeout.saturating_sub(started.elapsed());
         let stderr = err_rx.recv_timeout(remaining).unwrap_or_default();
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let stdout = out_rx.recv_timeout(remaining).unwrap_or_default();
         return Err(classify_failure(
             &String::from_utf8_lossy(&stderr),
+            &String::from_utf8_lossy(&stdout),
             through_cmd,
         ));
     }
@@ -336,12 +359,15 @@ fn run_process(
 /// way to tell "not installed" from "ran and failed".
 const CMD_NOT_RECOGNIZED: &str = "is not recognized as an internal or external command";
 
-fn classify_failure(stderr: &str, through_cmd: bool) -> LaunchError {
+/// The detail is the first non-blank stderr line, else the first non-blank
+/// stdout line: Claude Code reports API errors on stdout with a silent stderr.
+fn classify_failure(stderr: &str, stdout: &str, through_cmd: bool) -> LaunchError {
     if through_cmd && stderr.contains(CMD_NOT_RECOGNIZED) {
         return LaunchError::Unavailable;
     }
     let detail = stderr
         .lines()
+        .chain(stdout.lines())
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default()
@@ -548,6 +574,21 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn provider_failure_detail_falls_back_to_stdout() {
+        // Claude Code prints API errors ("API Error: ...") on stdout and
+        // exits 1 with nothing on stderr; the user still needs the reason.
+        let cwd = tempfile::tempdir().unwrap();
+        let spec = cmd("echo API Error: safeguards flagged this & exit /b 1", None);
+        assert_eq!(
+            run_process(&spec, cwd.path(), Duration::from_secs(10), 1024),
+            Err(LaunchError::Failed(
+                "API Error: safeguards flagged this".into()
+            ))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn provider_process_reports_a_missing_program_as_unavailable() {
         // Rust cannot spawn a bare name that is not on PATH, so the launcher
         // retries through cmd.exe, which runs fine and then prints "is not
@@ -562,6 +603,46 @@ mod tests {
             run_process(&spec, cwd.path(), Duration::from_secs(10), 1024),
             Err(LaunchError::Unavailable)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn provider_process_resolves_the_cli_on_the_session_path() {
+        // The GUI may have been launched with a stripped PATH (an installer or
+        // updater chain without the user's entries), while every PTY session
+        // gets the registry-merged PATH. The provider CLI must resolve on the
+        // session PATH, not on whatever the GUI process inherited.
+        let cwd = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            bin.path().join("foreman-probe-provider.cmd"),
+            "@echo FOUND_ON_SESSION_PATH
+",
+        )
+        .unwrap();
+        let spec = CommandSpec {
+            program: "foreman-probe-provider".into(),
+            args: vec![],
+            stdin: None,
+        };
+        let process_path = std::env::var_os("PATH").unwrap_or_default();
+        assert!(
+            !std::env::split_paths(&process_path).any(|d| d == bin.path()),
+            "probe dir must not already be on the process PATH"
+        );
+        let session_path = std::env::join_paths(
+            std::iter::once(bin.path().to_path_buf()).chain(std::env::split_paths(&process_path)),
+        )
+        .unwrap();
+        let output = run_process_on_path(
+            &spec,
+            cwd.path(),
+            &session_path,
+            Duration::from_secs(10),
+            1024,
+        )
+        .unwrap();
+        assert!(output.contains("FOUND_ON_SESSION_PATH"), "{output:?}");
     }
 
     #[cfg(windows)]
