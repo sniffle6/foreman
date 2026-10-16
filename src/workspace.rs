@@ -88,6 +88,11 @@ pub struct TabSnap {
     /// Whether this project hides its children in the Sessions pane.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub panel_collapsed: bool,
+    /// Persistent layout-item identity (`Tab::layout_id`). Additive post-v1
+    /// field: omitted when unset so v1 files and old builds are unaffected;
+    /// restore mints a fresh id for a tab without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_id: Option<u64>,
     pub content: ContentSnap,
 }
 
@@ -98,6 +103,7 @@ impl Default for TabSnap {
             managed_title: false,
             panel_order: None,
             panel_collapsed: false,
+            layout_id: None,
             content: ContentSnap::Chat,
         }
     }
@@ -378,6 +384,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_snap_layout_id_is_wire_compat_with_v1() {
+        let mut v1 = serde_json::to_value(TabSnap::default()).unwrap();
+        v1.as_object_mut().unwrap().remove("layout_id");
+        let snap: TabSnap = serde_json::from_value(v1).expect("v1 tab parses");
+        assert_eq!(snap.layout_id, None);
+        let out = serde_json::to_string(&snap).unwrap();
+        assert!(!out.contains("layout_id"), "None must be omitted: {out}");
+        let mut with = snap.clone();
+        with.layout_id = Some(42);
+        let back: TabSnap = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.layout_id, Some(42));
+    }
+
+    #[test]
     fn empty_object_loads_as_default() {
         // Default::version is 1 so `{}` and a hand-built default agree after load().
         let s: WorkspaceSnapshot = serde_json::from_str("{}").unwrap();
@@ -411,6 +431,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(r"C:\code\foreman")),
@@ -425,6 +446,7 @@ mod tests {
                                         managed_title: true,
                                         panel_order: None,
                                         panel_collapsed: false,
+                                        layout_id: None,
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
                                         },
@@ -480,6 +502,7 @@ mod tests {
             managed_title: false,
             panel_order: None,
             panel_collapsed: false,
+            layout_id: None,
             content: ContentSnap::Image {
                 path: PathBuf::from(r"C:\shots\armed.png"),
             },
@@ -534,6 +557,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
                         },
@@ -555,6 +579,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap::default(),
                         },

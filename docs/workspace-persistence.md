@@ -16,6 +16,9 @@ On restart, Foreman reloads the last desktop layout from
 - Per-project Sessions-pane folder collapse state (older files default to expanded)
 - Per-tab sessions-panel rank (`TabSnap.panel_order`, additive `Option` —
   omitted when unset, so v1 files and old builds are unaffected)
+- Per-tab layout-item identity (`TabSnap.layout_id`, same additive policy;
+  restore keeps it verbatim and mints one for tabs without it — see
+  `docs/project-layouts.md`)
 - Whether each terminal title is Foreman-managed. Generated semantic text is
   not authoritative state; snapshots store only a generic source/member label
   plus `managed_title = true`, and current restore starts the title lifecycle

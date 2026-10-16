@@ -59,6 +59,20 @@ A tmux-style temporary state that renders one Win over the whole area without
 changing the Layout tree.
 _Avoid_: maximize, fullscreen (maximize is a real rect change; Zoom is an overlay).
 
+**Layout item**:
+A Content-bearing tab as a project layout sees it: a persistent `layout_id`
+plus its Content kind. Survives tab moves and cold restore; never a Member id
+or a Win id. The inventory is the Project's current layout items in
+arrangement order (`docs/project-layouts.md`).
+_Avoid_: window id, tab uid (runtime-only, regenerates on restore).
+
+**Arrangement**:
+The GUI-free description of where every layout item sits: tab stacks, the
+tiling tree, floating and minimized placement in normalized geometry. A saved,
+named arrangement is a layout definition; fitting one to the current inventory
+is reconciliation.
+_Avoid_: preset, template, workspace (that is the cold desktop snapshot).
+
 ### Terminal
 
 **Session**:

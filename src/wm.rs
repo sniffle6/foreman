@@ -325,6 +325,25 @@ impl Content {
     fn bell_active(&self) -> bool {
         matches!(self, Content::Terminal(s) if s.bell_active())
     }
+
+    /// Layout-item kind for project layouts; `None` for desktop chrome that
+    /// never takes part in an arrangement.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
+    fn layout_kind(&self) -> Option<crate::project_layout::ItemKind> {
+        use crate::project_layout::ItemKind;
+        Some(match self {
+            Content::Terminal(_) => ItemKind::Terminal,
+            Content::Project(_) => ItemKind::Project,
+            Content::Chat(_) => ItemKind::Chat,
+            Content::Board(_) => ItemKind::Board,
+            Content::Plan(_) => ItemKind::Plan,
+            Content::GitHistory(_) => ItemKind::GitHistory,
+            Content::GitDiff(_) => ItemKind::GitDiff,
+            Content::GitChanges(_) => ItemKind::GitChanges,
+            Content::Image(_) => ItemKind::Image,
+            Content::TaskManager(_) | Content::Settings(_) => return None,
+        })
+    }
 }
 
 /// One entry in a window's tab-stack: a title and the content it shows. The
@@ -355,6 +374,10 @@ pub struct Tab {
     /// At most one model-generated naming attempt per upstream agent session.
     /// This is runtime-only; workspace restore deliberately starts fresh.
     agent_title: crate::terminal_titles::AgentTitleState,
+    /// Persistent layout-item identity (project layouts): minted once here,
+    /// carried through merge/untab, persisted in `TabSnap::layout_id` and
+    /// restored verbatim. Never a Member id or a Win id.
+    layout_id: crate::project_layout::LayoutItemId,
 }
 
 /// Process-global source for [`Tab::tab_uid`]. Tab construction happens on
@@ -364,6 +387,23 @@ static NEXT_TAB_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 fn next_tab_uid() -> u64 {
     NEXT_TAB_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Process-global source for [`Tab::layout_id`]. Restore raises it past
+/// every persisted id (`reserve_layout_id`) so fresh tabs never collide.
+static NEXT_LAYOUT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_layout_id() -> crate::project_layout::LayoutItemId {
+    NEXT_LAYOUT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keep the counter above a restored id.
+fn reserve_layout_id(id: crate::project_layout::LayoutItemId) {
+    NEXT_LAYOUT_ID.fetch_max(id + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Persisted layout ids at or above this are ignored (fresh id instead) so a
+/// corrupt file cannot park the counter at `u64::MAX` and wrap it.
+const MAX_RESTORED_LAYOUT_ID: crate::project_layout::LayoutItemId = u64::MAX >> 1;
 
 impl Tab {
     /// Fixed title (no auto-rename). Used for projects, chat, panel, dispatch.
@@ -376,7 +416,14 @@ impl Tab {
             tab_uid: next_tab_uid(),
             auto_title: false,
             agent_title: Default::default(),
+            layout_id: next_layout_id(),
         }
+    }
+
+    /// Persistent layout-item identity; stable across tab moves and restarts.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
+    pub fn layout_id(&self) -> crate::project_layout::LayoutItemId {
+        self.layout_id
     }
 
     /// Default shell title — auto-renames when an agent is detected.
@@ -389,6 +436,7 @@ impl Tab {
             tab_uid: next_tab_uid(),
             auto_title: true,
             agent_title: Default::default(),
+            layout_id: next_layout_id(),
         }
     }
 }
@@ -992,6 +1040,7 @@ impl WindowManager {
                     managed_title: t.auto_title,
                     panel_order: t.panel_order,
                     panel_collapsed: t.panel_collapsed,
+                    layout_id: Some(t.layout_id),
                     content,
                 });
             }
@@ -1048,6 +1097,39 @@ impl WindowManager {
             version: crate::workspace::WORKSPACE_VERSION,
             desktop: self.capture_manager(),
         }
+    }
+
+    /// Current layout items in arrangement order: tiled stacks in tree
+    /// order, then floating windows back→front, then minimized windows
+    /// back→front; tabs in stack order. Desktop chrome (panel, settings) is
+    /// excluded. This is the inventory `project_layout::reconcile` matches
+    /// against; the order is what **Additional windows** preserves.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
+    pub fn layout_inventory(&self) -> Vec<crate::project_layout::ItemRef> {
+        use crate::project_layout::ItemRef;
+        let win = |id: WinId| self.windows.iter().find(|w| w.id == id);
+        let mut ordered: Vec<&Win> = self
+            .tree
+            .leaves()
+            .iter()
+            .filter_map(|&id| win(id))
+            .collect();
+        let mut rest: Vec<&Win> = self
+            .windows
+            .iter()
+            .filter(|w| !self.tree.contains(w.id))
+            .collect();
+        rest.sort_by_key(|w| (w.minimized, w.z));
+        ordered.extend(rest);
+        ordered
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| {
+                t.content
+                    .layout_kind()
+                    .map(|k| ItemRef::new(t.layout_id, k))
+            })
+            .collect()
     }
 
     /// Flag that the workspace layout (or nested project layout) changed.
@@ -1109,6 +1191,21 @@ impl WindowManager {
 
         let mut report = ApplyReport::default();
         let mut snap_id_to_win: HashMap<SnapId, WinId> = HashMap::new();
+        // Reserve every persisted layout id at this level BEFORE any tab is
+        // constructed, so a constructor-minted id can never equal one that a
+        // later tab restores. `layout_ids_claimed` then makes a hand-edited
+        // duplicate keep its fresh id instead of aliasing the first holder.
+        for id in snap
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| t.layout_id)
+            .filter(|id| *id < MAX_RESTORED_LAYOUT_ID)
+        {
+            reserve_layout_id(id);
+        }
+        let mut layout_ids_claimed: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
 
         for win_snap in &snap.windows {
             // Id for this window (term env / project tags). Consumed up front:
@@ -1218,6 +1315,12 @@ impl WindowManager {
                 };
                 tab.panel_order = tab_snap.panel_order;
                 tab.panel_collapsed = tab_snap.panel_collapsed;
+                if let Some(id) = tab_snap
+                    .layout_id
+                    .filter(|id| *id < MAX_RESTORED_LAYOUT_ID && layout_ids_claimed.insert(*id))
+                {
+                    tab.layout_id = id;
+                }
                 tabs.push(tab);
             }
 
@@ -9362,6 +9465,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -9376,6 +9480,7 @@ mod tests {
                                         managed_title: false,
                                         panel_order: None,
                                         panel_collapsed: false,
+                                        layout_id: None,
                                         content: ContentSnap::Terminal {
                                             shell: "cmd".into(),
                                         },
@@ -9464,6 +9569,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(dir.clone()),
@@ -9481,6 +9587,7 @@ mod tests {
                                         managed_title: false,
                                         panel_order: None,
                                         panel_collapsed: false,
+                                        layout_id: None,
                                         content: ContentSnap::Board,
                                     }],
                                     minimized: false,
@@ -9561,6 +9668,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project {
                             child: ManagerSnap {
                                 cwd: Some(std::path::PathBuf::from(
@@ -11387,6 +11495,7 @@ mod tests {
             managed_title: false,
             panel_order: None,
             panel_collapsed: false,
+            layout_id: None,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -11430,6 +11539,7 @@ mod tests {
             managed_title: false,
             panel_order: None,
             panel_collapsed: false,
+            layout_id: None,
             content: ContentSnap::Terminal {
                 shell: "cmd".into(),
             },
@@ -11455,6 +11565,7 @@ mod tests {
                         managed_title: false,
                         panel_order: None,
                         panel_collapsed: false,
+                        layout_id: None,
                         content: ContentSnap::Project { child },
                     }],
                     ..Default::default()
@@ -11510,6 +11621,7 @@ mod tests {
             managed_title: false,
             panel_order: None,
             panel_collapsed: false,
+            layout_id: None,
             content: ContentSnap::Project {
                 child: ManagerSnap {
                     cwd: Some(std::env::current_dir().unwrap()),
@@ -11521,6 +11633,7 @@ mod tests {
                             managed_title: true,
                             panel_order: None,
                             panel_collapsed: false,
+                            layout_id: None,
                             content: ContentSnap::Terminal {
                                 shell: "cmd".into(),
                             },
@@ -18014,5 +18127,201 @@ mod tests {
             e.contains("cannot verify") || e.contains("not yet on"),
             "{e}"
         );
+    }
+
+    // ── Project layout identity (docs/project-layouts.md) ──────────────
+
+    fn push_tab(wm: &mut WindowManager, tab: Tab) -> WinId {
+        let (id, rect) = wm.next_slot(egui::vec2(400.0, 300.0));
+        wm.push_win(id, tab, rect);
+        id
+    }
+
+    fn push_chat(wm: &mut WindowManager, title: &str) -> WinId {
+        let tab = Tab::fixed(
+            title,
+            Content::Chat(crate::chat::ChatView::new(Rc::clone(&wm.chat))),
+        );
+        push_tab(wm, tab)
+    }
+
+    #[test]
+    fn layout_ids_are_unique_and_survive_tab_moves() {
+        let mut wm = WindowManager::new();
+        let a = push(&mut wm, "A");
+        let b = push(&mut wm, "B");
+        let id_a = wm.windows[0].tabs[0].layout_id();
+        let id_b = wm.windows[1].tabs[0].layout_id();
+        assert_ne!(id_a, id_b);
+
+        wm.merge_windows(b, a); // A: [A, B]
+        let win = wm.windows.iter().find(|w| w.id == a).unwrap();
+        assert_eq!(win.tabs[0].layout_id(), id_a);
+        assert_eq!(
+            win.tabs[1].layout_id(),
+            id_b,
+            "merge keeps the tab's identity"
+        );
+
+        wm.untab(a, 1, egui::pos2(500.0, 400.0));
+        let new = wm.windows.iter().max_by_key(|w| w.id).unwrap();
+        assert_ne!(new.id, b, "untab mints a fresh Win id");
+        assert_eq!(
+            new.tabs[0].layout_id(),
+            id_b,
+            "untab keeps the tab's identity"
+        );
+    }
+
+    #[test]
+    fn layout_inventory_lists_content_in_arrangement_order() {
+        use crate::project_layout::{ItemKind, ItemRef};
+        let mut wm = WindowManager::new();
+        wm.last_area = egui::vec2(1000.0, 600.0);
+        // Two tiled chat viewers, one floating image, one minimized chat;
+        // the Settings window never appears in the inventory.
+        let c1 = push_chat(&mut wm, "c1");
+        wm.tile_new(c1, None);
+        let c2 = push_chat(&mut wm, "c2");
+        wm.tile_new(c2, Some(c1));
+        let img = push_tab(
+            &mut wm,
+            Tab::fixed(
+                "img",
+                Content::Image(crate::imageview::ImageView::load(std::path::PathBuf::from(
+                    r"C:\nope\missing.png",
+                ))),
+            ),
+        );
+        let c3 = push_chat(&mut wm, "c3");
+        wm.minimize(c3);
+        let settings = push_tab(
+            &mut wm,
+            Tab::fixed(
+                "Settings",
+                Content::Settings(crate::settings_menu::SettingsMenu::default()),
+            ),
+        );
+        // Focusing the first tile raises its z; tiled order must still follow
+        // the tree, not z.
+        wm.focus(c1);
+        let lid = |id: WinId| wm.windows.iter().find(|w| w.id == id).unwrap().tabs[0].layout_id();
+        let inv = wm.layout_inventory();
+        assert_eq!(
+            inv,
+            vec![
+                ItemRef::new(lid(c1), ItemKind::Chat),
+                ItemRef::new(lid(c2), ItemKind::Chat),
+                ItemRef::new(lid(img), ItemKind::Image),
+                ItemRef::new(lid(c3), ItemKind::Chat),
+            ],
+            "tree order, then floating by z, then minimized"
+        );
+        assert!(!inv.iter().any(|i| i.id == lid(settings)));
+    }
+
+    #[test]
+    fn layout_ids_round_trip_through_cold_restore() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let a = push_chat(&mut wm, "a");
+        let b = push_chat(&mut wm, "b");
+        wm.merge_windows(b, a);
+        let before: Vec<u64> = wm.windows[0].tabs.iter().map(|t| t.layout_id()).collect();
+
+        let snap = wm.capture_manager();
+        assert_eq!(
+            snap.windows[0].tabs[1].layout_id,
+            Some(before[1]),
+            "capture persists the identity"
+        );
+
+        let mut restored = WindowManager::new();
+        restored.apply_manager(&snap, &ctx);
+        let after: Vec<u64> = restored.windows[0]
+            .tabs
+            .iter()
+            .map(|t| t.layout_id())
+            .collect();
+        assert_eq!(after, before, "cold restore keeps every identity");
+
+        // A tab minted after restore never collides with a restored id.
+        let fresh = push_chat(&mut restored, "fresh");
+        let fresh_id = restored
+            .windows
+            .iter()
+            .find(|w| w.id == fresh)
+            .unwrap()
+            .tabs[0]
+            .layout_id();
+        assert!(!before.contains(&fresh_id));
+    }
+
+    #[test]
+    fn restore_without_layout_ids_mints_fresh_unique_ones() {
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap};
+        let ctx = egui::Context::default();
+        let tab = |layout_id: Option<u64>| TabSnap {
+            title: "chat".into(),
+            managed_title: false,
+            panel_order: None,
+            panel_collapsed: false,
+            layout_id,
+            content: ContentSnap::Chat,
+        };
+        // Old file (no ids) plus a hand-edited duplicate: all four tabs end
+        // up with distinct identities and the persisted one is kept once.
+        let snap = ManagerSnap {
+            windows: vec![WinSnap {
+                id: 1,
+                active: 0,
+                tabs: vec![tab(None), tab(None), tab(Some(777)), tab(Some(777))],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut wm = WindowManager::new();
+        wm.apply_manager(&snap, &ctx);
+        let ids: Vec<u64> = wm.windows[0].tabs.iter().map(|t| t.layout_id()).collect();
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 4, "ids must be distinct: {ids:?}");
+        assert_eq!(ids[2], 777);
+    }
+
+    #[test]
+    fn restore_never_mints_an_id_a_later_tab_restores() {
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap};
+        let ctx = egui::Context::default();
+        // The id the first (id-less) tab would mint is exactly what the
+        // second tab persists. Reserving before constructing keeps them apart.
+        let would_mint = NEXT_LAYOUT_ID.load(std::sync::atomic::Ordering::Relaxed);
+        let tab = |layout_id: Option<u64>| TabSnap {
+            title: "chat".into(),
+            layout_id,
+            content: ContentSnap::Chat,
+            ..Default::default()
+        };
+        let snap = ManagerSnap {
+            windows: vec![WinSnap {
+                id: 1,
+                tabs: vec![tab(None), tab(Some(would_mint)), tab(Some(u64::MAX))],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut wm = WindowManager::new();
+        wm.apply_manager(&snap, &ctx);
+        let ids: Vec<u64> = wm.windows[0].tabs.iter().map(|t| t.layout_id()).collect();
+        assert_eq!(ids[1], would_mint, "persisted id wins");
+        assert_ne!(
+            ids[0], ids[1],
+            "the id-less tab got a different id: {ids:?}"
+        );
+        assert!(
+            ids[2] < MAX_RESTORED_LAYOUT_ID,
+            "absurd ids are replaced: {ids:?}"
+        );
+        let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), 3);
     }
 }

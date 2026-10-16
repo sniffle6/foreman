@@ -43,6 +43,7 @@ mod notify;
 mod panel;
 mod plan_view;
 mod proc;
+mod project_layout;
 mod psreadline;
 mod ready;
 mod recents;
