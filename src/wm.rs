@@ -59,7 +59,7 @@ const MAX_SETTLE_MS: u64 = 4000;
 // retries quickly and silently; a hold that outlasts HELD_QUIET (often a
 // debug app launched from the tree, which can run for hours) is toasted
 // once and retried far apart. Each attempt is a background thread spending
-// up to ~2s in the hold probe.
+// up to ~2s in the hold check.
 const HELD_RETRY_FAST: std::time::Duration = std::time::Duration::from_secs(5);
 const HELD_RETRY_SLOW: std::time::Duration = std::time::Duration::from_secs(30);
 const HELD_QUIET: std::time::Duration = std::time::Duration::from_secs(60);

@@ -335,50 +335,67 @@ already gone (removed by hand) passes.
   once the claiming terminal is no longer running — close the pane and the
   tree goes away. A Done card still showing its branch means the pane is
   still open (or the tree was kept: see the toast).
-- **`git worktree remove` is not atomic, so teardown judges what is left.**
-  When the cwd hold above bites mid-removal, git has already deleted the
-  tree's contents and its registration and only the empty top directory
-  survives — retrying git on it fails forever ("not a working tree").
-  Teardown therefore checks registration and the directory separately: a
-  registered tree goes through git; an unregistered leftover is removed only
-  if it is empty and sits under `<root>/.foreman/worktrees/`; a tree or
-  branch that is already gone counts as that step done, so repeating a
-  teardown is harmless. A nonempty unregistered directory whose `.git` link
-  points into this repository's `.git/worktrees/` is provably ours (only
-  `git worktree add` writes that link): it is deleted once its branch is
-  merged, or under Discard — uncommitted changes in it are not protected,
+- **`git worktree remove` is not atomic, so teardown never lets git delete.**
+  On Windows, a hold anywhere inside the tree makes git delete files up to
+  the held entry, fail, and drop the registration anyway, leaving a
+  half-deleted tree. The cwd hold above is one such hold. Others: a debug
+  build launched from the tree's `target/` (the screenshot flow leaves one
+  running), or a shell cd'd into a subdirectory. So teardown does the
+  removal itself, in this order:
+  1. Check the tree first (`ensure_removable`). It must sit in
+     `<root>/.foreman/worktrees/`, and its `.git` link must point into this
+     repository. A tree that fails either check, e.g. a card hand-edited to
+     name some other worktree, is refused and kept. Then come git's own
+     pre-removal checks. A locked tree is refused even under Discard.
+     Without Discard, submodules or modified or untracked files also
+     refuse. Ignored files (`target/`) never count.
+  2. Make ONE rename of the tree to
+     `.foreman/worktrees/.trash/<id>-<nanos>`.
+  3. Run `git worktree prune` to drop the registration of the now-missing
+     path. A registration that survives the prune (a locked entry) is an
+     error, because `branch -d` would refuse the branch it has checked out.
+  4. Delete the branch, then purge `.trash/`.
+
+  Nothing is ever moved back, so no failure can leave a tree under a name
+  git doesn't know. The purge runs on every teardown, held ones included,
+  and is best effort. A copy something still holds stays in `.trash/` until
+  a later purge. `.trash/` itself is never removed, so a concurrent
+  teardown always has it to rename into. Everything in it is foreman's to
+  delete by construction. Don't put anything there.
+- **A process running from inside the tree blocks teardown up front.**
+  Windows refuses to rename a directory while anything inside it is open,
+  so step 2 fails before anything is deleted. The toast says "worktree is
+  in use", and the tree stays whole and registered. A held teardown
+  re-queues itself whether or not the board is shown: every 5s for the
+  first minute, then every 30s. Closing the worker's pane often leaves the
+  tree held for a few more seconds. The holder is outside the pane's
+  process tree, since its own processes are gone within milliseconds. So
+  the first minute is silent, and the "worktree is in use" toast fires once,
+  only for a hold that outlasts it. Close the process and the tree clears
+  on its own. The retry is non-forcing even after a Discard, so a dirty
+  tree then needs Discard again. Each attempt retries the rename for about
+  2s. On some machines, something (an indexer or scanner) opens a freshly
+  renamed directory for roughly 150 ms. That is why the old
+  rename-and-back probe stranded trees, and the short retry covers it.
+- **Teardown judges what is left, so repeating it is harmless.** A
+  registered tree whose directory is gone is just pruned. A tree or branch
+  that is already gone counts as that step done. An unregistered leftover
+  under `<root>/.foreman/worktrees/` is removed only if it is empty. A
+  nonempty unregistered directory whose `.git` link points into this
+  repository's `.git/worktrees/` is provably ours, because only
+  `git worktree add` writes that link. It is deleted once its branch is
+  merged, or under Discard. Uncommitted changes in it are not protected,
   because git's dirty check needs the registration that is gone. Any other
-  nonempty unregistered directory is never deleted — the error toast names
-  it; inspect and delete it by hand.
-- **A process running from inside the tree blocks teardown up front.** A
-  hold deeper than the top directory — a debug build launched from the
-  tree's `target/` (the screenshot flow leaves one running), a shell cd'd
-  into a subdirectory — used to make git delete up to the held entry
-  (alphabetically), stop, and drop the registration anyway: a nonempty
-  leftover the rule above keeps forever. Before git runs, teardown renames
-  the tree to a sibling and straight back; Windows refuses that while
-  anything inside is open, so the toast says "worktree is in use" and
-  nothing is touched. A held teardown re-queues itself, board shown or not:
-  every 5s for the first minute, then every 30s. Closing the worker's pane
-  often leaves the tree held for a few seconds more (by something outside
-  the pane's process tree: its own processes are gone within milliseconds),
-  so the first minute is silent; the "worktree is in use" toast fires once,
-  only for a hold that outlasts it. Close the process and the tree clears on
-  its own. The retry is non-forcing even after a Discard — a dirty tree then
-  needs Discard again.
-- **The move back from the probe name is retried, then recovered.** The
-  sibling is `<id>.teardown-probe`. Something on some machines (an indexer
-  or scanner) opens a freshly renamed directory for roughly 150 ms, so a
-  one-shot move back failed on every teardown there. The failed teardown's
-  own prune then dropped the registration of the missing path, leaving the
-  whole tree — with its `target/`, gigabytes per card — orphaned under the
-  probe name where neither git nor the Worktrees page could see it, and
-  the leftover rule kept it forever once found. Now: the move back retries
-  for about 10 s; a teardown never prunes while a tree sits under the probe
-  name, so the registration survives for the next attempt; every teardown
-  first moves a stranded `<id>.teardown-probe` back to `<id>`; and a
-  recovered tree whose registration is already gone is removed through the
-  `.git`-link rule above.
+  nonempty unregistered directory is never deleted: the error toast names
+  it, so inspect and delete it by hand.
+- **Builds before the trash (up to v0.7.6) could strand a tree as
+  `<id>.teardown-probe`.** They probed for a hold by renaming the tree to
+  that sibling and back. When the move back failed, the tree was left there,
+  sometimes with its registration pruned. Teardown still moves such a tree
+  back first. If that move is held, it is `Held` like any other hold. The
+  `.git`-link rule above then covers the pruned case. Both are migration
+  code, and can go once no `*.teardown-probe` directory is left on any
+  contributor's machine.
 - **Untracked tool output keeps a merged tree.** `git worktree remove`
   refuses untracked files, so a directory a tool drops in the worker's cwd
   (Serena's `.serena/`, say) reads as Dirty and the tree is kept even
