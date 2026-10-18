@@ -10,6 +10,10 @@ use std::rc::Rc;
 
 pub type WinId = u64;
 
+mod layouts;
+#[allow(unused_imports)] // consumed by the layout picker wave
+pub use layouts::{LayoutApplied, LayoutApplyError, LayoutRequest, RevertStatus};
+
 /// Result of [`WindowManager::apply_workspace`] / nested manager restore.
 /// Used for startup logs and unit tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -328,7 +332,6 @@ impl Content {
 
     /// Layout-item kind for project layouts; `None` for desktop chrome that
     /// never takes part in an arrangement.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
     fn layout_kind(&self) -> Option<crate::project_layout::ItemKind> {
         use crate::project_layout::ItemKind;
         Some(match self {
@@ -421,7 +424,6 @@ impl Tab {
     }
 
     /// Persistent layout-item identity; stable across tab moves and restarts.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
     pub fn layout_id(&self) -> crate::project_layout::LayoutItemId {
         self.layout_id
     }
@@ -853,6 +855,9 @@ pub struct WindowManager {
     /// definition, Modified). Persisted in `ManagerSnap::layout`; the saved
     /// definitions themselves live in `layout_library`, never here.
     layout: crate::project_layout::LayoutSelection,
+    /// Live layout Apply/Revert: the deferred request, the revert point, and
+    /// the Modified edit watch (see `wm/layouts.rs`). Runtime-only.
+    layout_rt: layouts::LayoutRuntime,
     /// The window whose in-flight header drag started tiled/zoomed (tear-out).
     /// Such a drag keeps the tree drop hints without a modifier; a drag that
     /// started floating is a free move unless Shift is held.
@@ -929,6 +934,7 @@ impl WindowManager {
             tree: Default::default(),
             zoomed: None,
             layout: Default::default(),
+            layout_rt: Default::default(),
             drag_from_tree: None,
             pending_settles: Vec::new(),
             pending_card_dispatches: Vec::new(),
@@ -1110,7 +1116,6 @@ impl WindowManager {
     /// back→front; tabs in stack order. Desktop chrome (panel, settings) is
     /// excluded. This is the inventory `project_layout::reconcile` matches
     /// against; the order is what **Additional windows** preserves.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
     pub fn layout_inventory(&self) -> Vec<crate::project_layout::ItemRef> {
         use crate::project_layout::ItemRef;
         let win = |id: WinId| self.windows.iter().find(|w| w.id == id);
@@ -1141,6 +1146,9 @@ impl WindowManager {
     /// Flag that the workspace layout (or nested project layout) changed.
     pub fn mark_workspace_dirty(&mut self) {
         self.workspace_dirty = true;
+        // Every structural edit passes through here (over-marked with focus
+        // and the like): the layout watch re-measures at the end of the frame.
+        self.layout_rt.probe = true;
     }
 
     /// Consume this manager's local dirty bit (does not recurse).
@@ -1376,7 +1384,6 @@ impl WindowManager {
 
     /// Replace the picker state (Save, Apply, Revert, a structural edit) and
     /// schedule a workspace save so it survives restart.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
     pub fn set_layout_selection(&mut self, selection: crate::project_layout::LayoutSelection) {
         if self.layout != selection {
             self.layout = selection;
@@ -1386,13 +1393,17 @@ impl WindowManager {
 
     // Cascading offset for a freshly spawned window, plus a fresh id + z.
     fn next_slot(&mut self, size: egui::Vec2) -> (WinId, egui::Rect) {
-        let n = self.windows.len() as f32;
         let id = self.next;
         self.next += 1;
         self.z += 1;
+        (id, self.cascade_rect(size))
+    }
+
+    /// The cascading floating rect for the next new window.
+    fn cascade_rect(&self, size: egui::Vec2) -> egui::Rect {
+        let n = self.windows.len() as f32;
         let off = 36.0 + 28.0 * (n % 6.0);
-        let rect = egui::Rect::from_min_size(egui::pos2(off, off), size);
-        (id, rect)
+        egui::Rect::from_min_size(egui::pos2(off, off), size)
     }
 
     fn push_win(&mut self, id: WinId, tab: Tab, rect: egui::Rect) {
@@ -1414,20 +1425,33 @@ impl WindowManager {
     /// `place_split`, or left floating). Returns the new window's id, or `None`
     /// if the PTY failed to spawn (the caller treats that as a no-op).
     fn spawn_terminal_win(&mut self, shell: Shell, ctx: &egui::Context) -> Option<WinId> {
-        let env = self.term_env(self.next);
-        let mut s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone()).ok()?;
-        let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
-        s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
-        self.push_win(
-            id,
-            Tab::shell_default(
-                format!("{}  ·  #{}", shell.label(), id),
-                Content::Terminal(s),
-            ),
-            rect,
-        );
+        let (id, tab) = self.spawn_shell_tab(shell, ctx).ok()?;
+        self.z += 1;
+        let rect = self.cascade_rect(egui::vec2(580.0, 380.0));
+        self.push_win(id, tab, rect);
         self.mark_workspace_dirty();
         Some(id)
+    }
+
+    /// Spawn a plain shell in this manager's directory: no command, no
+    /// agent. Allocates the id that is both the returned window id and the
+    /// Session's Member id (`FOREMAN_TERMINAL_ID`). Shared by every "new
+    /// terminal" path and by layout Apply's fresh slots.
+    fn spawn_shell_tab(
+        &mut self,
+        shell: Shell,
+        ctx: &egui::Context,
+    ) -> std::io::Result<(WinId, Tab)> {
+        let id = self.next;
+        let env = self.term_env(id);
+        let mut s = Session::spawn(shell, self.cwd.as_deref(), &env, ctx.clone())?;
+        self.next += 1;
+        s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
+        let tab = Tab::shell_default(
+            format!("{}  ·  #{}", shell.label(), id),
+            Content::Terminal(s),
+        );
+        Ok((id, tab))
     }
 
     /// Spawn a terminal into this manager with default placement: tiles next
@@ -2678,6 +2702,40 @@ impl WindowManager {
         id
     }
 
+    /// A fresh Project view that needs no target: what `open_*_window` and
+    /// layout Apply's fresh slots open. `None` for every other kind (a
+    /// terminal spawns through `spawn_shell_tab`; Image, Git diff, and a
+    /// nested Project need a target).
+    fn view_tab(&self, kind: crate::project_layout::ItemKind) -> Option<Tab> {
+        use crate::project_layout::ItemKind;
+        let (title, content) = match kind {
+            ItemKind::Chat => (
+                "chat",
+                Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
+            ),
+            ItemKind::Board => (
+                "board",
+                Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban))),
+            ),
+            ItemKind::Plan => (
+                "plan",
+                Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban))),
+            ),
+            ItemKind::GitHistory => (
+                "Git History",
+                Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone())),
+            ),
+            ItemKind::GitChanges => (
+                "Git Changes",
+                Content::GitChanges(crate::git_history::ChangesView::new(self.cwd.clone())),
+            ),
+            ItemKind::Terminal | ItemKind::GitDiff | ItemKind::Image | ItemKind::Project => {
+                return None;
+            }
+        };
+        Some(Tab::fixed(title, content))
+    }
+
     /// Open (or focus) this project's chat viewer — singleton per project
     /// (spec §4). Closing it later doesn't touch the log; the room is the log.
     fn open_chat_window(&mut self) {
@@ -2698,10 +2756,8 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(420.0, 320.0));
         self.push_win(
             id,
-            Tab::fixed(
-                "chat",
-                Content::Chat(crate::chat::ChatView::new(Rc::clone(&self.chat))),
-            ),
+            self.view_tab(crate::project_layout::ItemKind::Chat)
+                .expect("chat opens without a target"),
             rect,
         );
         self.mark_workspace_dirty();
@@ -2728,10 +2784,8 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(520.0, 380.0));
         self.push_win(
             id,
-            Tab::fixed(
-                "board",
-                Content::Board(crate::board::BoardView::new(Rc::clone(&self.kanban))),
-            ),
+            self.view_tab(crate::project_layout::ItemKind::Board)
+                .expect("board opens without a target"),
             rect,
         );
         self.mark_workspace_dirty();
@@ -2758,10 +2812,8 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(460.0, 360.0));
         self.push_win(
             id,
-            Tab::fixed(
-                "plan",
-                Content::Plan(crate::plan_view::PlanView::new(Rc::clone(&self.kanban))),
-            ),
+            self.view_tab(crate::project_layout::ItemKind::Plan)
+                .expect("plan opens without a target"),
             rect,
         );
         self.mark_workspace_dirty();
@@ -2786,10 +2838,8 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(940.0, 520.0));
         self.push_win(
             id,
-            Tab::fixed(
-                "Git History",
-                Content::GitHistory(crate::git_history::HistoryView::new(self.cwd.clone())),
-            ),
+            self.view_tab(crate::project_layout::ItemKind::GitHistory)
+                .expect("history opens without a target"),
             rect,
         );
         self.mark_workspace_dirty();
@@ -2814,10 +2864,8 @@ impl WindowManager {
         let (id, rect) = self.next_slot(egui::vec2(420.0, 560.0));
         self.push_win(
             id,
-            Tab::fixed(
-                "Git Changes",
-                Content::GitChanges(crate::git_history::ChangesView::new(self.cwd.clone())),
-            ),
+            self.view_tab(crate::project_layout::ItemKind::GitChanges)
+                .expect("changes open without a target"),
             rect,
         );
         self.mark_workspace_dirty();
@@ -5556,6 +5604,7 @@ impl WindowManager {
         if self.renaming == Some(id) {
             self.renaming = None;
         }
+        self.mark_workspace_dirty();
     }
 
     /// Clear `minimized` and, when the window was tiled at minimize time,
@@ -5564,6 +5613,7 @@ impl WindowManager {
     /// panel-aware root insert `tile_new` uses (honouring the panel's remembered
     /// dock edge). No-op on unknown ids.
     fn unminimize(&mut self, id: WinId) {
+        self.mark_workspace_dirty(); // over-marking an unknown id is harmless
         let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
             return;
         };
@@ -5687,6 +5737,7 @@ impl WindowManager {
         if w.active >= w.tabs.len() {
             w.active = w.tabs.len() - 1;
         }
+        self.mark_workspace_dirty();
     }
 
     /// Close the active tab of window `id` (used by `x` / the titlebar close
@@ -5949,6 +6000,7 @@ impl WindowManager {
         let first_new = dst_win.tabs.len();
         dst_win.tabs.extend(src_win.tabs);
         dst_win.active = first_new; // show the just-dropped tab
+        self.mark_workspace_dirty();
         // Focus the merged target; drop any dangling focus/last-focus on src.
         if self.last_focused == Some(src) {
             self.last_focused = None;
@@ -6000,6 +6052,7 @@ impl WindowManager {
             prev: None,
         });
         self.focus(new_id);
+        self.mark_workspace_dirty();
         Some(new_id)
     }
 
@@ -6666,6 +6719,11 @@ impl WindowManager {
         // desktop's scan reaches every nested project; the flag threads down.
         self.app_modal = app_modal || self.any_pending_close();
         let live = active && !self.app_modal;
+        // Layout Apply/Revert runs here, between frames' renders: the area is
+        // known, no Content is borrowed, and this frame draws the result.
+        if !self.desktop {
+            self.drain_layout_request(ui.ctx());
+        }
 
         if self.desktop {
             self.refresh_exit_titles();
@@ -7884,6 +7942,8 @@ impl WindowManager {
                 }
             }
         }
+        // Last, after every act and drain of the frame has landed.
+        self.watch_layout_edits();
 
         interacted
     }

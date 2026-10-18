@@ -10,11 +10,6 @@
 //! decides what that arrangement is. Every public entry point validates its
 //! input and never returns an arrangement that fails [`validate`].
 
-// The model ships ahead of its consumers (project-layouts plan: persistence,
-// Apply/Revert, picker). Until those waves land only the tests call it;
-// remove this once `WindowManager` applies an `Arrangement`.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -120,6 +115,7 @@ impl Size {
 }
 
 impl NormRect {
+    #[cfg_attr(not(test), allow(dead_code))] // hand-built arrangements: tests, Create
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
     }
@@ -189,6 +185,7 @@ impl WindowSpec {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // hand-built arrangements: tests, Create
     pub fn floating(tabs: Vec<LayoutItemId>, active: usize, rect: NormRect) -> Self {
         Self {
             tabs,
@@ -197,6 +194,7 @@ impl WindowSpec {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // hand-built arrangements: tests, Create
     pub fn minimized(
         tabs: Vec<LayoutItemId>,
         active: usize,

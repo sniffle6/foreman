@@ -5,9 +5,9 @@ product contract):
 `docs/superpowers/specs/2026-10-16-project-layouts-design.md`.
 
 This doc tracks what has shipped. Status: **model, identity,
-reconciliation (fill missing slots), and the saved-layout library on disk**.
-No picker, no Apply/Revert, no provider integration yet; those are later
-cards of the `project-layouts` plan.
+reconciliation (fill missing slots), the saved-layout library on disk, and
+live Apply / Revert with the Modified flag**. No picker UI and no provider
+integration yet; those are later cards of the `project-layouts` plan.
 
 ## What exists
 
@@ -97,7 +97,10 @@ always applicable.
 
 #### Opening missing slots
 
-Which kinds open fresh, checked against the `wm.rs` open paths:
+Which kinds open fresh. Confirmed against the `wm.rs` open paths when Apply
+landed: Apply opens through the same constructors the menus use
+(`spawn_shell_tab` for a terminal, `view_tab` for the views, which
+`open_*_window` also calls), so the list cannot drift from them.
 
 | Kind | Opens fresh? | Why |
 |---|---|---|
@@ -220,19 +223,85 @@ omitted when Custom and unmodified, so old files load as Custom. Cold restore
 puts it back alongside the tab `layout_id`s and does not reapply the layout.
 A selection whose definition was deleted elsewhere stays as saved;
 `resolve_selection(layouts, selected)` returns `None` and the picker shows
-Custom. Nothing sets `modified` yet: the structural-event wiring is the Apply
-wave's.
+Custom. `modified` is set by the edit watch below.
+
+### Apply and Revert (`src/wm/layouts.rs`)
+
+Runs on a Project's child `WindowManager`. Refuses the desktop.
+
+**How to use it.** The picker calls `request_layout(LayoutRequest::Apply {
+def, select })` or `request_layout(LayoutRequest::Revert)` on the active
+Project's child manager. The manager runs it at the top of its next `show`
+(the deferred mutation boundary: area known, nothing borrowed, the same frame
+draws the result) and keeps the result for `take_layout_outcome()`. `select:
+true` is a saved layout and selects it; `false` is a Create candidate and
+leaves the picker on Custom. `layout_revert_status()` says whether **Revert
+Layout** is enabled; `mark_layout_saved(id)` is what Save calls after a
+successful write. `apply_layout` / `revert_layout` are the same steps run
+now, for tests.
+
+**What Apply does, in order.**
+
+1. `capture_arrangement` turns the live windows into an `Arrangement`
+   (normalized against the current area; a zoomed float reports the rect it
+   un-zooms to) plus the inventory.
+2. `reconcile` against the definition. An invalid definition stops here.
+3. Open one fresh item per `to_open` slot: a plain shell (the default shell
+   setting, in the Project directory, no command, no agent, no chat join) or
+   a view. A failed open goes into `failed_opens` and its slot is dropped by
+   `with_opened`; the Apply carries on.
+4. `rearrange` checks the arrangement places exactly the tabs that exist,
+   then takes every `Tab` out of its window and puts it into the new windows.
+   The `Tab` values move, so the Session, its process, grid, scrollback,
+   Member id, chat membership, viewer target and view state, title, and agent
+   state all come along. Nothing is rebuilt from a snapshot.
+5. Select the definition, Modified = `!is_exact()`. Store the revert point.
+   Mark the workspace dirty.
+
+A window keeps the id of the window its active tab came from when it can, so
+the panel and focus see the same window. Child zoom is exited. Floats are
+confined to the area with the `MIN_W`/`MIN_H` floor. Focus stays on the
+previously focused Content if it is a visible active tab; otherwise the first
+visible window in arrangement order; nothing when everything is minimized.
+Other Projects and the desktop are never touched.
+
+Refused, with the arrangement intact: the desktop (`NotAProject`), a Project
+never laid out (`NotLaidOut`), an open close-confirm (`Busy`; its target is a
+tab index that must not move), and Content that is not a layout kind.
+
+**Revert.** One level, in memory: the pre-Apply arrangement (ids and
+geometry, never Content) and selection. Revert reconciles that saved
+arrangement against the live windows like any definition, so every old item
+matches by id and anything the Apply opened lands in Additional windows. It
+opens nothing. It restores the old selection and Modified value, then the
+point is gone. A structural edit after the Apply retires it
+(`RevertStatus::Invalidated`; the reason text is
+`LayoutApplyError::RevertInvalidated`). Focus changes and resizes do not.
+
+**Modified is an event, measured per frame.** `mark_workspace_dirty` sets a
+probe (every structural edit already calls it, along with focus and other
+noise). At the end of `show`, if the probe is set, `watch_layout_edits`
+captures the arrangement and compares it with the one from the last check
+using `same_arrangement`. Different means a structural edit: Modified goes on
+(only when a layout is selected) and the revert point is retired. Same means
+focus, active tab, title, zoom, or viewer navigation: nothing happens. The
+comparison is always between two live captures in the same area, never
+against the definition.
+
+Gotcha: a resize **re-measures without comparing**. Floats keep pixel rects
+and get clamped into a smaller area, so comparing across a resize would
+report an edit nobody made. The cost is that an edit landing in the very
+frame the area changed is not counted. A Project that is not on screen (an
+inactive Project tab) runs neither the request nor the watch until it is
+shown.
 
 ## Not yet built
 
-- Capturing a live manager into an `Arrangement` (the `current` argument
-  `reconcile` needs), opening the `to_open` slots, and applying the result
-  through the deferred mutation boundary; Revert (Apply wave). The existing
-  `open_*_window` helpers surface an existing viewer and float the new one
-  with `next_slot`, so Apply needs an open path that only creates the Content.
-- The **Layout ▾** / **Save** controls and dialogs (picker wave), which call
-  `LayoutStore` off the render loop's hot path (on a click, not per frame).
-- Setting `LayoutSelection::modified` on structural edits (Apply wave).
+- The **Layout ▾** / **Save** controls, dialogs, and the post-Apply summary
+  (picker wave). They call `LayoutStore` on a click, never per frame, and
+  drive Apply through `request_layout` / `take_layout_outcome`. Until then
+  nothing in the running app issues a request, so Apply is proven by the
+  manager tests, not by a screenshot.
 - Opening a new Project with `new_project_layout()` (New Project wave).
 - Create Layout… and the provider boundary (promptable Create wave).
 
@@ -244,9 +313,14 @@ wave's.
   `project_key`, `resolve_selection`, and their tests
 - `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
   and atomic write the library rides on
+- `src/wm/layouts.rs` — Apply, Revert, `rearrange`, `capture_arrangement`,
+  the Modified edit watch, and their manager tests (including a real-shell
+  test that drives Sessions through `send` / `snapshot` across Apply and
+  Revert)
 - `src/wm.rs` — `Tab::layout_id`, `Content::layout_kind`,
   `WindowManager::layout_inventory`, the `layout` selection field, and
-  capture/restore of both
+  capture/restore of both; `spawn_shell_tab` and `view_tab`, the open paths
+  Apply shares; the `show` hooks
 - `src/workspace.rs` — `TabSnap::layout_id`, `ManagerSnap::layout`
 - `docs/workspace-persistence.md` — the snapshot it rides on
 - `docs/tiling-tree.md` — the live tree an `Arrangement` mirrors
