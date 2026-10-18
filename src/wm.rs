@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 pub type WinId = u64;
 
+mod layout_picker;
 mod layouts;
-#[allow(unused_imports)] // consumed by the layout picker wave
+#[allow(unused_imports)] // the public face of Apply/Revert; the picker uses them in-crate
 pub use layouts::{LayoutApplied, LayoutApplyError, LayoutRequest, RevertStatus};
 
 /// Result of [`WindowManager::apply_workspace`] / nested manager restore.
@@ -858,6 +859,10 @@ pub struct WindowManager {
     /// Live layout Apply/Revert: the deferred request, the revert point, and
     /// the Modified edit watch (see `wm/layouts.rs`). Runtime-only.
     layout_rt: layouts::LayoutRuntime,
+    /// The header's Layout picker and Save: menu, dialogs, the post-Apply
+    /// summary, and the cached library copy (see `wm/layout_picker.rs`).
+    /// Runtime-only.
+    layout_ui: layout_picker::PickerUi,
     /// The window whose in-flight header drag started tiled/zoomed (tear-out).
     /// Such a drag keeps the tree drop hints without a modifier; a drag that
     /// started floating is a free move unless Shift is held.
@@ -935,6 +940,7 @@ impl WindowManager {
             zoomed: None,
             layout: Default::default(),
             layout_rt: Default::default(),
+            layout_ui: Default::default(),
             drag_from_tree: None,
             pending_settles: Vec::new(),
             pending_card_dispatches: Vec::new(),
@@ -3821,7 +3827,11 @@ impl WindowManager {
                                 );
                                 toasted = true;
                             }
-                            let wait = if long { HELD_RETRY_SLOW } else { HELD_RETRY_FAST };
+                            let wait = if long {
+                                HELD_RETRY_SLOW
+                            } else {
+                                HELD_RETRY_FAST
+                            };
                             self.teardown_held.insert(id.clone(), (since, toasted));
                             self.queue_teardown(PendingTeardown {
                                 id,
@@ -6718,7 +6728,9 @@ impl WindowManager {
         // dialog reads Enter/Esc, and block a second dialog from opening. The
         // desktop's scan reaches every nested project; the flag threads down.
         self.app_modal = app_modal || self.any_pending_close();
-        let live = active && !self.app_modal;
+        // A layout dialog's name field owns the keyboard: freeze this
+        // Project's terminals while it is open.
+        let live = active && !self.app_modal && !self.layout_ui.captures_keyboard();
         // Layout Apply/Revert runs here, between frames' renders: the area is
         // known, no Content is borrowed, and this frame draws the result.
         if !self.desktop {
@@ -6902,7 +6914,7 @@ impl WindowManager {
             // fence both derive from the same policy. Panel used to inherit
             // the terminal's 113px reserve and needed to be quite wide before
             // the title drag strip was usable — collapse is only ~28px.
-            let ctl_w = header_ctl_w(is_project, is_panel);
+            let ctl_w = header_ctl_w(is_project, is_panel, scr.width());
 
             // Collapsed horizontal (bottom/top-docked) panel: the whole window
             // is a 36px strip. The header band is suppressed — the rail owns
@@ -7663,6 +7675,21 @@ impl WindowManager {
                     ) {
                         acts.push(act);
                     }
+                    // Layout ▾ and Save act on the stack's active Project,
+                    // the one this header draws (and so the one shown).
+                    if let Some(ctl) = hl.layout
+                        && let Content::Project(inner) = self.windows[i].active_content()
+                        && inner.show_layout_controls(
+                            ui,
+                            ctl,
+                            scr,
+                            area,
+                            is_focus,
+                            base.with((id, "layout")),
+                        )
+                    {
+                        acts.push(Act::Focus(id));
+                    }
                 }
             } // end header chrome
 
@@ -8013,7 +8040,11 @@ impl WindowManager {
 
     /// Follow the same active-tab chain as rendering, stopping at local overlays.
     fn terminal_owns_keyboard(&self) -> bool {
-        if self.picker.is_some() || self.renaming.is_some() || self.pending_close.is_some() {
+        if self.picker.is_some()
+            || self.renaming.is_some()
+            || self.pending_close.is_some()
+            || self.layout_ui.captures_keyboard()
+        {
             return false;
         }
         let Some(win) = self
@@ -8412,16 +8443,36 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 /// control-reserve policy — the title drag strip and the fence both derive
 /// from it.
 /// - Panel: collapse chevron only (~28).
-/// - Project: ✕+⋯ (54).
+/// - Project: ✕+⋯ (54), plus the layout picker and Save (see
+///   [`layout_ctl_compact`]): 236 wide, 118 compact.
 /// - Terminal: four buttons (113).
-const fn header_ctl_w(is_project: bool, is_panel: bool) -> f32 {
+fn header_ctl_w(is_project: bool, is_panel: bool, width: f32) -> f32 {
     if is_panel {
         28.0
     } else if is_project {
-        54.0
+        let (picker, save) = layout_ctl_widths(layout_ctl_compact(width));
+        LAYOUT_CTL_EDGE + save + LAYOUT_CTL_GAP + picker + 3.0
     } else {
         113.0
     }
+}
+
+/// A Project header narrower than this shows the layout picker and Save as
+/// icon buttons, so the title keeps room.
+const LAYOUT_CTL_FULL_MIN_W: f32 = 520.0;
+/// From the header's right edge to Save's right edge: past ✕ and ⋯ (51)
+/// and a 6pt gap.
+const LAYOUT_CTL_EDGE: f32 = 57.0;
+/// Between the picker and Save.
+const LAYOUT_CTL_GAP: f32 = 4.0;
+
+fn layout_ctl_compact(width: f32) -> bool {
+    width < LAYOUT_CTL_FULL_MIN_W
+}
+
+/// (picker, Save) button widths.
+fn layout_ctl_widths(compact: bool) -> (f32, f32) {
+    if compact { (30.0, 24.0) } else { (132.0, 40.0) }
 }
 
 /// Caller-measured tab label (raw galley width — the module applies the
@@ -8506,6 +8557,19 @@ struct HeaderLayout {
     /// (terminal); 22pt buttons at 25pt pitch, rightmost ends at
     /// scr.max.x - 4.
     controls: Vec<(CtlRole, egui::Rect)>,
+    /// The project's **Layout ▾** and **Save**, left of ⋯. `Some` iff
+    /// project (renaming included: the controls stay reachable).
+    layout: Option<LayoutCtlLayout>,
+}
+
+/// Rects for a Project header's layout controls, in `scr`'s space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LayoutCtlLayout {
+    pub(super) picker: egui::Rect,
+    pub(super) save: egui::Rect,
+    /// Icon-only buttons: the header is narrower than
+    /// `LAYOUT_CTL_FULL_MIN_W`.
+    pub(super) compact: bool,
 }
 
 /// Pure rect math over numbers — no Ui, no Context, no fonts. Total:
@@ -8516,7 +8580,7 @@ fn header_layout(
     is_panel: bool,
     spec: HeaderSpec<'_>,
 ) -> HeaderLayout {
-    let ctl_w = header_ctl_w(is_project, is_panel);
+    let ctl_w = header_ctl_w(is_project, is_panel, scr.width());
     let avail_end = scr.max.x - ctl_w;
 
     // (content, unclamped x where the `+` would anchor; None while renaming)
@@ -8636,11 +8700,29 @@ fn header_layout(
         bx -= 25.0;
     }
 
+    let layout = is_project.then(|| {
+        let compact = layout_ctl_compact(scr.width());
+        let (picker_w, save_w) = layout_ctl_widths(compact);
+        let save_max = scr.max.x - LAYOUT_CTL_EDGE;
+        let save =
+            egui::Rect::from_min_size(egui::pos2(save_max - save_w, by), egui::vec2(save_w, bh));
+        let picker = egui::Rect::from_min_size(
+            egui::pos2(save.min.x - LAYOUT_CTL_GAP - picker_w, by),
+            egui::vec2(picker_w, bh),
+        );
+        LayoutCtlLayout {
+            picker,
+            save,
+            compact,
+        }
+    });
+
     HeaderLayout {
         avail_end,
         content,
         plus,
         controls,
+        layout,
     }
 }
 
@@ -10316,7 +10398,10 @@ mod tests {
         assert_eq!(wm.pending_teardowns.len(), 1, "re-queued");
         assert!(!p.force && p.held_by.is_none());
         let wait = p.not_before.unwrap() - std::time::Instant::now();
-        assert!(wait <= HELD_RETRY_FAST, "a fresh hold retries fast: {wait:?}");
+        assert!(
+            wait <= HELD_RETRY_FAST,
+            "a fresh hold retries fast: {wait:?}"
+        );
         assert!(!wm.teardown_held["a"].1, "no toast yet");
 
         // Still held a minute later: toast once, then slow down.
@@ -10325,7 +10410,10 @@ mod tests {
         wm.drain_worktree_msgs(&ctx);
         assert_eq!(wm.pending_teardowns.len(), 1, "one entry per card");
         let wait = wm.pending_teardowns[0].not_before.unwrap() - std::time::Instant::now();
-        assert!(wait > HELD_RETRY_FAST, "a long hold retries slowly: {wait:?}");
+        assert!(
+            wait > HELD_RETRY_FAST,
+            "a long hold retries slowly: {wait:?}"
+        );
         assert!(wm.teardown_held["a"].1, "toasted");
 
         wm.pending_teardowns.clear();
@@ -11400,7 +11488,7 @@ mod tests {
                         if width == 800.0 && title_w == 40.0 {
                             assert!(label_rect.width() >= title_w, "fitting titles remain whole");
                         }
-                        if width <= header_ctl_w(is_project, false) {
+                        if width <= header_ctl_w(is_project, false, width) {
                             assert_eq!(label_rect.width(), 0.0);
                         }
                     }
@@ -11529,7 +11617,7 @@ mod tests {
         // control reserve (113) left almost no drag target until the panel
         // was wider than that.
         let narrow = egui::vec2(120.0, 400.0);
-        let ctl = header_ctl_w(false, true);
+        let ctl = header_ctl_w(false, true, narrow.x);
         assert!(ctl <= 30.0, "panel reserve is collapse-only, got {ctl}");
         let drag_w = (narrow.x - ctl).max(0.0);
         assert!(
@@ -11537,8 +11625,9 @@ mod tests {
             "narrow Sessions panel must still have a usable drag strip, got {drag_w}"
         );
         // Terminal policy must remain the wider reserve.
-        assert!((header_ctl_w(false, false) - 113.0).abs() < 0.1);
-        assert!((header_ctl_w(true, false) - 54.0).abs() < 0.1);
+        assert!((header_ctl_w(false, false, 800.0) - 113.0).abs() < 0.1);
+        assert!((header_ctl_w(true, false, 800.0) - 236.0).abs() < 0.1);
+        assert!((header_ctl_w(true, false, 300.0) - 118.0).abs() < 0.1);
     }
 
     #[test]

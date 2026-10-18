@@ -18,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 
 /// A layout change waiting for the manager's next frame (the deferred
 /// mutation boundary). The newest request replaces an unprocessed one.
-#[cfg_attr(not(test), allow(dead_code))] // built by the layout picker wave
 pub enum LayoutRequest {
     /// Apply `def`. `select: true` is a saved layout and selects it;
     /// `false` is a Create candidate and leaves the picker on Custom.
@@ -36,7 +35,6 @@ pub struct FailedOpen {
 
 /// What an Apply or Revert did, for the post-Apply summary.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // read by the layout picker wave
 pub struct LayoutApplied {
     /// The reconciliation that was applied, with fresh items resolved
     /// (`opened`) and failed opens moved to `unfilled`.
@@ -44,7 +42,6 @@ pub struct LayoutApplied {
     pub failed_opens: Vec<FailedOpen>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // read by the layout picker wave
 impl LayoutApplied {
     /// Clean Apply: every slot filled and nothing in Additional windows.
     pub fn is_exact(&self) -> bool {
@@ -89,7 +86,6 @@ impl std::fmt::Display for LayoutApplyError {
 
 /// Whether **Revert Layout** can run, for the picker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // read by the layout picker wave
 pub enum RevertStatus {
     /// No Apply in this session (or the last Revert consumed it).
     Unavailable,
@@ -141,18 +137,15 @@ struct Held {
 
 impl WindowManager {
     /// Queue a layout change for the next frame of this Project.
-    #[cfg_attr(not(test), allow(dead_code))] // called by the layout picker wave
     pub fn request_layout(&mut self, request: LayoutRequest) {
         self.layout_rt.pending = Some(request);
     }
 
     /// The result of the last processed request, once.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the layout picker wave
     pub fn take_layout_outcome(&mut self) -> Option<Result<LayoutApplied, LayoutApplyError>> {
         self.layout_rt.outcome.take()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // read by the layout picker wave
     pub fn layout_revert_status(&self) -> RevertStatus {
         match self.layout_rt.revert {
             Revert::None => RevertStatus::Unavailable,
@@ -162,7 +155,6 @@ impl WindowManager {
     }
 
     /// Save succeeded for definition `id`: select it and clear Modified.
-    #[cfg_attr(not(test), allow(dead_code))] // called by the layout picker wave
     pub fn mark_layout_saved(&mut self, id: String) {
         self.set_layout_selection(LayoutSelection {
             selected: Some(id),
@@ -852,6 +844,51 @@ mod tests {
         let c = tile(&mut wm, stub());
         let def = definition("a", &wm);
         (wm, [a, b, c], def)
+    }
+
+    /// One real frame of this Project through `show`.
+    fn show_frame(wm: &mut WindowManager, ctx: &egui::Context) {
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, AREA);
+        let input = egui::RawInput {
+            screen_rect: Some(area),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            wm.show(ui, area, true, egui::Id::new("layout-show"), false);
+        });
+    }
+
+    #[test]
+    fn show_runs_a_queued_apply_and_watches_edits_at_end_of_frame() {
+        let (mut wm, [_, _, c], def) = three_tiles();
+        let ctx = egui::Context::default();
+        show_frame(&mut wm, &ctx);
+        wm.request_layout(LayoutRequest::Apply { def, select: true });
+        assert!(wm.take_layout_outcome().is_none(), "queued, not run");
+
+        // The frame's top drains the request; drawing the result is not an
+        // edit, so the end-of-frame watch leaves Modified and Revert alone.
+        show_frame(&mut wm, &ctx);
+        let applied = wm
+            .take_layout_outcome()
+            .expect("show ran the request")
+            .expect("applies");
+        assert!(applied.is_exact());
+        assert_eq!(
+            wm.layout,
+            LayoutSelection {
+                selected: Some("a".into()),
+                modified: false
+            }
+        );
+        assert_eq!(wm.layout_revert_status(), RevertStatus::Ready);
+
+        // Closing Content is structural: the next frame's watch sees it.
+        let gone = win_id_of(&wm, c);
+        wm.close(gone);
+        show_frame(&mut wm, &ctx);
+        assert_eq!(wm.layout_revert_status(), RevertStatus::Invalidated);
+        assert!(wm.layout.modified);
     }
 
     #[test]
