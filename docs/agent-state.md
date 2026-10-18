@@ -68,8 +68,12 @@ fires nothing and its rows show no badge.
 - **Codex sends a late `PostToolUse` after `Interrupt`.** That is why
   `PostToolUse` only ever moves Needs you to Working and never wakes an Idle
   Session.
-- **Codex approvals were not captured** in the 2026-09-25 hook capture;
-  `PermissionRequest` is documented but unverified for Codex.
+- **Codex shows Needs you only when a human approves.** Verified 2026-10-15
+  (Codex 0.162.1): a real approval prompt fires `PermissionRequest` and the
+  row shows `needs you`; approving returns it to Working, then done. With
+  `approvals_reviewer = "auto_review"` in `~/.codex/config.toml`, an
+  automatic reviewer answers instead and no prompt reaches you, so the row
+  never shows `needs you`. That is correct, not a missed event.
 - **Big tool output.** The helper reads up to 16 MB of hook stdin because a
   `PostToolUse` payload includes the tool's full output; the forwarded message
   stays small (event name and IDs). The pipe server's read cap stays at 64 KB.
