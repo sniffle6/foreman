@@ -5,9 +5,10 @@ product contract):
 `docs/superpowers/specs/2026-10-16-project-layouts-design.md`.
 
 This doc tracks what has shipped. Status: **model, identity,
-reconciliation (fill missing slots), the saved-layout library on disk, and
-live Apply / Revert with the Modified flag**. No picker UI and no provider
-integration yet; those are later cards of the `project-layouts` plan.
+reconciliation (fill missing slots), the saved-layout library on disk, live
+Apply / Revert with the Modified flag, and the Project-header picker with
+Save**. Not yet: the New Project layout and Create Layout… (later cards of
+the `project-layouts` plan).
 
 ## What exists
 
@@ -295,14 +296,91 @@ frame the area changed is not counted. A Project that is not on screen (an
 inactive Project tab) runs neither the request nor the watch until it is
 shown.
 
+### The picker and Save (`src/wm/layout_picker.rs`)
+
+**Where.** Every Project header has **Layout ▾** and **Save** just left of
+its ⋯ and ✕. Under `LAYOUT_CTL_FULL_MIN_W` (520px) of header width they turn
+into icon buttons (a split-pane mark with ▾, and a down-arrow-into-tray),
+with the same tooltips, so the title keeps room. A zoomed Project keeps its
+header, so the controls stay. They act on the stack's active Project tab,
+the one the header draws. Clicking them in an unfocused Project focuses it
+first. Child windows get no picker.
+
+**The label** is the selected layout's name, or **Custom**. An amber dot
+after it means Modified.
+
+**The menu** says "Layouts for this Project", then one row per saved layout:
+a small diagram, the name, a check on the selected one, a "Modified" tag on
+it when set, and Rename… / Delete… icons. Below: **Save** (its hint says
+whether it updates a layout or asks for a name), **Save As…**, and **Revert
+Layout** once an Apply has happened (shown disabled, with the reason, after
+an edit retired the revert point). An empty library says layouts are saved
+for this Project. There is no Create Layout… and no Use for new Projects
+yet; those belong to later waves, and an inert entry would only mislead.
+
+The diagram is drawn from arrangement data only (`diagram_cells`): tiled
+windows by tree and ratios, floating ones outlined on top, minimized ones
+not drawn, and a one-letter kind mark where it fits (`>` terminal, `C` chat,
+`B` board, …) so a mixed layout reads at a glance.
+
+**Selecting a row applies it.** It queues `LayoutRequest::Apply { select:
+true }` on the Project being drawn; the next frame runs it. The header then
+reads `take_layout_outcome`. An exact Apply says nothing. Otherwise a
+dismissible summary sits under the picker, built from the applied
+`Reconciliation` (`summary_lines`): which windows stood in for saved ones,
+what opened, what moved to Additional windows, which slots could not be
+filled, and which opens failed (with the error, not shortened). It has a
+**Revert Layout** button. A failed Apply or Revert shows its error instead.
+
+**Save and friends.**
+
+| Action | What happens |
+|---|---|
+| Save, Custom | Name dialog, then `create(…, Reject)`; selects the new layout |
+| Save, a layout selected | `update` in place, no prompt; clears Modified |
+| Save, selected layout deleted elsewhere | Picker goes to Custom and the name dialog opens with "no longer exists" |
+| Save As… | Name dialog prefilled `<name> copy`; always a new definition |
+| Duplicate name (any case) | Dialog stays; "already exists — replace it, or type another name". Replace overwrites it in place, keeping its id, and selects it. Typing clears the offer |
+| Rename… | Dialog prefilled; Replace deletes the other holder of the name, and if that was selected the picker goes to Custom |
+| Delete… | Confirm dialog; the windows stay put; if it was selected, Custom |
+| Cancel, Escape, or a click outside | Nothing changes, on disk or on screen |
+| A write fails | The dialog stays with the error and the typed name; selection and Modified are untouched |
+
+Success is reported (a short "Saved …" note) only after the write returned
+`Ok`.
+
+**Disk.** `LayoutStore` re-reads the file on every call, so the picker keeps
+a copy: read once when the header first draws (the label needs the name),
+again when the menu opens, and after each write. Never per frame. A second
+instance of the same directory sees another's save the next time its menu
+opens; its windows never move.
+
+**Keyboard.** While a dialog is open, that Project's terminals are frozen
+(`live` is false and `terminal_owns_keyboard` says no) so typing goes to the
+name field. Enter submits, Escape cancels.
+
+**Testing it.** A click becomes a `PickerAction`, and `run_layout_action`
+does the work, so tests drive the bindings without a pointer.
+`layout_ui.store` points a test at a temp library; without it, tests read a
+never-written temp path, never the user's file.
+
+Gotchas:
+
+- **"No active Project" has no surface.** The controls live in a Project's
+  header, so with no Project open there is nothing to disable. The disabled
+  look ("Open or select a Project to use layouts.") appears only for a
+  child manager without a directory, which the app never creates, and
+  "Answer the open dialog first." while a close confirmation is up.
+- Applying uses the menu's copy. If another instance deleted that layout a
+  moment ago, the Apply still runs (the definition is in hand) and the
+  picker shows its name until the next read, then Custom.
+- The summary sits over the top-right of the Project, often on the
+  Additional windows header. Dismiss it with ✕.
+
 ## Not yet built
 
-- The **Layout ▾** / **Save** controls, dialogs, and the post-Apply summary
-  (picker wave). They call `LayoutStore` on a click, never per frame, and
-  drive Apply through `request_layout` / `take_layout_outcome`. Until then
-  nothing in the running app issues a request, so Apply is proven by the
-  manager tests, not by a screenshot.
-- Opening a new Project with `new_project_layout()` (New Project wave).
+- Opening a new Project with `new_project_layout()`, and **Use for new
+  Projects** in the menu (New Project wave).
 - Create Layout… and the provider boundary (promptable Create wave).
 
 ## Key files
@@ -314,13 +392,19 @@ shown.
 - `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
   and atomic write the library rides on
 - `src/wm/layouts.rs` — Apply, Revert, `rearrange`, `capture_arrangement`,
-  the Modified edit watch, and their manager tests (including a real-shell
-  test that drives Sessions through `send` / `snapshot` across Apply and
-  Revert)
+  the Modified edit watch, and their manager tests (including real-shell
+  tests that drive Sessions through `send` / `snapshot` across Apply and
+  Revert, directly and through the picker, and a `show`-level test of the
+  drain and end-of-frame watch hooks)
+- `src/wm/layout_picker.rs` — the header picker, menu, dialogs, summary,
+  `PickerAction` / `run_layout_action`, `summary_lines`, `diagram_cells`,
+  and their tests (including real-frame clicks on the header buttons)
 - `src/wm.rs` — `Tab::layout_id`, `Content::layout_kind`,
   `WindowManager::layout_inventory`, the `layout` selection field, and
   capture/restore of both; `spawn_shell_tab` and `view_tab`, the open paths
-  Apply shares; the `show` hooks
+  Apply shares; the `show` hooks; `header_layout` placing the picker and
+  Save (`LayoutCtlLayout`), and the header draw calling
+  `show_layout_controls`
 - `src/workspace.rs` — `TabSnap::layout_id`, `ManagerSnap::layout`
 - `docs/workspace-persistence.md` — the snapshot it rides on
 - `docs/tiling-tree.md` — the live tree an `Arrangement` mirrors

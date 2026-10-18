@@ -1589,6 +1589,84 @@ mod tests {
         assert!(text.contains("BEFORE_Windows_NT"), "grid kept:\n{text}");
     }
 
+    /// The header picker's path: a menu selection queued on the shown
+    /// Project, drained by a real `show` frame, then Revert from the same
+    /// actions. Proven by Member id, root pid, and the shell answering.
+    #[test]
+    fn picker_selection_and_revert_keep_live_sessions_usable_through_inspection() {
+        use super::super::layout_picker::PickerAction;
+        let ctx = egui::Context::default();
+        // Real frames draw the terminals, which need the app's font families.
+        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+            std::fs::read(p)
+        }));
+        cmd_settings(&ctx);
+        let library = tempfile::tempdir().unwrap();
+        let store = crate::layout_library::LayoutStore::at(library.path());
+        let mut inner = project();
+        inner.layout_ui.store = Some(store.clone());
+        let (t1, tab1) = inner.spawn_shell_tab(Shell::Cmd, &ctx).unwrap();
+        let (t2, tab2) = inner.spawn_shell_tab(Shell::Cmd, &ctx).unwrap();
+        let i1 = tab1.layout_id();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, AREA);
+        inner.push_win(t1, tab1, full);
+        inner.tile_new(t1, None);
+        inner.push_win(t2, tab2, full);
+        inner.tile_new(t2, Some(t1));
+        // A saved layout with a slot for t1 only: t2 becomes an extra.
+        let solo = store
+            .create(
+                inner.cwd.as_deref().unwrap(),
+                "Solo",
+                vec![ItemRef::new(i1, ItemKind::Terminal)],
+                sole_stack(vec![i1]),
+                crate::layout_library::OnConflict::Reject,
+            )
+            .unwrap();
+        let mut desk = WindowManager::new().as_desktop();
+        desk.push_win(
+            1,
+            Tab::fixed("proj", Content::Project(Box::new(inner))),
+            full,
+        );
+        desk.focused = Some(1);
+        let frame = |desk: &mut WindowManager| {
+            let input = egui::RawInput {
+                screen_rect: Some(full),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                desk.show(ui, full, true, egui::Id::new("picker-inspect"), false);
+            });
+        };
+        frame(&mut desk);
+        wait_for(&mut desk, &ctx, t2, ">");
+        send_line(&mut desk, &ctx, t2, "echo BEFORE_%OS%");
+        wait_for(&mut desk, &ctx, t2, "BEFORE_Windows_NT");
+        let before = sessions(&mut desk);
+        assert!(before.iter().all(|s| s.2.is_some()));
+
+        child(&mut desk).run_layout_action(PickerAction::ToggleMenu, &ctx);
+        child(&mut desk).run_layout_action(PickerAction::Apply(solo.id.clone()), &ctx);
+        frame(&mut desk);
+        let p = child(&mut desk);
+        assert_eq!(p.layout.selected.as_deref(), Some(solo.id.as_str()));
+        assert!(p.layout.modified, "t2 went to Additional windows");
+        assert_eq!(p.windows.len(), 2);
+        assert_eq!(sessions(&mut desk), before, "same Sessions after Apply");
+        send_line(&mut desk, &ctx, t2, "echo MOVED_%OS%");
+        wait_for(&mut desk, &ctx, t2, "MOVED_Windows_NT");
+
+        child(&mut desk).run_layout_action(PickerAction::Revert, &ctx);
+        frame(&mut desk);
+        assert_eq!(child(&mut desk).layout, LayoutSelection::default());
+        assert_eq!(sessions(&mut desk), before, "same Sessions after Revert");
+        send_line(&mut desk, &ctx, t1, "echo REVERTED_%OS%");
+        wait_for(&mut desk, &ctx, t1, "REVERTED_Windows_NT");
+        let text = snapshot_text(&mut desk, &ctx, t2);
+        assert!(text.contains("BEFORE_Windows_NT"), "grid kept:\n{text}");
+    }
+
     #[test]
     fn a_failed_open_omits_its_slot_and_is_reported_without_aborting() {
         let ctx = egui::Context::default();

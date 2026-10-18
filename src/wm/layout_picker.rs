@@ -35,7 +35,7 @@ pub(super) struct PickerUi {
     requested: Option<Requested>,
     /// Test seam: the store to use instead of the user's.
     #[cfg(test)]
-    store: Option<LayoutStore>,
+    pub(super) store: Option<LayoutStore>,
 }
 
 impl PickerUi {
@@ -1388,7 +1388,7 @@ fn menu_item(
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.0),
-        if enabled { th.text } else { th.dim_unfocused },
+        if enabled { th.text } else { th.dim },
     );
     if let Some(hint) = hint {
         ui.painter().text(
