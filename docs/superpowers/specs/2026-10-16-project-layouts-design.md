@@ -120,8 +120,10 @@ the geometry alone is insufficient for a mixed terminal/viewer layout.
 Example: “Large coding terminal on the left, two other terminals stacked in
 the middle, and chat on the right.”
 
-The user can refine the proposal conversationally. Each successful reply
-replaces the candidate preview, without moving live windows. Provide:
+Each request is single-shot: one description, one provider call, one
+candidate. There is no conversation history. To change the result, the user
+edits the description and runs it again, and the new candidate replaces the
+old one. Live windows do not move until Apply. Provide:
 
 - **Apply** to use the candidate without creating a saved definition.
 - **Save & Apply…** to name, persist, and apply the candidate.
@@ -160,14 +162,15 @@ inactive tabs and minimized items. The model may regroup, tile, float, or
 minimize them. No item may be discarded to satisfy the requested shape.
 
 Capture the target Project identity and arrangement revision for each request.
-Structural changes invalidate pending replies and previews. Display a refresh
-action rather than applying an outdated proposal. Geometry is recomputed for
-the current area after resizing; resize alone need not invalidate a candidate.
+A structural change discards the pending request or the candidate. Show
+"Windows changed — run again" instead of applying an outdated proposal.
+Geometry is recomputed for the current area after resizing, so a resize alone
+does not discard a candidate.
 
-Switching Projects hides the editor without retargeting it. Returning to the
-original Project can resume it if its revision still matches. Closing that
-Project cancels its request. Superseded and canceled replies cannot publish a
-preview. Bound request size, response size, conversation history, time, and
+Switching Projects or closing the target Project cancels the request and
+closes the editor. Nothing resumes. Each Project has at most one request at a
+time, and running again supersedes the pending one. Superseded and canceled
+replies cannot publish a preview. Bound request size, response size, time, and
 concurrency using the existing provider helper; validate output locally.
 
 ## Applying saved layouts
@@ -409,6 +412,7 @@ process preservation. Do not claim GUI correctness without image evidence.
 | Unused visible windows go to an Additional windows stack | Closing would destroy work. A visible stack means nothing quietly disappears after a switch, and the next layout that needs those windows reuses them. Already-minimized extras stay minimized, so a switch never reopens windows the user put away. Rejected: minimizing every extra into its own window (keeps the layout's shape exact, but windows vanish into the Sessions panel). |
 | Modified is an event flag | Comparing against the definition drifts with resize and with Apply-time geometry confinement, which would report Modified with no user edit. |
 | New Project layout is one copied global slot | A new directory has no library. A reference into another Project's library breaks when that definition is renamed or deleted, and a full global library stays excluded. |
+| Single-shot Create | Refinement needed conversation history, a resume-on-return state for Project switches, and more stale-reply cases, all for an optional path. Editing the description and running again covers the need. Rejected: conversational refinement (revisit if people ask for it). |
 | Manual layouts precede provider integration | Save, reconciliation, Apply, and Revert establish the same machinery Create must use. Building a separate AI-only apply path would duplicate validation and risk divergent behavior. |
 
 Implementation work is tracked as the `project-layouts` kanban plan. Its waves
