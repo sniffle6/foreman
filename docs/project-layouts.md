@@ -4,7 +4,8 @@ Named arrangements of a Project's child windows. Spec (authoritative on the
 product contract):
 `docs/superpowers/specs/2026-10-16-project-layouts-design.md`.
 
-This doc tracks what has shipped. Status: **model and identity wave only**.
+This doc tracks what has shipped. Status: **model, identity, and
+reconciliation (fill missing slots) only**.
 No picker, no persistence file, no Apply/Revert, no provider integration yet;
 those are later cards of the `project-layouts` plan.
 
@@ -63,25 +64,72 @@ the size floor at apply time.
 
 ### Reconciliation (`reconcile`)
 
-Fits a definition to the current inventory (`WindowManager::layout_inventory`:
-tiled stacks in tree order, then floating back→front, then minimized
-back→front; tabs in stack order). Deterministic, total, and never touches the
-live manager. The result is validated against the inventory before it is
-returned, so a `Reconciliation` is always applicable.
+`reconcile(def, current, inventory)` fits a definition to the Project as it
+is now. `inventory` is `WindowManager::layout_inventory` (tiled stacks in tree
+order, then floating back→front, then minimized back→front; tabs in stack
+order). `current` is the live arrangement of those same items; reconcile
+needs it to know which items are minimized and where they restore to.
+Deterministic, total, and never touches the live manager or opens anything.
+The result is validated before it is returned, so a `Reconciliation` is
+always applicable.
 
-1. Exact id + kind matches first.
-2. Each remaining saved item, in saved order, takes the lowest-id unassigned
-   current item of the same kind. Kinds never cross.
-3. Unmatched saved items are omitted: tabs leave their stacks, empty stacks
-   go, single-child splits collapse, surviving ratios renormalize. A stack
-   whose active tab vanished keeps the same slot, clamped.
-4. Unmatched current items form one tiled **Additional windows** stack, in
-   inventory order with the first tab active, appended as the right child of
-   an H split (`ADDITIONAL_RATIO` of the width) or as the root when no saved
-   tiled geometry survived.
+1. Exact id + kind matches first, for every slot.
+2. Remaining saved slots take the lowest-id unassigned current item of the
+   same kind. Minimized current items count, and a substitute takes the
+   slot's state (a minimized terminal can land in a tiled slot). Tiled and
+   floating slots pick first, then minimized slots, so a minimized slot never
+   takes the window a visible slot needed. Kinds never cross.
+3. A still-empty **tiled or floating** slot whose kind opens without a target
+   keeps its place under a placeholder id and joins `to_open`. Every other
+   empty slot is `unfilled` and omitted: its tab leaves its stack, empty
+   stacks go, single-child splits collapse, surviving ratios renormalize. A
+   stack whose active tab vanished keeps the same slot, clamped.
+4. Unassigned **visible** items form one tiled **Additional windows** stack,
+   in inventory order with the first tab active, appended as the right child
+   of an H split (`ADDITIONAL_RATIO` of the width) or as the root when no
+   saved tiled geometry survived. Unassigned **minimized** items stay
+   minimized in their own live stack, with its restore placement
+   (`kept_minimized`), so a switch never brings back windows the user put
+   away.
 
-`Reconciliation::is_exact` is the picker's "apply without a preview" test.
-`matched`, `substituted`, `missing`, and `additional` feed the preview.
+#### Opening missing slots
+
+Which kinds open fresh, checked against the `wm.rs` open paths:
+
+| Kind | Opens fresh? | Why |
+|---|---|---|
+| Terminal | yes, any number | default shell in the Project directory; never a command or agent |
+| Chat, Board, Plan, GitHistory, GitChanges | yes, **at most one** | built from Project state alone (`open_*_window`), but each is a per-Project singleton |
+| Image, GitDiff, Project | no | each needs a target (file, diff, directory) |
+
+The singleton rule is real, not caution: `open_chat_window` and friends
+surface the existing viewer instead of opening a second. So a viewer slot
+queues an open only when the Project has none of that kind and no earlier
+slot already queued one; a second Chat slot is `unfilled`.
+
+A placeholder id is never the id of a current item (they count down from
+`u64::MAX`). `Reconciliation::items` lists what the arrangement places: the
+inventory plus one placeholder per `to_open` slot.
+
+Apply's job, in order: open one fresh item per `to_open` slot, then call
+`with_opened(&[(placeholder, new_item)])`. That swaps each placeholder for the
+new id, records it in `opened`, and treats a slot with no pair as a failed
+open: the slot leaves the arrangement and joins `unfilled`. It rejects an
+unknown or repeated placeholder, a new item of the wrong kind, and an id
+already in the inventory. The result has an empty `to_open` and is what Apply
+moves Content into.
+
+#### Summary and Modified
+
+`matched`, `substituted`, `opened`, `additional`, `kept_minimized`, and
+`unfilled` feed the post-Apply summary. `is_exact` is the Modified test: true
+when nothing went to Additional windows and every slot was filled.
+Substitution and kept-minimized extras do not make an Apply dirty; pending
+`to_open` slots do until `with_opened` resolves them, so call it first.
+
+Switching A → B → A converges: B parks A's extras in Additional windows (and
+leaves A's minimized ones minimized), and A takes them back by exact id, so
+nothing opens. The window count only grows to the largest layout used.
 
 ### Modified comparison (`same_arrangement`)
 
@@ -99,8 +147,11 @@ not trigger it.
 
 - `project-layouts.json` library and the `config::load_json` / `save_json`
   wiring (persistence wave).
-- Capturing a live manager into an `Arrangement` and applying one through the
-  deferred mutation boundary; Revert (Apply wave).
+- Capturing a live manager into an `Arrangement` (the `current` argument
+  `reconcile` needs), opening the `to_open` slots, and applying the result
+  through the deferred mutation boundary; Revert (Apply wave). The existing
+  `open_*_window` helpers surface an existing viewer and float the new one
+  with `next_slot`, so Apply needs an open path that only creates the Content.
 - The **Layout ▾** / **Save** controls and dialogs (picker wave).
 - Create Layout… and the provider boundary (promptable Create wave).
 
