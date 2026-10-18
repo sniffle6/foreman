@@ -75,10 +75,13 @@ always applicable.
 
 1. Exact id + kind matches first, for every slot.
 2. Remaining saved slots take the lowest-id unassigned current item of the
-   same kind. Minimized current items count, and a substitute takes the
-   slot's state (a minimized terminal can land in a tiled slot). Tiled and
-   floating slots pick first, then minimized slots, so a minimized slot never
-   takes the window a visible slot needed. Kinds never cross.
+   same kind, and a substitute takes the slot's state. Tiled and floating
+   slots pick first, then minimized slots, so a minimized slot never takes
+   the window a visible slot needed. A visible slot prefers a visible item
+   and only then restores a minimized one; a minimized slot takes only an
+   already-minimized item. So Apply never hides a visible window, and never
+   brings back a minimized one while a visible one of that kind is free.
+   Kinds never cross.
 3. A still-empty **tiled or floating** slot whose kind opens without a target
    keeps its place under a placeholder id and joins `to_open`. Every other
    empty slot is `unfilled` and omitted: its tab leaves its stack, empty

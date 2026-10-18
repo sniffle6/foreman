@@ -190,9 +190,11 @@ Do not reuse Member ids or change Control-plane identity to implement layouts.
 
 Match saved items by this identifier first. Then give each remaining saved
 slot an unassigned current item of the same Content kind, in stable creation
-order. Minimized current items are available and are restored into their slot.
-Fill tiled and floating slots before minimized ones, so a minimized slot never
-takes the window a visible slot needed. Never substitute a terminal for a
+order. Fill tiled and floating slots before minimized ones, so a minimized slot
+never takes the window a visible slot needed. A visible slot prefers a visible
+item and only then restores a minimized one. A minimized slot takes only an
+already-minimized item. Apply therefore never hides a visible window, and
+never brings back a minimized one while a visible one of the same kind is free. Never substitute a terminal for a
 viewer or retarget a viewer to imitate a missing item. List substitutions in
 the summary.
 

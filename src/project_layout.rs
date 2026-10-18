@@ -563,9 +563,10 @@ impl Reconciliation {
 ///
 /// 1. Exact id+kind matches first.
 /// 2. Remaining saved slots take the lowest-id unassigned current item of
-///    the same kind (stable creation order), minimized items included.
-///    Tiled and floating slots go first, then minimized slots, each in
-///    saved order.
+///    the same kind (stable creation order). Tiled and floating slots go
+///    first, then minimized slots, each in saved order. A visible slot
+///    prefers a visible item, then restores a minimized one; a minimized
+///    slot takes only a minimized item, so Apply never hides a window.
 /// 3. A remaining tiled or floating slot whose kind opens without a target
 ///    keeps its place under a placeholder and joins `to_open`; a singleton
 ///    viewer opens only if the Project has none. Every other remaining slot
@@ -603,15 +604,23 @@ pub fn reconcile(
     }
 
     // Pass 2: same-kind substitutes in creation (ascending id) order. A
-    // BTreeSet per kind gives "lowest unassigned id" deterministically.
-    // Visible slots first, so a minimized slot never takes the item a
-    // visible slot needed.
-    let mut free: HashMap<ItemKind, BTreeSet<LayoutItemId>> = HashMap::new();
+    // BTreeSet per (kind, minimized now) gives "lowest unassigned id"
+    // deterministically. Visible slots first, so a minimized slot never
+    // takes the item a visible slot needed. A visible slot prefers a visible
+    // item and only then restores a minimized one; a minimized slot takes
+    // only an already-minimized item. Apply never hides a visible window.
+    let mut free: HashMap<(ItemKind, bool), BTreeSet<LayoutItemId>> = HashMap::new();
     for item in inventory {
         if !assigned.contains(&item.id) {
-            free.entry(item.kind).or_default().insert(item.id);
+            free.entry((item.kind, minimized_now.contains(&item.id)))
+                .or_default()
+                .insert(item.id);
         }
     }
+    let mut take = |kind: ItemKind, minimized: bool| {
+        free.get_mut(&(kind, minimized))
+            .and_then(|pool| pool.pop_first())
+    };
     let mut substituted = Vec::new();
     for minimized in [false, true] {
         for saved in &def.items {
@@ -620,7 +629,12 @@ pub fn reconcile(
             {
                 continue;
             }
-            if let Some(id) = free.get_mut(&saved.kind).and_then(|pool| pool.pop_first()) {
+            let pick = if minimized {
+                take(saved.kind, true)
+            } else {
+                take(saved.kind, false).or_else(|| take(saved.kind, true))
+            };
+            if let Some(id) = pick {
                 saved_to_current.insert(saved.id, id);
                 assigned.insert(id);
                 substituted.push(Substitution {
@@ -1389,6 +1403,68 @@ mod tests {
         assert!(r.to_open.is_empty());
         assert_eq!(r.arrangement.windows, vec![WindowSpec::tiled(vec![9], 0)]);
         assert_eq!(r.arrangement.tree, Some(leaf(0)));
+    }
+
+    #[test]
+    fn visible_slot_prefers_a_visible_window_over_a_minimized_one() {
+        // 10 is older, but it was put away; 20 is on screen and takes the
+        // slot, so the switch neither restores 10 nor displaces 20.
+        let d = def(
+            vec![term(1)],
+            vec![WindowSpec::tiled(vec![1], 0)],
+            Some(leaf(0)),
+        );
+        let inv = vec![term(10), term(20)];
+        let r = reconcile(&d, &live(&inv, &[10]), &inv).unwrap();
+        assert_eq!(r.substituted, vec![sub(1, 20, ItemKind::Terminal)]);
+        assert_eq!(r.kept_minimized, vec![term(10)]);
+        assert!(r.additional.is_empty());
+        assert_eq!(r.arrangement.windows[0], WindowSpec::tiled(vec![20], 0));
+    }
+
+    #[test]
+    fn minimized_slot_never_hides_a_visible_window() {
+        // Both terminals are on screen. The minimized slot stays unfilled
+        // and the spare goes to Additional windows instead of vanishing.
+        let d = def(
+            vec![term(1), term(2)],
+            vec![
+                WindowSpec::tiled(vec![1], 0),
+                WindowSpec::minimized(vec![2], 0, true, MIN_RECT),
+            ],
+            Some(leaf(0)),
+        );
+        let inv = vec![term(10), term(20)];
+        let r = rec(&d, &inv);
+        assert_eq!(r.substituted, vec![sub(1, 10, ItemKind::Terminal)]);
+        assert_eq!(r.unfilled, vec![term(2)]);
+        assert_eq!(r.additional, vec![term(20)]);
+        assert_eq!(validate(&r.arrangement, &r.items), Ok(()));
+    }
+
+    #[test]
+    fn slots_take_windows_in_their_own_state() {
+        // Lowest id alone would restore 10 into the tiled slot and hide 20
+        // in the minimized one; matching state keeps both where they are.
+        let d = def(
+            vec![term(1), term(2)],
+            vec![
+                WindowSpec::tiled(vec![1], 0),
+                WindowSpec::minimized(vec![2], 0, true, MIN_RECT),
+            ],
+            Some(leaf(0)),
+        );
+        let inv = vec![term(10), term(20)];
+        let r = reconcile(&d, &live(&inv, &[10]), &inv).unwrap();
+        assert_eq!(
+            r.substituted,
+            vec![
+                sub(1, 20, ItemKind::Terminal),
+                sub(2, 10, ItemKind::Terminal)
+            ]
+        );
+        assert!(r.additional.is_empty() && r.kept_minimized.is_empty());
+        assert!(r.unfilled.is_empty());
     }
 
     #[test]
