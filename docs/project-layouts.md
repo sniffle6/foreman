@@ -301,7 +301,8 @@ shown.
 **Where.** Every Project header has **Layout ▾** and **Save** just left of
 its ⋯ and ✕. Under `LAYOUT_CTL_FULL_MIN_W` (520px) of header width they turn
 into icon buttons (a split-pane mark with ▾, and a down-arrow-into-tray),
-with the same tooltips, so the title keeps room. A zoomed Project keeps its
+with the same tooltips, so the title keeps room. Under `LAYOUT_CTL_MIN_W`
+(140px) there is no room at all and they are not drawn. A zoomed Project keeps its
 header, so the controls stay. They act on the stack's active Project tab,
 the one the header draws. Clicking them in an unfocused Project focuses it
 first. Child windows get no picker.
@@ -355,9 +356,16 @@ again when the menu opens, and after each write. Never per frame. A second
 instance of the same directory sees another's save the next time its menu
 opens; its windows never move.
 
-**Keyboard.** While a dialog is open, that Project's terminals are frozen
-(`live` is false and `terminal_owns_keyboard` says no) so typing goes to the
-name field. Enter submits, Escape cancels.
+**Keyboard.** While the menu or a dialog is open, it owns the keys: that
+Project's terminals are frozen (`live` is false, `terminal_owns_keyboard`
+says no), and the desktop's leader and close funnels stand down
+(`any_layout_capture`). Escape closes or cancels. Enter submits a name, but
+never confirms Delete or Replace; those need a click. Both keys are
+consumed. Popups belong to the focused Project: when focus leaves it (a
+click, focus-follows-mouse), or it is not drawn this frame (minimized, or a
+background tab), its menu closes and its dialog is canceled. So an Enter
+typed into another Project can never confirm this one's dialog, and no
+invisible dialog keeps terminals frozen.
 
 **Testing it.** A click becomes a `PickerAction`, and `run_layout_action`
 does the work, so tests drive the bindings without a pointer.

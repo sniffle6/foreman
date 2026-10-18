@@ -5782,6 +5782,17 @@ impl WindowManager {
             || self.pending_close.is_some()
             || self.picker.is_some()
             || self.renaming.is_some()
+            || self.any_layout_capture()
+    }
+
+    /// A layout menu or dialog is open here or in any nested Project.
+    fn any_layout_capture(&self) -> bool {
+        self.layout_ui.captures_keyboard()
+            || self.windows.iter().any(|w| {
+                w.tabs.iter().any(
+                    |t| matches!(&t.content, Content::Project(wm) if wm.any_layout_capture()),
+                )
+            })
     }
 
     /// Close the active tab of `id`, or open the confirm modal if it has running
@@ -6780,6 +6791,19 @@ impl WindowManager {
             w.active_content().keepalive();
         }
         let mut order = self.draw_order();
+        // A Project tab this frame will not draw (minimized, or behind
+        // another tab) cannot show its layout menu or dialog, so close them:
+        // an invisible dialog would keep its terminals frozen.
+        for w in &mut self.windows {
+            let hidden = w.minimized;
+            for (ti, t) in w.tabs.iter_mut().enumerate() {
+                if (hidden || ti != w.active)
+                    && let Content::Project(inner) = &mut t.content
+                {
+                    inner.close_layout_popups();
+                }
+            }
+        }
 
         let mut placements: std::collections::HashMap<WinId, egui::Rect> = self
             .tree
@@ -8088,6 +8112,9 @@ impl WindowManager {
             && self.picker.is_none()
             && self.renaming.is_none()
             && !self.settings_capturing()
+            // A layout menu or dialog owns the keys (the Delete dialog has
+            // no text field, so egui focus alone does not say so).
+            && !self.any_layout_capture()
             // Any focused text field (chat input, rename) owns the keyboard — leader stays dormant.
             && ui.ctx().memory(|m| m.focused().is_none())
         {
@@ -8449,9 +8476,11 @@ fn clamp(rect: &mut egui::Rect, area: egui::Vec2) {
 fn header_ctl_w(is_project: bool, is_panel: bool, width: f32) -> f32 {
     if is_panel {
         28.0
-    } else if is_project {
+    } else if is_project && width >= LAYOUT_CTL_MIN_W {
         let (picker, save) = layout_ctl_widths(layout_ctl_compact(width));
         LAYOUT_CTL_EDGE + save + LAYOUT_CTL_GAP + picker + 3.0
+    } else if is_project {
+        54.0
     } else {
         113.0
     }
@@ -8460,6 +8489,9 @@ fn header_ctl_w(is_project: bool, is_panel: bool, width: f32) -> f32 {
 /// A Project header narrower than this shows the layout picker and Save as
 /// icon buttons, so the title keeps room.
 const LAYOUT_CTL_FULL_MIN_W: f32 = 520.0;
+/// Narrower than this, a Project header has no room for them at all: they
+/// would run past its left edge over the tabs.
+const LAYOUT_CTL_MIN_W: f32 = 140.0;
 /// From the header's right edge to Save's right edge: past ✕ and ⋯ (51)
 /// and a 6pt gap.
 const LAYOUT_CTL_EDGE: f32 = 57.0;
@@ -8558,7 +8590,8 @@ struct HeaderLayout {
     /// scr.max.x - 4.
     controls: Vec<(CtlRole, egui::Rect)>,
     /// The project's **Layout ▾** and **Save**, left of ⋯. `Some` iff
-    /// project (renaming included: the controls stay reachable).
+    /// project at least `LAYOUT_CTL_MIN_W` wide (renaming included: the
+    /// controls stay reachable).
     layout: Option<LayoutCtlLayout>,
 }
 
@@ -8700,7 +8733,7 @@ fn header_layout(
         bx -= 25.0;
     }
 
-    let layout = is_project.then(|| {
+    let layout = (is_project && scr.width() >= LAYOUT_CTL_MIN_W).then(|| {
         let compact = layout_ctl_compact(scr.width());
         let (picker_w, save_w) = layout_ctl_widths(compact);
         let save_max = scr.max.x - LAYOUT_CTL_EDGE;

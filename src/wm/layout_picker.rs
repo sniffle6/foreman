@@ -39,10 +39,11 @@ pub(super) struct PickerUi {
 }
 
 impl PickerUi {
-    /// A dialog's text field owns the keyboard: this Project's terminals
-    /// must not read keys meant for it.
+    /// An open menu or dialog owns the keyboard (Escape, Enter, the name
+    /// field): this Project's terminals and the leader must not read keys
+    /// meant for it.
     pub(super) fn captures_keyboard(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.menu_open
     }
 }
 
@@ -175,7 +176,16 @@ impl WindowManager {
         self.selected_layout().map_or("Custom", |d| d.name.as_str())
     }
 
+    /// Close the menu and cancel any dialog, changing nothing: the Project
+    /// lost focus or is not drawn this frame.
+    pub(super) fn close_layout_popups(&mut self) {
+        self.layout_ui.menu_open = false;
+        self.layout_ui.dialog = None;
+    }
+
     /// Run one picker action. `ctx` supplies the clock and repaints.
+    /// Writes and reads happen here, on the GUI thread, but only on a
+    /// click: one small JSON file, never in the per-frame path.
     pub(super) fn run_layout_action(&mut self, action: PickerAction, ctx: &egui::Context) {
         let Some(dir) = self.layout_project_dir() else {
             self.layout_ui.menu_open = false;
@@ -510,8 +520,10 @@ impl WindowManager {
         } else {
             None
         };
-        if disabled.is_some() {
-            self.layout_ui.menu_open = false;
+        // Popups belong to the focused Project: keys typed into another
+        // one must never confirm this one's dialog.
+        if disabled.is_some() || !focused {
+            self.close_layout_popups();
         }
         let mut actions = Vec::new();
         let fg = if disabled.is_some() {
@@ -542,7 +554,6 @@ impl WindowManager {
                 egui::StrokeKind::Inside,
             );
         }
-        let label = self.layout_picker_label().to_string();
         let custom = self.selected_layout().is_none();
         let modified = !custom && self.layout.modified;
         let glyph = egui::Rect::from_center_size(
@@ -565,7 +576,11 @@ impl WindowManager {
             let text_min = glyph.max.x + 6.0;
             let dot_w = if modified { 9.0 } else { 0.0 };
             let text_max = chevron.x - 8.0 - dot_w;
-            let galley = p.layout_no_wrap(label.clone(), font, if custom { th.dim } else { fg });
+            let galley = p.layout_no_wrap(
+                self.layout_picker_label().to_string(),
+                font,
+                if custom { th.dim } else { fg },
+            );
             let text_w = galley.size().x.min(text_max - text_min);
             let clip = egui::Rect::from_min_max(
                 egui::pos2(text_min, ctl.picker.min.y),
@@ -584,12 +599,17 @@ impl WindowManager {
                 );
             }
         }
-        let picker_tip = match &disabled {
-            Some(why) => why.clone(),
-            None if modified => format!("Layout: {label} (Modified since it was applied or saved)"),
-            None => format!("Layout: {label}"),
-        };
-        let presp = presp.on_hover_text(picker_tip);
+        // Tooltips are built only while hovered, not every frame.
+        let presp = presp.on_hover_ui(|ui| {
+            let label = self.layout_picker_label();
+            ui.label(match &disabled {
+                Some(why) => why.clone(),
+                None if modified => {
+                    format!("Layout: {label} (Modified since it was applied or saved)")
+                }
+                None => format!("Layout: {label}"),
+            });
+        });
         if presp.clicked() && disabled.is_none() {
             actions.push(PickerAction::ToggleMenu);
         }
@@ -611,15 +631,16 @@ impl WindowManager {
                 fg,
             );
         }
-        let save_tip = match (&disabled, self.selected_layout()) {
-            (Some(why), _) => why.clone(),
-            (None, Some(def)) => format!(
-                "Save the current arrangement to \u{201c}{}\u{201d}",
-                def.name
-            ),
-            (None, None) => "Save the current arrangement as a named layout".to_string(),
-        };
-        let sresp = sresp.on_hover_text(save_tip);
+        let sresp = sresp.on_hover_ui(|ui| {
+            ui.label(match (&disabled, self.selected_layout()) {
+                (Some(why), _) => why.clone(),
+                (None, Some(def)) => format!(
+                    "Save the current arrangement to \u{201c}{}\u{201d}",
+                    def.name
+                ),
+                (None, None) => "Save the current arrangement as a named layout".to_string(),
+            });
+        });
         if sresp.clicked() && disabled.is_none() {
             actions.push(PickerAction::Save);
         }
@@ -865,7 +886,8 @@ impl WindowManager {
                     .interact_pos()
                     .is_some_and(|p| !menu_rect.contains(p) && !ctl.picker.contains(p))
         });
-        if (outside || ui.input(|i| i.key_pressed(egui::Key::Escape))) && actions.is_empty() {
+        let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if (outside || escape) && actions.is_empty() {
             actions.push(PickerAction::CloseMenu);
         }
     }
@@ -882,12 +904,22 @@ impl WindowManager {
         let Some(dialog) = &mut self.layout_ui.dialog else {
             return;
         };
-        let (enter, escape) = ui.input(|i| {
+        // Consumed so neither reaches anything else. Enter only submits a
+        // name: Delete and Replace each need an explicit click.
+        let (enter, escape) = ui.input_mut(|i| {
             (
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             )
         });
+        let enter = enter
+            && matches!(
+                dialog,
+                Dialog::Name {
+                    conflict: None,
+                    ..
+                }
+            );
         let field_id = id.with("name-field");
         let shown = egui::Window::new("Layout")
             .id(id.with("dialog"))
@@ -1629,7 +1661,10 @@ mod tests {
 
     #[test]
     fn header_places_layout_controls_between_title_and_project_controls() {
-        for width in [120.0, 300.0, 519.0, 520.0, 800.0, 1600.0] {
+        let tiny = egui::Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(139.0, 400.0));
+        let hl = header_layout(tiny, true, false, HeaderSpec::Rename);
+        assert!(hl.layout.is_none(), "no room: hidden, not drawn over the tabs");
+        for width in [140.0, 300.0, 519.0, 520.0, 800.0, 1600.0] {
             let scr = egui::Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(width, 400.0));
             for spec in [
                 HeaderSpec::Title {
@@ -1653,6 +1688,7 @@ mod tests {
                 );
                 assert!(ctl.picker.max.x <= ctl.save.min.x, "w={width}");
                 assert!(hl.avail_end <= ctl.picker.min.x, "fence (w={width})");
+                assert!(ctl.picker.min.x >= scr.min.x, "inside the header (w={width})");
                 assert_eq!(ctl.picker.height(), ovf.height());
                 if let Some(plus) = hl.plus {
                     assert!(plus.max.x <= ctl.picker.min.x, "+ (w={width})");
@@ -2305,7 +2341,104 @@ mod tests {
         // The picker opens the menu; a press elsewhere closes it.
         click(&ctx, &mut desk, area, &mut t, ctl.picker.center());
         assert!(child(&mut desk).layout_ui.menu_open);
+        assert!(desk.any_layout_capture(), "the open menu owns the keys");
+        assert!(desk.overlay_blocks_close());
         click(&ctx, &mut desk, area, &mut t, egui::pos2(500.0, 500.0));
         assert!(!child(&mut desk).layout_ui.menu_open);
+        assert!(!desk.any_layout_capture());
+    }
+
+    fn key(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    /// A desktop holding one laid-out Project on `fx`, after one frame.
+    fn desk_with_project(fx: &Fixture) -> (egui::Context, WindowManager, egui::Rect, f64) {
+        let mut project = fx.project();
+        tile(&mut project, "a");
+        tile(&mut project, "b");
+        let mut desk = WindowManager::new();
+        desk.desktop = true;
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 700.0));
+        desk.push_win(
+            1,
+            Tab::fixed("repo", Content::Project(Box::new(project))),
+            area,
+        );
+        desk.focused = Some(1);
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut desk, area, 0.0, vec![]);
+        (ctx, desk, area, 0.0)
+    }
+
+    #[test]
+    fn enter_never_confirms_a_delete_or_a_replace() {
+        let fx = fixture();
+        let (ctx, mut desk, area, mut t) = desk_with_project(&fx);
+        let id = save_new(child(&mut desk), "Keep");
+
+        act(child(&mut desk), PickerAction::Delete(id.clone()));
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, key(egui::Key::Enter));
+        assert!(matches!(
+            child(&mut desk).layout_ui.dialog,
+            Some(Dialog::Delete { .. })
+        ));
+        assert_eq!(fx.saved().len(), 1, "Delete needs a click");
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, key(egui::Key::Escape));
+        assert_eq!(child(&mut desk).layout_ui.dialog, None, "Escape cancels");
+
+        act(child(&mut desk), PickerAction::SaveAs);
+        type_name(child(&mut desk), "keep");
+        act(child(&mut desk), PickerAction::Submit);
+        let before = fx.saved();
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, key(egui::Key::Enter));
+        assert!(
+            matches!(
+                child(&mut desk).layout_ui.dialog,
+                Some(Dialog::Name {
+                    conflict: Some(_),
+                    ..
+                })
+            ),
+            "Replace needs a click"
+        );
+        assert_eq!(fx.saved(), before);
+    }
+
+    #[test]
+    fn popups_close_when_their_project_loses_focus_or_is_not_drawn() {
+        let fx = fixture();
+        let (ctx, mut desk, area, mut t) = desk_with_project(&fx);
+        let id = save_new(child(&mut desk), "Keep");
+
+        // Focus leaves the Project: its Delete dialog is canceled, so an
+        // Enter typed elsewhere can never confirm it.
+        act(child(&mut desk), PickerAction::Delete(id));
+        assert!(desk.any_layout_capture());
+        desk.focused = None;
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, key(egui::Key::Enter));
+        assert_eq!(child(&mut desk).layout_ui.dialog, None);
+        assert_eq!(fx.saved().len(), 1, "canceled, not confirmed");
+        assert!(!desk.any_layout_capture());
+
+        // A minimized Project draws no header: its open menu closes rather
+        // than keep its terminals frozen out of sight.
+        desk.focused = Some(1);
+        act(child(&mut desk), PickerAction::ToggleMenu);
+        desk.windows[0].minimized = true;
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, vec![]);
+        assert!(!child(&mut desk).layout_ui.menu_open);
+        assert!(!desk.any_layout_capture());
     }
 }
