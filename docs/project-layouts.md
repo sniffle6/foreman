@@ -4,10 +4,10 @@ Named arrangements of a Project's child windows. Spec (authoritative on the
 product contract):
 `docs/superpowers/specs/2026-10-16-project-layouts-design.md`.
 
-This doc tracks what has shipped. Status: **model, identity, and
-reconciliation (fill missing slots) only**.
-No picker, no persistence file, no Apply/Revert, no provider integration yet;
-those are later cards of the `project-layouts` plan.
+This doc tracks what has shipped. Status: **model, identity,
+reconciliation (fill missing slots), and the saved-layout library on disk**.
+No picker, no Apply/Revert, no provider integration yet; those are later
+cards of the `project-layouts` plan.
 
 ## What exists
 
@@ -146,24 +146,107 @@ fractions drift. The comparison is therefore for captures taken around a
 structural edit, which is how the spec defines Modified; a resize alone must
 not trigger it.
 
+### The library on disk (`src/layout_library.rs`)
+
+Saved definitions live in `%APPDATA%\foreman\project-layouts.json`, never in
+Settings or a repository:
+
+```json
+{
+  "version": 1,
+  "projects": {
+    "h:\\code\\repo": { "dir": "H:\\code\\repo", "layouts": [ /* LayoutDefinition */ ] }
+  },
+  "new_project": { /* optional LayoutDefinition copy */ }
+}
+```
+
+**Who owns a library.** The key is `project_key(dir)`: absolute, `.`/`..`
+resolved, symlinks/junctions/subst drives resolved when the directory is
+reachable, no `\\?\` prefix, no trailing separator, lowercase on Windows. So
+two Project instances of one directory share definitions, while a worktree
+under `.foreman/worktrees/` is a different directory with its own library.
+`dir` is only for people reading the file. Libraries outlive their Projects
+(closing one deletes nothing) and an unreachable directory keeps its lexical
+key. Moving a directory does not migrate its library.
+
+**How to use it.** `LayoutStore::user()` (or `LayoutStore::at(dir)` in tests)
+then, per the picker contract:
+
+| Picker action | Call |
+|---|---|
+| Save with nothing selected, Save As | `create(project, name, items, arrangement, OnConflict::Reject)` |
+| …user picked "Replace" on a duplicate | same with `OnConflict::Replace`: overwrites the other definition in place, keeping its id |
+| Save with a layout selected | `update(project, id, items, arrangement)` |
+| Rename… | `rename(project, id, name, on_conflict)`; Replace deletes the other holder of the name |
+| Delete… | `delete(project, id)`; already gone is `Ok` |
+| Use for new Projects / reset | `set_new_project_layout(Some(&def))` / `(None)` |
+| Menu contents | `project_layouts(project)`, `new_project_layout()` |
+
+Names are trimmed and checked (`validate_name`), duplicates compare
+case-insensitively within one Project, and the arrangement is validated
+before anything is read or written. `StoreError` says why a call failed and
+its `Display` is the user-facing message: `NameTaken` (offer Replace or
+another name), `NotFound` (deleted elsewhere: show Custom), `Invalid`,
+`FutureVersion`, `Io`. A call that returns `Err` wrote nothing, so the UI
+reports success only on `Ok`.
+
+**Two processes.** There is no cache. Every call reads the file fresh, and
+every change re-reads, edits only its own definition by id (or the New
+Project slot), and writes. So the installed app and a dev build saving
+different definitions both keep them. The write goes through
+`config::save_json_in`, whose staging file is unique per process. There is
+no lock: two writes within a few milliseconds can still lose one.
+
+**Bad files.**
+
+- Missing file: empty library. Reading never creates it.
+- Malformed JSON, or an unknown field: the shared config recovery backs the
+  bytes up as `project-layouts.json.corrupt-…` and queues a toast before the
+  next write may replace them. Strict parsing is on purpose: trimming unknown
+  fields on rewrite would silently delete a newer build's data.
+- `version` above `LIBRARY_VERSION`: every call returns `FutureVersion` and
+  the file is neither backed up nor written. **Any change to the file's
+  shape, a definition's included, must bump `LIBRARY_VERSION`.**
+- Unreadable (locked, a directory): `Io`, and no write follows.
+
+### Picker state in the workspace (`LayoutSelection`)
+
+Selection and Modified belong to one Project instance, not to the library.
+`WindowManager` keeps a `LayoutSelection { selected, modified }`
+(`layout_selection` / `set_layout_selection`; setting a different value
+marks the workspace dirty). Capture writes it to `ManagerSnap::layout`,
+omitted when Custom and unmodified, so old files load as Custom. Cold restore
+puts it back alongside the tab `layout_id`s and does not reapply the layout.
+A selection whose definition was deleted elsewhere stays as saved;
+`resolve_selection(layouts, selected)` returns `None` and the picker shows
+Custom. Nothing sets `modified` yet: the structural-event wiring is the Apply
+wave's.
+
 ## Not yet built
 
-- `project-layouts.json` library and the `config::load_json` / `save_json`
-  wiring (persistence wave).
 - Capturing a live manager into an `Arrangement` (the `current` argument
   `reconcile` needs), opening the `to_open` slots, and applying the result
   through the deferred mutation boundary; Revert (Apply wave). The existing
   `open_*_window` helpers surface an existing viewer and float the new one
   with `next_slot`, so Apply needs an open path that only creates the Content.
-- The **Layout ▾** / **Save** controls and dialogs (picker wave).
+- The **Layout ▾** / **Save** controls and dialogs (picker wave), which call
+  `LayoutStore` off the render loop's hot path (on a click, not per frame).
+- Setting `LayoutSelection::modified` on structural edits (Apply wave).
+- Opening a new Project with `new_project_layout()` (New Project wave).
 - Create Layout… and the provider boundary (promptable Create wave).
 
 ## Key files
 
 - `src/project_layout.rs` — the model, validation, reconciliation, comparison,
   geometry adaptation, and their tests
+- `src/layout_library.rs` — `project-layouts.json`: `LayoutStore`,
+  `project_key`, `resolve_selection`, and their tests
+- `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
+  and atomic write the library rides on
 - `src/wm.rs` — `Tab::layout_id`, `Content::layout_kind`,
-  `WindowManager::layout_inventory`, capture/restore of the id
-- `src/workspace.rs` — `TabSnap::layout_id`
+  `WindowManager::layout_inventory`, the `layout` selection field, and
+  capture/restore of both
+- `src/workspace.rs` — `TabSnap::layout_id`, `ManagerSnap::layout`
 - `docs/workspace-persistence.md` — the snapshot it rides on
 - `docs/tiling-tree.md` — the live tree an `Arrangement` mirrors

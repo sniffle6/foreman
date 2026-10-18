@@ -16,8 +16,12 @@ setting instead of hand-rolling file I/O again.
   saved. A warning toast names the backup. If reading or backup creation fails,
   saves to that path are refused until a subsequent load succeeds or preserves
   the original. **Never panics** — a corrupt config can't crash the app.
-- `save_json(file, &value)` → writes JSON **atomically** (write a `.tmp`, then
-  rename over the real file). A crash mid-write leaves the old good file intact.
+- `save_json(file, &value)` → writes JSON **atomically** (write a
+  `<file>.<pid>-<sequence>.tmp` sibling, then rename over the real file). A
+  crash mid-write leaves the old good file intact. The staging name is unique
+  per process and per call because the installed app and a dev build share
+  `%APPDATA%\foreman`; a fixed `.tmp` let one rename the other's half-written
+  bytes.
 - `Settings` → the actual app-settings struct, saved to
   `%APPDATA%\foreman\settings.json`. Holds `font_size`, the panel prefs
   (`panel_collapsed`/`panel_width`/`panel_dock`), `bell`, and the whole

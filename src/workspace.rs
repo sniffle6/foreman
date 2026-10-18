@@ -48,6 +48,14 @@ pub struct ManagerSnap {
     pub zoomed: Option<SnapId>,
     pub windows: Vec<WinSnap>,
     pub tree: Option<NodeSnap>,
+    /// Project layout picker state (selected definition, Modified). Additive
+    /// post-v1 field: omitted when Custom and unmodified, so v1 files and old
+    /// builds are unaffected and old files restore as Custom.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::project_layout::LayoutSelection::is_default"
+    )]
+    pub layout: crate::project_layout::LayoutSelection,
 }
 
 impl ManagerSnap {
@@ -398,6 +406,28 @@ mod tests {
     }
 
     #[test]
+    fn manager_snap_layout_selection_is_wire_compat_with_v1() {
+        use crate::project_layout::LayoutSelection;
+        let v1 = r#"{"cwd":"C:/p","windows":[],"tree":null}"#;
+        let snap: ManagerSnap = serde_json::from_str(v1).expect("v1 manager parses");
+        assert!(snap.layout.is_default(), "old files restore as Custom");
+        let out = serde_json::to_string(&snap).unwrap();
+        assert!(!out.contains("layout"), "default must be omitted: {out}");
+        let mut with = snap.clone();
+        with.layout = LayoutSelection {
+            selected: Some("def-9".into()),
+            modified: true,
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        let back: ManagerSnap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.layout, with.layout);
+        // Only the set half is written.
+        with.layout.modified = false;
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""layout":{"selected":"def-9"}"#), "{json}");
+    }
+
+    #[test]
     fn empty_object_loads_as_default() {
         // Default::version is 1 so `{}` and a hand-built default agree after load().
         let s: WorkspaceSnapshot = serde_json::from_str("{}").unwrap();
@@ -462,6 +492,7 @@ mod tests {
                                     prev: None,
                                 }],
                                 tree: Some(NodeSnap::Leaf { id: 2 }),
+                                layout: Default::default(),
                             },
                         },
                     }],
@@ -476,6 +507,7 @@ mod tests {
                     prev: None,
                 }],
                 tree: Some(NodeSnap::Leaf { id: 1 }),
+                layout: Default::default(),
             },
         };
         let json = serde_json::to_string_pretty(&snap).unwrap();

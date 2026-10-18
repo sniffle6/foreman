@@ -19,6 +19,9 @@ On restart, Foreman reloads the last desktop layout from
 - Per-tab layout-item identity (`TabSnap.layout_id`, same additive policy;
   restore keeps it verbatim and mints one for tabs without it — see
   `docs/project-layouts.md`)
+- Per-project layout picker state (`ManagerSnap.layout`: selected definition
+  id and the Modified flag, same additive policy; old files restore as Custom.
+  Restore never reapplies the named layout on top)
 - Whether each terminal title is Foreman-managed. Generated semantic text is
   not authoritative state; snapshots store only a generic source/member label
   plus `managed_title = true`, and current restore starts the title lifecycle

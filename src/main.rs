@@ -39,6 +39,7 @@ mod keymap;
 mod landing;
 mod launcher;
 mod layout;
+mod layout_library;
 mod notify;
 mod panel;
 mod plan_view;

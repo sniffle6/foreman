@@ -195,10 +195,10 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Write a JSON file atomically into `dir`: serialize, write a sibling `.tmp`,
-/// then rename it over the target. A crash mid-write leaves the previous good
-/// file intact (a bare `write` could truncate it). Errors are returned, never
-/// panicked. [`save_json`] is the `config_dir()` flavor.
+/// Write a JSON file atomically into `dir`: serialize, write a sibling temp
+/// file, then rename it over the target. A crash mid-write leaves the previous
+/// good file intact (a bare `write` could truncate it). Errors are returned,
+/// never panicked. [`save_json`] is the `config_dir()` flavor.
 pub fn save_json_in<T: Serialize>(
     dir: &std::path::Path,
     file: &str,
@@ -216,13 +216,24 @@ pub fn save_json_in<T: Serialize>(
             path.display()
         ));
     }
-    let tmp = dir.join(format!("{file}.tmp"));
+    let tmp = dir.join(tmp_name(file));
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| format!("could not serialize {file}: {e}"))?;
     std::fs::write(&tmp, json).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("could not commit {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not commit {}: {e}", path.display())
+    })?;
     Ok(())
+}
+
+/// Staging name for one [`save_json_in`] call. Unique per process and per
+/// call: the installed app and a dev build share `%APPDATA%\foreman`, and a
+/// fixed `{file}.tmp` let one writer rename the other's half-written bytes.
+fn tmp_name(file: &str) -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{file}.{}-{sequence}.tmp", std::process::id())
 }
 
 /// Load a JSON config file from the foreman config dir. Tolerant by design:
@@ -555,6 +566,30 @@ mod tests {
         let missing: Sample = load_json_from(&dir, "does-not-exist.json");
         assert_eq!(missing, Sample::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_names_are_unique_per_process_and_call() {
+        let a = tmp_name("project-layouts.json");
+        let b = tmp_name("project-layouts.json");
+        assert_ne!(a, b);
+        let pid = std::process::id().to_string();
+        assert!(
+            a.starts_with(&format!("project-layouts.json.{pid}-")),
+            "{a}"
+        );
+        assert!(a.ends_with(".tmp"), "{a}");
+    }
+
+    #[test]
+    fn save_leaves_no_staging_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        save_json_in(dir.path(), "a.json", &1u32).unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.json"]);
     }
 
     #[test]

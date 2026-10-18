@@ -258,6 +258,30 @@ pub struct LayoutDefinition {
     pub arrangement: Arrangement,
 }
 
+/// One Project instance's picker state: which saved definition it shows and
+/// whether a structural edit happened since. Per instance, never shared
+/// through the library, so two instances of a directory select independently.
+/// Persisted with the workspace snapshot (`ManagerSnap::layout`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutSelection {
+    /// `LayoutDefinition::id`; `None` is Custom. May name a definition that
+    /// was deleted elsewhere, which also shows as Custom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    /// The Modified event flag (spec: Save behavior). Set by structural
+    /// edits, cleared by Save and a clean Apply; never derived by comparison.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub modified: bool,
+}
+
+impl LayoutSelection {
+    /// Custom and unmodified: what an old workspace file restores to.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Why an arrangement, definition, inventory, or name was rejected.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutError {

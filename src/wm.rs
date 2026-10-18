@@ -849,6 +849,10 @@ pub struct WindowManager {
     tree: crate::layout::LayoutTree,
     /// tmux-style zoom: render this window full-area on top, tree untouched.
     zoomed: Option<WinId>,
+    /// Project layout picker state for this Project instance (selected
+    /// definition, Modified). Persisted in `ManagerSnap::layout`; the saved
+    /// definitions themselves live in `layout_library`, never here.
+    layout: crate::project_layout::LayoutSelection,
     /// The window whose in-flight header drag started tiled/zoomed (tear-out).
     /// Such a drag keeps the tree drop hints without a modifier; a drag that
     /// started floating is a free move unless Shift is held.
@@ -924,6 +928,7 @@ impl WindowManager {
             keymap: Keymap::default(),
             tree: Default::default(),
             zoomed: None,
+            layout: Default::default(),
             drag_from_tree: None,
             pending_settles: Vec::new(),
             pending_card_dispatches: Vec::new(),
@@ -1088,6 +1093,7 @@ impl WindowManager {
             zoomed: keep(self.zoomed),
             windows,
             tree,
+            layout: self.layout.clone(),
         }
     }
 
@@ -1354,8 +1360,28 @@ impl WindowManager {
         self.focused = map(snap.focused);
         self.last_focused = map(snap.last_focused);
         self.zoomed = map(snap.zoomed);
+        // Restore the selection as saved, even when its definition was since
+        // deleted: the picker resolves that to Custom (`resolve_selection`).
+        // Startup never reapplies the named layout on top.
+        self.layout = snap.layout.clone();
 
         report
+    }
+
+    /// This Project instance's layout picker state.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout picker wave
+    pub fn layout_selection(&self) -> &crate::project_layout::LayoutSelection {
+        &self.layout
+    }
+
+    /// Replace the picker state (Save, Apply, Revert, a structural edit) and
+    /// schedule a workspace save so it survives restart.
+    #[cfg_attr(not(test), allow(dead_code))] // consumed by the layout Apply wave
+    pub fn set_layout_selection(&mut self, selection: crate::project_layout::LayoutSelection) {
+        if self.layout != selection {
+            self.layout = selection;
+            self.mark_workspace_dirty();
+        }
     }
 
     // Cascading offset for a freshly spawned window, plus a fresh id + z.
@@ -9496,6 +9522,7 @@ mod tests {
                                     prev: None,
                                 }],
                                 tree: Some(NodeSnap::Leaf { id: 2 }),
+                                layout: Default::default(),
                             },
                         },
                     }],
@@ -9510,6 +9537,7 @@ mod tests {
                     prev: None,
                 }],
                 tree: Some(NodeSnap::Leaf { id: 1 }),
+                layout: Default::default(),
             },
         };
         let mut d = WindowManager::new().as_desktop();
@@ -9601,6 +9629,7 @@ mod tests {
                                     prev: None,
                                 }],
                                 tree: None,
+                                layout: Default::default(),
                             },
                         },
                     }],
@@ -9615,6 +9644,7 @@ mod tests {
                     prev: None,
                 }],
                 tree: Some(NodeSnap::Leaf { id: 1 }),
+                layout: Default::default(),
             },
         };
         let mut d = WindowManager::new().as_desktop();
@@ -9679,6 +9709,7 @@ mod tests {
                                 zoomed: None,
                                 windows: vec![],
                                 tree: None,
+                                layout: Default::default(),
                             },
                         },
                     }],
@@ -9693,6 +9724,7 @@ mod tests {
                     prev: None,
                 }],
                 tree: Some(NodeSnap::Leaf { id: 1 }),
+                layout: Default::default(),
             },
         };
         let mut d = WindowManager::new().as_desktop();
@@ -18255,6 +18287,91 @@ mod tests {
             .tabs[0]
             .layout_id();
         assert!(!before.contains(&fresh_id));
+    }
+
+    #[test]
+    fn layout_selection_round_trips_through_cold_restore() {
+        use crate::project_layout::LayoutSelection;
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let a = push_chat(&mut wm, "a");
+        let b = push_chat(&mut wm, "b");
+        wm.merge_windows(b, a);
+        let ids: Vec<u64> = wm.windows[0].tabs.iter().map(|t| t.layout_id()).collect();
+        let selection = LayoutSelection {
+            selected: Some("def-1".into()),
+            modified: true,
+        };
+        wm.take_workspace_dirty();
+        wm.set_layout_selection(selection.clone());
+        assert!(wm.take_workspace_dirty(), "a selection change is saved");
+        wm.set_layout_selection(selection.clone());
+        assert!(!wm.take_workspace_dirty(), "an unchanged selection is not");
+
+        let mut restored = WindowManager::new();
+        restored.apply_manager(&wm.capture_manager(), &ctx);
+        assert_eq!(restored.layout_selection(), &selection);
+        let after: Vec<u64> = restored.windows[0]
+            .tabs
+            .iter()
+            .map(|t| t.layout_id())
+            .collect();
+        assert_eq!(after, ids, "item identity and selection restore together");
+
+        // An old file (no field) restores as Custom, unmodified.
+        let mut snap = wm.capture_manager();
+        snap.layout = Default::default();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("\"layout\""), "default is omitted: {json}");
+        restored.apply_manager(&serde_json::from_str(&json).unwrap(), &ctx);
+        assert!(restored.layout_selection().is_default());
+    }
+
+    #[test]
+    fn nested_project_selections_stay_independent() {
+        // Two instances of one directory: each child manager keeps its own
+        // selection through capture and restore.
+        use crate::project_layout::LayoutSelection;
+        use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap, WorkspaceSnapshot};
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let project = |selected: Option<&str>, id: u64| WinSnap {
+            id,
+            tabs: vec![TabSnap {
+                title: "p".into(),
+                content: ContentSnap::Project {
+                    child: ManagerSnap {
+                        cwd: Some(dir.path().to_path_buf()),
+                        layout: LayoutSelection {
+                            selected: selected.map(str::to_string),
+                            modified: false,
+                        },
+                        ..Default::default()
+                    },
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snap = WorkspaceSnapshot {
+            desktop: ManagerSnap {
+                windows: vec![project(Some("a"), 1), project(None, 2)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut d = WindowManager::new().as_desktop();
+        d.apply_workspace(&snap, &ctx);
+        let selected: Vec<Option<String>> = d
+            .windows
+            .iter()
+            .filter_map(|w| match &w.tabs[0].content {
+                Content::Project(child) => Some(child.layout_selection().selected.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selected, [Some("a".to_string()), None]);
+        assert!(d.layout_selection().is_default(), "the desktop has none");
     }
 
     #[test]
