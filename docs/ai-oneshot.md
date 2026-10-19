@@ -64,4 +64,5 @@ let text = ai_oneshot::run(&ai_oneshot::Request {
 - `src/terminal_titles.rs` — Session-title caller (`generate_title`)
 - `src/theme_expert.rs` — theme-expert caller (`generate`)
 - `src/git_history/commit.rs` — commit-message caller (`draft`)
+- `src/layout_prompt.rs` — Create Layout caller (`generate`)
 - `src/agent_command.rs` — `npm_codex` shim resolution

@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 pub type WinId = u64;
 
+mod layout_create;
 mod layout_picker;
 mod layouts;
 #[allow(unused_imports)] // the public face of Apply/Revert; the picker uses them in-crate
@@ -7708,18 +7709,25 @@ impl WindowManager {
                     }
                     // Layout ▾ and Save act on the stack's active Project,
                     // the one this header draws (and so the one shown).
-                    if let Some(ctl) = hl.layout
-                        && let Content::Project(inner) = self.windows[i].active_content()
-                        && inner.show_layout_controls(
-                            ui,
-                            ctl,
-                            scr,
-                            area,
-                            is_focus,
-                            base.with((id, "layout")),
-                        )
-                    {
-                        acts.push(Act::Focus(id));
+                    // Too narrow for the controls: nothing can draw their
+                    // popups, so close them rather than leave an invisible
+                    // editor holding the keyboard.
+                    if let Content::Project(inner) = self.windows[i].active_content() {
+                        match hl.layout {
+                            Some(ctl) => {
+                                if inner.show_layout_controls(
+                                    ui,
+                                    ctl,
+                                    scr,
+                                    area,
+                                    is_focus,
+                                    base.with((id, "layout")),
+                                ) {
+                                    acts.push(Act::Focus(id));
+                                }
+                            }
+                            None => inner.close_layout_popups(),
+                        }
                     }
                 }
             } // end header chrome

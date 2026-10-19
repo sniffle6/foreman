@@ -29,6 +29,16 @@ pub enum LayoutRequest {
     /// replaces was never on screen. Waits while the Project is not laid
     /// out or a dialog is open, rather than failing.
     NewProject { def: LayoutDefinition },
+    /// A Create candidate (`select: false`) or the definition Save & Apply
+    /// just wrote from one (`select: true`). Strict: it runs only while the
+    /// arrangement revision is still `revision` and the definition places
+    /// exactly the live items, so it can never open, substitute, or set
+    /// anything aside. Otherwise [`LayoutApplyError::Stale`].
+    Candidate {
+        def: LayoutDefinition,
+        select: bool,
+        revision: u64,
+    },
 }
 
 /// A fresh item that failed to open. Its slot was omitted.
@@ -69,6 +79,8 @@ pub enum LayoutApplyError {
     NoRevertPoint,
     /// A structural edit since the Apply replaced what Revert would restore.
     RevertInvalidated,
+    /// The windows changed since a Create candidate was proposed.
+    Stale,
 }
 
 impl std::fmt::Display for LayoutApplyError {
@@ -85,6 +97,7 @@ impl std::fmt::Display for LayoutApplyError {
             Self::RevertInvalidated => {
                 write!(f, "Windows changed since the layout was applied.")
             }
+            Self::Stale => write!(f, "Windows changed \u{2014} run again."),
         }
     }
 }
@@ -126,6 +139,11 @@ pub(super) struct LayoutRuntime {
     baseline: Option<(egui::Vec2, Arrangement)>,
     /// Set by `mark_workspace_dirty`: something may have changed structure.
     pub(super) probe: bool,
+    /// Arrangement revision: bumped by every structural edit the watch
+    /// sees and by every Apply and Revert. Resizes, focus, and titles leave
+    /// it alone. A Create request or candidate is valid only at the
+    /// revision it was made at.
+    revision: u64,
     /// Test seam: make every fresh open fail, as a shell that cannot spawn.
     #[cfg(test)]
     fail_opens: bool,
@@ -159,6 +177,17 @@ impl WindowManager {
         }
     }
 
+    /// Whether a request is queued for the next frame.
+    #[cfg(test)]
+    pub(super) fn has_pending_layout_request(&self) -> bool {
+        self.layout_rt.pending.is_some()
+    }
+
+    /// The arrangement revision (see `LayoutRuntime::revision`).
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_rt.revision
+    }
+
     /// Save succeeded for definition `id`: select it and clear Modified.
     pub fn mark_layout_saved(&mut self, id: String) {
         self.set_layout_selection(LayoutSelection {
@@ -176,6 +205,11 @@ impl WindowManager {
         let outcome = match request {
             LayoutRequest::Apply { def, select } => self.apply_layout(&def, select, ctx),
             LayoutRequest::Revert => self.revert_layout(),
+            LayoutRequest::Candidate {
+                def,
+                select,
+                revision,
+            } => self.apply_candidate(&def, select, revision, ctx),
             LayoutRequest::NewProject { def } => {
                 match self.apply_layout(&detach_ids(&def), false, ctx) {
                     Err(LayoutApplyError::NotLaidOut | LayoutApplyError::Busy) => {
@@ -205,9 +239,58 @@ impl WindowManager {
         select: bool,
         ctx: &egui::Context,
     ) -> Result<LayoutApplied, LayoutApplyError> {
+        self.apply_reconciled(def, select, false, ctx)
+    }
+
+    /// Apply a Create candidate (or the definition saved from one) now:
+    /// only at `revision`, and only if it places exactly the live items.
+    /// On `Err` nothing moved and nothing opened.
+    pub fn apply_candidate(
+        &mut self,
+        def: &LayoutDefinition,
+        select: bool,
+        revision: u64,
+        ctx: &egui::Context,
+    ) -> Result<LayoutApplied, LayoutApplyError> {
+        if revision != self.layout_rt.revision {
+            return Err(LayoutApplyError::Stale);
+        }
+        self.apply_reconciled(def, select, true, ctx)
+    }
+
+    /// Whether a candidate made at `revision` still applies cleanly to the
+    /// live windows, without applying it. Save & Apply checks this before
+    /// it writes anything.
+    pub(super) fn check_candidate(
+        &self,
+        def: &LayoutDefinition,
+        revision: u64,
+    ) -> Result<(), LayoutApplyError> {
+        let area = self.layout_area()?;
+        if revision != self.layout_rt.revision {
+            return Err(LayoutApplyError::Stale);
+        }
+        let (items, current) = self.capture_arrangement(area);
+        let rec = pl::reconcile(def, &current, &items).map_err(LayoutApplyError::Invalid)?;
+        strict(&rec)
+    }
+
+    /// Reconcile, open fresh items for fillable slots (never when
+    /// `strict_items`: then anything but an exact id match is `Stale`),
+    /// and move every `Tab` into the result.
+    fn apply_reconciled(
+        &mut self,
+        def: &LayoutDefinition,
+        select: bool,
+        strict_items: bool,
+        ctx: &egui::Context,
+    ) -> Result<LayoutApplied, LayoutApplyError> {
         let area = self.layout_area()?;
         let (items, current) = self.capture_arrangement(area);
         let rec = pl::reconcile(def, &current, &items).map_err(LayoutApplyError::Invalid)?;
+        if strict_items {
+            strict(&rec)?;
+        }
         let before = RevertPoint {
             items,
             arrangement: current,
@@ -306,7 +389,7 @@ impl WindowManager {
     }
 
     /// Preconditions shared by Apply and Revert; returns the area.
-    fn layout_area(&self) -> Result<egui::Vec2, LayoutApplyError> {
+    pub(super) fn layout_area(&self) -> Result<egui::Vec2, LayoutApplyError> {
         if self.desktop {
             return Err(LayoutApplyError::NotAProject);
         }
@@ -594,6 +677,7 @@ impl WindowManager {
         self.renaming = None;
         self.drag_from_tree = None;
         self.mark_workspace_dirty();
+        self.layout_rt.revision += 1;
         Ok(())
     }
 
@@ -643,6 +727,7 @@ impl WindowManager {
     /// A structural edit: set Modified on a selected layout and retire the
     /// revert point.
     fn note_structural_edit(&mut self) {
+        self.layout_rt.revision += 1;
         if matches!(self.layout_rt.revert, Revert::Ready(_)) {
             self.layout_rt.revert = Revert::Invalidated;
         }
@@ -653,6 +738,17 @@ impl WindowManager {
                 modified: true,
             });
         }
+    }
+}
+
+/// A candidate's reconciliation must match every item by id: nothing to
+/// open, no stand-ins, nothing set aside (visible or minimized), no slot
+/// left empty.
+fn strict(rec: &Reconciliation) -> Result<(), LayoutApplyError> {
+    if rec.is_exact() && rec.substituted.is_empty() && rec.kept_minimized.is_empty() {
+        Ok(())
+    } else {
+        Err(LayoutApplyError::Stale)
     }
 }
 
@@ -1717,6 +1813,85 @@ mod tests {
         assert!(text.contains("BEFORE_Windows_NT"), "grid kept:\n{text}");
     }
 
+    /// Create Layout's path end to end, minus the provider: the editor's
+    /// actions, a provider reply parsed against the inventory it was sent,
+    /// the strict Apply drained by a real `show` frame, then Revert.
+    /// Proven by Member id, root pid, and the shell answering.
+    #[test]
+    fn create_apply_and_revert_keep_live_sessions_usable_through_inspection() {
+        use super::super::layout_create::CreateAction;
+        use super::super::layout_picker::PickerAction;
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+            std::fs::read(p)
+        }));
+        cmd_settings(&ctx);
+        let library = tempfile::tempdir().unwrap();
+        let mut inner = project();
+        inner.layout_ui.store = Some(crate::layout_library::LayoutStore::at(library.path()));
+        let (t1, tab1) = inner.spawn_shell_tab(Shell::Cmd, &ctx).unwrap();
+        let (t2, tab2) = inner.spawn_shell_tab(Shell::Cmd, &ctx).unwrap();
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, AREA);
+        inner.push_win(t1, tab1, full);
+        inner.tile_new(t1, None);
+        inner.push_win(t2, tab2, full);
+        inner.tile_new(t2, Some(t1));
+        let mut desk = WindowManager::new().as_desktop();
+        desk.push_win(
+            1,
+            Tab::fixed("proj", Content::Project(Box::new(inner))),
+            full,
+        );
+        desk.focused = Some(1);
+        let frame = |desk: &mut WindowManager| {
+            let input = egui::RawInput {
+                screen_rect: Some(full),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                desk.show(ui, full, true, egui::Id::new("create-inspect"), false);
+            });
+        };
+        frame(&mut desk);
+        wait_for(&mut desk, &ctx, t1, ">");
+        send_line(&mut desk, &ctx, t1, "echo BEFORE_%OS%");
+        wait_for(&mut desk, &ctx, t1, "BEFORE_Windows_NT");
+        let before = sessions(&mut desk);
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|s| s.2.is_some()));
+
+        let p = child(&mut desk);
+        p.run_layout_action(PickerAction::OpenCreate, &ctx);
+        p.layout_ui.create.as_mut().unwrap().description = "both terminals in one stack".into();
+        p.run_layout_action(PickerAction::Create(CreateAction::Run), &ctx);
+        p.answer_create_for_test(&serde_json::json!({
+            "message": "One stack, second terminal in front.",
+            "windows": [{"tabs": [2, 1], "place": "tiled"}],
+            "tree": {"window": 0}
+        }));
+        frame(&mut desk); // the editor polls the reply
+        let p = child(&mut desk);
+        assert!(p.layout_ui.create.as_ref().unwrap().candidate.is_some());
+        assert_eq!(p.windows.len(), 2, "nothing moved before Apply");
+        p.run_layout_action(PickerAction::Create(CreateAction::Apply), &ctx);
+        frame(&mut desk); // the deferred boundary runs the Apply
+        let p = child(&mut desk);
+        assert_eq!(p.windows.len(), 1, "one stack");
+        assert_eq!(p.layout, LayoutSelection::default(), "Custom");
+        assert_eq!(sessions(&mut desk), before, "same Sessions after Apply");
+        send_line(&mut desk, &ctx, t1, "echo STACKED_%OS%");
+        wait_for(&mut desk, &ctx, t1, "STACKED_Windows_NT");
+
+        child(&mut desk).run_layout_action(PickerAction::Revert, &ctx);
+        frame(&mut desk);
+        assert_eq!(child(&mut desk).windows.len(), 2, "reverted to the split");
+        assert_eq!(sessions(&mut desk), before, "same Sessions after Revert");
+        send_line(&mut desk, &ctx, t2, "echo REVERTED_%OS%");
+        wait_for(&mut desk, &ctx, t2, "REVERTED_Windows_NT");
+        let text = snapshot_text(&mut desk, &ctx, t1);
+        assert!(text.contains("BEFORE_Windows_NT"), "grid kept:\n{text}");
+    }
+
     #[test]
     fn a_failed_open_omits_its_slot_and_is_reported_without_aborting() {
         let ctx = egui::Context::default();
@@ -1891,7 +2066,7 @@ mod tests {
 
         child.last_area = AREA;
         child.drain_layout_request(&ctx);
-        child.poll_layout_outcome();
+        child.poll_layout_outcome(0.0);
 
         // The first terminal took the first terminal slot (the left leaf);
         // the second terminal, Chat, and Board opened fresh; the Image slot

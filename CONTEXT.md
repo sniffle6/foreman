@@ -73,6 +73,14 @@ named arrangement is a layout definition; fitting one to the current inventory
 is reconciliation.
 _Avoid_: preset, template, workspace (that is the cold desktop snapshot).
 
+**Layout candidate**:
+The one arrangement a Create Layout request proposes for the open windows.
+It places every current layout item exactly once and adds none, and it is
+valid only at the arrangement revision it was made at. Apply uses it as is;
+Save & Apply turns it into a layout definition.
+_Avoid_: draft, suggestion. (In the integration queue "candidate" is avoided
+for the Prepared commit; here it is the spec's word.)
+
 ### Terminal
 
 **Session**:

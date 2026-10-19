@@ -7,8 +7,8 @@ product contract):
 This doc tracks what has shipped. Status: **model, identity,
 reconciliation (fill missing slots), the saved-layout library on disk, live
 Apply / Revert with the Modified flag, the Project-header picker with Save,
-and the New Project layout** (the manual-layout milestone). Not yet: Create
-Layout… (the promptable Create wave of the `project-layouts` plan).
+the New Project layout, and Create Layout…** (single-shot, provider
+proposed). Every wave of the `project-layouts` plan has landed.
 
 ## What exists
 
@@ -317,8 +317,8 @@ Rename…, Delete…. Below: **Save** (its hint says
 whether it updates a layout or asks for a name), **Save As…**, and **Revert
 Layout** once an Apply has happened (shown disabled, with the reason, after
 an edit retired the revert point). An empty library says layouts are saved
-for this Project. There is no Create Layout… yet; it belongs to a later
-wave, and an inert entry would only mislead.
+for this Project. **Create Layout…** sits between the list and Save (see
+below).
 
 The diagram is drawn from arrangement data only (`diagram_cells`): tiled
 windows by tree and ratios, floating ones outlined on top, minimized ones
@@ -443,9 +443,111 @@ Gotchas:
 - The summary sits over the top-right of the Project, often on the
   Additional windows header. Dismiss it with ✕.
 
-## Not yet built
+### Create Layout… (`src/wm/layout_create.rs`, `src/layout_prompt.rs`)
 
-- Create Layout… and the provider boundary (promptable Create wave).
+**What.** Describe an arrangement in words; one provider call proposes one
+**candidate** for the windows that are open; you Apply it, Save & Apply it,
+or Cancel. Single-shot: no conversation. To change it, edit the
+description and press **run again**; the new candidate replaces the old.
+
+**Where.** Layout ▾ → **Create Layout…** opens an editor centered on the
+Project. It shows: what is sent and to whom ("Sent to Codex (Settings:
+session-title provider): your description and the window labels below"),
+the list of windows with their icons, labels, and kinds, the description
+box, **run** (Ctrl+Enter), and once a reply is in, the provider's one-line
+message and a diagram of the candidate with each window's icon and label
+(stacked tabs listed under the active one, minimized windows listed below
+the diagram). Then **cancel**, **apply**, **save & apply…**.
+
+**What the provider gets** (`Inventory::wire_json`), and nothing else:
+
+```json
+{"area": {"w": 1200, "h": 800},
+ "items": [{"id": 1, "kind": "terminal", "label": "claude: auth refactor"}, …],
+ "windows": [{"place": "tiled", "tabs": [1]}, {"place": "minimized", "tabs": [4]}, …]}
+```
+
+plus the description as one JSON string. Ids are 1..n, never real layout
+ids. Labels are tab titles with control characters removed, cut to 60
+characters. No terminal output, chat, files, image bytes, or other
+Projects. The rules ride as the system prompt (Codex: prepended), the data
+after them. The run goes through `ai_oneshot` (no tools, scrubbed env,
+scratch dir `%APPDATA%\foreman\layout-create`), 60 s deadline, 32 KB reply
+cap, a 48 KB request cap, and at most `MAX_IN_FLIGHT` (2) runs alive across
+the app. The provider and model are the session-title ones, the same as
+commit-message drafting.
+
+**What the provider may return** (`parse_reply`, strict):
+
+- `{"message", "windows": [{"tabs", "active"?, "place", "rect"?}], "tree"?}`
+  where `place` is tiled / floating / minimized and the tree is
+  `{"window": i}` or `{"split": "row"|"column", "sizes", "children"}`; or
+- `{"message", "missing": [kinds]}` when the description needs Content that
+  is not open. The editor says what to open ("This needs windows that are
+  not open: Chat. Open them, then run again.") and shows the provider's
+  message. Nothing is opened for it, ever.
+
+Unknown fields anywhere, an unknown or repeated id, an omitted item, a rect
+on a tiled window or none on a floating one, rect values outside 0..1,
+non-finite or non-positive sizes, a tree deeper than `MAX_TREE_DEPTH`, and
+markdown fences are all errors. The arrangement then goes through the same
+`validate` as a saved layout, against exactly the inventory. So a candidate
+can only move what exists. Unlike a saved layout it never fills missing
+slots.
+
+**Staleness.** Each manager keeps an arrangement **revision**
+(`layout_revision`). The edit watch bumps it on every structural edit, and
+every Apply and Revert bumps it. A request and its candidate remember the
+revision they started at. Each frame the editor is open, a mismatch drops
+them and shows "Windows changed — run again". A resize does not bump it:
+the candidate's geometry is normalized and gets refit at Apply.
+
+**Supersede and cancel.** One request per Project instance. Run again drops
+the old receiver, so its reply has nowhere to land, and clears the
+candidate at once. Closing the editor (Cancel, Escape, opening the menu,
+the header's Save / Save As), switching away from the Project (focus
+leaves it, it is minimized or a background tab, its header gets too narrow
+for the layout controls), or closing it drops the editor and its request.
+Nothing resumes: reopening starts empty. A click elsewhere in the same
+Project does not close the editor, because a request may still be running.
+While open it owns the keyboard like the other dialogs: Escape backs out of
+the name row, then cancels; Enter submits only from the name field;
+Ctrl+Enter runs, except while a name is being typed.
+
+Dropping a request does not kill the provider: the CLI runs until it
+answers or hits the 60 s deadline, holding one of the `MAX_IN_FLIGHT`
+slots. A run that finds both slots taken says so and keeps the candidate
+it already has (the slot is taken before anything is cleared).
+
+**Apply** checks the candidate against the live windows now
+(`check_candidate`: same revision, reconciles to an exact id match), then
+queues `LayoutRequest::Candidate { select: false }`. The drain re-checks
+the revision and runs the normal Apply in **strict** form: anything but an
+exact id match (something to open, a stand-in, an extra, an empty slot) is
+`LayoutApplyError::Stale` and nothing moves. The picker shows Custom; the
+revert point is set; a short "Applied. It stays Custom until you save it."
+
+**Save & Apply…** asks for a name in the editor. On submit it checks the
+candidate (stale → dropped, nothing written), then writes it with
+`LayoutStore::create`, and only after `Ok` queues the strict Apply with
+`select: true`. A duplicate name offers **replace & apply**; any other
+write failure shows the error and keeps the editor, the candidate, and the
+windows as they were. If the windows change in the gap between the write
+and the next frame, the Apply refuses and the notice says the layout was
+saved and can be chosen from Layout ▾.
+
+Gotchas:
+
+- The tests never spawn a provider. In test builds the request stores its
+  sender on the editor (`test_tx`), so a test can answer late, answer a
+  superseded request, or drop the worker. `generate` itself is only run by
+  hand (screenshots of a real Codex reply are the evidence).
+- Grok takes its prompt on argv, so a Grok reached only through a `.cmd`
+  shim refuses the JSON prompt (see `docs/ai-oneshot.md`).
+- The revision misses an edit made in the very frame the Project resized
+  (the watch re-measures instead of comparing). The strict Apply still
+  refuses any inventory change, so the worst case is a regroup the
+  candidate did not see being rearranged, never a window opened or lost.
 
 ## Key files
 
@@ -455,12 +557,18 @@ Gotchas:
   `project_key`, `resolve_selection`, and their tests
 - `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
   and atomic write the library rides on
-- `src/wm/layouts.rs` — Apply, Revert, the `NewProject` request,
+- `src/wm/layouts.rs` — Apply, Revert, the `NewProject` and strict
+  `Candidate` requests, the arrangement revision,
   `rearrange`, `capture_arrangement`,
   the Modified edit watch, and their manager tests (including real-shell
   tests that drive Sessions through `send` / `snapshot` across Apply and
   Revert, directly and through the picker, and a `show`-level test of the
   drain and end-of-frame watch hooks)
+- `src/layout_prompt.rs` — Create's provider boundary: `Inventory` (what
+  is sent), `build_prompt`, the strict `parse_reply`, `generate`, the
+  in-flight cap, and their tests
+- `src/wm/layout_create.rs` — the Create editor: request, supersede, stale
+  checks, Apply / Save & Apply, the labeled preview, and their tests
 - `src/wm/layout_picker.rs` — the header picker, menu, dialogs, summary,
   `PickerAction` / `run_layout_action`, `summary_lines`, `diagram_cells`,
   `queue_new_project_layout`, and their tests (including real-frame clicks

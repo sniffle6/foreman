@@ -19,7 +19,7 @@ use crate::project_layout::{
 };
 
 /// How long "Saved …" stays up.
-const SAVED_NOTICE_SECS: f64 = 2.5;
+pub(super) const SAVED_NOTICE_SECS: f64 = 2.5;
 const MENU_W: f32 = 292.0;
 const NOTICE_W: f32 = 300.0;
 
@@ -31,11 +31,13 @@ pub(super) struct PickerUi {
     /// The New Project layout as last read with the library, to mark the
     /// row it was copied from while the two still match.
     new_project: Option<LayoutDefinition>,
-    menu_open: bool,
-    dialog: Option<Dialog>,
+    pub(super) menu_open: bool,
+    pub(super) dialog: Option<Dialog>,
     pub(super) notice: Option<Notice>,
+    /// The Create Layout… editor, while open.
+    pub(super) create: Option<super::layout_create::CreateEditor>,
     /// What the queued request was, to title its outcome.
-    requested: Option<Requested>,
+    pub(super) requested: Option<Requested>,
     /// Test seam: the store to use instead of the user's.
     #[cfg(test)]
     pub(super) store: Option<LayoutStore>,
@@ -46,14 +48,16 @@ impl PickerUi {
     /// field): this Project's terminals and the leader must not read keys
     /// meant for it.
     pub(super) fn captures_keyboard(&self) -> bool {
-        self.dialog.is_some() || self.menu_open
+        self.dialog.is_some() || self.menu_open || self.create.is_some()
     }
 }
 
-enum Requested {
+pub(super) enum Requested {
     Apply { name: String },
     Revert,
     NewProject { name: String },
+    /// A Create candidate; `saved` names the definition Save & Apply wrote.
+    Create { saved: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,6 +118,10 @@ pub(super) enum PickerAction {
     Delete(String),
     /// Copy a saved layout into the New Project slot.
     UseForNewProjects(String),
+    /// Open the Create Layout… editor.
+    OpenCreate,
+    /// A control inside the Create editor.
+    Create(super::layout_create::CreateAction),
     Revert,
     /// The dialog's primary button: save, rename, replace, or delete.
     Submit,
@@ -212,9 +220,12 @@ impl WindowManager {
 
     /// Close the menu and cancel any dialog, changing nothing: the Project
     /// lost focus or is not drawn this frame.
+    /// The Create editor goes too, and with it any pending request:
+    /// nothing resumes.
     pub(super) fn close_layout_popups(&mut self) {
         self.layout_ui.menu_open = false;
         self.layout_ui.dialog = None;
+        self.layout_ui.create = None;
     }
 
     /// Run one picker action. `ctx` supplies the clock and repaints.
@@ -233,6 +244,7 @@ impl WindowManager {
                     self.refresh_layouts();
                     self.layout_ui.notice = None;
                     self.layout_ui.dialog = None;
+                    self.layout_ui.create = None;
                 }
             }
             PickerAction::CloseMenu => self.layout_ui.menu_open = false,
@@ -293,6 +305,9 @@ impl WindowManager {
             }
             PickerAction::Save => {
                 self.layout_ui.menu_open = false;
+                // One popup at a time: Save's name dialog cannot draw
+                // under the Create editor.
+                self.layout_ui.create = None;
                 if self.layout_ui.library.is_none() {
                     self.refresh_layouts();
                 }
@@ -306,6 +321,7 @@ impl WindowManager {
             }
             PickerAction::SaveAs => {
                 self.layout_ui.menu_open = false;
+                self.layout_ui.create = None;
                 let suggested = self
                     .selected_layout()
                     .map(|d| format!("{} copy", d.name))
@@ -341,6 +357,8 @@ impl WindowManager {
                     error: None,
                 });
             }
+            PickerAction::OpenCreate => self.open_create_editor(),
+            PickerAction::Create(action) => self.run_create_action(action, &dir, ctx),
             PickerAction::Submit => self.submit_dialog(&dir, now),
             PickerAction::Cancel => self.layout_ui.dialog = None,
             PickerAction::EditName => {
@@ -513,11 +531,19 @@ impl WindowManager {
     }
 
     /// Turn the last processed request into the summary or an error.
-    pub(super) fn poll_layout_outcome(&mut self) {
+    pub(super) fn poll_layout_outcome(&mut self, now: f64) {
         let Some(outcome) = self.take_layout_outcome() else {
             return;
         };
         let requested = self.layout_ui.requested.take();
+        if let Some(Requested::Create { saved }) = requested {
+            self.layout_ui.notice = Some(Self::create_outcome_notice(
+                saved,
+                outcome.map(|_| ()),
+                now,
+            ));
+            return;
+        }
         self.layout_ui.notice = match outcome {
             Ok(applied) if applied.is_exact() => None,
             Ok(applied) => {
@@ -529,6 +555,7 @@ impl WindowManager {
                     Some(Requested::NewProject { name }) => {
                         format!("Opened with \u{201c}{name}\u{201d}, with changes")
                     }
+                    Some(Requested::Create { .. }) => unreachable!("handled above"),
                     None => "Layout applied with changes".to_string(),
                 };
                 let lines = summary_lines(&applied, |id| self.layout_item_title(id));
@@ -538,7 +565,7 @@ impl WindowManager {
         };
     }
 
-    fn layout_item_title(&self, id: LayoutItemId) -> Option<String> {
+    pub(super) fn layout_item_title(&self, id: LayoutItemId) -> Option<String> {
         self.windows
             .iter()
             .flat_map(|w| w.tabs.iter())
@@ -561,7 +588,7 @@ impl WindowManager {
     ) -> bool {
         let th = crate::theme::live(ui.ctx());
         let now = ui.input(|i| i.time);
-        self.poll_layout_outcome();
+        self.poll_layout_outcome(now);
         if self.layout_ui.library.is_none() && self.layout_project_dir().is_some() {
             self.refresh_layouts();
         }
@@ -708,7 +735,9 @@ impl WindowManager {
         if self.layout_ui.menu_open {
             self.show_layout_menu(ui, &th, ctl, screen, id, &mut actions);
         }
-        if self.layout_ui.dialog.is_some() {
+        if self.layout_ui.create.is_some() {
+            self.show_create_editor(ui, &th, project, screen, id, &mut actions);
+        } else if self.layout_ui.dialog.is_some() {
             self.show_layout_dialog(ui, &th, project, id, &mut actions);
         } else if !self.layout_ui.menu_open && self.layout_ui.notice.is_some() {
             self.show_layout_notice(ui, &th, ctl, screen, id, &mut actions);
@@ -914,6 +943,21 @@ impl WindowManager {
                             }
                         }
                         divider(mui, th);
+                        if menu_item(
+                            mui,
+                            th,
+                            menu_id.with("create"),
+                            "Create Layout\u{2026}",
+                            Some("describe it"),
+                            true,
+                        )
+                        .on_hover_text(
+                            "Describe an arrangement of this Project's windows; a provider proposes it",
+                        )
+                        .clicked()
+                        {
+                            actions.push(PickerAction::OpenCreate);
+                        }
                         let save_hint = self
                             .selected_layout()
                             .map(|d| format!("updates \u{201c}{}\u{201d}", d.name))
@@ -1223,17 +1267,7 @@ impl WindowManager {
 
 /// A user-facing name for a Content kind.
 pub(super) fn kind_label(kind: ItemKind) -> &'static str {
-    match kind {
-        ItemKind::Terminal => "Terminal",
-        ItemKind::Chat => "Chat",
-        ItemKind::Board => "Board",
-        ItemKind::Plan => "Plan",
-        ItemKind::GitHistory => "Git history",
-        ItemKind::GitChanges => "Git changes",
-        ItemKind::GitDiff => "Git diff",
-        ItemKind::Image => "Image",
-        ItemKind::Project => "Project",
-    }
+    crate::layout_prompt::kind_name(kind)
 }
 
 /// Up to four names, then "+N more".
@@ -1320,6 +1354,8 @@ pub(super) fn summary_lines(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct DiagramCell {
     pub(super) rect: egui::Rect,
+    /// Index into the definition's windows.
+    pub(super) window: usize,
     pub(super) floating: bool,
     /// The kind of the stack's active tab.
     pub(super) kind: Option<ItemKind>,
@@ -1384,6 +1420,7 @@ pub(super) fn diagram_cells(def: &LayoutDefinition, rect: egui::Rect) -> Vec<Dia
     for (window, r) in tiled {
         cells.push(DiagramCell {
             rect: r.shrink(0.5),
+            window,
             floating: false,
             kind: kind_of(window),
         });
@@ -1399,6 +1436,7 @@ pub(super) fn diagram_cells(def: &LayoutDefinition, rect: egui::Rect) -> Vec<Dia
                     egui::pos2(rect.min.x + local.x, rect.min.y + local.y),
                     egui::vec2(local.w, local.h),
                 ),
+                window,
                 floating: true,
                 kind: kind_of(window),
             });
@@ -1453,7 +1491,7 @@ fn paint_diagram(
     }
 }
 
-fn kind_glyph(kind: ItemKind) -> &'static str {
+pub(super) fn kind_glyph(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::Terminal => ">",
         ItemKind::Chat => "C",
@@ -2330,7 +2368,7 @@ mod tests {
         // Nothing moved yet: the request runs at the next frame's boundary.
         assert_eq!(wm.layout.selected, None);
         wm.drain_layout_request(&ctx);
-        wm.poll_layout_outcome();
+        wm.poll_layout_outcome(0.0);
 
         assert_eq!(wm.layout.selected.as_deref(), Some(def.id.as_str()));
         assert!(wm.layout.modified, "an extra went to Additional windows");
@@ -2348,7 +2386,7 @@ mod tests {
         act(&mut wm, PickerAction::Revert);
         assert_eq!(wm.layout_ui.notice, None);
         wm.drain_layout_request(&ctx);
-        wm.poll_layout_outcome();
+        wm.poll_layout_outcome(0.0);
         assert_eq!(wm.layout, LayoutSelection::default(), "selection restored");
         assert_eq!(wm.layout_ui.notice, None, "an exact Revert says nothing");
         assert_eq!(wm.windows.len(), 2);
@@ -2366,7 +2404,7 @@ mod tests {
         act(&mut wm, PickerAction::ToggleMenu);
         act(&mut wm, PickerAction::Apply(id));
         wm.drain_layout_request(&ctx);
-        wm.poll_layout_outcome();
+        wm.poll_layout_outcome(0.0);
         assert_eq!(wm.layout_ui.notice, None);
         assert!(!wm.layout.modified);
 
