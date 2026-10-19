@@ -4,11 +4,6 @@
   "title": "Define project layout model and item identity",
   "body": "Build the GUI-free arrangement model, validation, deterministic reconciliation, and persistent per-Content layout identity. Preserve identities across tab moves and cold restore without changing Member or Control-plane ids.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md\nBlocked by: None\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Mixed Content, tabs, tiling, floating/minimized restore state, normalized geometry, and stable matching follow the spec.\n- Missing/same-kind substitutes/extras reconcile deterministically; every current item survives exactly once.\n- Validation rejects malformed, oversized, duplicate, unknown, or non-finite arrangements. Tests witness failures before implementation.\n- Keep visibility narrow and preserve existing workspace compatibility; no picker or provider implementation in this card.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
   "state": "done",
-  "worktree": {
-    "path": "C:/code/Crazy Projects Go Brrr/foreman/.foreman/worktrees/w1tuaj",
-    "branch": "card/w1tuaj",
-    "base": "docs/project-layouts"
-  },
   "shipped": {
     "name": "v0.7.7",
     "at": "2026-10-19T17:50:37Z",
@@ -21,5 +16,5 @@
     "wave": 1
   },
   "created": "2026-10-16T14:15:54Z",
-  "updated": "2026-10-19T17:50:37Z"
+  "updated": "2026-10-19T19:09:58Z"
 }
