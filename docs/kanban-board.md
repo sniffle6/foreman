@@ -14,7 +14,10 @@ sibling — read those for *why*, this doc for *how*.
   and (while claimed) a claim linking the card to the Session working it.
 - **Dispatch from a card**: Start on a Backlog or Blocked card offers an agent
   picker. Picking one spawns a new Session in the
-  project cwd whose prompt embeds the card body, a `# Final report` section
+  project cwd whose prompt embeds the card body, a `# Chat` section (posts
+  that target the worker steer the card; it never acknowledges, and posts only
+  when another member must act — each delivery costs a full turn), a
+  `# Final report` section
   (end on four labeled lines — Landed, Follow-ups, Plan impact, Decisions —
   that an orchestrator reads from the pane tail before closing it), and the
   exact close-out commands, then claims the card and moves it to In Progress in the same

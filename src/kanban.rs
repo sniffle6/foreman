@@ -1701,6 +1701,17 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
             root = wt.root().display(),
         ));
     }
+    let cli = match style {
+        CloseoutStyle::Path => "foreman",
+        CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
+    };
+    // Every delivered post costs the receiver a full turn, so a card worker
+    // is told not to spend one on an acknowledgement (docs/chat-delivery.md).
+    out.push_str(&format!(
+        "# Chat\n\
+         Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    {cli} chat --to tX \"<message>\"\n\
+         \n",
+    ));
     // An orchestrator reviews a finished worker by reading the tail of its
     // pane, then closes it (foreman-kanban skill, orchestrating-plans.md):
     // fixed labels let it act on the board without reading the transcript.
@@ -1720,10 +1731,6 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         "End every commit message with the trailer line:    Card: {id}\n",
         id = card.id
     ));
-    let cli = match style {
-        CloseoutStyle::Path => "foreman",
-        CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
-    };
     if let Some(wt) = &card.worktree
         && wt.in_place
     {
@@ -3231,6 +3238,9 @@ mod tests {
              \n\
              Resize flickers on Up-arrow.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
              Landed: what you shipped.\n\
@@ -3257,6 +3267,9 @@ mod tests {
              # Task: Fix resize flicker\n\
              \n\
              \n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
              \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
@@ -3285,6 +3298,9 @@ mod tests {
              \n\
              Resize flickers on Up-arrow.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    & $env:FOREMAN_EXE chat --to tX \"<message>\"\n\
+             \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
              Landed: what you shipped.\n\
@@ -3312,6 +3328,9 @@ mod tests {
              # Task: Fix resize flicker\n\
              \n\
              \n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    & $env:FOREMAN_EXE chat --to tX \"<message>\"\n\
              \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
@@ -3347,6 +3366,9 @@ mod tests {
              A previous worker blocked this card: needs a design decision\n\
              Its work is still here: run git log and git status first and read what it left. Check whether the blocker still applies; if it does and you cannot resolve it, block again with the reason.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
              Landed: what you shipped.\n\
@@ -3378,6 +3400,9 @@ mod tests {
              # Previous attempt\n\
              A previous worker on this card ended without closing it out; its terminal is gone.\n\
              Whatever it finished is still here: run git log and git status first and continue from there instead of starting over.\n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
              \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
@@ -4419,6 +4444,9 @@ mod tests {
              You are in a git worktree at H:/repo/.foreman/worktrees/a3f8k2, on branch card/a3f8k2, based on main.\n\
              The main checkout at H:/repo is shared with other workers: never edit files there.\n\
              Leave .foreman/ untouched and never stage it.\n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
              \n\
              # Final report\n\
              Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\

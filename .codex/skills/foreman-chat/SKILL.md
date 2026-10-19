@@ -19,6 +19,11 @@ every line carries a `tN` terminal id.
 full agent turn. Broadcast only when every member must act; otherwise use
 `--to tN` or a leading `@tN`.
 
+**Say only what is new.** The receiver already has its own prompt, card,
+and repo. Never restate them, relay what it can read itself, or post an
+acknowledgement. Put everything for one receiver into one post, and send it
+only when it changes what that receiver does next.
+
 ## Post / Read / Target
 
 PowerShell:

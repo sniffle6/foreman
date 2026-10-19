@@ -131,7 +131,8 @@ criteria, and gate commands.
 
 Card workers are in the project chat room but hear only posts that target
 them (`chat --to tN` or a leading `@tN`); broadcasts never wake them. Steer
-one with a targeted post.
+one with a targeted post. A steer carries only what the card does not
+already say (orchestrating-plans.md, "Steering a running worker").
 
 ## Orchestrating a plan
 

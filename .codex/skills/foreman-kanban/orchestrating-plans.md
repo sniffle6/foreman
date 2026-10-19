@@ -145,6 +145,24 @@ need the blocked card's work.
 - `held by live Session`, `integration is …`, not Backlog, cmd-shim: a real
   refusal. Report it. Do not retry blindly and do not fall back to `open`.
 
+## Steering a running worker
+
+A worker's card is its whole brief, and every post costs it a full turn.
+Put scope, file ownership, and constraints in the card body before
+dispatch, not in chat. Then:
+
+- Post to a worker only when something changes what it must do next: a new
+  owner, a changed plan, a decision it is waiting on.
+- Never restate its card, the plan, or rules it already has. Never relay
+  what it can read itself (the board, the repo, `chat --history`); name
+  where it lives instead.
+- One post per worker per change. Fold related decisions into it; do not
+  follow up to refine the last post.
+- Do not invent a coordination protocol (leases, grants, release notices)
+  on top of the cards. If two cards touch the same file, fix it on the
+  board before dispatch: re-wave one, or give the file to one card's body.
+- Expect no acknowledgement. Silence means the worker is working.
+
 ## A worker that never comes back
 
 A worker stuck on a permission prompt looks exactly like a working one —

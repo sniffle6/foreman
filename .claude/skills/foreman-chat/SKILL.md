@@ -18,6 +18,11 @@ posts through the project's chat window.
 full agent turn. Broadcast only when every member must act; otherwise use
 `--to tX` or a leading `@tX`.
 
+**Say only what is new.** The receiver already has its own prompt, card,
+and repo. Never restate them, relay what it can read itself, or post an
+acknowledgement. Put everything for one receiver into one post, and send it
+only when it changes what that receiver does next.
+
 ## Recipe: post / read / target
 
     & $env:FOREMAN_EXE chat "claiming src/wm.rs"          # broadcast post
