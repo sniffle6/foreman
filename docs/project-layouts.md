@@ -6,9 +6,9 @@ product contract):
 
 This doc tracks what has shipped. Status: **model, identity,
 reconciliation (fill missing slots), the saved-layout library on disk, live
-Apply / Revert with the Modified flag, and the Project-header picker with
-Save**. Not yet: the New Project layout and Create Layout… (later cards of
-the `project-layouts` plan).
+Apply / Revert with the Modified flag, the Project-header picker with Save,
+and the New Project layout** (the manual-layout milestone). Not yet: Create
+Layout… (the promptable Create wave of the `project-layouts` plan).
 
 ## What exists
 
@@ -312,12 +312,13 @@ after it means Modified.
 
 **The menu** says "Layouts for this Project", then one row per saved layout:
 a small diagram, the name, a check on the selected one, a "Modified" tag on
-it when set, and Rename… / Delete… icons. Below: **Save** (its hint says
+it when set, and three icons: Use for new Projects (a window with a plus),
+Rename…, Delete…. Below: **Save** (its hint says
 whether it updates a layout or asks for a name), **Save As…**, and **Revert
 Layout** once an Apply has happened (shown disabled, with the reason, after
 an edit retired the revert point). An empty library says layouts are saved
-for this Project. There is no Create Layout… and no Use for new Projects
-yet; those belong to later waves, and an inert entry would only mislead.
+for this Project. There is no Create Layout… yet; it belongs to a later
+wave, and an inert entry would only mislead.
 
 The diagram is drawn from arrangement data only (`diagram_cells`): tiled
 windows by tree and ratios, floating ones outlined on top, minimized ones
@@ -349,6 +350,63 @@ filled, and which opens failed (with the error, not shortened). It has a
 
 Success is reported (a short "Saved …" note) only after the write returned
 `Ok`.
+
+### The New Project layout
+
+**What.** One global slot in `project-layouts.json` (`new_project`). When
+it is set, a Project opened from a directory starts with that arrangement
+instead of one terminal. Unset (the default, shown as **Single terminal**)
+is exactly the old behavior.
+
+**Set it** from any Project's Layout menu: the window-with-a-plus icon on a
+saved layout's row (**Use for new Projects**). The icon turns amber on the
+row the slot still matches. **See and reset it** in Settings → Window
+Manager → New Project layout: the value is the layout's name or Single
+terminal, and **Reset** writes Single terminal back. Both go through
+`set_new_project_layout`, so they re-read, change only the slot, and write.
+
+**It is a copy.** Setting it copies the whole definition into the slot.
+Saving over, renaming, or deleting the source layout later leaves the slot
+as it was (and the source row loses its amber mark once they differ). There
+is no global library beyond this one slot.
+
+**What opening does.** `add_project` and `add_project_with_command` (the
+directory picker, the landing page, the startup auto-project when there is
+no workspace to restore) spawn the first terminal as before, then
+`queue_new_project_layout` reads the slot once and queues
+`LayoutRequest::NewProject` on the new Project. Its first frame runs the
+normal Apply: Filling missing slots, so the first terminal takes the first
+terminal slot (a commanded agent terminal included), fillable slots open a
+plain shell or view, and target kinds (Image, GitDiff, Project) stay empty.
+Then, unlike a picker Apply:
+
+- the picker shows **Custom** (the directory's library does not hold the
+  slot, even when it was copied from that directory);
+- there is no revert point: the lone terminal it replaced was never on
+  screen;
+- a Project not yet laid out, or a dialog open, makes it wait for a later
+  frame instead of failing.
+
+A non-exact result shows the usual summary, titled "Opened with “name”,
+with changes".
+
+**Startup restore never applies it.** `apply_workspace` rebuilds Projects
+from the snapshot and never calls `add_project`.
+
+Gotchas:
+
+- The slot's item ids are renumbered (`detach_ids`) before reconcile.
+  They were minted in another Project, often another launch, and ids
+  restart at 1 each launch, so the new terminal could share an id with a
+  later slot and be pinned there by exact match. With no exact matches,
+  slots fill by kind in order.
+- An unreadable slot (future version, I/O error) opens one terminal and
+  toasts why. A malformed file goes through the shared recovery like any
+  library read.
+- Settings reads the slot when the pane is drawn first, when a pane is
+  selected, and when the Settings window becomes active again, never per
+  frame. So a slot set from a picker while Settings sits open shows up the
+  next time you click into Settings.
 
 **Disk.** `LayoutStore` re-reads the file on every call, so the picker keeps
 a copy: read once when the header first draws (the label needs the name),
@@ -387,8 +445,6 @@ Gotchas:
 
 ## Not yet built
 
-- Opening a new Project with `new_project_layout()`, and **Use for new
-  Projects** in the menu (New Project wave).
 - Create Layout… and the provider boundary (promptable Create wave).
 
 ## Key files
@@ -399,15 +455,19 @@ Gotchas:
   `project_key`, `resolve_selection`, and their tests
 - `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
   and atomic write the library rides on
-- `src/wm/layouts.rs` — Apply, Revert, `rearrange`, `capture_arrangement`,
+- `src/wm/layouts.rs` — Apply, Revert, the `NewProject` request,
+  `rearrange`, `capture_arrangement`,
   the Modified edit watch, and their manager tests (including real-shell
   tests that drive Sessions through `send` / `snapshot` across Apply and
   Revert, directly and through the picker, and a `show`-level test of the
   drain and end-of-frame watch hooks)
 - `src/wm/layout_picker.rs` — the header picker, menu, dialogs, summary,
   `PickerAction` / `run_layout_action`, `summary_lines`, `diagram_cells`,
-  and their tests (including real-frame clicks on the header buttons)
-- `src/wm.rs` — `Tab::layout_id`, `Content::layout_kind`,
+  `queue_new_project_layout`, and their tests (including real-frame clicks
+  on the header buttons)
+- `src/settings_menu.rs` — the New Project layout row (value + Reset)
+- `src/wm.rs` — `add_project` / `add_project_with_command` queueing the New
+  Project layout; `Tab::layout_id`, `Content::layout_kind`,
   `WindowManager::layout_inventory`, the `layout` selection field, and
   capture/restore of both; `spawn_shell_tab` and `view_tab`, the open paths
   Apply shares; the `show` hooks; `header_layout` placing the picker and

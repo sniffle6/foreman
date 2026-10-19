@@ -46,7 +46,7 @@ on purpose — a user slider on those creates support tickets, not value).
 | Appearance | The live theme editor and theme-expert chat beside a preview (see `docs/theme-system.md`): preset chips + Duplicate / Reload / Delete / Folder; every colour token in grouped rows with its JSON key; the 16 ANSI swatches and chat member colours; font size. Chat proposals apply only through a card's Apply chip. Editing the built-in "Foreman Warm" forks an editable copy; hand edits to the theme file apply live |
 | Terminal | Default shell (PowerShell); scrollback lines (10 000); scroll speed (3 lines/notch); zoom step (1.0 pt); copy on select (off); warn on multi-line paste (on) |
 | Bell & Alerts | Bell master switch (on); pulse speed (1.2 s); toast duration (6 s) |
-| Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off) |
+| Window Manager | New terminals float (off); focus follows mouse (off); dim unfocused panes (off); New Project layout (Single terminal; shown and reset here, set from a Project's Layout menu, stored in `project-layouts.json` — see `docs/project-layouts.md`) |
 | Keybindings | The keybindings editor, inline — leader, per-command chords, conflicts, reset-one / reset-all |
 | Agents | Install skills on launch (on); automatic Session naming (off); naming provider (Codex); naming model (`gpt-5.6-luna`, blank = provider default); crew stale after (5 min); send settle default (120 ms) |
 | Startup & Updates | Restore workspace (on); default project directory (blank = old behavior); update check on launch (on); Check now; open settings folder; version |

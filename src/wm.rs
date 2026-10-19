@@ -1517,7 +1517,9 @@ impl WindowManager {
         }
     }
 
-    /// Add a new project window. It starts as a sandbox containing one terminal.
+    /// Add a new project window. It starts as a sandbox containing one
+    /// terminal, laid out on its first frame by the New Project layout when
+    /// one is set (`docs/project-layouts.md`).
     /// TODO(status line): show repo / branch on the project titlebar.
     pub fn add_project(&mut self, shell: Shell, cwd: PathBuf, ctx: &egui::Context) -> WinId {
         self.opened.push((cwd.clone(), None));
@@ -1535,6 +1537,9 @@ impl WindowManager {
         if let Some(tid) = child.spawn_terminal_win(shell, ctx) {
             child.tile_new(tid, None);
         }
+        // That terminal then takes the New Project layout's first terminal
+        // slot, if one is set. Restore never comes through here.
+        self.queue_new_project_layout(&mut child, ctx);
         self.push_win(
             id,
             Tab::fixed(title, Content::Project(Box::new(child))),
@@ -1583,6 +1588,7 @@ impl WindowManager {
                 }
             }
         }
+        self.queue_new_project_layout(&mut child, ctx);
         self.push_win(
             id,
             Tab::fixed(title, Content::Project(Box::new(child))),
@@ -5521,6 +5527,7 @@ impl WindowManager {
         let pane = match name {
             "appearance" => crate::settings_menu::Pane::Appearance,
             "agents" => crate::settings_menu::Pane::Agents,
+            "window-manager" => crate::settings_menu::Pane::WindowManager,
             _ => return,
         };
         self.open_settings();
@@ -5789,9 +5796,9 @@ impl WindowManager {
     fn any_layout_capture(&self) -> bool {
         self.layout_ui.captures_keyboard()
             || self.windows.iter().any(|w| {
-                w.tabs.iter().any(
-                    |t| matches!(&t.content, Content::Project(wm) if wm.any_layout_capture()),
-                )
+                w.tabs
+                    .iter()
+                    .any(|t| matches!(&t.content, Content::Project(wm) if wm.any_layout_capture()))
             })
     }
 

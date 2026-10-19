@@ -9,10 +9,6 @@
 //! file keeps definitions this one never loaded. Selection and Modified are
 //! per Project instance and live in the workspace snapshot, not here.
 
-// The store ships ahead of the picker that calls it (project-layouts plan:
-// Apply/Revert, picker, New Project). Remove once the picker saves layouts.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::project_layout::{
     Arrangement, ItemRef, LayoutDefinition, LayoutError, names_collide, validate, validate_name,
 };

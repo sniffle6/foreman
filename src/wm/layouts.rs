@@ -24,6 +24,11 @@ pub enum LayoutRequest {
     Apply { def: LayoutDefinition, select: bool },
     /// Restore the arrangement from before the last Apply.
     Revert,
+    /// A Project just opened from a directory: apply the New Project
+    /// layout. Picker on Custom, and no revert point: the one terminal it
+    /// replaces was never on screen. Waits while the Project is not laid
+    /// out or a dialog is open, rather than failing.
+    NewProject { def: LayoutDefinition },
 }
 
 /// A fresh item that failed to open. Its slot was omitted.
@@ -171,6 +176,20 @@ impl WindowManager {
         let outcome = match request {
             LayoutRequest::Apply { def, select } => self.apply_layout(&def, select, ctx),
             LayoutRequest::Revert => self.revert_layout(),
+            LayoutRequest::NewProject { def } => {
+                match self.apply_layout(&detach_ids(&def), false, ctx) {
+                    Err(LayoutApplyError::NotLaidOut | LayoutApplyError::Busy) => {
+                        self.layout_rt.pending = Some(LayoutRequest::NewProject { def });
+                        return;
+                    }
+                    outcome => {
+                        if outcome.is_ok() {
+                            self.layout_rt.revert = Revert::None;
+                        }
+                        outcome
+                    }
+                }
+            }
         };
         self.layout_rt.outcome = Some(outcome);
     }
@@ -639,6 +658,37 @@ impl WindowManager {
 
 /// The live tree as a `TreeSpec` over window indices. Leaves without an
 /// index (no layout tabs) drop out and single-child splits collapse.
+/// Where [`detach_ids`] numbers items: far above any minted id and below
+/// reconcile's placeholders, which count down from `u64::MAX`.
+const DETACHED_BASE: LayoutItemId = 1 << 62;
+
+/// `def` with every item renumbered so none can equal a live item's id.
+/// The New Project slot was saved in another Project, maybe another launch
+/// (ids restart at 1), so an exact-id match there would be a coincidence:
+/// without one, slots fill by kind in order, and the first terminal takes
+/// the first terminal slot.
+fn detach_ids(def: &LayoutDefinition) -> LayoutDefinition {
+    let map: HashMap<LayoutItemId, LayoutItemId> = def
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (item.id, DETACHED_BASE + i as LayoutItemId))
+        .collect();
+    let mut out = def.clone();
+    for item in &mut out.items {
+        item.id = map[&item.id];
+    }
+    for window in &mut out.arrangement.windows {
+        for tab in &mut window.tabs {
+            // An id outside `items` stays as is, and validation rejects it.
+            if let Some(&id) = map.get(tab) {
+                *tab = id;
+            }
+        }
+    }
+    out
+}
+
 fn tree_spec(n: &crate::layout::Node, index: &HashMap<WinId, usize>) -> Option<TreeSpec> {
     use crate::layout::{Node, SplitDir};
     match n {
@@ -1749,5 +1799,253 @@ mod tests {
             "no agent joined chat"
         );
         assert!(!wm.chat.borrow().is_member(&term_tag(s.term_id())));
+    }
+
+    // ---- the New Project layout: a Project opened from a directory ----
+
+    fn slot_store(
+        def: Option<&LayoutDefinition>,
+    ) -> (tempfile::TempDir, crate::layout_library::LayoutStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::layout_library::LayoutStore::at(tmp.path());
+        store.set_new_project_layout(def).unwrap();
+        (tmp, store)
+    }
+
+    fn slot_desk(store: crate::layout_library::LayoutStore) -> WindowManager {
+        let mut desk = WindowManager::new().as_desktop();
+        desk.layout_ui.store = Some(store);
+        desk
+    }
+
+    /// Terminal | (Terminal, Chat) tiled, then a floating Image (needs a
+    /// target, so it never opens) and a floating Board.
+    fn mixed_def() -> LayoutDefinition {
+        let rect = NormRect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.4,
+            h: 0.4,
+        };
+        let mut def = hand_def(
+            "mixed",
+            vec![
+                ItemRef::new(9_001, ItemKind::Terminal),
+                ItemRef::new(9_002, ItemKind::Terminal),
+                ItemRef::new(9_003, ItemKind::Chat),
+                ItemRef::new(9_004, ItemKind::Image),
+                ItemRef::new(9_005, ItemKind::Board),
+            ],
+            Arrangement {
+                windows: vec![
+                    WindowSpec::tiled(vec![9_001], 0),
+                    WindowSpec::tiled(vec![9_002, 9_003], 0),
+                    WindowSpec::floating(vec![9_004], 0, rect),
+                    WindowSpec::floating(vec![9_005], 0, rect),
+                ],
+                tree: row(2),
+            },
+        );
+        def.name = "Mixed".into();
+        def
+    }
+
+    /// (layout id, Member id, shell, auto-titled) of every terminal.
+    fn terminals(wm: &WindowManager) -> Vec<(LayoutItemId, u64, Shell, bool)> {
+        wm.windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| match &t.content {
+                Content::Terminal(s) => Some((t.layout_id(), s.term_id(), s.shell, t.auto_title)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn kinds(wm: &WindowManager) -> Vec<ItemKind> {
+        let mut out: Vec<_> = wm
+            .windows
+            .iter()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| t.content.layout_kind())
+            .collect();
+        out.sort_by_key(|k| format!("{k:?}"));
+        out
+    }
+
+    #[test]
+    fn a_new_project_opens_with_the_new_project_layout_through_apply() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let (_tmp, store) = slot_store(Some(&mixed_def()));
+        let mut desk = slot_desk(store);
+        let pid = desk.add_project(Shell::Cmd, std::env::temp_dir(), &ctx);
+        let child = desk.project_child_mut(pid).unwrap();
+
+        // Opened as today, one tiled terminal, with the slot queued for the
+        // Project's first frame (the normal Apply boundary).
+        assert_eq!(child.windows.len(), 1);
+        let first = terminals(child);
+        assert_eq!(first.len(), 1);
+        assert!(child.layout_rt.pending.is_some(), "the slot is queued");
+
+        child.last_area = AREA;
+        child.drain_layout_request(&ctx);
+        child.poll_layout_outcome();
+
+        // The first terminal took the first terminal slot (the left leaf);
+        // the second terminal, Chat, and Board opened fresh; the Image slot
+        // needs a target and stayed empty.
+        let left = child.tree.leaves()[0];
+        let left = child.windows.iter().find(|w| w.id == left).unwrap();
+        assert_eq!(left.tabs.len(), 1);
+        assert_eq!(left.tabs[0].layout_id(), first[0].0);
+        assert_eq!(
+            kinds(child),
+            vec![
+                ItemKind::Board,
+                ItemKind::Chat,
+                ItemKind::Terminal,
+                ItemKind::Terminal
+            ]
+        );
+        let terms = terminals(child);
+        let fresh: Vec<_> = terms.iter().filter(|t| t.0 != first[0].0).collect();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].2, Shell::Cmd, "the default shell");
+        assert!(fresh[0].3, "a plain shell: no command, no agent");
+        assert!(!child.chat.borrow().is_member(&term_tag(fresh[0].1)));
+
+        // The picker shows Custom and there is nothing to revert to.
+        assert_eq!(child.layout, LayoutSelection::default());
+        child.refresh_layouts();
+        assert_eq!(child.layout_picker_label(), "Custom");
+        assert_eq!(child.layout_revert_status(), RevertStatus::Unavailable);
+        // The unfilled Image slot is reported, under the layout's name.
+        let Some(super::super::layout_picker::Notice::Summary { title, .. }) =
+            &child.layout_ui.notice
+        else {
+            panic!("expected a summary, got {:?}", child.layout_ui.notice);
+        };
+        assert!(title.contains("Mixed"), "{title}");
+    }
+
+    /// Ids restart every launch, so a slot saved in an earlier session can
+    /// name the new terminal's id in a later slot. It must still take the
+    /// first terminal slot: the slot's ids mean nothing in a new Project.
+    #[test]
+    fn a_slot_id_equal_to_the_new_terminal_never_pins_it_to_that_slot() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let (_tmp, store) = slot_store(None);
+        let mut desk = slot_desk(store);
+        let pid = desk.add_project(Shell::Cmd, std::env::temp_dir(), &ctx);
+        let child = desk.project_child_mut(pid).unwrap();
+        let first = terminals(child)[0].0;
+        let other = first + 1_000;
+        let def = hand_def(
+            "collide",
+            vec![
+                ItemRef::new(other, ItemKind::Terminal),
+                ItemRef::new(first, ItemKind::Terminal),
+            ],
+            Arrangement {
+                windows: vec![
+                    WindowSpec::tiled(vec![other], 0),
+                    WindowSpec::tiled(vec![first], 0),
+                ],
+                tree: row(2),
+            },
+        );
+        child.request_layout(LayoutRequest::NewProject { def });
+        child.last_area = AREA;
+        child.drain_layout_request(&ctx);
+        let left = child.tree.leaves()[0];
+        let left = child.windows.iter().find(|w| w.id == left).unwrap();
+        assert_eq!(
+            left.tabs[0].layout_id(),
+            first,
+            "first terminal, first slot"
+        );
+        assert_eq!(terminals(child).len(), 2);
+    }
+
+    #[test]
+    fn an_unset_slot_opens_one_tiled_terminal_as_today() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let (_tmp, store) = slot_store(None);
+        let mut desk = slot_desk(store);
+        let pid = desk.add_project(Shell::Cmd, std::env::temp_dir(), &ctx);
+        let child = desk.project_child_mut(pid).unwrap();
+        assert!(child.layout_rt.pending.is_none());
+        assert_eq!(child.windows.len(), 1);
+        assert_eq!(child.tree.leaves(), vec![child.windows[0].id]);
+        assert_eq!(terminals(child).len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_slot_opens_one_terminal() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(crate::layout_library::LIBRARY_FILE),
+            r#"{"version": 999}"#,
+        )
+        .unwrap();
+        let mut desk = slot_desk(crate::layout_library::LayoutStore::at(tmp.path()));
+        let pid = desk.add_project(Shell::Cmd, std::env::temp_dir(), &ctx);
+        let child = desk.project_child_mut(pid).unwrap();
+        assert!(child.layout_rt.pending.is_none());
+        assert_eq!(terminals(child).len(), 1);
+    }
+
+    #[test]
+    fn a_project_opened_with_a_command_applies_the_slot_around_it() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let (_tmp, store) = slot_store(Some(&mixed_def()));
+        let mut desk = slot_desk(store);
+        let pid = desk.add_project_with_command(std::env::temp_dir(), "echo hi", &ctx);
+        let child = desk.project_child_mut(pid).unwrap();
+        let first = terminals(child)[0].0;
+        child.last_area = AREA;
+        child.drain_layout_request(&ctx);
+        let left = child.tree.leaves()[0];
+        let left = child.windows.iter().find(|w| w.id == left).unwrap();
+        assert_eq!(
+            left.tabs[0].layout_id(),
+            first,
+            "the commanded terminal is the first terminal slot"
+        );
+        assert_eq!(terminals(child).len(), 2);
+    }
+
+    #[test]
+    fn startup_restore_never_applies_the_slot() {
+        let ctx = egui::Context::default();
+        cmd_settings(&ctx);
+        let (_tmp, store) = slot_store(None);
+        let mut desk = slot_desk(store.clone());
+        desk.add_project(Shell::Cmd, std::env::temp_dir(), &ctx);
+        let snap = desk.capture_workspace();
+
+        store.set_new_project_layout(Some(&mixed_def())).unwrap();
+        let mut restored = slot_desk(store);
+        restored.apply_workspace(&snap, &ctx);
+        let child = restored
+            .windows
+            .iter_mut()
+            .find_map(|w| match &mut w.tabs[w.active].content {
+                Content::Project(c) => Some(c.as_mut()),
+                _ => None,
+            })
+            .expect("the Project came back");
+        assert!(child.layout_rt.pending.is_none(), "restore queues nothing");
+        child.last_area = AREA;
+        child.drain_layout_request(&ctx);
+        assert_eq!(child.windows.len(), 1, "the restored arrangement as saved");
+        assert_eq!(terminals(child).len(), 1);
     }
 }

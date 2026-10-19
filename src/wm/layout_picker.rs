@@ -28,9 +28,12 @@ const NOTICE_W: f32 = 300.0;
 pub(super) struct PickerUi {
     /// This Project's saved layouts as last read, or the read error.
     library: Option<Result<Vec<LayoutDefinition>, String>>,
+    /// The New Project layout as last read with the library, to mark the
+    /// row it was copied from while the two still match.
+    new_project: Option<LayoutDefinition>,
     menu_open: bool,
     dialog: Option<Dialog>,
-    notice: Option<Notice>,
+    pub(super) notice: Option<Notice>,
     /// What the queued request was, to title its outcome.
     requested: Option<Requested>,
     /// Test seam: the store to use instead of the user's.
@@ -50,6 +53,7 @@ impl PickerUi {
 enum Requested {
     Apply { name: String },
     Revert,
+    NewProject { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +112,8 @@ pub(super) enum PickerAction {
     SaveAs,
     Rename(String),
     Delete(String),
+    /// Copy a saved layout into the New Project slot.
+    UseForNewProjects(String),
     Revert,
     /// The dialog's primary button: save, rename, replace, or delete.
     Submit,
@@ -127,7 +133,7 @@ impl WindowManager {
         self.cwd.clone()
     }
 
-    fn layout_store(&self) -> Result<LayoutStore, StoreError> {
+    pub(super) fn layout_store(&self) -> Result<LayoutStore, StoreError> {
         #[cfg(test)]
         {
             // Never the user's file from a test.
@@ -140,7 +146,7 @@ impl WindowManager {
     }
 
     /// Re-read this Project's saved layouts and keep the copy.
-    fn refresh_layouts(&mut self) {
+    pub(super) fn refresh_layouts(&mut self) {
         let Some(dir) = self.layout_project_dir() else {
             self.layout_ui.library = Some(Ok(Vec::new()));
             return;
@@ -153,6 +159,34 @@ impl WindowManager {
                 e => e.to_string(),
             });
         self.layout_ui.library = Some(read);
+        self.layout_ui.new_project = self
+            .layout_store()
+            .and_then(|store| store.new_project_layout())
+            .ok()
+            .flatten();
+    }
+
+    /// `child` is a Project this (desktop) manager just opened from a
+    /// directory. Queue the New Project layout on it, if one is set, for its
+    /// first frame. Unset, or unreadable, leaves today's single terminal; an
+    /// unreadable slot says so in a toast. One small read, on the open.
+    pub(super) fn queue_new_project_layout(&self, child: &mut WindowManager, ctx: &egui::Context) {
+        let def = match self.layout_store().and_then(|s| s.new_project_layout()) {
+            Ok(Some(def)) => def,
+            Ok(None) => return,
+            Err(e) => {
+                crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Warning,
+                    format!("New Project layout not used: {e}"),
+                );
+                return;
+            }
+        };
+        child.layout_ui.requested = Some(Requested::NewProject {
+            name: def.name.clone(),
+        });
+        child.request_layout(LayoutRequest::NewProject { def });
     }
 
     fn cached_layouts(&self) -> &[LayoutDefinition] {
@@ -216,6 +250,29 @@ impl WindowManager {
                 });
                 self.request_layout(LayoutRequest::Apply { def, select: true });
                 ctx.request_repaint();
+            }
+            PickerAction::UseForNewProjects(id) => {
+                self.layout_ui.menu_open = false;
+                let Some(def) = self.cached_layouts().iter().find(|d| d.id == id).cloned() else {
+                    self.refresh_layouts();
+                    self.layout_ui.notice =
+                        Some(Notice::Error(StoreError::NotFound(id).to_string()));
+                    return;
+                };
+                let written = self
+                    .layout_store()
+                    .and_then(|store| store.set_new_project_layout(Some(&def)));
+                self.layout_ui.notice = Some(match written {
+                    Ok(()) => {
+                        let text = format!("New Projects open with \u{201c}{}\u{201d}.", def.name);
+                        self.layout_ui.new_project = Some(def);
+                        Notice::Saved {
+                            text,
+                            until: now + SAVED_NOTICE_SECS,
+                        }
+                    }
+                    Err(e) => Notice::Error(e.to_string()),
+                });
             }
             PickerAction::Revert => {
                 self.layout_ui.menu_open = false;
@@ -469,6 +526,9 @@ impl WindowManager {
                         format!("Applied \u{201c}{name}\u{201d} with changes")
                     }
                     Some(Requested::Revert) => "Reverted the layout".to_string(),
+                    Some(Requested::NewProject { name }) => {
+                        format!("Opened with \u{201c}{name}\u{201d}, with changes")
+                    }
                     None => "Layout applied with changes".to_string(),
                 };
                 let lines = summary_lines(&applied, |id| self.layout_item_title(id));
@@ -730,10 +790,14 @@ impl WindowManager {
                                 egui::pos2(rect.max.x - 20.0, rect.center().y),
                                 egui::vec2(20.0, 20.0),
                             );
+                            let for_new = egui::Rect::from_center_size(
+                                egui::pos2(rect.max.x - 68.0, rect.center().y),
+                                egui::vec2(20.0, 20.0),
+                            );
                             let row = mui.interact(
                                 egui::Rect::from_min_max(
                                     rect.min,
-                                    egui::pos2(rename.min.x - 2.0, rect.max.y),
+                                    egui::pos2(for_new.min.x - 2.0, rect.max.y),
                                 ),
                                 menu_id.with(("row", ri)),
                                 egui::Sense::click(),
@@ -748,8 +812,16 @@ impl WindowManager {
                                 menu_id.with(("delete", ri)),
                                 egui::Sense::click(),
                             );
+                            let nw = mui.interact(
+                                for_new,
+                                menu_id.with(("for-new", ri)),
+                                egui::Sense::click(),
+                            );
+                            // The slot is a copy: marked only while it still
+                            // matches this definition.
+                            let is_new = self.layout_ui.new_project.as_ref() == Some(def);
                             let mp = mui.painter();
-                            if row.hovered() || rn.hovered() || del.hovered() {
+                            if row.hovered() || rn.hovered() || del.hovered() || nw.hovered() {
                                 mp.rect_filled(rect, 0.0, th.sel_bg);
                             }
                             if is_sel {
@@ -766,7 +838,7 @@ impl WindowManager {
                             paint_diagram(mp, def, diagram, th);
                             let name_min = diagram.max.x + 10.0;
                             let tag = (is_sel && self.layout.modified).then_some("Modified");
-                            let name_max = rename.min.x - 6.0;
+                            let name_max = for_new.min.x - 6.0;
                             let galley = mp.layout_no_wrap(def.name.clone(), font.clone(), th.text);
                             let name_y = if tag.is_some() {
                                 rect.center().y - 6.0
@@ -807,12 +879,32 @@ impl WindowManager {
                                     th.win_btn_danger_hover,
                                 );
                             }
+                            if nw.hovered() {
+                                mp.rect_filled(
+                                    for_new,
+                                    egui::CornerRadius::same(3),
+                                    th.win_btn_hover,
+                                );
+                            }
+                            paint_new_project(
+                                mp,
+                                for_new.center(),
+                                if is_new { th.caret } else { icon(&nw) },
+                            );
                             paint_pencil(mp, rename.center(), icon(&rn));
                             paint_cross(mp, delete.center(), icon(&del));
+                            let nw = nw.on_hover_text(if is_new {
+                                "New Projects open with this layout"
+                            } else {
+                                "Use for new Projects"
+                            });
                             let rn = rn.on_hover_text("Rename\u{2026}");
                             let del = del.on_hover_text("Delete\u{2026}");
                             if row.clicked() {
                                 actions.push(PickerAction::Apply(def.id.clone()));
+                            }
+                            if nw.clicked() {
+                                actions.push(PickerAction::UseForNewProjects(def.id.clone()));
                             }
                             if rn.clicked() {
                                 actions.push(PickerAction::Rename(def.id.clone()));
@@ -912,14 +1004,7 @@ impl WindowManager {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
             )
         });
-        let enter = enter
-            && matches!(
-                dialog,
-                Dialog::Name {
-                    conflict: None,
-                    ..
-                }
-            );
+        let enter = enter && matches!(dialog, Dialog::Name { conflict: None, .. });
         let field_id = id.with("name-field");
         let shown = egui::Window::new("Layout")
             .id(id.with("dialog"))
@@ -1546,6 +1631,25 @@ fn paint_pencil(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     );
 }
 
+/// A window with a plus: "new Projects".
+fn paint_new_project(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3, color);
+    p.rect_stroke(
+        egui::Rect::from_center_size(c, egui::vec2(11.0, 10.0)),
+        egui::CornerRadius::same(1),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    p.line_segment(
+        [egui::pos2(c.x - 2.5, c.y), egui::pos2(c.x + 2.5, c.y)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(c.x, c.y - 2.5), egui::pos2(c.x, c.y + 2.5)],
+        stroke,
+    );
+}
+
 fn paint_cross(p: &egui::Painter, c: egui::Pos2, color: egui::Color32) {
     let stroke = egui::Stroke::new(1.3, color);
     let s = 3.5;
@@ -1663,7 +1767,10 @@ mod tests {
     fn header_places_layout_controls_between_title_and_project_controls() {
         let tiny = egui::Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(139.0, 400.0));
         let hl = header_layout(tiny, true, false, HeaderSpec::Rename);
-        assert!(hl.layout.is_none(), "no room: hidden, not drawn over the tabs");
+        assert!(
+            hl.layout.is_none(),
+            "no room: hidden, not drawn over the tabs"
+        );
         for width in [140.0, 300.0, 519.0, 520.0, 800.0, 1600.0] {
             let scr = egui::Rect::from_min_size(egui::pos2(30.0, 20.0), egui::vec2(width, 400.0));
             for spec in [
@@ -1688,7 +1795,10 @@ mod tests {
                 );
                 assert!(ctl.picker.max.x <= ctl.save.min.x, "w={width}");
                 assert!(hl.avail_end <= ctl.picker.min.x, "fence (w={width})");
-                assert!(ctl.picker.min.x >= scr.min.x, "inside the header (w={width})");
+                assert!(
+                    ctl.picker.min.x >= scr.min.x,
+                    "inside the header (w={width})"
+                );
                 assert_eq!(ctl.picker.height(), ovf.height());
                 if let Some(plus) = hl.plus {
                     assert!(plus.max.x <= ctl.picker.min.x, "+ (w={width})");
@@ -2067,6 +2177,81 @@ mod tests {
         assert_eq!(wm.layout, LayoutSelection::default(), "Custom");
         assert_eq!(arrangement(&wm), live, "deleting moves nothing");
         assert_eq!(wm.layout_ui.dialog, None);
+    }
+
+    #[test]
+    fn use_for_new_projects_copies_the_layout_into_the_global_slot() {
+        let fx = fixture();
+        let mut wm = fx.project();
+        tile(&mut wm, "a");
+        let id = save_new(&mut wm, "Pair");
+        let source = fx.saved()[0].clone();
+
+        act(&mut wm, PickerAction::ToggleMenu);
+        act(&mut wm, PickerAction::UseForNewProjects(id.clone()));
+        assert!(!wm.layout_ui.menu_open);
+        assert_eq!(
+            fx.store().new_project_layout().unwrap(),
+            Some(source.clone())
+        );
+        assert!(matches!(
+            &wm.layout_ui.notice,
+            Some(Notice::Saved { text, .. }) if text.contains("New Projects") && text.contains("Pair")
+        ));
+        assert_eq!(
+            wm.layout_ui.new_project.as_ref(),
+            Some(&source),
+            "the row is marked"
+        );
+        assert_eq!(
+            wm.layout.selected.as_deref(),
+            Some(id.as_str()),
+            "selection untouched"
+        );
+
+        // A copy, not a reference: updating, renaming, and deleting the
+        // source leave the slot as it was.
+        tile(&mut wm, "b");
+        act(&mut wm, PickerAction::Save);
+        assert_ne!(fx.saved()[0].arrangement, source.arrangement);
+        act(&mut wm, PickerAction::Rename(id.clone()));
+        type_name(&mut wm, "Renamed");
+        act(&mut wm, PickerAction::Submit);
+        act(&mut wm, PickerAction::ToggleMenu);
+        assert_eq!(wm.layout_ui.new_project.as_ref(), Some(&source));
+        assert_ne!(
+            wm.cached_layouts().first(),
+            Some(&source),
+            "the edited source no longer matches, so its row is not marked"
+        );
+        act(&mut wm, PickerAction::Delete(id));
+        act(&mut wm, PickerAction::Submit);
+        assert!(fx.saved().is_empty());
+        assert_eq!(fx.store().new_project_layout().unwrap(), Some(source));
+    }
+
+    #[test]
+    fn use_for_new_projects_reports_a_failed_write() {
+        let fx = fixture();
+        let mut wm = fx.project();
+        tile(&mut wm, "a");
+        let id = save_new(&mut wm, "Pair");
+        let blocked = fx.config.join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        wm.layout_ui.store = Some(LayoutStore::at(&blocked));
+        act(&mut wm, PickerAction::UseForNewProjects(id));
+        assert!(matches!(&wm.layout_ui.notice, Some(Notice::Error(_))));
+        assert_eq!(wm.layout_ui.new_project, None);
+        assert_eq!(fx.store().new_project_layout().unwrap(), None);
+
+        // A row whose layout is gone says so instead of doing nothing.
+        wm.layout_ui.store = Some(fx.store());
+        act(&mut wm, PickerAction::UseForNewProjects("gone".into()));
+        assert!(matches!(
+            &wm.layout_ui.notice,
+            Some(Notice::Error(e)) if e.contains("no longer exists")
+        ));
+        assert_eq!(fx.store().new_project_layout().unwrap(), None);
     }
 
     #[test]

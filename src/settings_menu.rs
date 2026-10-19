@@ -57,6 +57,7 @@ pub enum Field {
     NewWindowsFloat,
     FocusFollowsMouse,
     DimUnfocused,
+    NewProjectLayout,
     InstallSkills,
     DispatchWorktrees,
     AutoNameAgentSessions,
@@ -175,6 +176,12 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 label: "Dim unfocused panes",
                 desc: "Slight darkening on everything but the focused terminal",
                 kind: Kind::Toggle,
+            },
+            RowSpec {
+                field: Field::NewProjectLayout,
+                label: "New Project layout",
+                desc: "How a Project opened from a directory starts; set in its Layout menu",
+                kind: Kind::Action,
             },
         ],
         // The pane itself *is* the editor (draw_pane special-cases it before
@@ -389,7 +396,7 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::RestoreWorkspace => flip(&mut s.restore_workspace),
         Field::DefaultProjectDir => false,
         Field::UpdateCheck => flip(&mut s.update_check),
-        Field::CheckUpdatesNow | Field::OpenConfigFolder => false,
+        Field::CheckUpdatesNow | Field::OpenConfigFolder | Field::NewProjectLayout => false,
     }
 }
 
@@ -425,7 +432,8 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::RestoreWorkspace => s.restore_workspace.to_string(),
         Field::DefaultProjectDir => s.default_project_dir.clone(),
         Field::UpdateCheck => s.update_check.to_string(),
-        Field::CheckUpdatesNow | Field::OpenConfigFolder => String::new(),
+        // Lives in project-layouts.json, not Settings: the view reads it.
+        Field::CheckUpdatesNow | Field::OpenConfigFolder | Field::NewProjectLayout => String::new(),
     }
 }
 
@@ -459,6 +467,16 @@ pub struct SettingsMenu {
     /// otherwise the same un-consumed Enter that dove in is read by the
     /// editor's Idle branch as "start a rebind".
     pub editor_just_entered: bool,
+    /// The New Project layout's name as last read from
+    /// `project-layouts.json` (`Ok(None)`: Single terminal), or why it could
+    /// not be read. `None` until read: on first draw, and again whenever the
+    /// pane is selected or the window becomes active, never per frame.
+    new_project_layout: Option<Result<Option<String>, String>>,
+    /// Whether the window was active last frame, to re-read on activation.
+    was_active: bool,
+    /// Test seam: the layout store to use instead of the user's.
+    #[cfg(test)]
+    pub layout_store: Option<crate::layout_library::LayoutStore>,
 }
 
 impl SettingsMenu {
@@ -473,6 +491,10 @@ impl SettingsMenu {
             keybindings: SettingsView::new(),
             appearance: crate::appearance::AppearanceView::new(),
             editor_just_entered: false,
+            new_project_layout: None,
+            was_active: false,
+            #[cfg(test)]
+            layout_store: None,
         }
     }
 
@@ -517,6 +539,56 @@ impl SettingsMenu {
         self.pane = p;
         self.row = 0;
         self.scroll_to_selected = true;
+        self.new_project_layout = None;
+    }
+
+    fn layout_store(
+        &self,
+    ) -> Result<crate::layout_library::LayoutStore, crate::layout_library::StoreError> {
+        #[cfg(test)]
+        {
+            // Never the user's file from a test.
+            Ok(self.layout_store.clone().unwrap_or_else(|| {
+                crate::layout_library::LayoutStore::at(
+                    std::env::temp_dir().join("foreman-settings-layout-unset"),
+                )
+            }))
+        }
+        #[cfg(not(test))]
+        crate::layout_library::LayoutStore::user()
+    }
+
+    /// The New Project layout row's value and whether Reset has anything to
+    /// do. Reads the file only when the cached copy was dropped.
+    fn new_project_layout_value(&mut self) -> (String, bool) {
+        if self.new_project_layout.is_none() {
+            let read = self
+                .layout_store()
+                .and_then(|store| store.new_project_layout())
+                .map(|def| def.map(|d| d.name))
+                .map_err(|e| e.to_string());
+            self.new_project_layout = Some(read);
+        }
+        match self.new_project_layout.as_ref().expect("read above") {
+            Ok(Some(name)) => (format!("\u{201c}{name}\u{201d}"), true),
+            Ok(None) => ("Single terminal".to_string(), false),
+            Err(_) => ("Unreadable".to_string(), false),
+        }
+    }
+
+    /// Reset the New Project layout to Single terminal: one tiled terminal.
+    fn reset_new_project_layout(&mut self, ctx: &egui::Context) {
+        let written = self
+            .layout_store()
+            .and_then(|store| store.set_new_project_layout(None));
+        if let Err(e) = written {
+            crate::notify::queue(
+                ctx,
+                crate::notify::Level::Error,
+                format!("New Project layout not reset: {e}"),
+            );
+        }
+        self.new_project_layout = None;
     }
 }
 
@@ -591,6 +663,12 @@ impl SettingsMenu {
         theme: &mut crate::theme::Theme,
     ) -> MenuOutcome {
         let th = crate::theme::live(ui.ctx());
+        // The New Project layout is set from a Project's picker: coming back
+        // to this window re-reads it.
+        if active && !self.was_active {
+            self.new_project_layout = None;
+        }
+        self.was_active = active;
         // Keyboard drives the menu only when this window is focused and no
         // inline text edit owns input.
         let mut outcome = if active && self.editing.is_none() {
@@ -757,7 +835,7 @@ impl SettingsMenu {
                 Kind::Toggle => changed |= adjust(spec.field, Adjust::Toggle, s),
                 Kind::Stepper | Kind::Choice => changed |= adjust(spec.field, Adjust::Inc, s),
                 Kind::Text => self.editing = Some(display(spec.field, s)),
-                Kind::Action => return self.do_action(spec.field),
+                Kind::Action => return self.do_action(spec.field, ui.ctx()),
             }
         }
         if changed {
@@ -784,9 +862,17 @@ impl SettingsMenu {
     }
 
     /// Run an `Action` row.
-    fn do_action(&self, field: Field) -> MenuOutcome {
+    fn do_action(&mut self, field: Field, ctx: &egui::Context) -> MenuOutcome {
         match field {
             Field::CheckUpdatesNow => MenuOutcome::CheckUpdatesNow,
+            Field::NewProjectLayout => {
+                // Mouse and Enter alike: nothing to reset while it is
+                // already Single terminal (or unreadable).
+                if self.new_project_layout_value().1 {
+                    self.reset_new_project_layout(ctx);
+                }
+                MenuOutcome::Pending
+            }
             Field::OpenConfigFolder => {
                 if let Some(dir) = crate::config::config_dir() {
                     std::process::Command::new("explorer").arg(dir).spawn().ok();
@@ -1248,7 +1334,16 @@ impl SettingsMenu {
                 let caption = match spec.field {
                     Field::OpenConfigFolder => "Open folder",
                     Field::CheckUpdatesNow => "Check now",
+                    Field::NewProjectLayout => "Reset",
                     _ => "Open",
+                };
+                // The New Project layout shows its value before the button,
+                // which does nothing while it is already Single terminal.
+                let (value, enabled) = if spec.field == Field::NewProjectLayout {
+                    let (value, enabled) = self.new_project_layout_value();
+                    (Some(value), enabled)
+                } else {
+                    (None, true)
                 };
                 let galley = ui.painter().layout_no_wrap(
                     caption.to_string(),
@@ -1261,10 +1356,10 @@ impl SettingsMenu {
                     egui::vec2(w, 24.0),
                 );
                 let resp = ui.interact(btn, id, egui::Sense::click());
-                if resp.clicked() {
-                    bump(outcome, self.do_action(spec.field));
+                if resp.clicked() && enabled {
+                    bump(outcome, self.do_action(spec.field, ui.ctx()));
                 }
-                let border = if selected || resp.hovered() {
+                let border = if enabled && (selected || resp.hovered()) {
                     th.border_focus
                 } else {
                     th.border
@@ -1280,8 +1375,29 @@ impl SettingsMenu {
                     egui::Align2::CENTER_CENTER,
                     caption,
                     egui::FontId::proportional(12.5),
-                    th.text,
+                    if enabled { th.text } else { th.dim },
                 );
+                if let Some(value) = value {
+                    let color = match &self.new_project_layout {
+                        Some(Err(_)) => th.danger,
+                        _ => th.text,
+                    };
+                    ui.painter().text(
+                        egui::pos2(btn.min.x - 10.0, cy),
+                        egui::Align2::RIGHT_CENTER,
+                        value,
+                        egui::FontId::proportional(12.5),
+                        color,
+                    );
+                    if spec.field == Field::NewProjectLayout {
+                        let tip = match &self.new_project_layout {
+                            Some(Err(e)) => e.clone(),
+                            _ => "Reset to Single terminal: new Projects open with one terminal"
+                                .to_string(),
+                        };
+                        resp.on_hover_text(tip);
+                    }
+                }
             }
         }
     }
@@ -1420,11 +1536,73 @@ mod tests {
 
     #[test]
     fn check_updates_now_action_requests_a_check() {
-        let m = SettingsMenu::new();
+        let mut m = SettingsMenu::new();
         assert!(matches!(
-            m.do_action(Field::CheckUpdatesNow),
+            m.do_action(Field::CheckUpdatesNow, &egui::Context::default()),
             MenuOutcome::CheckUpdatesNow
         ));
+    }
+
+    #[test]
+    fn new_project_layout_row_names_the_slot_and_resets_to_single_terminal() {
+        use crate::layout_library::LayoutStore;
+        use crate::project_layout::{
+            Arrangement, ItemKind, ItemRef, LayoutDefinition, TreeSpec, WindowSpec,
+        };
+        let row = rows(Pane::WindowManager)
+            .iter()
+            .find(|r| r.field == Field::NewProjectLayout)
+            .expect("a Window Manager row");
+        assert_eq!(row.kind, Kind::Action);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LayoutStore::at(tmp.path());
+        let mut m = SettingsMenu::new();
+        m.layout_store = Some(store.clone());
+        assert_eq!(
+            m.new_project_layout_value(),
+            ("Single terminal".into(), false)
+        );
+        m.do_action(Field::NewProjectLayout, &egui::Context::default());
+        assert!(
+            !tmp.path()
+                .join(crate::layout_library::LIBRARY_FILE)
+                .exists(),
+            "Reset on Single terminal writes nothing"
+        );
+
+        let quad = LayoutDefinition {
+            id: "q".into(),
+            name: "Quad".into(),
+            items: vec![ItemRef::new(1, ItemKind::Terminal)],
+            arrangement: Arrangement {
+                windows: vec![WindowSpec::tiled(vec![1], 0)],
+                tree: Some(TreeSpec::Leaf { window: 0 }),
+            },
+        };
+        store.set_new_project_layout(Some(&quad)).unwrap();
+        assert_eq!(
+            m.new_project_layout_value(),
+            ("Single terminal".into(), false),
+            "read once, never per frame"
+        );
+        m.select_pane(Pane::WindowManager);
+        assert_eq!(
+            m.new_project_layout_value(),
+            ("\u{201c}Quad\u{201d}".into(), true),
+            "re-read when the pane is shown again"
+        );
+
+        let ctx = egui::Context::default();
+        assert!(matches!(
+            m.do_action(Field::NewProjectLayout, &ctx),
+            MenuOutcome::Pending
+        ));
+        assert_eq!(store.new_project_layout().unwrap(), None, "reset on disk");
+        assert_eq!(
+            m.new_project_layout_value(),
+            ("Single terminal".into(), false)
+        );
     }
 
     #[test]
