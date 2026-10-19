@@ -2538,10 +2538,7 @@ mod tests {
     ) {
         let start = std::time::Instant::now();
         while !done(view) {
-            assert!(
-                start.elapsed() < BACKGROUND_DEADLINE,
-                "view never settled"
-            );
+            assert!(start.elapsed() < BACKGROUND_DEADLINE, "view never settled");
             frame(ctx, view, rect, base, vec![]);
             std::thread::sleep(Duration::from_millis(5));
         }

@@ -3773,7 +3773,11 @@ impl WindowManager {
                                 );
                                 toasted = true;
                             }
-                            let wait = if long { HELD_RETRY_SLOW } else { HELD_RETRY_FAST };
+                            let wait = if long {
+                                HELD_RETRY_SLOW
+                            } else {
+                                HELD_RETRY_FAST
+                            };
                             self.teardown_held.insert(id.clone(), (since, toasted));
                             self.queue_teardown(PendingTeardown {
                                 id,
@@ -10250,7 +10254,10 @@ mod tests {
         assert_eq!(wm.pending_teardowns.len(), 1, "re-queued");
         assert!(!p.force && p.held_by.is_none());
         let wait = p.not_before.unwrap() - std::time::Instant::now();
-        assert!(wait <= HELD_RETRY_FAST, "a fresh hold retries fast: {wait:?}");
+        assert!(
+            wait <= HELD_RETRY_FAST,
+            "a fresh hold retries fast: {wait:?}"
+        );
         assert!(!wm.teardown_held["a"].1, "no toast yet");
 
         // Still held a minute later: toast once, then slow down.
@@ -10259,7 +10266,10 @@ mod tests {
         wm.drain_worktree_msgs(&ctx);
         assert_eq!(wm.pending_teardowns.len(), 1, "one entry per card");
         let wait = wm.pending_teardowns[0].not_before.unwrap() - std::time::Instant::now();
-        assert!(wait > HELD_RETRY_FAST, "a long hold retries slowly: {wait:?}");
+        assert!(
+            wait > HELD_RETRY_FAST,
+            "a long hold retries slowly: {wait:?}"
+        );
         assert!(wm.teardown_held["a"].1, "toasted");
 
         wm.pending_teardowns.clear();
