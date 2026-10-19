@@ -16822,14 +16822,17 @@ mod tests {
         Some(tmp)
     }
 
-    /// Drain the worktree channel until `pred` holds or 15 s pass — teardown
+    /// Drain the worktree channel until `pred` holds or 120 s pass — teardown
     /// runs on a thread, so the test polls the same seam the frame loop does.
+    /// The bound is generous because each git step spawns processes that slow
+    /// sharply under the full parallel suite; 15 s timed out healthy work. A
+    /// green test returns as soon as `pred` holds.
     fn drain_until(
         m: &mut WindowManager,
         ctx: &egui::Context,
         mut pred: impl FnMut(&WindowManager) -> bool,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while !pred(m) {
             assert!(
                 std::time::Instant::now() < deadline,

@@ -1452,6 +1452,13 @@ fn columns(
 mod tests {
     use super::*;
 
+    /// Upper bound for background git work to land. Each step spawns `git`
+    /// processes, which cost ~0.1 s apiece on Windows and far more while the
+    /// full suite runs 24 threads of PTY and git tests. A green test returns
+    /// as soon as the work lands, so the bound only decides how long a real
+    /// hang takes to fail; 10 s timed out healthy work under load.
+    const BACKGROUND_DEADLINE: Duration = Duration::from_secs(120);
+
     #[test]
     fn commit_date_is_unpadded_twelve_hour_local() {
         let utc = chrono::Utc;
@@ -2243,7 +2250,7 @@ mod tests {
         let before = git(&work, &["status", "--porcelain=v1"]);
         let stream = Stream::start(work.clone(), scope::Scope::All, egui::Context::default());
         stream.next.send(()).unwrap();
-        let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+        let page = stream.pages.recv_timeout(BACKGROUND_DEADLINE).unwrap();
         assert!(page.end);
         assert!(page.error.is_none(), "{:?}", page.error);
         assert_eq!(page.rows.len(), 5);
@@ -2261,7 +2268,7 @@ mod tests {
         assert!(
             stream
                 .pages
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(BACKGROUND_DEADLINE)
                 .unwrap()
                 .error
                 .is_some()
@@ -2269,7 +2276,7 @@ mod tests {
         git(repo.path(), &["init"]);
         let stream = Stream::start(repo.path().into(), scope::Scope::Current, ctx);
         stream.next.send(()).unwrap();
-        let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+        let page = stream.pages.recv_timeout(BACKGROUND_DEADLINE).unwrap();
         assert!(page.end && page.rows.is_empty() && page.error.is_none());
     }
     #[test]
@@ -2388,7 +2395,7 @@ mod tests {
             egui::Context::default(),
         );
         stream.next.send(()).unwrap();
-        let first = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+        let first = stream.pages.recv_timeout(BACKGROUND_DEADLINE).unwrap();
         assert_eq!(first.rows.len(), BATCH);
         assert!(!first.end);
         assert!(matches!(
@@ -2396,7 +2403,7 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         stream.next.send(()).unwrap();
-        let second = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = stream.pages.recv_timeout(BACKGROUND_DEADLINE).unwrap();
         assert_eq!(second.rows.len(), 20);
         assert!(second.end);
         assert_eq!(first.rows.last().unwrap().color, second.rows[0].color);
@@ -2445,7 +2452,7 @@ mod tests {
         let read = |scope: scope::Scope| {
             let stream = Stream::start(dir.into(), scope, egui::Context::default());
             stream.next.send(()).unwrap();
-            let page = stream.pages.recv_timeout(Duration::from_secs(10)).unwrap();
+            let page = stream.pages.recv_timeout(BACKGROUND_DEADLINE).unwrap();
             assert!(page.error.is_none(), "{:?}", page.error);
             let subjects: Vec<String> =
                 page.rows.iter().map(|r| r.commit.subject.clone()).collect();
@@ -2532,7 +2539,7 @@ mod tests {
         let start = std::time::Instant::now();
         while !done(view) {
             assert!(
-                start.elapsed() < Duration::from_secs(10),
+                start.elapsed() < BACKGROUND_DEADLINE,
                 "view never settled"
             );
             frame(ctx, view, rect, base, vec![]);
@@ -2642,7 +2649,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + BACKGROUND_DEADLINE;
         while !(view.end && view.fingerprint.is_some() && view.check.is_none()) {
             assert!(std::time::Instant::now() < deadline, "never loaded");
             show(&mut view, true);
@@ -2663,7 +2670,7 @@ mod tests {
         // Focus away and back: at the top, the move just re-reads.
         show(&mut view, false);
         show(&mut view, true);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + BACKGROUND_DEADLINE;
         while !(view.end && view.count == 2) {
             assert!(
                 std::time::Instant::now() < deadline,
