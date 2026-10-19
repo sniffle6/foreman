@@ -6,15 +6,19 @@ description: Use when running inside Foreman (the FOREMAN env var is 1) and Code
 # The Foreman Project Kanban Board
 
 **This skill is complete. Do NOT read foreman source or docs to learn kanban
-mechanics — every fact you need is here or in `worktrees-and-integration.md`
+mechanics — every fact you need is here or in the two reference files
 beside this file.** Researching your task's subject matter is separate and
 fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
-Read `worktrees-and-integration.md` only when you need it: your prompt has a
-`# Workspace` section, `wait` exited 3, the queue is held, or you are
-inspecting worktrees, strays, or a Cut. Orchestrating a plan does not need it.
+Two reference files sit beside this one. Read each only when you need it:
+
+- `orchestrating-plans.md` — you run or orchestrate a plan: dispatching its
+  cards wave by wave, reviewing finished workers, closing their terminals.
+- `worktrees-and-integration.md` — your prompt has a `# Workspace` section,
+  `wait` exited 3, the queue is held, or you are inspecting worktrees,
+  strays, or a Cut. Orchestrating a plan does not need it.
 
 Address the CLI the same way as dispatch/chat:
 
@@ -43,7 +47,7 @@ accepted.
 & $env:FOREMAN_EXE kanban block a3f8k2 --reason "needs a design decision"
 & $env:FOREMAN_EXE kanban rm a3f8k2
 & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 300
-& $env:FOREMAN_EXE kanban wait --any --timeout 300
+& $env:FOREMAN_EXE kanban wait --any a3f8k2 b7c1d9 --timeout 300
 ```
 
 `worktrees`, `integrate`, `cut`, and `uncut` are in the reference file.
@@ -76,7 +80,8 @@ accepted.
 - `done` — closes a card you hold: in-progress -> done.
 - `block --reason R` — in-progress -> blocked; the reason is mandatory.
 - `rm` — deletes the card's file outright, from any state.
-- `wait` — polls until the card (or, with `--any`, any in-progress card)
+- `wait` — polls until the card (or, with `--any`, any in-progress card;
+  with `--any <id>...`, any of those cards, even one already finished)
   reaches done, blocked, orphaned, or removed, then prints that card's `list`
   line (`<id>  removed` if it vanished). Exit codes: `0` done, `1`
   blocked/orphaned/removed (needs a human), `2` timeout or foreman
@@ -106,6 +111,10 @@ given.
 End every commit message with the trailer line `Card: <id>`. That line is
 how the board attaches your commits to the card at Cut.
 
+A dispatched worker's prompt has a `# Final report` section: end on its
+four labeled lines. An orchestrator reads them from your pane, then closes
+it.
+
 `start` on a card another live Session holds is **rejected by design**, not
 a transient error. Pick a different card.
 
@@ -130,40 +139,7 @@ one with a targeted post.
 `kanban dispatch`. Never `open`, never `git worktree add` by hand — those
 skip the claim, the `Card:` trailer, the integration queue, and the board.
 
-1. **Find the plan.** One `list --json`: a card's plan is `planned.name` and
-   `planned.wave`. Copy the name from a card and note each wave's card ids.
-2. **Current wave** = the lowest `planned.wave` among the plan's cards that
-   are not `done`. Dispatch only that wave's `backlog` cards; never start a
-   later wave early.
-3. **Dispatch one at a time**, keeping each reply's `terminal`:
-
-   ```powershell
-   & $env:FOREMAN_EXE kanban dispatch <id> --agent claude
-   ```
-
-   `--agent` is required and cards have no agent field: follow the user's
-   instruction, else `claude` (workers implement; the chat skill's
-   Codex-research/Claude-implement split is for chat rooms, not cards).
-4. **Wait**: `kanban wait --any --timeout 600`. It prints the line of the
-   card that moved, so track the wave from those lines instead of
-   re-listing the board after every wait. The wave is finished when every
-   card in it is `done`; then start the next wave. Do not run `integrate` or
-   `done` for a worker — its prompt already does.
-5. **Stop and tell the human** when a card is `blocked` (the reason is in
-   its line) or `ORPHANED` (its terminal died). Restart is a board action —
-   do not route around it with `open`.
-
-Dispatch errors:
-
-- `foreman did not respond` or a bring-up error: worktree bring-up must
-  finish inside foreman's 5 s reply window. A slow one spawns nothing; a
-  reply lost after a spawn is undone and the card returns to Backlog. Check
-  `list <id>`, then retry the same dispatch once.
-- `held by live Session`, `integration is …`, not Backlog, cmd-shim: a real
-  refusal. Report it. Do not retry blindly and do not fall back to `open`.
-
-A worker stuck on a permission prompt looks exactly like a working one —
-`wait` only times out (exit 2). On a timeout, read the pane:
-`& $env:FOREMAN_EXE snapshot --terminal tN --tail 30`. Worktree cards
-cold-build their own `target/` and land through one queue a card at a time,
-so a wave lands slowly.
+**Read `orchestrating-plans.md` before dispatching the first card.** It
+carries the whole loop: dispatch a wave, wait, review each finished
+worker's report, fix the board from what it says, close its terminal, then
+dispatch more.

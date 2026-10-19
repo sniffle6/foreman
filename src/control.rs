@@ -1439,14 +1439,15 @@ fn parse_kanban_block(
     }))
 }
 
-/// `wait <id>` or `wait --any`, `[--timeout SECS] [--project P]` — exactly
-/// one of `<id>` / `--any`.
+/// `wait <id>`, `wait --any`, or `wait --any <id>...`,
+/// `[--timeout SECS] [--project P]`. Ids without `--any` take exactly one.
+/// Ids with it wait on exactly those cards.
 fn parse_kanban_wait(
     args: &[String],
     default_project: Option<String>,
 ) -> Result<KanbanAction, String> {
     let mut project = default_project;
-    let mut id: Option<String> = None;
+    let mut ids: Vec<String> = Vec::new();
     let mut any = false;
     let mut timeout: Option<u64> = None;
     let mut i = 0;
@@ -1472,19 +1473,19 @@ fn parse_kanban_wait(
             }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => {
-                if id.is_some() {
-                    return Err(format!("unexpected argument: {other}"));
-                }
-                id = Some(other.to_string());
+                ids.push(other.to_string());
                 i += 1;
             }
         }
     }
-    let target = match (id, any) {
-        (Some(_), true) => return Err("give either <id> or --any, not both".into()),
-        (Some(id), false) => crate::kanban::WaitTarget::Id(id),
-        (None, true) => crate::kanban::WaitTarget::Any,
-        (None, false) => return Err("wait needs <id> or --any".into()),
+    let target = match (ids.len(), any) {
+        (0, true) => crate::kanban::WaitTarget::Any,
+        (_, true) => crate::kanban::WaitTarget::AnyOf(ids),
+        (1, false) => crate::kanban::WaitTarget::Id(ids.remove(0)),
+        (0, false) => return Err("wait needs <id> or --any".into()),
+        (_, false) => {
+            return Err("wait takes one <id>; use --any <id>... to wait on several".into());
+        }
     };
     Ok(KanbanAction::Wait {
         project,
@@ -1635,7 +1636,7 @@ foreman kanban rm <id> [--project P]
 foreman kanban cut <name> [--release] [--project P]
 foreman kanban uncut <name> [--project P]
 foreman kanban wait <id> [--timeout SECS] [--project P]
-foreman kanban wait --any [--timeout SECS] [--project P]
+foreman kanban wait --any [<id>...] [--timeout SECS] [--project P]
 foreman kanban worktrees [--stray] [--json] [--project P]
 foreman kanban integrate <id> [--cancel] [--json] [--project P]
 
@@ -1737,7 +1738,10 @@ focused project).
   wait    poll (client-side, no pipe verb) until the card (or, with --any,
           any card seen InProgress) reaches Done, Blocked, or orphaned, or
           is removed — or, for wait <id>, until its integration is handed
-          back. --timeout SECS bounds the wait; queued and integrating are
+          back. --any <id>... watches exactly those cards and decides at
+          once on one already finished, so a card that finished between two
+          waits is not missed (bare --any never sees it). --timeout SECS
+          bounds the wait; queued and integrating are
           still pending. On a verdict it prints the deciding card's list
           line (<id>  removed if it vanished); when the integration was
           handed back it adds an integration: {...} JSON line.
@@ -2528,8 +2532,27 @@ mod tests {
         };
         assert_eq!(target, crate::kanban::WaitTarget::Any);
 
-        assert!(parse_kanban_args(&s(&["wait", "a1", "--any"]), None, None).is_err());
+        assert!(parse_kanban_args(&s(&["wait", "a1", "a2"]), None, None).is_err());
         assert!(parse_kanban_args(&s(&["wait"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_wait_any_with_ids_waits_on_exactly_those_cards() {
+        let target =
+            match parse_kanban_args(&s(&["wait", "--any", "a1", "b2"]), None, None).unwrap() {
+                KanbanAction::Wait { target, .. } => target,
+                _ => panic!("expected a wait"),
+            };
+        assert_eq!(
+            target,
+            crate::kanban::WaitTarget::AnyOf(vec!["a1".into(), "b2".into()])
+        );
+        // ids may come before --any too
+        let target = match parse_kanban_args(&s(&["wait", "a1", "--any"]), None, None).unwrap() {
+            KanbanAction::Wait { target, .. } => target,
+            _ => panic!("expected a wait"),
+        };
+        assert_eq!(target, crate::kanban::WaitTarget::AnyOf(vec!["a1".into()]));
     }
 
     #[test]

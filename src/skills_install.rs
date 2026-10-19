@@ -133,6 +133,13 @@ const KANBAN_REFERENCE: &str =
     include_str!("../.claude/skills/foreman-kanban/worktrees-and-integration.md");
 const CODEX_KANBAN_REFERENCE: &str =
     include_str!("../.codex/skills/foreman-kanban/worktrees-and-integration.md");
+/// The plan-orchestration loop, kept out of SKILL.md so card workers, who
+/// never orchestrate, do not carry it.
+const KANBAN_ORCHESTRATION_PATH: &str = "orchestrating-plans.md";
+const KANBAN_ORCHESTRATION: &str =
+    include_str!("../.claude/skills/foreman-kanban/orchestrating-plans.md");
+const CODEX_KANBAN_ORCHESTRATION: &str =
+    include_str!("../.codex/skills/foreman-kanban/orchestrating-plans.md");
 
 #[derive(Clone, Copy)]
 struct SkillBundle {
@@ -168,7 +175,10 @@ const CLAUDE_SKILLS: &[SkillBundle] = &[
         name: "foreman-kanban",
         skill_md: KANBAN_SKILL,
         openai_yaml: None,
-        references: &[(KANBAN_REFERENCE_PATH, KANBAN_REFERENCE)],
+        references: &[
+            (KANBAN_REFERENCE_PATH, KANBAN_REFERENCE),
+            (KANBAN_ORCHESTRATION_PATH, KANBAN_ORCHESTRATION),
+        ],
     },
 ];
 
@@ -196,7 +206,10 @@ const CODEX_SKILLS: &[SkillBundle] = &[
         name: "foreman-kanban",
         skill_md: CODEX_KANBAN_SKILL,
         openai_yaml: Some(CODEX_KANBAN_OPENAI),
-        references: &[(KANBAN_REFERENCE_PATH, CODEX_KANBAN_REFERENCE)],
+        references: &[
+            (KANBAN_REFERENCE_PATH, CODEX_KANBAN_REFERENCE),
+            (KANBAN_ORCHESTRATION_PATH, CODEX_KANBAN_ORCHESTRATION),
+        ],
     },
 ];
 
@@ -458,6 +471,22 @@ mod tests {
             std::fs::write(&reference, "stale").unwrap();
             let again = install_into(&dir, skills, OBSOLETE_SKILLS).unwrap();
             assert_eq!(again.written, vec!["foreman-kanban"], "{label}");
+        }
+    }
+
+    #[test]
+    fn install_into_ships_the_plan_orchestration_reference_the_skill_points_at() {
+        for (label, skills) in [("claude", CLAUDE_SKILLS), ("codex", CODEX_SKILLS)] {
+            let dir = temp(&format!("install-orchestration-{label}"));
+            install_into(&dir, skills, OBSOLETE_SKILLS).unwrap();
+            let kanban = dir.join("foreman-kanban");
+            let content = std::fs::read_to_string(kanban.join("orchestrating-plans.md"));
+            assert!(
+                content.expect(label).contains("review the worker"),
+                "{label}"
+            );
+            let skill = std::fs::read_to_string(kanban.join("SKILL.md")).unwrap();
+            assert!(skill.contains("orchestrating-plans.md"), "{label}");
         }
     }
 
