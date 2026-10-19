@@ -1228,12 +1228,14 @@ fn parse_kanban_edit(
     }))
 }
 
-/// `list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]`.
+/// `list [<id>] [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]`.
+/// An `<id>` lists that one card, shipped or not.
 fn parse_kanban_list(
     args: &[String],
     default_project: Option<String>,
 ) -> Result<KanbanAction, String> {
     let mut project = default_project;
+    let mut id: Option<String> = None;
     let mut state: Option<String> = None;
     let mut json = false;
     let mut shipped: Option<String> = None;
@@ -1268,8 +1270,18 @@ fn parse_kanban_list(
                 i += 1;
             }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other if id.is_none() => {
+                id = Some(other.to_string());
+                i += 1;
+            }
             other => return Err(format!("unexpected argument: {other}")),
         }
+    }
+    if id.is_some() && (all || shipped.is_some() || state.is_some()) {
+        return Err(
+            "list <id> names one card in any state; it cannot combine with --state, --shipped, or --all"
+                .into(),
+        );
     }
     if all && (shipped.is_some() || state.is_some()) {
         return Err("--all lists every card; it cannot combine with --shipped or --state".into());
@@ -1281,6 +1293,7 @@ fn parse_kanban_list(
         cmd: "kanban".into(),
         action: "list".into(),
         project,
+        id,
         state,
         json,
         name: shipped,
@@ -1613,6 +1626,7 @@ const HELP_KANBAN: &str = "\
 foreman kanban add <title words...> [--body B] [--project P]
 foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N] [--project P]
 foreman kanban list [--state backlog|in_progress|blocked|done] [--shipped NAME] [--all] [--json] [--project P]
+foreman kanban list <id> [--json] [--project P]
 foreman kanban start <id> [--project P]
 foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree] [--project P]
 foreman kanban done <id> [--project P]
@@ -1650,6 +1664,7 @@ focused project).
           are hidden, and a shipped card's line ends [shipped NAME].
           --shipped NAME lists that Version only (case-insensitive; unknown
           name = empty, exit 0). --all includes every shipped card.
+          list <id> prints only that card, in any state or Version.
   worktrees
           every worktree foreman made for the project (git's list filtered
           to .foreman/worktrees/, plus any tree a card still points at),
@@ -1723,7 +1738,9 @@ focused project).
           any card seen InProgress) reaches Done, Blocked, or orphaned, or
           is removed — or, for wait <id>, until its integration is handed
           back. --timeout SECS bounds the wait; queued and integrating are
-          still pending.
+          still pending. On a verdict it prints the deciding card's list
+          line (<id>  removed if it vanished); when the integration was
+          handed back it adds an integration: {...} JSON line.
 Exit codes for add/list/start/dispatch/edit/done/block/rm/cut/uncut/integrate: 0 ok,
 1 refused/unreachable, 2 bad arguments.
 Exit codes for wait: 0 the watched card finished (Done), 1 it needs a human
@@ -2012,8 +2029,11 @@ fn kanban_wait_with(
                     .iter()
                     .filter_map(|l| serde_json::from_str(l).ok())
                     .collect();
-                if let Some(code) = crate::kanban::wait_verdict(&target, &mut watched, &cards) {
-                    return code;
+                if let Some(v) = crate::kanban::wait_verdict(&target, &mut watched, &cards) {
+                    for line in crate::kanban::wait_report(&v, &cards) {
+                        println!("{line}");
+                    }
+                    return v.code;
                 }
             }
         }
@@ -2334,6 +2354,33 @@ mod tests {
         let e = parse_kanban_args(&s(&["edit", "a1", "--title", "  "]), None, None).unwrap_err();
         assert!(e.contains("title"), "{e}");
         assert!(parse_kanban_args(&s(&["edit", "--title", "x"]), None, None).is_err());
+    }
+
+    #[test]
+    fn parse_kanban_args_list_one_card_by_id() {
+        let req = match parse_kanban_args(&s(&["list", "a3f8k2", "--json"]), None, None).unwrap() {
+            KanbanAction::Request(r) => r,
+            _ => panic!("expected a request"),
+        };
+        assert_eq!(req.id.as_deref(), Some("a3f8k2"));
+        assert!(req.json);
+        // An id names one card in any state or Version; the board filters
+        // would silently contradict it.
+        for extra in [&["--state", "done"][..], &["--shipped", "v1"], &["--all"]] {
+            let mut args = vec!["list", "a3f8k2"];
+            args.extend_from_slice(extra);
+            assert!(
+                parse_kanban_args(&s(&args), None, None).is_err(),
+                "{extra:?}"
+            );
+        }
+        assert!(parse_kanban_args(&s(&["list", "a1", "b2"]), None, None).is_err());
+        // The id rides the existing optional field: v1 list stays minimal.
+        let j = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            j,
+            r#"{"cmd":"kanban","action":"list","id":"a3f8k2","json":true}"#
+        );
     }
 
     #[test]

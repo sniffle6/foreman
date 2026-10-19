@@ -50,6 +50,13 @@ The room's interface is small; the behaviour behind it is not.
   broadcast instead of erroring (the input line has no error seat).
 - **`join(id, name)`** — idempotent register + a `Joined` line. The engine calls
   it when it dispatches a terminal (auto-join).
+- **`join_receiving(id, name, reception)`** — `join` with an explicit
+  **Reception**. A `TargetedOnly` member is skipped by broadcasts (its cursor
+  still advances past them) and receives only posts whose to-set names it.
+  `kanban dispatch` and the board's "Start with" join card workers this way:
+  each delivery costs the receiving agent a full turn, and a card worker's
+  prompt is its card, not the room. Free-form `foreman open` workers still
+  receive everything.
 - **`tick(project, live) -> Vec<Delivery>`** — the per-frame heart. `live` is the
   set of terminals the engine sees this frame (identity, name, readiness, exit,
   and agent state). The
@@ -139,7 +146,8 @@ The engine adapter (`src/wm.rs`):
   `crew`/`is_member`/`history`/`blocks`), `LiveMember`, `Delivery`, and the inner
   `ChatLog` it composes (`deliver_after`, `frame`, seq). All unit-tested here.
 - `src/wm.rs` — the adapter: `chat_tick` (per-frame reconcile + inject),
-  `chat_post_now` / `chat_post_human` (thin), auto-join in `add_terminal_cmd`,
+  `chat_post_now` / `chat_post_human` (thin), auto-join in `add_terminal_cmd`
+  (targeted-only for card workers via `add_terminal_receiving`),
   membership in `status_dispatch`, the `Content::Chat` viewer pull,
   `drain_chat_clicks` (resolve click → window by id).
 - `src/chat_view.rs` — the dispatcher's-desk window: `ChatView::show` renders

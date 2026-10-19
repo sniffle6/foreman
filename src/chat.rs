@@ -483,6 +483,18 @@ impl ChatView {
     }
 }
 
+/// Which posts a member's PTY is woken for. Every delivery costs the
+/// receiving agent a full turn, so a member that is not part of the
+/// conversation hears only posts addressed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reception {
+    /// Broadcasts and posts that target this member.
+    Everything,
+    /// Only posts that target this member (`--to` / leading `@tX`). Card
+    /// workers join this way: their prompt is the card, not the room.
+    TargetedOnly,
+}
+
 /// One member's room-side state, keyed by the `tN`/`you` id.
 struct MemberState {
     name: String,
@@ -492,6 +504,7 @@ struct MemberState {
     delivered: std::collections::BTreeSet<u64>,
     exited: bool,
     is_human: bool,
+    reception: Reception,
 }
 
 /// A live member's presence as the wiring phase observes it each frame
@@ -547,6 +560,7 @@ impl ChatRoom {
                 delivered: Default::default(),
                 exited: false,
                 is_human: true,
+                reception: Reception::Everything,
             },
         ));
         room
@@ -633,6 +647,12 @@ impl ChatRoom {
     /// append one `Joined` sys line; a second call for a present id is a
     /// no-op. Used by dispatch auto-join.
     pub fn join(&mut self, id: &str, name: &str) {
+        self.join_receiving(id, name, Reception::Everything);
+    }
+
+    /// [`Self::join`] with an explicit [`Reception`]. A present id keeps the
+    /// reception it joined with.
+    pub fn join_receiving(&mut self, id: &str, name: &str, reception: Reception) {
         if self.member(id).is_some() {
             return; // already a member: no duplicate Joined line
         }
@@ -644,6 +664,7 @@ impl ChatRoom {
                 delivered: Default::default(),
                 exited: false,
                 is_human: false,
+                reception,
             },
         ));
         self.log.sys(ChatKind::Joined, id, name);
@@ -738,6 +759,7 @@ impl ChatRoom {
                 continue; // just reconciled exited this tick
             }
             let mut cursor = state.cursor;
+            let reception = state.reception;
             let delivered = &mut state.delivered;
             let mut lines = Vec::new();
             // Hold in the log, so framing uses the actual delivery time. Urgent
@@ -745,7 +767,11 @@ impl ChatRoom {
             for msg in self.log.msgs.iter().skip(cursor as usize) {
                 let addressed = msg.kind == ChatKind::Post
                     && msg.from != l.id
-                    && (msg.to.is_empty() || msg.to.contains(&l.id));
+                    && if msg.to.is_empty() {
+                        reception == Reception::Everything
+                    } else {
+                        msg.to.contains(&l.id)
+                    };
                 let allowed = match l.agent_state {
                     None | Some(crate::agent_state::AgentState::Idle) => true,
                     Some(crate::agent_state::AgentState::Working) => msg.now,
@@ -1179,6 +1205,33 @@ mod tests {
         // a second tick with no new posts delivers nothing.
         let d2 = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
         assert!(d2.is_empty(), "cursor advanced; nothing re-delivered");
+    }
+
+    #[test]
+    fn targeted_only_member_receives_mentions_but_never_broadcasts() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "orchestrator");
+        room.join_receiving("t2", "card worker", Reception::TargetedOnly);
+        room.post("t1", "everyone listen", &[], None).expect("ok");
+        room.post_human("human broadcast").expect("seq");
+        room.post("t1", "@t2 rebase first", &[], None).expect("ok");
+        room.post_human("@t2 from the human").expect("seq");
+        let d = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        let t2 = d.iter().find(|x| x.id == "t2").expect("t2 delivery");
+        assert_eq!(
+            t2.lines,
+            vec![
+                "[chat p1 #5] t1→t2: @t2 rebase first",
+                "[chat p1 #6] you→t2: @t2 from the human",
+            ]
+        );
+        // The skipped broadcasts still advance the cursor: nothing replays.
+        room.post("t1", "another broadcast", &[], None).expect("ok");
+        let d = room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        assert!(d.iter().all(|x| x.id != "t2"), "broadcast never reaches t2");
+        // A targeted-only member is still a valid target and can post.
+        assert!(room.is_member("t2"));
+        room.post("t2", "@t1 done", &[], None).expect("t2 posts");
     }
 
     #[test]

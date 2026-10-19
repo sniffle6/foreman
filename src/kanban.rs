@@ -1723,7 +1723,7 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
              \x20   {cli} kanban integrate {id}\n\
              \x20   {cli} kanban wait {id} --timeout 1800\n\
              wait exit 0: Foreman ran the project checks, fast-forwarded {base} to your branch, put the checkout back on {base}, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: a check failed or {base} moved. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it here (for a moved base: git rebase {base}, resolving any conflicts; if git refuses because of uncommitted changes that are not yours, block instead), commit, then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: a check failed or {base} moved. wait prints the reason on its integration line ({cli} kanban list {id} --json shows it again), fix it here (for a moved base: git rebase {base}, resolving any conflicts; if git refuses because of uncommitted changes that are not yours, block instead), commit, then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n",
             id = card.id,
             branch = wt.branch,
@@ -1739,7 +1739,7 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
              \x20   {cli} kanban integrate {id}\n\
              \x20   {cli} kanban wait {id} --timeout 1800\n\
              wait exit 0: Foreman rebased onto {base}, ran the project checks, fast-forwarded {base}, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: the rebase conflicted or a check failed. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: the rebase conflicted or a check failed. wait prints the reason on its integration line ({cli} kanban list {id} --json shows it again), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n",
             id = card.id,
             base = wt.base,
@@ -1847,6 +1847,34 @@ pub enum WaitTarget {
 /// its own card can branch on it.
 pub const WAIT_NEEDS_RESOLUTION: i32 = 3;
 
+/// A finished wait: the exit code and the card that decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitVerdict {
+    pub code: i32,
+    pub card: String,
+}
+
+/// What `foreman kanban wait` prints when it finishes: the deciding card's
+/// `list` line, so an orchestrator never re-lists the whole board to learn
+/// which card moved. A handed-back integration adds its view as one JSON
+/// line, which is what the worker needs to fix it. A card that vanished
+/// prints `<id>  removed`.
+pub fn wait_report(verdict: &WaitVerdict, cards: &[CardLine]) -> Vec<String> {
+    let Some(line) = cards.iter().find(|c| c.card.id == verdict.card) else {
+        return vec![format!("{}  removed", verdict.card)];
+    };
+    let mut out = vec![line.human_line()];
+    if verdict.code == WAIT_NEEDS_RESOLUTION
+        && let Some(i) = &line.integration
+    {
+        out.push(format!(
+            "integration: {}",
+            serde_json::to_string(i).unwrap_or_default()
+        ));
+    }
+    out
+}
+
 /// Pure verdict function the CLI wait loop (Task 2) drives on every poll.
 /// `Id`: Done -> exit 0; Blocked/orphaned/missing -> exit 1 (something needs
 /// a human); integration handed back -> exit [`WAIT_NEEDS_RESOLUTION`];
@@ -1855,24 +1883,31 @@ pub const WAIT_NEEDS_RESOLUTION: i32 = 3;
 /// sight, then each watched id is checked the same way — a card sitting in
 /// Backlog is never watched and so never triggers. `Any` ignores handed-back
 /// integrations: that is the live worker's job, not the orchestrator's.
+/// The verdict names the card that decided it.
 pub fn wait_verdict(
     target: &WaitTarget,
     watched: &mut std::collections::HashSet<String>,
     cards: &[CardLine],
-) -> Option<i32> {
+) -> Option<WaitVerdict> {
+    let verdict = |code: i32, card: &str| {
+        Some(WaitVerdict {
+            code,
+            card: card.to_string(),
+        })
+    };
     match target {
         WaitTarget::Id(id) => match cards.iter().find(|c| &c.card.id == id) {
-            None => Some(1), // removed under the waiter
+            None => verdict(1, id), // removed under the waiter
             Some(c) => match c.card.state {
-                CardState::Done => Some(0),
-                CardState::Blocked => Some(1),
-                _ if c.orphaned => Some(1),
+                CardState::Done => verdict(0, id),
+                CardState::Blocked => verdict(1, id),
+                _ if c.orphaned => verdict(1, id),
                 _ if c
                     .integration
                     .as_ref()
                     .is_some_and(|i| i.phase == crate::integrate::Phase::NeedsResolution) =>
                 {
-                    Some(WAIT_NEEDS_RESOLUTION)
+                    verdict(WAIT_NEEDS_RESOLUTION, id)
                 }
                 CardState::Backlog | CardState::InProgress => None,
             },
@@ -1883,13 +1918,17 @@ pub fn wait_verdict(
                     watched.insert(c.card.id.clone());
                 }
             }
-            for id in watched.iter() {
+            // Sorted so two cards finishing between polls report the same
+            // one every time; the other surfaces on the next wait.
+            let mut ids: Vec<&String> = watched.iter().collect();
+            ids.sort();
+            for id in ids {
                 match cards.iter().find(|c| &c.card.id == id) {
-                    None => return Some(1),
+                    None => return verdict(1, id),
                     Some(c) => match c.card.state {
-                        CardState::Done => return Some(0),
-                        CardState::Blocked => return Some(1),
-                        _ if c.orphaned => return Some(1),
+                        CardState::Done => return verdict(0, id),
+                        CardState::Blocked => return verdict(1, id),
+                        _ if c.orphaned => return verdict(1, id),
                         _ => {}
                     },
                 }
@@ -3792,6 +3831,7 @@ mod tests {
             "    foreman kanban wait e9e9e9 --timeout 1800\n",
             "put the checkout back on main",
             "for a moved base: git rebase main",
+            "wait prints the reason on its integration line (foreman kanban list e9e9e9 --json shows it again)",
             "Do not end the session without the card Done (by the queue) or blocked.",
         ] {
             assert!(p.contains(want), "missing {want:?} in:\n{p}");
@@ -4316,7 +4356,7 @@ mod tests {
              \x20   foreman kanban integrate a3f8k2\n\
              \x20   foreman kanban wait a3f8k2 --timeout 1800\n\
              wait exit 0: Foreman rebased onto main, ran the project checks, fast-forwarded main, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: the rebase conflicted or a check failed. Read the reason with foreman kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: the rebase conflicted or a check failed. wait prints the reason on its integration line (foreman kanban list a3f8k2 --json shows it again), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n\
              If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
              Do not end the session without the card Done (by the queue) or blocked."
@@ -4336,7 +4376,7 @@ mod tests {
         assert!(s.contains(
             "    & $env:FOREMAN_EXE kanban integrate a3f8k2\n    & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 1800\n"
         ));
-        assert!(s.contains("Read the reason with & $env:FOREMAN_EXE kanban list --json"));
+        assert!(s.contains("(& $env:FOREMAN_EXE kanban list a3f8k2 --json shows it again)"));
         assert!(s.contains(
             "If you are stuck and need a human: & $env:FOREMAN_EXE kanban block a3f8k2 --reason \"<one line>\"\n"
         ));
@@ -5258,28 +5298,37 @@ mod tests {
         );
     }
 
+    /// The exit code alone, for the verdict-table tests.
+    fn wait_code(
+        target: &WaitTarget,
+        watched: &mut std::collections::HashSet<String>,
+        cards: &[CardLine],
+    ) -> Option<i32> {
+        wait_verdict(target, watched, cards).map(|v| v.code)
+    }
+
     #[test]
     fn wait_verdict_by_id_covers_every_row() {
         let mut watched = std::collections::HashSet::new();
         let target = WaitTarget::Id("a1".into());
 
         let cards = vec![line_with_state("a1", CardState::Done, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(0));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(0));
 
         let cards = vec![line_with_state("a1", CardState::Blocked, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1));
 
         let cards = vec![line_with_state("a1", CardState::InProgress, true)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1)); // orphaned
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1)); // orphaned
 
         let cards: Vec<CardLine> = vec![]; // removed under the waiter
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1));
 
         let cards = vec![line_with_state("a1", CardState::Backlog, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
 
         let cards = vec![line_with_state("a1", CardState::InProgress, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
     }
 
     fn line_integrating(id: &str, phase: crate::integrate::Phase) -> CardLine {
@@ -5309,26 +5358,22 @@ mod tests {
         // queued / integrating: still pending
         for phase in [Phase::Queued, Phase::Integrating, Phase::Integrated] {
             let cards = vec![line_integrating("a1", phase)];
-            assert_eq!(
-                wait_verdict(&target, &mut watched, &cards),
-                None,
-                "{phase:?}"
-            );
+            assert_eq!(wait_code(&target, &mut watched, &cards), None, "{phase:?}");
         }
         let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
         assert_eq!(
-            wait_verdict(&target, &mut watched, &cards),
+            wait_code(&target, &mut watched, &cards),
             Some(WAIT_NEEDS_RESOLUTION)
         );
         // an orphaned worker outranks its handed-back integration
         let mut orphaned = line_integrating("a1", Phase::NeedsResolution);
         orphaned.orphaned = true;
-        assert_eq!(wait_verdict(&target, &mut watched, &[orphaned]), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &[orphaned]), Some(1));
         // --any leaves resolution to the live worker
         let any = WaitTarget::Any;
         let mut watched = std::collections::HashSet::new();
         let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
-        assert_eq!(wait_verdict(&any, &mut watched, &cards), None);
+        assert_eq!(wait_code(&any, &mut watched, &cards), None);
         assert!(watched.contains("a1"));
     }
 
@@ -5352,6 +5397,47 @@ mod tests {
     }
 
     #[test]
+    fn wait_any_names_the_card_that_moved_and_reports_only_that_card() {
+        let target = WaitTarget::Any;
+        let mut watched = std::collections::HashSet::new();
+        let cards = vec![
+            line_with_state("a1", CardState::InProgress, false),
+            line_with_state("a2", CardState::InProgress, false),
+        ];
+        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        let cards = vec![
+            line_with_state("a1", CardState::InProgress, false),
+            line_with_state("a2", CardState::Done, false),
+        ];
+        let v = wait_verdict(&target, &mut watched, &cards).expect("a2 moved");
+        assert_eq!(
+            v,
+            WaitVerdict {
+                code: 0,
+                card: "a2".into()
+            }
+        );
+        assert_eq!(wait_report(&v, &cards), vec![cards[1].human_line()]);
+    }
+
+    #[test]
+    fn wait_report_carries_the_integration_hand_back_and_removals() {
+        let mut line = line_integrating("a1", crate::integrate::Phase::NeedsResolution);
+        line.integration.as_mut().unwrap().detail = Some("cargo test failed".into());
+        let cards = vec![line.clone()];
+        let mut watched = std::collections::HashSet::new();
+        let v = wait_verdict(&WaitTarget::Id("a1".into()), &mut watched, &cards).unwrap();
+        assert_eq!(v.code, WAIT_NEEDS_RESOLUTION);
+        let integration = serde_json::to_string(line.integration.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            wait_report(&v, &cards),
+            vec![line.human_line(), format!("integration: {integration}")]
+        );
+        let v = wait_verdict(&WaitTarget::Id("gone".into()), &mut watched, &cards).unwrap();
+        assert_eq!(wait_report(&v, &cards), vec!["gone  removed".to_string()]);
+    }
+
+    #[test]
     fn wait_verdict_any_watches_a_card_only_after_seeing_it_in_progress() {
         let mut watched = std::collections::HashSet::new();
         let target = WaitTarget::Any;
@@ -5359,31 +5445,31 @@ mod tests {
         // Sitting in Backlog: never watched, never triggers even once Done
         // (it skipped being observed InProgress).
         let cards = vec![line_with_state("b1", CardState::Backlog, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
         assert!(watched.is_empty());
 
         // Now it's seen InProgress: watched, but still in-flight so None.
         let cards = vec![line_with_state("b1", CardState::InProgress, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
         assert!(watched.contains("b1"));
 
         // Transitions to Done: triggers.
         let cards = vec![line_with_state("b1", CardState::Done, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(0));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(0));
 
         // A separately-watched card going Blocked also triggers.
         let mut watched2 = std::collections::HashSet::new();
         let cards = vec![line_with_state("c1", CardState::InProgress, false)];
-        wait_verdict(&target, &mut watched2, &cards);
+        wait_code(&target, &mut watched2, &cards);
         let cards = vec![line_with_state("c1", CardState::Blocked, false)];
-        assert_eq!(wait_verdict(&target, &mut watched2, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched2, &cards), Some(1));
 
         // And going missing (removed under the waiter) also triggers.
         let mut watched3 = std::collections::HashSet::new();
         let cards = vec![line_with_state("d1", CardState::InProgress, false)];
-        wait_verdict(&target, &mut watched3, &cards);
+        wait_code(&target, &mut watched3, &cards);
         let cards: Vec<CardLine> = vec![];
-        assert_eq!(wait_verdict(&target, &mut watched3, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched3, &cards), Some(1));
     }
 
     const PORCELAIN: &str = "worktree H:/repo\n\

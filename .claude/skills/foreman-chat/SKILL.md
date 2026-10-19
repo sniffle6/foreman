@@ -14,6 +14,10 @@ terminal as typed input** — push, not pull; members never poll. The
 transcript is the roster (`tX` ids on every line). The human watches and
 posts through the project's chat window.
 
+**Cost rule: target by default.** Every delivered post costs each receiver a
+full agent turn. Broadcast only when every member must act; otherwise use
+`--to tX` or a leading `@tX`.
+
 ## Recipe: post / read / target
 
     & $env:FOREMAN_EXE chat "claiming src/wm.rs"          # broadcast post
@@ -49,10 +53,10 @@ Delivery timing:
 
 **Workers for kanban cards or a plan are not dispatched this way.** Use
 `kanban dispatch` (foreman-kanban skill) — `open` below skips the card claim,
-worktree, and integration queue. Card workers still auto-join the room, but
-their card prompt says nothing about chat, so none of the etiquette below
-reaches them: expect no replies from them, and post to one only with a
-targeted `--to tX` when you must steer it.
+worktree, and integration queue. Card workers are members that hear only
+posts targeting them: broadcasts, including `--now` broadcasts, never reach
+them. They can still post. Their card prompt says nothing about chat, so
+expect no replies; steer one with `--to tX` (add `--now` if it is Working).
 
 Provider mix rule (for chat teams of free-form `open` workers, not cards): when dispatching agents into a Foreman chat room, use BOTH
 providers by default no matter whether the orchestrator is Claude or Codex.
@@ -75,9 +79,9 @@ or one CLI is unavailable.
        into EVERY member's session and costs their attention, so keep posts
        to 1-3 sentences peers must act on: claims, blockers, handoffs,
        done-signals. Never paste reports or findings lists into chat - post
-       the one-line conclusion and where the detail lives. When only some
-       members need to act, target them: chat --to t3 "..." or a leading
-       @t3. Post with & $env:FOREMAN_EXE chat "..." (PowerShell; bash:
+       the one-line conclusion and where the detail lives. Target by
+       default - chat --to t3 "..." or a leading @t3 - and broadcast only
+       when every member must act. Post with & $env:FOREMAN_EXE chat "..." (PowerShell; bash:
        "$FOREMAN_EXE" chat "..."). You RECEIVE every post automatically as
        typed input - do NOT poll history on a timer; use
        & $env:FOREMAN_EXE chat --history only to catch up after heads-down
@@ -105,7 +109,8 @@ or one CLI is unavailable.
    kickoff deadlocks: all workers wait for someone else to open. ALWAYS
    seed the room with ONE post naming the opener by real id (e.g.
    `chat "@t3 you open: <topic>"`), then stay quiet and watch — your own
-   session receives their posts.
+   session receives their posts. Steer one worker with a targeted post; a
+   broadcast wakes every worker for a full turn.
 
 For a debate/discussion fleet, put explicit turn rules in the prompts (this
 exact shape produced a clean 8-post consensus live): "Post in turns: t-first
@@ -115,7 +120,8 @@ and you both stop."
 
 ## Facts and traps
 
-- Membership: dispatched workers auto-join; any other terminal joins on its
+- Membership: dispatched workers auto-join; `kanban dispatch` card workers
+  join hearing targeted posts only; any other terminal joins on its
   first post; `--history` never joins. `-p` workers can post but not receive.
 - Interactive workers never auto-exit. A finished worker posts its done-signal,
   then may close its OWN pane with & $env:FOREMAN_EXE close (kills its whole

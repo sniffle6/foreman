@@ -15,6 +15,10 @@ One chat room exists per Foreman project. Posts are injected into every member's
 terminal as typed input. Members do not poll. The transcript is the roster:
 every line carries a `tN` terminal id.
 
+**Cost rule: target by default.** Every delivered post costs each receiver a
+full agent turn. Broadcast only when every member must act; otherwise use
+`--to tN` or a leading `@tN`.
+
 ## Post / Read / Target
 
 PowerShell:
@@ -63,10 +67,10 @@ are non-interactive and exit on completion.
 
 **Workers for kanban cards or a plan are not dispatched this way.** Use
 `kanban dispatch` (foreman-kanban skill) — `open` below skips the card claim,
-worktree, and integration queue. Card workers still auto-join the room, but
-their card prompt says nothing about chat, so none of the etiquette below
-reaches them: expect no replies from them, and post to one only with a
-targeted `--to tN` when you must steer it.
+worktree, and integration queue. Card workers are members that hear only
+posts targeting them: broadcasts, including `--now` broadcasts, never reach
+them. They can still post. Their card prompt says nothing about chat, so
+expect no replies; steer one with `--to tN` (add `--now` if it is Working).
 
 Provider mix rule (for chat teams of free-form `open` workers, not cards): when dispatching agents into a Foreman chat room, use BOTH
 providers by default no matter whether the orchestrator is Codex or Claude.
@@ -85,7 +89,8 @@ Worker-prompt rules (put these in every worker prompt, or fleets stall):
 - Keep posts to 1-3 sentences peers must act on: claims, blockers, handoffs,
   done-signals. Never paste reports or findings lists — post the one-line
   conclusion and where the detail lives.
-- Target with `--to tN` or a leading `@tN` when only some members must act.
+- Target by default with `--to tN` or a leading `@tN`; broadcast only when
+  every member must act.
 - Do not poll history on a timer; `--history` is catch-up after heads-down
   work. Posts arrive as typed input.
 - When your part is done, post a one-line done-signal ending with `@you` if
@@ -112,6 +117,9 @@ room with one post naming the opener, using the real ids:
 & $env:FOREMAN_EXE chat "@t3 you open: review wm.rs; @t4 review terminal.rs"
 ```
 
+Steer one worker with a targeted post; a broadcast wakes every worker for a
+full turn.
+
 For debate/discussion fleets, put explicit turn rules in each prompt:
 "Post in turns. First worker opens, second responds, then alternate. Maximum N
 posts each. When you agree, the current speaker posts a line starting CONSENSUS:
@@ -119,7 +127,8 @@ and both stop."
 
 ## Facts And Traps
 
-- Dispatched interactive workers auto-join. Any other terminal joins on first
+- Dispatched interactive workers auto-join. `kanban dispatch` card workers
+  join hearing targeted posts only. Any other terminal joins on first
   post. `--history` never joins.
 - A post fired at the same instant a worker spawns can be eaten by shell startup.
   Wait for the open reply and give the pane a moment before a kickoff post.

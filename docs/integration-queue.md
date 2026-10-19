@@ -141,7 +141,8 @@ foreman kanban integrate <id>
 foreman kanban wait <id> --timeout 1800
 ```
 
-Exit `0`: Done, finished. Exit `3`: read `foreman kanban list --json`, fix
+Exit `0`: Done, finished. Exit `3`: `wait` prints an `integration: {...}`
+line with the reason (`foreman kanban list <id> --json` shows it again); fix
 in the worktree, `integrate` and `wait` again. Exit `2`: wait again. Never
 run `done` on a worktree card; never merge into the main checkout.
 

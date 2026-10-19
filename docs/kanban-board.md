@@ -233,6 +233,7 @@ foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
 foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N]
                                           # at least one of the four; --plan "" clears
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
+foreman kanban list <id> [--json]         # one card, any state or Version
 foreman kanban start <id>                 # claim a card yourself
 foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree]
                                           # the board's "Start with": spawn + claim
@@ -249,7 +250,11 @@ foreman kanban integrate <id> [--cancel] [--json]   # submit a worktree card to 
 
 `wait` exit codes: `0` Done, `1` Blocked / orphaned / removed (needs a
 human), `2` timeout or foreman unreachable, `3` (`wait <id>` only) its
-integration needs resolution. `foreman kanban --help` is ground
+integration needs resolution. On a verdict `wait` prints the deciding card's
+`list` line (`<id>  removed` if it vanished), and on `3` an
+`integration: {...}` JSON line with `reason`, `detail`, and `next`. That
+saves an orchestrator a whole-board `list --json` after every wait.
+`foreman kanban --help` is ground
 truth for flags. Agents not spawned from a card learn all of this from the
 embedded **foreman-kanban** skill.
 
