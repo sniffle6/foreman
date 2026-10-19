@@ -68,6 +68,15 @@ fires nothing and its rows show no badge.
 - **Codex sends a late `PostToolUse` after `Interrupt`.** That is why
   `PostToolUse` only ever moves Needs you to Working and never wakes an Idle
   Session.
+- **Codex's shared app-server daemon carries the wrong identity.** Since
+  Codex 0.157 every interactive TUI attaches to one daemon per `CODEX_HOME`, and
+  the daemon runs tools and hooks with the environment of the TUI that started
+  it. A second Codex Session then reported state and posted chat as the first
+  one (2026-10-19, p7 t7 as t5), and its own posts were delivered unheld while
+  it worked. `agent_command::codex_in_process` adds `--no-daemon` to every
+  interactive Codex Foreman spawns, which keeps the server in-process. The
+  flag needs Codex 0.156+; an older Codex rejects it and does not start. A
+  `codex` typed by hand in a shell pane still attaches to the daemon.
 - **Codex approvals were not captured** in the 2026-09-25 hook capture;
   `PermissionRequest` is documented but unverified for Codex.
 - **Big tool output.** The helper reads up to 16 MB of hook stdin because a

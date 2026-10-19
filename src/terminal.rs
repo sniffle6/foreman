@@ -877,6 +877,10 @@ impl Session {
                 "argv is empty",
             ));
         }
+        // The tab icon reads what was dispatched, not the flags added here.
+        let dispatched = argv;
+        let in_process = crate::agent_command::codex_in_process(argv);
+        let argv = in_process.as_deref().unwrap_or(argv);
         let build = |words: &[String]| {
             let mut c = CommandBuilder::new(&words[0]);
             for a in &words[1..] {
@@ -926,7 +930,7 @@ impl Session {
         };
         if let Some(resolved) = npm_codex() {
             let mut session = Self::spawn_with(build(&resolved), Shell::Cmd, ctx)?;
-            session.dispatch_argv = Some(argv.to_vec());
+            session.dispatch_argv = Some(dispatched.to_vec());
             return Ok(session);
         }
         if unsafe_for_cmd && is_batch {
@@ -941,7 +945,7 @@ impl Session {
             Self::spawn_with(build(&wrapped), Shell::Cmd, ctx)
         })?;
         // Remember what we dispatched so the tab can show the agent's logo.
-        session.dispatch_argv = Some(argv.to_vec());
+        session.dispatch_argv = Some(dispatched.to_vec());
         Ok(session)
     }
 
@@ -4300,7 +4304,7 @@ mod tests {
         .unwrap();
         let prompt = "# Task\r\nPreserve \"quotes\", %PATH%, & | < > ^, café and trailing \\";
         std::fs::write(bin.join("codex.js"), format!(
-            "const expected = {}; if (process.argv.length !== 3 || process.argv[2] !== expected) {{ console.log('BAD_ARGV'); process.exitCode = 1; }} else {{ console.log('NPM_PROMPT_PRESERVED'); }}",
+            "const expected = {}; if (process.argv.length !== 4 || process.argv[2] !== '--no-daemon' || process.argv[3] !== expected) {{ console.log('BAD_ARGV'); process.exitCode = 1; }} else {{ console.log('NPM_PROMPT_PRESERVED'); }}",
             serde_json::to_string(prompt).unwrap()
         )).unwrap();
         let env = vec![(
