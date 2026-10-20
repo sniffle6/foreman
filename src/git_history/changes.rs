@@ -1243,7 +1243,7 @@ mod tests {
         );
     }
     fn settle(ctx: &egui::Context, view: &mut ChangesView, active: bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         while view.request.is_some() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
             frame(ctx, view, active, vec![]);
@@ -1266,7 +1266,7 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
         let ctx = egui::Context::default();
         let mut view = ChangesView::new(Some(dir.to_path_buf()));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         // Until the watch is live and its catch-up read has landed.
         while (view.seen.is_none() || view.request.is_some()) && Instant::now() < deadline {
             frame(&ctx, &mut view, true, vec![]);
@@ -1372,7 +1372,7 @@ mod tests {
 
     /// Until the write and the re-read after it have both landed.
     fn settle_write(ctx: &egui::Context, view: &mut ChangesView) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         while (view.commit.busy() || view.request.is_some()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
             frame(ctx, view, true, vec![]);

@@ -724,7 +724,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::git_history::BACKGROUND_DEADLINE)
             .unwrap();
         assert!(matches!(result, Err(e) if e == "Invalid commit id"));
     }

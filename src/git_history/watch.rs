@@ -1020,7 +1020,7 @@ mod tests {
     /// Retry a filesystem call Windows refuses while another handle or
     /// process still has the path (os error 5 or 32).
     fn patiently(what: &str, f: impl Fn() -> std::io::Result<()>) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         loop {
             match f() {
                 Ok(()) => return,
@@ -1032,7 +1032,7 @@ mod tests {
         }
     }
     fn wait_until(what: &str, f: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         while !f() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
@@ -1142,7 +1142,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut follow = Follow::default();
         let until_live = |follow: &mut Follow, want: bool| {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
             while follow.live(Some(&dir), &ctx).is_some() != want {
                 assert!(Instant::now() < deadline, "live never became {want}");
                 std::thread::sleep(Duration::from_millis(20));

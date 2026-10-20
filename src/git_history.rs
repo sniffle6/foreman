@@ -1448,16 +1448,18 @@ fn columns(
     }
 }
 
+/// Upper bound for background git work to land, shared by every git_history
+/// test module. Each step spawns `git` processes, which cost ~0.1 s apiece on
+/// Windows and far more while the full suite runs 24 threads of PTY and git
+/// tests. A green test returns as soon as the work lands, so the bound only
+/// decides how long a real hang takes to fail; 10 s timed out healthy work
+/// under load.
+#[cfg(test)]
+pub(crate) const BACKGROUND_DEADLINE: Duration = Duration::from_secs(120);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Upper bound for background git work to land. Each step spawns `git`
-    /// processes, which cost ~0.1 s apiece on Windows and far more while the
-    /// full suite runs 24 threads of PTY and git tests. A green test returns
-    /// as soon as the work lands, so the bound only decides how long a real
-    /// hang takes to fail; 10 s timed out healthy work under load.
-    const BACKGROUND_DEADLINE: Duration = Duration::from_secs(120);
 
     #[test]
     fn commit_date_is_unpadded_twelve_hour_local() {

@@ -1205,10 +1205,11 @@ mod tests {
         git(dir, &["config", "core.sshCommand", &ssh]);
         HangingPush { repo, chain }
     }
-    /// The sleeper's tree once it has reported it, with a watch on each
-    /// process opened while it is alive (so pid reuse can't fool the test).
-    fn watch_tree(chain: &Path) -> Vec<(String, DeathWatch)> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+    /// The sleeper's tree once it has reported it within `patience`, with a
+    /// watch on each process opened while it is alive (so pid reuse can't
+    /// fool the test).
+    fn watch_tree(chain: &Path, patience: Duration) -> Vec<(String, DeathWatch)> {
+        let deadline = Instant::now() + patience;
         let tree = loop {
             let parsed: Option<Vec<(u32, String)>> =
                 std::fs::read_to_string(chain).ok().and_then(|text| {
@@ -1227,7 +1228,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "the sleeper never reported its tree"
+                "the sleeper never reported its tree within {patience:?}"
             );
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -1253,7 +1254,7 @@ mod tests {
         let cancel = never();
         let flag = cancel.clone();
         let worker = std::thread::spawn(move || super::run(&dir, &Write::Push(target), &flag));
-        let tree = watch_tree(&hang.chain);
+        let tree = watch_tree(&hang.chain, crate::git_history::BACKGROUND_DEADLINE);
         assert!(
             !tree[0].1.dead_within_ms(200),
             "the sleeper died on its own"
@@ -1276,8 +1277,12 @@ mod tests {
     fn a_timed_out_push_takes_its_whole_process_tree_with_it() {
         let hang = hanging_push();
         let dir = hang.repo.path().to_path_buf();
-        // Long enough for the sleeper to report its tree first.
-        let timeout = Duration::from_secs(8);
+        // The sleeper must report its tree before this fires. It takes about
+        // a second idle; 8 s lost that race with the CPU pinned, so leave
+        // ~20x room. The test waits out the whole timeout, in parallel, and
+        // waits for the tree only that long: a later report would come from
+        // a tree the timeout already killed.
+        let timeout = Duration::from_secs(30);
         let worker = std::thread::spawn(move || {
             git::write(
                 &dir,
@@ -1287,7 +1292,7 @@ mod tests {
                 Some(timeout),
             )
         });
-        let tree = watch_tree(&hang.chain);
+        let tree = watch_tree(&hang.chain, timeout);
         assert!(
             !worker.is_finished(),
             "the push returned before its timeout"
@@ -1323,7 +1328,7 @@ mod tests {
             "a commit runs beside the push"
         );
         assert!(panel.busy() && panel.pushing());
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::git_history::BACKGROUND_DEADLINE;
         let mut outcome = Outcome::default();
         while panel.busy() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -1333,7 +1338,7 @@ mod tests {
         assert_eq!(git(dir, &["log", "-1", "--format=%s"]), "feat: a");
         assert!(panel.pushing(), "the push is still in flight");
         // Closing the Changes window drops the panel: the push dies with it.
-        let tree = watch_tree(&hang.chain);
+        let tree = watch_tree(&hang.chain, crate::git_history::BACKGROUND_DEADLINE);
         drop(panel);
         assert_all_dead(&tree);
     }
