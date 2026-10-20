@@ -565,9 +565,10 @@ impl WindowManager {
                 dui.add(
                     egui::Label::new(
                         egui::RichText::new(
-                            "Describe how to arrange this Project's windows. Create only \
-                             moves the windows that are open: it never opens, closes, or \
-                             runs anything.",
+                            "Describe how to arrange this Project's windows. Create moves \
+                             the windows that are open and may add new ones (plain shells \
+                             or views), which the preview marks and only Apply opens. It \
+                             never closes a window or runs a command.",
                         )
                         .color(th.dim)
                         .size(11.5),
