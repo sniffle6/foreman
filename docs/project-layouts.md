@@ -178,13 +178,20 @@ Settings or a repository:
 ```
 
 **Who owns a library.** The key is `project_key(dir)`: absolute, `.`/`..`
-resolved, symlinks/junctions/subst drives resolved when the directory is
-reachable, no `\\?\` prefix, no trailing separator, lowercase on Windows. So
-two Project instances of one directory share definitions, while a worktree
-under `.foreman/worktrees/` is a different directory with its own library.
-`dir` is only for people reading the file. Libraries outlive their Projects
-(closing one deletes nothing) and an unreachable directory keeps its lexical
-key. Moving a directory does not migrate its library.
+resolved, symlinks/junctions/subst drives/8.3 short names resolved as far
+down the path as it exists, no `\\?\` prefix, no trailing separator,
+lowercase on Windows. So two Project instances of one directory share
+definitions, while a worktree under `.foreman/worktrees/` is a different
+directory with its own library. `dir` is only for people reading the file.
+Libraries outlive their Projects (closing one deletes nothing). A deleted
+directory keeps the key it had, because its parent is still resolved; only
+a whole missing drive falls back to the lexical spelling. Moving a directory
+does not migrate its library.
+
+Gotcha: resolve the deepest *existing* ancestor, not just the whole path.
+Canonicalizing the whole path or nothing made the key flip from
+`runneradmin` to `RUNNER~1` the moment a CI temp directory was deleted (the
+v0.8.0 release gate).
 
 **How to use it.** `LayoutStore::user()` (or `LayoutStore::at(dir)` in tests)
 then, per the picker contract:

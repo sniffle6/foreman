@@ -128,16 +128,15 @@ impl From<LayoutError> for StoreError {
 }
 
 /// The library key for a project directory: absolute, `.`/`..` resolved,
-/// symlinks, junctions, and substituted drives resolved when the directory
-/// is reachable, without the `\\?\` prefix or a trailing separator, and
-/// case-folded on Windows. An unreachable directory keeps its lexical key,
-/// so a library outlives a temporarily missing drive; it only fails to line
-/// up with a key taken through an alias that is now unresolvable.
+/// symlinks, junctions, substituted drives, and 8.3 short names resolved as
+/// far down as the path exists, without the `\\?\` prefix or a trailing
+/// separator, and case-folded on Windows. A missing directory keeps the key
+/// it had while it existed as long as its parent is still reachable, so a
+/// library outlives the directory disappearing. It only fails to line up
+/// when the missing part of the path was itself spelled through an alias.
 pub fn project_key(dir: &Path) -> String {
     let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let resolved = std::fs::canonicalize(&absolute)
-        .map(strip_verbatim)
-        .unwrap_or(absolute);
+    let resolved = resolve_existing_prefix(&absolute);
     let mut key = resolved.to_string_lossy().into_owned();
     if cfg!(windows) {
         key = key.replace('/', "\\").to_lowercase();
@@ -146,6 +145,26 @@ pub fn project_key(dir: &Path) -> String {
         key.pop();
     }
     key
+}
+
+/// `path` with its deepest existing ancestor canonicalized and the missing
+/// rest appended as spelled. Canonicalizing only the whole path would drop
+/// to the lexical spelling the moment the directory goes, and an alias in a
+/// parent that still exists (CI's `C:\Users\RUNNER~1\...` temp dir) would
+/// then key differently than it did a moment before.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    for base in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let real = strip_verbatim(real);
+            let rest = path.strip_prefix(base).unwrap_or(Path::new(""));
+            return if rest.as_os_str().is_empty() {
+                real
+            } else {
+                real.join(rest)
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 fn strip_verbatim(p: PathBuf) -> PathBuf {
@@ -507,6 +526,33 @@ mod tests {
         let gone = f.project.join("moved-away");
         assert_eq!(project_key(&gone), project_key(&gone.join(".")));
         assert_ne!(project_key(&gone), project_key(&f.project));
+    }
+
+    /// CI's temp dir is `C:\Users\RUNNER~1\...`: a short name in a parent
+    /// that outlives the project directory must not change its key. Proven
+    /// here with a short name of our own so it fails on any machine.
+    #[cfg(windows)]
+    #[test]
+    fn a_short_name_parent_keeps_the_key_after_the_directory_goes() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let f = fixture();
+        let parent = f.project.join("a-parent-longer-than-eight");
+        std::fs::create_dir_all(parent.join("repo")).unwrap();
+        let wide: Vec<u16> = parent.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: NUL-terminated input; the length passed is the buffer's.
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        assert!(n > 0 && (n as usize) < buf.len(), "GetShortPathNameW: {n}");
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]));
+        if short == parent {
+            eprintln!("8.3 names are off on this volume; nothing to prove");
+            return;
+        }
+        let repo = short.join("repo");
+        let before = project_key(&repo);
+        std::fs::remove_dir_all(parent.join("repo")).unwrap();
+        assert_eq!(project_key(&repo), before);
     }
 
     #[test]
