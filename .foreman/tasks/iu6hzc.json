@@ -3,11 +3,15 @@
   "id": "iu6hzc",
   "title": "Reconcile layouts by filling missing slots",
   "body": "Extend reconcile in src/project_layout.rs to the amended spec: missing tiled/floating slots of target-free kinds become an explicit to-open list, and unused items that were already minimized stay minimized instead of joining Additional windows. Keep the shipped Additional windows stack for visible extras. Pure model only; nothing is spawned here.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md (sections: Stable identity and reconciliation, Filling missing slots, Unused windows)\nBlocked by: w1tuaj - Define project layout model and item identity (done)\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Exact id first, then same-kind substitution in creation order with minimized current items available; tiled/floating slots fill before minimized slots.\n- Missing tiled/floating slots of an openable kind (Terminal, Chat, Board, Plan, GitHistory, GitChanges - confirm against wm open paths) appear in a to-open list placed in the result; Image/GitDiff/Project and every minimized slot are omitted.\n- Visible unmatched items go to Additional windows as today; minimized unmatched items keep their minimized state and restore placement.\n- is_exact / Modified-clean means nothing went to Additional windows and every slot was filled. Summary fields cover substituted/opened/additional/unfilled.\n- Result stays validated and total; A->B->A over the same inventory opens nothing. Tests witness failures first. Update docs/project-layouts.md.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
-  "state": "backlog",
+  "state": "done",
+  "shipped": {
+    "name": "v0.8.0",
+    "at": "2026-10-20T21:38:59Z"
+  },
   "planned": {
     "name": "project-layouts",
     "wave": 2
   },
   "created": "2026-10-18T20:50:17Z",
-  "updated": "2026-10-18T21:34:15Z"
+  "updated": "2026-10-20T21:38:59Z"
 }

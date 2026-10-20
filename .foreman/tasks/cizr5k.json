@@ -3,11 +3,15 @@
   "id": "cizr5k",
   "title": "Persist project-owned saved layout libraries",
   "body": "Add the versioned user-local project-layout library, the New Project slot storage, and workspace selection/Modified metadata using the model. Definitions belong to normalized project directories and survive project closure.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md (sections: Ownership and boundaries, Persistence)\nBlocked by: iu6hzc - Reconcile layouts by filling missing slots\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Save/update/Save As/rename/delete, names, replacement, and write failures follow the spec through a testable interface.\n- Every write re-reads project-layouts.json, applies only its own change (one definition by id, or the New Project slot), then writes. Two processes saving different definitions both keep them. The temp file name is unique per process (the shared helper's fixed {file}.tmp is not).\n- Duplicate directory instances share definitions without cross-applying. Distinct directories/worktrees remain isolated.\n- Old workspaces load with defaults; item identity/selection cold-restore correctly. Corrupt/future data is preserved and failed writes do not report success.\n- Keep layout data out of Settings and repositories; no provider integration, no New Project UI.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
-  "state": "backlog",
+  "state": "done",
+  "shipped": {
+    "name": "v0.8.0",
+    "at": "2026-10-20T21:38:59Z"
+  },
   "planned": {
     "name": "project-layouts",
     "wave": 3
   },
   "created": "2026-10-16T14:15:54Z",
-  "updated": "2026-10-18T21:34:16Z"
+  "updated": "2026-10-20T21:38:59Z"
 }

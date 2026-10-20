@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "id": "x48nhi",
+  "title": "Land Codex error fix, Create adding windows, extras stacking, git_history test patience",
+  "body": "Already implemented and committed on branch fix/codex-failure-detail (every commit carries this card's trailer). Do NOT change code unless a rebase conflicts.\n\n1. In your worktree: git merge --ff-only fix/codex-failure-detail (if it is not a fast-forward because main moved: git reset --hard fix/codex-failure-detail, then git rebase main, resolving any conflict).\n2. Gate: cargo check --target-dir target/agent and cargo test --target-dir target/agent. git_history timing tests now wait up to TEST_PATIENCE (60 s); a failure elsewhere under load: re-run once before treating it as real.\n3. integrate + wait (close-out lines below). On exit 3 read list --json, fix, re-integrate.\n\nDocs: docs/ai-oneshot.md, docs/project-layouts.md (Create Layout, reconciliation rule 4-5), spec amendment at the top of docs/superpowers/specs/2026-10-16-project-layouts-design.md.",
+  "state": "done",
+  "worktree": {
+    "path": "H:/claude code/foreman/.foreman/worktrees/x48nhi",
+    "branch": "card/x48nhi",
+    "base": "main"
+  },
+  "shipped": {
+    "name": "v0.8.0",
+    "at": "2026-10-20T21:38:59Z",
+    "commits": [
+      "e0f92a9",
+      "d8f9250",
+      "0dc12c2",
+      "bf4b55a",
+      "4759e67"
+    ]
+  },
+  "created": "2026-10-20T03:29:56Z",
+  "updated": "2026-10-20T21:38:59Z"
+}

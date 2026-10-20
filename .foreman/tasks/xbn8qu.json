@@ -3,11 +3,15 @@
   "id": "xbn8qu",
   "title": "Open new Projects with a chosen layout",
   "body": "Add the New Project layout: one global definition slot in project-layouts.json, set with Use for new Projects in the picker, shown and reset to Single terminal in Settings. Opening a Project from a directory applies it through the normal Apply path.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md (section: New Projects)\nBlocked by: cplsbf - Add project layout picker and Save controls\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- The slot is a copy, not a reference; editing/deleting the source layout leaves it unchanged. Unset means one tiled terminal, as today.\n- Opening a Project applies it via Filling missing slots (first terminal takes the first terminal slot; fresh terminals run no command, start no agent). The new Project's picker shows Custom.\n- Startup workspace restore never applies the slot. Writes use the reload-merge-write path.\n- Test first; screenshot the picker action, the Settings row, and a Project opened with a mixed layout. Update docs/project-layouts.md. This completes the manual-layout milestone.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
-  "state": "backlog",
+  "state": "done",
+  "shipped": {
+    "name": "v0.8.0",
+    "at": "2026-10-20T21:38:59Z"
+  },
   "planned": {
     "name": "project-layouts",
     "wave": 6
   },
   "created": "2026-10-18T20:50:17Z",
-  "updated": "2026-10-18T20:50:36Z"
+  "updated": "2026-10-20T21:38:59Z"
 }
