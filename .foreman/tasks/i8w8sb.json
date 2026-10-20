@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "i8w8sb",
+  "title": "Fix Codex pane detection when the prompt mentions claude",
+  "body": "Bug: Session::icon_kind() can report Claude for a Codex pane. src/icons.rs IconKind::from_argv joins argv into one string and tests contains(\"claude\") BEFORE \"codex\", so `foreman open codex \"...claude...\"` (a Codex worker whose prompt mentions claude) is classified Claude. Separately, the proc::agent_for process scan refreshes every 1.5s (REFRESH_EVERY), so detection lags right after an agent exits back to the shell.\n\nWhy it matters now: the Codex chat-submit fix (sibling card in plan \"Codex chat delivery\") must send its key only to Codex panes. A wrong Claude verdict silently skips the fix; a stale Codex verdict sends Insert to a plain shell (cmd.exe toggles overtype).\n\nDo:\n- Write a failing regression first (bug-fix rule): from_argv on a codex argv whose prompt contains \"claude\" must yield Codex.\n- Fix from_argv to classify by the executable (argv[0] basename / first program token), not substring of the whole joined line.\n- Expose a Codex check for chat delivery that prefers the provider from the agent's own hooks (AgentStateSlot.source == SourceAgent::Codex, src/agent_state.rs) and falls back to icon_kind(). Keep visibility narrow.\n\nAcceptance: regression red on old code, green after; existing icon/agent-state tests pass.\nGates: cargo fmt --check; cargo test (use --target-dir target/agent when running inside foreman).",
+  "state": "backlog",
+  "planned": {
+    "name": "Codex chat delivery",
+    "wave": 1
+  },
+  "created": "2026-10-20T19:43:43Z",
+  "updated": "2026-10-20T19:44:13Z"
+}

@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "0c2k1l",
+  "title": "Probe async-hook chat delivery to busy agents",
+  "body": "Probe whether chat can reach a BUSY agent through async hooks, with no added per-turn latency. Today posts to a Working agent are held until its turn ends (src/chat.rs tick_at), so an orchestrator sitting in `kanban wait` gets stale posts minutes late, one turn per post.\n\nConstraint from the user: no sync hooks. Anything that delays every turn is rejected.\n\nVerified in source/docs (needs end-to-end proof):\n- Codex 0.163.0: async command hooks can return hookSpecificOutput.additionalContext. core/src/hook_runtime.rs drain_async_hook_results injects it into a running turn as a developer message (inject_hook_context_if_running) or at the next turn start. There is no asyncRewake, so an idle Codex cannot be woken by a hook. Keyboard delivery stays for idle agents.\n- Claude Code: async additionalContext arrives on the next turn; asyncRewake + exit 2 wakes an idle Claude.\n- Codex re-prompts hook trust when a hook's command/config changes (hooks/src/engine/discovery.rs hook_hash -> Modified). Changing the managed hook (src/agent_hooks.rs) costs users a /hooks re-trust.\n\nProbe: an async PostToolUse hook that fetches pending posts for FOREMAN_TERMINAL_ID and returns them as additionalContext. Verify against installed Codex and Claude: delivery mid-turn, the latency added (should be none), and how the cursor/ack should advance so a post is never delivered by both hook and keyboard.\n\nDeliverable: probe results + a design note (docs/chat-delivery.md section or spec in docs/superpowers/specs/). Do not ship the delivery change from this card. It changes the control plane and goes through foreman-change-control.",
+  "state": "backlog",
+  "planned": {
+    "name": "Codex chat delivery",
+    "wave": 3
+  },
+  "created": "2026-10-20T19:44:09Z",
+  "updated": "2026-10-20T19:44:14Z"
+}

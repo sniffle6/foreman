@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "u83oq0",
+  "title": "Investigate remaining Codex chat-paste hazards",
+  "body": "Investigate (diagnosis first, no fix without evidence) remaining ways a chat paste into a Codex pane is misinterpreted. These exist today and the Insert-separator fix (card nind1d) does not address them. Source: Codex 0.163.0 (tag rust-v0.163.0), codex-rs/tui/src.\n\n1. Modal in the paste->Enter window: an approval or list view that opens between paste and the deferred Enter takes Enter as accept. approval_overlay.rs try_handle_shortcut also binds plain y/a/p/d/n/c, which pasted text can trigger. Foreman holds delivery only for NeedsYou BEFORE the paste (src/chat.rs tick_at).\n2. Vim normal mode: pasted chars run as vim commands.\n3. History search / transcript search / expanded questions panel capture the keys.\n4. A post ending in an @token may open the mention/file popup on apply_paste -> sync_popups, and Enter then selects an item (trigger rule unverified).\n5. A Codex stall >60ms mid-paste flushes the paste early; a newline later in the post can then submit a partial message. Candidate mitigation: send Codex single-line frames.\n\nDeliverable: for each item, a reproduction (or evidence it cannot happen), how often it plausibly occurs in fleet use, and a proposed fix that uses ordering or events, never a delay. File follow-up cards for the ones worth fixing.",
+  "state": "backlog",
+  "planned": {
+    "name": "Codex chat delivery",
+    "wave": 3
+  },
+  "created": "2026-10-20T19:44:09Z",
+  "updated": "2026-10-20T19:44:13Z"
+}
