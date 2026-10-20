@@ -9,7 +9,9 @@
 //! (its receiver is dropped, so its reply can never publish) and replaces
 //! the candidate. A request and a candidate are tied to the arrangement
 //! revision they were made at; a structural change discards them ("Windows
-//! changed — run again"), a resize does not. The editor lives in this
+//! changed — run again"), a resize does not. A candidate may add new
+//! windows: the preview shows them, marked new, and only Apply opens them.
+//! The editor lives in this
 //! Project's picker state, so closing the Project or switching away from it
 //! drops the request with the editor. Applying goes through the same
 //! deferred, validated path as a saved layout, in its strict form
@@ -59,11 +61,14 @@ struct Pending {
     program: &'static str,
 }
 
-/// The validated proposal. `entries` are the labels that were sent.
+/// The validated proposal. `entries` are the labels that were sent, then
+/// one "New …" entry per added window.
 pub(super) struct Candidate {
     pub(super) def: LayoutDefinition,
     pub(super) message: String,
     pub(super) revision: u64,
+    /// New windows Apply opens; in `def`, never live yet.
+    pub(super) added: Vec<ItemRef>,
     entries: Vec<Entry>,
     icons: HashMap<LayoutItemId, crate::icons::IconKind>,
 }
@@ -75,6 +80,8 @@ pub(super) enum Status {
     Stale,
     /// The description needs Content that is not open.
     Missing { text: String, message: String },
+    /// The proposal is the arrangement the windows already have.
+    Unchanged { message: String },
 }
 
 /// Save & Apply's name row.
@@ -125,14 +132,15 @@ impl WindowManager {
         match action {
             CreateAction::Run => self.run_create_request(ctx),
             CreateAction::Apply => {
-                let Some((def, revision)) = self.candidate_in_hand() else {
+                let Some((def, added, revision)) = self.candidate_in_hand() else {
                     return;
                 };
-                match self.check_candidate(&def, revision) {
+                match self.check_candidate(&def, &added, revision) {
                     Ok(()) => {
                         self.layout_ui.requested = Some(Requested::Create { saved: None });
                         self.request_layout(LayoutRequest::Candidate {
                             def,
+                            added,
                             select: false,
                             revision,
                         });
@@ -171,9 +179,10 @@ impl WindowManager {
         }
     }
 
-    fn candidate_in_hand(&self) -> Option<(LayoutDefinition, u64)> {
+    fn candidate_in_hand(&self) -> Option<(LayoutDefinition, Vec<LayoutItemId>, u64)> {
         let c = self.layout_ui.create.as_ref()?.candidate.as_ref()?;
-        Some((c.def.clone(), c.revision))
+        let added = c.added.iter().map(|a| a.id).collect();
+        Some((c.def.clone(), added, c.revision))
     }
 
     /// A candidate could not be used. Stale drops it; anything else keeps
@@ -322,12 +331,27 @@ impl WindowManager {
         };
         let pending = ed.pending.take().expect("checked above");
         match reply {
-            Ok(Reply::Candidate { message, def }) => {
+            Ok(Reply::Candidate {
+                message,
+                def,
+                added,
+            }) => {
+                if added.is_empty() && changes_nothing(&pending.inventory.current, &def.arrangement)
+                {
+                    ed.status = Some(Status::Unchanged { message });
+                    return;
+                }
+                let mut entries = pending.inventory.entries;
+                entries.extend(added.iter().map(|&item| Entry {
+                    item,
+                    label: format!("New {}", lp::kind_name(item.kind).to_lowercase()),
+                }));
                 ed.candidate = Some(Candidate {
                     def,
                     message,
                     revision: pending.revision,
-                    entries: pending.inventory.entries,
+                    added,
+                    entries,
                     icons: pending.icons,
                 });
             }
@@ -345,7 +369,7 @@ impl WindowManager {
     /// it, and only then queue the Apply. A failed write keeps the editor
     /// and the candidate, and moves nothing.
     fn save_and_apply(&mut self, dir: &std::path::Path, ctx: &egui::Context) {
-        let Some((def, revision)) = self.candidate_in_hand() else {
+        let Some((def, added, revision)) = self.candidate_in_hand() else {
             return;
         };
         let Some(naming) = self
@@ -356,7 +380,7 @@ impl WindowManager {
         else {
             return;
         };
-        if let Err(e) = self.check_candidate(&def, revision) {
+        if let Err(e) = self.check_candidate(&def, &added, revision) {
             self.create_failed(e);
             return;
         }
@@ -382,6 +406,7 @@ impl WindowManager {
                 });
                 self.request_layout(LayoutRequest::Candidate {
                     def: saved,
+                    added,
                     select: true,
                     revision,
                 });
@@ -660,6 +685,26 @@ impl WindowManager {
                     Some(Status::Error(e)) => {
                         dui.add(egui::Label::new(egui::RichText::new(e.as_str()).color(th.danger)).wrap());
                     }
+                    Some(Status::Unchanged { message }) => {
+                        dui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "That is already how the windows are arranged. \
+                                     Describe a change, then run again.",
+                                )
+                                .color(th.caret),
+                            )
+                            .wrap(),
+                        );
+                        dui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{program}: {message}"))
+                                    .color(th.dim)
+                                    .size(11.5),
+                            )
+                            .wrap(),
+                        );
+                    }
                     Some(Status::Missing { text, message }) => {
                         dui.add(egui::Label::new(egui::RichText::new(text.as_str()).color(th.caret)).wrap());
                         dui.add(
@@ -685,6 +730,22 @@ impl WindowManager {
                         egui::Sense::hover(),
                     );
                     paint_candidate(dui.painter(), c, rect, th);
+                    if !c.added.is_empty() {
+                        let names: Vec<&str> =
+                            c.added.iter().map(|a| lp::kind_name(a.kind)).collect();
+                        dui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Apply opens {} new: {}",
+                                    if c.added.len() == 1 { "one window".to_string() } else { format!("{} windows", c.added.len()) },
+                                    names.join(", ")
+                                ))
+                                .color(th.caret)
+                                .size(11.0),
+                            )
+                            .wrap(),
+                        );
+                    }
                     let minimized = minimized_labels(c);
                     if !minimized.is_empty() {
                         dui.add(
@@ -810,6 +871,22 @@ impl WindowManager {
     }
 }
 
+/// Whether a proposal would leave the windows as they are. Stricter than
+/// `same_arrangement`, which ignores the front tab for Modified: "show the
+/// chat first" is a real change.
+fn changes_nothing(current: &pl::Arrangement, proposed: &pl::Arrangement) -> bool {
+    let fronts = |a: &pl::Arrangement| {
+        let mut ids: Vec<LayoutItemId> = a
+            .windows
+            .iter()
+            .filter_map(|w| w.tabs.get(w.active).copied())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    pl::same_arrangement(current, proposed) && fronts(current) == fronts(proposed)
+}
+
 /// The labels of the candidate's minimized items, shown under the diagram.
 fn minimized_labels(c: &Candidate) -> Vec<String> {
     c.def
@@ -884,11 +961,16 @@ fn paint_candidate(p: &egui::Painter, c: &Candidate, rect: egui::Rect, th: &crat
                 egui::Color32::from_black_alpha(90),
             );
         }
+        let new = w.tabs.iter().any(|t| c.added.iter().any(|a| a.id == *t));
         p.rect_filled(cell_rect, egui::CornerRadius::same(3), th.win_bg);
         p.rect_stroke(
             cell_rect,
             egui::CornerRadius::same(3),
-            egui::Stroke::new(1.0, if cell.floating { th.text } else { th.border }),
+            match (new, cell.floating) {
+                (true, _) => egui::Stroke::new(1.5, th.caret),
+                (false, true) => egui::Stroke::new(1.0, th.text),
+                (false, false) => egui::Stroke::new(1.0, th.border),
+            },
             egui::StrokeKind::Inside,
         );
         let Some(active) = active else {
@@ -1209,9 +1291,9 @@ mod tests {
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
         };
-        assert_eq!(wm.check_candidate(&def, rev), Err(LayoutApplyError::Stale));
+        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
         assert_eq!(
-            wm.apply_candidate(&def, false, rev, &ctx).unwrap_err(),
+            wm.apply_candidate(&def, &[], false, rev, &ctx).unwrap_err(),
             LayoutApplyError::Stale
         );
         // A definition with a slot no live item fills would open one.
@@ -1219,7 +1301,7 @@ mod tests {
         extra.items.push(ItemRef::new(9999, ItemKind::Terminal));
         extra.arrangement.windows[0].tabs.push(9999);
         assert_eq!(
-            wm.apply_candidate(&extra, false, rev, &ctx).unwrap_err(),
+            wm.apply_candidate(&extra, &[], false, rev, &ctx).unwrap_err(),
             LayoutApplyError::Stale
         );
         // The wrong revision is stale however good the definition.
@@ -1231,12 +1313,12 @@ mod tests {
             arrangement: current,
         };
         assert_eq!(
-            wm.apply_candidate(&same, false, rev + 1, &ctx).unwrap_err(),
+            wm.apply_candidate(&same, &[], false, rev + 1, &ctx).unwrap_err(),
             LayoutApplyError::Stale
         );
         assert_eq!(arrangement(&wm), before, "nothing moved");
         assert_eq!(wm.windows.iter().map(|w| w.tabs.len()).sum::<usize>(), 3, "nothing opened");
-        assert!(wm.apply_candidate(&same, false, rev, &ctx).is_ok());
+        assert!(wm.apply_candidate(&same, &[], false, rev, &ctx).is_ok());
     }
 
     #[test]
@@ -1479,7 +1561,214 @@ mod tests {
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
         };
-        assert_eq!(wm.check_candidate(&def, rev), Err(LayoutApplyError::Stale));
+        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
+    }
+
+    /// The three live stubs stacked on the left, a new Board and a new Chat
+    /// tiled to their right.
+    fn reply_with_new(wm: &WindowManager) -> Reply {
+        let inv = &editor(wm).pending.as_ref().expect("pending").inventory;
+        let raw = serde_json::json!({
+            "message": "Stack left, board and chat right.",
+            "new": [{"id": 4, "kind": "board"}, {"id": 5, "kind": "chat"}],
+            "windows": [
+                {"tabs": [1, 2, 3], "place": "tiled"},
+                {"tabs": [4], "place": "tiled"},
+                {"tabs": [5], "place": "tiled"}
+            ],
+            "tree": {"split": "row", "sizes": [2, 1, 1], "children": [
+                {"window": 0}, {"window": 1}, {"window": 2}
+            ]}
+        });
+        lp::parse_reply(&raw.to_string(), inv).unwrap()
+    }
+
+    fn kind_of(wm: &WindowManager, id: LayoutItemId) -> ItemKind {
+        wm.layout_inventory()
+            .iter()
+            .find(|i| i.id == id)
+            .expect("live")
+            .kind
+    }
+
+    #[test]
+    fn new_windows_show_in_the_preview_and_open_only_on_apply() {
+        let f = fixture();
+        let (mut wm, [a, b, c]) = three(&f);
+        let ids = identities(&wm);
+        let tx = open_and_run(&mut wm, "like Rider");
+        tx.send(Ok(reply_with_new(&wm))).unwrap();
+        wm.poll_create();
+        let cand = editor(&wm).candidate.as_ref().expect("a candidate");
+        let added: Vec<ItemKind> = cand.added.iter().map(|x| x.kind).collect();
+        assert_eq!(added, vec![ItemKind::Board, ItemKind::Chat]);
+        let labels: Vec<String> = cand.added.iter().map(|x| label_of(cand, x.id)).collect();
+        assert_eq!(labels, vec!["New board", "New chat"], "the preview names them");
+        assert_eq!(identities(&wm), ids, "a reply opens nothing");
+        act(&mut wm, CreateAction::Apply);
+        assert_eq!(identities(&wm), ids, "nor does the click: the Apply is deferred");
+        let ctx = egui::Context::default();
+        wm.drain_layout_request(&ctx);
+        wm.poll_layout_outcome(0.0);
+        assert!(
+            matches!(wm.layout_ui.notice, Some(Notice::Saved { .. })),
+            "{:?}",
+            wm.layout_ui.notice
+        );
+        assert_eq!(wm.layout_inventory().len(), 5, "both new windows opened");
+        let now = arrangement(&wm);
+        assert_eq!(now.windows.len(), 3);
+        assert_eq!(now.windows[0].tabs, vec![a, b, c]);
+        assert_eq!(kind_of(&wm, now.windows[1].tabs[0]), ItemKind::Board);
+        assert_eq!(kind_of(&wm, now.windows[2].tabs[0]), ItemKind::Chat);
+        assert_eq!(wm.layout, LayoutSelection::default(), "Custom until saved");
+        // Revert restores the old arrangement; what opened stays open.
+        wm.revert_layout().unwrap();
+        assert_eq!(wm.layout_inventory().len(), 5);
+    }
+
+    #[test]
+    fn save_and_apply_saves_the_new_windows_and_opens_them() {
+        let f = fixture();
+        let (mut wm, _) = three(&f);
+        let tx = open_and_run(&mut wm, "like Rider");
+        tx.send(Ok(reply_with_new(&wm))).unwrap();
+        wm.poll_create();
+        act(&mut wm, CreateAction::SaveAndApply);
+        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "Rider".into();
+        act(&mut wm, CreateAction::SubmitName);
+        let saved = f.store().project_layouts(&f.repo).unwrap();
+        assert_eq!(saved.len(), 1);
+        let kinds: Vec<ItemKind> = saved[0].items.iter().map(|i| i.kind).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Board).count(), 1);
+        assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Chat).count(), 1);
+        assert_eq!(wm.layout_inventory().len(), 3, "saved first, opened later");
+        let ctx = egui::Context::default();
+        wm.drain_layout_request(&ctx);
+        wm.poll_layout_outcome(0.0);
+        assert_eq!(wm.layout_inventory().len(), 5);
+        assert_eq!(
+            wm.layout,
+            LayoutSelection {
+                selected: Some(saved[0].id.clone()),
+                modified: false
+            },
+            "every slot filled: the saved layout, not Modified"
+        );
+    }
+
+    #[test]
+    fn a_new_window_that_fails_to_open_is_reported() {
+        let f = fixture();
+        let (mut wm, _) = three(&f);
+        let tx = open_and_run(&mut wm, "like Rider");
+        tx.send(Ok(reply_with_new(&wm))).unwrap();
+        wm.poll_create();
+        wm.layout_rt.fail_opens = true;
+        act(&mut wm, CreateAction::Apply);
+        let ctx = egui::Context::default();
+        wm.drain_layout_request(&ctx);
+        wm.poll_layout_outcome(0.0);
+        assert_eq!(wm.layout_inventory().len(), 3, "nothing opened");
+        assert!(
+            matches!(&wm.layout_ui.notice, Some(Notice::Summary { title, .. }) if title == "Applied with changes"),
+            "{:?}",
+            wm.layout_ui.notice
+        );
+    }
+
+    #[test]
+    fn strict_apply_opens_exactly_the_candidates_new_windows() {
+        let f = fixture();
+        let (wm, [.., c]) = three(&f);
+        let rev = wm.layout_revision();
+        let (mut items, current) = wm.capture_arrangement(AREA);
+        let fresh = c + 100;
+        items.push(ItemRef::new(fresh, ItemKind::Board));
+        let mut arrangement = current.clone();
+        arrangement.windows[0].tabs.push(fresh);
+        let def = LayoutDefinition {
+            id: String::new(),
+            name: String::new(),
+            items,
+            arrangement,
+        };
+        assert_eq!(wm.check_candidate(&def, &[fresh], rev), Ok(()));
+        // The same slot not declared new: refused.
+        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
+        // A declared window that no slot opens: refused.
+        assert_eq!(
+            wm.check_candidate(&def, &[fresh, fresh + 1], rev),
+            Err(LayoutApplyError::Stale)
+        );
+        // An item the candidate placed that has since closed is never
+        // reopened, even with the new window declared.
+        let mut gone = def.clone();
+        let closed = c + 50;
+        gone.items.push(ItemRef::new(closed, ItemKind::Terminal));
+        gone.arrangement.windows[0].tabs.push(closed);
+        assert_eq!(wm.check_candidate(&gone, &[fresh], rev), Err(LayoutApplyError::Stale));
+    }
+
+    #[test]
+    fn a_proposal_that_only_changes_the_front_tab_is_offered() {
+        let f = fixture();
+        let (mut wm, [a, b, c]) = three(&f);
+        // Put all three in one stack, c in front.
+        let tx = open_and_run(&mut wm, "one stack");
+        tx.send(Ok(stacked_reply(&wm))).unwrap();
+        wm.poll_create();
+        act(&mut wm, CreateAction::Apply);
+        let ctx = egui::Context::default();
+        wm.drain_layout_request(&ctx);
+        wm.poll_layout_outcome(0.0);
+        assert_eq!(arrangement(&wm).windows[0].tabs, vec![c, b, a]);
+        // Same stack, b in front: a real change.
+        let tx = open_and_run(&mut wm, "show beta first");
+        let inv = editor(&wm).pending.as_ref().unwrap().inventory.clone();
+        let mut def = LayoutDefinition {
+            id: String::new(),
+            name: String::new(),
+            items: inv.items(),
+            arrangement: inv.current.clone(),
+        };
+        def.arrangement.windows[0].active = 1;
+        tx.send(Ok(Reply::Candidate {
+            message: "Beta in front.".into(),
+            def,
+            added: Vec::new(),
+        }))
+        .unwrap();
+        wm.poll_create();
+        assert!(editor(&wm).candidate.is_some(), "{:?}", editor(&wm).status);
+    }
+
+    #[test]
+    fn a_proposal_that_changes_nothing_is_not_offered() {
+        let f = fixture();
+        let (mut wm, _) = three(&f);
+        let tx = open_and_run(&mut wm, "like Rider");
+        let inv = editor(&wm).pending.as_ref().unwrap().inventory.clone();
+        let def = LayoutDefinition {
+            id: String::new(),
+            name: String::new(),
+            items: inv.items(),
+            arrangement: inv.current.clone(),
+        };
+        tx.send(Ok(Reply::Candidate {
+            message: "Kept it.".into(),
+            def,
+            added: Vec::new(),
+        }))
+        .unwrap();
+        wm.poll_create();
+        assert!(editor(&wm).candidate.is_none(), "nothing to apply or save");
+        assert_eq!(
+            editor(&wm).status,
+            Some(Status::Unchanged {
+                message: "Kept it.".into()
+            })
+        );
     }
 
     fn child(desk: &mut WindowManager) -> &mut WindowManager {

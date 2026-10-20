@@ -1,5 +1,14 @@
 # Project layouts — design
 
+> **Amended 2026-10-19** (the shipped behavior is in `docs/project-layouts.md`):
+> - A visible window the layout has no slot for now stacks behind the
+>   layout's largest visible window of the same kind. Only kinds with no
+>   such window go to the Additional windows stack described below.
+> - Create Layout may propose new windows of kinds that open without a
+>   target. The reply only declares them; Apply opens them, and the strict
+>   Apply refuses any other open. This replaces the "no new Content" rule
+>   under Create Layout and Generation boundary.
+
 ## Intent
 
 Give each Project a Unity-style layout picker: choose a named arrangement,

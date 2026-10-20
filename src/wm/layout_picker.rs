@@ -537,11 +537,18 @@ impl WindowManager {
         };
         let requested = self.layout_ui.requested.take();
         if let Some(Requested::Create { saved }) = requested {
-            self.layout_ui.notice = Some(Self::create_outcome_notice(
-                saved,
-                outcome.map(|_| ()),
-                now,
-            ));
+            self.layout_ui.notice = Some(match outcome {
+                // A new window failed to open: say which, like a saved
+                // layout's Apply does.
+                Ok(applied) if !applied.is_exact() => Notice::Summary {
+                    title: match &saved {
+                        Some(name) => format!("Saved \u{201c}{name}\u{201d} and applied it, with changes"),
+                        None => "Applied with changes".to_string(),
+                    },
+                    lines: summary_lines(&applied, |id| self.layout_item_title(id)),
+                },
+                outcome => Self::create_outcome_notice(saved, outcome.map(|_| ()), now),
+            });
             return;
         }
         self.layout_ui.notice = match outcome {
@@ -1326,6 +1333,10 @@ pub(super) fn summary_lines(
             .collect(),
     );
     push(
+        "Stacked with matching windows",
+        rec.stacked.iter().map(|i| named(i.id, i.kind)).collect(),
+    );
+    push(
         "Moved to Additional windows",
         rec.additional.iter().map(|i| named(i.id, i.kind)).collect(),
     );
@@ -1874,6 +1885,7 @@ mod tests {
                 current: 2,
                 kind: ItemKind::Chat,
             }],
+            stacked: vec![ItemRef::new(6, ItemKind::Terminal)],
             additional: vec![
                 ItemRef::new(3, ItemKind::Terminal),
                 ItemRef::new(4, ItemKind::Image),
@@ -1899,6 +1911,7 @@ mod tests {
             1 => Some("claude: fix login".to_string()),
             3 => Some("pwsh".to_string()),
             4 => Some("   ".to_string()),
+            6 => Some("cargo watch".to_string()),
             _ => None,
         };
         let lines = summary_lines(&applied, titles);
@@ -1910,6 +1923,7 @@ mod tests {
                     "claude: fix login".to_string()
                 ),
                 ("Opened", "Chat".to_string()),
+                ("Stacked with matching windows", "cargo watch".to_string()),
                 ("Moved to Additional windows", "pwsh, Image".to_string()),
                 ("Could not fill", "Git diff".to_string()),
                 (
@@ -1927,6 +1941,7 @@ mod tests {
         rec.substituted.clear();
         rec.opened.clear();
         rec.unfilled.clear();
+        rec.stacked.clear();
         rec.additional = (10..17)
             .map(|id| ItemRef::new(id, ItemKind::Terminal))
             .collect();
@@ -2371,14 +2386,14 @@ mod tests {
         wm.poll_layout_outcome(0.0);
 
         assert_eq!(wm.layout.selected.as_deref(), Some(def.id.as_str()));
-        assert!(wm.layout.modified, "an extra went to Additional windows");
+        assert!(wm.layout.modified, "an extra stacked with a matching window");
         let Some(Notice::Summary { title, lines }) = &wm.layout_ui.notice else {
             panic!("expected a summary, got {:?}", wm.layout_ui.notice);
         };
         assert!(title.contains("Solo"));
         assert_eq!(
             lines,
-            &vec![("Moved to Additional windows", "beta".to_string())]
+            &vec![("Stacked with matching windows", "beta".to_string())]
         );
         assert_eq!(wm.layout_revert_status(), RevertStatus::Ready);
 

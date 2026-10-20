@@ -62,7 +62,7 @@ impl ItemKind {
 
     /// One per Project: the open path surfaces the existing viewer instead
     /// of opening a second, so reconciliation never queues one beside it.
-    fn is_project_singleton(self) -> bool {
+    pub fn is_project_singleton(self) -> bool {
         use ItemKind::*;
         matches!(self, Chat | Board | Plan | GitHistory | GitChanges)
     }
@@ -499,8 +499,11 @@ pub struct Reconciliation {
     pub to_open: Vec<OpenSlot>,
     /// Slots filled by fresh items; set by [`Self::with_opened`].
     pub opened: Vec<Substitution>,
-    /// Visible current items with no slot, in inventory order: the appended
-    /// **Additional windows** stack.
+    /// Visible current items with no slot that joined the largest visible
+    /// window holding their kind, behind its tabs, in inventory order.
+    pub stacked: Vec<ItemRef>,
+    /// Visible current items with no slot and no visible window of their
+    /// kind, in inventory order: the appended **Additional windows** stack.
     pub additional: Vec<ItemRef>,
     /// Minimized current items with no slot, in inventory order. They stay
     /// minimized in their own stack with their restore placement.
@@ -513,10 +516,14 @@ pub struct Reconciliation {
 
 impl Reconciliation {
     /// The Apply is clean and leaves Modified clear: every slot was filled
-    /// and nothing went to Additional windows. Substitutes and kept-minimized
-    /// extras do not count; pending opens do until [`Self::with_opened`].
+    /// and no extra was stacked or went to Additional windows. Substitutes
+    /// and kept-minimized extras do not count; pending opens do until
+    /// [`Self::with_opened`].
     pub fn is_exact(&self) -> bool {
-        self.to_open.is_empty() && self.unfilled.is_empty() && self.additional.is_empty()
+        self.to_open.is_empty()
+            && self.unfilled.is_empty()
+            && self.stacked.is_empty()
+            && self.additional.is_empty()
     }
 
     /// Resolve `to_open` once Apply has opened fresh items. `opened` pairs a
@@ -594,10 +601,12 @@ impl Reconciliation {
 ///    viewer opens only if the Project has none. Every other remaining slot
 ///    is unfilled: its tab leaves its stack, empty stacks go, empty branches
 ///    collapse, surviving ratios renormalize.
-/// 4. Unassigned visible items form one tiled **Additional windows** stack
-///    appended on the right, or filling the Project when no saved tiled
-///    geometry survived. Unassigned minimized items keep their stack and
-///    restore placement.
+/// 4. An unassigned visible item joins the largest visible window that
+///    holds its kind, behind that window's tabs (tiled before floating;
+///    ties go to the first window). The rest form one tiled **Additional
+///    windows** stack appended on the right, or filling the Project when no
+///    saved tiled geometry survived. Unassigned minimized items keep their
+///    stack and restore placement.
 ///
 /// Fails only when `def`, `current`, or `inventory` is itself invalid; the
 /// live arrangement is never touched here.
@@ -699,7 +708,7 @@ pub fn reconcile(
         });
     }
 
-    let (additional, kept_minimized): (Vec<ItemRef>, Vec<ItemRef>) = inventory
+    let (extras, kept_minimized): (Vec<ItemRef>, Vec<ItemRef>) = inventory
         .iter()
         .filter(|i| !assigned.contains(&i.id))
         .partition(|i| !minimized_now.contains(&i.id));
@@ -713,6 +722,32 @@ pub fn reconcile(
         .tree
         .as_ref()
         .and_then(|t| prune_tree(t, &index_map));
+
+    // Pass 5: each visible extra joins the largest visible window of its
+    // kind (placeholders count as their kind); the rest go to Additional.
+    let kind_of: HashMap<LayoutItemId, ItemKind> = inventory
+        .iter()
+        .map(|i| (i.id, i.kind))
+        .chain(to_open.iter().map(|o| (o.placeholder, o.saved.kind)))
+        .collect();
+    let mut share = HashMap::new();
+    if let Some(t) = &tree {
+        tile_shares(t, 1.0, &mut share);
+    }
+    let mut stacked = Vec::new();
+    let mut additional = Vec::new();
+    for item in extras {
+        let target = stack_target(&windows, &share, |w| {
+            w.tabs.iter().any(|t| kind_of.get(t) == Some(&item.kind))
+        });
+        match target {
+            Some(wi) => {
+                windows[wi].tabs.push(item.id);
+                stacked.push(item);
+            }
+            None => additional.push(item),
+        }
+    }
 
     if !additional.is_empty() {
         let extra = windows.len();
@@ -755,10 +790,53 @@ pub fn reconcile(
         substituted,
         to_open,
         opened: Vec::new(),
+        stacked,
         additional,
         kept_minimized,
         unfilled,
     })
+}
+
+/// Each tiled window's share of the area, from the tree's ratios: `share`
+/// split down every branch.
+fn tile_shares(node: &TreeSpec, share: f32, out: &mut HashMap<usize, f32>) {
+    match node {
+        TreeSpec::Leaf { window } => {
+            out.insert(*window, share);
+        }
+        TreeSpec::Split {
+            ratios, children, ..
+        } => {
+            for (child, r) in children.iter().zip(normalize_ratios(ratios)) {
+                tile_shares(child, share * r, out);
+            }
+        }
+    }
+}
+
+/// The window extras of one kind join: the largest visible window `holds`
+/// accepts, tiled before floating, the first on a tie. Never a minimized one.
+fn stack_target(
+    windows: &[WindowSpec],
+    tile_share: &HashMap<usize, f32>,
+    holds: impl Fn(&WindowSpec) -> bool,
+) -> Option<usize> {
+    let mut best: Option<(usize, bool, f32)> = None;
+    for (wi, w) in windows.iter().enumerate() {
+        let (tiled, size) = match &w.state {
+            WindowState::Tiled => (true, tile_share.get(&wi).copied().unwrap_or(0.0)),
+            WindowState::Floating { rect } => (false, rect.w * rect.h),
+            WindowState::Minimized { .. } => continue,
+        };
+        if !holds(w) {
+            continue;
+        }
+        let better = best.is_none_or(|(_, bt, bs)| (tiled, size) > (bt, bs));
+        if better {
+            best = Some((wi, tiled, size));
+        }
+    }
+    best.map(|(wi, ..)| wi)
 }
 
 /// Ids in the minimized windows of `arrangement`.
@@ -1342,25 +1420,17 @@ mod tests {
         let r = rec(&d, &inv);
         assert_eq!(r.substituted, vec![sub(1, 7, ItemKind::Terminal)]);
         assert!(r.unfilled.is_empty() && r.to_open.is_empty());
-        assert_eq!(r.additional, vec![term(9), chat(8)], "inventory order");
+        assert_eq!(r.stacked, vec![term(9), chat(8)], "inventory order");
+        assert!(r.additional.is_empty());
+        // Terminal 9 joins the larger terminal tile; chat 8 joins the stack
+        // that holds the chat, behind its front tab.
         assert_eq!(
             tabs_of(&r.arrangement),
-            vec![vec![7], vec![2, 3], vec![4], vec![5], vec![9, 8]]
+            vec![vec![7, 9], vec![2, 3, 8], vec![4], vec![5]]
         );
-        let extra = &r.arrangement.windows[4];
-        assert!(extra.is_tiled() && extra.active == 0);
-        assert_eq!(
-            r.arrangement.tree,
-            Some(split(
-                SplitAxis::H,
-                &[1.0 - ADDITIONAL_RATIO, ADDITIONAL_RATIO],
-                vec![
-                    split(SplitAxis::H, &[0.6, 0.4], vec![leaf(0), leaf(1)]),
-                    leaf(4)
-                ]
-            ))
-        );
-        assert!(!r.is_exact(), "extras went to Additional windows");
+        assert_eq!(r.arrangement.windows[1].active, 1, "the front tab is unchanged");
+        assert_eq!(r.arrangement.tree, d.arrangement.tree, "no Additional windows split");
+        assert!(!r.is_exact(), "extras were stacked");
         assert_eq!(validate(&r.arrangement, &inv), Ok(()));
     }
 
@@ -1447,7 +1517,7 @@ mod tests {
     #[test]
     fn minimized_slot_never_hides_a_visible_window() {
         // Both terminals are on screen. The minimized slot stays unfilled
-        // and the spare goes to Additional windows instead of vanishing.
+        // and the spare stacks with the tiled terminal instead of vanishing.
         let d = def(
             vec![term(1), term(2)],
             vec![
@@ -1460,7 +1530,8 @@ mod tests {
         let r = rec(&d, &inv);
         assert_eq!(r.substituted, vec![sub(1, 10, ItemKind::Terminal)]);
         assert_eq!(r.unfilled, vec![term(2)]);
-        assert_eq!(r.additional, vec![term(20)]);
+        assert_eq!(r.stacked, vec![term(20)]);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![10, 20]]);
         assert_eq!(validate(&r.arrangement, &r.items), Ok(()));
     }
 
@@ -1507,7 +1578,8 @@ mod tests {
         // stays minimized alone with the stack's placement (active clamped).
         assert_eq!(r.substituted, vec![sub(3, 8, ItemKind::Chat)]);
         assert_eq!(r.kept_minimized, vec![term(7)]);
-        assert_eq!(r.additional, vec![term(9)], "visible extra");
+        assert_eq!(r.stacked, vec![term(9)], "visible extra joins terminal 1");
+        assert!(r.additional.is_empty());
         let kept = r
             .arrangement
             .windows
@@ -1782,10 +1854,12 @@ mod tests {
         let mut inv = a.items.clone();
 
         // A → B: terminal 1 substitutes; the board opens fresh; terminal 2
-        // and chat 3 go to Additional; minimized terminal 5 stays put.
+        // stacks with terminal 1; chat 3 (B has no chat) goes to Additional;
+        // minimized terminal 5 stays put.
         let rb = reconcile(&b, &a.arrangement, &inv).unwrap();
         assert_eq!(rb.substituted, vec![sub(100, 1, ItemKind::Terminal)]);
-        assert_eq!(rb.additional, vec![term(2), chat(3)]);
+        assert_eq!(rb.stacked, vec![term(2)]);
+        assert_eq!(rb.additional, vec![chat(3)]);
         assert_eq!(rb.kept_minimized, vec![term(5)]);
         assert_eq!(rb.to_open.len(), 1);
         let board = ItemRef::new(50, ItemKind::Board);
@@ -1818,6 +1892,157 @@ mod tests {
         let back = reconcile(&a, &rb.arrangement, &a.items).unwrap();
         assert!(back.is_exact() && back.to_open.is_empty());
         assert_eq!(back.arrangement, a.arrangement);
+    }
+
+    // ── extras stack onto a window of their kind ─────────────────────────
+
+    #[test]
+    fn five_terminals_into_a_one_terminal_layout_share_its_window() {
+        // A layout saved elsewhere: one terminal. The Project has five.
+        let d = def(vec![term(100)], vec![WindowSpec::tiled(vec![100], 0)], Some(leaf(0)));
+        let inv = vec![term(1), term(2), term(3), term(4), term(5)];
+        let r = rec(&d, &inv);
+        assert_eq!(r.substituted, vec![sub(100, 1, ItemKind::Terminal)]);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1, 2, 3, 4, 5]]);
+        assert_eq!(r.arrangement.windows[0].active, 0, "the layout's own tab stays in front");
+        assert_eq!(r.arrangement.tree, Some(leaf(0)), "no Additional windows split");
+        assert_eq!(r.stacked, vec![term(2), term(3), term(4), term(5)]);
+        assert!(r.additional.is_empty());
+        assert!(!r.is_exact(), "the live windows differ from the saved layout");
+        assert_eq!(validate(&r.arrangement, &r.items), Ok(()));
+    }
+
+    #[test]
+    fn extras_join_the_largest_tiled_window_of_their_kind() {
+        // terminal 1 (30%) | terminal 2 (50%) | chat 3 (20%).
+        let d = def(
+            vec![term(1), term(2), chat(3)],
+            vec![
+                WindowSpec::tiled(vec![1], 0),
+                WindowSpec::tiled(vec![2], 0),
+                WindowSpec::tiled(vec![3], 0),
+            ],
+            Some(split(SplitAxis::H, &[0.3, 0.5, 0.2], vec![leaf(0), leaf(1), leaf(2)])),
+        );
+        let inv = vec![term(1), term(2), chat(3), term(9), term(7)];
+        let r = rec(&d, &inv);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1], vec![2, 9, 7], vec![3]]);
+        assert_eq!(r.stacked, vec![term(9), term(7)], "inventory order");
+        assert_eq!(r.arrangement.tree, d.arrangement.tree, "the saved tiling, untouched");
+        // A nested split: shares multiply down the tree. Terminal 1 has 60%
+        // of the width; terminal 2 has 40% of the width times 90% of the height.
+        let nested = def(
+            vec![term(1), term(2), chat(3)],
+            vec![
+                WindowSpec::tiled(vec![1], 0),
+                WindowSpec::tiled(vec![2], 0),
+                WindowSpec::tiled(vec![3], 0),
+            ],
+            Some(split(
+                SplitAxis::H,
+                &[3.0, 2.0],
+                vec![leaf(0), split(SplitAxis::V, &[9.0, 1.0], vec![leaf(1), leaf(2)])],
+            )),
+        );
+        let r = rec(&nested, &inv);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1, 9, 7], vec![2], vec![3]]);
+    }
+
+    #[test]
+    fn a_tiled_window_beats_a_floating_one_and_ties_go_to_the_first() {
+        // A big floating terminal and a small tiled one: tiled wins.
+        let d = def(
+            vec![term(1), term(2), chat(3)],
+            vec![
+                WindowSpec::floating(vec![1], 0, NormRect::new(0.0, 0.0, 0.9, 0.9)),
+                WindowSpec::tiled(vec![3], 0),
+                WindowSpec::tiled(vec![2], 0),
+            ],
+            Some(split(SplitAxis::H, &[0.9, 0.1], vec![leaf(1), leaf(2)])),
+        );
+        let r = rec(&d, &[term(1), term(2), chat(3), term(8)]);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1], vec![3], vec![2, 8]]);
+        // Only floating terminals: the larger one. Equal: the first.
+        let floats = |a: f32, b: f32| {
+            def(
+                vec![term(1), term(2)],
+                vec![
+                    WindowSpec::floating(vec![1], 0, NormRect::new(0.0, 0.0, a, a)),
+                    WindowSpec::floating(vec![2], 0, NormRect::new(0.5, 0.5, b, b)),
+                ],
+                None,
+            )
+        };
+        let inv = [term(1), term(2), term(8)];
+        assert_eq!(tabs_of(&rec(&floats(0.2, 0.4), &inv).arrangement), vec![vec![1], vec![2, 8]]);
+        assert_eq!(tabs_of(&rec(&floats(0.3, 0.3), &inv).arrangement), vec![vec![1, 8], vec![2]]);
+        // Two equal tiles: the first.
+        let even = def(
+            vec![term(1), term(2)],
+            vec![WindowSpec::tiled(vec![1], 0), WindowSpec::tiled(vec![2], 0)],
+            Some(split(SplitAxis::H, &[0.5, 0.5], vec![leaf(0), leaf(1)])),
+        );
+        assert_eq!(tabs_of(&rec(&even, &inv).arrangement), vec![vec![1, 8], vec![2]]);
+    }
+
+    #[test]
+    fn extras_never_join_a_minimized_window_and_unmatched_kinds_go_to_additional() {
+        // The layout's only terminal is minimized, and it has no chat.
+        let d = def(
+            vec![term(1), image(4)],
+            vec![
+                WindowSpec::minimized(vec![1], 0, true, MIN_RECT),
+                WindowSpec::tiled(vec![4], 0),
+            ],
+            Some(leaf(1)),
+        );
+        let inv = vec![term(1), image(4), term(2), chat(5)];
+        let r = rec(&d, &inv);
+        assert!(r.stacked.is_empty(), "a minimized window never takes extras");
+        assert_eq!(r.additional, vec![term(2), chat(5)]);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1], vec![4], vec![2, 5]]);
+        assert_eq!(
+            r.arrangement.tree,
+            Some(split(
+                SplitAxis::H,
+                &[1.0 - ADDITIONAL_RATIO, ADDITIONAL_RATIO],
+                vec![leaf(1), leaf(2)]
+            ))
+        );
+        // With a visible terminal, the terminal stacks and only the chat is
+        // left over for Additional windows.
+        let d = def(
+            vec![term(1), image(4)],
+            vec![WindowSpec::tiled(vec![1], 0), WindowSpec::tiled(vec![4], 0)],
+            Some(split(SplitAxis::H, &[0.5, 0.5], vec![leaf(0), leaf(1)])),
+        );
+        let r = rec(&d, &inv);
+        assert_eq!(r.stacked, vec![term(2)]);
+        assert_eq!(r.additional, vec![chat(5)]);
+        assert_eq!(tabs_of(&r.arrangement), vec![vec![1, 2], vec![4], vec![5]]);
+        assert_eq!(validate(&r.arrangement, &inv), Ok(()));
+        // A minimized extra stays minimized; it does not stack.
+        let cur = live(&inv, &[2]);
+        let r = reconcile(&d, &cur, &inv).unwrap();
+        assert_eq!(r.kept_minimized, vec![term(2)]);
+        assert!(r.stacked.is_empty());
+    }
+
+    #[test]
+    fn a_window_whose_placeholder_fails_to_open_keeps_its_stacked_extras() {
+        // [board 7 (opens fresh), terminal 1] in one stack; terminal 2 is an extra.
+        let board = ItemRef::new(7, ItemKind::Board);
+        let d = def(
+            vec![board, term(1)],
+            vec![WindowSpec::tiled(vec![7, 1], 0)],
+            Some(leaf(0)),
+        );
+        let inv = vec![term(1), term(2)];
+        let r = rec(&d, &inv);
+        assert_eq!(r.stacked, vec![term(2)]);
+        let failed = r.with_opened(&[]).unwrap();
+        assert_eq!(tabs_of(&failed.arrangement), vec![vec![1, 2]]);
+        assert_eq!(validate(&failed.arrangement, &inv), Ok(()));
     }
 
     #[test]

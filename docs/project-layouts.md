@@ -8,7 +8,7 @@ This doc tracks what has shipped. Status: **model, identity,
 reconciliation (fill missing slots), the saved-layout library on disk, live
 Apply / Revert with the Modified flag, the Project-header picker with Save,
 the New Project layout, and Create Layout…** (single-shot, provider
-proposed). Every wave of the `project-layouts` plan has landed.
+proposed, may add windows that open on Apply). Every wave of the `project-layouts` plan has landed.
 
 ## What exists
 
@@ -88,11 +88,20 @@ always applicable.
    empty slot is `unfilled` and omitted: its tab leaves its stack, empty
    stacks go, single-child splits collapse, surviving ratios renormalize. A
    stack whose active tab vanished keeps the same slot, clamped.
-4. Unassigned **visible** items form one tiled **Additional windows** stack,
-   in inventory order with the first tab active, appended as the right child
-   of an H split (`ADDITIONAL_RATIO` of the width) or as the root when no
-   saved tiled geometry survived. Unassigned **minimized** items stay
-   minimized in their own live stack, with its restore placement
+4. An unassigned **visible** item joins the layout's window that holds its
+   kind, behind that window's tabs (`stacked`; the front tab stays the
+   layout's). Five terminals into a one-terminal layout: one window, five
+   tabs. When several windows hold the kind, it is the largest visible one:
+   tiled before floating, a tile's size is its share of the tree, a float's
+   is its rect, and a tie goes to the first window. A minimized window never
+   takes extras. A placeholder counts as its kind, so extras can stack with
+   a window that is still to open.
+5. What is left (visible items with no visible window of their kind, say a
+   Chat when the layout has none) forms one tiled **Additional windows**
+   stack, in inventory order with the first tab active, appended as the
+   right child of an H split (`ADDITIONAL_RATIO` of the width) or as the
+   root when no saved tiled geometry survived. Unassigned **minimized**
+   items stay minimized in their own live stack, with its restore placement
    (`kept_minimized`), so a switch never brings back windows the user put
    away.
 
@@ -128,15 +137,18 @@ moves Content into.
 
 #### Summary and Modified
 
-`matched`, `substituted`, `opened`, `additional`, `kept_minimized`, and
-`unfilled` feed the post-Apply summary. `is_exact` is the Modified test: true
-when nothing went to Additional windows and every slot was filled.
+`matched`, `substituted`, `opened`, `stacked`, `additional`,
+`kept_minimized`, and `unfilled` feed the post-Apply summary. `is_exact` is
+the Modified test: true when no extra was stacked or went to Additional
+windows and every slot was filled. A stacked extra makes the picker show
+Modified because the live windows no longer match the saved layout; saving
+then saves the stacks.
 Substitution and kept-minimized extras do not make an Apply dirty; pending
 `to_open` slots do until `with_opened` resolves them, so call it first.
 
-Switching A → B → A converges: B parks A's extras in Additional windows (and
-leaves A's minimized ones minimized), and A takes them back by exact id, so
-nothing opens. The window count only grows to the largest layout used.
+Switching A → B → A converges: B stacks A's extras with matching windows or
+parks them in Additional windows (and leaves A's minimized ones minimized),
+and A takes them back by exact id, so nothing opens. The window count only grows to the largest layout used.
 
 ### Modified comparison (`same_arrangement`)
 
@@ -273,8 +285,8 @@ tab index that must not move), and Content that is not a layout kind.
 **Revert.** One level, in memory: the pre-Apply arrangement (ids and
 geometry, never Content) and selection. Revert reconciles that saved
 arrangement against the live windows like any definition, so every old item
-matches by id and anything the Apply opened lands in Additional windows. It
-opens nothing. It restores the old selection and Modified value, then the
+matches by id and anything the Apply opened stacks with a window of its
+kind (else lands in Additional windows). It opens nothing. It restores the old selection and Modified value, then the
 point is gone. A structural edit after the Apply retires it
 (`RevertStatus::Invalidated`; the reason text is
 `LayoutApplyError::RevertInvalidated`). Focus changes and resizes do not.
@@ -330,7 +342,9 @@ true }` on the Project being drawn; the next frame runs it. The header then
 reads `take_layout_outcome`. An exact Apply says nothing. Otherwise a
 dismissible summary sits under the picker, built from the applied
 `Reconciliation` (`summary_lines`): which windows stood in for saved ones,
-what opened, what moved to Additional windows, which slots could not be
+what opened, what stacked with matching windows ("Stacked with matching
+windows: beta, gamma"), what moved to Additional windows, which slots could
+not be
 filled, and which opens failed (with the error, not shortened). It has a
 **Revert Layout** button. A failed Apply or Revert shows its error instead.
 
@@ -446,9 +460,19 @@ Gotchas:
 ### Create Layout… (`src/wm/layout_create.rs`, `src/layout_prompt.rs`)
 
 **What.** Describe an arrangement in words; one provider call proposes one
-**candidate** for the windows that are open; you Apply it, Save & Apply it,
-or Cancel. Single-shot: no conversation. To change it, edit the
-description and press **run again**; the new candidate replaces the old.
+**candidate** for the windows that are open, plus any new windows the
+description needs ("chat on the right" with no chat open, "like Rider");
+you Apply it, Save & Apply it, or Cancel. Single-shot: no conversation. To
+change it, edit the description and press **run again**; the new candidate
+replaces the old.
+
+**New windows open on Apply, never from the reply.** The reply only
+declares them; the preview draws them with an accent border, labels them
+"New terminal", "New chat", …, and says "Apply opens 2 new windows:
+Terminal, Git changes". Apply (or Save & Apply, or picking the saved layout
+later) opens them the way a saved layout opens its missing windows: the
+default shell in the Project directory with no command, or an empty
+viewer. No agent starts and nothing runs.
 
 **Where.** Layout ▾ → **Create Layout…** opens an editor centered on the
 Project. It shows: what is sent and to whom ("Sent to Codex (Settings:
@@ -457,7 +481,10 @@ the list of windows with their icons, labels, and kinds, the description
 box, **run** (Ctrl+Enter), and once a reply is in, the provider's one-line
 message and a diagram of the candidate with each window's icon and label
 (stacked tabs listed under the active one, minimized windows listed below
-the diagram). Then **cancel**, **apply**, **save & apply…**.
+the diagram, new windows marked as above). Then **cancel**, **apply**,
+**save & apply…**. A reply that would leave the windows exactly as they are
+is not offered: the editor says "That is already how the windows are
+arranged" instead of enabling Apply.
 
 **What the provider gets** (`Inventory::wire_json`), and nothing else:
 
@@ -479,21 +506,29 @@ commit-message drafting.
 
 **What the provider may return** (`parse_reply`, strict):
 
-- `{"message", "windows": [{"tabs", "active"?, "place", "rect"?}], "tree"?}`
-  where `place` is tiled / floating / minimized and the tree is
-  `{"window": i}` or `{"split": "row"|"column", "sizes", "children"}`; or
-- `{"message", "missing": [kinds]}` when the description needs Content that
-  is not open. The editor says what to open ("This needs windows that are
-  not open: Chat. Open them, then run again.") and shows the provider's
-  message. Nothing is opened for it, ever.
+- `{"message", "new"?: [{"id", "kind"}], "windows": [{"tabs", "active"?,
+  "place", "rect"?}], "tree"?}` where `place` is tiled / floating /
+  minimized and the tree is `{"window": i}` or `{"split": "row"|"column",
+  "sizes", "children"}`; or
+- `{"message", "missing": [kinds]}` when the description needs an image,
+  diff, or Project window that is not open. Those need a target, so they
+  can't be new. The editor says what to open ("This needs windows that are
+  not open: Image. Open them, then run again.") and shows the provider's
+  message.
+
+`new` (`new_items`): at most `MAX_NEW_ITEMS` (6); kinds terminal, chat,
+board, plan, git_history, git_changes only; a viewer (chat, board, plan,
+git history, git changes) only when the Project has none, and once; a wire
+id that is not listed and not repeated; tiled or floating, never
+minimized (a minimized slot never opens). Each gets a real id past the
+highest live id.
 
 Unknown fields anywhere, an unknown or repeated id, an omitted item, a rect
 on a tiled window or none on a floating one, rect values outside 0..1,
 non-finite or non-positive sizes, a tree deeper than `MAX_TREE_DEPTH`, and
 markdown fences are all errors. The arrangement then goes through the same
-`validate` as a saved layout, against exactly the inventory. So a candidate
-can only move what exists. Unlike a saved layout it never fills missing
-slots.
+`validate` as a saved layout, against exactly the inventory plus the new
+windows. So a candidate moves what exists and adds only what it declared.
 
 **Staleness.** Each manager keeps an arrangement **revision**
 (`layout_revision`). The edit watch bumps it on every structural edit, and
@@ -520,17 +555,25 @@ slots. A run that finds both slots taken says so and keeps the candidate
 it already has (the slot is taken before anything is cleared).
 
 **Apply** checks the candidate against the live windows now
-(`check_candidate`: same revision, reconciles to an exact id match), then
-queues `LayoutRequest::Candidate { select: false }`. The drain re-checks
-the revision and runs the normal Apply in **strict** form: anything but an
-exact id match (something to open, a stand-in, an extra, an empty slot) is
-`LayoutApplyError::Stale` and nothing moves. The picker shows Custom; the
-revert point is set; a short "Applied. It stays Custom until you save it."
+(`check_candidate`: same revision, every live item matched by id, and the
+windows reconcile would open are exactly the candidate's `added`), then
+queues `LayoutRequest::Candidate { added, select: false }`. The drain
+re-checks and runs the normal Apply in **strict** form: a stand-in, an
+extra, an empty slot, or any open besides `added` (say a window the
+candidate placed has since closed) is `LayoutApplyError::Stale` and
+nothing moves or opens. The new windows open first, then everything moves.
+The picker shows Custom; the revert point is set; a short "Applied. It
+stays Custom until you save it." If a new window fails to open, the notice
+is the usual summary ("Applied with changes", with what was left out).
+Revert puts the old arrangement back; windows Apply opened stay open,
+stacked with a window of their kind, as with any Apply.
 
 **Save & Apply…** asks for a name in the editor. On submit it checks the
 candidate (stale → dropped, nothing written), then writes it with
-`LayoutStore::create`, and only after `Ok` queues the strict Apply with
-`select: true`. A duplicate name offers **replace & apply**; any other
+`LayoutStore::create` (the new windows are saved as ordinary items), and
+only after `Ok` queues the strict Apply with `select: true`. Picking that
+layout later opens whichever of its windows are missing, like any saved
+layout. A duplicate name offers **replace & apply**; any other
 write failure shows the error and keeps the editor, the candidate, and the
 windows as they were. If the windows change in the gap between the write
 and the next frame, the Apply refuses and the notice says the layout was
@@ -547,7 +590,11 @@ Gotchas:
 - The revision misses an edit made in the very frame the Project resized
   (the watch re-measures instead of comparing). The strict Apply still
   refuses any inventory change, so the worst case is a regroup the
-  candidate did not see being rearranged, never a window opened or lost.
+  candidate did not see being rearranged, never a window lost or an
+  undeclared one opened.
+- Foreman has no editor or file-tree window. "Like Rider" or "like VS
+  Code" maps onto terminals and git viewers as the provider sees fit (in
+  testing: new terminals for the "project pane" and "editor").
 
 ## Key files
 

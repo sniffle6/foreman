@@ -31,11 +31,14 @@ pub enum LayoutRequest {
     NewProject { def: LayoutDefinition },
     /// A Create candidate (`select: false`) or the definition Save & Apply
     /// just wrote from one (`select: true`). Strict: it runs only while the
-    /// arrangement revision is still `revision` and the definition places
-    /// exactly the live items, so it can never open, substitute, or set
-    /// anything aside. Otherwise [`LayoutApplyError::Stale`].
+    /// arrangement revision is still `revision`, the definition matches
+    /// every live item by id, and the only windows it opens are exactly
+    /// `added` (the candidate's new windows). It can never substitute, set
+    /// anything aside, or reopen something that closed. Otherwise
+    /// [`LayoutApplyError::Stale`].
     Candidate {
         def: LayoutDefinition,
+        added: Vec<LayoutItemId>,
         select: bool,
         revision: u64,
     },
@@ -58,7 +61,8 @@ pub struct LayoutApplied {
 }
 
 impl LayoutApplied {
-    /// Clean Apply: every slot filled and nothing in Additional windows.
+    /// Clean Apply: every slot filled, nothing stacked, and nothing in
+    /// Additional windows.
     pub fn is_exact(&self) -> bool {
         self.reconciliation.is_exact()
     }
@@ -146,7 +150,7 @@ pub(super) struct LayoutRuntime {
     revision: u64,
     /// Test seam: make every fresh open fail, as a shell that cannot spawn.
     #[cfg(test)]
-    fail_opens: bool,
+    pub(super) fail_opens: bool,
 }
 
 /// A `Tab` out of its window for the duration of a rearrangement.
@@ -207,9 +211,10 @@ impl WindowManager {
             LayoutRequest::Revert => self.revert_layout(),
             LayoutRequest::Candidate {
                 def,
+                added,
                 select,
                 revision,
-            } => self.apply_candidate(&def, select, revision, ctx),
+            } => self.apply_candidate(&def, &added, select, revision, ctx),
             LayoutRequest::NewProject { def } => {
                 match self.apply_layout(&detach_ids(&def), false, ctx) {
                     Err(LayoutApplyError::NotLaidOut | LayoutApplyError::Busy) => {
@@ -239,15 +244,16 @@ impl WindowManager {
         select: bool,
         ctx: &egui::Context,
     ) -> Result<LayoutApplied, LayoutApplyError> {
-        self.apply_reconciled(def, select, false, ctx)
+        self.apply_reconciled(def, select, None, ctx)
     }
 
     /// Apply a Create candidate (or the definition saved from one) now:
-    /// only at `revision`, and only if it places exactly the live items.
-    /// On `Err` nothing moved and nothing opened.
+    /// only at `revision`, and only if it matches every live item by id and
+    /// opens exactly `added`. On `Err` nothing moved and nothing opened.
     pub fn apply_candidate(
         &mut self,
         def: &LayoutDefinition,
+        added: &[LayoutItemId],
         select: bool,
         revision: u64,
         ctx: &egui::Context,
@@ -255,7 +261,7 @@ impl WindowManager {
         if revision != self.layout_rt.revision {
             return Err(LayoutApplyError::Stale);
         }
-        self.apply_reconciled(def, select, true, ctx)
+        self.apply_reconciled(def, select, Some(added), ctx)
     }
 
     /// Whether a candidate made at `revision` still applies cleanly to the
@@ -264,6 +270,7 @@ impl WindowManager {
     pub(super) fn check_candidate(
         &self,
         def: &LayoutDefinition,
+        added: &[LayoutItemId],
         revision: u64,
     ) -> Result<(), LayoutApplyError> {
         let area = self.layout_area()?;
@@ -272,24 +279,24 @@ impl WindowManager {
         }
         let (items, current) = self.capture_arrangement(area);
         let rec = pl::reconcile(def, &current, &items).map_err(LayoutApplyError::Invalid)?;
-        strict(&rec)
+        strict(&rec, added)
     }
 
-    /// Reconcile, open fresh items for fillable slots (never when
-    /// `strict_items`: then anything but an exact id match is `Stale`),
-    /// and move every `Tab` into the result.
+    /// Reconcile, open fresh items for fillable slots, and move every
+    /// `Tab` into the result. With `strict_added`, anything but an exact
+    /// id match that opens exactly those items is `Stale` (see [`strict`]).
     fn apply_reconciled(
         &mut self,
         def: &LayoutDefinition,
         select: bool,
-        strict_items: bool,
+        strict_added: Option<&[LayoutItemId]>,
         ctx: &egui::Context,
     ) -> Result<LayoutApplied, LayoutApplyError> {
         let area = self.layout_area()?;
         let (items, current) = self.capture_arrangement(area);
         let rec = pl::reconcile(def, &current, &items).map_err(LayoutApplyError::Invalid)?;
-        if strict_items {
-            strict(&rec)?;
+        if let Some(added) = strict_added {
+            strict(&rec, added)?;
         }
         let before = RevertPoint {
             items,
@@ -344,7 +351,8 @@ impl WindowManager {
 
     /// Restore the arrangement from before the last Apply, with its
     /// selection and Modified state. Content is not rewound. Items the
-    /// Apply opened stay open, in Additional windows. One level only.
+    /// Apply opened stay open, stacked with a window of their kind (else in
+    /// Additional windows). One level only.
     pub fn revert_layout(&mut self) -> Result<LayoutApplied, LayoutApplyError> {
         let area = self.layout_area()?;
         let point = match std::mem::take(&mut self.layout_rt.revert) {
@@ -741,11 +749,20 @@ impl WindowManager {
     }
 }
 
-/// A candidate's reconciliation must match every item by id: nothing to
-/// open, no stand-ins, nothing set aside (visible or minimized), no slot
-/// left empty.
-fn strict(rec: &Reconciliation) -> Result<(), LayoutApplyError> {
-    if rec.is_exact() && rec.substituted.is_empty() && rec.kept_minimized.is_empty() {
+/// A candidate's reconciliation must match every live item by id and open
+/// exactly its own new windows (`added`): no stand-ins, nothing stacked or
+/// set aside (visible or minimized), no slot left empty, and no reopening a
+/// saved item that has since closed.
+fn strict(rec: &Reconciliation, added: &[LayoutItemId]) -> Result<(), LayoutApplyError> {
+    let opens: HashSet<LayoutItemId> = rec.to_open.iter().map(|o| o.saved.id).collect();
+    let added: HashSet<LayoutItemId> = added.iter().copied().collect();
+    if opens == added
+        && rec.unfilled.is_empty()
+        && rec.stacked.is_empty()
+        && rec.additional.is_empty()
+        && rec.substituted.is_empty()
+        && rec.kept_minimized.is_empty()
+    {
         Ok(())
     } else {
         Err(LayoutApplyError::Stale)
@@ -1092,12 +1109,12 @@ mod tests {
         let to_b = wm.apply_layout(&def_b, true, &ctx).unwrap();
         let extras: Vec<_> = to_b
             .reconciliation
-            .additional
+            .stacked
             .iter()
             .map(|i| i.id)
             .collect();
         assert_eq!(extras, vec![b, c]);
-        assert_eq!(wm.windows.len(), 2, "a, plus one Additional windows stack");
+        assert_eq!(wm.windows.len(), 1, "b and c stacked behind a");
         assert!(wm.layout.modified, "extras make the Apply dirty");
 
         let back = wm.apply_layout(&def_a, true, &ctx).unwrap();
@@ -1566,7 +1583,7 @@ mod tests {
         assert_eq!(wm.windows.len(), 3, "nothing moves until the next frame");
         wm.drain_layout_request(&ctx);
         assert!(matches!(wm.take_layout_outcome(), Some(Ok(_))));
-        assert_eq!(wm.windows.len(), 2);
+        assert_eq!(wm.windows.len(), 1, "the extras stacked behind a");
         wm.request_layout(LayoutRequest::Revert);
         wm.drain_layout_request(&ctx);
         assert!(matches!(wm.take_layout_outcome(), Some(Ok(_))));
@@ -1797,8 +1814,8 @@ mod tests {
         frame(&mut desk);
         let p = child(&mut desk);
         assert_eq!(p.layout.selected.as_deref(), Some(solo.id.as_str()));
-        assert!(p.layout.modified, "t2 went to Additional windows");
-        assert_eq!(p.windows.len(), 2);
+        assert!(p.layout.modified, "t2 stacked with t1");
+        assert_eq!(p.windows.len(), 1);
         assert_eq!(sessions(&mut desk), before, "same Sessions after Apply");
         send_line(&mut desk, &ctx, t2, "echo MOVED_%OS%");
         wait_for(&mut desk, &ctx, t2, "MOVED_Windows_NT");

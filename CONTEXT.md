@@ -75,8 +75,9 @@ _Avoid_: preset, template, workspace (that is the cold desktop snapshot).
 
 **Layout candidate**:
 The one arrangement a Create Layout request proposes for the open windows.
-It places every current layout item exactly once and adds none, and it is
-valid only at the arrangement revision it was made at. Apply uses it as is;
+It places every current layout item exactly once, may add new windows
+that only open when it is applied, and it is valid only at the arrangement
+revision it was made at. Apply uses it as is;
 Save & Apply turns it into a layout definition.
 _Avoid_: draft, suggestion. (In the integration queue "candidate" is avoided
 for the Prepared commit; here it is the spec's word.)
