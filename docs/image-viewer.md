@@ -20,8 +20,9 @@ foreman view screenshot.png --project p2    # a specific project
 ```
 
 Reply: `{"ok":true,"terminal":"tN","project":"pN"}` — same shape as `open`.
-The window tiles in next to whatever's focused, like a dispatched agent
-terminal, and (also like dispatch) it doesn't steal your keyboard focus.
+The window tiles in next to whatever's focused, and (like a dispatched agent
+terminal) it doesn't steal your keyboard focus. Unlike a dispatched terminal
+it never stacks as a tab (`docs/tiling-tree.md`).
 
 Inside the window:
 - **Ctrl+Scroll** zooms, centered on the pointer (0.1x–32x of fit-to-window).

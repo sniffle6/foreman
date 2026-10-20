@@ -94,6 +94,21 @@ New windows tile by default: they split the previously-focused tiled window
 along its longer axis, or become the root tile of an empty tree. The chat
 viewer window is the exception — it always opens floating.
 
+Dispatched terminals (`foreman open`, `kanban dispatch`) stack instead when
+they can: the new terminal becomes a back tab on the largest tiled window
+whose front tab is a terminal, never the focused window and never a floating
+or minimized one (ties: first in tree order; `dispatch_stack_target` in
+`src/wm.rs`). The target's front tab and the focus stay as they were. With
+nothing to stack onto, e.g. only the orchestrator open, it tiles as above.
+So the first worker splits beside the orchestrator, every later worker joins
+that worker's stack, and the orchestrator keeps its half. That assumes the
+orchestrator has focus: the pick only excludes whatever is focused, so with a
+worker or the Board focused, a dispatch can land as a back tab on the
+orchestrator's window instead. Why: splitting the
+focus on every dispatch halved the orchestrator each time (1/2, 1/4, 1/8…)
+in plan runs. Hand-opened terminals, layout Apply's fresh slots, and image
+windows still tile.
+
 Tabs are unchanged: a tab stack is just a window (`Win.tabs`), so a tree leaf
 with multiple tabs IS a tabbed container sitting in the layout.
 
@@ -133,10 +148,18 @@ work shipped, and unlike the rest of that plan it had no surviving spec.)
   next frame's refit. Invisible at 60fps; don't "fix" it by setting rects
   inline.
 - **Ratios can sink below 10%** via repeated same-axis splits (insert halves
-  the target's ratio without a floor). `resize_edge` clamps so dragging can't
-  crush tiles further — and its bounds are built to never panic on such
+  the target's ratio without a floor). Repeated manual splits still do this;
+  dispatch no longer does, since it stacks. `resize_edge` clamps so dragging
+  can't crush tiles further — and its bounds are built to never panic on such
   degenerate ratios (`f32::clamp` panics if min > max; see the regression
   test in `layout.rs`).
+- **A stacked worker runs at the 80×24 spawn grid until its tab is first
+  shown.** Back tabs are pumped, never resized (only `show` resizes), so a
+  `snapshot` of one reads 80 columns and its dim dispatch banner appears on
+  first show. Same as any back tab.
+- **Dispatch sizes stack targets by tree share, not `Win.rect`.** A window
+  tiled earlier in the same frame still has its cascade rect (rects refit
+  next frame), and a never-shown Project has no area.
 - **At startup** the longer-axis rule sees pre-layout spawn rects (580×380 →
   "wide"), so early windows split `Right`. At runtime it uses live rects.
 - **Drop gating keys off where the drag STARTED**
@@ -156,7 +179,9 @@ work shipped, and unlike the rest of that plan it had no surviving spec.)
   Pure data + math, fully unit-tested, no egui interaction.
 - `src/wm.rs` — integration: per-frame refit from `tree.layout()`, drag
   tear-out in `show()`, `drop_proposal` / `commit_drop` via `Act::Drop`, `move_dir` / `place_split` /
-  `toggle_float` / `toggle_zoom` / `tile_new` / `detach`.
+  `toggle_float` / `toggle_zoom` / `tile_new` / `detach`, and dispatch
+  stacking: `dispatch_stack_target` (the pure pick) and `append_tabs` (the
+  one tab-append, shared with drag-merge).
 - `src/keymap.rs` — `TermFloat`/`ProjFloat` commands; `TermSnap`/`ProjSnap`
   kept their serialized names (user keybinding files still work) but are
   labeled "Move …" and dispatch to `move_dir`.

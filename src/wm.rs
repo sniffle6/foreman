@@ -2648,6 +2648,8 @@ impl WindowManager {
     }
 
     /// [`Self::add_terminal_cmd`] joining the chat room with `reception`.
+    /// Placement: a back tab on [`Self::dispatch_stack_target`] when there is
+    /// one, else tiled beside the focused window. Either way focus stays put.
     fn add_terminal_receiving(
         &mut self,
         argv: &[String],
@@ -2665,29 +2667,60 @@ impl WindowManager {
         let title = title
             .map(str::to_string)
             .unwrap_or_else(|| format!("agent · {}", argv[0]));
+        // Dispatched agents auto-join the project chat room (spec §2) — the
+        // room appends the Joined line; the transcript records it. Joined
+        // from the title, not the window: a stacked window is gone by then.
+        self.chat
+            .borrow_mut()
+            .join_receiving(&term_tag(id), display_name(&title), reception);
         // push_win focuses the new window; a dispatched agent must never yank
         // the keyboard out from under the user mid-keystroke (fire-and-watch:
         // the new terminal is to LOOK at, not type into). Keep focus where it
-        // was; the window still spawns on top visually (z from next_slot).
+        // was; a tiled one still spawns on top visually (z from next_slot).
         let prev_focus = self.focused;
+        // Chosen before push_win: it reads the focus the user actually has.
+        let stack_onto = self.dispatch_stack_target();
         // Explicit dispatch title — never auto-renamed (already intentional).
         self.push_win(id, Tab::fixed(title, Content::Terminal(s)), rect);
-        self.tile_new(id, prev_focus);
-        // Dispatched agents auto-join the project chat room (spec §2) — the
-        // room appends the Joined line; the transcript records it.
-        if let Some(w) = self.windows.iter().find(|w| w.id == id) {
-            // (`title` was moved into push_win — read it back off the window)
-            self.chat.borrow_mut().join_receiving(
-                &term_tag(id),
-                display_name(w.title()),
-                reception,
-            );
-        } else {
-            debug_assert!(false, "just-pushed window {id} missing");
+        // A back tab: the target's front tab stays what the user sees.
+        let stacked = stack_onto.is_some_and(|dst| self.append_tabs(id, dst).is_some());
+        if !stacked {
+            self.tile_new(id, prev_focus);
         }
         self.focused = prev_focus;
         self.mark_workspace_dirty();
         Ok(id)
+    }
+
+    /// The window a dispatched terminal stacks onto, if any
+    /// ([`dispatch_stack_target`]). Tiled windows are sized by their share of
+    /// the tree (on-screen area over the manager's area, gaps aside) rather
+    /// than `Win.rect`: a tiled rect refits only next frame, so a worker tiled
+    /// earlier this frame would still carry its cascade rect, and a never
+    /// shown Project has no area at all.
+    fn dispatch_stack_target(&self) -> Option<WinId> {
+        let unit = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0));
+        let shares = self.tree.layout(unit, 0.0);
+        let candidate = |w: &Win, area: f32, tiled: bool| StackCandidate {
+            id: w.id,
+            area,
+            tiled,
+            minimized: w.minimized,
+            terminal: matches!(w.tabs[w.active].content, Content::Terminal(_)),
+            focused: self.focused == Some(w.id),
+        };
+        // Tree order first, so a tie goes to the earliest tile.
+        let tiled = shares.iter().filter_map(|(id, r)| {
+            let w = self.windows.iter().find(|w| w.id == *id)?;
+            Some(candidate(w, r.area(), true))
+        });
+        let rest = self
+            .windows
+            .iter()
+            .filter(|w| !self.tree.contains(w.id))
+            .map(|w| candidate(w, w.rect.area(), false));
+        let cands: Vec<StackCandidate> = tiled.chain(rest).collect();
+        dispatch_stack_target(&cands)
     }
 
     /// Debug-only test hook for `FOREMAN_VIEW_TEST` (main.rs): this debug
@@ -2719,8 +2752,9 @@ impl WindowManager {
 
     /// Open a `Content::Image` window showing `path` (decode happens inside
     /// `ImageView::load`; a missing/bad file lands in its placeholder state,
-    /// never a failed dispatch). Tiled like a dispatched terminal — a static
-    /// viewer is meant to be looked at, so focus stays where it was.
+    /// never a failed dispatch). Always tiled beside the focus, never stacked
+    /// like a dispatched terminal; a static viewer is meant to be looked at,
+    /// so focus stays where it was.
     fn add_image(&mut self, path: PathBuf) -> WinId {
         let title = path
             .file_name()
@@ -6029,22 +6063,35 @@ impl WindowManager {
     }
 
     /// Merge `src` window's tabs onto `dst` window's stack, then remove `src`.
-    /// The merged tabs are appended; the first moved tab becomes active so the
-    /// dropped window is what the user sees. No-op if either id is missing or
-    /// `src == dst` (can't merge a window onto itself).
+    /// The first moved tab becomes active and `dst` takes focus, so the
+    /// dropped window is what the user sees. No-op under the same conditions
+    /// as [`Self::append_tabs`].
     fn merge_windows(&mut self, src: WinId, dst: WinId) {
-        if src == dst {
+        let Some(first_new) = self.append_tabs(src, dst) else {
             return;
+        };
+        if let Some(w) = self.windows.iter_mut().find(|w| w.id == dst) {
+            w.active = first_new; // show the just-dropped tab
         }
-        let Some(si) = self.windows.iter().position(|w| w.id == src) else {
-            return;
-        };
-        let Some(di) = self.windows.iter().position(|w| w.id == dst) else {
-            return;
-        };
+        self.focus(dst);
+    }
+
+    /// Append `src` window's tabs to the end of `dst` window's stack and
+    /// remove `src`. `dst`'s active tab and the focus stay as they were
+    /// (beyond dropping a focus that pointed at `src`). Returns the index of
+    /// the first moved tab, or `None` with nothing changed if either id is
+    /// missing, `src == dst`, or either window is the Sessions panel. The one
+    /// home for tab-append: drag-merge (`merge_windows`) and dispatch
+    /// stacking (`add_terminal_receiving`) both come through here.
+    fn append_tabs(&mut self, src: WinId, dst: WinId) -> Option<usize> {
+        if src == dst {
+            return None;
+        }
+        let si = self.windows.iter().position(|w| w.id == src)?;
+        let di = self.windows.iter().position(|w| w.id == dst)?;
         // Defensive commit guard: no caller may merge the Sessions panel.
         if self.windows[si].is_panel() || self.windows[di].is_panel() {
-            return;
+            return None;
         }
         // Remove the source first; recompute the destination index afterwards
         // since removal may shift it.
@@ -6054,16 +6101,15 @@ impl WindowManager {
         let dst_win = &mut self.windows[di];
         let first_new = dst_win.tabs.len();
         dst_win.tabs.extend(src_win.tabs);
-        dst_win.active = first_new; // show the just-dropped tab
         self.mark_workspace_dirty();
-        // Focus the merged target; drop any dangling focus/last-focus on src.
+        // Drop any dangling focus/last-focus on the now-gone src.
         if self.last_focused == Some(src) {
             self.last_focused = None;
         }
         if self.focused == Some(src) {
             self.focused = None;
         }
-        self.focus(dst);
+        Some(first_new)
     }
 
     /// Detach tab `idx` of window `id` into a brand-new floating window placed at
@@ -8934,6 +8980,38 @@ fn term_tag(id: WinId) -> String {
     format!("t{id}")
 }
 
+/// One window as dispatch placement sees it ([`dispatch_stack_target`]).
+#[derive(Clone, Copy, Debug)]
+struct StackCandidate {
+    id: WinId,
+    /// On-screen size; only compared between tiled windows.
+    area: f32,
+    tiled: bool,
+    minimized: bool,
+    /// The active tab is a Terminal.
+    terminal: bool,
+    focused: bool,
+}
+
+/// Where a dispatched terminal stacks as a tab: the largest tiled,
+/// unminimized window showing a Terminal, never the focused one. A tie goes
+/// to the first in `cands` (callers pass tree order). `None` means tile it
+/// as usual. Stacking every later worker onto one worker window keeps the
+/// focused pane (the orchestrator) at its size; splitting the focus on each
+/// dispatch halved it every time (`docs/tiling-tree.md`).
+fn dispatch_stack_target(cands: &[StackCandidate]) -> Option<WinId> {
+    let mut best: Option<&StackCandidate> = None;
+    for c in cands {
+        if !c.tiled || c.minimized || !c.terminal || c.focused {
+            continue;
+        }
+        if best.is_none_or(|b| c.area > b.area) {
+            best = Some(c);
+        }
+    }
+    best.map(|c| c.id)
+}
+
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
@@ -10987,9 +11065,7 @@ mod tests {
         let a = wm
             .add_terminal_cmd(&pause_argv(), None, Some("A"), &ctx)
             .unwrap();
-        let b = wm
-            .add_terminal_cmd(&pause_argv(), None, Some("B"), &ctx)
-            .unwrap();
+        let b = dispatch_beside(&mut wm, a, &ctx);
 
         let term_id_at = |wm: &WindowManager, win: WinId, tab: usize| -> u64 {
             let w = wm.windows.iter().find(|w| w.id == win).unwrap();
@@ -11013,6 +11089,190 @@ mod tests {
             b,
             "but the Member id is stable — it does not follow the Win id"
         );
+    }
+
+    // --- dispatch placement: stack later workers instead of splitting focus ---
+
+    #[test]
+    fn dispatch_stack_target_table() {
+        // A tiled, unfocused, unminimized window showing a Terminal.
+        let tile = |id: WinId, area: f32| StackCandidate {
+            id,
+            area,
+            tiled: true,
+            minimized: false,
+            terminal: true,
+            focused: false,
+        };
+        let orch = StackCandidate {
+            focused: true,
+            ..tile(1, 0.5)
+        };
+        let cases: Vec<(&str, Vec<StackCandidate>, Option<WinId>)> = vec![
+            ("empty manager", vec![], None),
+            ("lone focused orchestrator", vec![orch], None),
+            (
+                "largest unfocused tile",
+                vec![orch, tile(2, 0.2), tile(3, 0.3)],
+                Some(3),
+            ),
+            (
+                "tie goes to the first",
+                vec![orch, tile(2, 0.25), tile(3, 0.25)],
+                Some(2),
+            ),
+            (
+                "focused never, even when largest",
+                vec![
+                    StackCandidate {
+                        focused: true,
+                        ..tile(1, 0.8)
+                    },
+                    tile(2, 0.2),
+                ],
+                Some(2),
+            ),
+            (
+                "floating never, however big",
+                vec![
+                    orch,
+                    StackCandidate {
+                        tiled: false,
+                        ..tile(2, 9.0)
+                    },
+                    tile(3, 0.1),
+                ],
+                Some(3),
+            ),
+            (
+                "minimized never",
+                vec![
+                    orch,
+                    StackCandidate {
+                        minimized: true,
+                        ..tile(2, 0.5)
+                    },
+                ],
+                None,
+            ),
+            (
+                "front tab not a Terminal never (Sessions panel, board, chat)",
+                vec![
+                    orch,
+                    StackCandidate {
+                        terminal: false,
+                        ..tile(2, 0.5)
+                    },
+                ],
+                None,
+            ),
+            ("no focus at all", vec![tile(1, 0.4), tile(2, 0.6)], Some(2)),
+        ];
+        for (name, cands, want) in cases {
+            assert_eq!(dispatch_stack_target(&cands), want, "{name}");
+        }
+    }
+
+    /// A Project child whose sole tile is a focused terminal: the
+    /// orchestrator a plan's workers are dispatched from.
+    fn orchestrated(ctx: &egui::Context) -> (WindowManager, WinId) {
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".to_string());
+        wm.last_area = egui::vec2(1000.0, 800.0);
+        let orch = wm
+            .add_terminal_cmd(&pause_argv(), None, Some("orchestrator"), ctx)
+            .unwrap();
+        wm.focused = Some(orch);
+        (wm, orch)
+    }
+
+    fn dispatch_worker(wm: &mut WindowManager, ctx: &egui::Context) -> WinId {
+        wm.add_terminal_cmd(&pause_argv(), None, None, ctx).unwrap()
+    }
+
+    /// A hand-opened terminal window, left floating; focus is put back.
+    fn plain_terminal(wm: &mut WindowManager, ctx: &egui::Context) -> WinId {
+        let mut s = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+        let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+        s.set_term_id(id);
+        let keep = wm.focused;
+        wm.push_win(id, Tab::fixed("plain", Content::Terminal(s)), rect);
+        wm.focused = keep;
+        id
+    }
+
+    fn tile_rect(wm: &WindowManager, id: WinId) -> egui::Rect {
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, wm.last_area);
+        wm.tree
+            .layout(local, SNAP_GAP)
+            .into_iter()
+            .find(|(w, _)| *w == id)
+            .map(|(_, r)| r)
+            .expect("tiled")
+    }
+
+    #[test]
+    fn first_dispatch_tiles_beside_the_focused_orchestrator() {
+        let ctx = egui::Context::default();
+        let (mut wm, orch) = orchestrated(&ctx);
+        let w1 = dispatch_worker(&mut wm, &ctx);
+        assert_eq!(wm.tree.leaves(), vec![orch, w1], "nothing to stack onto");
+        assert_eq!(wm.terminal_location(w1), Some((w1, 0)));
+        assert_eq!(wm.focused, Some(orch), "focus never moves");
+    }
+
+    #[test]
+    fn later_dispatches_stack_onto_the_worker_window() {
+        let ctx = egui::Context::default();
+        let (mut wm, orch) = orchestrated(&ctx);
+        let w1 = dispatch_worker(&mut wm, &ctx);
+        let half = tile_rect(&wm, orch);
+        let w2 = dispatch_worker(&mut wm, &ctx);
+        let w3 = dispatch_worker(&mut wm, &ctx);
+        assert_eq!(wm.tree.leaves(), vec![orch, w1], "no new tiles");
+        assert_eq!(wm.terminal_location(w2), Some((w1, 1)));
+        assert_eq!(wm.terminal_location(w3), Some((w1, 2)));
+        let host = wm.windows.iter().find(|w| w.id == w1).unwrap();
+        assert_eq!(host.active, 0, "the front tab is still the first worker");
+        assert_eq!(wm.focused, Some(orch), "focus never moves");
+        assert_eq!(tile_rect(&wm, orch), half, "the orchestrator keeps 1/2");
+        // Both still joined the room under their own Member ids.
+        assert!(wm.chat.borrow().is_member(&term_tag(w2)));
+        assert!(wm.chat.borrow().is_member(&term_tag(w3)));
+    }
+
+    #[test]
+    fn dispatch_stacks_onto_the_larger_of_two_candidates() {
+        let ctx = egui::Context::default();
+        let (mut wm, orch) = orchestrated(&ctx);
+        let big = dispatch_worker(&mut wm, &ctx); // [orch | big], 1/2 each
+        let small = plain_terminal(&mut wm, &ctx);
+        wm.tile_new(small, Some(orch)); // halves the orchestrator's side
+        // `small` comes first in tree order, so only size can pick `big`.
+        assert_eq!(wm.tree.leaves(), vec![orch, small, big]);
+        let w = dispatch_worker(&mut wm, &ctx);
+        assert_eq!(wm.terminal_location(w), Some((big, 1)));
+    }
+
+    #[test]
+    fn dispatch_never_stacks_onto_floating_minimized_or_focused() {
+        let ctx = egui::Context::default();
+        let (mut wm, orch) = orchestrated(&ctx);
+        let float = plain_terminal(&mut wm, &ctx);
+        // Bigger than the whole area: size must not make a float a target.
+        wm.windows.iter_mut().find(|w| w.id == float).unwrap().rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4000.0, 4000.0));
+        let mini = plain_terminal(&mut wm, &ctx);
+        wm.tile_new(mini, Some(orch));
+        wm.minimize(mini);
+        assert_eq!(wm.focused, Some(orch));
+        let w = dispatch_worker(&mut wm, &ctx);
+        assert_eq!(wm.terminal_location(w), Some((w, 0)), "its own window");
+        assert_eq!(wm.tree.leaves(), vec![orch, w], "tiled beside the focus");
+        for id in [orch, float, mini] {
+            let win = wm.windows.iter().find(|x| x.id == id).unwrap();
+            assert_eq!(win.tabs.len(), 1, "window {id} gained no tab");
+        }
     }
 
     // --- Tree-based split/move/float (drives place_split with stub windows so no
@@ -11968,6 +12228,17 @@ mod tests {
         vec!["cmd.exe".into(), "/c".into(), "pause".into()]
     }
 
+    /// Dispatch a `pause` member as its own tiled window beside
+    /// `orchestrator`, the way a plan's first worker lands: with the
+    /// orchestrator focused there is nothing else to stack onto
+    /// (`dispatch_stack_target`). Focus is put back as it was.
+    fn dispatch_beside(wm: &mut WindowManager, orchestrator: WinId, ctx: &egui::Context) -> WinId {
+        let keep = wm.focused.replace(orchestrator);
+        let id = wm.add_terminal_cmd(&pause_argv(), None, None, ctx).unwrap();
+        wm.focused = keep;
+        id
+    }
+
     // Count Joined/Exited syslines for a member id by reading the room's paint
     // blocks (the room exposes no raw msg list — blocks() is the read path).
     // Sys lines render as "— {name} ({id}) joined|exited —".
@@ -12624,9 +12895,7 @@ mod tests {
         let a = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let b = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
+        let b = dispatch_beside(&mut wm, a, &ctx);
         wm.open_chat_window();
         // simulate the input line submitting
         for w in &mut wm.windows {
@@ -12711,9 +12980,7 @@ mod tests {
         let first = child
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let second = child
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
+        let second = dispatch_beside(&mut child, first, &ctx);
         child.focused = Some(first);
         let mut wm = WindowManager::new();
         wm.desktop = true;
@@ -13118,9 +13385,7 @@ mod tests {
         let sender = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let member = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
+        let member = dispatch_beside(&mut wm, sender, &ctx);
         // outsider is hand-opened (pushed plainly): never registered with the
         // room, so the membership filter must skip it.
         let outsider = {
@@ -13194,9 +13459,7 @@ mod tests {
         let a = child
             .add_terminal_cmd(&pause_argv(), None, None, ctx)
             .unwrap();
-        let b = child
-            .add_terminal_cmd(&pause_argv(), None, None, ctx)
-            .unwrap();
+        let b = dispatch_beside(&mut child, a, ctx);
         let mut d = WindowManager::new().as_desktop();
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         d.push_win(
@@ -13709,14 +13972,8 @@ mod tests {
         // cmd.exe hangs on its startup query until keepalive answers it)
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let win = d.windows.iter_mut().find(|w| w.id == 1).unwrap();
-            let Content::Project(child) = &mut win.tabs[win.active].content else {
-                panic!()
-            };
-            let w = child.windows.iter_mut().find(|w| w.id == t).unwrap();
-            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
-                panic!()
-            };
+            // by Member id: this third worker stacks as a tab of another window
+            let s = d.session_mut(1, t).unwrap();
             s.keepalive();
             if s.exited().is_some() {
                 break;
@@ -13729,7 +13986,10 @@ mod tests {
         d.handle_ctrl(msg, &ctx);
         let r = rrx.try_recv().expect("no close reply");
         assert!(r.ok, "{:?}", r.error);
-        assert!(!child_has_win(&d, t), "exited terminal must close cleanly");
+        assert!(
+            d.session(1, t).is_err(),
+            "exited terminal must close cleanly"
+        );
     }
 
     // --- send / snapshot verbs ---
@@ -14068,9 +14328,7 @@ mod tests {
         let sender = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let host = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
+        let host = dispatch_beside(&mut wm, sender, &ctx);
         // simulate a tab-merge: host window gains a foreground NON-member shell
         // tab (its own distinct term_id, never joined); the dispatched member
         // terminal stays behind it as a background tab.
@@ -14157,19 +14415,13 @@ mod tests {
         wm.chat_post(&term_tag(sender), "go", &[term_tag(target)], None)
             .unwrap();
 
+        // Dispatch stacks members as tabs, so every tab is pumped and each
+        // member is found by its Member id, wherever it sits.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            for w in wm.windows.iter_mut() {
-                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
-                    s.keepalive();
-                }
-            }
+            wm.keepalive();
             wm.chat_tick(false);
-            let w = wm.windows.iter_mut().find(|w| w.id == target).unwrap();
-            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
-                panic!()
-            };
-            if s.exited().is_some() {
+            if wm.terminal_session_mut(target).unwrap().exited().is_some() {
                 break;
             }
             assert!(
@@ -14184,20 +14436,13 @@ mod tests {
             .unwrap();
         let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
         while std::time::Instant::now() < grace {
-            for w in wm.windows.iter_mut() {
-                if let Content::Terminal(s) = &mut w.tabs[w.active].content {
-                    s.keepalive();
-                }
-            }
+            wm.keepalive();
             // tick on a ready frame: the @you post must deliver to nobody
             wm.chat_tick(false);
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         for (id, who) in [(sender, "sender"), (bystander, "member bystander")] {
-            let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
-            let Content::Terminal(s) = &mut w.tabs[w.active].content else {
-                panic!()
-            };
+            let s = wm.terminal_session_mut(id).unwrap();
             assert!(s.exited().is_none(), "{who} must not be injected");
         }
     }
@@ -14332,9 +14577,7 @@ mod tests {
         let sender = wm
             .add_terminal_cmd(&pause_argv(), None, None, &ctx)
             .unwrap();
-        let victim = wm
-            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
-            .unwrap();
+        let victim = dispatch_beside(&mut wm, sender, &ctx);
         // kill the victim by injecting a byte (pause exits on any stdin), pumping
         // through the DSR window like the broadcast tests
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -16059,11 +16302,8 @@ mod tests {
         loop {
             m.keepalive();
             let child = m.project_child_mut(pid).unwrap();
-            let w = child.windows.iter().find(|w| w.id == tid).unwrap();
-            if let Content::Terminal(s) = &w.tabs[w.active].content {
-                if s.ready() {
-                    break;
-                }
+            if child.terminal_session(tid).unwrap().ready() {
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -16249,6 +16489,87 @@ mod tests {
         start2.from = Some(term_tag(t2));
         let e = m.kanban_dispatch(&start2).unwrap_err();
         assert!(e.contains("cannot be claimed"), "{e}");
+    }
+
+    /// A worker that dispatch stacked as a BACK tab is still a full Member:
+    /// its card claim is not orphaned, it answers `snapshot`, and a post
+    /// targeted at it arrives. Everything resolves by Member id, never by
+    /// the window it happens to sit in.
+    #[test]
+    fn stacked_back_tab_worker_keeps_claim_snapshot_and_chat() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (orch, worker) = {
+            let child = m.project_child_mut(pid).unwrap();
+            let orch = child
+                .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+                .unwrap();
+            child.focused = Some(orch);
+            // `kanban dispatch`'s spawn: targeted posts only.
+            let mut receive = |child: &mut WindowManager| {
+                child
+                    .add_terminal_receiving(
+                        &pause_argv(),
+                        None,
+                        None,
+                        &ctx,
+                        crate::chat::Reception::TargetedOnly,
+                    )
+                    .unwrap()
+            };
+            let first = receive(child);
+            let worker = receive(child);
+            assert_eq!(child.terminal_location(worker), Some((first, 1)));
+            let host = child.windows.iter().find(|w| w.id == first).unwrap();
+            assert_eq!(host.active, 0, "the worker is a back tab");
+            (orch, worker)
+        };
+        pump_until_ready(&mut m, pid, worker);
+
+        let mut add = kanban_req("add");
+        add.title = Some("card".into());
+        let id = m.kanban_dispatch(&add).unwrap().id.unwrap();
+        let mut start = kanban_req("start");
+        start.id = Some(id.clone());
+        start.from = Some(term_tag(worker));
+        assert!(m.kanban_dispatch(&start).unwrap().ok);
+        m.kanban_tick(&ctx);
+        assert!(
+            !m.project_child_mut(pid)
+                .unwrap()
+                .kanban
+                .borrow()
+                .orphans()
+                .contains(&id),
+            "a live back-tab worker's claim is not orphaned"
+        );
+
+        let project = format!("p{pid}");
+        let (msg, rrx) = snapshot_msg(Some(&project), &term_tag(worker), std::time::Instant::now());
+        m.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no snapshot reply");
+        assert!(r.ok, "snapshot of a back tab: {:?}", r.error);
+
+        // Last, since it ends the worker: `pause` exits on any stdin byte.
+        m.project_child_mut(pid)
+            .unwrap()
+            .chat_post(&term_tag(orch), "go", &[term_tag(worker)], None)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            m.keepalive();
+            m.chat_tick(false);
+            if m.session_mut(pid, worker).unwrap().exited().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the back-tab worker never got its targeted post"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]
