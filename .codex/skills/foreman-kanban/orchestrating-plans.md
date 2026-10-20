@@ -37,8 +37,8 @@ change you made. The ledger replaces re-reading the board.
    ```
 
    `--agent` is required and cards have no agent field: follow the user's
-   instruction, else `claude` (workers implement; the chat skill's
-   Codex-research/Claude-implement split is for chat rooms, not cards).
+   instruction, else `claude` (workers implement; the dispatch skill's
+   provider split applies to free-form chat teams, not cards).
 4. **Wait on your in-flight cards by id**:
    `kanban wait --any <id> <id> ... --timeout 600`, listing every ledger
    card you have not yet handled. It prints the line of the card that moved
@@ -55,7 +55,7 @@ change you made. The ledger replaces re-reading the board.
 
 ## A card came back done: review the worker
 
-The worker's terminal holds its final report. Read only the tail:
+The worker's terminal holds its final report. Start with the tail:
 
 ```powershell
 & $env:FOREMAN_EXE snapshot --terminal tN --tail 40
@@ -65,8 +65,12 @@ First check it is finished. A finished pane ends on the agent's final
 message with an empty input prompt below it. A spinner, `esc to interrupt`,
 or a tool call still printing means it is still in its last turn: handle
 other cards and snapshot it again later. Raise `--tail` only when the
-report is cut off. Do not read its transcript or diff unless the report is
-ambiguous about something you must act on.
+report is cut off. Use the report to direct verification proportional to
+risk. For a narrow documentation change, inspect the diff and relevant checks.
+For production behavior, inspect the changed logic, affected consumers, and
+regression evidence; independently run focused checks where needed. A clear
+report does not establish correctness. Read the transcript only when needed
+to resolve missing evidence. Record material gaps before dispatching dependents.
 
 Its dispatch prompt makes it end on four labeled lines; read those:
 
@@ -96,8 +100,8 @@ Turn each finding into one board change, or into a line for the human:
 
 Rules:
 
-- Act only on what the worker reported or what the board shows. Do not add
-  speculative cards, and do not grow the plan past its goal.
+- Base board changes on the worker's report, board state, or verified review
+  findings. Do not add speculative cards or grow the plan past its goal.
 - A card you add will be dispatched cold: its body is the worker's whole
   prompt. Give it what to do, file/doc pointers, acceptance criteria, and
   the gate commands, the way the plan's other cards do.
@@ -156,12 +160,13 @@ dispatch, not in chat. Then:
 - Never restate its card, the plan, or rules it already has. Never relay
   what it can read itself (the board, the repo, `chat --history`); name
   where it lives instead.
-- One post per worker per change. Fold related decisions into it; do not
-  follow up to refine the last post.
+- Group related decisions into one post per worker. Avoid cosmetic
+  follow-ups; promptly correct consequential errors or changed instructions.
 - Do not invent a coordination protocol (leases, grants, release notices)
   on top of the cards. If two cards touch the same file, fix it on the
   board before dispatch: re-wave one, or give the file to one card's body.
-- Expect no acknowledgement. Silence means the worker is working.
+- Routine acknowledgements are unnecessary. Silence does not prove progress;
+  use the timeout and inspection steps below when progress is uncertain.
 
 ## A worker that never comes back
 

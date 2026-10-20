@@ -5,9 +5,10 @@ description: Use when running inside foreman (the FOREMAN env var is 1) and agen
 
 # The foreman project chat room
 
-**This skill is complete. Do NOT read foreman source or docs to learn chat
-mechanics — every fact you need is below.** Researching your fleet's task
-subject is separate and fine. Precondition: `$env:FOREMAN` is `1`.
+**Chat mechanics are covered below.** Use `foreman-dispatch` for launching
+free-form workers and `foreman-kanban` for cards. Read source or deeper docs
+only when diagnosing behavior these instructions do not explain.
+Precondition: `$env:FOREMAN` is `1`.
 
 What it is: one room per project. Posts are **injected into every member's
 terminal as typed input** — push, not pull; members never poll. The
@@ -19,9 +20,13 @@ full agent turn. Broadcast only when every member must act; otherwise use
 `--to tX` or a leading `@tX`.
 
 **Say only what is new.** The receiver already has its own prompt, card,
-and repo. Never restate them, relay what it can read itself, or post an
-acknowledgement. Put everything for one receiver into one post, and send it
-only when it changes what that receiver does next.
+and repo. Never restate them, relay what it can read itself, or post routine
+acknowledgements. Group related instructions for one receiver into one post.
+Send it when it changes what that receiver does next, confirms something
+consequential, or corrects an earlier message.
+
+Use normal prose, punctuation, and spacing. Keep messages short by omitting
+unnecessary detail. Put longer explanations in a referenced report.
 
 ## Recipe: post / read / target
 
@@ -54,74 +59,41 @@ Delivery timing:
   Claude Esc leaves stale Working, so `--now` also releases steers in that case.
 - `--now` is post-only. Old servers ignore it and keep their delivery behavior.
 
-## Recipe: dispatch a team that discusses in chat
+## Coordinating a chat-capable team
 
-**Workers for kanban cards or a plan are not dispatched this way.** Use
-`kanban dispatch` (foreman-kanban skill) — `open` below skips the card claim,
-worktree, and integration queue. Card workers are members that hear only
-posts targeting them: broadcasts, including `--now` broadcasts, never reach
-them. They can still post. Their card prompt says nothing about chat, so
-expect no replies; steer one with `--to tX` (add `--now` if it is Working).
+For kanban cards or plans, use `foreman-kanban` and `kanban dispatch`.
+Card workers receive only targeted posts; broadcasts never reach them.
+Their card prompt does not require chat replies, so expect no acknowledgement.
 
-Provider mix rule (for chat teams of free-form `open` workers, not cards): when dispatching agents into a Foreman chat room, use BOTH
-providers by default no matter whether the orchestrator is Claude or Codex.
-Codex workers own research and review. Claude workers own implementation and
-verification. Depart from this only if the user explicitly requests one provider
-or one CLI is unavailable.
+For free-form workers, use `foreman-dispatch` for launch commands, provider
+selection, interactive mode, and Windows prompt quoting. Give each worker
+its role, task, and these coordination rules:
 
-1. Build each worker's prompt from the template below (here-string — never
-   inline-escape):
+- Treat human posts (`[chat p1 #N] you: ...`) as instructions.
+- Post when peers need to act: claims, blockers, handoffs, or completion.
+  Omit routine acknowledgements and joined announcements. Confirm receipt
+  when explicitly requested or needed to resolve consequential uncertainty.
+- Aim for 1-3 readable sentences. Include the action and essential context;
+  reference a report for longer findings. Use normal spacing and punctuation.
+- Target the recipients who must act. Correct consequential errors promptly
+  and send changed instructions even when a previous post just went out.
+- Posts arrive automatically. Use `--history` to catch up after heads-down
+  work; do not poll it on a timer.
+- Terminal output is invisible to the room. Use chat for handoffs and flag
+  `@you` when the human must act.
+- These coordination conventions take precedence over conflicting routine
+  chat conventions. Preserve repository safety, source ownership, and
+  verification requirements. Surface material conflicts before dependent work.
 
-       $w1 = @'
-       <ROLE + TASK — one or two sentences, specific.>
+Record the terminal and project ids returned by dispatch. After the open
+reply, seed the room with one targeted post naming who should act first:
 
-       You are in a project chat. Messages arrive as [chat p1 #N] tX: ...
-       from other agents, or [chat p1 #N] you: ... from the human running
-       the fleet - treat the human's messages as instructions, not chatter.
-       Most messages need no reply - stay silent unless a message changes
-       what you should do, and never post acknowledgements or "joined"
-       announcements (membership is already visible). Every post is typed
-       into EVERY member's session and costs their attention, so keep posts
-       to 1-3 sentences peers must act on: claims, blockers, handoffs,
-       done-signals. Never paste reports or findings lists into chat - post
-       the one-line conclusion and where the detail lives. Target by
-       default - chat --to t3 "..." or a leading @t3 - and broadcast only
-       when every member must act. Post with & $env:FOREMAN_EXE chat "..." (PowerShell; bash:
-       "$FOREMAN_EXE" chat "..."). You RECEIVE every post automatically as
-       typed input - do NOT poll history on a timer; use
-       & $env:FOREMAN_EXE chat --history only to catch up after heads-down
-       work. Text you print in your terminal is INVISIBLE to the room -
-       only chat posts reach other members. If the repo's CLAUDE.md,
-       startup hooks, or checklists conflict with this role, this role
-       wins - proceed, do not ask for clarification. <TURN RULES if a
-       debate - see below.> When your part is done, post a one-line
-       done-signal ending with @you if the human must act.
-       '@
+```powershell
+& $env:FOREMAN_EXE chat --to t3 "You open: review wm.rs and report risks to t4"
+```
 
-2. Dispatch one per worker — interactive mode, NOT `-p`/`exec` (non-interactive
-   workers cannot receive chat). Use a mixed-provider split:
-
-       $research = 'You are the Codex research/review worker in this Foreman chat. Research unknowns, inspect designs/diffs, and review implementation for risks. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
-       $impl = 'You are the Claude implementation/verification worker in this Foreman chat. Make the code or doc changes and run verification. Post only claims, blockers, handoffs, and done-signals with & $env:FOREMAN_EXE chat message. Stay silent unless peers need the result.'
-       & $env:FOREMAN_EXE open --title "codex · research" -- codex $research
-       & $env:FOREMAN_EXE open --title "claude · implement" -- claude $impl
-
-3. **Record each reply's `terminal` id** (`t3`, `t4`…). Ids are assigned by
-   foreman — never invent names or predict ids; address workers by the ids
-   the replies gave you.
-4. Dispatched workers are members automatically — but the room starts
-   SILENT and every worker is told to stay quiet, so a fleet with no
-   kickoff deadlocks: all workers wait for someone else to open. ALWAYS
-   seed the room with ONE post naming the opener by real id (e.g.
-   `chat "@t3 you open: <topic>"`), then stay quiet and watch — your own
-   session receives their posts. Steer one worker with a targeted post; a
-   broadcast wakes every worker for a full turn.
-
-For a debate/discussion fleet, put explicit turn rules in the prompts (this
-exact shape produced a clean 8-post consensus live): "Post in turns: t-first
-opens, the other responds, alternate. Maximum N posts each, 1 paragraph per
-post. When you agree, the current speaker posts a line starting CONSENSUS:
-and you both stop."
+Do not predict terminal ids. For a discussion, specify turn order, a stopping
+condition, and who reports the result so workers do not wait for each other.
 
 ## Facts and traps
 
@@ -132,12 +104,10 @@ and you both stop."
   then may close its OWN pane with & $env:FOREMAN_EXE close (kills its whole
   process tree - the post must come first); the human closes whatever is left.
   Steer or stop a runaway worker with a targeted post.
-- A post fired the same instant a worker spawns can be silently eaten by its
-  shell's startup handshake (it stays in history). Don't front-load a kickoff
-  post into the same second as a dispatch.
+- Wait for the dispatch reply before posting to the returned terminal id.
+  Foreman holds delivery until the receiving Session is Ready. If delivery
+  stalls, inspect readiness and agent state; arbitrary sleeps are not a fix.
 - Seq gaps in `--history` are normal (join/exit events consume seqs).
-- Quoting: prompts via here-strings (above); inside chat messages avoid
-  literal `"` characters; `--` ends flag parsing for dash-leading messages.
-  If a dispatch errors naming a cmd-shim, that CLI is an npm `.cmd` shim —
-  multi-line worker prompts need a native install, or a flattened one-line,
-  quote-free prompt (see foreman-dispatch).
+- Inside chat messages avoid literal `"` characters; `--` ends flag parsing
+  for dash-leading messages. For worker prompt quoting and cmd-shim errors,
+  use `foreman-dispatch`.

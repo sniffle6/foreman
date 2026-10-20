@@ -17,6 +17,17 @@ wave)? Stop — use the foreman-kanban skill and `kanban dispatch <id> --agent
 trailer, no integration queue, and the board never learns the worker exists.
 `kanban dispatch` is exactly what the board's "Start with" button does.
 
+## Choosing workers
+
+Use an interactive agent when it must receive project chat or remain open
+for steering. Non-interactive `codex exec` and `claude -p` workers cannot
+receive chat while running and exit on completion.
+
+For free-form chat teams, use both providers by default: Codex for research
+and review, Claude for implementation and verification. Follow an explicit
+user choice, or use the available provider if one CLI is unavailable.
+Kanban cards follow `foreman-kanban` instead.
+
 ## The two commands (PowerShell)
 
     # Watchable (default): interactive — streams live, human can steer or
@@ -68,6 +79,5 @@ and pass the variable — this is the entire quoting story:
 - A `-p` worker's scrolled-away transcript is recoverable at
   `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
 
-**Coordinating multiple workers, or anything involving the project chat
-room? → use the foreman-chat skill.** It carries the mixed-provider rule:
-Codex for research/review, Claude for implementation/verification.
+Use `foreman-chat` for message content, recipient targeting, delivery timing,
+and team coordination rules.
