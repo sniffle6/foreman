@@ -126,12 +126,28 @@ const KANBAN_SKILL: &str = include_str!("../.claude/skills/foreman-kanban/SKILL.
 const CODEX_KANBAN_SKILL: &str = include_str!("../.codex/skills/foreman-kanban/SKILL.md");
 const CODEX_KANBAN_OPENAI: &str =
     include_str!("../.codex/skills/foreman-kanban/agents/openai.yaml");
+/// The kanban skill's on-demand detail (worktrees, integration queue, Cut),
+/// kept out of SKILL.md so orchestrators do not carry it in every turn.
+const KANBAN_REFERENCE_PATH: &str = "worktrees-and-integration.md";
+const KANBAN_REFERENCE: &str =
+    include_str!("../.claude/skills/foreman-kanban/worktrees-and-integration.md");
+const CODEX_KANBAN_REFERENCE: &str =
+    include_str!("../.codex/skills/foreman-kanban/worktrees-and-integration.md");
+/// The plan-orchestration loop, kept out of SKILL.md so card workers, who
+/// never orchestrate, do not carry it.
+const KANBAN_ORCHESTRATION_PATH: &str = "orchestrating-plans.md";
+const KANBAN_ORCHESTRATION: &str =
+    include_str!("../.claude/skills/foreman-kanban/orchestrating-plans.md");
+const CODEX_KANBAN_ORCHESTRATION: &str =
+    include_str!("../.codex/skills/foreman-kanban/orchestrating-plans.md");
 
 #[derive(Clone, Copy)]
 struct SkillBundle {
     name: &'static str,
     skill_md: &'static str,
     openai_yaml: Option<&'static str>,
+    /// Supporting Markdown files as (path relative to the skill dir, body).
+    references: &'static [(&'static str, &'static str)],
 }
 
 /// (directory name, embedded SKILL.md body). The directory name MUST match the
@@ -141,21 +157,28 @@ const CLAUDE_SKILLS: &[SkillBundle] = &[
         name: "foreman-dispatch",
         skill_md: DISPATCH_SKILL,
         openai_yaml: None,
+        references: &[],
     },
     SkillBundle {
         name: "foreman-chat",
         skill_md: CHAT_SKILL,
         openai_yaml: None,
+        references: &[],
     },
     SkillBundle {
         name: "foreman-icat",
         skill_md: ICAT_SKILL,
         openai_yaml: None,
+        references: &[],
     },
     SkillBundle {
         name: "foreman-kanban",
         skill_md: KANBAN_SKILL,
         openai_yaml: None,
+        references: &[
+            (KANBAN_REFERENCE_PATH, KANBAN_REFERENCE),
+            (KANBAN_ORCHESTRATION_PATH, KANBAN_ORCHESTRATION),
+        ],
     },
 ];
 
@@ -165,21 +188,28 @@ const CODEX_SKILLS: &[SkillBundle] = &[
         name: "foreman-dispatch",
         skill_md: CODEX_DISPATCH_SKILL,
         openai_yaml: Some(CODEX_DISPATCH_OPENAI),
+        references: &[],
     },
     SkillBundle {
         name: "foreman-chat",
         skill_md: CODEX_CHAT_SKILL,
         openai_yaml: Some(CODEX_CHAT_OPENAI),
+        references: &[],
     },
     SkillBundle {
         name: "foreman-icat",
         skill_md: CODEX_ICAT_SKILL,
         openai_yaml: Some(CODEX_ICAT_OPENAI),
+        references: &[],
     },
     SkillBundle {
         name: "foreman-kanban",
         skill_md: CODEX_KANBAN_SKILL,
         openai_yaml: Some(CODEX_KANBAN_OPENAI),
+        references: &[
+            (KANBAN_REFERENCE_PATH, CODEX_KANBAN_REFERENCE),
+            (KANBAN_ORCHESTRATION_PATH, CODEX_KANBAN_ORCHESTRATION),
+        ],
     },
 ];
 
@@ -217,6 +247,9 @@ fn write_bundle_if_changed(skills_dir: &Path, skill: &SkillBundle) -> io::Result
     if let Some(raw) = skill.openai_yaml {
         wrote |=
             write_managed_file_if_changed(&root, "agents/openai.yaml", raw, NoticeStyle::Yaml)?;
+    }
+    for (path, raw) in skill.references {
+        wrote |= write_managed_file_if_changed(&root, path, raw, NoticeStyle::Markdown)?;
     }
     Ok(wrote)
 }
@@ -420,6 +453,41 @@ mod tests {
             "expected no rewrites, got {:?}",
             second.written
         );
+    }
+
+    #[test]
+    fn install_into_writes_reference_files_beside_the_skill_and_refreshes_them() {
+        for (label, skills) in [("claude", CLAUDE_SKILLS), ("codex", CODEX_SKILLS)] {
+            let dir = temp(&format!("install-refs-{label}"));
+            install_into(&dir, skills, OBSOLETE_SKILLS).unwrap();
+            let reference = dir.join("foreman-kanban").join(KANBAN_REFERENCE_PATH);
+            let content = std::fs::read_to_string(&reference).expect(label);
+            assert!(content.contains("Integration queue"), "{label}");
+            assert!(content.ends_with(&format!("{MANAGED_NOTICE}\n")), "{label}");
+            // The SKILL.md body points at the file it ships with.
+            let skill = std::fs::read_to_string(dir.join("foreman-kanban").join("SKILL.md"));
+            assert!(skill.unwrap().contains(KANBAN_REFERENCE_PATH), "{label}");
+            // A stale reference is rewritten; the bundle reports the write.
+            std::fs::write(&reference, "stale").unwrap();
+            let again = install_into(&dir, skills, OBSOLETE_SKILLS).unwrap();
+            assert_eq!(again.written, vec!["foreman-kanban"], "{label}");
+        }
+    }
+
+    #[test]
+    fn install_into_ships_the_plan_orchestration_reference_the_skill_points_at() {
+        for (label, skills) in [("claude", CLAUDE_SKILLS), ("codex", CODEX_SKILLS)] {
+            let dir = temp(&format!("install-orchestration-{label}"));
+            install_into(&dir, skills, OBSOLETE_SKILLS).unwrap();
+            let kanban = dir.join("foreman-kanban");
+            let content = std::fs::read_to_string(kanban.join("orchestrating-plans.md"));
+            assert!(
+                content.expect(label).contains("review the worker"),
+                "{label}"
+            );
+            let skill = std::fs::read_to_string(kanban.join("SKILL.md")).unwrap();
+            assert!(skill.contains("orchestrating-plans.md"), "{label}");
+        }
     }
 
     #[test]

@@ -2129,18 +2129,26 @@ impl WindowManager {
                     ),
                 };
                 let store = child.kanban.borrow();
+                if let Some(id) = req.id.as_deref()
+                    && store.get(id).is_none()
+                {
+                    return Err(format!("no such card: {id}"));
+                }
                 let history: Vec<String> = store
                     .cards()
                     .iter()
-                    .filter(|c| match req.name.as_deref() {
+                    .filter(|c| match (req.id.as_deref(), req.name.as_deref()) {
+                        // list <id>: that one card, shipped or not; the
+                        // client refuses to combine it with board filters.
+                        (Some(id), _) => c.id == id,
                         // --shipped NAME: that Version only, any state filter
                         // was validated client-side to be `done` or absent.
-                        Some(v) => c
+                        (None, Some(v)) => c
                             .shipped
                             .as_ref()
                             .is_some_and(|s| crate::kanban::same_name(&s.name, v)),
                         // bare / --state: the live board; --all: everything.
-                        None => {
+                        (None, None) => {
                             (req.all || c.shipped.is_none())
                                 && filter.map(|f| c.state == f).unwrap_or(true)
                         }
@@ -2636,6 +2644,18 @@ impl WindowManager {
         title: Option<&str>,
         ctx: &egui::Context,
     ) -> std::io::Result<WinId> {
+        self.add_terminal_receiving(argv, cwd, title, ctx, crate::chat::Reception::Everything)
+    }
+
+    /// [`Self::add_terminal_cmd`] joining the chat room with `reception`.
+    fn add_terminal_receiving(
+        &mut self,
+        argv: &[String],
+        cwd: Option<&std::path::Path>,
+        title: Option<&str>,
+        ctx: &egui::Context,
+        reception: crate::chat::Reception,
+    ) -> std::io::Result<WinId> {
         let env = self.term_env(self.next);
         let cwd = cwd.or(self.cwd.as_deref());
         let mut s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
@@ -2657,9 +2677,11 @@ impl WindowManager {
         // room appends the Joined line; the transcript records it.
         if let Some(w) = self.windows.iter().find(|w| w.id == id) {
             // (`title` was moved into push_win — read it back off the window)
-            self.chat
-                .borrow_mut()
-                .join(&term_tag(id), display_name(w.title()));
+            self.chat.borrow_mut().join_receiving(
+                &term_tag(id),
+                display_name(w.title()),
+                reception,
+            );
         } else {
             debug_assert!(false, "just-pushed window {id} missing");
         }
@@ -3385,11 +3407,15 @@ impl WindowManager {
             .as_ref()
             .filter(|w| !w.in_place)
             .map(|w| std::path::PathBuf::from(&w.path));
-        let tid = match self.add_terminal_cmd(
+        // A card worker's prompt is its card, not the room: broadcasts would
+        // wake it for a full agent turn it has no use for. It still hears
+        // posts that target it, so the orchestrator or human can steer it.
+        let tid = match self.add_terminal_receiving(
             &[agent.to_string(), prompt],
             spawn_cwd.as_deref(),
             Some(&card.title),
             ctx,
+            crate::chat::Reception::TargetedOnly,
         ) {
             Ok(tid) => tid,
             Err(e) => {
@@ -16070,6 +16096,51 @@ mod tests {
     }
 
     #[test]
+    fn kanban_list_by_id_returns_only_that_card_even_when_shipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let (shipped, other) = {
+            let child = m.project_child_mut(pid).unwrap();
+            child.kanban.borrow_mut().set_dir(Some(tmp.path()));
+            let mut s = child.kanban.borrow_mut();
+            let shipped = s.add("shipped", None).unwrap();
+            s.claim_for_dispatch(
+                &shipped,
+                "t1",
+                "claude",
+                crate::kanban::run_nonce(),
+                crate::kanban::TermState::Missing,
+                None,
+            )
+            .unwrap();
+            s.done(&shipped).unwrap();
+            let other = s.add("other", None).unwrap();
+            (shipped, other)
+        };
+        let mut cut = kanban_req("cut");
+        cut.name = Some("v1".into());
+        m.kanban_dispatch(&cut).unwrap();
+
+        let mut one = kanban_req("list");
+        one.id = Some(other.clone());
+        let lines = m.kanban_dispatch(&one).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(&other), "{lines:?}");
+
+        one.id = Some(shipped.clone());
+        one.json = true;
+        let lines = m.kanban_dispatch(&one).unwrap().history.unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line: crate::kanban::CardLine = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(line.card.id, shipped);
+
+        one.id = Some("nope00".into());
+        let e = m.kanban_dispatch(&one).unwrap_err();
+        assert!(e.contains("nope00"), "{e}");
+    }
+
+    #[test]
     fn kanban_edit_replaces_title_and_body_on_the_wire_path() {
         let tmp = tempfile::tempdir().unwrap();
         let mut m = kanban_desktop(tmp.path().to_path_buf());
@@ -17051,14 +17122,17 @@ mod tests {
         Some(tmp)
     }
 
-    /// Drain the worktree channel until `pred` holds or 15 s pass — teardown
+    /// Drain the worktree channel until `pred` holds or 120 s pass — teardown
     /// runs on a thread, so the test polls the same seam the frame loop does.
+    /// The bound is generous because each git step spawns processes that slow
+    /// sharply under the full parallel suite; 15 s timed out healthy work. A
+    /// green test returns as soon as `pred` holds.
     fn drain_until(
         m: &mut WindowManager,
         ctx: &egui::Context,
         mut pred: impl FnMut(&WindowManager) -> bool,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while !pred(m) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -17291,6 +17365,35 @@ mod tests {
         let again = cli_dispatch(&mut m, &dispatch_req(&id, Some(false)), &ctx);
         assert!(!again.ok);
         assert!(again.error.unwrap().contains("not Backlog"));
+    }
+
+    #[test]
+    fn card_worker_joins_chat_for_targeted_posts_only() {
+        let ctx = egui::Context::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut m = kanban_desktop(tmp.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Quiet worker");
+        let r = cli_dispatch(&mut m, &dispatch_req(&id, Some(false)), &ctx);
+        assert!(r.ok, "{:?}", r.error);
+        let worker = r.terminal.unwrap();
+
+        let child = m.project_child_mut(pid).unwrap();
+        let mut room = child.chat.borrow_mut();
+        assert!(room.is_member(&worker), "card workers stay addressable");
+        room.post_human("broadcast to the fleet").unwrap();
+        room.post_human(&format!("@{worker} steer")).unwrap();
+        let live = [crate::chat::LiveMember {
+            id: worker.clone(),
+            name: worker.clone(),
+            ready: true,
+            agent_state: None,
+            exited: false,
+        }];
+        let d = room.tick("p1", &live);
+        let lines: Vec<&String> = d.iter().flat_map(|x| &x.lines).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(&format!("@{worker} steer")), "{lines:?}");
     }
 
     #[test]
@@ -18322,7 +18425,8 @@ mod tests {
                 &crate::kanban::WaitTarget::Id(id.clone()),
                 &mut watched,
                 &[listed]
-            ),
+            )
+            .map(|v| v.code),
             Some(crate::kanban::WAIT_NEEDS_RESOLUTION)
         );
         // the worktree is left mid-rebase for the worker; a resubmit while

@@ -82,8 +82,10 @@ skill.
   `/to-tickets` keeps file paths out of the ticket text itself.
 - **Ready** = Backlog. Cards carry no labels; a planned Backlog card is
   agent-ready. Leave every card in Backlog.
-- **Execution** is **foreman-kanban**'s "Orchestrating a plan": dispatch wave by
-  wave, each worker on its own worktree, landing through the integration queue.
+- **Execution** is **foreman-kanban**'s `orchestrating-plans.md`: dispatch wave
+  by wave, each worker on its own worktree, landing through the integration
+  queue; review each finished worker's report, fix the board from it, and
+  close its terminal before dispatching more.
 
 ## When `/triage` moves an issue to `ready-for-agent`
 

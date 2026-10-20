@@ -14,8 +14,13 @@ sibling — read those for *why*, this doc for *how*.
   and (while claimed) a claim linking the card to the Session working it.
 - **Dispatch from a card**: Start on a Backlog or Blocked card offers an agent
   picker. Picking one spawns a new Session in the
-  project cwd whose prompt embeds the card body and the exact close-out
-  commands, then claims the card and moves it to In Progress in the same
+  project cwd whose prompt embeds the card body, a `# Chat` section (posts
+  that target the worker steer the card; it never acknowledges, and posts only
+  when another member must act — each delivery costs a full turn), a
+  `# Final report` section
+  (end on four labeled lines — Landed, Follow-ups, Plan impact, Decisions —
+  that an orchestrator reads from the pane tail before closing it), and the
+  exact close-out commands, then claims the card and moves it to In Progress in the same
   action — a card-spawned agent never runs `start` itself. A Restart (a
   Blocked or orphaned card) adds a `# Previous attempt` section to the prompt:
   the blocker reason for a Blocked card, or "ended without closing out" for an
@@ -233,6 +238,7 @@ foreman kanban add "fix caret flicker" --body "repros on resize; see wm.rs"
 foreman kanban edit <id> [--title T] [--body B] [--plan NAME] [--wave N]
                                           # at least one of the four; --plan "" clears
 foreman kanban list [--state ...] [--shipped NAME] [--all] [--json]   # bare = live board
+foreman kanban list <id> [--json]         # one card, any state or Version
 foreman kanban start <id>                 # claim a card yourself
 foreman kanban dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree]
                                           # the board's "Start with": spawn + claim
@@ -242,14 +248,23 @@ foreman kanban rm <id>                    # delete the card file, any state
 foreman kanban cut <name>                 # record only: Done -> Version <name>
 foreman kanban cut vX.Y.Z --release       # the board's Cut: record + release (replies at once)
 foreman kanban uncut <name>               # Version <name> -> Current Done
-foreman kanban wait <id> | --any [--timeout SECS]
+foreman kanban wait <id> | --any [<id>...] [--timeout SECS]
 foreman kanban worktrees [--stray] [--json]   # every foreman worktree, probed live
 foreman kanban integrate <id> [--cancel] [--json]   # submit a worktree card to the queue
 ```
 
 `wait` exit codes: `0` Done, `1` Blocked / orphaned / removed (needs a
 human), `2` timeout or foreman unreachable, `3` (`wait <id>` only) its
-integration needs resolution. `foreman kanban --help` is ground
+integration needs resolution. On a verdict `wait` prints the deciding card's
+`list` line (`<id>  removed` if it vanished), and on `3` an
+`integration: {...}` JSON line with `reason`, `detail`, and `next`. That
+saves an orchestrator a whole-board `list --json` after every wait.
+Bare `wait --any` watches only the cards it sees In Progress during that
+call, so a card that finished between two calls is never reported.
+`wait --any <id>...` watches exactly the listed cards and decides at once on
+one that already finished; an orchestrator passes the ids of every worker it
+still has in flight and misses none.
+`foreman kanban --help` is ground
 truth for flags. Agents not spawned from a card learn all of this from the
 embedded **foreman-kanban** skill.
 
@@ -518,4 +533,5 @@ already gone (removed by hand) passes.
 - `src/keymap.rs` — `Command::OpenBoard` / `Command::OpenPlan` and their
   default bindings (`K` and `L`).
 - `src/skills_install.rs` — embeds the foreman-kanban skill (Claude + Codex
-  twins).
+  twins) and its reference files, `worktrees-and-integration.md` and
+  `orchestrating-plans.md` (the dispatch, review, board-fix, close loop).

@@ -182,6 +182,12 @@ identity the agent reads as its own terminal id, so the room's view of "who" and
 the agent's view of "me" never disagree.
 _Avoid_: window id, tab id (a Win id can change; a Member id cannot).
 
+**Reception**:
+Which posts wake a Member: everything (broadcasts and posts that target it) or
+targeted only. Card workers join targeted-only, because every delivery costs
+the receiving agent a full turn and their prompt is the card, not the room.
+_Avoid_: mute, subscription.
+
 **Dispatcher / Worker**:
 Roles in a Chat room — the Dispatcher hands out work; a Worker is a Session
 dispatched to do it.

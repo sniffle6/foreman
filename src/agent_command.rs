@@ -111,6 +111,71 @@ pub fn npm_codex(argv: &[String], cwd: &Path, path: &std::ffi::OsStr) -> Option<
     Some(resolved)
 }
 
+/// Subcommands that take `--no-daemon` after their own name.
+const CODEX_SESSION_SUBCOMMANDS: &[&str] = &["resume", "fork"];
+
+/// Subcommands that never start a TUI; Codex rejects `--no-daemon` on them.
+const CODEX_OTHER_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+];
+
+/// `argv` with `--no-daemon` added when it launches an interactive Codex TUI;
+/// `None` when it is not one or already chooses its server.
+///
+/// Codex 0.157+ attaches every interactive TUI to one shared app-server
+/// daemon, which runs tools and hooks with the environment of the TUI that
+/// started it. Every Codex Session after the first would then post chat and
+/// report agent state as another Session's FOREMAN_TERMINAL_ID. In-process,
+/// the server inherits this Session's own environment. The flag needs Codex
+/// 0.156+, the first release with the daemon.
+pub fn codex_in_process(argv: &[String]) -> Option<Vec<String>> {
+    let stem = Path::new(argv.first()?).file_stem()?.to_str()?;
+    if !stem.eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    // `--remote` is an explicit server choice; Codex rejects it with --no-daemon.
+    if argv[1..]
+        .iter()
+        .any(|a| a == "--no-daemon" || a == "--remote" || a.starts_with("--remote="))
+    {
+        return None;
+    }
+    let at = match argv.get(1).map(String::as_str) {
+        Some(sub) if CODEX_SESSION_SUBCOMMANDS.contains(&sub) => 2,
+        Some(sub) if CODEX_OTHER_SUBCOMMANDS.contains(&sub) => return None,
+        _ => 1,
+    };
+    let mut out = argv.to_vec();
+    out.insert(at, "--no-daemon".to_owned());
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +184,56 @@ mod tests {
         std::fs::create_dir_all(root.join("node_modules/@openai/codex/bin")).unwrap();
         std::fs::write(root.join("codex.cmd"), "unused batch wrapper").unwrap();
         std::fs::write(root.join("node_modules/@openai/codex/bin/codex.js"), "").unwrap();
+    }
+
+    fn words(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    #[test]
+    fn interactive_codex_runs_its_server_in_process() {
+        for (argv, expected) in [
+            (vec!["codex"], vec!["codex", "--no-daemon"]),
+            (vec!["codex", "task"], vec!["codex", "--no-daemon", "task"]),
+            (
+                vec!["codex", "-m", "x"],
+                vec!["codex", "--no-daemon", "-m", "x"],
+            ),
+            (
+                vec![r"C:\npm\codex.cmd", "t"],
+                vec![r"C:\npm\codex.cmd", "--no-daemon", "t"],
+            ),
+            (vec!["CODEX.EXE"], vec!["CODEX.EXE", "--no-daemon"]),
+            (
+                vec!["codex", "resume", "--last"],
+                vec!["codex", "resume", "--no-daemon", "--last"],
+            ),
+            (vec!["codex", "fork"], vec!["codex", "fork", "--no-daemon"]),
+        ] {
+            assert_eq!(
+                codex_in_process(&words(&argv)).as_deref(),
+                Some(words(&expected).as_slice()),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_server_flag_is_left_out_where_codex_rejects_or_ignores_it() {
+        for argv in [
+            vec!["codex", "exec", "task"],
+            vec!["codex", "e", "task"],
+            vec!["codex", "review"],
+            vec!["codex", "agents"],
+            vec!["codex", "login"],
+            vec!["codex", "--no-daemon"],
+            vec!["codex", "--remote", "ws://h"],
+            vec!["codex", "--remote=ws://h"],
+            vec!["claude", "task"],
+            vec!["codexx"],
+        ] {
+            assert_eq!(codex_in_process(&words(&argv)), None, "{argv:?}");
+        }
     }
 
     #[test]

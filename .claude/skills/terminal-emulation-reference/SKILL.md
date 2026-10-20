@@ -103,7 +103,7 @@ Rest of the lifecycle, in order:
 | cwd | `CommandBuilder::cwd` from the Project directory | src/terminal.rs |
 | Argv spawn | `spawn_argv` retries npm `.cmd` shims through `cmd /c`; refuses newline/quote args (cmd re-parses the line — injection) | src/terminal.rs `fn spawn_argv` |
 | Dispatch banner | `inject_note` is DEFERRED to the first `resize()` — written at the 80x24 placeholder it reflows into scrollback on the first-frame shrink | src/terminal.rs `fn inject_note` |
-| Chat inject | bracketed paste, then a `\r` deferred by `SUBMIT_DELAY` (150 ms) — a back-to-back `\r` folds into the paste as a literal newline (live failure 2026-06-10) | src/ready.rs `SUBMIT_DELAY`, `paste_wrap`, `try_inject` |
+| Chat inject | bracketed paste, then one `\r` deferred by `SUBMIT_DELAY` — a back-to-back `\r` can fold into the paste, and busy Codex requires additional processing headroom (regression: `codex_chat_submit_while_busy`) | src/ready.rs `SUBMIT_DELAY`, `paste_wrap`, `try_inject` |
 | Exit | `child.try_wait()` polled via `exited()`; `exit_to_note()` reports once | src/terminal.rs `fn exited` / `fn exit_to_note` |
 
 ## 3. Sequences foreman handles (the one table)

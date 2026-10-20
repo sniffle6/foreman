@@ -877,6 +877,10 @@ impl Session {
                 "argv is empty",
             ));
         }
+        // The tab icon reads what was dispatched, not the flags added here.
+        let dispatched = argv;
+        let in_process = crate::agent_command::codex_in_process(argv);
+        let argv = in_process.as_deref().unwrap_or(argv);
         let build = |words: &[String]| {
             let mut c = CommandBuilder::new(&words[0]);
             for a in &words[1..] {
@@ -926,7 +930,7 @@ impl Session {
         };
         if let Some(resolved) = npm_codex() {
             let mut session = Self::spawn_with(build(&resolved), Shell::Cmd, ctx)?;
-            session.dispatch_argv = Some(argv.to_vec());
+            session.dispatch_argv = Some(dispatched.to_vec());
             return Ok(session);
         }
         if unsafe_for_cmd && is_batch {
@@ -941,7 +945,7 @@ impl Session {
             Self::spawn_with(build(&wrapped), Shell::Cmd, ctx)
         })?;
         // Remember what we dispatched so the tab can show the agent's logo.
-        session.dispatch_argv = Some(argv.to_vec());
+        session.dispatch_argv = Some(dispatched.to_vec());
         Ok(session)
     }
 
@@ -4300,7 +4304,7 @@ mod tests {
         .unwrap();
         let prompt = "# Task\r\nPreserve \"quotes\", %PATH%, & | < > ^, café and trailing \\";
         std::fs::write(bin.join("codex.js"), format!(
-            "const expected = {}; if (process.argv.length !== 3 || process.argv[2] !== expected) {{ console.log('BAD_ARGV'); process.exitCode = 1; }} else {{ console.log('NPM_PROMPT_PRESERVED'); }}",
+            "const expected = {}; if (process.argv.length !== 4 || process.argv[2] !== '--no-daemon' || process.argv[3] !== expected) {{ console.log('BAD_ARGV'); process.exitCode = 1; }} else {{ console.log('NPM_PROMPT_PRESERVED'); }}",
             serde_json::to_string(prompt).unwrap()
         )).unwrap();
         let env = vec![(
@@ -5657,6 +5661,134 @@ mod tests {
             cur.row as usize, prompt,
             "caret stranded off the prompt row"
         );
+    }
+
+    /// Run the installed Codex against a loopback-only response fixture. No
+    /// model service is contacted. At the old submit delay, chat stays in the
+    /// composer while the initial response is pending; a later Enter sends it.
+    /// Run alone: cargo test codex_chat_submit_while_busy -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: drives a real codex TUI against a loopback fixture"]
+    fn codex_chat_submit_while_busy() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "Codex never requested a response"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(err) => panic!("accept loopback request: {err}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 65536];
+                let n = stream.read(&mut request).unwrap();
+                println!(
+                    "loopback request: {}",
+                    String::from_utf8_lossy(&request[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                );
+                if request[..n].starts_with(b"GET /v1/models") {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    continue;
+                }
+                assert!(request[..n].starts_with(b"POST /v1/responses "));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture\"}}\n\n").unwrap();
+                stream.flush().unwrap();
+                request_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(15));
+                break;
+            }
+        });
+        let argv = vec![
+            "codex".into(),
+            "--no-alt-screen".into(),
+            "-c".into(),
+            "model_provider=\"foreman_fixture\"".into(),
+            "-c".into(),
+            "model_providers.foreman_fixture.name=\"Foreman fixture\"".into(),
+            "-c".into(),
+            format!("model_providers.foreman_fixture.base_url=\"http://{address}/v1\""),
+            "-c".into(),
+            "model_providers.foreman_fixture.wire_api=\"responses\"".into(),
+        ];
+        let mut s = Session::spawn_argv(
+            &argv,
+            Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
+            &[],
+            egui::Context::default(),
+        )
+        .unwrap();
+        let screen = |s: &Session| {
+            (0..s.rows as i32)
+                .map(|r| grid_row(s, r, s.cols))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !screen(&s).contains("Context 0% used") && !screen(&s).contains("? for shortcuts") {
+            s.pump();
+            if Instant::now() >= deadline {
+                let remaining = screen(&s);
+                let _ = s.child.kill();
+                panic!("composer did not open:\n{remaining}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s.inject_input("Start local transport fixture.");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            s.pump();
+            if request_rx.try_recv().is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let remaining = screen(&s);
+                let _ = s.child.kill();
+                panic!("initial prompt was not submitted:\n{remaining}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for i in 0..3 {
+            s.inject_input(&format!("[chat p0 #{}] t1: {}", i + 1, "x".repeat(1100)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            s.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let remaining = screen(&s);
+        let transcript = crate::inspect::snapshot_tail(&s.term, 1000).join("\n");
+        let exited = s.exited();
+        let _ = s.child.kill();
+        println!("final screen:\n{remaining}");
+        assert!(exited.is_none(), "Codex exited before chat was submitted");
+        assert!(
+            !remaining.contains("[Pasted Content")
+                && remaining.contains("Ask Codex to do anything"),
+            "chat text remained in the composer"
+        );
+        for i in 1..=3 {
+            assert!(
+                transcript.contains(&format!("[chat p0 #{i}]")),
+                "post {i} never reached Codex"
+            );
+        }
     }
 
     /// Diagnostic capture: run the real codex TUI headlessly (pets enabled via

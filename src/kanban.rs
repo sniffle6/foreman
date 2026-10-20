@@ -1701,6 +1701,29 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
             root = wt.root().display(),
         ));
     }
+    let cli = match style {
+        CloseoutStyle::Path => "foreman",
+        CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
+    };
+    // Every delivered post costs the receiver a full turn, so a card worker
+    // is told not to spend one on an acknowledgement (docs/chat-delivery.md).
+    out.push_str(&format!(
+        "# Chat\n\
+         Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    {cli} chat --to tX \"<message>\"\n\
+         \n",
+    ));
+    // An orchestrator reviews a finished worker by reading the tail of its
+    // pane, then closes it (foreman-kanban skill, orchestrating-plans.md):
+    // fixed labels let it act on the board without reading the transcript.
+    out.push_str(
+        "# Final report\n\
+         Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+         Landed: what you shipped.\n\
+         Follow-ups: work you deferred or found that still needs doing.\n\
+         Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+         Decisions: anything a human must decide.\n\
+         \n",
+    );
     out.push_str("# Close-out (required)\n");
     // The card trailer (spec: kanban-cut §The card trailer): the only
     // per-commit signal that survives rebase and squash, read back at Cut.
@@ -1708,10 +1731,6 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
         "End every commit message with the trailer line:    Card: {id}\n",
         id = card.id
     ));
-    let cli = match style {
-        CloseoutStyle::Path => "foreman",
-        CloseoutStyle::EnvVar => "& $env:FOREMAN_EXE",
-    };
     if let Some(wt) = &card.worktree
         && wt.in_place
     {
@@ -1723,7 +1742,7 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
              \x20   {cli} kanban integrate {id}\n\
              \x20   {cli} kanban wait {id} --timeout 1800\n\
              wait exit 0: Foreman ran the project checks, fast-forwarded {base} to your branch, put the checkout back on {base}, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: a check failed or {base} moved. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it here (for a moved base: git rebase {base}, resolving any conflicts; if git refuses because of uncommitted changes that are not yours, block instead), commit, then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: a check failed or {base} moved. wait prints the reason on its integration line ({cli} kanban list {id} --json shows it again), fix it here (for a moved base: git rebase {base}, resolving any conflicts; if git refuses because of uncommitted changes that are not yours, block instead), commit, then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n",
             id = card.id,
             branch = wt.branch,
@@ -1739,7 +1758,7 @@ pub fn dispatch_prompt(card: &Card, style: CloseoutStyle) -> String {
              \x20   {cli} kanban integrate {id}\n\
              \x20   {cli} kanban wait {id} --timeout 1800\n\
              wait exit 0: Foreman rebased onto {base}, ran the project checks, fast-forwarded {base}, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: the rebase conflicted or a check failed. Read the reason with {cli} kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: the rebase conflicted or a check failed. wait prints the reason on its integration line ({cli} kanban list {id} --json shows it again), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n",
             id = card.id,
             base = wt.base,
@@ -1839,6 +1858,10 @@ impl CardLine {
 pub enum WaitTarget {
     Id(String),
     Any,
+    /// `wait --any <id>...`: exactly these cards, finished or not when the
+    /// wait starts, so an orchestrator that was busy between two waits
+    /// still hears about every worker it dispatched.
+    AnyOf(Vec<String>),
 }
 
 /// Exit code of `foreman kanban wait <id>` when the card's integration was
@@ -1846,6 +1869,34 @@ pub enum WaitTarget {
 /// and resubmit. Distinct from `1` (needs a human) so a worker waiting on
 /// its own card can branch on it.
 pub const WAIT_NEEDS_RESOLUTION: i32 = 3;
+
+/// A finished wait: the exit code and the card that decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitVerdict {
+    pub code: i32,
+    pub card: String,
+}
+
+/// What `foreman kanban wait` prints when it finishes: the deciding card's
+/// `list` line, so an orchestrator never re-lists the whole board to learn
+/// which card moved. A handed-back integration adds its view as one JSON
+/// line, which is what the worker needs to fix it. A card that vanished
+/// prints `<id>  removed`.
+pub fn wait_report(verdict: &WaitVerdict, cards: &[CardLine]) -> Vec<String> {
+    let Some(line) = cards.iter().find(|c| c.card.id == verdict.card) else {
+        return vec![format!("{}  removed", verdict.card)];
+    };
+    let mut out = vec![line.human_line()];
+    if verdict.code == WAIT_NEEDS_RESOLUTION
+        && let Some(i) = &line.integration
+    {
+        out.push(format!(
+            "integration: {}",
+            serde_json::to_string(i).unwrap_or_default()
+        ));
+    }
+    out
+}
 
 /// Pure verdict function the CLI wait loop (Task 2) drives on every poll.
 /// `Id`: Done -> exit 0; Blocked/orphaned/missing -> exit 1 (something needs
@@ -1855,24 +1906,34 @@ pub const WAIT_NEEDS_RESOLUTION: i32 = 3;
 /// sight, then each watched id is checked the same way — a card sitting in
 /// Backlog is never watched and so never triggers. `Any` ignores handed-back
 /// integrations: that is the live worker's job, not the orchestrator's.
+/// `AnyOf`: the same checks over exactly the listed ids, with no sighting
+/// needed, so a listed card already Done or Blocked decides at once; unlisted
+/// cards never do.
+/// The verdict names the card that decided it.
 pub fn wait_verdict(
     target: &WaitTarget,
     watched: &mut std::collections::HashSet<String>,
     cards: &[CardLine],
-) -> Option<i32> {
+) -> Option<WaitVerdict> {
+    let verdict = |code: i32, card: &str| {
+        Some(WaitVerdict {
+            code,
+            card: card.to_string(),
+        })
+    };
     match target {
         WaitTarget::Id(id) => match cards.iter().find(|c| &c.card.id == id) {
-            None => Some(1), // removed under the waiter
+            None => verdict(1, id), // removed under the waiter
             Some(c) => match c.card.state {
-                CardState::Done => Some(0),
-                CardState::Blocked => Some(1),
-                _ if c.orphaned => Some(1),
+                CardState::Done => verdict(0, id),
+                CardState::Blocked => verdict(1, id),
+                _ if c.orphaned => verdict(1, id),
                 _ if c
                     .integration
                     .as_ref()
                     .is_some_and(|i| i.phase == crate::integrate::Phase::NeedsResolution) =>
                 {
-                    Some(WAIT_NEEDS_RESOLUTION)
+                    verdict(WAIT_NEEDS_RESOLUTION, id)
                 }
                 CardState::Backlog | CardState::InProgress => None,
             },
@@ -1883,20 +1944,33 @@ pub fn wait_verdict(
                     watched.insert(c.card.id.clone());
                 }
             }
-            for id in watched.iter() {
-                match cards.iter().find(|c| &c.card.id == id) {
-                    None => return Some(1),
-                    Some(c) => match c.card.state {
-                        CardState::Done => return Some(0),
-                        CardState::Blocked => return Some(1),
-                        _ if c.orphaned => return Some(1),
-                        _ => {}
-                    },
-                }
-            }
-            None
+            // Sorted so two cards finishing between polls report the same
+            // one every time; the other surfaces on the next wait.
+            let mut ids: Vec<&String> = watched.iter().collect();
+            ids.sort();
+            ids.into_iter().find_map(|id| any_verdict(id, cards))
+        }
+        WaitTarget::AnyOf(listed) => {
+            let mut ids: Vec<&String> = listed.iter().collect();
+            ids.sort();
+            ids.into_iter().find_map(|id| any_verdict(id, cards))
         }
     }
+}
+
+/// The `--any` check for one card: Done -> 0; Blocked, orphaned, or gone ->
+/// 1; anything else (including a handed-back integration) keeps waiting.
+fn any_verdict(id: &str, cards: &[CardLine]) -> Option<WaitVerdict> {
+    let code = match cards.iter().find(|c| c.card.id == id) {
+        None => 1,
+        Some(c) if c.card.state == CardState::Done => 0,
+        Some(c) if c.card.state == CardState::Blocked || c.orphaned => 1,
+        Some(_) => return None,
+    };
+    Some(WaitVerdict {
+        code,
+        card: id.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3225,6 +3299,16 @@ mod tests {
              \n\
              Resize flickers on Up-arrow.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
+             \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    foreman kanban done a3f8k2\n\
@@ -3244,6 +3328,16 @@ mod tests {
              # Task: Fix resize flicker\n\
              \n\
              \n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
              \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
@@ -3265,6 +3359,16 @@ mod tests {
              \n\
              Resize flickers on Up-arrow.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    & $env:FOREMAN_EXE chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
+             \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    & $env:FOREMAN_EXE kanban done a3f8k2\n\
@@ -3285,6 +3389,16 @@ mod tests {
              # Task: Fix resize flicker\n\
              \n\
              \n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    & $env:FOREMAN_EXE chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
              \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
@@ -3313,6 +3427,16 @@ mod tests {
              A previous worker blocked this card: needs a design decision\n\
              Its work is still here: run git log and git status first and read what it left. Check whether the blocker still applies; if it does and you cannot resolve it, block again with the reason.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
+             \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
              When the work is complete, run:    foreman kanban done a3f8k2\n\
@@ -3337,6 +3461,16 @@ mod tests {
              # Previous attempt\n\
              A previous worker on this card ended without closing it out; its terminal is gone.\n\
              Whatever it finished is still here: run git log and git status first and continue from there instead of starting over.\n\
+             \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
              \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
@@ -3853,6 +3987,7 @@ mod tests {
             "    foreman kanban wait e9e9e9 --timeout 1800\n",
             "put the checkout back on main",
             "for a moved base: git rebase main",
+            "wait prints the reason on its integration line (foreman kanban list e9e9e9 --json shows it again)",
             "Do not end the session without the card Done (by the queue) or blocked.",
         ] {
             assert!(p.contains(want), "missing {want:?} in:\n{p}");
@@ -4569,13 +4704,23 @@ mod tests {
              The main checkout at H:/repo is shared with other workers: never edit files there.\n\
              Leave .foreman/ untouched and never stage it.\n\
              \n\
+             # Chat\n\
+             Posts addressed to you arrive as typed input framed [chat pN #M] tX→tY: <text>. They steer this card: act on them, and never post an acknowledgement. Post only when another member must act or you need an answer, in one to three sentences:    foreman chat --to tX \"<message>\"\n\
+             \n\
+             # Final report\n\
+             Whoever runs this plan reads your last message and then closes this terminal. End it with these four lines, writing none for an empty one:\n\
+             Landed: what you shipped.\n\
+             Follow-ups: work you deferred or found that still needs doing.\n\
+             Plan impact: anything that makes a later card wrong, redundant, or dependent on new work.\n\
+             Decisions: anything a human must decide.\n\
+             \n\
              # Close-out (required)\n\
              End every commit message with the trailer line:    Card: a3f8k2\n\
              Commit everything in your worktree, then hand integration to Foreman's queue (never merge into the main checkout yourself):\n\
              \x20   foreman kanban integrate a3f8k2\n\
              \x20   foreman kanban wait a3f8k2 --timeout 1800\n\
              wait exit 0: Foreman rebased onto main, ran the project checks, fast-forwarded main, and marked the card Done. You are finished; do not run done yourself.\n\
-             wait exit 3: the rebase conflicted or a check failed. Read the reason with foreman kanban list --json (the \"integration\" object), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
+             wait exit 3: the rebase conflicted or a check failed. wait prints the reason on its integration line (foreman kanban list a3f8k2 --json shows it again), fix it in your worktree (finish the rebase, commit), then run integrate and wait again. Queued is not Done.\n\
              wait exit 2: still queued or checking; run wait again.\n\
              If you are stuck and need a human: foreman kanban block a3f8k2 --reason \"<one line>\"\n\
              Do not end the session without the card Done (by the queue) or blocked."
@@ -4595,7 +4740,7 @@ mod tests {
         assert!(s.contains(
             "    & $env:FOREMAN_EXE kanban integrate a3f8k2\n    & $env:FOREMAN_EXE kanban wait a3f8k2 --timeout 1800\n"
         ));
-        assert!(s.contains("Read the reason with & $env:FOREMAN_EXE kanban list --json"));
+        assert!(s.contains("(& $env:FOREMAN_EXE kanban list a3f8k2 --json shows it again)"));
         assert!(s.contains(
             "If you are stuck and need a human: & $env:FOREMAN_EXE kanban block a3f8k2 --reason \"<one line>\"\n"
         ));
@@ -5517,28 +5662,37 @@ mod tests {
         );
     }
 
+    /// The exit code alone, for the verdict-table tests.
+    fn wait_code(
+        target: &WaitTarget,
+        watched: &mut std::collections::HashSet<String>,
+        cards: &[CardLine],
+    ) -> Option<i32> {
+        wait_verdict(target, watched, cards).map(|v| v.code)
+    }
+
     #[test]
     fn wait_verdict_by_id_covers_every_row() {
         let mut watched = std::collections::HashSet::new();
         let target = WaitTarget::Id("a1".into());
 
         let cards = vec![line_with_state("a1", CardState::Done, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(0));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(0));
 
         let cards = vec![line_with_state("a1", CardState::Blocked, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1));
 
         let cards = vec![line_with_state("a1", CardState::InProgress, true)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1)); // orphaned
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1)); // orphaned
 
         let cards: Vec<CardLine> = vec![]; // removed under the waiter
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(1));
 
         let cards = vec![line_with_state("a1", CardState::Backlog, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
 
         let cards = vec![line_with_state("a1", CardState::InProgress, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
     }
 
     fn line_integrating(id: &str, phase: crate::integrate::Phase) -> CardLine {
@@ -5568,26 +5722,22 @@ mod tests {
         // queued / integrating: still pending
         for phase in [Phase::Queued, Phase::Integrating, Phase::Integrated] {
             let cards = vec![line_integrating("a1", phase)];
-            assert_eq!(
-                wait_verdict(&target, &mut watched, &cards),
-                None,
-                "{phase:?}"
-            );
+            assert_eq!(wait_code(&target, &mut watched, &cards), None, "{phase:?}");
         }
         let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
         assert_eq!(
-            wait_verdict(&target, &mut watched, &cards),
+            wait_code(&target, &mut watched, &cards),
             Some(WAIT_NEEDS_RESOLUTION)
         );
         // an orphaned worker outranks its handed-back integration
         let mut orphaned = line_integrating("a1", Phase::NeedsResolution);
         orphaned.orphaned = true;
-        assert_eq!(wait_verdict(&target, &mut watched, &[orphaned]), Some(1));
+        assert_eq!(wait_code(&target, &mut watched, &[orphaned]), Some(1));
         // --any leaves resolution to the live worker
         let any = WaitTarget::Any;
         let mut watched = std::collections::HashSet::new();
         let cards = vec![line_integrating("a1", Phase::NeedsResolution)];
-        assert_eq!(wait_verdict(&any, &mut watched, &cards), None);
+        assert_eq!(wait_code(&any, &mut watched, &cards), None);
         assert!(watched.contains("a1"));
     }
 
@@ -5611,6 +5761,91 @@ mod tests {
     }
 
     #[test]
+    fn wait_any_names_the_card_that_moved_and_reports_only_that_card() {
+        let target = WaitTarget::Any;
+        let mut watched = std::collections::HashSet::new();
+        let cards = vec![
+            line_with_state("a1", CardState::InProgress, false),
+            line_with_state("a2", CardState::InProgress, false),
+        ];
+        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        let cards = vec![
+            line_with_state("a1", CardState::InProgress, false),
+            line_with_state("a2", CardState::Done, false),
+        ];
+        let v = wait_verdict(&target, &mut watched, &cards).expect("a2 moved");
+        assert_eq!(
+            v,
+            WaitVerdict {
+                code: 0,
+                card: "a2".into()
+            }
+        );
+        assert_eq!(wait_report(&v, &cards), vec![cards[1].human_line()]);
+    }
+
+    #[test]
+    fn wait_any_of_reports_a_listed_card_that_finished_before_the_wait_began() {
+        let mut watched = std::collections::HashSet::new();
+        let target = WaitTarget::AnyOf(vec!["a2".into(), "a1".into()]);
+        // Both already finished when the wait starts (the orchestrator was
+        // busy reviewing): one reports now, sorted, and the other on the
+        // next wait, because a listed card needs no sighting In Progress.
+        let cards = vec![
+            line_with_state("a1", CardState::Done, false),
+            line_with_state("a2", CardState::Blocked, false),
+        ];
+        let v = wait_verdict(&target, &mut watched, &cards).expect("a1 finished");
+        assert_eq!(
+            v,
+            WaitVerdict {
+                code: 0,
+                card: "a1".into()
+            }
+        );
+        let next = WaitTarget::AnyOf(vec!["a2".into()]);
+        assert_eq!(wait_code(&next, &mut watched, &cards), Some(1));
+    }
+
+    #[test]
+    fn wait_any_of_ignores_unlisted_cards_and_pending_listed_ones() {
+        use crate::integrate::Phase;
+        let mut watched = std::collections::HashSet::new();
+        let target = WaitTarget::AnyOf(vec!["a1".into(), "a2".into(), "a3".into()]);
+        let cards = vec![
+            line_with_state("zz", CardState::Done, false), // not listed
+            line_with_state("a1", CardState::Backlog, false),
+            line_with_state("a2", CardState::InProgress, false),
+            // a handed-back integration is the live worker's to resolve
+            line_integrating("a3", Phase::NeedsResolution),
+        ];
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
+        // orphaned or removed listed cards need a human
+        let orphaned = vec![line_with_state("a1", CardState::InProgress, true)];
+        let only_a1 = WaitTarget::AnyOf(vec!["a1".into()]);
+        assert_eq!(wait_code(&only_a1, &mut watched, &orphaned), Some(1));
+        let v = wait_verdict(&only_a1, &mut watched, &[]).expect("removed");
+        assert_eq!(wait_report(&v, &[]), vec!["a1  removed".to_string()]);
+    }
+
+    #[test]
+    fn wait_report_carries_the_integration_hand_back_and_removals() {
+        let mut line = line_integrating("a1", crate::integrate::Phase::NeedsResolution);
+        line.integration.as_mut().unwrap().detail = Some("cargo test failed".into());
+        let cards = vec![line.clone()];
+        let mut watched = std::collections::HashSet::new();
+        let v = wait_verdict(&WaitTarget::Id("a1".into()), &mut watched, &cards).unwrap();
+        assert_eq!(v.code, WAIT_NEEDS_RESOLUTION);
+        let integration = serde_json::to_string(line.integration.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            wait_report(&v, &cards),
+            vec![line.human_line(), format!("integration: {integration}")]
+        );
+        let v = wait_verdict(&WaitTarget::Id("gone".into()), &mut watched, &cards).unwrap();
+        assert_eq!(wait_report(&v, &cards), vec!["gone  removed".to_string()]);
+    }
+
+    #[test]
     fn wait_verdict_any_watches_a_card_only_after_seeing_it_in_progress() {
         let mut watched = std::collections::HashSet::new();
         let target = WaitTarget::Any;
@@ -5618,31 +5853,31 @@ mod tests {
         // Sitting in Backlog: never watched, never triggers even once Done
         // (it skipped being observed InProgress).
         let cards = vec![line_with_state("b1", CardState::Backlog, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
         assert!(watched.is_empty());
 
         // Now it's seen InProgress: watched, but still in-flight so None.
         let cards = vec![line_with_state("b1", CardState::InProgress, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), None);
+        assert_eq!(wait_code(&target, &mut watched, &cards), None);
         assert!(watched.contains("b1"));
 
         // Transitions to Done: triggers.
         let cards = vec![line_with_state("b1", CardState::Done, false)];
-        assert_eq!(wait_verdict(&target, &mut watched, &cards), Some(0));
+        assert_eq!(wait_code(&target, &mut watched, &cards), Some(0));
 
         // A separately-watched card going Blocked also triggers.
         let mut watched2 = std::collections::HashSet::new();
         let cards = vec![line_with_state("c1", CardState::InProgress, false)];
-        wait_verdict(&target, &mut watched2, &cards);
+        wait_code(&target, &mut watched2, &cards);
         let cards = vec![line_with_state("c1", CardState::Blocked, false)];
-        assert_eq!(wait_verdict(&target, &mut watched2, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched2, &cards), Some(1));
 
         // And going missing (removed under the waiter) also triggers.
         let mut watched3 = std::collections::HashSet::new();
         let cards = vec![line_with_state("d1", CardState::InProgress, false)];
-        wait_verdict(&target, &mut watched3, &cards);
+        wait_code(&target, &mut watched3, &cards);
         let cards: Vec<CardLine> = vec![];
-        assert_eq!(wait_verdict(&target, &mut watched3, &cards), Some(1));
+        assert_eq!(wait_code(&target, &mut watched3, &cards), Some(1));
     }
 
     const PORCELAIN: &str = "worktree H:/repo\n\
