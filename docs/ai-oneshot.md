@@ -51,6 +51,13 @@ let text = ai_oneshot::run(&ai_oneshot::Request {
 
 - **Codex has no system-prompt flag.** `system` is prepended to the prompt on
   stdin. Claude gets `--system-prompt`, Grok `--system-prompt-override`.
+- **Codex's stderr starts with a banner, not the error.** `codex exec`
+  prints `OpenAI Codex v…`, a config block, and the echoed prompt, then
+  `ERROR: {json}` lines. `Failed` carries the last `ERROR:` line's
+  `error.message` (or the line itself), and nothing when there is none, so
+  the prompt never shows up as an error. Other CLIs: first non-blank stderr
+  line, else stdout. Stderr past `max_output` keeps its first and last
+  `max_output` bytes, so both kinds of reason survive a large echo.
 - **Codex ignores `config.toml`** (`--ignore-user-config`). A blank model is
   Codex's built-in default, not the user's configured one.
 - **Grok's prompt rides on argv**, the others use stdin. If a CLI is only

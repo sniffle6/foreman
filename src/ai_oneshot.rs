@@ -45,8 +45,9 @@ pub struct Request<'a> {
 pub enum LaunchError {
     /// The CLI could not be started at all (not installed or not on PATH).
     Unavailable,
-    /// The CLI ran and exited non-zero. Carries its first stderr line, capped
-    /// to [`FAILURE_DETAIL_CHARS`], or an empty string when it said nothing.
+    /// The CLI ran and exited non-zero. Carries its reason (see
+    /// `classify_failure`), capped to [`FAILURE_DETAIL_CHARS`], or an empty
+    /// string when it gave none.
     Failed(String),
     Timeout,
     TooLarge,
@@ -296,7 +297,7 @@ fn run_process_on_path(
         let _ = out_tx.send(read_capped(stdout, max_output + 1));
     });
     std::thread::spawn(move || {
-        let _ = err_tx.send(read_capped(stderr, max_output));
+        let _ = err_tx.send(read_ends(stderr, max_output));
     });
     let status = loop {
         match child.try_wait() {
@@ -359,22 +360,54 @@ fn run_process_on_path(
 /// way to tell "not installed" from "ran and failed".
 const CMD_NOT_RECOGNIZED: &str = "is not recognized as an internal or external command";
 
+/// Starts a line of every `codex exec` run's stderr (the first, in
+/// v0.163.0). What follows it is a config block and the echoed prompt, so
+/// the first line is never the reason.
+const CODEX_BANNER: &str = "OpenAI Codex v";
+
 /// The detail is the first non-blank stderr line, else the first non-blank
 /// stdout line: Claude Code reports API errors on stdout with a silent stderr.
+/// Codex is the exception: see [`codex_failure_detail`].
 fn classify_failure(stderr: &str, stdout: &str, through_cmd: bool) -> LaunchError {
     if through_cmd && stderr.contains(CMD_NOT_RECOGNIZED) {
         return LaunchError::Unavailable;
     }
-    let detail = stderr
+    let detail = if stderr.lines().any(|l| l.trim().starts_with(CODEX_BANNER)) {
+        codex_failure_detail(stderr)
+    } else {
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    LaunchError::Failed(detail.chars().take(FAILURE_DETAIL_CHARS).collect())
+}
+
+/// Codex's reason is its last `ERROR:` line, often the API's JSON error body,
+/// in which case only `error.message` is kept. No such line means no detail:
+/// the rest of its stderr is the echoed prompt, which is not an error message.
+/// A raw-text prompt with its own line starting `ERROR:` could pass for one;
+/// JSON prompts (Create Layout) cannot.
+fn codex_failure_detail(stderr: &str) -> String {
+    let Some(error) = stderr
         .lines()
-        .chain(stdout.lines())
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("ERROR:"))
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .chars()
-        .take(FAILURE_DETAIL_CHARS)
-        .collect();
-    LaunchError::Failed(detail)
+    else {
+        return String::new();
+    };
+    serde_json::from_str::<serde_json::Value>(error)
+        .ok()
+        .and_then(|body| {
+            let message = body.pointer("/error/message").or(body.get("message"))?;
+            Some(message.as_str()?.trim().to_owned())
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| error.to_owned())
 }
 
 #[cfg(windows)]
@@ -385,6 +418,35 @@ fn cmd_fallback_word_is_safe(word: &str) -> bool {
             '\0' | '\r' | '\n' | '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>'
         )
     })
+}
+
+/// Keep the first `cap` bytes and, past them, the last `cap`, joined by a
+/// newline: a CLI's reason is its first line, or (Codex, after echoing a
+/// prompt that can outgrow the cap) its last. Drains to EOF so the child
+/// never blocks on a full pipe.
+fn read_ends(mut reader: impl Read, cap: usize) -> Vec<u8> {
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        let room = cap.saturating_sub(head.len()).min(n);
+        head.extend_from_slice(&buf[..room]);
+        tail.extend_from_slice(&buf[room..n]);
+        if tail.len() > 2 * cap {
+            tail.drain(..tail.len() - cap);
+        }
+    }
+    if tail.len() > cap {
+        tail.drain(..tail.len() - cap);
+    }
+    if !tail.is_empty() {
+        head.push(b'\n');
+        head.extend_from_slice(&tail);
+    }
+    head
 }
 
 /// Keep at most `cap` bytes but drain the pipe to EOF so the child never
@@ -421,6 +483,93 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_output: 1024,
         }
+    }
+
+    /// `codex exec` stderr for a rejected model, as v0.163.0 prints it: the
+    /// banner, its config block, the echoed prompt, then the error.
+    const CODEX_REJECTED_MODEL: &str = concat!(
+        "OpenAI Codex v0.163.0\n",
+        "--------\n",
+        "workdir: C:\\tmp\n",
+        "model: no-such-model\n",
+        "provider: openai\n",
+        "session id: 01a15244\n",
+        "--------\n",
+        "user\n",
+        "secret prompt text\n",
+        "\n",
+        "warning: Model metadata for `no-such-model` not found.\n",
+        r#"ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","#,
+        r#""message":"The 'no-such-model' model is not supported."}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn codex_failure_detail_is_its_error_message_not_its_banner() {
+        assert_eq!(
+            classify_failure(CODEX_REJECTED_MODEL, "", false),
+            LaunchError::Failed("The 'no-such-model' model is not supported.".into())
+        );
+    }
+
+    #[test]
+    fn codex_failure_detail_takes_a_plain_error_line_as_is() {
+        let stderr = concat!(
+            "OpenAI Codex v0.163.0\n",
+            "--------\n",
+            "user\n",
+            "hi\n",
+            "ERROR: stream disconnected before completion\n",
+        );
+        assert_eq!(
+            classify_failure(stderr, "", false),
+            LaunchError::Failed("stream disconnected before completion".into())
+        );
+    }
+
+    #[test]
+    fn codex_failure_detail_finds_the_banner_after_a_preamble() {
+        let stderr = concat!(
+            "Reading prompt from stdin...\n",
+            "OpenAI Codex v0.170.0\n",
+            "--------\n",
+            "user\n",
+            "hi\n",
+            "ERROR: stream disconnected before completion\n",
+        );
+        assert_eq!(
+            classify_failure(stderr, "", false),
+            LaunchError::Failed("stream disconnected before completion".into())
+        );
+    }
+
+    #[test]
+    fn capped_stderr_keeps_its_first_and_last_lines() {
+        // The first line is most CLIs' reason; Codex's comes last, after an
+        // echoed prompt that can be larger than the cap.
+        assert_eq!(read_ends(&b"abc"[..], 4), b"abc");
+        assert_eq!(read_ends(&b"abcdef"[..], 4), b"abcd\nef");
+        let long = format!("first\n{}\nERROR: last\n", "x".repeat(50_000));
+        let kept = String::from_utf8(read_ends(long.as_bytes(), 1024)).unwrap();
+        assert!(kept.len() <= 2 * 1024 + 1);
+        assert!(kept.starts_with("first\n"));
+        assert!(kept.ends_with("ERROR: last\n"));
+    }
+
+    #[test]
+    fn codex_failure_without_an_error_line_never_shows_the_echoed_prompt() {
+        let stderr = concat!(
+            "OpenAI Codex v0.163.0\n",
+            "--------\n",
+            "model: m\n",
+            "--------\n",
+            "user\n",
+            "secret prompt text\n",
+        );
+        assert_eq!(
+            classify_failure(stderr, "", false),
+            LaunchError::Failed(String::new())
+        );
     }
 
     #[test]
