@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 /// Gap between a chat paste and its submitting `\r`. Claude Code's TUI folds
 /// input arriving within the same few-ms burst as a paste INTO the paste, so
 /// a `\r` written back-to-back with `ESC[201~` becomes a literal newline in
-/// the input box instead of an Enter keypress. ~150ms is past the burst window
-/// while still feeling instant.
-pub const SUBMIT_DELAY: Duration = Duration::from_millis(150);
+/// the input box instead of an Enter keypress. Busy Codex 0.163.0 also leaves
+/// chat unsubmitted at 150ms (see terminal's codex_chat_submit_while_busy
+/// regression). Leave processing headroom and send exactly one Enter.
+pub const SUBMIT_DELAY: Duration = Duration::from_millis(500);
 
 /// Session-facing effect from the gate. Exactly one variant by design — every
 /// Ready/inject outcome is a PTY write. A second variant during implementation
@@ -216,6 +217,41 @@ impl Default for ReadyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_submit_waits_through_busy_receiver_paste_processing() {
+        let now = Instant::now();
+        let mut gate = ReadyGate::new();
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        assert_eq!(
+            gate.try_inject("first", now),
+            Some(Action::Write(paste_wrap("first")))
+        );
+        assert!(gate.try_inject("second", now).is_none());
+        assert!(
+            gate.poll(now + Duration::from_millis(250)).is_empty(),
+            "a busy Codex receiver can still consume Enter without submitting at the old deadline"
+        );
+        assert!(!gate.chat_input_available());
+        assert_eq!(
+            gate.poll(now + Duration::from_secs(1)),
+            [
+                Action::Write(b"\r".to_vec()),
+                Action::Write(paste_wrap("second"))
+            ]
+        );
+        assert!(gate.poll(now + Duration::from_millis(1250)).is_empty());
+        assert_eq!(
+            gate.poll(now + Duration::from_secs(2)),
+            [Action::Write(b"\r".to_vec())]
+        );
+        assert!(
+            gate.poll(now + Duration::from_secs(3)).is_empty(),
+            "submit exactly once per post"
+        );
+        assert!(gate.chat_input_available());
+    }
 
     #[test]
     fn outbox_waits_for_ready_queue_and_deferred_submit() {

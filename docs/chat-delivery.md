@@ -110,7 +110,10 @@ The engine adapter (`src/wm.rs`):
   owner. Don't fold them — the CLI agent needs the error; the pane input can't
   show one.
 - **One post = one turn.** `ReadyGate` queues every post and writes the next
-  paste only after the previous post's deferred Enter has fired (~150ms each).
+  paste only after the previous post's deferred Enter has fired. The delay in
+  `src/ready.rs` (`SUBMIT_DELAY`) leaves processing headroom for busy agent CLIs;
+  a shorter delay left posts in Codex's input box until a later manual Enter.
+  Each post sends exactly one Enter, with no automatic retry.
   Posts never fold into one paste, so a receiver never reads two instructions
   as one line.
 - **Stale posts get an age stamp.** At delivery, a post older than
