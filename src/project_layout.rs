@@ -1428,8 +1428,14 @@ mod tests {
             tabs_of(&r.arrangement),
             vec![vec![7, 9], vec![2, 3, 8], vec![4], vec![5]]
         );
-        assert_eq!(r.arrangement.windows[1].active, 1, "the front tab is unchanged");
-        assert_eq!(r.arrangement.tree, d.arrangement.tree, "no Additional windows split");
+        assert_eq!(
+            r.arrangement.windows[1].active, 1,
+            "the front tab is unchanged"
+        );
+        assert_eq!(
+            r.arrangement.tree, d.arrangement.tree,
+            "no Additional windows split"
+        );
         assert!(!r.is_exact(), "extras were stacked");
         assert_eq!(validate(&r.arrangement, &inv), Ok(()));
     }
@@ -1899,16 +1905,30 @@ mod tests {
     #[test]
     fn five_terminals_into_a_one_terminal_layout_share_its_window() {
         // A layout saved elsewhere: one terminal. The Project has five.
-        let d = def(vec![term(100)], vec![WindowSpec::tiled(vec![100], 0)], Some(leaf(0)));
+        let d = def(
+            vec![term(100)],
+            vec![WindowSpec::tiled(vec![100], 0)],
+            Some(leaf(0)),
+        );
         let inv = vec![term(1), term(2), term(3), term(4), term(5)];
         let r = rec(&d, &inv);
         assert_eq!(r.substituted, vec![sub(100, 1, ItemKind::Terminal)]);
         assert_eq!(tabs_of(&r.arrangement), vec![vec![1, 2, 3, 4, 5]]);
-        assert_eq!(r.arrangement.windows[0].active, 0, "the layout's own tab stays in front");
-        assert_eq!(r.arrangement.tree, Some(leaf(0)), "no Additional windows split");
+        assert_eq!(
+            r.arrangement.windows[0].active, 0,
+            "the layout's own tab stays in front"
+        );
+        assert_eq!(
+            r.arrangement.tree,
+            Some(leaf(0)),
+            "no Additional windows split"
+        );
         assert_eq!(r.stacked, vec![term(2), term(3), term(4), term(5)]);
         assert!(r.additional.is_empty());
-        assert!(!r.is_exact(), "the live windows differ from the saved layout");
+        assert!(
+            !r.is_exact(),
+            "the live windows differ from the saved layout"
+        );
         assert_eq!(validate(&r.arrangement, &r.items), Ok(()));
     }
 
@@ -1922,13 +1942,23 @@ mod tests {
                 WindowSpec::tiled(vec![2], 0),
                 WindowSpec::tiled(vec![3], 0),
             ],
-            Some(split(SplitAxis::H, &[0.3, 0.5, 0.2], vec![leaf(0), leaf(1), leaf(2)])),
+            Some(split(
+                SplitAxis::H,
+                &[0.3, 0.5, 0.2],
+                vec![leaf(0), leaf(1), leaf(2)],
+            )),
         );
         let inv = vec![term(1), term(2), chat(3), term(9), term(7)];
         let r = rec(&d, &inv);
-        assert_eq!(tabs_of(&r.arrangement), vec![vec![1], vec![2, 9, 7], vec![3]]);
+        assert_eq!(
+            tabs_of(&r.arrangement),
+            vec![vec![1], vec![2, 9, 7], vec![3]]
+        );
         assert_eq!(r.stacked, vec![term(9), term(7)], "inventory order");
-        assert_eq!(r.arrangement.tree, d.arrangement.tree, "the saved tiling, untouched");
+        assert_eq!(
+            r.arrangement.tree, d.arrangement.tree,
+            "the saved tiling, untouched"
+        );
         // A nested split: shares multiply down the tree. Terminal 1 has 60%
         // of the width; terminal 2 has 40% of the width times 90% of the height.
         let nested = def(
@@ -1941,11 +1971,17 @@ mod tests {
             Some(split(
                 SplitAxis::H,
                 &[3.0, 2.0],
-                vec![leaf(0), split(SplitAxis::V, &[9.0, 1.0], vec![leaf(1), leaf(2)])],
+                vec![
+                    leaf(0),
+                    split(SplitAxis::V, &[9.0, 1.0], vec![leaf(1), leaf(2)]),
+                ],
             )),
         );
         let r = rec(&nested, &inv);
-        assert_eq!(tabs_of(&r.arrangement), vec![vec![1, 9, 7], vec![2], vec![3]]);
+        assert_eq!(
+            tabs_of(&r.arrangement),
+            vec![vec![1, 9, 7], vec![2], vec![3]]
+        );
     }
 
     #[test]
@@ -1974,15 +2010,24 @@ mod tests {
             )
         };
         let inv = [term(1), term(2), term(8)];
-        assert_eq!(tabs_of(&rec(&floats(0.2, 0.4), &inv).arrangement), vec![vec![1], vec![2, 8]]);
-        assert_eq!(tabs_of(&rec(&floats(0.3, 0.3), &inv).arrangement), vec![vec![1, 8], vec![2]]);
+        assert_eq!(
+            tabs_of(&rec(&floats(0.2, 0.4), &inv).arrangement),
+            vec![vec![1], vec![2, 8]]
+        );
+        assert_eq!(
+            tabs_of(&rec(&floats(0.3, 0.3), &inv).arrangement),
+            vec![vec![1, 8], vec![2]]
+        );
         // Two equal tiles: the first.
         let even = def(
             vec![term(1), term(2)],
             vec![WindowSpec::tiled(vec![1], 0), WindowSpec::tiled(vec![2], 0)],
             Some(split(SplitAxis::H, &[0.5, 0.5], vec![leaf(0), leaf(1)])),
         );
-        assert_eq!(tabs_of(&rec(&even, &inv).arrangement), vec![vec![1, 8], vec![2]]);
+        assert_eq!(
+            tabs_of(&rec(&even, &inv).arrangement),
+            vec![vec![1, 8], vec![2]]
+        );
     }
 
     #[test]
@@ -1998,7 +2043,10 @@ mod tests {
         );
         let inv = vec![term(1), image(4), term(2), chat(5)];
         let r = rec(&d, &inv);
-        assert!(r.stacked.is_empty(), "a minimized window never takes extras");
+        assert!(
+            r.stacked.is_empty(),
+            "a minimized window never takes extras"
+        );
         assert_eq!(r.additional, vec![term(2), chat(5)]);
         assert_eq!(tabs_of(&r.arrangement), vec![vec![1], vec![4], vec![2, 5]]);
         assert_eq!(

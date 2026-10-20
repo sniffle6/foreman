@@ -472,9 +472,7 @@ fn arrangement_from(
         let tabs = w
             .tabs
             .iter()
-            .map(|&t| {
-                resolve(t).ok_or_else(|| invalid(format!("item {t} is not in the Project")))
-            })
+            .map(|&t| resolve(t).ok_or_else(|| invalid(format!("item {t} is not in the Project"))))
             .collect::<Result<Vec<_>, _>>()?;
         let active = match w.active {
             None => 0,
@@ -1096,10 +1094,11 @@ mod tests {
         // At most MAX_NEW_ITEMS.
         let mut many = good();
         let ids: Vec<u64> = (6..6 + MAX_NEW_ITEMS as u64 + 1).collect();
-        many["new"] = json!(ids
-            .iter()
-            .map(|id| json!({"id": id, "kind": "terminal"}))
-            .collect::<Vec<_>>());
+        many["new"] = json!(
+            ids.iter()
+                .map(|id| json!({"id": id, "kind": "terminal"}))
+                .collect::<Vec<_>>()
+        );
         many["windows"][0]["tabs"] = json!([1].iter().chain(&ids).collect::<Vec<_>>());
         let err = parse(&many).unwrap_err();
         assert!(err.contains("too many new windows"), "{err}");

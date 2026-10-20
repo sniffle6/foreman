@@ -1107,12 +1107,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         let to_b = wm.apply_layout(&def_b, true, &ctx).unwrap();
-        let extras: Vec<_> = to_b
-            .reconciliation
-            .stacked
-            .iter()
-            .map(|i| i.id)
-            .collect();
+        let extras: Vec<_> = to_b.reconciliation.stacked.iter().map(|i| i.id).collect();
         assert_eq!(extras, vec![b, c]);
         assert_eq!(wm.windows.len(), 1, "b and c stacked behind a");
         assert!(wm.layout.modified, "extras make the Apply dirty");

@@ -53,11 +53,17 @@ impl PickerUi {
 }
 
 pub(super) enum Requested {
-    Apply { name: String },
+    Apply {
+        name: String,
+    },
     Revert,
-    NewProject { name: String },
+    NewProject {
+        name: String,
+    },
     /// A Create candidate; `saved` names the definition Save & Apply wrote.
-    Create { saved: Option<String> },
+    Create {
+        saved: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -542,7 +548,9 @@ impl WindowManager {
                 // layout's Apply does.
                 Ok(applied) if !applied.is_exact() => Notice::Summary {
                     title: match &saved {
-                        Some(name) => format!("Saved \u{201c}{name}\u{201d} and applied it, with changes"),
+                        Some(name) => {
+                            format!("Saved \u{201c}{name}\u{201d} and applied it, with changes")
+                        }
                         None => "Applied with changes".to_string(),
                     },
                     lines: summary_lines(&applied, |id| self.layout_item_title(id)),
@@ -2386,7 +2394,10 @@ mod tests {
         wm.poll_layout_outcome(0.0);
 
         assert_eq!(wm.layout.selected.as_deref(), Some(def.id.as_str()));
-        assert!(wm.layout.modified, "an extra stacked with a matching window");
+        assert!(
+            wm.layout.modified,
+            "an extra stacked with a matching window"
+        );
         let Some(Notice::Summary { title, lines }) = &wm.layout_ui.notice else {
             panic!("expected a summary, got {:?}", wm.layout_ui.notice);
         };

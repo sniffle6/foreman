@@ -79,9 +79,14 @@ pub(super) enum Status {
     /// The windows changed under a request or candidate.
     Stale,
     /// The description needs Content that is not open.
-    Missing { text: String, message: String },
+    Missing {
+        text: String,
+        message: String,
+    },
     /// The proposal is the arrangement the windows already have.
-    Unchanged { message: String },
+    Unchanged {
+        message: String,
+    },
 }
 
 /// Save & Apply's name row.
@@ -164,7 +169,11 @@ impl WindowManager {
             CreateAction::EditName => {
                 if let Some(Naming {
                     conflict, error, ..
-                }) = self.layout_ui.create.as_mut().and_then(|e| e.naming.as_mut())
+                }) = self
+                    .layout_ui
+                    .create
+                    .as_mut()
+                    .and_then(|e| e.naming.as_mut())
                 {
                     *conflict = None;
                     *error = None;
@@ -314,7 +323,11 @@ impl WindowManager {
             ed.pending = None;
             ed.status = Some(Status::Stale);
         }
-        if ed.candidate.as_ref().is_some_and(|c| c.revision != revision) {
+        if ed
+            .candidate
+            .as_ref()
+            .is_some_and(|c| c.revision != revision)
+        {
             ed.candidate = None;
             ed.naming = None;
             ed.status = Some(Status::Stale);
@@ -414,7 +427,12 @@ impl WindowManager {
                 ctx.request_repaint();
             }
             Err(e) => {
-                if let Some(n) = self.layout_ui.create.as_mut().and_then(|e| e.naming.as_mut()) {
+                if let Some(n) = self
+                    .layout_ui
+                    .create
+                    .as_mut()
+                    .and_then(|e| e.naming.as_mut())
+                {
                     match e {
                         StoreError::NameTaken { id, name } => {
                             n.conflict = Some((id, name));
@@ -984,16 +1002,18 @@ fn paint_candidate(p: &egui::Painter, c: &Candidate, rect: egui::Rect, th: &crat
             .iter()
             .find(|e| e.item.id == active)
             .map_or(pl::ItemKind::Terminal, |e| e.item.kind);
-        let badge = egui::Rect::from_min_size(
-            cell_rect.min + egui::vec2(4.0, 4.0),
-            egui::vec2(12.0, 12.0),
-        );
+        let badge =
+            egui::Rect::from_min_size(cell_rect.min + egui::vec2(4.0, 4.0), egui::vec2(12.0, 12.0));
         paint_kind_badge(p, badge, kind, c.icons.get(&active), th);
         let clip = egui::Rect::from_min_max(
             egui::pos2(badge.max.x + 4.0, cell_rect.min.y),
             egui::pos2(cell_rect.max.x - 3.0, cell_rect.max.y),
         );
-        let label = p.layout_no_wrap(label_of(c, active), egui::FontId::proportional(11.0), th.text);
+        let label = p.layout_no_wrap(
+            label_of(c, active),
+            egui::FontId::proportional(11.0),
+            th.text,
+        );
         p.with_clip_rect(clip).galley(
             egui::pos2(clip.min.x, badge.center().y - label.size().y / 2.0),
             label,
@@ -1015,7 +1035,11 @@ fn paint_candidate(p: &egui::Painter, c: &Candidate, rect: egui::Rect, th: &crat
                 egui::pos2(cell_rect.min.x + 4.0, cell_rect.min.y),
                 egui::pos2(cell_rect.max.x - 3.0, cell_rect.max.y),
             ))
-            .galley(egui::pos2(cell_rect.min.x + 6.0, badge.max.y + 3.0), more, th.dim);
+            .galley(
+                egui::pos2(cell_rect.min.x + 6.0, badge.max.y + 3.0),
+                more,
+                th.dim,
+            );
         }
     }
 }
@@ -1087,7 +1111,10 @@ mod tests {
         wm.layout_ui.create.as_ref().expect("the editor is open")
     }
 
-    fn open_and_run(wm: &mut WindowManager, description: &str) -> mpsc::SyncSender<Result<Reply, String>> {
+    fn open_and_run(
+        wm: &mut WindowManager,
+        description: &str,
+    ) -> mpsc::SyncSender<Result<Reply, String>> {
         if wm.layout_ui.create.is_none() {
             let ctx = egui::Context::default();
             wm.run_layout_action(PickerAction::OpenCreate, &ctx);
@@ -1149,14 +1176,22 @@ mod tests {
         assert!(editor(&wm).busy());
         let inv = &editor(&wm).pending.as_ref().unwrap().inventory;
         let labels: Vec<&str> = inv.entries.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, vec!["alpha", "beta", "gamma"], "labels are what is sent");
+        assert_eq!(
+            labels,
+            vec!["alpha", "beta", "gamma"],
+            "labels are what is sent"
+        );
         tx.send(Ok(stacked_reply(&wm))).unwrap();
         wm.poll_create();
         let ed = editor(&wm);
         assert!(!ed.busy());
         let cand = ed.candidate.as_ref().expect("candidate");
         assert_eq!(cand.def.arrangement.windows[0].tabs, vec![c, b, a]);
-        assert_eq!(arrangement(&wm), before, "live windows do not move until Apply");
+        assert_eq!(
+            arrangement(&wm),
+            before,
+            "live windows do not move until Apply"
+        );
     }
 
     #[test]
@@ -1167,7 +1202,10 @@ mod tests {
         let reply = stacked_reply(&wm);
         let second = open_and_run(&mut wm, "one stack, please");
         // The first request's reply has nowhere to land.
-        assert!(first.send(Ok(reply.clone())).is_err(), "superseded receiver dropped");
+        assert!(
+            first.send(Ok(reply.clone())).is_err(),
+            "superseded receiver dropped"
+        );
         wm.poll_create();
         assert!(editor(&wm).busy(), "still waiting on the second");
         second.send(Ok(reply)).unwrap();
@@ -1192,7 +1230,10 @@ mod tests {
         wm.poll_create();
         assert_eq!(editor(&wm).status, Some(Status::Stale));
         assert!(editor(&wm).candidate.is_none() && !editor(&wm).busy());
-        assert_eq!(LayoutApplyError::Stale.to_string(), "Windows changed \u{2014} run again.");
+        assert_eq!(
+            LayoutApplyError::Stale.to_string(),
+            "Windows changed \u{2014} run again."
+        );
 
         // A candidate, then a resize: it survives.
         let tx = open_and_run(&mut wm, "one stack");
@@ -1245,7 +1286,10 @@ mod tests {
         wm.revert_layout().unwrap();
         assert_eq!(arrangement(&wm).windows.len(), 3);
         assert_eq!(identities(&wm), ids);
-        assert!(f.store().project_layouts(&f.repo).unwrap().is_empty(), "Apply saves nothing");
+        assert!(
+            f.store().project_layouts(&f.repo).unwrap().is_empty(),
+            "Apply saves nothing"
+        );
     }
 
     #[test]
@@ -1268,7 +1312,10 @@ mod tests {
             wm.layout_ui.notice,
             Some(Notice::Error("Windows changed \u{2014} run again.".into()))
         );
-        assert_eq!(wm.layout_revert_status(), super::super::layouts::RevertStatus::Unavailable);
+        assert_eq!(
+            wm.layout_revert_status(),
+            super::super::layouts::RevertStatus::Unavailable
+        );
     }
 
     #[test]
@@ -1291,7 +1338,10 @@ mod tests {
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
         };
-        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
+        assert_eq!(
+            wm.check_candidate(&def, &[], rev),
+            Err(LayoutApplyError::Stale)
+        );
         assert_eq!(
             wm.apply_candidate(&def, &[], false, rev, &ctx).unwrap_err(),
             LayoutApplyError::Stale
@@ -1301,7 +1351,8 @@ mod tests {
         extra.items.push(ItemRef::new(9999, ItemKind::Terminal));
         extra.arrangement.windows[0].tabs.push(9999);
         assert_eq!(
-            wm.apply_candidate(&extra, &[], false, rev, &ctx).unwrap_err(),
+            wm.apply_candidate(&extra, &[], false, rev, &ctx)
+                .unwrap_err(),
             LayoutApplyError::Stale
         );
         // The wrong revision is stale however good the definition.
@@ -1313,11 +1364,16 @@ mod tests {
             arrangement: current,
         };
         assert_eq!(
-            wm.apply_candidate(&same, &[], false, rev + 1, &ctx).unwrap_err(),
+            wm.apply_candidate(&same, &[], false, rev + 1, &ctx)
+                .unwrap_err(),
             LayoutApplyError::Stale
         );
         assert_eq!(arrangement(&wm), before, "nothing moved");
-        assert_eq!(wm.windows.iter().map(|w| w.tabs.len()).sum::<usize>(), 3, "nothing opened");
+        assert_eq!(
+            wm.windows.iter().map(|w| w.tabs.len()).sum::<usize>(),
+            3,
+            "nothing opened"
+        );
         assert!(wm.apply_candidate(&same, &[], false, rev, &ctx).is_ok());
     }
 
@@ -1329,13 +1385,24 @@ mod tests {
         tx.send(Ok(stacked_reply(&wm))).unwrap();
         wm.poll_create();
         act(&mut wm, CreateAction::SaveAndApply);
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "  Stacked ".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "  Stacked ".into();
         act(&mut wm, CreateAction::SubmitName);
         assert!(wm.layout_ui.create.is_none());
         let saved = f.store().project_layouts(&f.repo).unwrap();
         assert_eq!(saved.len(), 1, "written before the Apply ran");
         assert_eq!(saved[0].name, "Stacked");
-        assert_eq!(arrangement(&wm).windows.len(), 3, "not moved yet: the Apply is deferred");
+        assert_eq!(
+            arrangement(&wm).windows.len(),
+            3,
+            "not moved yet: the Apply is deferred"
+        );
         let ctx = egui::Context::default();
         wm.drain_layout_request(&ctx);
         wm.poll_layout_outcome(0.0);
@@ -1349,7 +1416,10 @@ mod tests {
             "Save & Apply selects the saved definition"
         );
         assert_eq!(
-            wm.layout_ui.notice.as_ref().map(|n| matches!(n, Notice::Saved { text, .. } if text.contains("Stacked"))),
+            wm.layout_ui
+                .notice
+                .as_ref()
+                .map(|n| matches!(n, Notice::Saved { text, .. } if text.contains("Stacked"))),
             Some(true)
         );
     }
@@ -1368,15 +1438,32 @@ mod tests {
         tx.send(Ok(stacked_reply(&wm))).unwrap();
         wm.poll_create();
         act(&mut wm, CreateAction::SaveAndApply);
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "stacked".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "stacked".into();
         act(&mut wm, CreateAction::SubmitName);
         let ed = editor(&wm);
         assert!(ed.candidate.is_some(), "candidate kept");
-        assert!(ed.naming.as_ref().unwrap().conflict.is_some(), "offers Replace");
+        assert!(
+            ed.naming.as_ref().unwrap().conflict.is_some(),
+            "offers Replace"
+        );
         assert!(!wm.has_pending_layout_request(), "no Apply queued");
         // An empty name is rejected by the store: kept again.
         act(&mut wm, CreateAction::EditName);
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "   ".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "   ".into();
         act(&mut wm, CreateAction::SubmitName);
         let ed = editor(&wm);
         assert!(ed.candidate.is_some());
@@ -1387,11 +1474,22 @@ mod tests {
             r#"{"version": 999, "projects": {}}"#,
         )
         .unwrap();
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "Fresh".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "Fresh".into();
         act(&mut wm, CreateAction::SubmitName);
         let ed = editor(&wm);
         assert!(ed.candidate.is_some());
-        assert!(ed.naming.as_ref().unwrap().error.is_some(), "{:?}", ed.naming);
+        assert!(
+            ed.naming.as_ref().unwrap().error.is_some(),
+            "{:?}",
+            ed.naming
+        );
         assert!(!wm.has_pending_layout_request());
         assert_eq!(arrangement(&wm), before);
         // Back keeps the candidate; Cancel drops the editor and changes nothing.
@@ -1410,12 +1508,22 @@ mod tests {
         tx.send(Ok(stacked_reply(&wm))).unwrap();
         wm.poll_create();
         act(&mut wm, CreateAction::SaveAndApply);
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "Stacked".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "Stacked".into();
         // The revision moves without a frame in between.
         wm.minimize(win_id_of(&wm, a));
         wm.watch_layout_edits();
         act(&mut wm, CreateAction::SubmitName);
-        assert!(f.store().project_layouts(&f.repo).unwrap().is_empty(), "validated before the write");
+        assert!(
+            f.store().project_layouts(&f.repo).unwrap().is_empty(),
+            "validated before the write"
+        );
         assert_eq!(editor(&wm).status, Some(Status::Stale));
     }
 
@@ -1425,13 +1533,19 @@ mod tests {
         let (mut wm, _) = three(&f);
         let before = arrangement(&wm);
         let tx = open_and_run(&mut wm, "one stack");
-        tx.send(Err(lp::launch_error_text("claude", crate::ai_oneshot::LaunchError::Unavailable)))
-            .unwrap();
+        tx.send(Err(lp::launch_error_text(
+            "claude",
+            crate::ai_oneshot::LaunchError::Unavailable,
+        )))
+        .unwrap();
         wm.poll_create();
         assert!(matches!(&editor(&wm).status, Some(Status::Error(e)) if e.contains("unavailable")));
         let tx = open_and_run(&mut wm, "one stack");
-        tx.send(Err(lp::launch_error_text("claude", crate::ai_oneshot::LaunchError::Timeout)))
-            .unwrap();
+        tx.send(Err(lp::launch_error_text(
+            "claude",
+            crate::ai_oneshot::LaunchError::Timeout,
+        )))
+        .unwrap();
         wm.poll_create();
         assert!(matches!(&editor(&wm).status, Some(Status::Error(e)) if e.contains("too long")));
         let tx = open_and_run(&mut wm, "chat on the right");
@@ -1451,7 +1565,10 @@ mod tests {
         wm.poll_create();
         assert!(matches!(&editor(&wm).status, Some(Status::Error(_))));
         act(&mut wm, CreateAction::Apply);
-        assert!(!wm.has_pending_layout_request(), "no candidate: nothing queued");
+        assert!(
+            !wm.has_pending_layout_request(),
+            "no candidate: nothing queued"
+        );
         assert_eq!(arrangement(&wm), before);
         assert_eq!(wm.windows.iter().map(|w| w.tabs.len()).sum::<usize>(), 3);
     }
@@ -1462,7 +1579,10 @@ mod tests {
         let (mut wm, _) = three(&f);
         let tx = open_and_run(&mut wm, "one stack");
         let reply = stacked_reply(&wm);
-        assert!(wm.layout_ui.captures_keyboard(), "the editor owns the keyboard");
+        assert!(
+            wm.layout_ui.captures_keyboard(),
+            "the editor owns the keyboard"
+        );
         // Switching away (focus leaves, or the Project is not drawn).
         wm.close_layout_popups();
         assert!(wm.layout_ui.create.is_none());
@@ -1517,7 +1637,10 @@ mod tests {
         desk_frame(&mut desk, &ctx, 1000.0);
         child(&mut desk).run_layout_action(PickerAction::OpenCreate, &ctx);
         desk_frame(&mut desk, &ctx, 1000.0);
-        assert!(child(&mut desk).layout_ui.create.is_some(), "drawn: stays open");
+        assert!(
+            child(&mut desk).layout_ui.create.is_some(),
+            "drawn: stays open"
+        );
         // Narrower than the controls: no header can draw the editor, so it
         // must not linger, invisible, with the terminals frozen.
         if let Some(w) = desk.windows.iter_mut().find(|w| w.id == 1) {
@@ -1536,7 +1659,10 @@ mod tests {
         let ctx = egui::Context::default();
         wm.run_layout_action(PickerAction::Save, &ctx);
         assert!(wm.layout_ui.create.is_none(), "one popup at a time");
-        assert!(wm.layout_ui.dialog.is_some(), "Save's name dialog is the one shown");
+        assert!(
+            wm.layout_ui.dialog.is_some(),
+            "Save's name dialog is the one shown"
+        );
         let _tx = open_and_run(&mut wm, "one stack");
         wm.run_layout_action(PickerAction::SaveAs, &ctx);
         assert!(wm.layout_ui.create.is_none());
@@ -1561,7 +1687,10 @@ mod tests {
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
         };
-        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
+        assert_eq!(
+            wm.check_candidate(&def, &[], rev),
+            Err(LayoutApplyError::Stale)
+        );
     }
 
     /// The three live stubs stacked on the left, a new Board and a new Chat
@@ -1603,10 +1732,18 @@ mod tests {
         let added: Vec<ItemKind> = cand.added.iter().map(|x| x.kind).collect();
         assert_eq!(added, vec![ItemKind::Board, ItemKind::Chat]);
         let labels: Vec<String> = cand.added.iter().map(|x| label_of(cand, x.id)).collect();
-        assert_eq!(labels, vec!["New board", "New chat"], "the preview names them");
+        assert_eq!(
+            labels,
+            vec!["New board", "New chat"],
+            "the preview names them"
+        );
         assert_eq!(identities(&wm), ids, "a reply opens nothing");
         act(&mut wm, CreateAction::Apply);
-        assert_eq!(identities(&wm), ids, "nor does the click: the Apply is deferred");
+        assert_eq!(
+            identities(&wm),
+            ids,
+            "nor does the click: the Apply is deferred"
+        );
         let ctx = egui::Context::default();
         wm.drain_layout_request(&ctx);
         wm.poll_layout_outcome(0.0);
@@ -1635,7 +1772,14 @@ mod tests {
         tx.send(Ok(reply_with_new(&wm))).unwrap();
         wm.poll_create();
         act(&mut wm, CreateAction::SaveAndApply);
-        wm.layout_ui.create.as_mut().unwrap().naming.as_mut().unwrap().buf = "Rider".into();
+        wm.layout_ui
+            .create
+            .as_mut()
+            .unwrap()
+            .naming
+            .as_mut()
+            .unwrap()
+            .buf = "Rider".into();
         act(&mut wm, CreateAction::SubmitName);
         let saved = f.store().project_layouts(&f.repo).unwrap();
         assert_eq!(saved.len(), 1);
@@ -1695,7 +1839,10 @@ mod tests {
         };
         assert_eq!(wm.check_candidate(&def, &[fresh], rev), Ok(()));
         // The same slot not declared new: refused.
-        assert_eq!(wm.check_candidate(&def, &[], rev), Err(LayoutApplyError::Stale));
+        assert_eq!(
+            wm.check_candidate(&def, &[], rev),
+            Err(LayoutApplyError::Stale)
+        );
         // A declared window that no slot opens: refused.
         assert_eq!(
             wm.check_candidate(&def, &[fresh, fresh + 1], rev),
@@ -1707,7 +1854,10 @@ mod tests {
         let closed = c + 50;
         gone.items.push(ItemRef::new(closed, ItemKind::Terminal));
         gone.arrangement.windows[0].tabs.push(closed);
-        assert_eq!(wm.check_candidate(&gone, &[fresh], rev), Err(LayoutApplyError::Stale));
+        assert_eq!(
+            wm.check_candidate(&gone, &[fresh], rev),
+            Err(LayoutApplyError::Stale)
+        );
     }
 
     #[test]
