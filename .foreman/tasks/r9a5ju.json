@@ -5,8 +5,8 @@
   "body": "Integrate reconciliations with the active Project Window manager through deferred mutations: move existing Content, open fresh items for to-open slots, set unused windows aside in Additional windows, never close anything. Implement one-level structural Revert and the event-driven Modified flag.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md (sections: Applying saved layouts, Filling missing slots, Unused windows, Apply invariants, Revert, Modified paragraph under Save behavior)\nBlocked by: cizr5k - Persist project-owned saved layout libraries\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Apply preserves Session instances/processes, grids/scrollback, Member ids, viewer targets/view state, and title/agent-state ownership. Nothing is ever closed.\n- Fresh items open through the Project's existing spawn/open paths before the rearrangement step: default shell in the Project directory, no startup command, no agent. A failed open omits its slot and is reported; it does not abort. Confirm and document the openable kind list.\n- Modified is an event flag: structural actions set it, Save/Apply clear it, Revert restores it. Never derived by comparing live state to the definition; resize and an Apply at a different size leave it clear.\n- Focus, child zoom, minimized restore, floating bounds, and workspace dirtiness follow the spec. Other Projects and desktop geometry untouched; invalid/stale transitions leave the arrangement intact.\n- Revert restores geometry/selection without rewinding Content; Apply-opened items stay open and go to Additional windows; structural edits invalidate it. Never use cold restore for live Apply.\n- Prove preservation and A->B->A convergence through manager tests and supported Inspection. Update docs/project-layouts.md.\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
   "state": "done",
   "shipped": {
-    "name": "v0.8.0",
-    "at": "2026-10-20T21:38:59Z",
+    "name": "v0.8.1",
+    "at": "2026-10-20T22:23:45Z",
     "commits": [
       "88b914e"
     ]
@@ -16,5 +16,5 @@
     "wave": 4
   },
   "created": "2026-10-16T14:15:54Z",
-  "updated": "2026-10-20T21:38:59Z"
+  "updated": "2026-10-20T22:23:45Z"
 }

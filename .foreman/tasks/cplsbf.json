@@ -5,13 +5,13 @@
   "body": "Build the Project-header Layout picker and visible Save button over the model/store/apply seams. Selecting a layout applies immediately; a non-exact Apply shows a short dismissible summary instead of a reconciliation preview.\nSpec: docs/superpowers/specs/2026-10-16-project-layouts-design.md (sections: Picker and Save, Applying saved layouts, Revert)\nBlocked by: r9a5ju - Apply and revert layouts without replacing Content\nDispatch prerequisite: the spec must be committed and available in the worker checkout. This plan only creates Backlog cards; do not start later waves early.\nDone when:\n- Project-only entries/diagrams, Custom/Modified, Save/Save As, rename/delete, replacement and errors follow the spec.\n- Every selection applies immediately. The summary lists substituted/opened/additional/unfilled items from the same validated reconciliation Apply used; Revert stays one click away.\n- Revert, no-active-project state, compact/zoomed Project access, and preservation on canceled dialogs work as specified.\n- Test assertable UI bindings first. Capture and inspect screenshots covering picker, names, the post-Apply summary, errors, Modified, compact/zoomed cases and mixed applied Content.\n- LayoutStore (src/layout_library.rs) re-reads project-layouts.json on every call by design. Read it when the menu opens and after each write, and keep that copy; never call it per frame.\n- Queue layout requests only against the Project being shown; a request queued on a hidden Project runs whenever it is next drawn (src/wm/layouts.rs).\n- Add one show()-level test: queue an Apply, run a frame, assert the outcome and Modified; then close a window and assert RevertStatus::Invalidated. The show() drain and end-of-frame watch_layout_edits hooks are untested today.\n- Add/update the feature doc. No Use for new Projects action (wave 6) and no inert Create action (wave 7).\nGate: Follow AGENTS.md and the build/validation/change-control references. Run cargo check --target-dir target/agent and cargo test --target-dir target/agent, plus focused behavior tests. GUI claims require inspected screenshots; process preservation requires manager/Inspection evidence.",
   "state": "done",
   "shipped": {
-    "name": "v0.8.0",
-    "at": "2026-10-20T21:38:59Z"
+    "name": "v0.8.1",
+    "at": "2026-10-20T22:23:45Z"
   },
   "planned": {
     "name": "project-layouts",
     "wave": 5
   },
   "created": "2026-10-16T14:15:55Z",
-  "updated": "2026-10-20T21:38:59Z"
+  "updated": "2026-10-20T22:23:45Z"
 }
