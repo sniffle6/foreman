@@ -24,7 +24,9 @@ event to a state on the matching Session.
 
 The **done marker** is set when a turn ends and clears when the Session gets
 keyboard focus, in the same place the Bell clears. Needs you outranks the Bell
-in the row's right-edge slot; the other states rank below it.
+in the row's right-edge slot; the other states rank below it. A tab stack's
+"+N" chip paints the same badge on its list rows and turns the needs-you
+colour while a tab it hides needs you (`docs/window-chrome.md`).
 
 An event applies to the Session whose Foreman project ID and terminal ID match
 (terminal IDs repeat across projects). An event whose provider does not match

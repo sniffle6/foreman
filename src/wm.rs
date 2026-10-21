@@ -332,6 +332,15 @@ impl Content {
         matches!(self, Content::Terminal(s) if s.bell_active())
     }
 
+    /// The agent-state badge the Sessions panel shows for this tab, before
+    /// the `agent_state_badges` setting gates it.
+    fn agent_badge(&self) -> Option<crate::agent_state::AgentBadge> {
+        match self {
+            Content::Terminal(s) => s.agent_state().badge(s.icon_kind(), s.has_exited()),
+            _ => None,
+        }
+    }
+
     /// Layout-item kind for project layouts; `None` for desktop chrome that
     /// never takes part in an arrangement.
     fn layout_kind(&self) -> Option<crate::project_layout::ItemKind> {
@@ -525,6 +534,10 @@ enum Act {
     OpenProjectPicker,
     /// Switch window `WinId` to tab index `usize` (tab-bar click).
     SetTab(WinId, usize),
+    /// Open or close window `WinId`'s tab-overflow list (the "+N" chip),
+    /// focusing the window like any header click: the list holds the keys,
+    /// so no terminal off the focus path may keep reading them.
+    ToggleTabOverflow(WinId),
     /// Close tab index `usize` of window `WinId` (tab-bar close affordance).
     CloseTab(WinId, usize),
     /// Detach tab `idx` of window `id` into a new floating window at `pos` (local).
@@ -870,6 +883,10 @@ pub struct WindowManager {
     /// summary, and the cached library copy (see `wm/layout_picker.rs`).
     /// Runtime-only.
     layout_ui: layout_picker::PickerUi,
+    /// The window whose tab-overflow list (the header's "+N") is open; at
+    /// most one per manager. While set no terminal here reads keys, so it
+    /// closes on any frame its window draws no "+N". Runtime-only.
+    tab_overflow: Option<WinId>,
     /// The window whose in-flight header drag started tiled/zoomed (tear-out).
     /// Such a drag keeps the tree drop hints without a modifier; a drag that
     /// started floating is a free move unless Shift is held.
@@ -949,6 +966,7 @@ impl WindowManager {
             layout: Default::default(),
             layout_rt: Default::default(),
             layout_ui: Default::default(),
+            tab_overflow: None,
             drag_from_tree: None,
             pending_settles: Vec::new(),
             pending_card_dispatches: Vec::new(),
@@ -4265,12 +4283,7 @@ impl WindowManager {
                                 _ => false,
                             },
                             bell: t.content.bell_active(),
-                            agent: match &t.content {
-                                Content::Terminal(s) => {
-                                    s.agent_state().badge(s.icon_kind(), s.has_exited())
-                                }
-                                _ => None,
-                            },
+                            agent: t.content.agent_badge(),
                             rank: t.panel_order,
                             uid: t.tab_uid,
                         });
@@ -5954,6 +5967,28 @@ impl WindowManager {
             })
     }
 
+    /// A tab-overflow list is open here or in any nested Project.
+    fn any_tab_overflow(&self) -> bool {
+        self.tab_overflow.is_some()
+            || self.windows.iter().any(|w| {
+                w.tabs
+                    .iter()
+                    .any(|t| matches!(&t.content, Content::Project(wm) if wm.any_tab_overflow()))
+            })
+    }
+
+    /// Close the tab-overflow list here and in every nested Project.
+    fn close_tab_overflows(&mut self) {
+        self.tab_overflow = None;
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Project(inner) = &mut t.content {
+                    inner.close_tab_overflows();
+                }
+            }
+        }
+    }
+
     /// Close the active tab of `id`, or open the confirm modal if it has running
     /// subprocesses. No-op if any overlay is already up.
     fn request_close_active_tab(&mut self, id: WinId) {
@@ -6972,6 +7007,9 @@ impl WindowManager {
                     && let Content::Project(inner) = &mut t.content
                 {
                     inner.close_layout_popups();
+                    // Nor can its tab-overflow lists, which would keep the
+                    // leader dormant.
+                    inner.close_tab_overflows();
                 }
             }
         }
@@ -7009,10 +7047,15 @@ impl WindowManager {
         // the overlay, and (below) stops a hover under the overlay from
         // stealing focus either.
         let no_modal = live && self.picker.is_none() && self.renaming.is_none();
+        // An open tab-overflow list owns Escape and the pointer: no terminal
+        // here reads keys, but window chrome keeps its focus look (unlike
+        // the overlays above, which dim it).
+        let keys_live = no_modal && self.tab_overflow.is_none();
+        let mut ovf_drawn = false;
         // Focus-follows-mouse fires only on genuine pointer movement (not a
         // still cursor under a pane that just re-laid-out) and never while a
         // button is held (title drag, text selection, divider resize).
-        let follow_mouse = no_modal
+        let follow_mouse = keys_live
             && crate::config::live(ui.ctx()).focus_follows_mouse
             && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO && !i.pointer.any_down());
 
@@ -7072,7 +7115,7 @@ impl WindowManager {
                 let child_interacted = self.windows[i].active_content().show(
                     ui,
                     scr,
-                    is_focus,
+                    is_focus && keys_live,
                     base,
                     id,
                     &cresp,
@@ -7280,7 +7323,7 @@ impl WindowManager {
             let child_interacted = self.windows[i].active_content().show(
                 ui,
                 content_paint,
-                is_focus,
+                is_focus && keys_live,
                 base,
                 id,
                 &cresp,
@@ -7316,7 +7359,10 @@ impl WindowManager {
                             has_icon: t.content.icon_kind().is_some(),
                         })
                         .collect();
-                    HeaderSpec::Tabs(&tab_measures)
+                    HeaderSpec::Tabs {
+                        tabs: &tab_measures,
+                        active: self.windows[i].active,
+                    }
                 } else {
                     HeaderSpec::Title {
                         title_w: ui
@@ -7559,6 +7605,79 @@ impl WindowManager {
                                         grab: false,
                                     });
                                 } else {
+                                    acts.push(Act::SetTab(id, ti));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ovf) = &hl.overflow {
+                        // "+N" stands in for the chipless tabs and carries
+                        // their attention cues, so a hidden worker waiting
+                        // on you shows without the Sessions panel.
+                        let hidden = &ovf.hidden;
+                        let tabs = &self.windows[i].tabs;
+                        let ringing =
+                            bell_gate && hidden.iter().any(|&ti| tabs[ti].content.bell_active());
+                        let needs_you = crate::config::live(ui.ctx()).agent_state_badges
+                            && hidden.iter().any(|&ti| {
+                                tabs[ti].content.agent_badge().is_some_and(|b| {
+                                    b.state == crate::agent_state::AgentState::NeedsYou
+                                })
+                            });
+                        let oresp =
+                            ui.interact(ovf.rect, base.with((id, "tabovf")), egui::Sense::click());
+                        let open = self.tab_overflow == Some(id);
+                        let lit = open || oresp.hovered();
+                        let radius = egui::CornerRadius {
+                            nw: 6,
+                            ne: 6,
+                            sw: 0,
+                            se: 0,
+                        };
+                        p.rect_filled(
+                            ovf.rect,
+                            radius,
+                            if lit { th.tab_bg_hover } else { th.tab_bg },
+                        );
+                        if ringing {
+                            p.rect_stroke(
+                                ovf.rect,
+                                radius,
+                                egui::Stroke::new(BORDER_W, bell_col),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        p.text(
+                            ovf.rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("+{}", hidden.len()),
+                            tab_font.clone(),
+                            if needs_you {
+                                th.bell
+                            } else if lit {
+                                th.text
+                            } else {
+                                th.dim
+                            },
+                        );
+                        if oresp.clicked() {
+                            acts.push(Act::ToggleTabOverflow(id));
+                        }
+                        if self.tab_overflow == Some(id) {
+                            ovf_drawn = true;
+                            match show_tab_overflow(
+                                ui,
+                                base.with((id, "tabovf-menu")),
+                                &self.windows[i].tabs,
+                                hidden,
+                                ovf.rect,
+                                area,
+                            ) {
+                                OvfOutcome::Open => {}
+                                OvfOutcome::Close => self.tab_overflow = None,
+                                OvfOutcome::Pick(ti) => {
+                                    self.tab_overflow = None;
+                                    // The same act as a chip click.
                                     acts.push(Act::SetTab(id, ti));
                                 }
                             }
@@ -8131,6 +8250,9 @@ impl WindowManager {
             }
         }
 
+        if !ovf_drawn {
+            self.tab_overflow = None;
+        }
         self.paint_drag_overlays(ui, area, snap_overlay);
         // Chip taskbar removed — minimized windows restore via the panel.
 
@@ -8246,6 +8368,7 @@ impl WindowManager {
             || self.renaming.is_some()
             || self.pending_close.is_some()
             || self.layout_ui.captures_keyboard()
+            || self.tab_overflow.is_some()
         {
             return false;
         }
@@ -8293,6 +8416,8 @@ impl WindowManager {
             // A layout menu or dialog owns the keys (the Delete dialog has
             // no text field, so egui focus alone does not say so).
             && !self.any_layout_capture()
+            // So does a tab-overflow list (Escape closes it).
+            && !self.any_tab_overflow()
             // Any focused text field (chat input, rename) owns the keyboard — leader stays dormant.
             && ui.ctx().memory(|m| m.focused().is_none())
         {
@@ -8380,6 +8505,10 @@ impl WindowManager {
                             w.active = idx;
                         }
                     }
+                    self.focus(id);
+                }
+                Act::ToggleTabOverflow(id) => {
+                    self.tab_overflow = (self.tab_overflow != Some(id)).then_some(id);
                     self.focus(id);
                 }
                 Act::CloseTab(id, idx) => self.request_close_tab(id, idx),
@@ -8697,8 +8826,15 @@ struct TabMeasure {
 /// branch one to one; the layout variant always matches the spec variant.
 enum HeaderSpec<'a> {
     Rename,
-    Tabs(&'a [TabMeasure]),
-    Title { title_w: f32, has_icon: bool },
+    Tabs {
+        tabs: &'a [TabMeasure],
+        /// Always gets a chip, sliding the visible run when it must.
+        active: usize,
+    },
+    Title {
+        title_w: f32,
+        has_icon: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -8752,6 +8888,22 @@ enum HeaderContentLayout {
     },
 }
 
+/// The "+N" chip that stands in for the tabs without one; `scr`'s space.
+struct TabOverflowLayout {
+    rect: egui::Rect,
+    /// Tab indices with no chip, in tab order; N is its length.
+    hidden: Vec<usize>,
+}
+
+/// Width of the "+N" chip. Fixed, so its room is reserved before packing
+/// without knowing N (no fonts in here); fits "+99" at the chip font.
+const TAB_OVF_W: f32 = 30.0;
+/// After the "+N" on a project, the `+`: a 4pt gap, the 16pt button, and
+/// the 2pt its clamp keeps from the fence.
+const TAB_OVF_PLUS_W: f32 = 22.0;
+/// Row height in the tab-overflow list.
+const TAB_OVF_ROW_H: f32 = 22.0;
+
 struct HeaderLayout {
     /// The fence: left content (chips past the first, the `+`) never
     /// crosses `avail_end = scr.max.x - header_ctl_w(kind)`. Read by the
@@ -8763,6 +8915,10 @@ struct HeaderLayout {
     /// The project `+`, pre-clamped against the fence. `Some` iff project
     /// and not renaming.
     plus: Option<egui::Rect>,
+    /// `Some` iff a tab stack has more tabs than chips. Its width is taken
+    /// from the fence before packing, so it never crosses it (nor, on a
+    /// project, meets the `+` after it).
+    overflow: Option<TabOverflowLayout>,
     /// Right-to-left: [Close, Ovf] (project) / [Close, Max, Min, Float]
     /// (terminal); 22pt buttons at 25pt pitch, rightmost ends at
     /// scr.max.x - 4.
@@ -8794,6 +8950,7 @@ fn header_layout(
     let ctl_w = header_ctl_w(is_project, is_panel, scr.width());
     let avail_end = scr.max.x - ctl_w;
 
+    let mut overflow = None;
     // (content, unclamped x where the `+` would anchor; None while renaming)
     let (mut content, plus_x) = match spec {
         HeaderSpec::Rename => {
@@ -8804,28 +8961,33 @@ fn header_layout(
             );
             (HeaderContentLayout::Rename { field }, None)
         }
-        HeaderSpec::Tabs(tabs) => {
+        HeaderSpec::Tabs { tabs, active } => {
             let chip_h = TITLE_H - 4.0;
             let cy = scr.min.y + 4.0;
-            let mut cx = scr.min.x + 6.0;
+            let x0 = scr.min.x + 6.0;
+            let mut cx = x0;
             let icon_disp = 14.0;
             let icon_gap = 6.0;
             let left_pad = 8.0;
             let close_w = 16.0;
-            let mut chips = Vec::new();
-            for (idx, t) in tabs.iter().enumerate() {
-                let tw = t.label_w.min(120.0);
-                let icon_w = if t.has_icon {
+            let icon_w = |t: &TabMeasure| {
+                if t.has_icon {
                     icon_disp + icon_gap
                 } else {
                     0.0
-                };
-                let chip_w = left_pad + icon_w + tw + 6.0 + close_w;
-                if cx + chip_w > avail_end && idx > 0 {
-                    // Out of room: stop packing (many tabs on a narrow
-                    // window); cycling still reaches the hidden tabs.
-                    break;
                 }
+            };
+            let widths: Vec<f32> = tabs
+                .iter()
+                .map(|t| left_pad + icon_w(t) + t.label_w.min(120.0) + 6.0 + close_w)
+                .collect();
+            let reserve = 4.0 + TAB_OVF_W + if is_project { TAB_OVF_PLUS_W } else { 0.0 };
+            let run = visible_tabs(&widths, active, x0, avail_end, reserve);
+            let mut chips = Vec::new();
+            for idx in run.clone() {
+                let t = &tabs[idx];
+                let icon_w = icon_w(t);
+                let chip_w = widths[idx];
                 let rect =
                     egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(chip_w, chip_h));
                 let icon = t.has_icon.then(|| {
@@ -8851,6 +9013,22 @@ fn header_layout(
                     close,
                 });
                 cx += chip_w + 4.0;
+            }
+            if run.len() < tabs.len() {
+                // Right after the last chip; held inside its reserve even
+                // when a lone chip on a narrow window overruns the fence,
+                // where it then covers that chip's label (its ✕ stays clear).
+                // Accepted: crossing into the controls would be worse.
+                let ovf_end = avail_end - if is_project { TAB_OVF_PLUS_W } else { 0.0 };
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(cx.min(ovf_end - TAB_OVF_W), cy),
+                    egui::vec2(TAB_OVF_W, chip_h),
+                );
+                cx = rect.max.x + 4.0;
+                overflow = Some(TabOverflowLayout {
+                    rect,
+                    hidden: (0..tabs.len()).filter(|i| !run.contains(i)).collect(),
+                });
             }
             (HeaderContentLayout::Tabs { chips }, Some(cx + 8.0))
         }
@@ -8932,9 +9110,199 @@ fn header_layout(
         avail_end,
         content,
         plus,
+        overflow,
         controls,
         layout,
     }
+}
+
+/// Which tabs get a chip: a contiguous run of `widths` (chip widths packed
+/// from `x0`, 4pt apart, before `fence`). When all fit, all of them: the
+/// layout from before overflow existed. Otherwise the fence first gives up
+/// `reserve` for the "+N", then the run packs from tab 0 if the active tab
+/// fits, else it ends at the active tab and reaches back as far as fits.
+/// The run's first chip is placed fit or not, so `active` is never hidden.
+fn visible_tabs(
+    widths: &[f32],
+    active: usize,
+    x0: f32,
+    fence: f32,
+    reserve: f32,
+) -> std::ops::Range<usize> {
+    let fit_from_0 = |fence: f32| {
+        let mut cx = x0;
+        let mut k = 0;
+        for (idx, w) in widths.iter().enumerate() {
+            if cx + w > fence && idx > 0 {
+                break;
+            }
+            cx += w + 4.0;
+            k += 1;
+        }
+        k
+    };
+    let n = widths.len();
+    if fit_from_0(fence) == n {
+        return 0..n;
+    }
+    let fence = fence - reserve;
+    let k = fit_from_0(fence);
+    let active = active.min(n - 1);
+    if active < k {
+        return 0..k;
+    }
+    let mut start = active;
+    let mut used = widths[active];
+    while start > 0 && x0 + used + 4.0 + widths[start - 1] <= fence {
+        start -= 1;
+        used += 4.0 + widths[start];
+    }
+    start..active + 1
+}
+
+/// The tab-overflow list for `rows` rows of width `w`: right edge on the
+/// "+N" so it opens over its own window, below it unless that runs past
+/// `area`'s bottom, and inside `area` on the left and top.
+fn tab_overflow_panel(anchor: egui::Rect, area: egui::Rect, w: f32, rows: usize) -> egui::Rect {
+    let h = rows as f32 * TAB_OVF_ROW_H + 8.0;
+    let below = anchor.bottom() + 2.0;
+    let y = if below + h > area.max.y {
+        (anchor.top() - 2.0 - h).max(area.min.y)
+    } else {
+        below
+    };
+    let x = (anchor.right() - w).max(area.min.x);
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+}
+
+fn tab_overflow_row(panel: egui::Rect, row: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(panel.min.x, panel.min.y + 4.0 + row as f32 * TAB_OVF_ROW_H),
+        egui::vec2(panel.width(), TAB_OVF_ROW_H),
+    )
+}
+
+enum OvfOutcome {
+    Open,
+    Close,
+    /// A row was clicked: its tab index.
+    Pick(usize),
+}
+
+/// The "+N" list: a row per hidden tab with its icon, title, and the
+/// Sessions panel's attention badge. Escape, or a press outside the list
+/// and its anchor, closes it.
+fn show_tab_overflow(
+    ui: &egui::Ui,
+    menu_id: egui::Id,
+    tabs: &[Tab],
+    hidden: &[usize],
+    anchor: egui::Rect,
+    area: egui::Rect,
+) -> OvfOutcome {
+    let th = crate::theme::live(ui.ctx());
+    let font = egui::FontId::proportional(12.0);
+    let bell_gate = crate::terminal::bell_enabled(ui.ctx());
+    let state_gate = crate::config::live(ui.ctx()).agent_state_badges;
+    let cue = |t: &Tab| {
+        (
+            state_gate.then(|| t.content.agent_badge()).flatten(),
+            bell_gate && t.content.bell_active(),
+        )
+    };
+    // Text starts past a 10pt pad, the 14pt icon and a 6pt gap.
+    let text_dx = 30.0;
+    let w = hidden
+        .iter()
+        .map(|&ti| {
+            let (agent, bell) = cue(&tabs[ti]);
+            let title_w = ui
+                .painter()
+                .layout_no_wrap(tabs[ti].title.clone(), font.clone(), th.text)
+                .size()
+                .x;
+            text_dx + title_w + 12.0 + crate::panel::attention_badge_w(agent, bell)
+        })
+        .fold(0.0f32, f32::max)
+        .clamp(180.0, 320.0);
+    let panel = tab_overflow_panel(anchor, area, w, hidden.len());
+    let mut outcome = OvfOutcome::Open;
+    egui::Area::new(menu_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel.min)
+        .constrain(false)
+        .default_size(panel.size())
+        .movable(false)
+        .show(ui.ctx(), |mui| {
+            // The rows only interact, so give the Area its full bounds or a
+            // press in the padding falls through to the window below.
+            mui.allocate_rect(panel, egui::Sense::hover());
+            let mp = mui.painter();
+            mp.rect_filled(panel, egui::CornerRadius::same(4), th.bg);
+            mp.rect_stroke(
+                panel,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, th.border),
+                egui::StrokeKind::Inside,
+            );
+            for (r, &ti) in hidden.iter().enumerate() {
+                let tab = &tabs[ti];
+                let row = tab_overflow_row(panel, r);
+                let resp = mui.interact(row, menu_id.with(("row", ti)), egui::Sense::click());
+                if resp.hovered() {
+                    mp.rect_filled(row, 0.0, th.sel_bg);
+                }
+                if let Some(kind) = tab.content.icon_kind() {
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(row.min.x + 17.0, row.center().y),
+                        egui::vec2(14.0, 14.0),
+                    );
+                    let px = (icon_rect.width() * mui.ctx().pixels_per_point())
+                        .round()
+                        .max(1.0) as u32;
+                    let tex = crate::icons::texture(mui.ctx(), kind, px);
+                    mp.image(
+                        tex.id(),
+                        icon_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        kind.tint(),
+                    );
+                }
+                let (agent, bell) = cue(tab);
+                let text_x = row.min.x + text_dx;
+                let avail =
+                    (row.max.x - 8.0 - crate::panel::attention_badge_w(agent, bell) - text_x)
+                        .max(0.0);
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    tab.title.clone(),
+                    font.clone(),
+                    th.text,
+                );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(avail);
+                let galley = mp.layout_job(job);
+                let text_pos = egui::pos2(text_x, row.center().y - galley.size().y / 2.0);
+                mp.galley(text_pos, galley, th.text);
+                crate::panel::paint_attention_badge(mui, mp, row, agent, bell);
+                if resp.clicked() {
+                    outcome = OvfOutcome::Pick(ti);
+                }
+            }
+        });
+    if matches!(outcome, OvfOutcome::Open) {
+        let esc = ui
+            .ctx()
+            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let outside = ui.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !panel.contains(p) && !anchor.contains(p))
+        });
+        if esc || outside {
+            outcome = OvfOutcome::Close;
+        }
+    }
+    outcome
 }
 
 /// Paint only within the text slot; icons and controls retain their own regions.
@@ -11933,7 +12301,10 @@ mod tests {
             wm.windows[0].rect.translate(area.min.to_vec2()),
             true,
             false,
-            HeaderSpec::Tabs(&measures),
+            HeaderSpec::Tabs {
+                tabs: &measures,
+                active: 0,
+            },
         );
         let HeaderContentLayout::Tabs { chips } = hl.content else {
             panic!()
@@ -11983,7 +12354,15 @@ mod tests {
                 let scr =
                     egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(600.0, 300.0));
                 for is_project in [false, true] {
-                    let hl = header_layout(scr, is_project, false, HeaderSpec::Tabs(&tabs));
+                    let hl = header_layout(
+                        scr,
+                        is_project,
+                        false,
+                        HeaderSpec::Tabs {
+                            tabs: &tabs,
+                            active: 0,
+                        },
+                    );
                     let HeaderContentLayout::Tabs { chips } = hl.content else {
                         panic!("expected tab chips");
                     };
@@ -12095,7 +12474,15 @@ mod tests {
                 };
                 6
             ];
-            let hl = header_layout(scr, true, false, HeaderSpec::Tabs(&tabs));
+            let hl = header_layout(
+                scr,
+                true,
+                false,
+                HeaderSpec::Tabs {
+                    tabs: &tabs,
+                    active: 0,
+                },
+            );
             let HeaderContentLayout::Tabs { chips } = &hl.content else {
                 panic!("layout variant must mirror spec variant");
             };
@@ -12113,6 +12500,454 @@ mod tests {
                 assert!(!plus.intersects(*r), "+ overlaps {} (w={w})", role.id_str());
             }
         }
+    }
+
+    /// A tab stack's header split into its chips and the rest.
+    fn tab_header(
+        scr: egui::Rect,
+        is_project: bool,
+        tabs: &[TabMeasure],
+        active: usize,
+    ) -> (Vec<ChipLayout>, HeaderLayout) {
+        let mut hl = header_layout(scr, is_project, false, HeaderSpec::Tabs { tabs, active });
+        let content = std::mem::replace(
+            &mut hl.content,
+            HeaderContentLayout::Tabs { chips: Vec::new() },
+        );
+        let HeaderContentLayout::Tabs { chips } = content else {
+            panic!("layout variant must mirror spec variant");
+        };
+        (chips, hl)
+    }
+
+    fn chip_idxs(chips: &[ChipLayout]) -> Vec<usize> {
+        chips.iter().map(|c| c.idx).collect()
+    }
+
+    // 100pt chips: 8 pad + 20 icon + 50 label + 6 + 16 close.
+    const TAB_100: TabMeasure = TabMeasure {
+        label_w: 50.0,
+        has_icon: true,
+    };
+
+    #[test]
+    fn tabs_that_fit_keep_todays_rects_whatever_is_active() {
+        let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(600.0, 300.0));
+        let tabs = [TAB_100; 3];
+        for is_project in [false, true] {
+            for active in 0..3 {
+                let (chips, hl) = tab_header(scr, is_project, &tabs, active);
+                assert!(hl.overflow.is_none());
+                assert_eq!(chip_idxs(&chips), [0, 1, 2]);
+                for (c, x) in chips.iter().zip([86.0, 190.0, 294.0]) {
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(x, 44.0),
+                        egui::vec2(100.0, TITLE_H - 4.0),
+                    );
+                    assert_eq!(c.rect, rect);
+                    assert_eq!(c.icon.unwrap().center().x, x + 15.0);
+                    assert_eq!(c.label_rect.min.x, x + 28.0);
+                    assert_eq!(c.label_rect.max.x, x + 84.0);
+                    assert_eq!(c.close.min.x, x + 84.0);
+                    assert_eq!(c.close.max.x, x + 100.0);
+                }
+                assert_eq!(
+                    hl.plus.map(|p| p.center().x),
+                    is_project.then_some(406.0),
+                    "the + still anchors 8pt past the last chip's gap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_packs_from_tab_zero_while_the_active_tab_fits() {
+        // Fence 417: three 100pt chips fit, so six overflow; reserving the
+        // "+N" (34) leaves room for two.
+        let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(450.0, 300.0));
+        let tabs = [TAB_100; 6];
+        for active in [0, 1] {
+            let (chips, hl) = tab_header(scr, false, &tabs, active);
+            assert_eq!(chip_idxs(&chips), [0, 1]);
+            assert_eq!(chips[0].rect.min.x, 86.0);
+            assert_eq!(chips[1].rect.min.x, 190.0);
+            let ovf = hl.overflow.expect("six tabs cannot fit");
+            assert_eq!(ovf.hidden, [2, 3, 4, 5]);
+            assert_eq!(
+                ovf.rect,
+                egui::Rect::from_min_size(
+                    egui::pos2(294.0, 44.0),
+                    egui::vec2(TAB_OVF_W, TITLE_H - 4.0)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_slides_to_end_at_an_active_tab_past_the_fit() {
+        let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(450.0, 300.0));
+        let tabs = [TAB_100; 6];
+        for (active, shown, hidden) in [
+            (2, vec![1, 2], vec![0, 3, 4, 5]),
+            (4, vec![3, 4], vec![0, 1, 2, 5]),
+            (5, vec![4, 5], vec![0, 1, 2, 3]),
+        ] {
+            let (chips, hl) = tab_header(scr, false, &tabs, active);
+            assert_eq!(chip_idxs(&chips), shown, "active {active}");
+            assert_eq!(
+                chips.last().unwrap().idx,
+                active,
+                "the active chip is the last one"
+            );
+            assert_eq!(
+                chips[0].rect.min.x, 86.0,
+                "the run still starts at the left edge"
+            );
+            let ovf = hl.overflow.expect("six tabs cannot fit");
+            assert_eq!(ovf.hidden, hidden, "active {active}");
+            assert_eq!(ovf.rect.min.x, 294.0);
+        }
+    }
+
+    #[test]
+    fn a_very_narrow_stack_shows_only_its_active_chip() {
+        let tabs = [TAB_100; 6];
+        for width in [0.0, 1.0, 30.0, 60.0, 120.0] {
+            let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(width, 300.0));
+            for is_project in [false, true] {
+                for active in 0..6 {
+                    let (chips, hl) = tab_header(scr, is_project, &tabs, active);
+                    assert_eq!(chip_idxs(&chips), [active], "w={width} active={active}");
+                    let ovf = hl.overflow.expect("one chip shown, five hidden");
+                    assert_eq!(ovf.hidden.len(), 5);
+                    assert!(!ovf.hidden.contains(&active));
+                    assert!(ovf.rect.max.x <= hl.avail_end, "w={width}");
+                    for r in [chips[0].rect, chips[0].label_rect, chips[0].close, ovf.rect] {
+                        assert!(r.min.is_finite() && r.max.is_finite(), "w={width}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_chip_never_meets_the_control_zone() {
+        let mut w = 0.0f32;
+        while w <= 1600.0 {
+            let scr = egui::Rect::from_min_size(egui::pos2(80.0, 40.0), egui::vec2(w, 300.0));
+            for n in 2..=9 {
+                for label_w in [0.0, 30.0, 90.0, 300.0] {
+                    for has_icon in [false, true] {
+                        let tabs = vec![TabMeasure { label_w, has_icon }; n];
+                        for is_project in [false, true] {
+                            let (first, _) = tab_header(scr, is_project, &tabs, 0);
+                            for active in 0..n {
+                                let at = format!("w={w} n={n} label={label_w} active={active}");
+                                let (chips, hl) = tab_header(scr, is_project, &tabs, active);
+                                let idxs = chip_idxs(&chips);
+                                assert!(idxs.contains(&active), "{at}");
+                                assert!(idxs.windows(2).all(|p| p[1] == p[0] + 1), "{at}");
+                                let Some(ovf) = &hl.overflow else {
+                                    assert_eq!(idxs.len(), n, "{at}");
+                                    assert_eq!(idxs, chip_idxs(&first), "{at}");
+                                    continue;
+                                };
+                                assert_eq!(idxs.len() + ovf.hidden.len(), n, "{at}");
+                                assert!(ovf.hidden.iter().all(|i| !idxs.contains(i)), "{at}");
+                                assert!(ovf.rect.max.x <= hl.avail_end, "{at}");
+                                for (role, r) in &hl.controls {
+                                    assert!(!ovf.rect.intersects(*r), "{at}: {}", role.id_str());
+                                }
+                                if let Some(l) = hl.layout {
+                                    assert!(!ovf.rect.intersects(l.picker), "{at}");
+                                    assert!(!ovf.rect.intersects(l.save), "{at}");
+                                }
+                                if let Some(plus) = hl.plus {
+                                    assert!(plus.min.x > ovf.rect.max.x, "{at}: + meets +N");
+                                }
+                                if chips.len() > 1 {
+                                    let last = chips.last().unwrap().rect;
+                                    assert!(last.max.x < ovf.rect.min.x, "{at}: chip meets +N");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            w += 37.0;
+        }
+    }
+
+    /// Six project tabs whose titles all pass the 120pt chip cap, in a
+    /// half-width floating window, active past the fit, and another
+    /// window focused. Returns (manager, stack, other, area).
+    fn overflow_desk() -> (WindowManager, WinId, WinId, egui::Rect) {
+        let mut wm = WindowManager::new();
+        let other = push(&mut wm, "other");
+        let title = |k| format!("worker {k} with a title long enough to pass the chip cap");
+        let stack = push(&mut wm, &title(0));
+        let w = wm.windows.iter_mut().find(|w| w.id == stack).unwrap();
+        for k in 1..6 {
+            w.tabs.push(Tab::fixed(title(k), stub_content()));
+        }
+        w.active = 5;
+        w.rect = egui::Rect::from_min_size(egui::pos2(450.0, 0.0), egui::vec2(450.0, 400.0));
+        wm.focus(other);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0));
+        (wm, stack, other, area)
+    }
+
+    fn overflow_of(wm: &WindowManager, stack: WinId, area: egui::Rect) -> TabOverflowLayout {
+        let w = wm.windows.iter().find(|w| w.id == stack).unwrap();
+        let measures = vec![
+            TabMeasure {
+                label_w: 300.0,
+                has_icon: w.tabs[0].content.icon_kind().is_some(),
+            };
+            w.tabs.len()
+        ];
+        let hl = header_layout(
+            w.rect.translate(area.min.to_vec2()),
+            true,
+            false,
+            HeaderSpec::Tabs {
+                tabs: &measures,
+                active: w.active,
+            },
+        );
+        hl.overflow.expect("the stack overflows")
+    }
+
+    fn run_frames(
+        wm: &mut WindowManager,
+        area: egui::Rect,
+        ctx: &egui::Context,
+        frames: Vec<Vec<egui::Event>>,
+    ) {
+        for events in frames {
+            let t = ctx.input(|i| i.time) + 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(area),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                wm.show(ui, area, true, egui::Id::new("tab-ovf-test"), false);
+            });
+        }
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![
+            vec![egui::Event::PointerMoved(pos)],
+            vec![],
+            vec![button(true)],
+            vec![button(false)],
+            vec![],
+        ]
+    }
+
+    #[test]
+    fn picking_a_hidden_tab_from_the_list_acts_like_its_chip() {
+        let ctx = egui::Context::default();
+        let (mut wm, stack, other, area) = overflow_desk();
+        let ovf = overflow_of(&wm, stack, area);
+        assert_eq!(ovf.hidden, [0, 1, 2, 3, 4], "only the active tab fits");
+        run_frames(&mut wm, area, &ctx, vec![vec![]]);
+        run_frames(&mut wm, area, &ctx, click_at(ovf.rect.center()));
+        assert_eq!(wm.tab_overflow, Some(stack), "clicking +N opens the list");
+        assert_eq!(wm.focused, Some(stack), "and focuses its window");
+
+        // Row 2 lists tab 2. Rows end at the +N's right edge whatever the
+        // list's measured width, so x is safe; y does not depend on it.
+        let row = tab_overflow_row(tab_overflow_panel(ovf.rect, area, 200.0, 5), 2);
+        run_frames(
+            &mut wm,
+            area,
+            &ctx,
+            click_at(egui::pos2(ovf.rect.max.x - 10.0, row.center().y)),
+        );
+
+        let (mut chip, ..) = overflow_desk();
+        chip.apply_acts(
+            vec![Act::SetTab(stack, 2)],
+            area.size(),
+            egui::Id::new("chip"),
+            &ctx,
+        );
+        let win = |m: &WindowManager| m.windows.iter().find(|w| w.id == stack).unwrap().active;
+        assert_eq!(win(&wm), 2, "the picked tab is active");
+        assert_eq!(win(&wm), win(&chip));
+        assert_eq!(
+            wm.focused, chip.focused,
+            "focus lands as a chip click leaves it"
+        );
+        assert_eq!(wm.last_focused, chip.last_focused);
+        assert_eq!(wm.tab_overflow, None, "picking closes the list");
+    }
+
+    #[test]
+    fn the_overflow_list_closes_on_escape_outside_press_and_when_undrawn() {
+        let ctx = egui::Context::default();
+        let (mut wm, stack, _, area) = overflow_desk();
+        let ovf = overflow_of(&wm, stack, area);
+        let reopen = |wm: &mut WindowManager| {
+            wm.tab_overflow = Some(stack);
+            run_frames(wm, area, &ctx, vec![vec![]]);
+            assert_eq!(wm.tab_overflow, Some(stack), "an open list stays open");
+        };
+
+        reopen(&mut wm);
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run_frames(&mut wm, area, &ctx, vec![vec![escape]]);
+        assert_eq!(wm.tab_overflow, None, "Escape closes it");
+
+        reopen(&mut wm);
+        run_frames(&mut wm, area, &ctx, click_at(egui::pos2(100.0, 250.0)));
+        assert_eq!(wm.tab_overflow, None, "a press outside closes it");
+
+        reopen(&mut wm);
+        run_frames(&mut wm, area, &ctx, click_at(ovf.rect.center()));
+        assert_eq!(wm.tab_overflow, None, "clicking +N again closes it");
+
+        reopen(&mut wm);
+        wm.windows
+            .iter_mut()
+            .find(|w| w.id == stack)
+            .unwrap()
+            .minimized = true;
+        run_frames(&mut wm, area, &ctx, vec![vec![]]);
+        assert_eq!(
+            wm.tab_overflow, None,
+            "an undrawn list cannot hold the keys"
+        );
+
+        // A list inside a Project tab the desk does not draw closes too,
+        // or the leader would stay dormant with nothing on screen.
+        let mut desk = WindowManager::new();
+        let proj = push(&mut desk, "front");
+        let mut back = WindowManager::new();
+        back.tab_overflow = Some(1);
+        desk.windows[0]
+            .tabs
+            .push(Tab::fixed("back", Content::Project(Box::new(back))));
+        assert!(desk.any_tab_overflow());
+        run_frames(&mut desk, area, &ctx, vec![vec![]]);
+        assert!(!desk.any_tab_overflow(), "the hidden tab's list closed");
+        assert_eq!(desk.focused, Some(proj));
+    }
+
+    #[test]
+    fn clicking_plus_n_in_an_unfocused_project_takes_the_focus_path() {
+        // The list freezes keys only on its own manager, so opening it must
+        // move focus there; else the focused project's terminal keeps
+        // reading keys (Escape included) while the list is up.
+        let ctx = egui::Context::default();
+        let mut desk = WindowManager::new();
+        let a = push(&mut desk, "a");
+        let b = push(&mut desk, "b");
+        let title = |k| format!("worker {k} with a title long enough to pass the chip cap");
+        let bwin = desk.windows.iter_mut().find(|w| w.id == b).unwrap();
+        bwin.rect = egui::Rect::from_min_size(egui::pos2(450.0, 0.0), egui::vec2(450.0, 400.0));
+        let Content::Project(inner) = &mut bwin.tabs[0].content else {
+            panic!("push makes a project");
+        };
+        let stack = push(inner, &title(0));
+        for k in 1..6 {
+            inner.windows[0]
+                .tabs
+                .push(Tab::fixed(title(k), stub_content()));
+        }
+        desk.focus(a);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0));
+        run_frames(&mut desk, area, &ctx, vec![vec![]]);
+        fn inner_of_b(desk: &WindowManager, b: WinId) -> &WindowManager {
+            let w = desk.windows.iter().find(|w| w.id == b).unwrap();
+            let Content::Project(inner) = &w.tabs[0].content else {
+                panic!();
+            };
+            inner
+        }
+        // The inner manager's area starts below b's title band.
+        let inner_area_min = egui::pos2(451.0, TITLE_H);
+        let ovf = overflow_of(
+            inner_of_b(&desk, b),
+            stack,
+            egui::Rect::from_min_size(inner_area_min, egui::vec2(448.0, 360.0)),
+        );
+        run_frames(&mut desk, area, &ctx, click_at(ovf.rect.center()));
+        assert_eq!(inner_of_b(&desk, b).tab_overflow, Some(stack), "+N opened");
+        assert_eq!(
+            desk.focused,
+            Some(b),
+            "the project holding the list is focused"
+        );
+        assert_eq!(inner_of_b(&desk, b).focused, Some(stack));
+    }
+
+    #[test]
+    fn overflow_list_ids_stay_unique_across_nested_projects() {
+        // The desk's window 1 and its Project's window 1 both open a list;
+        // both must exist as separate Areas, not one shared Id.
+        let ctx = egui::Context::default();
+        let mut desk = WindowManager::new();
+        let title = |k| format!("stack {k} with a title long enough to pass the chip cap");
+        let proj = push(&mut desk, &title(0));
+        for k in 1..6 {
+            desk.windows[0]
+                .tabs
+                .push(Tab::fixed(title(k), stub_content()));
+        }
+        let Content::Project(inner) = &mut desk.windows[0].tabs[0].content else {
+            panic!("push makes a project");
+        };
+        let inner_id = push(inner, &title(0));
+        for k in 1..6 {
+            inner.windows[0]
+                .tabs
+                .push(Tab::fixed(title(k), stub_content()));
+        }
+        assert_eq!(proj, inner_id, "both managers number from the same start");
+        inner.tab_overflow = Some(inner_id);
+        desk.tab_overflow = Some(proj);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let base = egui::Id::new("nested-ovf");
+        for _ in 0..2 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(area),
+                    ..Default::default()
+                },
+                |ui| {
+                    desk.show(ui, area, true, base, false);
+                },
+            );
+        }
+        let Content::Project(inner) = &desk.windows[0].tabs[0].content else {
+            panic!();
+        };
+        assert_eq!(desk.tab_overflow, Some(proj));
+        assert_eq!(inner.tab_overflow, Some(inner_id), "both lists drew");
+        let outer = base.with((proj, "tabovf-menu"));
+        let nested = base.with(("proj", proj)).with((inner_id, "tabovf-menu"));
+        let rects = ctx.memory(|m| (m.area_rect(outer), m.area_rect(nested)));
+        let (Some(a), Some(b)) = rects else {
+            panic!("both lists must be live Areas: {rects:?}");
+        };
+        assert_ne!(a, b, "one Id would have collapsed them into one Area");
     }
 
     #[test]

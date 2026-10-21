@@ -107,7 +107,8 @@ worker or the Board focused, a dispatch can land as a back tab on the
 orchestrator's window instead. Why: splitting the
 focus on every dispatch halved the orchestrator each time (1/2, 1/4, 1/8…)
 in plan runs. Hand-opened terminals, layout Apply's fresh slots, and image
-windows still tile.
+windows still tile. A stack with more tabs than its header fits keeps the
+active tab's chip and shows a "+N" for the rest (`docs/window-chrome.md`).
 
 Tabs are unchanged: a tab stack is just a window (`Win.tabs`), so a tree leaf
 with multiple tabs IS a tabbed container sitting in the layout.

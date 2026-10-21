@@ -1753,19 +1753,13 @@ impl PanelView {
         // Title, truncated with … to the space left of the buttons/labels.
         let font = egui::FontId::proportional(if rp.project_row { 12.5 } else { 12.0 });
         let text_x = row.min.x + 20.0;
+        let badge_w = attention_badge_w(rp.agent, rp.bell);
         let reserve = if over && rp.project_row {
             54.0 // add + min + close buttons
         } else if over {
             38.0 // min + close buttons
-        } else if rp
-            .agent
-            .is_some_and(|b| b.state == crate::agent_state::AgentState::NeedsYou)
-        {
-            58.0 // "needs you" label outranks the bell dot
-        } else if rp.bell {
-            20.0 // pulsing bell dot
-        } else if rp.agent.is_some() {
-            50.0 // "working" / "idle" / "done" label
+        } else if badge_w > 0.0 {
+            badge_w
         } else if rp.minimized || rp.background_tab {
             26.0 // "min"/"tab" label
         } else {
@@ -1875,27 +1869,8 @@ impl PanelView {
                     plus_clicked = true;
                 }
             }
-        } else if let Some(badge) = rp
-            .agent
-            .filter(|b| b.state == crate::agent_state::AgentState::NeedsYou)
-        {
-            // Needs you blocks work, so it outranks the Bell.
-            paint_state_label(&p, row, badge, th.bell);
-        } else if rp.bell {
-            // Latched Bell: pulsing amber dot in the right-edge slot — the
-            // attention cue outranks the "min"/"tab" state labels.
-            p.circle_filled(
-                egui::pos2(row.max.x - 12.0, row.center().y),
-                3.5,
-                bell_pulse(
-                    ui.input(|i| i.time),
-                    crate::config::live(ui.ctx()).bell_period as f64,
-                    th.bell,
-                ),
-            );
-        } else if let Some(badge) = rp.agent {
-            let color = if badge.finished { th.text } else { th.dim };
-            paint_state_label(&p, row, badge, color);
+        } else if paint_attention_badge(ui, &p, row, rp.agent, rp.bell) {
+            // The attention cue outranks the "min"/"tab" state labels.
         } else if rp.minimized {
             p.text(
                 egui::pos2(row.max.x - 8.0, row.center().y),
@@ -1973,6 +1948,54 @@ struct RowPaintOwned {
     /// Some = this row is a drag-reorder source (expanded modes). Rail rows
     /// stay None/non-draggable.
     drag_ref: Option<PanelRowRef>,
+}
+
+/// Width [`paint_attention_badge`] needs at a row's right edge; 0 when it
+/// paints nothing.
+pub(crate) fn attention_badge_w(agent: Option<crate::agent_state::AgentBadge>, bell: bool) -> f32 {
+    if agent.is_some_and(|b| b.state == crate::agent_state::AgentState::NeedsYou) {
+        58.0 // "needs you" label outranks the bell dot
+    } else if bell {
+        20.0 // pulsing bell dot
+    } else if agent.is_some() {
+        50.0 // "working" / "idle" / "done" label
+    } else {
+        0.0
+    }
+}
+
+/// A Session's attention cue in a row's right-edge slot, shared by the
+/// Sessions panel and the tab-overflow list (`src/wm.rs`) so both read the
+/// same: Needs you blocks work, so it outranks the latched Bell (a pulsing
+/// dot), which outranks the other agent states. `agent` and `bell` arrive
+/// already gated by their settings. False when there is nothing to paint.
+pub(crate) fn paint_attention_badge(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    row: egui::Rect,
+    agent: Option<crate::agent_state::AgentBadge>,
+    bell: bool,
+) -> bool {
+    let th = crate::theme::live(ui.ctx());
+    if let Some(badge) = agent.filter(|b| b.state == crate::agent_state::AgentState::NeedsYou) {
+        paint_state_label(p, row, badge, th.bell);
+    } else if bell {
+        p.circle_filled(
+            egui::pos2(row.max.x - 12.0, row.center().y),
+            3.5,
+            bell_pulse(
+                ui.input(|i| i.time),
+                crate::config::live(ui.ctx()).bell_period as f64,
+                th.bell,
+            ),
+        );
+    } else if let Some(badge) = agent {
+        let color = if badge.finished { th.text } else { th.dim };
+        paint_state_label(p, row, badge, color);
+    } else {
+        return false;
+    }
+    true
 }
 
 /// Agent state in the right-edge slot. Read-only: the draw pass never
