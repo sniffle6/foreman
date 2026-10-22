@@ -5,6 +5,8 @@
 
 use crate::wm::{Dir, WinId};
 use eframe::egui;
+use std::collections::HashSet;
+use std::ops::Range;
 
 /// No tile may shrink below this fraction of its split.
 pub const MIN_RATIO: f32 = 0.10;
@@ -39,6 +41,24 @@ fn holds(n: &Node, id: WinId) -> bool {
         Node::Leaf(w) => *w == id,
         Node::Split { children, .. } => children.iter().any(|c| holds(c, id)),
     }
+}
+
+/// Append `n`'s leaves in visual order.
+fn collect_leaves(n: &Node, out: &mut Vec<WinId>) {
+    match n {
+        Node::Leaf(w) => out.push(*w),
+        Node::Split { children, .. } => children.iter().for_each(|c| collect_leaves(c, out)),
+    }
+}
+
+fn leaves_of(nodes: &[Node]) -> Vec<WinId> {
+    let mut out = Vec::new();
+    nodes.iter().for_each(|n| collect_leaves(n, &mut out));
+    out
+}
+
+fn leaf_set(nodes: &[Node]) -> HashSet<WinId> {
+    leaves_of(nodes).into_iter().collect()
 }
 
 /// Deepest split on `axis` along the path to `id` where `edge` is interior:
@@ -110,6 +130,21 @@ pub enum DropTarget {
     Tab(WinId),
 }
 
+/// Where a leaf sat in its parent split. [`LayoutTree::slot_of`] captures it
+/// before the leaf leaves the tree; [`LayoutTree::restore_slot`] puts the
+/// leaf back on the same side of the same neighbours at the same share
+/// (minimize → restore).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeafSlot {
+    dir: SplitDir,
+    /// The leaf's siblings in that split, in order: each child's leaves and
+    /// its share. The leaf itself sat before `siblings[at]`.
+    siblings: Vec<(Vec<WinId>, f32)>,
+    at: usize,
+    /// The leaf's share of that split.
+    ratio: f32,
+}
+
 impl LayoutTree {
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
@@ -127,17 +162,10 @@ impl LayoutTree {
 
     /// All leaf ids in visual order (left→right, top→bottom recursion order).
     pub fn leaves(&self) -> Vec<WinId> {
-        fn walk(n: &Node, out: &mut Vec<WinId>) {
-            match n {
-                Node::Leaf(w) => out.push(*w),
-                Node::Split { children, .. } => children.iter().for_each(|c| walk(c, out)),
-            }
-        }
-        let mut out = Vec::new();
-        if let Some(r) = &self.root {
-            walk(r, &mut out);
-        }
-        out
+        self.root
+            .as_ref()
+            .map(|r| leaves_of(std::slice::from_ref(r)))
+            .unwrap_or_default()
     }
 
     /// Split the whole root: the new leaf takes the `side` half of the area.
@@ -282,6 +310,82 @@ impl LayoutTree {
         let mut removed = false;
         self.root = self.root.take().and_then(|r| prune(r, id, &mut removed));
         removed
+    }
+
+    /// Where leaf `id` sits in its parent split, for [`Self::restore_slot`].
+    /// None when it is absent or the sole leaf (no split to return to).
+    pub fn slot_of(&self, id: WinId) -> Option<LeafSlot> {
+        fn go(n: &Node, id: WinId) -> Option<LeafSlot> {
+            let Node::Split {
+                dir,
+                ratios,
+                children,
+            } = n
+            else {
+                return None;
+            };
+            let idx = children.iter().position(|c| holds(c, id))?;
+            if !matches!(children[idx], Node::Leaf(_)) {
+                return go(&children[idx], id);
+            }
+            let siblings = children
+                .iter()
+                .zip(ratios)
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, (c, r))| (leaves_of(std::slice::from_ref(c)), *r))
+                .collect();
+            Some(LeafSlot {
+                dir: *dir,
+                siblings,
+                at: idx,
+                ratio: ratios[idx],
+            })
+        }
+        go(self.root.as_ref()?, id)
+    }
+
+    /// Put `id` back where [`Self::slot_of`] found it: same split axis, same
+    /// side of the same neighbours, same share. Undoes `remove` exactly when
+    /// nothing else changed — including the collapse and same-axis splice it
+    /// may have done. Siblings that left the tree since are skipped and the
+    /// share is taken against those still here, so restoring several removed
+    /// leaves of one split gives back the original proportions in any order.
+    /// `fixed` is a leaf with a pinned extent (the task-manager panel): it
+    /// keeps its share and cannot be the only anchor. False, tree untouched,
+    /// when no neighbour is left or they were rearranged so the old boundary
+    /// no longer exists.
+    pub fn restore_slot(&mut self, id: WinId, slot: &LeafSlot, fixed: Option<WinId>) -> bool {
+        let live: HashSet<WinId> = self.leaves().into_iter().collect();
+        if live.contains(&id) {
+            return false;
+        }
+        let (mut before, mut after) = (HashSet::new(), HashSet::new());
+        let mut present = 0.0;
+        for (i, (leaves, share)) in slot.siblings.iter().enumerate() {
+            let side = if i < slot.at { &mut before } else { &mut after };
+            let had = side.len();
+            side.extend(leaves.iter().copied().filter(|w| live.contains(w)));
+            if side.len() > had {
+                present += share;
+            }
+        }
+        let re = Reentry {
+            id,
+            dir: slot.dir,
+            ratio: slot.ratio / (slot.ratio + present),
+            before,
+            after,
+            fixed,
+        };
+        let want: HashSet<WinId> = re.before.union(&re.after).copied().collect();
+        if want.iter().all(|w| Some(*w) == fixed) {
+            return false;
+        }
+        match &mut self.root {
+            Some(root) => re.place(root, &want),
+            None => false,
+        }
     }
 
     /// Compute leaf rects within `area` (any coordinate space — local or screen),
@@ -600,6 +704,142 @@ impl LayoutTree {
             return true;
         }
         false
+    }
+}
+
+/// A [`LeafSlot`] narrowed to the neighbours still in the tree: the working
+/// state of [`LayoutTree::restore_slot`]. Every method checks before it
+/// mutates, so a `false` leaves the tree as it was.
+struct Reentry {
+    id: WinId,
+    dir: SplitDir,
+    ratio: f32,
+    before: HashSet<WinId>,
+    after: HashSet<WinId>,
+    fixed: Option<WinId>,
+}
+
+impl Reentry {
+    /// Descend to the node, or run of sibling nodes, holding exactly the
+    /// neighbours `want`, and re-enter there. `n` holds all of `want`.
+    fn place(&self, n: &mut Node, want: &HashSet<WinId>) -> bool {
+        if leaf_set(std::slice::from_ref(n)) == *want {
+            if let Node::Split {
+                dir,
+                ratios,
+                children,
+            } = n
+                && *dir == self.dir
+            {
+                let all = 0..children.len();
+                return self.insert_flat(ratios, children, all);
+            }
+            // The old split collapsed into this node.
+            if !self.one_sided() {
+                return false;
+            }
+            let region = std::mem::replace(n, Node::Leaf(self.id));
+            *n = self.wrap(region);
+            return true;
+        }
+        let Node::Split {
+            dir,
+            ratios,
+            children,
+        } = n
+        else {
+            return false;
+        };
+        let touching: Vec<usize> = (0..children.len())
+            .filter(|&i| leaf_set(&children[i..=i]).iter().any(|w| want.contains(w)))
+            .collect();
+        let (Some(&lo), Some(&hi)) = (touching.first(), touching.last()) else {
+            return false;
+        };
+        if lo == hi {
+            return self.place(&mut children[lo], want);
+        }
+        // Spread over several children: the old split collapsed and was
+        // spliced flat into this one, so the neighbours must be exactly a
+        // contiguous run of its children.
+        if hi - lo + 1 != touching.len() || leaf_set(&children[lo..=hi]) != *want {
+            return false;
+        }
+        if *dir == self.dir {
+            return self.insert_flat(ratios, children, lo..hi + 1);
+        }
+        if !self.one_sided() {
+            return false;
+        }
+        let total: f32 = ratios[lo..=hi].iter().sum();
+        let inner = Node::Split {
+            dir: *dir,
+            ratios: ratios.drain(lo..=hi).map(|r| r / total).collect(),
+            children: children.drain(lo..=hi).collect(),
+        };
+        ratios.insert(lo, total);
+        children.insert(lo, self.wrap(inner));
+        true
+    }
+
+    /// A boundary cannot cut through one node: wrapping one needs every
+    /// neighbour on the same side.
+    fn one_sided(&self) -> bool {
+        self.before.is_empty() || self.after.is_empty()
+    }
+
+    /// A new split on the slot's axis: `region` on one side, the leaf at its
+    /// old share on the other.
+    fn wrap(&self, region: Node) -> Node {
+        let leaf = Node::Leaf(self.id);
+        let (children, ratios) = if self.before.is_empty() {
+            (vec![leaf, region], vec![self.ratio, 1.0 - self.ratio])
+        } else {
+            (vec![region, leaf], vec![1.0 - self.ratio, self.ratio])
+        };
+        Node::Split {
+            dir: self.dir,
+            ratios,
+            children,
+        }
+    }
+
+    /// Insert the leaf into `children[run]` of a split already on the slot's
+    /// axis, at the boundary between the before and after neighbours. The
+    /// leaf takes its share of the run back from the run's members in
+    /// proportion, except `fixed`, which keeps its share.
+    fn insert_flat(
+        &self,
+        ratios: &mut Vec<f32>,
+        children: &mut Vec<Node>,
+        run: Range<usize>,
+    ) -> bool {
+        let Some(at) = (run.start..=run.end).find(|&k| {
+            leaf_set(&children[run.start..k]) == self.before
+                && leaf_set(&children[k..run.end]) == self.after
+        }) else {
+            return false;
+        };
+        let is_fixed = |c: &Node| matches!(c, Node::Leaf(w) if Some(*w) == self.fixed);
+        let total: f32 = ratios[run.clone()].iter().sum();
+        let share = self.ratio * total;
+        let pinned: f32 = run
+            .clone()
+            .filter(|&i| is_fixed(&children[i]))
+            .map(|i| ratios[i])
+            .sum();
+        // A fixed leaf too large to keep whole gives way like the rest.
+        let keep_fixed = total - pinned - share > 0.0;
+        let pinned = if keep_fixed { pinned } else { 0.0 };
+        let scale = (total - pinned - share) / (total - pinned);
+        for i in run {
+            if !(keep_fixed && is_fixed(&children[i])) {
+                ratios[i] *= scale;
+            }
+        }
+        ratios.insert(at, share);
+        children.insert(at, Node::Leaf(self.id));
+        true
     }
 }
 
@@ -1026,5 +1266,227 @@ mod tests {
         t.insert_split(1, 2, Dir::Right); // [1 | 2] — no V split anywhere
         assert!(!t.set_leaf_extent(2, SplitDir::V, 36.0, area(), 8.0));
         assert!(t.set_leaf_extent(2, SplitDir::H, 36.0, area(), 8.0));
+    }
+
+    // ── slot_of / restore_slot (minimize → restore) ──────────────────────────
+
+    fn split(dir: SplitDir, ratios: &[f32], children: Vec<Node>) -> Node {
+        Node::Split {
+            dir,
+            ratios: ratios.to_vec(),
+            children,
+        }
+    }
+
+    /// Gapless, so a nested same-axis split and its flattened twin compare equal.
+    fn rects(t: &LayoutTree) -> Vec<(WinId, egui::Rect)> {
+        let mut r = t.layout(area(), 0.0);
+        r.sort_by_key(|(w, _)| *w);
+        r
+    }
+
+    fn assert_same_rects(name: &str, got: &[(WinId, egui::Rect)], want: &[(WinId, egui::Rect)]) {
+        assert_eq!(got.len(), want.len(), "{name}: {got:?} vs {want:?}");
+        for ((wg, rg), (ww, rw)) in got.iter().zip(want) {
+            assert_eq!(wg, ww, "{name}");
+            let d = (rg.min - rw.min).length() + (rg.max - rw.max).length();
+            assert!(d < 0.01, "{name}: leaf {wg} at {rg:?}, want {rw:?}");
+        }
+    }
+
+    #[test]
+    fn restore_slot_puts_a_removed_leaf_back_exactly() {
+        use Node::Leaf;
+        use SplitDir::{H, V};
+        let strip = || split(H, &[0.2, 0.5, 0.3], vec![Leaf(1), Leaf(2), Leaf(3)]);
+        let cases: Vec<(&str, Node, WinId)> = vec![
+            ("middle of a 3-way split", strip(), 2),
+            ("first of a 3-way split", strip(), 1),
+            (
+                "2-way split collapses into the sibling leaf",
+                split(
+                    H,
+                    &[0.4, 0.6],
+                    vec![Leaf(1), split(V, &[0.3, 0.7], vec![Leaf(2), Leaf(3)])],
+                ),
+                3,
+            ),
+            (
+                "sibling subtree becomes the root",
+                split(
+                    V,
+                    &[0.65, 0.35],
+                    vec![split(H, &[0.5, 0.5], vec![Leaf(1), Leaf(2)]), Leaf(3)],
+                ),
+                3,
+            ),
+            (
+                "collapse splices the sibling flat into the grandparent",
+                split(
+                    H,
+                    &[0.4, 0.6],
+                    vec![
+                        Leaf(1),
+                        split(
+                            V,
+                            &[0.25, 0.75],
+                            vec![Leaf(2), split(H, &[0.3, 0.7], vec![Leaf(3), Leaf(4)])],
+                        ),
+                    ],
+                ),
+                2,
+            ),
+            (
+                "nested same-axis split",
+                split(
+                    H,
+                    &[0.3, 0.7],
+                    vec![Leaf(1), split(H, &[0.4, 0.6], vec![Leaf(2), Leaf(3)])],
+                ),
+                1,
+            ),
+        ];
+        for (name, root, id) in cases {
+            let mut t = LayoutTree { root: Some(root) };
+            let before = rects(&t);
+            let slot = t.slot_of(id).expect(name);
+            assert!(t.remove(id), "{name}");
+            assert!(t.restore_slot(id, &slot, None), "{name}");
+            assert_same_rects(name, &rects(&t), &before);
+        }
+    }
+
+    #[test]
+    fn restore_slot_in_reverse_removal_order_rebuilds_the_tree() {
+        let mut t = LayoutTree {
+            root: Some(split(
+                SplitDir::H,
+                &[0.1, 0.2, 0.3, 0.4],
+                (1..=4).map(Node::Leaf).collect(),
+            )),
+        };
+        let before = rects(&t);
+        let s2 = t.slot_of(2).unwrap();
+        t.remove(2);
+        let s3 = t.slot_of(3).unwrap();
+        t.remove(3);
+        assert!(t.restore_slot(3, &s3, None));
+        assert!(t.restore_slot(2, &s2, None));
+        assert_same_rects("LIFO", &rects(&t), &before);
+    }
+
+    #[test]
+    fn restore_slot_skips_neighbours_that_left_the_tree() {
+        use Node::Leaf;
+        let mut t = LayoutTree {
+            root: Some(split(
+                SplitDir::H,
+                &[0.25, 0.25, 0.5],
+                vec![Leaf(1), Leaf(2), Leaf(3)],
+            )),
+        };
+        let slot = t.slot_of(2).unwrap();
+        t.remove(2);
+        t.remove(3); // closed while 2 was away
+        assert!(t.restore_slot(2, &slot, None));
+        assert_eq!(
+            t.leaves(),
+            vec![1, 2],
+            "still right of the neighbour that stayed"
+        );
+        let r = rects(&t);
+        assert!(
+            (r[0].1.width() - r[1].1.width()).abs() < 0.01,
+            "1 and 2 were equal before, so they split the space equally: {r:?}"
+        );
+    }
+
+    #[test]
+    fn restore_slot_takes_its_share_against_the_siblings_still_present() {
+        // Both slots captured from the full split (as the manager's ghost
+        // tree does): either restore order gives back every proportion.
+        for first in [2, 4] {
+            let mut t = LayoutTree {
+                root: Some(split(
+                    SplitDir::H,
+                    &[0.1, 0.2, 0.3, 0.4],
+                    (1..=4).map(Node::Leaf).collect(),
+                )),
+            };
+            let before = rects(&t);
+            let s2 = t.slot_of(2).unwrap();
+            let s4 = t.slot_of(4).unwrap();
+            t.remove(2);
+            t.remove(4);
+            let order = if first == 2 {
+                [(2, &s2), (4, &s4)]
+            } else {
+                [(4, &s4), (2, &s2)]
+            };
+            for (id, slot) in order {
+                assert!(t.restore_slot(id, slot, None), "{first} first: {id}");
+            }
+            assert_same_rects(&format!("{first} first"), &rects(&t), &before);
+        }
+    }
+
+    #[test]
+    fn restore_slot_refuses_a_rearranged_or_vanished_neighbourhood() {
+        use Node::Leaf;
+        let three = || LayoutTree {
+            root: Some(split(
+                SplitDir::H,
+                &[0.3, 0.4, 0.3],
+                vec![Leaf(1), Leaf(2), Leaf(3)],
+            )),
+        };
+        // Neighbours swapped sides: no boundary has 1 before and 3 after.
+        let mut t = three();
+        let slot = t.slot_of(2).unwrap();
+        t.remove(2);
+        t.swap(1, 3);
+        assert!(!t.restore_slot(2, &slot, None));
+        assert_eq!(
+            t.leaves(),
+            vec![3, 1],
+            "a refused restore leaves the tree alone"
+        );
+        // Every neighbour gone.
+        let mut t = three();
+        let slot = t.slot_of(2).unwrap();
+        t.remove(2);
+        t.remove(1);
+        t.remove(3);
+        assert!(!t.restore_slot(2, &slot, None));
+        // Only the fixed leaf left: it cannot anchor a proportional share.
+        let mut t = three();
+        let slot = t.slot_of(2).unwrap();
+        t.remove(2);
+        t.remove(1);
+        assert!(!t.restore_slot(2, &slot, Some(3)));
+        // A sole leaf has no split to return to.
+        let mut t = LayoutTree::default();
+        t.insert_root(1, Dir::Right);
+        assert_eq!(t.slot_of(1), None);
+    }
+
+    #[test]
+    fn restore_slot_keeps_a_fixed_leaf_at_its_share() {
+        // [1 | 2 | panel]: the panel is re-pinned to its width after 2 leaves,
+        // so 2's share must come back out of 1 alone.
+        use Node::Leaf;
+        let mut t = LayoutTree {
+            root: Some(split(
+                SplitDir::H,
+                &[0.5, 0.3, 0.2],
+                vec![Leaf(1), Leaf(2), Leaf(9)],
+            )),
+        };
+        let before = rects(&t);
+        let slot = t.slot_of(2).unwrap();
+        t.remove(2);
+        assert!(t.set_leaf_width(9, 200.0, area(), 0.0)); // the manager's re-pin
+        assert!(t.restore_slot(2, &slot, Some(9)));
+        assert_same_rects("fixed", &rects(&t), &before);
     }
 }

@@ -851,6 +851,12 @@ pub struct WindowManager {
     /// The tiling tree: windows whose ids are leaves are *tiled* and take their
     /// rect from `tree.layout()` each frame. Everything else floats.
     tree: crate::layout::LayoutTree,
+    /// Where each window minimized out of `tree` sat, in minimize order, so
+    /// restore puts it back in that exact place whatever order windows come
+    /// back in (see `ghost_tree`). Restored windows keep their entry until
+    /// none is left minimized. Runtime-only: after a restart, or a wholesale
+    /// tree rebuild, restore falls back to the leaf under the old center.
+    min_slots: Vec<(WinId, Vec<crate::layout::LeafSlot>)>,
     /// tmux-style zoom: render this window full-area on top, tree untouched.
     zoomed: Option<WinId>,
     /// Project layout picker state for this Project instance (selected
@@ -938,6 +944,7 @@ impl WindowManager {
             last_area: egui::vec2(0.0, 0.0),
             keymap: Keymap::default(),
             tree: Default::default(),
+            min_slots: Default::default(),
             zoomed: None,
             layout: Default::default(),
             layout_rt: Default::default(),
@@ -1206,6 +1213,7 @@ impl WindowManager {
         // long-lived manager never reuses ids that may still be referenced.
         self.windows.clear();
         self.tree = Default::default();
+        self.min_slots.clear();
         self.focused = None;
         self.last_focused = None;
         self.zoomed = None;
@@ -5643,6 +5651,7 @@ impl WindowManager {
         }
         self.detach(id);
         self.windows.retain(|w| w.id != id);
+        self.min_slots.retain(|(m, _)| *m != id);
         if self.focused == Some(id) {
             self.focused = self.last_focused.take();
         }
@@ -5671,6 +5680,11 @@ impl WindowManager {
         // dock edge is no longer observable from the tree.
         self.sync_panel_dock_from_layout();
         let was_tiled = self.tree.contains(id);
+        self.min_slots.retain(|(m, _)| *m != id);
+        let slots = self.min_slots_of(id);
+        if !slots.is_empty() {
+            self.min_slots.push((id, slots));
+        }
         self.detach(id);
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.minimized = true;
@@ -5685,13 +5699,75 @@ impl WindowManager {
         self.mark_workspace_dirty();
     }
 
+    /// The layout as it would be had no recorded window ever been minimized:
+    /// `tree` without the recorded windows already restored, then every
+    /// recorded window put back in its slot, newest first. Onto an empty tree
+    /// the newest becomes the root — it was the last one standing.
+    fn ghost_tree(&self, panel: Option<WinId>) -> crate::layout::LayoutTree {
+        let mut ghost = self.tree.clone();
+        for (m, _) in &self.min_slots {
+            ghost.remove(*m);
+        }
+        for (m, slots) in self.min_slots.iter().rev() {
+            if ghost.is_empty() {
+                ghost.insert_root(*m, Dir::Right);
+            } else {
+                slots.iter().any(|s| ghost.restore_slot(*m, s, panel));
+            }
+        }
+        ghost
+    }
+
+    fn is_minimized(&self, id: WinId) -> bool {
+        self.windows.iter().any(|w| w.id == id && w.minimized)
+    }
+
+    /// `id`'s slots for `min_slots`: where it sits in the ghost tree, so
+    /// neighbours minimized earlier still count (minimize b, then its
+    /// neighbour a, restore b, then a: a lands on b's side, not past it);
+    /// then where it sits among the windows tiled now.
+    fn min_slots_of(&self, id: WinId) -> Vec<crate::layout::LeafSlot> {
+        let panel = self.panel_id().filter(|p| self.tree.contains(*p));
+        let mut out: Vec<_> = self.ghost_tree(panel).slot_of(id).into_iter().collect();
+        if let Some(now) = self.tree.slot_of(id)
+            && !out.contains(&now)
+        {
+            out.push(now);
+        }
+        out
+    }
+
     /// Clear `minimized` and, when the window was tiled at minimize time,
-    /// re-enter the tree at the leaf under its old center (longer-axis split).
-    /// Best effort — the tree may have changed shape since; falls back to the
-    /// panel-aware root insert `tile_new` uses (honouring the panel's remembered
-    /// dock edge). No-op on unknown ids.
+    /// re-enter the tree where it would sit had nothing been minimized —
+    /// same split, same side, same size — whatever order windows come back
+    /// in. Otherwise (its neighbours closed or were rearranged, or the app
+    /// restarted) best effort: split the leaf under its old center (longer
+    /// axis), else the panel-aware root insert `tile_new` uses (honouring the
+    /// panel's remembered dock edge). No-op on unknown ids.
     fn unminimize(&mut self, id: WinId) {
         self.mark_workspace_dirty(); // over-marking an unknown id is harmless
+        let panel = self.panel_id().filter(|p| self.tree.contains(*p));
+        // The ghost tree minus the windows staying minimized: the tree as it
+        // is now, plus `id` in its place. Its own slots are the fallback.
+        let mut ghost = self.ghost_tree(panel);
+        for (m, _) in &self.min_slots {
+            if *m != id && !self.tree.contains(*m) {
+                ghost.remove(*m);
+            }
+        }
+        let mut slots: Vec<_> = ghost.slot_of(id).into_iter().collect();
+        for (_, own) in self.min_slots.iter().filter(|(m, _)| *m == id) {
+            slots.extend(own.iter().cloned());
+        }
+        // A restored window keeps its record while others are still away:
+        // it may be the only thing tying them to the windows that stayed.
+        if !self
+            .min_slots
+            .iter()
+            .any(|(m, _)| *m != id && self.is_minimized(*m))
+        {
+            self.min_slots.clear();
+        }
         let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
             return;
         };
@@ -5701,8 +5777,14 @@ impl WindowManager {
             return;
         }
         let center = w.rect.center();
+        // The panel is pinned, not proportional: it keeps its width, and a
+        // slot whose only remaining neighbour is the panel takes the
+        // dock-aware path below instead.
+        if slots.iter().any(|s| self.tree.restore_slot(id, s, panel)) {
+            self.repin_panel();
+            return;
+        }
         let local = egui::Rect::from_min_size(egui::Pos2::ZERO, self.last_area);
-        let panel = self.panel_id().filter(|p| self.tree.contains(*p));
         match self.tree.hit_leaf(center, local, SNAP_GAP) {
             Some((leaf, r)) if Some(leaf) != panel => {
                 let side = if r.width() >= r.height() {
@@ -10388,6 +10470,130 @@ mod tests {
         let wa = wm.windows.iter().find(|w| w.id == a).unwrap();
         assert!(!wa.minimized);
         assert!(!wm.tree.contains(a), "floating windows restore floating");
+    }
+
+    fn assert_same_layout(name: &str, got: &[(WinId, egui::Rect)], want: &[(WinId, egui::Rect)]) {
+        assert_eq!(got.len(), want.len(), "{name}: {got:?} vs {want:?}");
+        for ((wg, rg), (ww, rw)) in got.iter().zip(want) {
+            assert_eq!(wg, ww, "{name}: leaf order");
+            let d = (rg.min - rw.min).length() + (rg.max - rw.max).length();
+            assert!(d < 0.5, "{name}: window {wg} at {rg:?}, was {rw:?}");
+        }
+    }
+
+    /// Every ordering of every non-empty subset of `xs`.
+    fn orderings<T: Copy>(xs: &[T]) -> Vec<Vec<T>> {
+        let mut out = Vec::new();
+        for (i, &x) in xs.iter().enumerate() {
+            out.push(vec![x]);
+            let rest: Vec<T> = (0..xs.len()).filter(|&j| j != i).map(|j| xs[j]).collect();
+            for mut tail in orderings(&rest) {
+                tail.insert(0, x);
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Minimize `mins` in that order, restore them in every order, and check
+    /// each run gives back `before`. `setup` builds a fresh manager with its
+    /// windows on their tiled rects.
+    fn assert_restores_in_any_order(
+        name: &str,
+        local: egui::Rect,
+        mins: &[WinId],
+        setup: &dyn Fn() -> WindowManager,
+    ) {
+        for rests in orderings(mins)
+            .into_iter()
+            .filter(|r| r.len() == mins.len())
+        {
+            let mut wm = setup();
+            let before = wm.tree.layout(local, SNAP_GAP);
+            for &id in mins {
+                wm.minimize(id);
+            }
+            for &id in &rests {
+                wm.surface_target(crate::panel::TargetPath {
+                    project: id,
+                    ptab: None,
+                    window: None,
+                    tab: None,
+                });
+            }
+            let what = format!("{name}: minimize {mins:?}, restore {rests:?}");
+            assert_same_layout(&what, &wm.tree.layout(local, SNAP_GAP), &before);
+        }
+    }
+
+    #[test]
+    fn unminimize_in_any_order_gives_back_the_layout() {
+        // Minimize any windows in any order, restore them in any order: each
+        // comes back to its own rect, not a 50/50 split of whatever is under
+        // its center. Flat and nested, with dragged dividers.
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let layouts: [(&str, Dir); 2] = [("a | b | c", Dir::Right), ("a | (b / c)", Dir::Down)];
+        for (name, c_side) in layouts {
+            let setup = || {
+                let mut wm = WindowManager::new();
+                wm.last_area = local.size();
+                let a = push(&mut wm, "a");
+                let b = push(&mut wm, "b");
+                let c = push(&mut wm, "c");
+                wm.tree.insert_root(a, Dir::Right);
+                wm.tree.insert_split(a, b, Dir::Right);
+                wm.tree.insert_split(b, c, c_side);
+                assert!(wm.tree.resize_edge(a, Dir::Right, 150.0, local, SNAP_GAP));
+                assert!(wm.tree.resize_edge(b, c_side, -80.0, local, SNAP_GAP));
+                for (w, r) in wm.tree.layout(local, SNAP_GAP) {
+                    wm.windows.iter_mut().find(|win| win.id == w).unwrap().rect = r;
+                }
+                wm
+            };
+            let ids = setup().tree.leaves();
+            for mins in orderings(&ids) {
+                assert_restores_in_any_order(name, local, &mins, &setup);
+            }
+        }
+    }
+
+    #[test]
+    fn unminimize_beside_the_panel_restores_window_and_panel_widths() {
+        // [a | b | panel]: a restored window's width comes back out of the
+        // other windows, not out of the re-pinned panel, and the panel keeps
+        // its width.
+        let local = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let setup = || {
+            let mut desk = WindowManager::new().as_desktop();
+            desk.last_area = local.size();
+            desk.ensure_panel(false, 260.0, Dir::Right);
+            let pid = desk.windows.iter().find(|w| w.is_panel()).unwrap().id;
+            let a = push(&mut desk, "a");
+            let b = push(&mut desk, "b");
+            desk.tree = crate::layout::LayoutTree::default();
+            desk.tree.insert_root(a, Dir::Right);
+            desk.tree.insert_split(a, b, Dir::Right);
+            desk.tree.insert_split(b, pid, Dir::Right);
+            desk.apply_panel_ratio(local.width());
+            for (w, r) in desk.tree.layout(local, SNAP_GAP) {
+                desk.windows
+                    .iter_mut()
+                    .find(|win| win.id == w)
+                    .unwrap()
+                    .rect = r;
+            }
+            desk
+        };
+        let desk = setup();
+        let projects: Vec<WinId> = desk
+            .tree
+            .leaves()
+            .into_iter()
+            .filter(|&w| Some(w) != desk.panel_id())
+            .collect();
+        for mins in orderings(&projects) {
+            assert_restores_in_any_order("a | b | panel", local, &mins, &setup);
+        }
     }
 
     #[test]

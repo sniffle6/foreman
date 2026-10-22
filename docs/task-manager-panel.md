@@ -65,9 +65,26 @@ and the landing site for future agent-state badges.
   child-id scan always resolves to the first project tab. `TargetPath.ptab`
   records the owning project-tab index; `owning_project_tab` prefers it and
   falls back to the scan only for stale paths.
-- **Restore returns to the tree:** `minimize` records whether the window was
-  tiled (`Win::min_from_tree`); `unminimize` re-enters the tree at the leaf
-  under the window's old center (best effort — the tree may have changed).
+- **Restore returns to the same place:** `minimize` records whether the
+  window was tiled (`Win::min_from_tree`) and, if so, where it sat
+  (`layout::LeafSlot`: split axis, its siblings and their shares, its own
+  share). `unminimize` puts it back there at the same size, whatever order
+  minimized windows come back in.
+  - How: `ghost_tree` rebuilds the layout as if nothing had been minimized
+    (replaying every recorded slot, newest first). Restore drops the windows
+    still minimized from that ghost and reads off where the window sits
+    among the ones tiled now. That is why a restored window keeps its
+    record while others are away: it may be what ties them to the rest.
+  - Shares are taken against the siblings still present, so a split with
+    some members away keeps the others' proportions.
+  - The panel counts as fixed-size: a window restored next to it takes its
+    width back from the other windows, not from the panel.
+  - Falls back to splitting the leaf under the window's old center when no
+    old neighbour is left (or only the panel), the neighbours were
+    rearranged, a Project layout was applied, or the app restarted (slots
+    are runtime-only; `min_from_tree` persists).
+  - Windows moved or tiled while others are minimized keep where you put
+    them; the restored window takes its share from its present neighbours.
   Windows minimized while floating restore floating.
 - **Preferred size survives fitting:** `PanelView::expanded_width` is the
   user's preferred extent, carried between dock axes through the existing
@@ -165,7 +182,8 @@ and the landing site for future agent-state badges.
 - `src/wm.rs` — `panel_model`, `surface_target`, `ensure_panel`, path Acts,
   drains, `apply_panel_reorder` + `Tab::panel_order` (drag ordering),
   `apply_panel_ratio` (H→V axis fallback)
-- `src/layout.rs` — `set_leaf_extent` (axis-aware; `set_leaf_width` wraps it)
+- `src/layout.rs` — `set_leaf_extent` (axis-aware; `set_leaf_width` wraps it);
+  `slot_of` / `restore_slot` (minimize → restore placement)
 - `src/keymap.rs` — `Command::ToggleTaskManager` (default leader `M`)
 - `src/config.rs` — persistence fields
 - Spec: `docs/superpowers/specs/2026-07-09-task-manager-panel-design.md`

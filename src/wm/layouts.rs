@@ -597,6 +597,9 @@ impl WindowManager {
             );
         }
         self.tree = Default::default();
+        // Slots name neighbours in the tree just dropped; minimized windows
+        // restore against the arrangement's geometry instead.
+        self.min_slots.clear();
 
         let size = pl::Size::new(area.x, area.y);
         let min = pl::Size::new(MIN_W, MIN_H);
