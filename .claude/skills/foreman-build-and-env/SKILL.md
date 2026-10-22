@@ -1,6 +1,6 @@
 ---
 name: foreman-build-and-env
-description: Use when setting up a fresh Windows machine to build foreman, or when a build/test fails with "cannot find -lgcc_eh", "Access is denied (os error 5)", "error: no library targets found in package `foreman`", or link.exe/MSVC errors; when touching rustup/stable-gnu, w64devkit, libgcc_eh.a, PATH, the kill-foreman.ps1 or cargo-fmt.ps1 hooks; or when asked about the cargo build/run/test loop, per-module test filters, what CI does and does not gate, or the expected-warning baseline.
+description: Use when setting up a fresh Windows machine to build foreman, or when a build/test fails with "cannot find -lgcc_eh", "cannot find -lshlwapi", "Access is denied (os error 5)", "error: no library targets found in package `foreman`", or link.exe/MSVC errors, or when a test run ignores your edits (a new test missing from the run); when touching rustup/stable-gnu, w64devkit, libgcc_eh.a, PATH, the kill-foreman.ps1 or cargo-fmt.ps1 hooks; or when asked about the cargo build/run/test loop, per-module test filters, what CI does and does not gate, or the expected-warning baseline.
 ---
 
 # foreman-build-and-env
@@ -187,6 +187,16 @@ inventory lives in **foreman-config-and-flags**.
   (exit 101). Use the filter form above, or `cargo test --bin foreman <filter>`.
   CLAUDE.md carried this bad form until 2026-08-24 and seeded copies of it
   across the repo; fixed at the same time.
+- **Never build an exported copy of the tree in a shared target dir.** Build
+  a `git archive` / `git checkout-index` export (say, to test one commit
+  alone) with `--target-dir target/agent`, and cargo treats it and the real
+  checkout as one package, judging freshness by file mtime. The checkout's
+  files are older than that build, so `cargo test` there reports green
+  while running the export's binary. Give the export its own target dir, or
+  run `cargo clean -p foreman --target-dir target/agent` afterwards (deps
+  stay cached). The tell: a test you just added is missing from
+  `cargo test -- --list`. Incident 2026-10-21: a false green right before a
+  commit.
 
 ## Warning baseline
 
@@ -229,6 +239,7 @@ Runtime symptoms (black Session, dead input, etc.) belong to
 | `Access is denied (os error 5)`                        | Linking over a running `foreman.exe`         | The `Stop-Process` kill line, then rebuild              |
 | `link.exe not found` / Visual Studio component errors  | rustup reverted to MSVC default              | `rustup default stable-gnu`                             |
 | `dlltool` / `gcc` not found                            | `C:\w64devkit\bin` not on PATH               | Checklist step 4                                        |
+| `cannot find -lshlwapi` (linker `x86_64-w64-mingw32-gcc`) | `C:\w64devkit` gone while still on PATH: cargo silently falls back to Rust's bundled mingw, which lacks it | `Test-Path C:\w64devkit\bin\gcc.exe`; reinstall, checklist steps 3–5 (incl. the stub) |
 | ``error: no library targets found in package `foreman` `` | `cargo test --lib …` — bin-only crate           | `cargo test <module>::` filter                       |
 
 ## Toolchain and pinned versions (as of 2026-07-01)
