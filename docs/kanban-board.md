@@ -126,6 +126,12 @@ sibling — read those for *why*, this doc for *how*.
   remembers a base. Strays are discovered on the fallback interval, so a
   hidden board lists nothing and discovery runs on a shown board even when
   no card has a worktree.
+- **Integration queue strip**: while the repository has any integration
+  request, a one-row strip along the top of the board shows the running
+  request's stage and elapsed time, the hold, and the waiting counts.
+  Clicking it opens the queue page, which lists every request in turn
+  order. Both are described in `docs/integration-queue.md` (The board's
+  queue view).
 - **Cut and Versions**: Done is the live pile until you Cut it. Cut (a
   button on the Done header, or `foreman kanban cut <name>`) stamps every
   ungrouped Done card with `shipped` (`{name, at, commits}`), which moves
@@ -504,7 +510,8 @@ already gone (removed by hand) passes.
   version dropdown and Cut field, the release step list (`show_release`),
   the archive banner, the worktree strip
   (`show_strip`) and the Worktrees page (`show_worktrees`,
-  `show_worktree_row`, the `RemoveStray` / `DiscardStray` acts).
+  `show_worktree_row`, the `RemoveStray` / `DiscardStray` acts), and the
+  integration queue strip and page (`show_queue_strip`, `show_queue`).
 - `src/wm.rs` — the seams: `kanban_tick` (per-frame orphan recompute + gated
   reload), `kanban_dispatch` (the control-pipe verb table), `drain_board_acts`
   (applies board intents: store writes, jump-to-terminal, dispatch-from-card),

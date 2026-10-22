@@ -895,10 +895,13 @@ pub struct CardStore {
     last_status_poll: Option<std::time::Instant>,
     status_inflight: bool,
     /// The integration queue's view of each card (spec:
-    /// worktree-integration-queue), refreshed by the project's coordinator
-    /// tick from the repository's request files. Memory only, replaced
-    /// wholesale; never written to a card file.
-    integration: std::collections::HashMap<String, crate::integrate::IntegrationView>,
+    /// worktree-integration-queue), in turn order, refreshed by the
+    /// project's coordinator tick from the repository's request files.
+    /// Memory only, replaced wholesale; never written to a card file.
+    integration: crate::integrate::QueueView,
+    /// Bumped each time `integration` changes, so a painter can cache what
+    /// it laid out from it.
+    integration_gen: u64,
 }
 
 /// What one Cut did (spec §Cut step 9). `held_back` is `(id, reason)` for
@@ -1088,12 +1091,22 @@ impl CardStore {
         self.integration.get(id).cloned()
     }
 
+    /// The whole queue, for the board's queue strip and page.
+    pub fn integration_queue(&self) -> &crate::integrate::QueueView {
+        &self.integration
+    }
+
+    /// Changes whenever [`Self::integration_queue`] does.
+    pub fn integration_gen(&self) -> u64 {
+        self.integration_gen
+    }
+
     /// Replace the integration views wholesale (one coordinator read).
-    pub fn set_integration(
-        &mut self,
-        map: std::collections::HashMap<String, crate::integrate::IntegrationView>,
-    ) {
-        self.integration = map;
+    pub fn set_integration(&mut self, views: crate::integrate::QueueView) {
+        if self.integration != views {
+            self.integration = views;
+            self.integration_gen += 1;
+        }
     }
 
     /// Start a round for changed watched cards, or on the fallback interval

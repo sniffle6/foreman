@@ -35,6 +35,8 @@ const STRIP_H: f32 = 22.0;
 /// `Grid` sizes a column from its first frame, when a wrapping label has no
 /// width to wrap at and folds a few characters per line.
 const OWNER_W: f32 = 260.0;
+/// Width of the queue page's status column, fixed for the same reason.
+const QUEUE_STATUS_W: f32 = 300.0;
 
 /// Done header controls (spec: kanban-cut §Board UI): the version dropdown
 /// and, in Current, the Cut button — right-anchored, own hit regions.
@@ -168,6 +170,109 @@ fn detail_text(ui: &mut egui::Ui, text: &str) {
     }
 }
 
+/// How a run of board text is coloured, kept apart from the theme so pure
+/// helpers can say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Text,
+    Dim,
+    Danger,
+}
+
+impl Tone {
+    fn color(self, th: &crate::theme::Theme) -> egui::Color32 {
+        match self {
+            Tone::Text => th.text,
+            Tone::Dim => th.dim,
+            Tone::Danger => th.danger,
+        }
+    }
+}
+
+/// How a step stands, drawn the same way for release steps and
+/// integration stages: ✓ done, … running, ✗ failed, · still to come.
+fn mark_style(mark: crate::release::Mark) -> (&'static str, Tone) {
+    use crate::release::Mark;
+    match mark {
+        Mark::Pending => ("·", Tone::Dim),
+        Mark::Running => ("…", Tone::Text),
+        Mark::Ok => ("✓", Tone::Text),
+        Mark::Failed => ("✗", Tone::Danger),
+    }
+}
+
+/// `12s`, `4m 07s`, `1h 02m`. The running request's timer: it shows a long
+/// check is still going without inventing how far it has left.
+fn elapsed_label(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+/// Each stage `e`'s turn runs, marked done, running, or still to come.
+fn stage_marks(
+    e: &crate::integrate::QueueEntry,
+) -> impl Iterator<Item = (crate::integrate::Stage, crate::release::Mark)> + '_ {
+    use crate::release::Mark;
+    let step = e.step();
+    e.stages().iter().enumerate().map(move |(i, &stage)| {
+        let mark = match step {
+            Some(j) if i < j => Mark::Ok,
+            Some(j) if i == j => Mark::Running,
+            _ => Mark::Pending,
+        };
+        (stage, mark)
+    })
+}
+
+/// The integration queue strip's line as toned runs: the running request
+/// with its stage track and elapsed time, then the hold, then how many
+/// requests stand in each other phase. `now` is Unix seconds. Pure; the
+/// board rebuilds it only when the queue view or the elapsed second
+/// changes.
+fn queue_strip(q: &crate::integrate::QueueView, now: i64) -> Vec<(String, Tone)> {
+    use crate::integrate::Phase;
+    const SEP: &str = "   ·   ";
+    let mut out = Vec::new();
+    if let Some(a) = q.active() {
+        out.push((format!("Integrating {}", a.card), Tone::Text));
+        if a.step().is_none() {
+            out.push(("   … preflight".to_owned(), Tone::Text));
+        }
+        for (stage, mark) in stage_marks(a) {
+            let (glyph, tone) = mark_style(mark);
+            out.push((format!("   {glyph} {}", stage.label()), tone));
+        }
+        if let Some(secs) = a.elapsed(now) {
+            out.push((format!("   {}", elapsed_label(secs)), Tone::Dim));
+        }
+        if a.view.cancel_requested {
+            out.push(("   cancelling".to_owned(), Tone::Danger));
+        }
+    }
+    if let Some(hold) = q.hold() {
+        let sep = if out.is_empty() { "" } else { SEP };
+        let first = hold.lines().next().unwrap_or("");
+        out.push((format!("{sep}Held: {first}"), Tone::Danger));
+    }
+    for (phase, label, tone) in [
+        (Phase::Queued, "queued", Tone::Dim),
+        (Phase::NeedsResolution, "needs resolution", Tone::Danger),
+        (Phase::Integrated, "integrated", Tone::Dim),
+    ] {
+        let n = q.count(phase);
+        if n > 0 {
+            let sep = if out.is_empty() { "" } else { SEP };
+            out.push((format!("{sep}{n} {label}"), tone));
+        }
+    }
+    out
+}
+
 /// Fixed column order the board always renders, left to right.
 const COLUMNS: [crate::kanban::CardState; 4] = [
     crate::kanban::CardState::Backlog,
@@ -255,6 +360,13 @@ pub struct BoardView {
     /// The Worktrees page is showing (below `selected`: a card opened from
     /// the page returns to it on Back). View state, never persisted.
     worktrees_open: bool,
+    /// The integration queue page is showing; same rules as
+    /// `worktrees_open`.
+    queue_open: bool,
+    /// The queue strip's runs and the `(generation, elapsed second)` they
+    /// were built for. Rebuilt only when that key moves, so a shown board
+    /// paints the strip without formatting anything per frame.
+    strip_cache: Option<((u64, Option<u64>), Vec<(String, Tone)>)>,
     scale: f32,
     /// Which Done view is showing: `None` = Current, `Some(name)` = that
     /// Version (spec §Board UI). View state, never persisted — same rule as
@@ -303,6 +415,16 @@ pub struct BoardView {
     /// Test probe: the worktree strip's text last frame (`None` = no strip).
     #[cfg(test)]
     pub(crate) strip_text: Option<String>,
+    /// Test probe: the queue strip's text last frame (`None` = no strip).
+    #[cfg(test)]
+    pub(crate) queue_strip_text: Option<String>,
+    /// Test probe: the card ids the queue page listed last frame, in order.
+    #[cfg(test)]
+    pub(crate) queue_rows_drawn: Vec<String>,
+    /// Test probe: `(card id, rect)` of each Open card button the queue
+    /// page drew last frame.
+    #[cfg(test)]
+    pub(crate) queue_btn_rects: Vec<(String, egui::Rect)>,
     /// Test probe: the row names the Worktrees page drew last frame.
     #[cfg(test)]
     pub(crate) wt_rows_drawn: Vec<String>,
@@ -332,6 +454,8 @@ impl BoardView {
             collapsed: [false; 4],
             selected: None,
             worktrees_open: false,
+            queue_open: false,
+            strip_cache: None,
             scale: 1.0,
             acts: Vec::new(),
             version: None,
@@ -362,6 +486,12 @@ impl BoardView {
             #[cfg(test)]
             strip_text: None,
             #[cfg(test)]
+            queue_strip_text: None,
+            #[cfg(test)]
+            queue_rows_drawn: Vec::new(),
+            #[cfg(test)]
+            queue_btn_rects: Vec::new(),
+            #[cfg(test)]
             wt_rows_drawn: Vec::new(),
             #[cfg(test)]
             wt_btn_rects: Vec::new(),
@@ -379,6 +509,7 @@ impl BoardView {
     pub fn open_card(&mut self, id: &str) {
         self.selected = Some(id.to_string());
         self.worktrees_open = false;
+        self.queue_open = false;
         self.picker = None;
     }
 
@@ -509,6 +640,9 @@ impl BoardView {
             self.uncut_rect = None;
             self.rail_text = None;
             self.strip_text = None;
+            self.queue_strip_text = None;
+            self.queue_rows_drawn.clear();
+            self.queue_btn_rects.clear();
             self.wt_rows_drawn.clear();
             self.wt_btn_rects.clear();
         }
@@ -524,6 +658,10 @@ impl BoardView {
             self.show_worktrees(ui, rect, base, &rows, &th);
             return;
         }
+        if self.queue_open {
+            self.show_queue(ui, rect, base, &cards, &th);
+            return;
+        }
         // The worktree strip takes the bottom row only when there is
         // something to show, so a project without worktrees sees no change.
         let mut rect = rect;
@@ -534,6 +672,16 @@ impl BoardView {
             );
             rect.max.y = strip.min.y;
             self.show_strip(ui, &p, strip, base, &text, attention, &th);
+        }
+        // The integration queue strip takes the top row while the
+        // repository has any request, the same way.
+        if !self.store.borrow().integration_queue().is_empty() {
+            let strip = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.max.x, rect.min.y + zoom.px(STRIP_H)),
+            );
+            rect.min.y = strip.max.y;
+            self.show_queue_strip(ui, &p, strip, base, &th);
         }
         // Focus belongs to the window frame, not column dividers.
         let border_col = th.border;
@@ -683,7 +831,6 @@ impl BoardView {
         prog: &crate::release::Progress,
         th: &crate::theme::Theme,
     ) -> f32 {
-        use crate::release::Mark;
         let s = self.scale;
         let font = egui::FontId::proportional(11.0 * s);
         let mono = egui::FontId::monospace(10.5 * s);
@@ -736,12 +883,8 @@ impl BoardView {
         child.set_clip_rect(body.intersect(ui.clip_rect()));
         child.spacing_mut().item_spacing.y = 1.0 * s;
         for (step, mark) in &prog.steps {
-            let (glyph, color) = match mark {
-                Mark::Pending => ("·", th.dim),
-                Mark::Running => ("…", th.text),
-                Mark::Ok => ("✓", th.text),
-                Mark::Failed => ("✗", th.danger),
-            };
+            let (glyph, tone) = mark_style(*mark);
+            let color = tone.color(th);
             let line = format!("{glyph} {}", step.label());
             child.add(
                 egui::Label::new(egui::RichText::new(&line).font(font.clone()).color(color))
@@ -1682,6 +1825,240 @@ impl BoardView {
         });
     }
 
+    /// The one-row integration queue summary along the top of the board;
+    /// the whole row is the button that opens the queue page. It paints the
+    /// cached runs, so nothing is formatted, collected, or read from disk
+    /// per frame; the cache moves with the store's generation and, while a
+    /// request runs, with the elapsed second.
+    fn show_queue_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &egui::Painter,
+        strip: egui::Rect,
+        base: egui::Id,
+        th: &crate::theme::Theme,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let store = self.store.borrow();
+            let q = store.integration_queue();
+            let key = (
+                store.integration_gen(),
+                q.active().and_then(|a| a.elapsed(now)),
+            );
+            if self.strip_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.strip_cache = Some((key, queue_strip(q, now)));
+            }
+        }
+        let Some((_, runs)) = &self.strip_cache else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.queue_strip_text = Some(runs.iter().map(|(t, _)| t.as_str()).collect());
+        }
+        let r = ui.interact(strip, base.with("queue-strip"), egui::Sense::click());
+        p.rect_filled(strip, 0.0, if r.hovered() { th.sel_bg } else { th.bg });
+        p.line_segment(
+            [strip.left_bottom(), strip.right_bottom()],
+            egui::Stroke::new(1.0, th.border),
+        );
+        let font = egui::FontId::proportional(10.5 * self.scale);
+        let link = p.text(
+            egui::pos2(strip.max.x - PAD * self.scale * 2.0, strip.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "Queue ›",
+            font.clone(),
+            th.text,
+        );
+        // Runs stop short of the link rather than painting under it.
+        let lp = p.with_clip_rect(egui::Rect::from_min_max(
+            strip.min,
+            egui::pos2(link.min.x - PAD * self.scale, strip.max.y),
+        ));
+        let mut x = strip.min.x + PAD * self.scale * 2.0;
+        for (text, tone) in runs {
+            x = lp
+                .text(
+                    egui::pos2(x, strip.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    font.clone(),
+                    tone.color(th),
+                )
+                .max
+                .x;
+        }
+        if r.on_hover_text("The repository's integration queue, in turn order")
+            .clicked()
+        {
+            self.queue_open = true;
+            self.picker = None;
+        }
+    }
+
+    /// The integration queue page: every request in turn order, the hold
+    /// that stops the queue and why, and the running request's stage track
+    /// and elapsed time. Rows navigate only (Open card; Back from that card
+    /// returns here); Submit and Cancel stay on the card. Swaps in for the
+    /// columns like the Worktrees page, reading the store's cached view.
+    fn show_queue(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        base: egui::Id,
+        cards: &[crate::kanban::Card],
+        th: &crate::theme::Theme,
+    ) {
+        let store = std::rc::Rc::clone(&self.store);
+        let store = store.borrow();
+        let q = store.integration_queue();
+        let now = chrono::Utc::now().timestamp();
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(base.with("queue-page"))
+                .max_rect(rect.shrink(12.0 * self.scale))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(rect);
+        child.visuals_mut().override_text_color = Some(th.text);
+        if child.button("‹ Back to board").clicked() {
+            self.queue_open = false;
+        }
+        child.separator();
+        child.add(
+            egui::Label::new(
+                egui::RichText::new(format!("Integration queue ({})", q.entries().len()))
+                    .size(18.0 * self.scale),
+            )
+            .wrap(),
+        );
+        if let Some(hold) = q.hold() {
+            child.add(
+                egui::Label::new(egui::RichText::new(format!("Held: {hold}")).color(th.danger))
+                    .wrap()
+                    .selectable(true),
+            );
+            child.label(
+                egui::RichText::new(
+                    "Every worktree card behind it waits. The queue retries on its own once \
+                     the destination checkout is fixed; held is not blocked.",
+                )
+                .color(th.dim),
+            );
+        }
+        if q.is_empty() {
+            child.label(egui::RichText::new("Nothing submitted.").color(th.dim));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(base.with("queue-scroll"))
+            .show(&mut child, |ui| {
+                egui::Grid::new(base.with("queue-grid"))
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing(egui::vec2(16.0 * self.scale, 6.0 * self.scale))
+                    .show(ui, |ui| {
+                        for e in q.entries() {
+                            self.show_queue_row(ui, e, cards, now, th);
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn show_queue_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        e: &crate::integrate::QueueEntry,
+        cards: &[crate::kanban::Card],
+        now: i64,
+        th: &crate::theme::Theme,
+    ) {
+        use crate::integrate::Phase;
+        #[cfg(test)]
+        {
+            self.queue_rows_drawn.push(e.card.clone());
+        }
+        let v = &e.view;
+        let bad = v.phase == Phase::NeedsResolution || v.hold.is_some();
+        let place = match (v.phase, v.position) {
+            (Phase::Integrating, _) => "now".to_owned(),
+            (Phase::Queued, Some(n)) => format!("#{n}"),
+            (Phase::Queued, None) => "queued".to_owned(),
+            (Phase::NeedsResolution, _) => "back".to_owned(),
+            (Phase::Integrated, _) => "landed".to_owned(),
+        };
+        ui.label(egui::RichText::new(place).monospace().color(if bad {
+            th.danger
+        } else {
+            th.text
+        }));
+        let card = cards.iter().find(|c| c.id == e.card);
+        ui.vertical(|ui| {
+            ui.set_min_width(OWNER_W * self.scale);
+            ui.set_max_width(OWNER_W * self.scale);
+            ui.add(
+                egui::Label::new(egui::RichText::new(&e.card).monospace().color(th.dim)).truncate(),
+            );
+            match card {
+                Some(c) => ui.add(egui::Label::new(c.title.as_str()).truncate()),
+                None => ui.add(
+                    egui::Label::new(egui::RichText::new("not on this board").color(th.dim))
+                        .truncate(),
+                ),
+            };
+        });
+        ui.vertical(|ui| {
+            ui.set_min_width(QUEUE_STATUS_W * self.scale);
+            ui.set_max_width(QUEUE_STATUS_W * self.scale);
+            if v.phase == Phase::Integrating {
+                ui.horizontal(|ui| {
+                    if e.step().is_none() {
+                        ui.label(egui::RichText::new("… preflight").color(th.text));
+                    }
+                    for (stage, mark) in stage_marks(e) {
+                        let (glyph, tone) = mark_style(mark);
+                        ui.label(
+                            egui::RichText::new(format!("{glyph} {}", stage.label()))
+                                .color(tone.color(th)),
+                        );
+                    }
+                });
+                let mut line = e
+                    .elapsed(now)
+                    .map(|s| format!("running {}", elapsed_label(s)))
+                    .unwrap_or_else(|| "running".to_owned());
+                if v.cancel_requested {
+                    line.push_str(" · cancelling");
+                }
+                ui.label(egui::RichText::new(line).color(th.dim));
+            } else {
+                let summary = v.summary();
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&summary).color(if bad {
+                        th.danger
+                    } else {
+                        th.dim
+                    }))
+                    .truncate(),
+                )
+                .on_hover_text(summary);
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(c) = card {
+                let r = ui.button("Open card");
+                #[cfg(test)]
+                self.queue_btn_rects.push((c.id.clone(), r.rect));
+                if r.clicked() {
+                    self.selected = Some(c.id.clone());
+                    self.picker = None;
+                }
+            }
+        });
+    }
+
     fn show_details(
         &mut self,
         ui: &mut egui::Ui,
@@ -2460,6 +2837,240 @@ mod tests {
         }
     }
 
+    fn queue_entry(
+        card: &str,
+        view: crate::integrate::IntegrationView,
+    ) -> crate::integrate::QueueEntry {
+        crate::integrate::QueueEntry {
+            card: card.into(),
+            view,
+            in_place: false,
+            started: None,
+        }
+    }
+
+    fn running_entry(
+        card: &str,
+        stage: crate::integrate::Stage,
+        started: i64,
+    ) -> crate::integrate::QueueEntry {
+        let mut view = integration_view(crate::integrate::Phase::Integrating);
+        (view.position, view.reason, view.detail, view.next) = (None, None, None, None);
+        view.stage = Some(stage);
+        crate::integrate::QueueEntry {
+            started: Some(started),
+            ..queue_entry(card, view)
+        }
+    }
+
+    fn queued_entry(
+        card: &str,
+        position: usize,
+        hold: Option<&str>,
+    ) -> crate::integrate::QueueEntry {
+        let mut view = integration_view(crate::integrate::Phase::Queued);
+        (view.reason, view.detail, view.next) = (None, None, None);
+        view.position = Some(position);
+        view.hold = hold.map(str::to_owned);
+        queue_entry(card, view)
+    }
+
+    fn strip_text(runs: &[(String, Tone)]) -> String {
+        runs.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn elapsed_label_reads_seconds_minutes_then_hours() {
+        for (secs, want) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m 00s"),
+            (125, "2m 05s"),
+            (3599, "59m 59s"),
+            (3600, "1h 00m"),
+            (3725, "1h 02m"),
+        ] {
+            assert_eq!(elapsed_label(secs), want, "{secs}");
+        }
+    }
+
+    #[test]
+    fn queue_strip_says_the_running_stage_its_time_the_hold_and_the_counts() {
+        use crate::integrate::{Phase, QueueView, Stage};
+        let now = 1_000_000;
+        let mut back = queue_entry("c", integration_view(Phase::NeedsResolution));
+        back.view.position = None;
+        let q = QueueView::from_entries(vec![
+            running_entry("a", Stage::Check, now - 125),
+            queued_entry("b", 1, None),
+            queued_entry("z", 2, None),
+            back,
+        ]);
+        let runs = queue_strip(&q, now);
+        assert_eq!(
+            strip_text(&runs),
+            "Integrating a   ✓ rebase   … check   · merge   2m 05s   ·   2 queued   ·   1 needs resolution"
+        );
+        let tone = |text: &str| runs.iter().find(|(t, _)| t.contains(text)).unwrap().1;
+        assert_eq!(tone("check"), Tone::Text, "the running stage stands out");
+        assert_eq!(tone("merge"), Tone::Dim, "what is still to come is dim");
+        assert_eq!(tone("needs resolution"), Tone::Danger);
+
+        // Preflight runs before stage one; branch mode has no rebase.
+        let mut pre = running_entry("a", Stage::Preflight, now);
+        pre.in_place = true;
+        let runs = queue_strip(&QueueView::from_entries(vec![pre]), now);
+        assert_eq!(
+            strip_text(&runs),
+            "Integrating a   … preflight   · check   · merge   0s"
+        );
+
+        let mut cancelling = running_entry("a", Stage::Merge, now - 7);
+        cancelling.view.cancel_requested = true;
+        let runs = queue_strip(&QueueView::from_entries(vec![cancelling]), now);
+        assert_eq!(
+            strip_text(&runs),
+            "Integrating a   ✓ rebase   ✓ check   … merge   7s   cancelling"
+        );
+
+        // Held: nothing runs, the head carries why, in the danger colour.
+        let q = QueueView::from_entries(vec![
+            queued_entry(
+                "b",
+                1,
+                Some("destination dirty: uncommitted changes: x\nsecond line"),
+            ),
+            queued_entry("z", 2, None),
+        ]);
+        let runs = queue_strip(&q, now);
+        assert_eq!(
+            strip_text(&runs),
+            "Held: destination dirty: uncommitted changes: x   ·   2 queued"
+        );
+        assert_eq!(runs[0].1, Tone::Danger);
+        assert!(queue_strip(&QueueView::default(), now).is_empty());
+    }
+
+    #[test]
+    fn queue_strip_opens_the_page_in_turn_order_and_a_card_opened_from_it_returns_to_it() {
+        use crate::integrate::{QueueView, Stage};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let a = store.borrow_mut().add("running card", None).unwrap();
+        let b = store.borrow_mut().add("waiting card", None).unwrap();
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("queue-strip");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.queue_strip_text.is_none(), "empty queue: no strip");
+
+        let now = chrono::Utc::now().timestamp();
+        store
+            .borrow_mut()
+            .set_integration(QueueView::from_entries(vec![
+                running_entry(&a, Stage::Check, now - 30),
+                queued_entry(&b, 1, None),
+                // Another project's card on the same repository still waits in
+                // this queue.
+                queued_entry("zz9999", 2, None),
+            ]));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        let text = board.queue_strip_text.clone().expect("strip drawn");
+        assert!(
+            text.starts_with(&format!("Integrating {a}   ✓ rebase   … check   · merge")),
+            "{text}"
+        );
+        assert!(text.ends_with("   ·   2 queued"), "{text}");
+
+        let strip_pos = egui::pos2(rect.center().x, rect.min.y + STRIP_H / 2.0);
+        click_at(&ctx, &mut board, rect, base, strip_pos);
+        assert!(board.queue_open, "clicking the strip opens the page");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.queue_rows_drawn,
+            vec![a.clone(), b.clone(), "zz9999".into()]
+        );
+        assert!(board.queue_strip_text.is_none(), "the page draws no strip");
+        assert_eq!(
+            board
+                .queue_btn_rects
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            [a.as_str(), b.as_str()],
+            "only this board's cards can be opened"
+        );
+
+        let open = board
+            .queue_btn_rects
+            .iter()
+            .find(|(id, _)| id == &b)
+            .map(|(_, r)| r.center())
+            .unwrap();
+        click_at(&ctx, &mut board, rect, base, open);
+        assert_eq!(board.selected.as_deref(), Some(b.as_str()));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.queue_rows_drawn.is_empty(), "the detail page wins");
+        // What Back does: clear `selected`; the page is still open beneath.
+        board.selected = None;
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert!(board.queue_open);
+        assert_eq!(board.queue_rows_drawn.len(), 3);
+        assert!(board.acts.is_empty());
+
+        // A held queue says why on the strip.
+        board.queue_open = false;
+        store
+            .borrow_mut()
+            .set_integration(QueueView::from_entries(vec![queued_entry(
+                &b,
+                1,
+                Some("destination dirty: uncommitted changes in the destination checkout: f.txt"),
+            )]));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            board.queue_strip_text.as_deref(),
+            Some(
+                "Held: destination dirty: uncommitted changes in the destination checkout: f.txt   ·   1 queued"
+            )
+        );
+    }
+
+    #[test]
+    fn queue_strip_is_laid_out_once_until_the_queue_changes() {
+        use crate::integrate::QueueView;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(tmp.path());
+        let mut board = BoardView::new(Rc::clone(&store));
+        let ctx = egui::Context::default();
+        let base = egui::Id::new("queue-cache");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let waiting = || QueueView::from_entries(vec![queued_entry("aa", 1, None)]);
+        store.borrow_mut().set_integration(waiting());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        let built = |b: &BoardView| b.strip_cache.as_ref().map(|(_, runs)| runs.as_ptr());
+        let first = built(&board).expect("cache built");
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        // The coordinator re-reads every couple of seconds; an equal read
+        // must not count as a change.
+        store.borrow_mut().set_integration(waiting());
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(
+            built(&board),
+            Some(first),
+            "nothing changed: nothing rebuilt"
+        );
+        store
+            .borrow_mut()
+            .set_integration(QueueView::from_entries(vec![
+                queued_entry("aa", 1, None),
+                queued_entry("bb", 2, None),
+            ]));
+        run_frame(&ctx, &mut board, rect, base, vec![]);
+        assert_eq!(board.queue_strip_text.as_deref(), Some("2 queued"));
+    }
+
     #[test]
     fn detail_page_offers_submit_resubmit_and_cancel_by_integration_phase() {
         use crate::integrate::Phase;
@@ -2489,11 +3100,13 @@ mod tests {
         let base = egui::Id::new("integration");
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let set = |phase: Option<Phase>| {
-            let mut map = std::collections::HashMap::new();
-            if let Some(p) = phase {
-                map.insert(id.clone(), integration_view(p));
-            }
-            store.borrow_mut().set_integration(map);
+            let entries = phase
+                .map(|p| queue_entry(&id, integration_view(p)))
+                .into_iter()
+                .collect();
+            store
+                .borrow_mut()
+                .set_integration(crate::integrate::QueueView::from_entries(entries));
         };
         // In Progress, nothing submitted: Submit only
         set(None);

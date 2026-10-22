@@ -105,7 +105,70 @@ against.
   `hold`, `prepared`, `checks`, `note`, `cancel_requested`). `wait <id>`
   exits `3` on needs resolution; `wait --any` leaves that to the live
   worker. The board paints the substate as the card's status line and the
-  detail page's Integration section, with Submit / Resubmit / Cancel.
+  detail page's Integration section, with Submit / Resubmit / Cancel, and
+  the whole queue as a strip and a page (next section).
+
+## The board's queue view
+
+While the repository has any request, a one-row **queue strip** runs
+across the top of the board. It shows the running request with its stage
+track and elapsed time, the hold, and how many requests stand in each
+other phase:
+
+```
+Integrating w4ufci   ✓ rebase   … check   · merge   4m 07s   ·   2 queued   ·   1 needs resolution
+Held: destination dirty: uncommitted changes in the destination checkout: src/x.rs   ·   2 queued
+```
+
+Clicking it swaps in the **queue page**: every request in turn order
+(integrating, then queued by position, then handed back, then integrated
+with bookkeeping pending; submission order within each). Each row shows
+where it stands (`now`, `#2`, `back`, `landed`), the card id and title,
+the stage track or the card's summary line, and Open card. Back from that
+card returns to the page. A held queue gets a banner with the full hold
+text. The page only navigates. Submit and Cancel stay on the card's
+detail page.
+
+- **Why a strip, not a panel or a badge.** The strip costs nothing while
+  the queue is empty and keeps the thing that changes (the running stage,
+  the timer, a hold) visible without a click. A side panel would take
+  column width for something that is usually empty. A badge would hide the
+  live stage behind a click. It copies the worktree strip and the
+  Worktrees page, so the board has one pattern for this.
+- **Stages, not a percentage.** A worktree request runs rebase, check,
+  merge (the fast-forward). A branch-mode request runs check, merge.
+  `… preflight` shows before stage one. The marks are the release step
+  list's: ✓ done, … running, · still to come. Nothing knows how long a
+  check takes, so nothing shows a fraction.
+- **The timer counts from the attempt's start**, not the stage's: no stage
+  timestamp is persisted. The timer only proves the board is live, not the
+  check process. A dead owner's request reads `integrating` with a growing
+  timer until the next turn recovers it. Any coordinator starts that turn
+  on its next poll, because an `integrating` request counts as pending.
+- **Other projects' cards on the same repository are listed** (they hold
+  this project's cards up too), as `not on this board`, with no Open card.
+- **Freshness**: the coordinator re-reads the queue every `POLL_INTERVAL`,
+  so a stage change shows within one poll. The timer ticks on the app's
+  idle repaint and needs no repaint request of its own.
+- **Cost**: `integrate::views` builds the `QueueView` once per coordinator
+  read, and `CardStore::set_integration` keeps it, bumping
+  `integration_gen` only when the view actually changed. The strip caches
+  its text runs keyed on that generation and the elapsed second. Each
+  frame only paints `&str`s: no file read, no git, no sort, no formatting.
+  egui's text calls still copy each run into their layout job, as for
+  every label, and its galley cache serves the layout. Caching `Galley`s
+  across frames was rejected: egui rebuilds its font atlas when the atlas
+  fills, and a held galley would then paint stale glyphs. The page, like
+  the Worktrees page, builds its widgets per frame while it is open.
+- **"merge" is the fast-forward.** `Stage::Merge`'s label predates the
+  glossary's "avoid merge". The strip keeps it so the strip, the card's
+  status line, and `kanban list` use the same word.
+- **Screenshot fixture**: `scripts/seed-queue-fixture.ps1` seeds two
+  throwaway repositories (one with a running queue, one held) and a sandbox
+  APPDATA that shows both boards. It then holds both repositories' turns,
+  so the launched instance only reads and paints them. Without the held
+  turn, that instance would take the turn, find the fake worktrees
+  missing, and hand every request back.
 
 ## Recovery and ownership
 
@@ -150,9 +213,10 @@ Project: add `.foreman/integrate.json` at the repository root to run checks
 on every integration. Without it, integrations land unchecked and the card
 says `checks: none configured`.
 
-Human: the card's status line shows the phase; the detail page shows the
-reason and next action; Cancel withdraws; Resubmit re-queues a handed-back
-card once the worktree is clean.
+Human: the board's queue strip shows what runs now and what waits; the
+card's status line shows the phase; the detail page shows the reason and
+next action; Cancel withdraws; Resubmit re-queues a handed-back card once
+the worktree is clean.
 
 ## Gotchas
 
@@ -213,21 +277,26 @@ card once the worktree is clean.
   `dest_preflight` / `source_preflight`, `rebase` / `fast_forward` (git
   refusal classification), `run_git_long` + `run_git_long_on_path`,
   `load_policy` + `run_check` + `run_check_on_path` +
-  `run_child` (bounded, cancellable, Job-owned subprocesses), `IntegrationView` /
-  `views` (the wire projection), `TurnHooks` (test barriers).
+  `run_child` (bounded, cancellable, Job-owned subprocesses), `IntegrationView`
+  (the wire projection), `views` / `QueueView` / `QueueEntry` (every view
+  in turn order, with each attempt's start and stage list), `TurnHooks`
+  (test barriers).
 - `src/wm.rs` — `IntegrationDriver` (per-project coordinator state),
   `integration_tick` (re-read, bookkeeping, turn thread),
   `kanban_integrate` (the verb and the board's Submit/Cancel),
   `done_guard`, `integration_owns` (teardown / rm / discard / dispatch
   guards), `report_integration` (toasts).
-- `src/kanban.rs` — `CardStore::integration` / `set_integration`,
+- `src/kanban.rs` — `CardStore::integration` / `integration_queue` /
+  `integration_gen` / `set_integration`,
   `CardLine::integration`, `wait_verdict` + `WAIT_NEEDS_RESOLUTION`,
   `dispatch_prompt` (the worker close-out), `git` + `git_output_on_path`
   (queue queries such as `rev-parse` and `worktree list`).
 - `src/control.rs` — `KanbanRequest::cancel`, `parse_kanban_integrate`,
   `HELP_KANBAN`.
 - `src/board.rs` — the card status line and the detail page's Integration
-  section (`BoardAct::Integrate` / `CancelIntegration`).
+  section (`BoardAct::Integrate` / `CancelIntegration`), the queue strip
+  (`queue_strip`, the pure text; `show_queue_strip`, the cached paint) and
+  the queue page (`show_queue`, `show_queue_row`).
 - `.claude/skills/foreman-kanban/SKILL.md`, `.codex/skills/foreman-kanban/
   SKILL.md` — the worker-facing instructions (embedded; rebuild to
   propagate).

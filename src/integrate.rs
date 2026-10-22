@@ -21,7 +21,6 @@
 //! ownership, not an expiring lease that could grant a second turn while
 //! the first still runs.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -470,21 +469,151 @@ fn first_line(s: &str) -> String {
     }
 }
 
-/// Views for every request, keyed by card: queued positions count in `seq`
+/// One request as the queue-wide display sees it: the card-facing view plus
+/// the two facts only that display needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub card: String,
+    pub view: IntegrationView,
+    /// Branch mode: the turn skips the rebase.
+    pub in_place: bool,
+    /// When the running attempt started, in Unix seconds: the elapsed
+    /// timer's zero. `None` unless integrating.
+    pub started: Option<i64>,
+}
+
+impl QueueEntry {
+    /// The stages this request's turn runs, in order. The preflight runs
+    /// before the first and is not one of them.
+    pub fn stages(&self) -> &'static [Stage] {
+        if self.in_place {
+            &[Stage::Check, Stage::Merge]
+        } else {
+            &[Stage::Rebase, Stage::Check, Stage::Merge]
+        }
+    }
+
+    /// The index in [`Self::stages`] the running attempt is on; `None`
+    /// during the preflight or when not integrating.
+    pub fn step(&self) -> Option<usize> {
+        if self.view.phase != Phase::Integrating {
+            return None;
+        }
+        let st = self.view.stage?;
+        self.stages().iter().position(|s| *s == st)
+    }
+
+    /// Seconds the running attempt has taken at `now` (Unix seconds).
+    pub fn elapsed(&self, now: i64) -> Option<u64> {
+        self.started.map(|s| now.saturating_sub(s).max(0) as u64)
+    }
+}
+
+/// Every request's view, in turn order: integrating first, then queued by
+/// position, then handed back, then integrated (bookkeeping pending),
+/// submission order within each. What `kanban list` and the board read,
+/// cached on the card store by the coordinator; derived, never stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueView {
+    entries: Vec<QueueEntry>,
+}
+
+impl QueueView {
+    pub fn get(&self, card: &str) -> Option<&IntegrationView> {
+        self.entries
+            .iter()
+            .find(|e| e.card == card)
+            .map(|e| &e.view)
+    }
+
+    pub fn entries(&self) -> &[QueueEntry] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The request a turn is working on now.
+    pub fn active(&self) -> Option<&QueueEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.view.phase == Phase::Integrating)
+    }
+
+    /// Why the queue is held: the hold on the first queued request that
+    /// has one. The turn stopped there, so every worktree card behind it
+    /// waits too.
+    pub fn hold(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.view.phase == Phase::Queued)
+            .find_map(|e| e.view.hold.as_deref())
+    }
+
+    pub fn count(&self, phase: Phase) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.view.phase == phase)
+            .count()
+    }
+
+    /// A view of hand-built entries, kept in the order given.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<QueueEntry>) -> Self {
+        QueueView { entries }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&str> for QueueView {
+    type Output = IntegrationView;
+
+    fn index(&self, card: &str) -> &IntegrationView {
+        self.get(card)
+            .unwrap_or_else(|| panic!("no integration request for {card}"))
+    }
+}
+
+fn turn_rank(phase: Phase) -> u8 {
+    match phase {
+        Phase::Integrating => 0,
+        Phase::Queued => 1,
+        Phase::NeedsResolution => 2,
+        Phase::Integrated => 3,
+    }
+}
+
+/// Views for every request, in turn order: queued positions count in `seq`
 /// order. Pure.
-pub fn views(requests: &[Request]) -> HashMap<String, IntegrationView> {
+pub fn views(requests: &[Request]) -> QueueView {
     let mut sorted: Vec<&Request> = requests.iter().collect();
     sorted.sort_by_key(|r| r.seq);
     let mut pos = 0;
-    let mut out = HashMap::new();
-    for r in sorted {
-        let position = (r.phase == Phase::Queued).then(|| {
-            pos += 1;
-            pos
-        });
-        out.insert(r.card.clone(), IntegrationView::from_request(r, position));
-    }
-    out
+    let mut entries: Vec<QueueEntry> = sorted
+        .into_iter()
+        .map(|r| {
+            let position = (r.phase == Phase::Queued).then(|| {
+                pos += 1;
+                pos
+            });
+            let started = r
+                .attempt
+                .as_ref()
+                .filter(|_| r.phase == Phase::Integrating)
+                .and_then(|a| chrono::DateTime::parse_from_rfc3339(&a.started).ok())
+                .map(|t| t.timestamp());
+            QueueEntry {
+                card: r.card.clone(),
+                view: IntegrationView::from_request(r, position),
+                in_place: r.in_place,
+                started,
+            }
+        })
+        .collect();
+    // Stable: submission order survives within each phase.
+    entries.sort_by_key(|e| turn_rank(e.view.phase));
+    QueueView { entries }
 }
 
 // ---------------------------------------------------------------------------
@@ -769,8 +898,8 @@ impl Queue {
         }
     }
 
-    /// The card-facing views of every request.
-    pub fn views(&self) -> HashMap<String, IntegrationView> {
+    /// The views of every request, in turn order.
+    pub fn views(&self) -> QueueView {
         views(&self.requests())
     }
 }
@@ -2504,6 +2633,77 @@ mod tests {
         assert_eq!(v["a"].summary(), "needs resolution");
         assert_eq!(v["d"].summary(), "integrating");
         assert_eq!(v["b"].tail(), "[integrate queued #1]");
+    }
+
+    #[test]
+    fn views_list_the_queue_in_turn_order_with_start_mode_and_hold() {
+        let mut running = sample_request("d", 4, Phase::Integrating);
+        let mut a = attempt_for(&owner());
+        a.started = "2026-10-21T12:00:00Z".into();
+        a.stage = Stage::Check;
+        running.attempt = Some(a.clone());
+        // A handed-back request keeps its attempt; its start is not a timer.
+        let mut back = sample_request("a", 1, Phase::NeedsResolution);
+        back.attempt = Some(a);
+        let mut held = sample_request("b", 2, Phase::Queued);
+        held.hold = Some("destination dirty: x\nmore".into());
+        let mut branch = sample_request("f", 6, Phase::Queued);
+        branch.in_place = true;
+        let reqs = vec![
+            sample_request("c", 3, Phase::Queued),
+            back,
+            held,
+            running,
+            sample_request("e", 5, Phase::Integrated),
+            branch,
+        ];
+        let q = views(&reqs);
+        let order: Vec<&str> = q.entries().iter().map(|e| e.card.as_str()).collect();
+        assert_eq!(order, ["d", "b", "c", "f", "a", "e"]);
+
+        let active = q.active().expect("d is integrating");
+        assert_eq!(active.card, "d");
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-10-21T12:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(active.started, Some(t0));
+        assert_eq!(active.elapsed(t0 + 125), Some(125));
+        assert_eq!(
+            active.elapsed(t0 - 5),
+            Some(0),
+            "clock skew never goes negative"
+        );
+        assert_eq!(active.stages(), [Stage::Rebase, Stage::Check, Stage::Merge]);
+        assert_eq!(active.step(), Some(1));
+
+        let back = &q.entries()[4];
+        assert_eq!((back.started, back.step()), (None, None));
+        let branch = &q.entries()[3];
+        assert_eq!(branch.stages(), [Stage::Check, Stage::Merge]);
+        assert_eq!(branch.view.position, Some(3));
+
+        assert_eq!(q.hold(), Some("destination dirty: x\nmore"));
+        assert_eq!(q.count(Phase::Queued), 3);
+        assert_eq!(q.count(Phase::NeedsResolution), 1);
+        assert_eq!(q.get("e").map(|v| v.phase), Some(Phase::Integrated));
+        assert!(q.get("zz").is_none());
+        assert!(views(&[]).is_empty());
+    }
+
+    #[test]
+    fn step_is_none_during_the_preflight_and_after_the_turn() {
+        let mut r = sample_request("a", 1, Phase::Integrating);
+        r.attempt = Some(attempt_for(&owner()));
+        let q = views(std::slice::from_ref(&r));
+        assert_eq!(q.entries()[0].step(), None, "preflight is before stage one");
+        assert!(q.entries()[0].started.is_some());
+        r.attempt.as_mut().unwrap().stage = Stage::Merge;
+        let q = views(std::slice::from_ref(&r));
+        assert_eq!(q.entries()[0].step(), Some(2));
+        r.phase = Phase::Integrated;
+        let q = views(std::slice::from_ref(&r));
+        assert_eq!(q.entries()[0].step(), None);
+        assert!(q.active().is_none());
     }
 
     #[test]
