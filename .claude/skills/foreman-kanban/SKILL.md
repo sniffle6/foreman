@@ -5,10 +5,11 @@ description: Use when running inside foreman (the FOREMAN env var is 1) and coor
 
 # The foreman project kanban board
 
-**This skill is complete. Do NOT read foreman source or docs to learn kanban
-mechanics — every fact you need is here or in the two reference files
-beside this file.** Researching your task's subject matter is separate and
-fine. Precondition: `$env:FOREMAN` is `1`.
+Everything needed for the board is here or in the two reference files
+beside this file. Foreman's source and docs are for changing foreman; read
+them only to diagnose behavior these files do not explain. Researching your
+task's subject matter is separate and fine. Precondition: `$env:FOREMAN` is
+`1`.
 
 Two reference files sit beside this one. Read each only when you need it:
 

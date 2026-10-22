@@ -10,8 +10,8 @@ skip the claim, the `Card:` trailer, the integration queue, and the board.
 You coordinate; you do not do the cards' work yourself.
 
 Codex sandbox: Foreman's control channel is a named pipe the sandbox blocks
-("Access is denied (os error 5)"). Run every kanban, snapshot, and close
-command with escalated/approved execution from the start.
+("Access is denied (os error 5)"). Run every `$env:FOREMAN_EXE` command with
+escalated/approved execution from the start.
 
 ## The loop
 
@@ -55,7 +55,8 @@ change you made. The ledger replaces re-reading the board.
 
 ## A card came back done: review the worker
 
-The worker's terminal holds its final report. Start with the tail:
+The worker's terminal holds its final report, and snapshot reads it
+wherever its tab sits. Start with the tail:
 
 ```powershell
 & $env:FOREMAN_EXE snapshot --terminal tN --tail 40
@@ -170,12 +171,30 @@ dispatch, not in chat. Then:
 
 ## A worker that never comes back
 
-A worker stuck on a permission prompt looks exactly like a working one —
-`wait` only times out (exit 2). On a timeout, snapshot each ledger card's
-pane with `--tail 30`. Report a prompt or a stall to the human; do not
-answer the worker's permission prompts yourself. Worktree cards cold-build
-their own `target/` and land through one queue a card at a time, so a wave
-lands slowly.
+A worker stuck on a permission prompt stays `in_progress`, so `wait` only
+times out. Exit 2 is a timeout or an unreachable foreman: run
+`& $env:FOREMAN_EXE status --json`, and if that fails too, report foreman
+unreachable and stop. Otherwise act on each ledger terminal's `agent_state`:
+
+- `needs_you` — the worker is waiting on the human. Hand it over: snapshot
+  its tail to read the prompt, post `@you` naming the terminal, its card,
+  and what it asks, then `focus --terminal tN` so the human lands on it.
+  Focus the next one only after the previous one has left `needs_you`; the
+  human answers the prompt, never you. Keep waiting on the rest.
+- `working` — still busy; wait again. If it is still `working` at the
+  next timeout, snapshot the tail: Claude interrupted with Esc keeps
+  reporting `working`, and Grok never reports `needs_you`.
+- `idle` while its card is still `in_progress` — first `list <id> --json`:
+  an `integration` whose `phase` is `queued` or `integrating` is landing,
+  not stalled. Otherwise the worker ended its turn without closing out:
+  snapshot the tail, answer a question the plan settles with a targeted
+  post, else report it.
+- No `agent_state` (state is off in Settings, or no hook has fired yet) —
+  snapshot each ledger pane with `--tail 30` and report a prompt or a stall
+  to the human.
+
+Worktree cards cold-build their own `target/` and land through one queue a
+card at a time, so a wave lands slowly; a timeout alone is not a stall.
 
 ## When the plan is finished
 

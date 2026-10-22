@@ -5,12 +5,16 @@ description: Use when running inside Foreman (the FOREMAN env var is 1) and Code
 
 # The Foreman Project Kanban Board
 
-**This skill is complete. Do NOT read foreman source or docs to learn kanban
-mechanics — every fact you need is here or in the two reference files
-beside this file.** Researching your task's subject matter is separate and
-fine.
+Everything needed for the board is here or in the two reference files
+beside this file. Foreman's source and docs are for changing Foreman; read
+them only to diagnose behavior these files do not explain. Researching your
+task's subject matter is separate and fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
+
+Codex sandbox: Foreman's control channel is a named pipe the sandbox blocks
+("Access is denied (os error 5)"). Run every `$env:FOREMAN_EXE` command with
+escalated/approved execution from the start.
 
 Two reference files sit beside this one. Read each only when you need it:
 
@@ -95,11 +99,6 @@ Creating a card is a single `add` call. Do not research the repo to compose
 a body — write the pointer you already have, or go title-only. Exit code `0`
 means the card exists; no follow-up `list`. The reply JSON carries the new
 card's `id` — capture it if you will `wait` on the card.
-
-Sandbox note: Foreman's control channel is a named pipe, which the Codex
-sandbox blocks — the connection fails with "Access is denied (os error 5)".
-Run kanban commands with escalated/approved execution from the start
-instead of discovering this per card.
 
 ## Close-out discipline
 

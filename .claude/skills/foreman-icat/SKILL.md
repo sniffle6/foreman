@@ -5,8 +5,9 @@ description: Use when running inside foreman (the FOREMAN env var is 1) and you 
 
 # Show an image to the human in foreman
 
-**This skill is complete. Do NOT read foreman source or docs to learn icat/view
-mechanics — every fact you need is below.**
+Everything needed to show images is below. Foreman's source and docs are for
+changing foreman; read them only to diagnose behavior this skill does not
+explain.
 
 Precondition: `$env:FOREMAN` is `1`; if not, tell the user this needs to run
 inside foreman (icat also renders in kitty/WezTerm, but don't rely on it
@@ -52,20 +53,10 @@ bash: `"$FOREMAN_EXE" icat "/c/path/to/image.png"` (same for `view`).
   it just writes kitty-graphics bytes to stdout — it means **stdout could
   not be written**, i.e. the harness-capture / redirect failure above, not
   a dead GUI.
-- Release installs ship a console `foreman.com` beside the GUI `foreman.exe`
-  (≥ v0.5.6), and `FOREMAN_EXE` points at it, so PowerShell waits for CLI
-  verbs and sets `$LASTEXITCODE`. On older installs PowerShell doesn't wait
-  for `foreman.exe`: redirect or pipe output to surface CLI errors.
-- If foreman replies `unexpected argument "icat"`/`"view"` or shows usage,
-  the installed foreman predates the verb (icat needs ≥ v0.3.0, view
-  ≥ v0.3.2) — tell the user to update foreman, and fall back to naming the
-  file path.
 
-## Anti-patterns
+## Showing it well
 
-- Do NOT `cat`/`Get-Content` an image file into the terminal — that floods
-  the pane with binary garbage. icat/view are the only correct ways.
-- Don't screenshot-verify silently and describe the result in prose when the
-  human asked to see it — show the image.
-- Don't icat from a captured-output tool call and claim the human saw it —
-  they didn't. Use `view` there.
+- Show image files with icat or view only; printing one with
+  `cat`/`Get-Content` floods the pane with binary.
+- When the human asks to see something, show the image itself rather than
+  describing a screenshot in prose.

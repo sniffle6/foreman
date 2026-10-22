@@ -1,21 +1,25 @@
 ---
 name: foreman-dispatch
-description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to launch an agent or command in a new visible terminal, dispatch or spawn a worker, open a pane with a prompt, or run a task in its own Foreman project terminal. NOT for kanban cards or plans: dispatching a card uses foreman-kanban (`kanban dispatch`), never this.
+description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex launches or manages visible terminals — dispatch or spawn a worker, open a pane with a prompt or command, check on a worker, read or drive another pane, hand a pane to the human, close one. Kanban cards and plans dispatch through foreman-kanban (`kanban dispatch`) instead.
 ---
 
-# Dispatch a Visible Agent Into Foreman
+# Launch and Manage Visible Terminals in Foreman
 
-**This skill is complete. Do NOT read foreman source or docs to learn
-dispatch mechanics — every fact you need (including quoting safety) is
-below.** Researching your task's subject matter is separate and fine.
+Everything needed to launch and manage panes is below, quoting safety
+included. Foreman's source and docs are for changing Foreman; read them only
+to diagnose behavior this skill does not explain. Researching your task's
+subject matter is separate and fine.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
-**Is the work a kanban card, or part of a plan (cards tagged with a plan and
-wave)? Stop — use the foreman-kanban skill and `kanban dispatch <id> --agent
-…`.** `open` is a bare terminal: no card claim, no worktree, no `Card:`
-trailer, no integration queue, and the board never learns the worker exists.
-`kanban dispatch` is exactly what the board's "Start with" button does.
+Codex sandbox: Foreman's control channel is a named pipe the sandbox blocks
+("Access is denied (os error 5)"). Run every `$env:FOREMAN_EXE` command with
+escalated/approved execution from the start.
+
+**Kanban card or plan work goes through foreman-kanban: `kanban dispatch <id>
+--agent …`.** `open` is a bare terminal: no card claim, no worktree, no
+`Card:` trailer, no integration queue, and the board never learns the worker
+exists. `kanban dispatch` is exactly what the board's "Start with" button does.
 
 ## Choosing workers
 
@@ -42,7 +46,7 @@ PowerShell:
 & $env:FOREMAN_EXE open --title "agent - <short-label>" -- codex exec "<task prompt>"
 ```
 
-bash:
+bash (and the same `"$FOREMAN_EXE" <verb>` shape for every command below):
 
 ```bash
 "$FOREMAN_EXE" open --title "agent - <short-label>" -- codex "<task prompt>"
@@ -55,10 +59,9 @@ The reply JSON gives the new terminal id and project id:
 {"ok":true,"terminal":"t3","project":"p1"}
 ```
 
-The ids are assigned by Foreman. Do not invent them or predict them.
-The reply is NOT the worker's result: fire-and-watch, do not poll the pane.
-Check on a worker with `& $env:FOREMAN_EXE status` — it lists every terminal
-as running or exited(code).
+The ids are assigned by Foreman; record them, you cannot pick or predict
+them. The reply is NOT the worker's result: fire-and-watch. Tell the user the
+agent is running and where.
 
 ## Prompt Quoting
 
@@ -72,7 +75,7 @@ Practical rule for Codex on Windows:
 - For the npm-shim `codex`, use one-line, quote-free prompts.
 - For multi-line prompts, use a native executable if available, or flatten the
   prompt before dispatch.
-- Do not hand-escape a long prompt inline in PowerShell; simplify it instead.
+- Keep long prompts simple rather than hand-escaping them inline in PowerShell.
 
 Example one-line prompt:
 
@@ -101,5 +104,43 @@ Examples:
 & $env:FOREMAN_EXE open --cwd "C:\code\repo" --title "cmd" -- cmd.exe
 ```
 
-Use `foreman-chat` for message content, recipient targeting, delivery timing,
-and team coordination rules.
+## Your Panes After Launch
+
+Every pane is reachable by its `tN` wherever it sits: behind another tab, in
+a minimized window, or in a project tab the human isn't looking at. Read and
+message panes where they are.
+
+```powershell
+& $env:FOREMAN_EXE status --json    # one JSON object per line, per project and per terminal
+```
+
+- **Check on workers:** `status --json`. Each terminal line has `state`
+  (`running` | `exited`, plus `exit_code`), `ready` (the pane takes input),
+  `placement` (`focused` | `front` | `background` | `minimized`), and, when
+  the agent's hooks report it, `agent_state`: `working` (leave it),
+  `needs_you` (hand it to the human, below), or `idle` (its turn ended;
+  snapshot to read its last message). No `agent_state` means unknown, not
+  idle: snapshot instead. Check when you need an answer; a worker's result
+  reaches you through chat or its final message, so a timer adds nothing.
+- **Talk to an agent:** chat. A post waits until the agent can take it —
+  Ready, and Idle too when agent state is on — so a Working agent gets it
+  after its turn; `chat --now` is for a steer that cannot wait. `foreman-chat`
+  covers message content, targeting, and team rules.
+- **Read a pane:** `snapshot --terminal tN --tail 40` — the last 40 lines,
+  scrollback included.
+- **Drive a program that is not an agent** — a dev server, REPL, or script
+  prompt you launched: `send --terminal tN --keys "Ctrl+C"` or
+  `` send --terminal tN --text "y`r" `` (bash: `--text $'y\r'`), then
+  snapshot to see the effect. Agents get chat instead: `send` types straight
+  into the pane past the delivery gate, so it can land mid-turn or answer
+  the agent's permission prompt.
+- **Hand a pane to the human:** `focus --terminal tN` brings it to the front
+  and moves the human's keyboard there, mid-keystroke if they are typing.
+  When the human asks to see a pane, focus it. When a worker you launched is
+  `needs_you`, snapshot it to learn what it asks, post `@you` naming the
+  pane and the question (`foreman-chat`), then focus it. One pane at a time;
+  the human answers the prompt, never you.
+- **Close:** `close tN` — a bare id, no `--terminal` — closes that pane and
+  kills its process tree. Bare `close` closes your own pane, ending you.
+
+`& $env:FOREMAN_EXE <verb> --help` has every flag.

@@ -11,9 +11,14 @@ only when diagnosing behavior these instructions do not explain.
 Precondition: `$env:FOREMAN` is `1`. If not, tell the user this needs to run
 inside a Foreman terminal.
 
+Codex sandbox: Foreman's control channel is a named pipe the sandbox blocks
+("Access is denied (os error 5)"). Run every `$env:FOREMAN_EXE` command with
+escalated/approved execution from the start.
+
 One chat room exists per Foreman project. Posts are injected into every member's
-terminal as typed input. Members do not poll. The transcript is the roster:
-every line carries a `tN` terminal id.
+terminal as typed input. Members do not poll. Delivery reaches a member
+wherever its pane sits, behind another tab or minimized, so post to it where
+it is. The transcript is the roster: every line carries a `tN` terminal id.
 
 **Cost rule: target by default.** Every delivered post costs each receiver a
 full agent turn. Broadcast only when every member must act; otherwise use
@@ -67,7 +72,7 @@ Delivery timing:
 - Needs you (permission prompts) holds every post, including `--now`.
 - No state yet or state disabled keeps Ready-only delivery. Hooks can be late;
   Claude Esc leaves stale Working, so `--now` also releases steers in that case.
-- `--now` is post-only. Old servers ignore it and keep their delivery behavior.
+- `--now` is post-only.
 
 ## Coordinating a chat-capable team
 
@@ -112,7 +117,12 @@ condition, and who reports the result so workers do not wait for each other.
   post. `--history` never joins.
 - Wait for the dispatch reply before posting to the returned terminal id.
   Foreman holds delivery until the receiving Session is Ready. If delivery
-  stalls, inspect readiness and agent state; arbitrary sleeps are not a fix.
+  stalls, read the receiver's line in `& $env:FOREMAN_EXE status --json`:
+  `ready: false` means it cannot take input yet; `agent_state` `working` or
+  `needs_you` means the post is held by design. Sleeping releases nothing.
+- A member stuck on `needs_you` is waiting on the human, and so is every
+  post to it. Post `@you` naming the pane and what it asks; to put the human
+  on it directly, see `foreman-dispatch`, "Your Panes After Launch".
 - Sequence gaps in `--history` are normal; join/exit events consume sequence ids.
 - Avoid literal `"` in chat messages. Use `--` before dash-leading messages.
 - A worker may close its own pane with & $env:FOREMAN_EXE close AFTER posting
