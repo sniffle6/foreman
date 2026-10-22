@@ -59,6 +59,15 @@ A tmux-style temporary state that renders one Win over the whole area without
 changing the Layout tree.
 _Avoid_: maximize, fullscreen (maximize is a real rect change; Zoom is an overlay).
 
+**Placement**:
+Where a tab sits, as `foreman status` reports it: `focused` (holds the
+keyboard), `front` (the tab its Win shows), `background` (behind another tab in
+its Win), or `minimized` (its Win is minimized). Placement never limits
+targeting: ids follow the Session, so every placement takes send, snapshot,
+chat, close and focus.
+_Avoid_: visible/hidden (a Zoom can cover a `front` tab), active (that word
+already means both "shown tab" and "has focus").
+
 **Layout item**:
 A Content-bearing tab as a project layout sees it: a persistent `layout_id`
 plus its Content kind. Survives tab moves and cold restore; never a Member id
@@ -152,7 +161,7 @@ _Avoid_: spawn, run, fork.
 
 **Control plane**:
 The local request channel an in-terminal agent uses to drive Foreman — open a
-terminal, post to chat, query status, close.
+terminal, post to chat, query status, focus a tab, close.
 _Avoid_: API, IPC bus, server.
 
 **FOREMAN_PIPE**:

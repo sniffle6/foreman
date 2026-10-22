@@ -1826,6 +1826,7 @@ mod app_logic_tests {
                 control::StatusRequest {
                     cmd: "status".into(),
                     project: None,
+                    json: false,
                 },
                 reply_tx,
                 std::time::Instant::now(),

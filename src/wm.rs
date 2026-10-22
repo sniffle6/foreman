@@ -1751,7 +1751,8 @@ impl WindowManager {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return;
                 }
-                let _ = reply.send(match self.status_dispatch(&req) {
+                let state_enabled = crate::config::live(ctx).agent_state_badges;
+                let _ = reply.send(match self.status_dispatch(&req, state_enabled) {
                     Ok(lines) => OpenReply {
                         ok: true,
                         history: Some(lines),
@@ -1844,6 +1845,31 @@ impl WindowManager {
                     },
                     Err(e) => OpenReply::err(e),
                 });
+            }
+            CtrlMsg::Focus(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                match self.focus_dispatch(&req) {
+                    Err(e) => {
+                        let _ = reply.send(OpenReply::err(e));
+                    }
+                    Ok((path, pid, tid)) => {
+                        let ok = OpenReply {
+                            ok: true,
+                            project: Some(format!("p{pid}")),
+                            terminal: tid.map(term_tag),
+                            ..Default::default()
+                        };
+                        // Close's rule: a client that already gave up must not
+                        // see its keyboard grab land later, so act only once
+                        // the reply is on the channel.
+                        if reply.send(ok).is_ok() {
+                            self.surface_target(path);
+                            ctx.request_repaint();
+                        }
+                    }
+                }
             }
             CtrlMsg::View(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
@@ -2354,22 +2380,34 @@ impl WindowManager {
     /// Build the `status` listing: one header line per Project tab, one
     /// line per terminal TAB inside it (`Content::Chat`/nested projects are
     /// skipped). Project and Terminal ids belong to their tabs and survive
-    /// merge/untab. `None` project = every Project tab; a filter that doesn't
-    /// resolve is an error, not an empty list. Running/exited truth comes from
+    /// merge/untab; each line carries its tab's [`placement`] so a caller can
+    /// see which targets are hidden. `None` project = every Project tab; a
+    /// filter that doesn't resolve is an error, not an empty list. Running/exited truth comes from
     /// `Session::exited()`
     /// (try_wait on the live process), never from the `"  ·  exited (code)"`
-    /// title stamp — titles are cleaned with `display_name`.
+    /// title stamp — titles are cleaned with `display_name`. Text and `--json`
+    /// render the same rows; `agent_state` rides only the JSON, and only when
+    /// the Settings toggle that installs the hooks is on (the gate chat
+    /// delivery uses, so status never reports state delivery ignores).
     fn status_dispatch(
         &mut self,
         req: &crate::control::StatusRequest,
+        agent_state_enabled: bool,
     ) -> Result<Vec<String>, String> {
+        use crate::control::{StatusProjectLine, StatusTerminalLine};
         let filter = match req.project.as_deref() {
             Some(spec) => Some(self.resolve_project(Some(spec))?),
             None => None,
         };
-        let mut lines = Vec::new();
+        enum Row {
+            Project(StatusProjectLine),
+            Terminal(StatusTerminalLine),
+        }
+        let mut rows = Vec::new();
+        let desk_focused = self.focused;
         for w in self.windows.iter_mut() {
-            for project_tab in &mut w.tabs {
+            let (wid, wactive, wmin) = (w.id, w.active, w.minimized);
+            for (ti, project_tab) in w.tabs.iter_mut().enumerate() {
                 // Detach the display title before borrowing its content.
                 let name = display_name(&project_tab.title).to_string();
                 let Content::Project(child) = &mut project_tab.content else {
@@ -2381,41 +2419,89 @@ impl WindowManager {
                 if filter.is_some_and(|wanted| wanted != pid) {
                     continue;
                 }
-                let cwd = child
-                    .cwd
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "-".into());
-                lines.push(format!("p{pid}  {name}  {cwd}"));
+                let project_place = placement(wmin, ti == wactive, desk_focused == Some(wid));
+                rows.push(Row::Project(StatusProjectLine {
+                    project: format!("p{pid}"),
+                    name,
+                    cwd: child.cwd.as_deref().map(|p| p.display().to_string()),
+                    placement: project_place.into(),
+                }));
+                // Only the focused Project's focused window holds the keyboard.
+                let child_focused = child.focused.filter(|_| project_place == "focused");
                 // Clone the room Rc before the terminal loop so membership reads
                 // don't borrow `child` a second time while it is borrowed mutably.
                 let room = Rc::clone(&child.chat);
                 for win in child.windows.iter_mut() {
-                    for tab in win.tabs.iter_mut() {
+                    let (cwid, cactive, cmin) = (win.id, win.active, win.minimized);
+                    for (ci, tab) in win.tabs.iter_mut().enumerate() {
+                        let place = placement(cmin, ci == cactive, child_focused == Some(cwid));
                         let Content::Terminal(s) = &mut tab.content else {
                             continue;
                         };
                         let tag = term_tag(s.term_id());
-                        let state = match s.exited() {
-                            Some(code) => format!("exited({code})"),
-                            None => "running".into(),
-                        };
-                        let member = if room.borrow().is_member(&tag) {
-                            "chat"
-                        } else {
-                            "-"
-                        };
-                        lines.push(format!(
-                            "  {}  {}  {}  {}",
-                            tag,
-                            state,
-                            member,
-                            display_name(&tab.title)
-                        ));
+                        let exit_code = s.exited();
+                        let agent_state = agent_state_enabled
+                            .then(|| s.agent_state().badge(s.icon_kind(), s.has_exited()))
+                            .flatten()
+                            .map(|b| match b.state {
+                                crate::agent_state::AgentState::Working => "working",
+                                crate::agent_state::AgentState::NeedsYou => "needs_you",
+                                crate::agent_state::AgentState::Idle => "idle",
+                            });
+                        rows.push(Row::Terminal(StatusTerminalLine {
+                            project: format!("p{pid}"),
+                            chat: room.borrow().is_member(&tag),
+                            terminal: tag,
+                            title: display_name(&tab.title).to_string(),
+                            agent: s.icon_kind().agent_label().map(str::to_ascii_lowercase),
+                            state: if exit_code.is_some() {
+                                "exited"
+                            } else {
+                                "running"
+                            }
+                            .into(),
+                            exit_code,
+                            placement: place.into(),
+                            ready: s.ready(),
+                            agent_state: agent_state.map(str::to_string),
+                        }));
                     }
                 }
             }
         }
+        if req.json {
+            return Ok(rows
+                .iter()
+                .map(|row| match row {
+                    Row::Project(p) => serde_json::to_string(p),
+                    Row::Terminal(t) => serde_json::to_string(t),
+                })
+                .collect::<Result<_, _>>()
+                .expect("status lines are plain data"));
+        }
+        let mut lines: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                Row::Project(p) => format!(
+                    "{}  {}  {}  {}",
+                    p.project,
+                    p.placement,
+                    p.name,
+                    p.cwd.as_deref().unwrap_or("-")
+                ),
+                Row::Terminal(t) => format!(
+                    "  {}  {}  {}  {}  {}",
+                    t.terminal,
+                    match t.exit_code {
+                        Some(code) => format!("exited({code})"),
+                        None => "running".into(),
+                    },
+                    if t.chat { "chat" } else { "-" },
+                    t.placement,
+                    t.title
+                ),
+            })
+            .collect();
         if filter.is_none() && lines.is_empty() {
             lines.push("no projects".into());
         }
@@ -2648,6 +2734,73 @@ impl WindowManager {
         // One pump for the whole reply — chaining snapshot_text/cells/cursor_info
         // would pump per field and can stitch gens under active output.
         Ok(session.snapshot_all(req.attrs, req.cursor, req.tail))
+    }
+
+    /// Validate a focus request and resolve it to the panel's write-seam
+    /// address WITHOUT acting — the caller surfaces only after replying. A
+    /// terminal resolves wherever its tab sits: behind another tab, in a
+    /// minimized window, or inside a Project that is itself a background tab.
+    #[allow(clippy::type_complexity)]
+    fn focus_dispatch(
+        &self,
+        req: &crate::control::FocusRequest,
+    ) -> Result<(crate::panel::TargetPath, WinId, Option<WinId>), String> {
+        let (pid, tid) = match req.terminal.as_deref() {
+            Some(terminal) => {
+                let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
+                (pid, Some(tid))
+            }
+            None => {
+                let spec = req
+                    .project
+                    .as_deref()
+                    .ok_or("focus: give a project and/or a terminal")?;
+                (self.resolve_project(Some(spec))?, None)
+            }
+        };
+        let (widx, ptab, child) = self
+            .project_location(pid)
+            .ok_or_else(|| format!("no such project: p{pid}"))?;
+        let project = self.windows[widx].id;
+        let path = match tid {
+            None => crate::panel::TargetPath {
+                project,
+                ptab: None,
+                window: None,
+                tab: Some(ptab),
+            },
+            Some(tid) => {
+                let (window, tab) = child
+                    .terminal_location(tid)
+                    .ok_or_else(|| format!("no such terminal: t{tid}"))?;
+                crate::panel::TargetPath {
+                    project,
+                    ptab: Some(ptab),
+                    window: Some(window),
+                    tab: Some(tab),
+                }
+            }
+        };
+        Ok((path, pid, tid))
+    }
+
+    /// Where Project `pid`'s tab sits on this desktop: window index, tab index,
+    /// and its nested manager. [`Self::project_child`] for callers that also
+    /// need the container.
+    fn project_location(&self, pid: WinId) -> Option<(usize, usize, &WindowManager)> {
+        let tag = format!("p{pid}");
+        self.windows.iter().enumerate().find_map(|(wi, window)| {
+            window
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(ti, tab)| match &tab.content {
+                    Content::Project(child) if child.tag.as_deref() == Some(tag.as_str()) => {
+                        Some((wi, ti, child.as_ref()))
+                    }
+                    _ => None,
+                })
+        })
     }
 
     /// Close terminal `tid` inside project `pid` (the dispatch undo path).
@@ -9439,6 +9592,20 @@ fn term_tag(id: WinId) -> String {
     format!("t{id}")
 }
 
+/// Where a tab sits, as `foreman status` reports it. A minimized window wins
+/// over its tab order; `focused` only counts for its window's shown tab.
+fn placement(minimized: bool, active_tab: bool, focused: bool) -> &'static str {
+    if minimized {
+        "minimized"
+    } else if !active_tab {
+        "background"
+    } else if focused {
+        "focused"
+    } else {
+        "front"
+    }
+}
+
 /// One window as dispatch placement sees it ([`dispatch_stack_target`]).
 #[derive(Clone, Copy, Debug)]
 struct StackCandidate {
@@ -14746,6 +14913,7 @@ mod tests {
         let req = crate::control::StatusRequest {
             cmd: "status".into(),
             project: project.map(str::to_string),
+            json: false,
         };
         (crate::control::CtrlMsg::Status(req, rtx, sent), rrx)
     }
@@ -14760,7 +14928,7 @@ mod tests {
         assert!(r.ok, "{:?}", r.error);
         let lines = r.history.expect("status rides the history field");
         assert_eq!(lines.len(), 3, "project header + two terminals: {lines:?}");
-        assert!(lines[0].starts_with("p1  proj"), "{}", lines[0]);
+        assert!(lines[0].starts_with("p1  focused  proj"), "{}", lines[0]);
         for (line, id) in [(&lines[1], a), (&lines[2], b)] {
             assert!(
                 line.starts_with(&format!("  t{id}  running  chat")),
@@ -14790,7 +14958,9 @@ mod tests {
         // query can't park cmd.exe (the documented trap), and refreshing exit
         // titles so the title-stamp path is exercised (display_name must
         // strip it from the status line).
-        let want = format!("  t{t}  exited(7)  chat  agent · cmd.exe");
+        // Placement sits between membership and title; this test is about the
+        // state column, so it accepts whichever slot the dispatch landed in.
+        let (want_head, want_tail) = (format!("  t{t}  exited(7)  chat  "), "  agent · cmd.exe");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
@@ -14816,7 +14986,7 @@ mod tests {
                 .iter()
                 .find(|l| l.starts_with(&format!("  t{t}  ")))
                 .expect("the worker's line");
-            if *line == want {
+            if line.starts_with(&want_head) && line.ends_with(want_tail) {
                 // status asked the live process, and the title stamp
                 // ("  ·  exited (7)") never leaks into the listing
                 assert!(!line.contains("·  exited ("), "{line}");
@@ -15189,6 +15359,438 @@ mod tests {
             rrx.try_recv().is_err(),
             "stale send must be dropped unanswered"
         );
+    }
+
+    // --- hidden tabs as targets: status placement, focus, send, chat ---
+
+    /// Desktop whose Project p1 hides terminals every way a tab can hide.
+    /// `a` is focused in its own window; `b` (member) sits behind non-member
+    /// `c` in one window; `m` (member) is in a minimized window. p2 is a
+    /// Project tab behind p1 on the same desktop window. Returns
+    /// `(desk, a, b, c, m)`; every terminal runs `cmd /c pause`, so the first
+    /// stdin byte it reads makes it exit.
+    fn hidden_tabs_fixture(ctx: &egui::Context) -> (WindowManager, WinId, WinId, WinId, WinId) {
+        let mut child = WindowManager::new();
+        child.tag = Some("p1".to_string());
+        let a = child
+            .add_terminal_cmd(&pause_argv(), None, None, ctx)
+            .unwrap();
+        let m = dispatch_beside(&mut child, a, ctx);
+        // Minimize before dispatching b: stacking skips minimized windows, so
+        // b gets its own window instead of becoming a tab on m's.
+        child.minimize(m);
+        let b = dispatch_beside(&mut child, a, ctx);
+        let c = child.next;
+        child.next += 1;
+        let mut shell = Session::spawn_argv(&pause_argv(), None, &[], ctx.clone()).unwrap();
+        shell.set_term_id(c);
+        let w = child.windows.iter_mut().find(|w| w.id == b).unwrap();
+        w.tabs.push(Tab::fixed("c", Content::Terminal(shell)));
+        w.active = 1; // c in front, b behind
+        child.focus(a);
+
+        let mut other = WindowManager::new();
+        other.tag = Some("p2".to_string());
+        let mut d = WindowManager::new().as_desktop();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        d.push_win(
+            1,
+            Tab::fixed("proj", Content::Project(Box::new(child))),
+            rect,
+        );
+        d.windows[0]
+            .tabs
+            .push(Tab::fixed("other", Content::Project(Box::new(other))));
+        (d, a, b, c, m)
+    }
+
+    fn focus_msg(
+        project: Option<&str>,
+        terminal: Option<&str>,
+        sent: std::time::Instant,
+    ) -> (
+        crate::control::CtrlMsg,
+        std::sync::mpsc::Receiver<crate::control::OpenReply>,
+    ) {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::FocusRequest {
+            cmd: "focus".into(),
+            project: project.map(str::to_string),
+            terminal: terminal.map(str::to_string),
+        };
+        (crate::control::CtrlMsg::Focus(req, rtx, sent), rrx)
+    }
+
+    /// `id -> placement` from one status reply: project lines are
+    /// `pN  place  …`, terminal lines `  tN  state  chat  place  …`.
+    fn placements(
+        d: &mut WindowManager,
+        ctx: &egui::Context,
+    ) -> std::collections::HashMap<String, String> {
+        let (msg, rrx) = status_msg(None, std::time::Instant::now());
+        d.handle_ctrl(msg, ctx);
+        let r = rrx.try_recv().expect("no status reply");
+        assert!(r.ok, "{:?}", r.error);
+        r.history
+            .expect("lines")
+            .iter()
+            .map(|line| {
+                let cols: Vec<&str> = line.trim_start().split("  ").collect();
+                let place = if line.starts_with('p') {
+                    cols[1]
+                } else {
+                    cols[3]
+                };
+                (cols[0].to_string(), place.to_string())
+            })
+            .collect()
+    }
+
+    /// One real desktop frame: the production pump path, so background tabs
+    /// and minimized windows are kept alive only by `show`'s own keepalive.
+    fn desk_frame(d: &mut WindowManager, ctx: &egui::Context) {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 700.0),
+        ));
+        let _ = ctx.run_ui(input, |ui| {
+            let area = ui.max_rect();
+            d.show(ui, area, true, egui::Id::new("hidden-tabs"), false);
+        });
+    }
+
+    #[test]
+    fn placement_ranks_minimized_over_tab_order_over_focus() {
+        assert_eq!(placement(true, true, true), "minimized");
+        assert_eq!(placement(true, false, false), "minimized");
+        assert_eq!(placement(false, false, true), "background");
+        assert_eq!(placement(false, true, true), "focused");
+        assert_eq!(placement(false, true, false), "front");
+    }
+
+    #[test]
+    fn status_reports_where_each_tab_sits() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b, c, m) = hidden_tabs_fixture(&ctx);
+        let places = placements(&mut d, &ctx);
+        assert_eq!(places["p1"], "focused", "{places:?}");
+        assert_eq!(places["p2"], "background", "{places:?}");
+        assert_eq!(places[&format!("t{a}")], "focused", "{places:?}");
+        assert_eq!(places[&format!("t{b}")], "background", "{places:?}");
+        assert_eq!(places[&format!("t{c}")], "front", "{places:?}");
+        assert_eq!(places[&format!("t{m}")], "minimized", "{places:?}");
+
+        // A terminal is only `focused` while its Project is: focus elsewhere
+        // on the desktop and a drops to `front`.
+        d.focused = None;
+        let places = placements(&mut d, &ctx);
+        assert_eq!(places["p1"], "front", "{places:?}");
+        assert_eq!(places[&format!("t{a}")], "front", "{places:?}");
+    }
+
+    fn status_json(d: &mut WindowManager, ctx: &egui::Context) -> Vec<serde_json::Value> {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        let req = crate::control::StatusRequest {
+            cmd: "status".into(),
+            project: None,
+            json: true,
+        };
+        d.handle_ctrl(
+            crate::control::CtrlMsg::Status(req, rtx, std::time::Instant::now()),
+            ctx,
+        );
+        let r = rrx.try_recv().expect("no status reply");
+        assert!(r.ok, "{:?}", r.error);
+        r.history
+            .expect("lines")
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+            .collect()
+    }
+
+    #[test]
+    fn status_json_lines_carry_placement_ready_and_hook_state() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b, c, m) = hidden_tabs_fixture(&ctx);
+        let term = |rows: &[serde_json::Value], id: WinId| {
+            rows.iter()
+                .find(|r| r["project"] == "p1" && r["terminal"] == format!("t{id}"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for t{id}: {rows:?}"))
+        };
+        let rows = status_json(&mut d, &ctx);
+        let p1 = rows
+            .iter()
+            .find(|r| r["project"] == "p1" && r.get("terminal").is_none())
+            .expect("p1's project line");
+        assert_eq!(p1["placement"], "focused");
+        assert_eq!(p1["name"], "proj");
+        assert!(p1.get("cwd").is_none(), "no directory = no key: {p1}");
+        let tb = term(&rows, b);
+        assert_eq!(tb["placement"], "background");
+        assert_eq!(tb["state"], "running");
+        assert_eq!(tb["chat"], true);
+        assert!(tb["ready"].is_boolean(), "{tb}");
+        assert_eq!(term(&rows, c)["chat"], false, "c never joined");
+        assert_eq!(term(&rows, m)["placement"], "minimized");
+        for r in rows.iter().filter(|r| r.get("terminal").is_some()) {
+            assert!(
+                r.get("agent").is_none() && r.get("agent_state").is_none(),
+                "plain cmd panes carry no agent fields: {r}"
+            );
+        }
+
+        // A Claude pane stopped on a permission prompt: its state shows only
+        // once the Settings toggle that installs the hooks is on.
+        let s = d.session_mut(1, a).unwrap();
+        s.set_osc_title_for_test(Some("claude".into()));
+        s.agent_state_mut().apply(
+            crate::terminal_titles::SourceAgent::Claude,
+            crate::agent_state::HookEvent::PermissionRequest,
+        );
+        let ta = term(&status_json(&mut d, &ctx), a);
+        assert_eq!(ta["agent"], "claude");
+        assert!(ta.get("agent_state").is_none(), "state off: {ta}");
+        let mut on = crate::config::Settings::default();
+        on.agent_state_badges = true;
+        crate::config::seed_live(&ctx, &on);
+        assert_eq!(
+            term(&status_json(&mut d, &ctx), a)["agent_state"],
+            "needs_you"
+        );
+
+        // No projects: no lines at all, so a parser sees an empty stream.
+        let mut empty = WindowManager::new().as_desktop();
+        assert!(status_json(&mut empty, &ctx).is_empty());
+    }
+
+    #[test]
+    fn focus_surfaces_a_background_tab() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b, c, _m) = hidden_tabs_fixture(&ctx);
+        let tb = format!("t{b}");
+        let (msg, rrx) = focus_msg(Some("p1"), Some(&tb), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no focus reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.project.as_deref(), Some("p1"));
+        assert_eq!(r.terminal.as_deref(), Some(tb.as_str()));
+
+        let places = placements(&mut d, &ctx);
+        assert_eq!(places[&tb], "focused", "{places:?}");
+        assert_eq!(places[&format!("t{c}")], "background", "{places:?}");
+        assert_eq!(places[&format!("t{a}")], "front", "{places:?}");
+        assert_eq!(
+            places.values().filter(|p| *p == "focused").count(),
+            2,
+            "exactly one project and one terminal hold the keyboard: {places:?}"
+        );
+    }
+
+    #[test]
+    fn focus_restores_a_minimized_terminal() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b, _c, m) = hidden_tabs_fixture(&ctx);
+        let tm = format!("t{m}");
+        let (msg, rrx) = focus_msg(Some("p1"), Some(&tm), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no focus reply");
+        assert!(r.ok, "{:?}", r.error);
+        let child = d.project_child(1).unwrap();
+        let w = child.windows.iter().find(|w| w.id == m).unwrap();
+        assert!(!w.minimized, "focus must restore the window");
+        assert_eq!(child.focused, Some(m));
+        assert_eq!(placements(&mut d, &ctx)[&tm], "focused");
+    }
+
+    #[test]
+    fn focus_switches_project_tabs_both_ways() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b, _c, _m) = hidden_tabs_fixture(&ctx);
+        // --project alone: the background Project tab comes to the front.
+        let (msg, rrx) = focus_msg(Some("p2"), None, std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no focus reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.project.as_deref(), Some("p2"));
+        assert_eq!(r.terminal, None);
+        let places = placements(&mut d, &ctx);
+        assert_eq!(places["p2"], "focused", "{places:?}");
+        assert_eq!(places["p1"], "background", "{places:?}");
+
+        // A terminal inside the now-hidden p1 pulls its Project tab back.
+        let ta = format!("t{a}");
+        let (msg, rrx) = focus_msg(Some("p1"), Some(&ta), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        assert!(rrx.try_recv().expect("no focus reply").ok);
+        let places = placements(&mut d, &ctx);
+        assert_eq!(places["p1"], "focused", "{places:?}");
+        assert_eq!(places[&ta], "focused", "{places:?}");
+    }
+
+    #[test]
+    fn focus_refuses_bad_targets_and_moves_nothing() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, _b, _c, _m) = hidden_tabs_fixture(&ctx);
+        let before = placements(&mut d, &ctx);
+        for (project, terminal, needle) in [
+            (Some("p1"), Some("t99"), "t99"),
+            (Some("p99"), None, "p99"),
+            (Some("p99"), Some("t1"), "p99"),
+            (None, None, "give a project"),
+        ] {
+            let (msg, rrx) = focus_msg(project, terminal, std::time::Instant::now());
+            d.handle_ctrl(msg, &ctx);
+            let r = rrx.try_recv().expect("no focus reply");
+            assert!(!r.ok, "{project:?} {terminal:?} must fail");
+            let err = r.error.unwrap_or_default();
+            assert!(err.contains(needle), "{err}");
+        }
+        assert_eq!(placements(&mut d, &ctx), before);
+    }
+
+    #[test]
+    fn stale_or_abandoned_focus_moves_nothing() {
+        let ctx = egui::Context::default();
+        let (mut d, _a, b, _c, _m) = hidden_tabs_fixture(&ctx);
+        let tb = format!("t{b}");
+        let before = placements(&mut d, &ctx);
+        let stale = std::time::Instant::now()
+            - (crate::control::REPLY_TIMEOUT + std::time::Duration::from_secs(1));
+        let (msg, rrx) = focus_msg(Some("p1"), Some(&tb), stale);
+        d.handle_ctrl(msg, &ctx);
+        assert!(rrx.try_recv().is_err(), "stale focus must be dropped");
+        // Client gone before the GUI got to it: no late keyboard grab.
+        let (msg, rrx) = focus_msg(Some("p1"), Some(&tb), std::time::Instant::now());
+        drop(rrx);
+        d.handle_ctrl(msg, &ctx);
+        assert_eq!(placements(&mut d, &ctx), before);
+    }
+
+    /// A context that can paint the front terminals [`desk_frame`] renders.
+    fn painting_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+            std::fs::read(p)
+        }));
+        ctx
+    }
+
+    #[test]
+    fn send_reaches_background_tab_and_minimized_terminal() {
+        let ctx = painting_ctx();
+        let (mut d, a, b, c, m) = hidden_tabs_fixture(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Ready = startup DSR answered, which for b and m only the hidden-tab
+        // keepalive inside `show` can do.
+        while ![b, m].iter().all(|&t| d.session(1, t).unwrap().ready()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hidden terminals never became Ready"
+            );
+            desk_frame(&mut d, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for t in [b, m] {
+            let (msg, rrx) = send_msg(
+                Some("p1"),
+                &format!("t{t}"),
+                "x",
+                std::time::Instant::now(),
+                Some(0),
+            );
+            d.handle_ctrl(msg, &ctx);
+            assert!(rrx.try_recv().expect("no send reply").ok);
+        }
+        while ![b, m]
+            .iter()
+            .all(|&t| d.session_mut(1, t).unwrap().exited().is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a hidden terminal never read its sent byte"
+            );
+            desk_frame(&mut d, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Keep pumping past the positive signal so a late stray write into a
+        // or c would have time to land before the negative check.
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < grace {
+            desk_frame(&mut d, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for t in [a, c] {
+            assert!(
+                d.session_mut(1, t).unwrap().exited().is_none(),
+                "t{t} was not a send target"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_picks_the_named_project_when_terminal_ids_collide() {
+        let ctx = egui::Context::default();
+        let (mut d, a, _b, _c, _m) = hidden_tabs_fixture(&ctx);
+        // Each Project numbers its own ids from 1, so p2's first terminal is
+        // also `t{a}` — only the project spec tells the two apart.
+        let twin = d
+            .project_child_mut(2)
+            .unwrap()
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        assert_eq!(twin, a, "fixture premise: the ids collide");
+        d.project_child_mut(1).unwrap().focused = None;
+        let ta = format!("t{a}");
+        let (msg, rrx) = focus_msg(Some("p2"), Some(&ta), std::time::Instant::now());
+        d.handle_ctrl(msg, &ctx);
+        let r = rrx.try_recv().expect("no focus reply");
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.project.as_deref(), Some("p2"));
+        assert_eq!(d.windows[0].active, 1, "p2's tab must come to the front");
+        assert_eq!(d.project_child(2).unwrap().focused, Some(twin));
+        assert_eq!(
+            d.project_child(1).unwrap().focused,
+            None,
+            "p1's same-numbered terminal must not be touched"
+        );
+    }
+
+    #[test]
+    fn chat_reaches_background_and_minimized_members() {
+        let ctx = painting_ctx();
+        let (mut d, a, b, c, m) = hidden_tabs_fixture(&ctx);
+        d.project_child_mut(1)
+            .unwrap()
+            .chat_post(&term_tag(a), "go", &[], None)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while ![b, m]
+            .iter()
+            .all(|&t| d.session_mut(1, t).unwrap().exited().is_some())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a hidden member never received the broadcast"
+            );
+            desk_frame(&mut d, &ctx);
+            d.chat_tick(false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < grace {
+            desk_frame(&mut d, &ctx);
+            d.chat_tick(false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // a sent it and c never joined: neither may be injected.
+        for t in [a, c] {
+            assert!(
+                d.session_mut(1, t).unwrap().exited().is_none(),
+                "t{t} must not receive the post"
+            );
+        }
     }
 
     #[test]

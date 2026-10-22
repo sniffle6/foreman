@@ -52,6 +52,7 @@ foreman chat "backend endpoints are yours; I'll take the UI"
 foreman chat --history 20
 foreman status
 foreman snapshot --terminal t4
+foreman focus --terminal t4
 ```
 
 - **Dispatch** — an agent (or you, from any pane) spawns a worker in a new
@@ -62,6 +63,9 @@ foreman snapshot --terminal t4
 - **Screens are readable** — `snapshot` returns any terminal's grid (viewport,
   or `--tail N` of scrollback), so an agent can check on a worker without
   touching it.
+- **Hidden tabs are still targets** — background tabs and minimized windows
+  keep running and take `send`/`chat`/`snapshot`; `status` shows where each
+  one sits and `focus` brings it to the front.
 - **Skills auto-installed** — on first launch foreman installs
   `foreman-dispatch` / `foreman-chat` skills into Claude Code and Codex, so
   agents discover all of this on their own.

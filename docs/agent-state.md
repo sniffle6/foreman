@@ -28,6 +28,12 @@ in the row's right-edge slot; the other states rank below it. A tab stack's
 "+N" chip paints the same badge on its list rows and turns the needs-you
 colour while a tab it hides needs you (`docs/window-chrome.md`).
 
+Agents read the same state through `foreman status --json` (`agent_state`:
+`working`, `needs_you`, or `idle`; the done marker stays panel-only), behind
+the same setting, so status never reports state that chat delivery ignores.
+The orchestration skill uses it to hand needs-you workers to the human
+(`docs/tab-targeting.md`).
+
 An event applies to the Session whose Foreman project ID and terminal ID match
 (terminal IDs repeat across projects). An event whose provider does not match
 the Session's icon is dropped, so Codex run from a Claude pane's Bash tool
@@ -110,8 +116,8 @@ fires nothing and its rows show no badge.
   `TitlePromptEvent.hook_event`.
 - `src/agent_hooks.rs` — `HookWants`, `wanted_events`, `merge_event` (in-place
   handler update that never reorders).
-- `src/wm.rs` — `apply_hook_event` (project + terminal + icon match) and the
-  `panel_model` badge read.
+- `src/wm.rs` — `apply_hook_event` (project + terminal + icon match), the
+  `panel_model` badge read, and the `status_dispatch` read for `status --json`.
 - `src/panel.rs` — `paint_state_label` and the right-edge slot ranking.
 - `src/terminal.rs` — `Session::agent_state`, done marker cleared on focus in
   `Session::show`.

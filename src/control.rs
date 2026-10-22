@@ -145,6 +145,47 @@ pub struct StatusRequest {
     pub cmd: String, // always "status"
     #[serde(default)]
     pub project: Option<String>, // "p2"; None = ALL projects (no focused fallback)
+    /// `--json`: one [`StatusProjectLine`] / [`StatusTerminalLine`] object per
+    /// line instead of text. Skipped when false (wire compat v1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json: bool,
+}
+
+/// `status --json` project line. Field names are the contract: add fields,
+/// never rename them. Absent `cwd` = the project has no directory.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusProjectLine {
+    pub project: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub placement: String,
+}
+
+/// `status --json` terminal line; it carries its `project` because a `tN` is
+/// unique only within one. Absent optional fields mean "not known", never a
+/// default: no `agent_state` is not `idle`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusTerminalLine {
+    pub project: String,
+    pub terminal: String,
+    pub title: String,
+    /// "claude" | "codex" | "grok" when the pane shows an agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// "running" | "exited".
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    /// A chat-room member.
+    pub chat: bool,
+    pub placement: String,
+    /// Ready: the pane takes input (chat delivery waits for this).
+    pub ready: bool,
+    /// "working" | "needs_you" | "idle", from the agent's lifecycle hooks;
+    /// absent while state is off in Settings or no hook has fired yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<String>,
 }
 
 /// Close terminal panes in one project. Self-close is resolved CLIENT-side:
@@ -221,6 +262,20 @@ pub struct SnapshotRequest {
     /// requests stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<usize>,
+}
+
+/// Bring a Project tab, or one terminal inside it, to the front and give it
+/// keyboard focus — what a Sessions-panel click does (`surface_target`).
+/// `terminal` None = focus the Project itself. Self-focus is resolved
+/// CLIENT-side (bare `foreman focus` fills both from the caller's env), so
+/// the server never guesses a target.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FocusRequest {
+    pub cmd: String, // always "focus"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>, // "p2"; None = focused project (terminal given)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>, // "t4"; None = the project tab itself
 }
 
 /// Kanban board verb (spec: kanban-board §wire shape). `action` selects the
@@ -350,6 +405,7 @@ pub enum CtrlMsg {
     Close(CloseRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Send(SendRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Focus(FocusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Kanban(KanbanRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
@@ -442,6 +498,9 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
                             .map_err(|e| format!("bad request: {e}")),
                         "snapshot" => serde_json::from_str::<SnapshotRequest>(&line)
                             .map(|r| CtrlMsg::Snapshot(r, rtx, now))
+                            .map_err(|e| format!("bad request: {e}")),
+                        "focus" => serde_json::from_str::<FocusRequest>(&line)
+                            .map(|r| CtrlMsg::Focus(r, rtx, now))
                             .map_err(|e| format!("bad request: {e}")),
                         "view" => serde_json::from_str::<ViewRequest>(&line)
                             .map(|r| CtrlMsg::View(r, rtx, now))
@@ -617,16 +676,21 @@ pub fn parse_chat_args(
     }
 }
 
-/// Parse `foreman status` args: `[--project P]`. No env default — bare
-/// `status` deliberately lists ALL projects (see [`StatusRequest`]).
+/// Parse `foreman status` args: `[--project P] [--json]`. No env default —
+/// bare `status` deliberately lists ALL projects (see [`StatusRequest`]).
 pub fn parse_status_args(args: &[String]) -> Result<StatusRequest, String> {
     let mut project = None;
+    let mut json = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--project" => {
                 project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
                 i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
             }
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => return Err(format!("unexpected argument: {other}")),
@@ -635,6 +699,7 @@ pub fn parse_status_args(args: &[String]) -> Result<StatusRequest, String> {
     Ok(StatusRequest {
         cmd: "status".into(),
         project,
+        json,
     })
 }
 
@@ -860,6 +925,57 @@ pub fn parse_snapshot_args(
         attrs,
         cursor,
         tail,
+    })
+}
+
+/// Parse `foreman focus` args: `[--project P] [--terminal T]`. `--terminal`
+/// focuses that terminal in P (default: FOREMAN_PROJECT_ID, else the server's
+/// focused project). `--project` alone focuses the Project tab itself. With
+/// neither, focus the caller's own pane: requires BOTH env vars, same
+/// self-target rule as `send` (a tN is only unique within its project).
+pub fn parse_focus_args(
+    args: &[String],
+    default_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<FocusRequest, String> {
+    let mut project = None;
+    let mut terminal = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            "--terminal" => {
+                terminal = Some(args.get(i + 1).ok_or("--terminal needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    if terminal.is_none() && project.is_none() {
+        // self-focus: the caller's own identity, never a cross-project guess
+        let me = self_terminal.ok_or(
+            "nothing to focus: pass --terminal T and/or --project P (or run inside a foreman terminal to focus your own pane)",
+        )?;
+        let proj = default_project.ok_or(
+            "cannot resolve your own pane without FOREMAN_PROJECT_ID (terminal ids are only unique within a project)",
+        )?;
+        return Ok(FocusRequest {
+            cmd: "focus".into(),
+            project: Some(proj),
+            terminal: Some(me),
+        });
+    }
+    if terminal.is_some() && project.is_none() {
+        project = default_project;
+    }
+    Ok(FocusRequest {
+        cmd: "focus".into(),
+        project,
+        terminal,
     })
 }
 
@@ -1502,16 +1618,18 @@ USAGE
   foreman open [flags] -- <command...>      spawn a command in a new visible terminal
   foreman chat [flags] [--] <message...>    post to the project chat room
   foreman chat [--project P] --history [N]  read the last N room lines (default 20)
-  foreman status [--project P]              list projects + terminals (running/exited)
+  foreman status [--project P] [--json]     list projects + terminals (state, placement)
   foreman close [tN ...] [--project P]      close terminals (no ids: your own pane)
   foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
+  foreman focus [--project P] [--terminal T]  bring a project or terminal tab to the front
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman kanban <action> ...                add/list/start/dispatch/edit/done/block/rm/wait a card
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
-                                            snapshot --help, view --help, kanban --help)
+                                            snapshot --help, focus --help, view --help,
+                                            kanban --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -1554,18 +1672,29 @@ Replies: a post prints {\"ok\":true,\"seq\":N}; history prints line per line.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_STATUS: &str = "\
-foreman status [--project P]
+foreman status [--project P] [--json]
 
 List every project and its terminals, line per line:
-  p1  myrepo  C:\\src\\myrepo
-    t3  running  chat  agent · parser
-    t5  exited(0)  -  cmd
-Fields: id, state (running | exited(code)), chat membership (chat | -),
-title. Terminal ids are unique only within their project. A worker that
-spawned and instantly died shows exited(code) — status asks the live
-process, not the pane title. No --project = all projects; \"no projects\"
-when there are none. --project pN filters to one project (unknown pN is
-an error).
+  p1  focused  myrepo  C:\\src\\myrepo
+    t3  running  chat  focused  agent · parser
+    t5  exited(0)  -  background  cmd
+Project fields: id, placement, name, cwd. Terminal fields: id, state
+(running | exited(code)), chat membership (chat | -), placement, title.
+Placement is where the tab sits: focused (holds the keyboard — at most one
+project and one terminal), front (the tab its window shows), background
+(behind another tab in its window), minimized (its window is minimized).
+Every placement is reachable by send, snapshot, chat, close and focus: ids
+follow the Session, not the tab. Terminal ids are unique only within their
+project. A worker that spawned and instantly died shows exited(code) —
+status asks the live process, not the pane title. No --project = all
+projects; \"no projects\" when there are none. --project pN filters to one
+project (unknown pN is an error).
+--json prints one JSON object per line instead (nothing when there are no
+projects). Project lines: project, name, cwd, placement. Terminal lines:
+project, terminal, title, agent (claude|codex|grok), state (running|exited),
+exit_code, chat (bool), placement, ready (bool: takes input yet), and
+agent_state (working|needs_you|idle, from the agent's hooks). A missing
+field means unknown, not a default: no agent_state is not idle.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_CLOSE: &str = "\
@@ -1607,6 +1736,22 @@ Opt-in structured fields:
             inverse/dim/wide flags (same row span as the text).
   --cursor  cursor: {row, col, shape}.
 With --attrs or --cursor the whole reply is printed as one JSON line instead.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_FOCUS: &str = "\
+foreman focus [--project P] [--terminal T]
+
+Bring a tab to the front and give it the keyboard, the way a Sessions-panel
+click does: restore its window if minimized, switch its window to that tab,
+drop a zoom that would cover it, and focus it.
+  --terminal T   that terminal in project P (default: your
+                 FOREMAN_PROJECT_ID, else the focused project)
+  --project P    alone: project P's tab itself
+  (neither)      your own pane (requires FOREMAN_TERMINAL_ID and
+                 FOREMAN_PROJECT_ID)
+This takes the keyboard from whatever the human is typing into. Only the
+foreman window's contents change; it does not raise foreman over other apps.
+Reply: {\"ok\":true,\"project\":\"pN\"}, plus \"terminal\":\"tN\" for a terminal.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_VIEW: &str = "\
@@ -1763,6 +1908,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("close") => close_main(&args[1..]),
         Some("send") => send_main(&args[1..]),
         Some("snapshot") => snapshot_main(&args[1..]),
+        Some("focus") => focus_main(&args[1..]),
         Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("view") => view_main(&args[1..]),
         Some("kanban") => kanban_main(&args[1..]),
@@ -1776,12 +1922,13 @@ pub fn client_main(args: &[String]) -> i32 {
                 "       foreman chat [--project P] [--to T]... [--re N] [--now] [--] <message...>"
             );
             eprintln!("       foreman chat [--project P] --history [N]");
-            eprintln!("       foreman status [--project P]");
+            eprintln!("       foreman status [--project P] [--json]");
             eprintln!("       foreman close [tN ...] [--project P]");
             eprintln!(
                 "       foreman send [--project P] [--terminal T] --text TXT [--keys \"K\"] [--settle-ms N]"
             );
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
+            eprintln!("       foreman focus [--project P] [--terminal T]");
             eprintln!("       foreman icat <file.png> [--cols N]");
             eprintln!("       foreman view <file.png> [--project P]");
             eprintln!("       foreman kanban <action> ...");
@@ -1898,6 +2045,26 @@ fn snapshot_main(args: &[String]) -> i32 {
         }
     };
     report("foreman snapshot", request(&client_pipe(), &req))
+}
+
+fn focus_main(args: &[String]) -> i32 {
+    // before env/parsing: help must work outside a foreman terminal
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_FOCUS}");
+        return 0;
+    }
+    let req = match parse_focus_args(
+        args,
+        std::env::var("FOREMAN_PROJECT_ID").ok(),
+        std::env::var("FOREMAN_TERMINAL_ID").ok(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman focus: {e}");
+            return 2;
+        }
+    };
+    report("foreman focus", request(&client_pipe(), &req))
 }
 
 fn view_main(args: &[String]) -> i32 {
@@ -2789,10 +2956,54 @@ mod tests {
         let req = StatusRequest {
             cmd: "status".into(),
             project: Some("p2".into()),
+            json: false,
         };
         let back: StatusRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn status_request_json_is_wire_compatible_with_v1() {
+        let plain = StatusRequest {
+            cmd: "status".into(),
+            project: None,
+            json: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"cmd":"status","project":null}"#,
+            "an unset --json must stay off the wire"
+        );
+        let v1: StatusRequest = serde_json::from_str(r#"{"cmd":"status","project":null}"#).unwrap();
+        assert!(!v1.json);
+        let req = parse_status_args(&s(&["--json", "--project", "p2"])).unwrap();
+        assert!(req.json);
+        assert_eq!(req.project.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn status_terminal_line_omits_unknown_fields() {
+        let line = StatusTerminalLine {
+            project: "p1".into(),
+            terminal: "t3".into(),
+            title: "cmd".into(),
+            agent: None,
+            state: "running".into(),
+            exit_code: None,
+            chat: false,
+            placement: "front".into(),
+            ready: true,
+            agent_state: None,
+        };
+        let json = serde_json::to_string(&line).unwrap();
+        for absent in ["agent", "exit_code", "agent_state"] {
+            assert!(!json.contains(&format!("\"{absent}\"")), "{json}");
+        }
+        assert_eq!(
+            serde_json::from_str::<StatusTerminalLine>(&json).unwrap(),
+            line
+        );
     }
 
     #[test]
@@ -2817,6 +3028,7 @@ mod tests {
         let req = StatusRequest {
             cmd: "status".into(),
             project: None,
+            json: false,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -3652,7 +3864,120 @@ mod tests {
         );
     }
 
+    // ---- focus ----------------------------------------------------------------
+
+    #[test]
+    fn parse_focus_args_terminal_defaults_to_own_project() {
+        let req = parse_focus_args(&s(&["--terminal", "t4"]), Some("p1".into()), None).unwrap();
+        assert_eq!(req.terminal.as_deref(), Some("t4"));
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        // outside a foreman terminal: the server's focused project decides
+        let req = parse_focus_args(&s(&["--terminal", "t4"]), None, None).unwrap();
+        assert_eq!(req.project, None);
+        // an explicit --project beats the env default
+        let req = parse_focus_args(
+            &s(&["--terminal", "t4", "--project", "p2"]),
+            Some("p1".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn parse_focus_args_project_alone_targets_the_project_tab() {
+        let req = parse_focus_args(
+            &s(&["--project", "p2"]),
+            Some("p1".into()),
+            Some("t9".into()),
+        )
+        .unwrap();
+        assert_eq!(req.project.as_deref(), Some("p2"));
+        assert_eq!(req.terminal, None, "never borrows the caller's own tN");
+    }
+
+    #[test]
+    fn parse_focus_args_bare_is_self_and_needs_both_env_vars() {
+        let req = parse_focus_args(&[], Some("p1".into()), Some("t3".into())).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p1"));
+        assert_eq!(req.terminal.as_deref(), Some("t3"));
+        let e = parse_focus_args(&[], Some("p1".into()), None).unwrap_err();
+        assert!(e.contains("nothing to focus"), "{e}");
+        let e = parse_focus_args(&[], None, Some("t3".into())).unwrap_err();
+        assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
+    }
+
+    #[test]
+    fn parse_focus_args_rejects_bad_flags() {
+        for (args, needle) in [
+            (vec!["--terminal"], "--terminal needs a value"),
+            (vec!["--project"], "--project needs a value"),
+            (vec!["--tab", "1"], "unknown flag: --tab"),
+            (vec!["t3"], "unexpected argument: t3"),
+        ] {
+            let e = parse_focus_args(&s(&args), None, None).unwrap_err();
+            assert!(e.contains(needle), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn focus_request_omits_unset_fields_on_the_wire() {
+        let req = FocusRequest {
+            cmd: "focus".into(),
+            project: Some("p2".into()),
+            terminal: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"focus","project":"p2"}"#
+        );
+        let parsed: FocusRequest = serde_json::from_str(r#"{"cmd":"focus"}"#).unwrap();
+        assert_eq!(parsed.project, None);
+        assert_eq!(parsed.terminal, None);
+    }
+
     // ---- pipe roundtrips -----------------------------------------------------
+
+    #[test]
+    fn focus_pipe_roundtrip() {
+        let pipe = format!("foreman-test-focus-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = pipe.clone();
+        std::thread::spawn(move || serve(&p2, tx, eframe::egui::Context::default()));
+        std::thread::spawn(move || {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                CtrlMsg::Focus(req, reply, _) => {
+                    assert_eq!(req.project.as_deref(), Some("p1"));
+                    assert_eq!(req.terminal.as_deref(), Some("t3"));
+                    let _ = reply.send(OpenReply {
+                        ok: true,
+                        project: Some("p1".into()),
+                        terminal: Some("t3".into()),
+                        ..Default::default()
+                    });
+                }
+                _ => panic!("expected CtrlMsg::Focus"),
+            }
+        });
+        let req = FocusRequest {
+            cmd: "focus".into(),
+            project: Some("p1".into()),
+            terminal: Some("t3".into()),
+        };
+        let mut reply = None;
+        for _ in 0..100 {
+            match request(&pipe, &req) {
+                Ok(r) => {
+                    reply = Some(r);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let reply = reply.expect("no reply");
+        assert!(reply.ok);
+        assert_eq!(reply.terminal.as_deref(), Some("t3"));
+    }
 
     #[test]
     fn send_pipe_roundtrip() {

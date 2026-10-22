@@ -76,10 +76,11 @@ General rules:
 | open | `foreman open [--project P] [--title T] [--cwd D] -- <command...>` | `--` is **mandatory**; command after it must be non-empty; nothing is shell-interpreted. Unknown flag = error. Default project: `FOREMAN_PROJECT_ID`, else the focused Project. Default cwd: the Project's directory. Default title: `agent · <argv[0]>`. |
 | chat (post) | `foreman chat [--project P] [--to TARGET]... [--re N] [--now] [--] <message...>` | Flags come **first**; the first positional word (or explicit `--`) ends flag parsing, rest is the message verbatim (words joined with single spaces). Requires `FOREMAN_TERMINAL_ID` (the sender). `--to` repeatable; each TARGET is either a `tN` or the word `you` (leading `@` stripped). `--re N` = reply to room seq N. `--now` bypasses Working when state gating is enabled, but still waits for Ready and through Needs you. |
 | chat (read) | `foreman chat [--project P] --history [N]` | N optional (default 20, `DEFAULT_HISTORY`). Mutually exclusive with a message AND with `--to`; `--re` and `--now` are post-only. Needs no terminal id; never joins the room. |
-| status | `foreman status [--project P]` | **Deliberately no env default**: bare `status` lists ALL projects; it is an overview verb. `--project pN` filters; unknown pN is an error. Any stray positional is an error. |
+| status | `foreman status [--project P] [--json]` | **Deliberately no env default**: bare `status` lists ALL projects; it is an overview verb. `--project pN` filters; unknown pN is an error. Any stray positional is an error. `--json` prints one `StatusProjectLine` / `StatusTerminalLine` (`src/control.rs`) per line, nothing at all when there are no projects; terminal lines add `ready` and `agent_state`, the latter only while `agent_state_badges` is on. Missing field = unknown. |
 | close | `foreman close [tN ...] [--project P]` | Ids must match `t<digits>`. **`close` takes no other flags** — no `--terminal`; any other `--` token is `unknown flag: X`, exit 2, and a bare word that is not a `tN` is `bad terminal id: X (expected tN)`. With ids: closes those in P (default `FOREMAN_PROJECT_ID`, else focused). Validation is **all-or-nothing**: any unknown/non-terminal id fails the whole request, nothing closes. With **no** ids = self-close: requires BOTH `FOREMAN_TERMINAL_ID` and `FOREMAN_PROJECT_ID`, and **refuses** an explicit `--project` (`--project needs explicit terminal ids; bare close closes your own terminal`). |
 | send | `foreman send [--project P] [--terminal T] [--text TXT] [--keys "K K..."]... [--settle-ms N]` | At least one of `--text`/`--keys`. `--text` is raw UTF-8 written verbatim (last one wins if repeated); `--keys` splits its value on whitespace and is repeatable (appends). Write order: text first, then keys. No `--terminal` = self-target: requires BOTH env vars and **refuses** an explicit `--project` (a `tN` is only unique within its project — pass `--terminal` to cross projects). Key names validated against the Session's live terminal mode BEFORE any byte is written — errors have no side effects (`send_dispatch`, `src/wm.rs`). |
 | snapshot | `foreman snapshot [--project P] [--terminal T] [--attrs] [--cursor] [--tail N]` | `--attrs`/`--cursor` are valueless opt-ins. `--tail N` (positive integer; `0`, a missing value, or a non-number all fail with `--tail needs a positive integer`) is the last N buffer lines including scrollback, not the displayed viewport; larger than the buffer returns the whole buffer. No `--terminal`: **refuses** an explicit `--project` (same rule as send); self-targets only when `FOREMAN_TERMINAL_ID` is set (then `FOREMAN_PROJECT_ID` is required); otherwise errors `--terminal is required`. |
+| focus | `foreman focus [--project P] [--terminal T]` | Panel-click semantics over the pipe (`focus_dispatch` → `surface_target`, `src/wm.rs`): unminimize, switch tab at both levels, drop a covering zoom, focus. `--terminal` alone defaults P like send (`--project`, env, focused). `--project` alone focuses the Project tab itself. **Neither = self**: requires BOTH env vars. Replies BEFORE acting (close's rule): a stale or abandoned request never grabs the keyboard later. Reply `{"ok":true,"project":"pN"}` plus `"terminal":"tN"` for a terminal. Takes the human's keyboard, so foreman-dispatch teaches agents to use it only when the human asks to see a pane or a launched worker is `needs_you` (after an `@you` post). Feature doc: `docs/tab-targeting.md`. |
 | icat | `foreman icat <file.png> [--cols N]` | **Client-side only — no pipe request.** Prints the PNG into the calling pane as kitty graphics; `--cols N` (positive) overrides the width. Bad `--cols`, a missing/unreadable file, a non-PNG, or a second positional all exit 2. Operational use by an agent inside foreman: the **foreman-icat** skill. |
 | view | `foreman view <file.png> [--project P]` | Opens a persistent `Content::Image` window (a normal pane: tile/float/tab/close/minimize, restored across restarts by path). PNG only in v1. The path is canonicalized **client-side, relative to this process's cwd, not the GUI's** — a nonexistent file or non-`.png` extension fails before the pipe is touched. Reply is `open`-shaped: `{"ok":true,"terminal":"tN","project":"pN"}`. |
 
@@ -238,6 +239,9 @@ The full injected-env table and how to extend it is
 | send without `--terminal` | **required**; `--project` refused | **required** |
 | send/snapshot with `--terminal` | default for `--project` | unused |
 | snapshot without `--terminal` | **required**; `--project` refused | used as the target when set; otherwise `--terminal is required (or run inside a foreman terminal to target your own pane)` |
+| focus with `--terminal` | default for `--project` | unused |
+| focus `--project` only | ignored | ignored (never borrows the caller's tN) |
+| focus (bare = self) | **required** | **required** |
 | view | default for `--project` | unused |
 | icat | unused (never touches the pipe) | unused |
 
@@ -287,13 +291,18 @@ $exe = ".\target\debug\foreman.exe"                  # inside a foreman terminal
 ```
 
 `status` line format (`WindowManager::status_dispatch`, `src/wm.rs`):
-`p1  <name>  <cwd>` then indented `t3  running  chat  <title>` (state
-`running|exited(code)`, chat membership `chat|-`). Prints `no projects` when
-there are none.
+`p1  <placement>  <name>  <cwd>` then indented
+`t3  running  chat  <placement>  <title>` (state `running|exited(code)`, chat
+membership `chat|-`, placement `focused|front|background|minimized` from
+`placement`). Prints `no projects` when there are none.
 
-Known targeting gotcha: after tab-merging two Projects, only the **active** tab
-resolves — the swallowed Project's old `pN` goes stale
-(`WindowManager::resolve_project`, `src/wm.rs`).
+Hidden tabs are first-class targets: `project_child` and `terminal_location`
+scan every tab of every window, minimized ones included, so a `pN` merged
+behind another Project tab and a `tN` behind a tab or in a minimized window
+all resolve. `show` keeps them pumped. Proof:
+`send_reaches_background_tab_and_minimized_terminal` and
+`chat_reaches_background_and_minimized_members` (`src/wm.rs`). The old
+"swallowed Project's `pN` goes stale" gotcha no longer applies.
 
 ## Artifacts map
 

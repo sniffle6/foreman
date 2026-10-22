@@ -13,7 +13,8 @@ without touching the GUI. Phase 1 (`src/inspect.rs` pure functions) and Phase 2
 
 Together they close the feedback loop: an agent can `send` a command and then
 `snapshot` to see the result — including output that has already scrolled off
-the pane.
+the pane. Both work on terminals behind another tab or in a minimized window;
+see `docs/tab-targeting.md`.
 
 ## How to use
 

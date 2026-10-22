@@ -175,12 +175,16 @@ foreman status --project p2    # one Project (unknown pN errors)
 foreman chat --history 30      # last 30 room posts; NEVER joins the room
 ```
 
-- `status` lines: `p1  <name>  <cwd>` then per Session
-  `  t3  running  chat  <title>` — id, state (`running` | `exited(code)`),
-  Chat-room membership (`chat` | `-`), title (`WindowManager::status_dispatch`,
-  src/wm.rs; `no projects` when there are none). A worker that spawned and
-  instantly died shows `exited(code)`: status asks the live process, not the
-  title.
+- `status` lines: `p1  <placement>  <name>  <cwd>` then per Session
+  `  t3  running  chat  <placement>  <title>` — id, state (`running` |
+  `exited(code)`), Chat-room membership (`chat` | `-`), placement
+  (`focused` | `front` | `background` | `minimized`), title
+  (`WindowManager::status_dispatch`, src/wm.rs; `no projects` when there are
+  none). A worker that spawned and instantly died shows `exited(code)`: status
+  asks the live process, not the title. Placement is about the tab, not
+  reachability: every placement takes send/snapshot/chat (`docs/tab-targeting.md`).
+  `status --json` is the machine form, one object per line, and the only CLI
+  read of a Session's Ready latch (`ready`) and hook state (`agent_state`).
 - `chat --history` is a pure read from any caller, and **seq gaps in the output
   are normal**: system entries (join/exit) occupy seqs but are excluded from
   history — "seqs exist to be cited, not to be dense" (`ChatRoom::history`,
