@@ -780,7 +780,7 @@ impl WindowManager {
                 dui.add_space(6.0);
                 if let Some(naming) = &mut ed.naming {
                     dui.label(
-                        egui::RichText::new("Name the layout. It is saved for this Project, then applied.")
+                        egui::RichText::new("Name the layout. It is saved for every Project, then applied here.")
                             .color(th.dim)
                             .size(11.5),
                     );
@@ -843,7 +843,7 @@ impl WindowManager {
                         }
                         if dui
                             .add_enabled(has, egui::Button::new("save & apply\u{2026}"))
-                            .on_hover_text("Name it, save it for this Project, then apply it.")
+                            .on_hover_text("Name it, save it for every Project, then apply it here.")
                             .clicked()
                         {
                             actions.push(PickerAction::Create(CreateAction::SaveAndApply));
@@ -1288,7 +1288,7 @@ mod tests {
         assert_eq!(arrangement(&wm).windows.len(), 3);
         assert_eq!(identities(&wm), ids);
         assert!(
-            f.store().project_layouts(&f.repo).unwrap().is_empty(),
+            f.store().layouts().unwrap().is_empty(),
             "Apply saves nothing"
         );
     }
@@ -1338,6 +1338,7 @@ mod tests {
                 windows: vec![pl::WindowSpec::tiled(vec![a, b], 0)],
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
+            origin: None,
         };
         assert_eq!(
             wm.check_candidate(&def, &[], rev),
@@ -1363,6 +1364,7 @@ mod tests {
             name: String::new(),
             items,
             arrangement: current,
+            origin: None,
         };
         assert_eq!(
             wm.apply_candidate(&same, &[], false, rev + 1, &ctx)
@@ -1396,7 +1398,7 @@ mod tests {
             .buf = "  Stacked ".into();
         act(&mut wm, CreateAction::SubmitName);
         assert!(wm.layout_ui.create.is_none());
-        let saved = f.store().project_layouts(&f.repo).unwrap();
+        let saved = f.store().layouts().unwrap();
         assert_eq!(saved.len(), 1, "written before the Apply ran");
         assert_eq!(saved[0].name, "Stacked");
         assert_eq!(
@@ -1522,7 +1524,7 @@ mod tests {
         wm.watch_layout_edits();
         act(&mut wm, CreateAction::SubmitName);
         assert!(
-            f.store().project_layouts(&f.repo).unwrap().is_empty(),
+            f.store().layouts().unwrap().is_empty(),
             "validated before the write"
         );
         assert_eq!(editor(&wm).status, Some(Status::Stale));
@@ -1687,6 +1689,7 @@ mod tests {
                 windows: vec![pl::WindowSpec::tiled(vec![a, b], 0)],
                 tree: Some(pl::TreeSpec::Leaf { window: 0 }),
             },
+            origin: None,
         };
         assert_eq!(
             wm.check_candidate(&def, &[], rev),
@@ -1782,7 +1785,7 @@ mod tests {
             .unwrap()
             .buf = "Rider".into();
         act(&mut wm, CreateAction::SubmitName);
-        let saved = f.store().project_layouts(&f.repo).unwrap();
+        let saved = f.store().layouts().unwrap();
         assert_eq!(saved.len(), 1);
         let kinds: Vec<ItemKind> = saved[0].items.iter().map(|i| i.kind).collect();
         assert_eq!(kinds.iter().filter(|k| **k == ItemKind::Board).count(), 1);
@@ -1837,6 +1840,7 @@ mod tests {
             name: String::new(),
             items,
             arrangement,
+            origin: None,
         };
         assert_eq!(wm.check_candidate(&def, &[fresh], rev), Ok(()));
         // The same slot not declared new: refused.
@@ -1882,6 +1886,7 @@ mod tests {
             name: String::new(),
             items: inv.items(),
             arrangement: inv.current.clone(),
+            origin: None,
         };
         def.arrangement.windows[0].active = 1;
         tx.send(Ok(Reply::Candidate {
@@ -1905,6 +1910,7 @@ mod tests {
             name: String::new(),
             items: inv.items(),
             arrangement: inv.current.clone(),
+            origin: None,
         };
         tx.send(Ok(Reply::Candidate {
             message: "Kept it.".into(),

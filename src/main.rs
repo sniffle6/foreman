@@ -897,6 +897,10 @@ impl eframe::App for App {
             if let Ok(pane) = std::env::var("FOREMAN_SETTINGS_TEST") {
                 self.desktop.debug_open_settings(&pane);
             }
+            #[cfg(debug_assertions)]
+            if std::env::var_os("FOREMAN_LAYOUT_MENU_TEST").is_some() {
+                self.desktop.debug_open_layout_menu(&ctx);
+            }
         }
 
         let ctrl_activity = self.service_background(&ctx);

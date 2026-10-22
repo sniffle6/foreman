@@ -73,6 +73,12 @@ named arrangement is a layout definition; fitting one to the current inventory
 is reconciliation.
 _Avoid_: preset, template, workspace (that is the cold desktop snapshot).
 
+**Built-in layout**:
+A layout definition that ships with Foreman. Every Project lists the
+built-ins above the saved layouts. They are read-only and their names are
+reserved, and Apply always fills their slots by kind.
+_Avoid_: default layout (that is the New Project layout), preset, template.
+
 **Layout candidate**:
 The one arrangement a Create Layout request proposes for the open windows.
 It places every current layout item exactly once, may add new windows

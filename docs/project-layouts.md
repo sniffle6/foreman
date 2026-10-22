@@ -1,7 +1,9 @@
 # Project layouts
 
-Named arrangements of a Project's child windows. Spec (authoritative on the
-product contract):
+Named arrangements of a Project's child windows. Every Project lists the
+same layouts (a few built in, then the ones you save), and each Project
+instance selects its own. Spec (the product contract, except where this doc
+says it was reversed):
 `docs/superpowers/specs/2026-10-16-project-layouts-design.md`.
 
 This doc tracks what has shipped. Status: **model, identity,
@@ -40,7 +42,7 @@ GUI-free; serde only. No egui, no `Content`, no `WindowManager`.
 | `WindowSpec { tabs, active, state }` | One tab stack and its `WindowState`: `Tiled`, `Floating { rect }`, or `Minimized { from_tree, rect }`. |
 | `NormRect` | Floating / minimized-restore geometry as fractions of the Project's content area, so a saved layout adapts to the current size. |
 | `TreeSpec` | `Leaf { window }` or `Split { dir, ratios, children }`. Same shape as `layout::Node`; serde-only so the model stays GUI-free. |
-| `LayoutDefinition { id, name, items, arrangement }` | A saved, named layout. `id` is immutable, `name` is editable. |
+| `LayoutDefinition { id, name, items, arrangement, origin }` | A saved, named layout. `id` is immutable, `name` is editable. `origin` is the `project_key` of the directory whose tabs `items` came from (see **Whose ids**). |
 
 All persisted types use `deny_unknown_fields`, which is what rejects extra
 provider fields later.
@@ -169,29 +171,55 @@ Settings or a repository:
 
 ```json
 {
-  "version": 1,
-  "projects": {
-    "h:\\code\\repo": { "dir": "H:\\code\\repo", "layouts": [ /* LayoutDefinition */ ] }
-  },
+  "version": 2,
+  "layouts": [ /* LayoutDefinition, in creation order */ ],
   "new_project": { /* optional LayoutDefinition copy */ }
 }
 ```
 
-**Who owns a library.** The key is `project_key(dir)`: absolute, `.`/`..`
-resolved, symlinks/junctions/subst drives/8.3 short names resolved as far
-down the path as it exists, no `\\?\` prefix, no trailing separator,
-lowercase on Windows. So two Project instances of one directory share
-definitions, while a worktree under `.foreman/worktrees/` is a different
-directory with its own library. `dir` is only for people reading the file.
-Libraries outlive their Projects (closing one deletes nothing). A deleted
-directory keeps the key it had, because its parent is still resolved; only
-a whole missing drive falls back to the lexical spelling. Moving a directory
-does not migrate its library.
+**One list for every Project.** Every Project's menu shows the whole list,
+and a name is unique across it (case-insensitive). Selection is not shared:
+it stays per Project instance (see **Picker state**). Layouts outlive their
+Projects (closing one deletes nothing).
+
+Why one list: a definition is only window kinds and geometry, nothing about
+a directory, so a layout saved in one repo is just as useful in the next.
+The original spec kept a library per directory; the user reversed that and
+asked for one shared list.
+
+**Whose ids.** A definition's item ids are the `layout_id`s of the tabs it
+was saved from, and they only mean something in that directory. So `create`
+and `update` record `origin = project_key(dir)`, and the picker's Apply
+keeps exact-id matching only when `origin` is this Project's key. Otherwise
+it renumbers the items first (`detach_ids`, the same step the New Project
+layout uses), and slots fill by kind, oldest item first. Without that, a
+tab whose id happened to equal one in a layout saved elsewhere (ids are
+reminted after a restart) would be pinned to that slot, say into a small
+corner pane while a fresh shell took the main one. Rename keeps `origin`;
+saving over a layout from another Project moves it there.
+
+`project_key(dir)`: absolute, `.`/`..` resolved, symlinks/junctions/subst
+drives/8.3 short names resolved as far down the path as it exists, no
+`\\?\` prefix, no trailing separator, lowercase on Windows. So two Project
+instances of one directory have one key, while a worktree under
+`.foreman/worktrees/` is a different directory. A deleted directory keeps
+the key it had, because its parent is still resolved; only a whole missing
+drive falls back to the lexical spelling.
 
 Gotcha: resolve the deepest *existing* ancestor, not just the whole path.
 Canonicalizing the whole path or nothing made the key flip from
 `runneradmin` to `RUNNER~1` the moment a CI temp directory was deleted (the
 v0.8.0 release gate).
+
+**Version 1 files.** Version 1 kept one list per directory
+(`"projects": { "<key>": { "dir", "layouts" } }`). Reading one migrates it
+in memory (`From<LibraryFileV1>`): the lists are joined in key order, ids
+are kept (so workspace selections still resolve), each definition's
+`origin` becomes its old key, and a name an earlier directory or a built-in
+already holds gets the folder name appended: "Coding" from `web` becomes
+"Coding (web)", then "Coding (web 2)". The file keeps the v1 shape until the
+next write, so an older Foreman can still use it until then; after that it
+sees version 2 and refuses to touch it (`FutureVersion`).
 
 **How to use it.** `LayoutStore::user()` (or `LayoutStore::at(dir)` in tests)
 then, per the picker contract:
@@ -201,18 +229,42 @@ then, per the picker contract:
 | Save with nothing selected, Save As | `create(project, name, items, arrangement, OnConflict::Reject)` |
 | …user picked "Replace" on a duplicate | same with `OnConflict::Replace`: overwrites the other definition in place, keeping its id |
 | Save with a layout selected | `update(project, id, items, arrangement)` |
-| Rename… | `rename(project, id, name, on_conflict)`; Replace deletes the other holder of the name |
-| Delete… | `delete(project, id)`; already gone is `Ok` |
+| Rename… | `rename(id, name, on_conflict)`; Replace deletes the other holder of the name |
+| Delete… | `delete(id)`; already gone is `Ok` |
 | Use for new Projects / reset | `set_new_project_layout(Some(&def))` / `(None)` |
-| Menu contents | `project_layouts(project)`, `new_project_layout()` |
+| Menu contents | `builtin_layouts()`, then `layouts()`; `new_project_layout()` |
+| Look up an id or selection | `find_layout(saved, id)`, `resolve_selection(saved, selected)`: built-ins first, then `saved` |
 
-Names are trimmed and checked (`validate_name`), duplicates compare
-case-insensitively within one Project, and the arrangement is validated
-before anything is read or written. `StoreError` says why a call failed and
-its `Display` is the user-facing message: `NameTaken` (offer Replace or
-another name), `NotFound` (deleted elsewhere: show Custom), `Invalid`,
-`FutureVersion`, `Io`. A call that returns `Err` wrote nothing, so the UI
-reports success only on `Ok`.
+`project` is the directory the windows are captured from; it only sets
+`origin`. Names are trimmed and checked (`validate_name`), duplicates
+compare case-insensitively across the whole list, and the arrangement is
+validated before anything is read or written. `StoreError` says why a call
+failed and its `Display` is the user-facing message: `NameTaken` (offer
+Replace or another name), `ReservedName` (a built-in's name: no Replace,
+type another), `ReadOnly` (a built-in's id), `NotFound` (deleted elsewhere:
+show Custom), `Invalid`, `FutureVersion`, `Io`. A call that returns `Err`
+wrote nothing, so the UI reports success only on `Ok`.
+
+### Built-in layouts
+
+`builtin_layouts()` (`src/layout_library.rs`) defines the few that ship with
+Foreman, in code: terminals side by side, a main terminal with a stack
+beside it, a grid, and a terminal with the chat. Read the function for the
+current set.
+
+- Every Project lists them first, under **Built-in**. They are never in the
+  file, so a new Foreman can change or add them.
+- Read-only: no Rename or Delete in the menu, and the store refuses
+  (`ReadOnly`). Save with one selected opens Save As, prefilled
+  "<name> copy". Their names are reserved (`ReservedName`).
+- Their ids start `builtin:` (`is_builtin`); saved ids are hex, so the two
+  never collide. A Project can select one, and the workspace saves that
+  selection like any other.
+- No `origin`, so Apply always fills them by kind. A slot the Project has
+  nothing for opens a plain shell (or the chat), like any layout's missing
+  windows. Applying the grid to a Project with one terminal opens three
+  shells.
+- **Use for new Projects** works on them too.
 
 **Two processes.** There is no cache. Every call reads the file fresh, and
 every change re-reads, edits only its own definition by id (or the New
@@ -329,15 +381,32 @@ first. Child windows get no picker.
 **The label** is the selected layout's name, or **Custom**. An amber dot
 after it means Modified.
 
-**The menu** says "Layouts for this Project", then one row per saved layout:
-a small diagram, the name, a check on the selected one, a "Modified" tag on
-it when set, and three icons: Use for new Projects (a window with a plus),
-Rename…, Delete…. Below: **Save** (its hint says
-whether it updates a layout or asks for a name), **Save As…**, and **Revert
-Layout** once an Apply has happened (shown disabled, with the reason, after
-an edit retired the revert point). An empty library says layouts are saved
-for this Project. **Create Layout…** sits between the list and Save (see
-below).
+**The menu** has two groups: **Built-in**, then **Saved**. Each row has a
+small diagram, the name, a check on the selected one, a "Modified" tag on it
+when set, and icons: Use for new Projects (a window with a plus) on every
+row, Rename… and Delete… on saved rows only.
+
+**A long list scrolls.** The two groups sit in a scroll area that stops short
+of the window's bottom edge (never shorter than three rows); everything from
+Create Layout… down stays fixed below it. The menu opens already scrolled to
+the selected layout. Rows have fixed heights, so `selected_row_center`
+computes the offset and hands it to the scroll area before the first visible
+frame. egui's `scroll_to_rect` lands two frames late, so the menu would show
+the top and then jump. The bar uses the theme's `scroll_thumb` token and rests
+at `THUMB_DIM_FLOOR`, like the Sessions panel's and the terminals' thumbs,
+instead of egui's text-colored bar that hides until hovered.
+
+Gotcha: egui measures a new Area in an invisible first frame, placed as if it
+were 600px wide, so the menu's rect is wrong for that one frame. A test that
+reads the menu's position must run one more frame first. The reveal is kept
+until a frame that is actually drawn (`show_layout_menu` returns whether it
+was).
+Below: **Save** (its hint says whether it updates a layout, saves a copy of
+a built-in, or asks for a name), **Save As…**, and **Revert Layout** once an
+Apply has happened (shown disabled, with the reason, after an edit retired
+the revert point). With nothing saved, the saved group says to arrange the
+windows and Save. A read error shows there too; the built-ins still list.
+**Create Layout…** sits between the list and Save (see below).
 
 The diagram is drawn from arrangement data only (`diagram_cells`): tiled
 windows by tree and ratios, floating ones outlined on top, minimized ones
@@ -345,7 +414,8 @@ not drawn, and a one-letter kind mark where it fits (`>` terminal, `C` chat,
 `B` board, …) so a mixed layout reads at a glance.
 
 **Selecting a row applies it.** It queues `LayoutRequest::Apply { select:
-true }` on the Project being drawn; the next frame runs it. The header then
+true }` on the Project being drawn, with the ids detached unless the layout
+was saved from this directory (**Whose ids**); the next frame runs it. The header then
 reads `take_layout_outcome`. An exact Apply says nothing. Otherwise a
 dismissible summary sits under the picker, built from the applied
 `Reconciliation` (`summary_lines`): which windows stood in for saved ones,
@@ -361,9 +431,11 @@ filled, and which opens failed (with the error, not shortened). It has a
 |---|---|
 | Save, Custom | Name dialog, then `create(…, Reject)`; selects the new layout |
 | Save, a layout selected | `update` in place, no prompt; clears Modified |
+| Save, a built-in selected | The Save As dialog, prefilled `<name> copy`; the built-in never changes |
 | Save, selected layout deleted elsewhere | Picker goes to Custom and the name dialog opens with "no longer exists" |
 | Save As… | Name dialog prefilled `<name> copy`; always a new definition |
 | Duplicate name (any case) | Dialog stays; "already exists — replace it, or type another name". Replace overwrites it in place, keeping its id, and selects it. Typing clears the offer |
+| A built-in's name (any case) | Dialog stays with the error; there is no Replace |
 | Rename… | Dialog prefilled; Replace deletes the other holder of the name, and if that was selected the picker goes to Custom |
 | Delete… | Confirm dialog; the windows stay put; if it was selected, Custom |
 | Cancel, Escape, or a click outside | Nothing changes, on disk or on screen |
@@ -380,7 +452,7 @@ instead of one terminal. Unset (the default, shown as **Single terminal**)
 is exactly the old behavior.
 
 **Set it** from any Project's Layout menu: the window-with-a-plus icon on a
-saved layout's row (**Use for new Projects**). The icon turns amber on the
+layout's row, built-in or saved (**Use for new Projects**). The icon turns amber on the
 row the slot still matches. **See and reset it** in Settings → Window
 Manager → New Project layout: the value is the layout's name or Single
 terminal, and **Reset** writes Single terminal back. Both go through
@@ -388,8 +460,7 @@ terminal, and **Reset** writes Single terminal back. Both go through
 
 **It is a copy.** Setting it copies the whole definition into the slot.
 Saving over, renaming, or deleting the source layout later leaves the slot
-as it was (and the source row loses its amber mark once they differ). There
-is no global library beyond this one slot.
+as it was (and the source row loses its amber mark once they differ).
 
 **What opening does.** `add_project` and `add_project_with_command` (the
 directory picker, the landing page, the startup auto-project when there is
@@ -401,8 +472,8 @@ terminal slot (a commanded agent terminal included), fillable slots open a
 plain shell or view, and target kinds (Image, GitDiff, Project) stay empty.
 Then, unlike a picker Apply:
 
-- the picker shows **Custom** (the directory's library does not hold the
-  slot, even when it was copied from that directory);
+- the picker shows **Custom** (the slot is a copy, not one of the listed
+  layouts, even when it was copied from one);
 - there is no revert point: the lone terminal it replaced was never on
   screen;
 - a Project not yet laid out, or a dialog open, makes it wait for a later
@@ -431,9 +502,11 @@ Gotchas:
 
 **Disk.** `LayoutStore` re-reads the file on every call, so the picker keeps
 a copy: read once when the header first draws (the label needs the name),
-again when the menu opens, and after each write. Never per frame. A second
-instance of the same directory sees another's save the next time its menu
-opens; its windows never move.
+again when the menu opens, and after each write. Never per frame. Any other
+Project sees a save the next time its menu opens; its windows never move,
+and a Project that has the saved-over layout selected keeps its own
+Modified flag (Modified is an edit event, not a comparison). The built-ins
+need no read.
 
 **Keyboard.** While the menu or a dialog is open, it owns the keys: that
 Project's terminals are frozen (`live` is false, `terminal_owns_keyboard`
@@ -449,7 +522,10 @@ invisible dialog keeps terminals frozen.
 **Testing it.** A click becomes a `PickerAction`, and `run_layout_action`
 does the work, so tests drive the bindings without a pointer.
 `layout_ui.store` points a test at a temp library; without it, tests read a
-never-written temp path, never the user's file.
+never-written temp path, never the user's file. To screenshot the open menu
+without clicking, launch a debug build with `FOREMAN_LAYOUT_MENU_TEST=1`
+(and `FOREMAN_NO_LANDING=1`, so a Project opens): it opens the focused
+Project's menu at startup (`debug_open_layout_menu`).
 
 Gotchas:
 
@@ -607,8 +683,9 @@ Gotchas:
 
 - `src/project_layout.rs` — the model, validation, reconciliation, comparison,
   geometry adaptation, and their tests
-- `src/layout_library.rs` — `project-layouts.json`: `LayoutStore`,
-  `project_key`, `resolve_selection`, and their tests
+- `src/layout_library.rs` — `project-layouts.json`: `LayoutStore`, the
+  version 1 migration (`LibraryFileV1`), `builtin_layouts`, `project_key`,
+  `find_layout`, `resolve_selection`, and their tests
 - `src/config.rs` — `load_json_from` / `save_json_in`, the shared recovery
   and atomic write the library rides on
 - `src/wm/layouts.rs` — Apply, Revert, the `NewProject` and strict

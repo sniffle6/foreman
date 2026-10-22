@@ -1,7 +1,8 @@
 //! Saved project layouts on disk: `%APPDATA%\foreman\project-layouts.json`,
-//! one library per normalized project directory plus the single New Project
-//! slot. Spec: `docs/superpowers/specs/2026-10-16-project-layouts-design.md`
-//! (Ownership and boundaries, Persistence).
+//! one list every Project shares plus the single New Project slot, and the
+//! read-only built-ins that ship with Foreman. Spec:
+//! `docs/superpowers/specs/2026-10-16-project-layouts-design.md`
+//! (Persistence). Feature doc: `docs/project-layouts.md`.
 //!
 //! There is no in-memory cache. Every read goes to disk and every change
 //! re-reads the file, edits only its own definition (or the New Project
@@ -10,17 +11,20 @@
 //! per Project instance and live in the workspace snapshot, not here.
 
 use crate::project_layout::{
-    Arrangement, ItemRef, LayoutDefinition, LayoutError, names_collide, validate, validate_name,
+    Arrangement, ItemKind, ItemRef, LayoutDefinition, LayoutError, MAX_NAME_CHARS, SplitAxis,
+    TreeSpec, WindowSpec, names_collide, validate, validate_name,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const LIBRARY_FILE: &str = "project-layouts.json";
 /// Any change to the file's shape, a definition's included, bumps this. An
 /// older build then refuses to write the file instead of dropping fields.
-pub const LIBRARY_VERSION: u32 = 1;
+/// Version 1 kept one list per project directory; it is migrated on read.
+pub const LIBRARY_VERSION: u32 = 2;
 
 /// The whole file. Strict on purpose: an unknown field means a newer or
 /// hand-edited file, which goes through the shared recovery (backed up before
@@ -30,10 +34,10 @@ pub const LIBRARY_VERSION: u32 = 1;
 pub struct LibraryFile {
     #[serde(default = "current_version")]
     pub version: u32,
-    /// Keyed by [`project_key`].
+    /// Saved layouts, in creation order. Every Project lists all of them.
     #[serde(default)]
-    pub projects: BTreeMap<String, ProjectLibrary>,
-    /// The New Project layout: a copy, never a reference into a library.
+    pub layouts: Vec<LayoutDefinition>,
+    /// The New Project layout: a copy, never a reference into the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_project: Option<LayoutDefinition>,
 }
@@ -42,7 +46,7 @@ impl Default for LibraryFile {
     fn default() -> Self {
         Self {
             version: LIBRARY_VERSION,
-            projects: BTreeMap::new(),
+            layouts: Vec::new(),
             new_project: None,
         }
     }
@@ -52,26 +56,191 @@ fn current_version() -> u32 {
     LIBRARY_VERSION
 }
 
-/// One project directory's saved layouts, in creation order.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Version 1 of the file: one list per directory, keyed by [`project_key`].
+/// Only ever read, to migrate.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectLibrary {
-    /// The directory as last saved from, for people reading the file. The
-    /// map key, not this, decides ownership.
-    pub dir: PathBuf,
-    pub layouts: Vec<LayoutDefinition>,
+struct LibraryFileV1 {
+    #[serde(rename = "version", default)]
+    _version: u32,
+    #[serde(default)]
+    projects: BTreeMap<String, ProjectLibraryV1>,
+    #[serde(default)]
+    new_project: Option<LayoutDefinition>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectLibraryV1 {
+    dir: PathBuf,
+    layouts: Vec<LayoutDefinition>,
+}
+
+/// Longest folder name a migrated duplicate gets as its suffix.
+const MIGRATION_HINT_CHARS: usize = 32;
+
+impl From<LibraryFileV1> for LibraryFile {
+    /// Flatten the per-directory lists in key order. Ids are kept, so
+    /// workspace selections still resolve, and each definition records its
+    /// directory as `origin`. A name an earlier directory or a built-in
+    /// already holds gets the directory's folder name appended.
+    fn from(v1: LibraryFileV1) -> Self {
+        let mut layouts: Vec<LayoutDefinition> = Vec::new();
+        for (key, project) in v1.projects {
+            let folder = project
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| key.clone());
+            for mut def in project.layouts {
+                let taken = |name: &str| {
+                    builtin_named(name).is_some()
+                        || layouts.iter().any(|d| names_collide(&d.name, name))
+                };
+                if taken(&def.name) {
+                    def.name = disambiguate(&def.name, &folder, taken);
+                }
+                def.origin = Some(key.clone());
+                layouts.push(def);
+            }
+        }
+        Self {
+            version: LIBRARY_VERSION,
+            layouts,
+            new_project: v1.new_project,
+        }
+    }
+}
+
+/// `name` with ` (hint)`, then ` (hint 2)`, … appended until `taken` lets
+/// it go, the name cut so the whole fits in [`MAX_NAME_CHARS`].
+fn disambiguate(name: &str, hint: &str, taken: impl Fn(&str) -> bool) -> String {
+    let hint: String = hint.chars().take(MIGRATION_HINT_CHARS).collect();
+    (1..)
+        .map(|n| {
+            let suffix = if n == 1 {
+                format!(" ({hint})")
+            } else {
+                format!(" ({hint} {n})")
+            };
+            let keep = MAX_NAME_CHARS.saturating_sub(suffix.chars().count());
+            let base: String = name.chars().take(keep).collect();
+            format!("{}{suffix}", base.trim_end())
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("an unbounded counter finds a free name")
 }
 
 /// Just enough of the file to refuse a newer one before strict parsing or
-/// the recovery backup can touch it.
+/// the recovery backup can touch it, and to pick the shape to parse.
 #[derive(Deserialize)]
 struct VersionProbe {
     #[serde(default)]
     version: u32,
 }
 
-/// What Save, Save As, and Rename do when another definition in the Project
-/// already has the name (compared case-insensitively).
+/// Prefix of a built-in's id. Saved ids are hex and dashes
+/// ([`new_definition_id`]), so the two can never collide.
+const BUILTIN_PREFIX: &str = "builtin:";
+
+/// The layouts that ship with Foreman, listed before the saved ones in every
+/// Project. Read-only: never in the file, never renamed, updated, or
+/// deleted, and their names are reserved. They carry no `origin`, so Apply
+/// always fills them by kind, opening plain shells (or the chat) for slots
+/// the Project has nothing for.
+pub fn builtin_layouts() -> &'static [LayoutDefinition] {
+    static BUILTINS: OnceLock<Vec<LayoutDefinition>> = OnceLock::new();
+    BUILTINS.get_or_init(|| {
+        use ItemKind::{Chat, Terminal};
+        use SplitAxis::{H, V};
+        vec![
+            builtin(
+                "side-by-side",
+                "Side by side",
+                &[Terminal, Terminal],
+                split(H, &[0.5, 0.5], vec![leaf(0), leaf(1)]),
+            ),
+            builtin(
+                "main-and-stack",
+                "Main and stack",
+                &[Terminal; 3],
+                split(
+                    H,
+                    &[0.6, 0.4],
+                    vec![leaf(0), split(V, &[0.5, 0.5], vec![leaf(1), leaf(2)])],
+                ),
+            ),
+            builtin(
+                "grid",
+                "Grid",
+                &[Terminal; 4],
+                split(
+                    H,
+                    &[0.5, 0.5],
+                    vec![
+                        split(V, &[0.5, 0.5], vec![leaf(0), leaf(1)]),
+                        split(V, &[0.5, 0.5], vec![leaf(2), leaf(3)]),
+                    ],
+                ),
+            ),
+            builtin(
+                "terminal-and-chat",
+                "Terminal and chat",
+                &[Terminal, Chat],
+                split(H, &[0.7, 0.3], vec![leaf(0), leaf(1)]),
+            ),
+        ]
+    })
+}
+
+/// One tiled window per kind, in order; `tree` places window `i` with
+/// `leaf(i)`.
+fn builtin(slug: &str, name: &str, kinds: &[ItemKind], tree: TreeSpec) -> LayoutDefinition {
+    let items: Vec<ItemRef> = kinds
+        .iter()
+        .zip(1..)
+        .map(|(&kind, id)| ItemRef::new(id, kind))
+        .collect();
+    LayoutDefinition {
+        id: format!("{BUILTIN_PREFIX}{slug}"),
+        name: name.to_string(),
+        arrangement: Arrangement {
+            windows: items
+                .iter()
+                .map(|item| WindowSpec::tiled(vec![item.id], 0))
+                .collect(),
+            tree: Some(tree),
+        },
+        items,
+        origin: None,
+    }
+}
+
+fn leaf(window: usize) -> TreeSpec {
+    TreeSpec::Leaf { window }
+}
+
+fn split(dir: SplitAxis, ratios: &[f32], children: Vec<TreeSpec>) -> TreeSpec {
+    TreeSpec::Split {
+        dir,
+        ratios: ratios.to_vec(),
+        children,
+    }
+}
+
+/// Whether `id` names a built-in layout.
+pub fn is_builtin(id: &str) -> bool {
+    id.starts_with(BUILTIN_PREFIX)
+}
+
+fn builtin_named(name: &str) -> Option<&'static LayoutDefinition> {
+    builtin_layouts()
+        .iter()
+        .find(|d| names_collide(&d.name, name))
+}
+
+/// What Save, Save As, and Rename do when another saved definition already
+/// has the name (compared case-insensitively).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnConflict {
     /// Fail with [`StoreError::NameTaken`] so the UI can offer replacement
@@ -86,8 +255,12 @@ pub enum OnConflict {
 pub enum StoreError {
     /// The name or arrangement failed validation; nothing was written.
     Invalid(LayoutError),
-    /// Another definition in this Project already uses the name.
+    /// Another saved definition already uses the name.
     NameTaken { id: String, name: String },
+    /// The name is a built-in's. There is nothing to replace: pick another.
+    ReservedName(String),
+    /// The id is a built-in's, which cannot be changed. Carries its name.
+    ReadOnly(String),
     /// No definition with this id (deleted, possibly by another instance).
     NotFound(String),
     /// The file was written by a newer Foreman; it is left untouched.
@@ -101,11 +274,16 @@ impl fmt::Display for StoreError {
         match self {
             Self::Invalid(e) => write!(f, "Layout not saved: {e}."),
             Self::NameTaken { name, .. } => {
-                write!(
-                    f,
-                    "A layout named \"{name}\" already exists in this Project."
-                )
+                write!(f, "A layout named \"{name}\" already exists.")
             }
+            Self::ReservedName(name) => write!(
+                f,
+                "\"{name}\" is the name of a built-in layout. Type another name."
+            ),
+            Self::ReadOnly(name) => write!(
+                f,
+                "\"{name}\" is a built-in layout and cannot be changed. Save As makes a copy you can change."
+            ),
             Self::NotFound(_) => write!(
                 f,
                 "That layout no longer exists. It may have been deleted in another window."
@@ -127,13 +305,27 @@ impl From<LayoutError> for StoreError {
     }
 }
 
-/// The library key for a project directory: absolute, `.`/`..` resolved,
-/// symlinks, junctions, substituted drives, and 8.3 short names resolved as
-/// far down as the path exists, without the `\\?\` prefix or a trailing
-/// separator, and case-folded on Windows. A missing directory keeps the key
-/// it had while it existed as long as its parent is still reachable, so a
-/// library outlives the directory disappearing. It only fails to line up
-/// when the missing part of the path was itself spelled through an alias.
+fn reject_builtin_id(id: &str) -> Result<(), StoreError> {
+    match builtin_layouts().iter().find(|d| d.id == id) {
+        Some(def) => Err(StoreError::ReadOnly(def.name.clone())),
+        None => Ok(()),
+    }
+}
+
+fn reject_builtin_name(name: &str) -> Result<(), StoreError> {
+    match builtin_named(name) {
+        Some(def) => Err(StoreError::ReservedName(def.name.clone())),
+        None => Ok(()),
+    }
+}
+
+/// The key that identifies a project directory, recorded as a definition's
+/// `origin`: absolute, `.`/`..` resolved, symlinks, junctions, substituted
+/// drives, and 8.3 short names resolved as far down as the path exists,
+/// without the `\\?\` prefix or a trailing separator, and case-folded on
+/// Windows. A missing directory keeps the key it had while it existed as
+/// long as its parent is still reachable. It only fails to line up when the
+/// missing part of the path was itself spelled through an alias.
 pub fn project_key(dir: &Path) -> String {
     let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let resolved = resolve_existing_prefix(&absolute);
@@ -178,14 +370,19 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
     }
 }
 
+/// The definition `id` names: a built-in, or one of `saved`. `None` when it
+/// is neither (deleted elsewhere since).
+pub fn find_layout<'a>(saved: &'a [LayoutDefinition], id: &str) -> Option<&'a LayoutDefinition> {
+    builtin_layouts().iter().chain(saved).find(|d| d.id == id)
+}
+
 /// The definition a Project instance's selection names, or `None` to show
 /// Custom (nothing selected, or deleted elsewhere since).
 pub fn resolve_selection<'a>(
-    layouts: &'a [LayoutDefinition],
+    saved: &'a [LayoutDefinition],
     selected: Option<&str>,
 ) -> Option<&'a LayoutDefinition> {
-    let id = selected?;
-    layouts.iter().find(|d| d.id == id)
+    find_layout(saved, selected?)
 }
 
 fn new_definition_id() -> String {
@@ -221,16 +418,12 @@ impl LayoutStore {
         self.dir.join(LIBRARY_FILE)
     }
 
-    /// The saved layouts of `project`, in creation order. A missing file is
-    /// an empty library. A malformed file is backed up by the shared config
-    /// recovery and reads as empty, with a warning toast queued.
-    pub fn project_layouts(&self, project: &Path) -> Result<Vec<LayoutDefinition>, StoreError> {
-        let mut file = self.read()?;
-        Ok(file
-            .projects
-            .remove(&project_key(project))
-            .map(|p| p.layouts)
-            .unwrap_or_default())
+    /// The saved layouts, in creation order; the built-ins are not among
+    /// them ([`builtin_layouts`]). A missing file is an empty list. A
+    /// malformed file is backed up by the shared config recovery and reads
+    /// as empty, with a warning toast queued.
+    pub fn layouts(&self) -> Result<Vec<LayoutDefinition>, StoreError> {
+        Ok(self.read()?.layouts)
     }
 
     /// The New Project layout, `None` when unset (one tiled terminal).
@@ -238,8 +431,9 @@ impl LayoutStore {
         Ok(self.read()?.new_project)
     }
 
-    /// Save or Save As with a name: a new definition, or, when the user chose
-    /// replacement, the colliding definition overwritten in place (same id).
+    /// Save or Save As with a name, from `project`'s live windows: a new
+    /// definition, or, when the user chose replacement, the colliding
+    /// definition overwritten in place (same id).
     pub fn create(
         &self,
         project: &Path,
@@ -250,7 +444,9 @@ impl LayoutStore {
     ) -> Result<LayoutDefinition, StoreError> {
         let name = validate_name(name)?;
         validate(&arrangement, &items)?;
-        self.change(project, |layouts| {
+        reject_builtin_name(&name)?;
+        let origin = Some(project_key(project));
+        self.change(|layouts| {
             if let Some(existing) = layouts.iter_mut().find(|d| names_collide(&d.name, &name)) {
                 if on_conflict == OnConflict::Reject {
                     return Err(StoreError::NameTaken {
@@ -261,6 +457,7 @@ impl LayoutStore {
                 existing.name = name;
                 existing.items = items;
                 existing.arrangement = arrangement;
+                existing.origin = origin;
                 return Ok(existing.clone());
             }
             let def = LayoutDefinition {
@@ -268,14 +465,15 @@ impl LayoutStore {
                 name,
                 items,
                 arrangement,
+                origin,
             };
             layouts.push(def.clone());
             Ok(def)
         })
     }
 
-    /// Save with a layout selected: replace that definition's arrangement,
-    /// keeping its id and name.
+    /// Save with a layout selected: replace that definition's arrangement
+    /// with `project`'s, keeping its id and name.
     pub fn update(
         &self,
         project: &Path,
@@ -284,13 +482,16 @@ impl LayoutStore {
         arrangement: Arrangement,
     ) -> Result<LayoutDefinition, StoreError> {
         validate(&arrangement, &items)?;
-        self.change(project, |layouts| {
+        reject_builtin_id(id)?;
+        let origin = Some(project_key(project));
+        self.change(|layouts| {
             let def = layouts
                 .iter_mut()
                 .find(|d| d.id == id)
                 .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
             def.items = items;
             def.arrangement = arrangement;
+            def.origin = origin;
             Ok(def.clone())
         })
     }
@@ -300,13 +501,14 @@ impl LayoutStore {
     /// deleted; changing only the case of its own name never conflicts.
     pub fn rename(
         &self,
-        project: &Path,
         id: &str,
         name: &str,
         on_conflict: OnConflict,
     ) -> Result<LayoutDefinition, StoreError> {
         let name = validate_name(name)?;
-        self.change(project, |layouts| {
+        reject_builtin_id(id)?;
+        reject_builtin_name(&name)?;
+        self.change(|layouts| {
             if !layouts.iter().any(|d| d.id == id) {
                 return Err(StoreError::NotFound(id.to_string()));
             }
@@ -334,17 +536,12 @@ impl LayoutStore {
 
     /// Delete one definition. Deleting one that is already gone succeeds
     /// without writing; the UI shows Custom either way.
-    pub fn delete(&self, project: &Path, id: &str) -> Result<(), StoreError> {
-        let key = project_key(project);
-        if !self
-            .read()?
-            .projects
-            .get(&key)
-            .is_some_and(|p| p.layouts.iter().any(|d| d.id == id))
-        {
+    pub fn delete(&self, id: &str) -> Result<(), StoreError> {
+        reject_builtin_id(id)?;
+        if !self.read()?.layouts.iter().any(|d| d.id == id) {
             return Ok(());
         }
-        self.change(project, |layouts| {
+        self.change(|layouts| {
             layouts.retain(|d| d.id != id);
             Ok(())
         })
@@ -363,23 +560,12 @@ impl LayoutStore {
         })
     }
 
-    /// Re-read, apply `edit` to `project`'s layouts only, write. An emptied
-    /// library drops its entry so deleted Projects do not linger as keys.
+    /// Re-read, apply `edit` to the saved layouts only, write.
     fn change<R>(
         &self,
-        project: &Path,
         edit: impl FnOnce(&mut Vec<LayoutDefinition>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let key = project_key(project);
-        self.write_with(|file| {
-            let entry = file.projects.entry(key.clone()).or_default();
-            entry.dir = project.to_path_buf();
-            let out = edit(&mut entry.layouts)?;
-            if entry.layouts.is_empty() {
-                file.projects.remove(&key);
-            }
-            Ok(out)
-        })
+        self.write_with(|file| edit(&mut file.layouts))
     }
 
     fn write_with<R>(
@@ -395,8 +581,10 @@ impl LayoutStore {
 
     /// Read the file fresh. Missing = empty. Unreadable = error (so no write
     /// follows). Newer version = error, before anything can back it up or
-    /// replace it. Malformed = the shared recovery: `load_json_from` backs
-    /// the bytes up (or blocks writes if it cannot) and yields the default.
+    /// replace it. Version 1 = migrated in memory; the file keeps that shape
+    /// until the next write, so an older build can still use it until then.
+    /// Malformed = the shared recovery: `load_json_from` backs the bytes up
+    /// (or blocks writes if it cannot) and yields the default.
     fn read(&self) -> Result<LibraryFile, StoreError> {
         let path = self.path();
         let bytes = match std::fs::read(&path) {
@@ -409,12 +597,22 @@ impl LayoutStore {
                 )));
             }
         };
-        if let Ok(probe) = serde_json::from_slice::<VersionProbe>(&bytes)
-            && probe.version > LIBRARY_VERSION
+        let version = serde_json::from_slice::<VersionProbe>(&bytes).map(|p| p.version);
+        if let Ok(v) = version
+            && v > LIBRARY_VERSION
         {
-            return Err(StoreError::FutureVersion(probe.version));
+            return Err(StoreError::FutureVersion(v));
         }
-        match serde_json::from_slice::<LibraryFile>(&bytes) {
+        let v1 = || serde_json::from_slice::<LibraryFileV1>(&bytes).map(LibraryFile::from);
+        let v2 = || serde_json::from_slice::<LibraryFile>(&bytes);
+        let parsed = match version {
+            Ok(1) => v1(),
+            // No version key: only a hand edit writes that, and version 1
+            // read it as itself. Let the shape decide.
+            Ok(0) => v1().or_else(|_| v2()),
+            _ => v2(),
+        };
+        match parsed {
             Ok(file) => Ok(file),
             Err(_) => Ok(crate::config::load_json_from(&self.dir, LIBRARY_FILE)),
         }
@@ -424,7 +622,7 @@ impl LayoutStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_layout::{ItemKind, NormRect, SplitAxis, TreeSpec, WindowSpec};
+    use crate::project_layout::{NormRect, SplitAxis, TreeSpec, WindowSpec};
 
     fn term(id: u64) -> ItemRef {
         ItemRef::new(id, ItemKind::Terminal)
@@ -489,16 +687,20 @@ mod tests {
                 .create(&self.project, name, items, arrangement, OnConflict::Reject)
                 .unwrap()
         }
+        fn saved(&self) -> Vec<LayoutDefinition> {
+            self.store().layouts().unwrap()
+        }
         fn names(&self) -> Vec<String> {
-            self.store()
-                .project_layouts(&self.project)
-                .unwrap()
-                .into_iter()
-                .map(|d| d.name)
-                .collect()
+            self.saved().into_iter().map(|d| d.name).collect()
         }
         fn file(&self) -> PathBuf {
             self.config.join(LIBRARY_FILE)
+        }
+        /// Another existing project directory next to `project`.
+        fn other(&self, name: &str) -> PathBuf {
+            let dir = self.project.parent().unwrap().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
         }
     }
 
@@ -576,7 +778,7 @@ mod tests {
     #[test]
     fn missing_file_is_an_empty_library() {
         let f = fixture();
-        assert_eq!(f.store().project_layouts(&f.project), Ok(vec![]));
+        assert_eq!(f.store().layouts(), Ok(vec![]));
         assert_eq!(f.store().new_project_layout(), Ok(None));
         assert!(!f.file().exists(), "reading never creates the file");
     }
@@ -587,8 +789,8 @@ mod tests {
         let def = f.save("  Coding  ");
         assert_eq!(def.name, "Coding");
         assert!(!def.id.is_empty());
-        let back = f.store().project_layouts(&f.project).unwrap();
-        assert_eq!(back, vec![def]);
+        assert!(!is_builtin(&def.id));
+        assert_eq!(f.saved(), vec![def]);
     }
 
     #[test]
@@ -659,10 +861,7 @@ mod tests {
                 name: "Coding".into()
             }
         );
-        assert_eq!(
-            f.store().project_layouts(&f.project).unwrap(),
-            vec![first.clone()]
-        );
+        assert_eq!(f.saved(), vec![first.clone()]);
 
         let replaced = f
             .store()
@@ -680,10 +879,7 @@ mod tests {
         );
         assert_eq!(replaced.name, "CODING");
         assert_eq!(replaced.arrangement, arrangement);
-        assert_eq!(
-            f.store().project_layouts(&f.project).unwrap(),
-            vec![replaced]
-        );
+        assert_eq!(f.saved(), vec![replaced]);
     }
 
     #[test]
@@ -713,17 +909,14 @@ mod tests {
             (updated.items.clone(), updated.arrangement.clone()),
             (items, arrangement)
         );
-        assert_eq!(
-            f.store().project_layouts(&f.project).unwrap(),
-            vec![updated, b]
-        );
+        assert_eq!(f.saved(), vec![updated, b]);
     }
 
     #[test]
     fn update_of_a_definition_deleted_elsewhere_reports_not_found() {
         let f = fixture();
         let a = f.save("A");
-        f.store().delete(&f.project, &a.id).unwrap();
+        f.store().delete(&a.id).unwrap();
         let (items, arrangement) = single();
         assert_eq!(
             f.store().update(&f.project, &a.id, items, arrangement),
@@ -738,14 +931,14 @@ mod tests {
         let a = f.save("A");
         let renamed = f
             .store()
-            .rename(&f.project, &a.id, " Review ", OnConflict::Reject)
+            .rename(&a.id, " Review ", OnConflict::Reject)
             .unwrap();
         assert_eq!(renamed.id, a.id);
         assert_eq!(renamed.name, "Review");
         assert_eq!(renamed.arrangement, a.arrangement);
         // Re-casing its own name is not a conflict.
         f.store()
-            .rename(&f.project, &a.id, "REVIEW", OnConflict::Reject)
+            .rename(&a.id, "REVIEW", OnConflict::Reject)
             .unwrap();
         assert_eq!(f.names(), ["REVIEW"]);
     }
@@ -756,17 +949,15 @@ mod tests {
         let a = f.save("A");
         let b = f.save("B");
         assert_eq!(
-            f.store().rename(&f.project, &a.id, "b", OnConflict::Reject),
+            f.store().rename(&a.id, "b", OnConflict::Reject),
             Err(StoreError::NameTaken {
                 id: b.id.clone(),
                 name: "B".into()
             })
         );
         assert_eq!(f.names(), ["A", "B"]);
-        f.store()
-            .rename(&f.project, &a.id, "b", OnConflict::Replace)
-            .unwrap();
-        let left = f.store().project_layouts(&f.project).unwrap();
+        f.store().rename(&a.id, "b", OnConflict::Replace).unwrap();
+        let left = f.saved();
         assert_eq!(left.len(), 1);
         assert_eq!(
             (left[0].id.as_str(), left[0].name.as_str()),
@@ -779,76 +970,105 @@ mod tests {
         let f = fixture();
         f.save("A");
         assert_eq!(
-            f.store()
-                .rename(&f.project, "nope", "X", OnConflict::Reject),
+            f.store().rename("nope", "X", OnConflict::Reject),
             Err(StoreError::NotFound("nope".into()))
         );
-        assert_eq!(f.store().delete(&f.project, "nope"), Ok(()));
+        assert_eq!(f.store().delete("nope"), Ok(()));
         assert_eq!(f.names(), ["A"]);
     }
 
     #[test]
-    fn delete_removes_one_definition_and_drops_an_empty_library() {
+    fn delete_removes_one_definition() {
         let f = fixture();
         let a = f.save("A");
         let b = f.save("B");
-        f.store().delete(&f.project, &a.id).unwrap();
+        f.store().delete(&a.id).unwrap();
         assert_eq!(f.names(), ["B"]);
-        f.store().delete(&f.project, &b.id).unwrap();
+        f.store().delete(&b.id).unwrap();
         let file: LibraryFile = serde_json::from_slice(&std::fs::read(f.file()).unwrap()).unwrap();
-        assert!(file.projects.is_empty(), "{file:?}");
+        assert!(file.layouts.is_empty(), "{file:?}");
     }
 
     #[test]
     fn selection_resolves_to_custom_when_its_definition_is_gone() {
         let f = fixture();
         let a = f.save("A");
-        let layouts = f.store().project_layouts(&f.project).unwrap();
+        let layouts = f.saved();
         assert_eq!(resolve_selection(&layouts, Some(&a.id)), Some(&a));
         assert_eq!(resolve_selection(&layouts, None), None);
-        f.store().delete(&f.project, &a.id).unwrap();
-        let layouts = f.store().project_layouts(&f.project).unwrap();
+        f.store().delete(&a.id).unwrap();
+        let layouts = f.saved();
         assert_eq!(resolve_selection(&layouts, Some(&a.id)), None);
     }
 
-    // ── ownership ─────────────────────────────────────────────────────────
+    // ── one list for every Project ────────────────────────────────────────
 
     #[test]
-    fn two_instances_of_one_directory_share_definitions() {
+    fn every_project_shares_one_list_and_one_namespace() {
         let f = fixture();
-        let a = f.save("A");
-        // A second Project instance reaches the same directory another way.
-        let alias = f.project.join("sub").join("..");
-        std::fs::create_dir_all(f.project.join("sub")).unwrap();
-        assert_eq!(f.store().project_layouts(&alias).unwrap(), vec![a]);
-        let (items, arrangement) = single();
-        f.store()
-            .create(&alias, "B", items, arrangement, OnConflict::Reject)
-            .unwrap();
-        assert_eq!(f.names(), ["A", "B"]);
-    }
-
-    #[test]
-    fn distinct_directories_and_worktrees_stay_isolated() {
-        let f = fixture();
-        f.save("Main");
+        let a = f.save("Main");
+        // A worktree is its own directory, and still sees the same list.
         let worktree = f.project.join(".foreman").join("worktrees").join("abc");
         std::fs::create_dir_all(&worktree).unwrap();
-        assert_eq!(f.store().project_layouts(&worktree), Ok(vec![]));
         let (items, arrangement) = single();
-        f.store()
-            .create(&worktree, "Main", items, arrangement, OnConflict::Reject)
-            .expect("names only collide within one Project");
-        assert_eq!(f.names(), ["Main"]);
-        assert_eq!(f.store().project_layouts(&worktree).unwrap().len(), 1);
+        assert_eq!(
+            f.store().create(
+                &worktree,
+                "main",
+                items.clone(),
+                arrangement.clone(),
+                OnConflict::Reject
+            ),
+            Err(StoreError::NameTaken {
+                id: a.id.clone(),
+                name: "Main".into()
+            }),
+            "names collide across Projects"
+        );
+        let b = f
+            .store()
+            .create(&worktree, "Review", items, arrangement, OnConflict::Reject)
+            .unwrap();
+        assert_eq!(f.saved(), vec![a, b]);
     }
 
     #[test]
-    fn libraries_survive_the_directory_disappearing() {
+    fn a_definition_records_the_directory_its_ids_came_from() {
         let f = fixture();
         let a = f.save("A");
-        std::fs::remove_dir_all(&f.project).unwrap();
-        assert_eq!(f.store().project_layouts(&f.project).unwrap(), vec![a]);
+        assert_eq!(a.origin, Some(project_key(&f.project)));
+        // Another spelling of the same directory is the same origin.
+        std::fs::create_dir_all(f.project.join("sub")).unwrap();
+        let alias = f.project.join("sub").join("..");
+        let (items, arrangement) = single();
+        let b = f
+            .store()
+            .create(
+                &alias,
+                "B",
+                items.clone(),
+                arrangement.clone(),
+                OnConflict::Reject,
+            )
+            .unwrap();
+        assert_eq!(b.origin, a.origin);
+        // Saving over it from another Project moves the origin there: the
+        // items are now that Project's.
+        let other = f.other("other");
+        let moved = f
+            .store()
+            .update(&other, &a.id, items.clone(), arrangement.clone())
+            .unwrap();
+        assert_eq!(moved.origin, Some(project_key(&other)));
+        let replaced = f
+            .store()
+            .create(&other, "b", items, arrangement, OnConflict::Replace)
+            .unwrap();
+        assert_eq!(replaced.id, b.id);
+        assert_eq!(replaced.origin, Some(project_key(&other)));
+        // Rename keeps the items, so it keeps the origin.
+        let renamed = f.store().rename(&b.id, "Bee", OnConflict::Reject).unwrap();
+        assert_eq!(renamed.origin, Some(project_key(&other)));
     }
 
     #[test]
@@ -858,10 +1078,9 @@ mod tests {
         let f = fixture();
         let installed = LayoutStore::at(&f.config);
         let dev = LayoutStore::at(&f.config);
-        let other = f.project.join("other");
-        std::fs::create_dir_all(&other).unwrap();
-        assert!(installed.project_layouts(&f.project).unwrap().is_empty());
-        assert!(dev.project_layouts(&f.project).unwrap().is_empty());
+        let other = f.other("other");
+        assert!(installed.layouts().unwrap().is_empty());
+        assert!(dev.layouts().unwrap().is_empty());
         let (items, arrangement) = pair();
         let a = installed
             .create(
@@ -885,10 +1104,215 @@ mod tests {
             .create(&other, "C", items, arrangement, OnConflict::Reject)
             .unwrap();
         installed.set_new_project_layout(Some(&c)).unwrap();
-        dev.delete(&f.project, &b.id).unwrap();
-        assert_eq!(installed.project_layouts(&f.project).unwrap(), vec![a]);
-        assert_eq!(installed.project_layouts(&other).unwrap(), vec![c.clone()]);
+        dev.delete(&b.id).unwrap();
+        assert_eq!(installed.layouts().unwrap(), vec![a, c.clone()]);
         assert_eq!(dev.new_project_layout().unwrap(), Some(c));
+    }
+
+    // ── built-ins ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn builtins_are_valid_distinct_and_carry_no_origin() {
+        let all = builtin_layouts();
+        assert!(all.len() >= 3, "a few to start from");
+        for (i, def) in all.iter().enumerate() {
+            assert!(is_builtin(&def.id), "{}", def.id);
+            assert_eq!(validate_name(&def.name).as_deref(), Ok(def.name.as_str()));
+            validate(&def.arrangement, &def.items).unwrap_or_else(|e| panic!("{}: {e}", def.name));
+            assert_eq!(def.origin, None, "{}", def.name);
+            assert!(
+                def.items
+                    .iter()
+                    .all(|item| item.kind.opens_without_target()),
+                "{}: every slot can open on an empty Project",
+                def.name
+            );
+            for other in &all[i + 1..] {
+                assert_ne!(def.id, other.id);
+                assert!(!names_collide(&def.name, &other.name), "{}", def.name);
+            }
+        }
+        assert!(std::ptr::eq(all, builtin_layouts()), "built once");
+    }
+
+    #[test]
+    fn builtins_resolve_like_saved_layouts_but_are_not_in_the_file() {
+        let f = fixture();
+        let a = f.save("A");
+        let saved = f.saved();
+        let grid = &builtin_layouts()[2];
+        assert_eq!(find_layout(&saved, &grid.id), Some(grid));
+        assert_eq!(find_layout(&saved, &a.id), Some(&a));
+        assert_eq!(resolve_selection(&[], Some(&grid.id)), Some(grid));
+        assert_eq!(find_layout(&saved, "builtin:retired"), None);
+        assert_eq!(saved, vec![a], "the file holds only saved layouts");
+    }
+
+    #[test]
+    fn builtins_are_read_only_and_their_names_reserved() {
+        let f = fixture();
+        let builtin = &builtin_layouts()[0];
+        let a = f.save("A");
+        let (items, arrangement) = single();
+        let reserved = StoreError::ReservedName(builtin.name.clone());
+        let read_only = StoreError::ReadOnly(builtin.name.clone());
+        for on_conflict in [OnConflict::Reject, OnConflict::Replace] {
+            assert_eq!(
+                f.store().create(
+                    &f.project,
+                    &builtin.name.to_uppercase(),
+                    items.clone(),
+                    arrangement.clone(),
+                    on_conflict
+                ),
+                Err(reserved.clone())
+            );
+            assert_eq!(
+                f.store().rename(&a.id, &builtin.name, on_conflict),
+                Err(reserved.clone())
+            );
+            assert_eq!(
+                f.store().rename(&builtin.id, "Mine", on_conflict),
+                Err(read_only.clone())
+            );
+        }
+        assert_eq!(
+            f.store()
+                .update(&f.project, &builtin.id, items, arrangement),
+            Err(read_only.clone())
+        );
+        assert_eq!(f.store().delete(&builtin.id), Err(read_only));
+        assert_eq!(f.saved(), vec![a]);
+        assert!(reserved.to_string().contains("another name"));
+    }
+
+    #[test]
+    fn a_builtin_can_be_the_new_project_layout() {
+        let f = fixture();
+        let builtin = &builtin_layouts()[1];
+        f.store().set_new_project_layout(Some(builtin)).unwrap();
+        assert_eq!(
+            f.store().new_project_layout().unwrap().as_ref(),
+            Some(builtin)
+        );
+    }
+
+    // ── version 1 ─────────────────────────────────────────────────────────
+
+    /// A v1 definition as v1 wrote it: no `origin`.
+    fn v1_def(id: &str, name: &str) -> serde_json::Value {
+        let (items, arrangement) = pair();
+        serde_json::json!({ "id": id, "name": name, "items": items, "arrangement": arrangement })
+    }
+
+    #[test]
+    fn a_version_1_file_migrates_into_one_list_on_read() {
+        let f = fixture();
+        let web = f.other("web");
+        let api = f.other("api");
+        let (web_key, api_key) = (project_key(&web), project_key(&api));
+        let v1 = serde_json::json!({
+            "version": 1,
+            "projects": {
+                web_key.clone(): { "dir": web, "layouts": [v1_def("w1", "Coding"), v1_def("w2", "grid")] },
+                api_key.clone(): { "dir": api, "layouts": [v1_def("a1", "coding"), v1_def("a2", "Solo")] },
+            },
+            "new_project": v1_def("n", "Slot"),
+        });
+        let bytes = serde_json::to_vec_pretty(&v1).unwrap();
+        std::fs::write(f.file(), &bytes).unwrap();
+
+        // Keys sort, so api's layouts come first and keep their names.
+        // A name another directory or a built-in holds gets its folder.
+        let got: Vec<(String, String, String)> = f
+            .saved()
+            .into_iter()
+            .map(|d| (d.id, d.name, d.origin.unwrap()))
+            .collect();
+        let want = [
+            ("a1", "coding", &api_key),
+            ("a2", "Solo", &api_key),
+            ("w1", "Coding (web)", &web_key),
+            ("w2", "grid (web)", &web_key),
+        ]
+        .map(|(id, name, key)| (id.to_string(), name.to_string(), key.clone()));
+        assert_eq!(got, want);
+        assert_eq!(
+            f.store().new_project_layout().unwrap().map(|d| d.name),
+            Some("Slot".into())
+        );
+        assert_eq!(
+            std::fs::read(f.file()).unwrap(),
+            bytes,
+            "reading leaves a v1 file for older builds"
+        );
+
+        // The first write stores the new shape.
+        f.save("New");
+        let file: LibraryFile = serde_json::from_slice(&std::fs::read(f.file()).unwrap()).unwrap();
+        assert_eq!(file.version, LIBRARY_VERSION);
+        assert_eq!(file.layouts.len(), 5);
+        assert!(
+            !std::fs::read_dir(&f.config).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")),
+            "a v1 file is migrated, not treated as corrupt"
+        );
+    }
+
+    #[test]
+    fn migrated_names_fit_the_limit_and_never_collide() {
+        let long = "n".repeat(MAX_NAME_CHARS);
+        let hint = "h".repeat(MIGRATION_HINT_CHARS + 20);
+        // The first two candidates are taken.
+        let name = disambiguate(&long, &hint, |n| !n.ends_with(" 3)"));
+        let cut = "h".repeat(MIGRATION_HINT_CHARS);
+        assert!(name.ends_with(&format!(" ({cut} 3)")), "{name}");
+        assert!(name.starts_with("nnn"), "{name}");
+        assert_eq!(validate_name(&name).as_deref(), Ok(name.as_str()));
+    }
+
+    #[test]
+    fn a_file_without_a_version_is_read_by_its_shape() {
+        let f = fixture();
+        let key = project_key(&f.project);
+        let v1 = serde_json::json!({
+            "projects": { key.clone(): { "dir": f.project, "layouts": [v1_def("a", "A")] } },
+        });
+        std::fs::write(f.file(), serde_json::to_vec(&v1).unwrap()).unwrap();
+        let saved = f.saved();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].origin.as_deref(), Some(key.as_str()));
+
+        let v2 = serde_json::json!({ "layouts": [v1_def("b", "B")] });
+        std::fs::write(f.file(), serde_json::to_vec(&v2).unwrap()).unwrap();
+        assert_eq!(f.names(), ["B"]);
+        assert!(
+            !std::fs::read_dir(&f.config).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")),
+            "neither shape is treated as corrupt"
+        );
+    }
+
+    #[test]
+    fn a_malformed_version_1_file_is_backed_up() {
+        let f = fixture();
+        let odd = br#"{"version": 1, "projects": {}, "surprise": true}"#;
+        std::fs::write(f.file(), odd).unwrap();
+        assert_eq!(f.store().layouts(), Ok(vec![]));
+        f.save("A");
+        let backup = std::fs::read_dir(&f.config)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains(".corrupt-"))
+            .expect("the bytes are preserved");
+        assert_eq!(std::fs::read(backup).unwrap(), odd);
+        crate::config::take_load_warnings();
     }
 
     // ── New Project slot ──────────────────────────────────────────────────
@@ -903,10 +1327,10 @@ mod tests {
             .update(&f.project, &a.id, items, arrangement)
             .unwrap();
         f.store()
-            .rename(&f.project, &a.id, "Renamed", OnConflict::Reject)
+            .rename(&a.id, "Renamed", OnConflict::Reject)
             .unwrap();
         assert_eq!(f.store().new_project_layout().unwrap(), Some(a.clone()));
-        f.store().delete(&f.project, &a.id).unwrap();
+        f.store().delete(&a.id).unwrap();
         assert_eq!(f.store().new_project_layout().unwrap(), Some(a));
         f.store().set_new_project_layout(None).unwrap();
         assert_eq!(f.store().new_project_layout().unwrap(), None);
@@ -946,7 +1370,7 @@ mod tests {
         if cfg!(windows) {
             assert!(matches!(result, Err(StoreError::Io(_))), "{result:?}");
             assert_eq!(std::fs::read(f.file()).unwrap(), before);
-            assert_eq!(f.store().project_layouts(&f.project).unwrap(), vec![a]);
+            assert_eq!(f.saved(), vec![a]);
         }
         let leftovers: Vec<_> = std::fs::read_dir(&f.config)
             .unwrap()
@@ -959,23 +1383,21 @@ mod tests {
     #[test]
     fn a_future_version_is_never_overwritten() {
         let f = fixture();
-        let future = br#"{"version": 2, "projects": {"x": {"shape": "new"}}}"#;
-        std::fs::write(f.file(), future).unwrap();
-        assert_eq!(
-            f.store().project_layouts(&f.project),
-            Err(StoreError::FutureVersion(2))
-        );
+        let next = LIBRARY_VERSION + 1;
+        let future = format!(r#"{{"version": {next}, "layouts": {{"shape": "new"}}}}"#);
+        std::fs::write(f.file(), &future).unwrap();
+        assert_eq!(f.store().layouts(), Err(StoreError::FutureVersion(next)));
         let (items, arrangement) = pair();
         assert_eq!(
             f.store()
                 .create(&f.project, "A", items, arrangement, OnConflict::Reject),
-            Err(StoreError::FutureVersion(2))
+            Err(StoreError::FutureVersion(next))
         );
         assert_eq!(
             f.store().set_new_project_layout(None),
-            Err(StoreError::FutureVersion(2))
+            Err(StoreError::FutureVersion(next))
         );
-        assert_eq!(std::fs::read(f.file()).unwrap(), future);
+        assert_eq!(std::fs::read(f.file()).unwrap(), future.as_bytes());
         let entries = std::fs::read_dir(&f.config).unwrap().count();
         assert_eq!(entries, 1, "a newer file is not backed up as corrupt");
     }
@@ -983,11 +1405,11 @@ mod tests {
     #[test]
     fn corrupt_data_is_backed_up_before_it_is_replaced() {
         let f = fixture();
-        let corrupt = br#"{"version": 1, "projects": "#;
+        let corrupt = br#"{"version": 2, "layouts": "#;
         std::fs::write(f.file(), corrupt).unwrap();
-        assert_eq!(f.store().project_layouts(&f.project), Ok(vec![]));
+        assert_eq!(f.store().layouts(), Ok(vec![]));
         let a = f.save("A");
-        assert_eq!(f.store().project_layouts(&f.project).unwrap(), vec![a]);
+        assert_eq!(f.saved(), vec![a]);
         let backup = std::fs::read_dir(&f.config)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1000,7 +1422,7 @@ mod tests {
     #[test]
     fn unknown_fields_are_preserved_as_corrupt_not_trimmed() {
         let f = fixture();
-        let odd = br#"{"version": 1, "projects": {}, "surprise": true}"#;
+        let odd = br#"{"version": 2, "layouts": [], "surprise": true}"#;
         std::fs::write(f.file(), odd).unwrap();
         f.save("A");
         let backup = std::fs::read_dir(&f.config)
@@ -1017,10 +1439,7 @@ mod tests {
         let f = fixture();
         // A directory at the file's path cannot be read as a file.
         std::fs::create_dir_all(f.file()).unwrap();
-        assert!(matches!(
-            f.store().project_layouts(&f.project),
-            Err(StoreError::Io(_))
-        ));
+        assert!(matches!(f.store().layouts(), Err(StoreError::Io(_))));
         let (items, arrangement) = pair();
         assert!(matches!(
             f.store()
@@ -1041,6 +1460,11 @@ mod tests {
             StoreError::FutureVersion(3)
                 .to_string()
                 .contains("Update Foreman")
+        );
+        assert!(
+            StoreError::ReadOnly("Grid".into())
+                .to_string()
+                .contains("Save As")
         );
     }
 }

@@ -1,6 +1,6 @@
 //! The Project header's **Layout ▾** picker and **Save** button: the menu of
-//! this Project's saved layouts, the naming and delete dialogs, and the
-//! post-Apply summary. Spec:
+//! built-in and saved layouts (one list every Project shares), the naming
+//! and delete dialogs, and the post-Apply summary. Spec:
 //! `docs/superpowers/specs/2026-10-16-project-layouts-design.md` (Picker and
 //! Save, Applying saved layouts, Revert). Feature doc: `docs/project-layouts.md`.
 //!
@@ -13,7 +13,9 @@
 
 use super::layouts::{LayoutApplied, LayoutRequest, RevertStatus};
 use super::*;
-use crate::layout_library::{LayoutStore, OnConflict, StoreError};
+use crate::layout_library::{
+    LayoutStore, OnConflict, StoreError, builtin_layouts, find_layout, is_builtin, project_key,
+};
 use crate::project_layout::{
     self as pl, ItemKind, LayoutDefinition, LayoutItemId, LayoutSelection, TreeSpec, WindowState,
 };
@@ -22,16 +24,31 @@ use crate::project_layout::{
 pub(super) const SAVED_NOTICE_SECS: f64 = 2.5;
 const MENU_W: f32 = 292.0;
 const NOTICE_W: f32 = 300.0;
+/// A menu row: Create, Save, Save As, Revert.
+const MENU_ITEM_H: f32 = 24.0;
+const DIVIDER_H: f32 = 9.0;
+/// One layout row in the list, and a group's title above its rows.
+const LAYOUT_ROW_H: f32 = 34.0;
+const GROUP_HEADER_H: f32 = 20.0;
+/// The list never gets shorter than this, so a short window still shows a
+/// few rows (the menu then overlaps the window's bottom edge instead).
+const MENU_LIST_MIN_H: f32 = 3.0 * LAYOUT_ROW_H;
+/// Space a full-height menu leaves above the window's bottom edge.
+const MENU_BOTTOM_GAP: f32 = 6.0;
 
 /// Per-instance picker UI state. Runtime-only: nothing here is persisted.
 #[derive(Default)]
 pub(super) struct PickerUi {
-    /// This Project's saved layouts as last read, or the read error.
+    /// The saved layouts as last read, or the read error. The built-ins
+    /// are not here: they need no read.
     library: Option<Result<Vec<LayoutDefinition>, String>>,
     /// The New Project layout as last read with the library, to mark the
     /// row it was copied from while the two still match.
     new_project: Option<LayoutDefinition>,
     pub(super) menu_open: bool,
+    /// Open the list scrolled to the selected layout: set when the menu
+    /// opens, cleared once it has been drawn.
+    reveal_selected: bool,
     pub(super) dialog: Option<Dialog>,
     pub(super) notice: Option<Notice>,
     /// The Create Layout… editor, while open.
@@ -115,14 +132,14 @@ pub(super) enum Notice {
 pub(super) enum PickerAction {
     ToggleMenu,
     CloseMenu,
-    /// Apply a saved layout by id, selecting it.
+    /// Apply a built-in or saved layout by id, selecting it.
     Apply(String),
     /// Update the selected layout, or ask for a name if there is none.
     Save,
     SaveAs,
     Rename(String),
     Delete(String),
-    /// Copy a saved layout into the New Project slot.
+    /// Copy a built-in or saved layout into the New Project slot.
     UseForNewProjects(String),
     /// Open the Create Layout… editor.
     OpenCreate,
@@ -138,8 +155,8 @@ pub(super) enum PickerAction {
 }
 
 impl WindowManager {
-    /// The directory that keys this Project's library. `None` outside a
-    /// Project, where the controls are disabled.
+    /// This Project's directory: what Save records as a layout's `origin`.
+    /// `None` outside a Project, where the controls are disabled.
     fn layout_project_dir(&self) -> Option<std::path::PathBuf> {
         if self.desktop {
             return None;
@@ -159,15 +176,15 @@ impl WindowManager {
         LayoutStore::user()
     }
 
-    /// Re-read this Project's saved layouts and keep the copy.
+    /// Re-read the saved layouts and keep the copy.
     pub(super) fn refresh_layouts(&mut self) {
-        let Some(dir) = self.layout_project_dir() else {
+        if self.layout_project_dir().is_none() {
             self.layout_ui.library = Some(Ok(Vec::new()));
             return;
-        };
+        }
         let read = self
             .layout_store()
-            .and_then(|store| store.project_layouts(&dir))
+            .and_then(|store| store.layouts())
             .map_err(|e| match e {
                 StoreError::Io(e) => format!("Saved layouts could not be read: {e}"),
                 e => e.to_string(),
@@ -203,6 +220,7 @@ impl WindowManager {
         child.request_layout(LayoutRequest::NewProject { def });
     }
 
+    /// The saved layouts as last read; the built-ins are not among them.
     fn cached_layouts(&self) -> &[LayoutDefinition] {
         match &self.layout_ui.library {
             Some(Ok(list)) => list,
@@ -210,8 +228,8 @@ impl WindowManager {
         }
     }
 
-    /// The selected definition, `None` for Custom (nothing selected, or it
-    /// was deleted elsewhere).
+    /// The selected definition, built-in or saved; `None` for Custom
+    /// (nothing selected, or it was deleted elsewhere).
     fn selected_layout(&self) -> Option<&LayoutDefinition> {
         crate::layout_library::resolve_selection(
             self.cached_layouts(),
@@ -246,6 +264,7 @@ impl WindowManager {
         match action {
             PickerAction::ToggleMenu => {
                 self.layout_ui.menu_open = !self.layout_ui.menu_open;
+                self.layout_ui.reveal_selected = self.layout_ui.menu_open;
                 if self.layout_ui.menu_open {
                     self.refresh_layouts();
                     self.layout_ui.notice = None;
@@ -256,11 +275,20 @@ impl WindowManager {
             PickerAction::CloseMenu => self.layout_ui.menu_open = false,
             PickerAction::Apply(id) => {
                 self.layout_ui.menu_open = false;
-                let Some(def) = self.cached_layouts().iter().find(|d| d.id == id).cloned() else {
+                let Some(def) = find_layout(self.cached_layouts(), &id).cloned() else {
                     self.refresh_layouts();
                     self.layout_ui.notice =
                         Some(Notice::Error(StoreError::NotFound(id).to_string()));
                     return;
+                };
+                // Item ids match live tabs only in the directory the layout
+                // was saved from. Anywhere else (and for a built-in) a match
+                // would be a coincidence that pins a window to the wrong
+                // slot, so slots fill by kind in order instead.
+                let def = if def.origin.as_deref() == Some(project_key(&dir).as_str()) {
+                    def
+                } else {
+                    super::layouts::detach_ids(&def)
                 };
                 self.layout_ui.notice = None;
                 self.layout_ui.requested = Some(Requested::Apply {
@@ -271,7 +299,7 @@ impl WindowManager {
             }
             PickerAction::UseForNewProjects(id) => {
                 self.layout_ui.menu_open = false;
-                let Some(def) = self.cached_layouts().iter().find(|d| d.id == id).cloned() else {
+                let Some(def) = find_layout(self.cached_layouts(), &id).cloned() else {
                     self.refresh_layouts();
                     self.layout_ui.notice =
                         Some(Notice::Error(StoreError::NotFound(id).to_string()));
@@ -321,6 +349,10 @@ impl WindowManager {
                     .selected_layout()
                     .map(|d| (d.id.clone(), d.name.clone()))
                 {
+                    // A built-in cannot change: save a copy instead.
+                    Some((id, name)) if is_builtin(&id) => {
+                        self.open_name_dialog(NamePurpose::SaveAs, format!("{name} copy"), None)
+                    }
                     Some((id, name)) => self.save_over(&dir, id, name, now),
                     None => self.open_name_dialog(NamePurpose::Save, String::new(), None),
                 }
@@ -479,7 +511,7 @@ impl WindowManager {
                             return;
                         }
                     },
-                    NamePurpose::Rename { id } => store.rename(dir, id, &buf, on_conflict),
+                    NamePurpose::Rename { id } => store.rename(id, &buf, on_conflict),
                 };
                 match result {
                     Ok(def) => match purpose {
@@ -513,7 +545,7 @@ impl WindowManager {
                     }
                 }
             }
-            Dialog::Delete { id, .. } => match store.delete(dir, &id) {
+            Dialog::Delete { id, .. } => match store.delete(&id) {
                 Ok(()) => {
                     // The live arrangement stays; the picker shows Custom.
                     if self.layout.selected.as_deref() == Some(id.as_str()) {
@@ -736,6 +768,10 @@ impl WindowManager {
         let sresp = sresp.on_hover_ui(|ui| {
             ui.label(match (&disabled, self.selected_layout()) {
                 (Some(why), _) => why.clone(),
+                (None, Some(def)) if is_builtin(&def.id) => format!(
+                    "Save the current arrangement as a new layout (\u{201c}{}\u{201d} is built in)",
+                    def.name
+                ),
                 (None, Some(def)) => format!(
                     "Save the current arrangement to \u{201c}{}\u{201d}",
                     def.name
@@ -748,7 +784,9 @@ impl WindowManager {
         }
 
         if self.layout_ui.menu_open {
-            self.show_layout_menu(ui, &th, ctl, screen, id, &mut actions);
+            if self.show_layout_menu(ui, &th, ctl, screen, id, &mut actions) {
+                self.layout_ui.reveal_selected = false;
+            }
         }
         if self.layout_ui.create.is_some() {
             self.show_create_editor(ui, &th, project, screen, id, &mut actions);
@@ -765,6 +803,8 @@ impl WindowManager {
         interacted
     }
 
+    /// Returns whether the menu was shown (not just measured: egui sizes a
+    /// new Area in an invisible first pass), so a reveal has happened.
     fn show_layout_menu(
         &self,
         ui: &mut egui::Ui,
@@ -773,21 +813,24 @@ impl WindowManager {
         screen: egui::Rect,
         id: egui::Id,
         actions: &mut Vec<PickerAction>,
-    ) {
+    ) -> bool {
         let menu_id = id.with("menu");
-        let layouts = self.cached_layouts();
-        let selected = self.layout.selected.as_deref();
         let revert = self.layout_revert_status();
         let x = (ctl.save.max.x - MENU_W).max(screen.min.x);
         let pos = egui::pos2(x, ctl.picker.max.y + 3.0);
-        let small = egui::FontId::proportional(10.5);
-        let font = egui::FontId::proportional(12.0);
+        // The list scrolls once it would run past the window; the footer
+        // below it stays put.
+        let list_max =
+            (screen.max.y - MENU_BOTTOM_GAP - pos.y - menu_footer_h(revert)).max(MENU_LIST_MIN_H);
+        let reveal = self.layout_ui.reveal_selected;
+        let mut drawn = false;
         let shown = egui::Area::new(menu_id)
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .constrain_to(screen)
             .movable(false)
             .show(ui.ctx(), |mui| {
+                drawn = !mui.is_sizing_pass();
                 egui::Frame::NONE
                     .fill(th.bg)
                     .stroke(egui::Stroke::new(1.0, th.border))
@@ -796,167 +839,34 @@ impl WindowManager {
                     .show(mui, |mui| {
                         mui.set_width(MENU_W);
                         mui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        let header = |mui: &mut egui::Ui, text: &str| {
-                            let (rect, _) = mui.allocate_exact_size(
-                                egui::vec2(MENU_W, 20.0),
-                                egui::Sense::hover(),
-                            );
-                            mui.painter().text(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                text,
-                                small.clone(),
-                                th.dim,
-                            );
-                        };
-                        header(mui, "Layouts for this Project");
-                        match &self.layout_ui.library {
-                            Some(Err(e)) => wrapped(mui, e, th.danger),
-                            _ if layouts.is_empty() => wrapped(
-                                mui,
-                                "No saved layouts yet. Layouts are saved for this Project: \
-                                 arrange its windows, then Save.",
-                                th.dim,
-                            ),
-                            _ => {}
-                        }
-                        for (ri, def) in layouts.iter().enumerate() {
-                            let is_sel = selected == Some(def.id.as_str());
-                            let (rect, _) = mui.allocate_exact_size(
-                                egui::vec2(MENU_W, 34.0),
-                                egui::Sense::hover(),
-                            );
-                            let rename = egui::Rect::from_center_size(
-                                egui::pos2(rect.max.x - 44.0, rect.center().y),
-                                egui::vec2(20.0, 20.0),
-                            );
-                            let delete = egui::Rect::from_center_size(
-                                egui::pos2(rect.max.x - 20.0, rect.center().y),
-                                egui::vec2(20.0, 20.0),
-                            );
-                            let for_new = egui::Rect::from_center_size(
-                                egui::pos2(rect.max.x - 68.0, rect.center().y),
-                                egui::vec2(20.0, 20.0),
-                            );
-                            let row = mui.interact(
-                                egui::Rect::from_min_max(
-                                    rect.min,
-                                    egui::pos2(for_new.min.x - 2.0, rect.max.y),
-                                ),
-                                menu_id.with(("row", ri)),
-                                egui::Sense::click(),
-                            );
-                            let rn = mui.interact(
-                                rename,
-                                menu_id.with(("rename", ri)),
-                                egui::Sense::click(),
-                            );
-                            let del = mui.interact(
-                                delete,
-                                menu_id.with(("delete", ri)),
-                                egui::Sense::click(),
-                            );
-                            let nw = mui.interact(
-                                for_new,
-                                menu_id.with(("for-new", ri)),
-                                egui::Sense::click(),
-                            );
-                            // The slot is a copy: marked only while it still
-                            // matches this definition.
-                            let is_new = self.layout_ui.new_project.as_ref() == Some(def);
-                            let mp = mui.painter();
-                            if row.hovered() || rn.hovered() || del.hovered() || nw.hovered() {
-                                mp.rect_filled(rect, 0.0, th.sel_bg);
+                        // The bar is the theme's scroll thumb, resting faintly
+                        // visible like the panel's and the terminals' thumbs,
+                        // not egui's text-colored one that hides until hovered.
+                        mui.scope(|mui| {
+                            let style = mui.style_mut();
+                            style.spacing.scroll.dormant_handle_opacity =
+                                crate::theme::THUMB_DIM_FLOOR;
+                            let v = &mut style.visuals;
+                            for w in [
+                                &mut v.widgets.inactive,
+                                &mut v.widgets.hovered,
+                                &mut v.widgets.active,
+                            ] {
+                                w.fg_stroke.color = th.scroll_thumb;
                             }
-                            if is_sel {
-                                paint_check(
-                                    mp,
-                                    egui::pos2(rect.min.x + 12.0, rect.center().y),
-                                    th.caret,
-                                );
+                            v.extreme_bg_color = th.bg;
+                            let mut list = egui::ScrollArea::vertical()
+                                .id_salt(menu_id.with("list"))
+                                .max_height(list_max)
+                                .auto_shrink([false, true]);
+                            if let Some(center) = reveal.then(|| self.selected_row_center()).flatten() {
+                                // egui clamps this to the content.
+                                list = list.vertical_scroll_offset((center - list_max / 2.0).max(0.0));
                             }
-                            let diagram = egui::Rect::from_min_size(
-                                egui::pos2(rect.min.x + 24.0, rect.center().y - 12.0),
-                                egui::vec2(40.0, 24.0),
-                            );
-                            paint_diagram(mp, def, diagram, th);
-                            let name_min = diagram.max.x + 10.0;
-                            let tag = (is_sel && self.layout.modified).then_some("Modified");
-                            let name_max = for_new.min.x - 6.0;
-                            let galley = mp.layout_no_wrap(def.name.clone(), font.clone(), th.text);
-                            let name_y = if tag.is_some() {
-                                rect.center().y - 6.0
-                            } else {
-                                rect.center().y
-                            };
-                            mp.with_clip_rect(egui::Rect::from_min_max(
-                                egui::pos2(name_min, rect.min.y),
-                                egui::pos2(name_max, rect.max.y),
-                            ))
-                            .galley(
-                                egui::pos2(name_min, name_y - galley.size().y / 2.0),
-                                galley,
-                                th.text,
-                            );
-                            if let Some(tag) = tag {
-                                mp.text(
-                                    egui::pos2(name_min, rect.center().y + 7.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    tag,
-                                    small.clone(),
-                                    th.caret,
-                                );
-                            }
-                            let icon =
-                                |r: &egui::Response| if r.hovered() { th.text } else { th.dim };
-                            if rn.hovered() {
-                                mp.rect_filled(
-                                    rename,
-                                    egui::CornerRadius::same(3),
-                                    th.win_btn_hover,
-                                );
-                            }
-                            if del.hovered() {
-                                mp.rect_filled(
-                                    delete,
-                                    egui::CornerRadius::same(3),
-                                    th.win_btn_danger_hover,
-                                );
-                            }
-                            if nw.hovered() {
-                                mp.rect_filled(
-                                    for_new,
-                                    egui::CornerRadius::same(3),
-                                    th.win_btn_hover,
-                                );
-                            }
-                            paint_new_project(
-                                mp,
-                                for_new.center(),
-                                if is_new { th.caret } else { icon(&nw) },
-                            );
-                            paint_pencil(mp, rename.center(), icon(&rn));
-                            paint_cross(mp, delete.center(), icon(&del));
-                            let nw = nw.on_hover_text(if is_new {
-                                "New Projects open with this layout"
-                            } else {
-                                "Use for new Projects"
+                            list.show(mui, |mui| {
+                                self.show_layout_rows(mui, th, menu_id, actions);
                             });
-                            let rn = rn.on_hover_text("Rename\u{2026}");
-                            let del = del.on_hover_text("Delete\u{2026}");
-                            if row.clicked() {
-                                actions.push(PickerAction::Apply(def.id.clone()));
-                            }
-                            if nw.clicked() {
-                                actions.push(PickerAction::UseForNewProjects(def.id.clone()));
-                            }
-                            if rn.clicked() {
-                                actions.push(PickerAction::Rename(def.id.clone()));
-                            }
-                            if del.clicked() {
-                                actions.push(PickerAction::Delete(def.id.clone()));
-                            }
-                        }
+                        });
                         divider(mui, th);
                         if menu_item(
                             mui,
@@ -973,10 +883,11 @@ impl WindowManager {
                         {
                             actions.push(PickerAction::OpenCreate);
                         }
-                        let save_hint = self
-                            .selected_layout()
-                            .map(|d| format!("updates \u{201c}{}\u{201d}", d.name))
-                            .unwrap_or_else(|| "asks for a name".to_string());
+                        let save_hint = match self.selected_layout() {
+                            Some(d) if is_builtin(&d.id) => "saves a copy".to_string(),
+                            Some(d) => format!("updates \u{201c}{}\u{201d}", d.name),
+                            None => "asks for a name".to_string(),
+                        };
                         if menu_item(
                             mui,
                             th,
@@ -1041,6 +952,191 @@ impl WindowManager {
         if (outside || escape) && actions.is_empty() {
             actions.push(PickerAction::CloseMenu);
         }
+        drawn
+    }
+
+    /// Where the selected row's center sits in the list, if it is listed.
+    /// Rows have fixed heights, so the menu can open already scrolled to it,
+    /// rather than drawing the top and jumping a frame later as egui's
+    /// `scroll_to_rect` would. (The saved group's note only shows when it has
+    /// no rows, so it never sits above a selected one.)
+    fn selected_row_center(&self) -> Option<f32> {
+        let selected = self.layout.selected.as_deref()?;
+        let builtins = builtin_layouts();
+        if let Some(i) = builtins.iter().position(|d| d.id == selected) {
+            return Some(GROUP_HEADER_H + (i as f32 + 0.5) * LAYOUT_ROW_H);
+        }
+        let i = self
+            .cached_layouts()
+            .iter()
+            .position(|d| d.id == selected)?;
+        Some(2.0 * GROUP_HEADER_H + (builtins.len() + i) as f32 * LAYOUT_ROW_H + LAYOUT_ROW_H / 2.0)
+    }
+
+    /// The menu's scrolling part: **Built-in**, then **Saved**, one row per
+    /// layout.
+    fn show_layout_rows(
+        &self,
+        mui: &mut egui::Ui,
+        th: &crate::theme::Theme,
+        menu_id: egui::Id,
+        actions: &mut Vec<PickerAction>,
+    ) {
+        let layouts = self.cached_layouts();
+        let selected = self.layout.selected.as_deref();
+        let small = egui::FontId::proportional(10.5);
+        let font = egui::FontId::proportional(12.0);
+        let header = |mui: &mut egui::Ui, text: &str| {
+            let (rect, _) =
+                mui.allocate_exact_size(egui::vec2(MENU_W, GROUP_HEADER_H), egui::Sense::hover());
+            mui.painter().text(
+                egui::pos2(rect.min.x + 10.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                small.clone(),
+                th.dim,
+            );
+        };
+        let groups: [(&str, &[LayoutDefinition], bool); 2] = [
+            ("Built-in", builtin_layouts(), true),
+            ("Saved", layouts, false),
+        ];
+        for (gi, (title, list, builtin)) in groups.into_iter().enumerate() {
+            header(mui, title);
+            if !builtin {
+                match &self.layout_ui.library {
+                    Some(Err(e)) => wrapped(mui, e, th.danger),
+                    _ if list.is_empty() => wrapped(
+                        mui,
+                        "No saved layouts yet. Arrange the windows, then Save.",
+                        th.dim,
+                    ),
+                    _ => {}
+                }
+            }
+            for (ri, def) in list.iter().enumerate() {
+                let key = (gi, ri);
+                let is_sel = selected == Some(def.id.as_str());
+                let (rect, _) =
+                    mui.allocate_exact_size(egui::vec2(MENU_W, LAYOUT_ROW_H), egui::Sense::hover());
+                let rename = egui::Rect::from_center_size(
+                    egui::pos2(rect.max.x - 44.0, rect.center().y),
+                    egui::vec2(20.0, 20.0),
+                );
+                let delete = egui::Rect::from_center_size(
+                    egui::pos2(rect.max.x - 20.0, rect.center().y),
+                    egui::vec2(20.0, 20.0),
+                );
+                let for_new = egui::Rect::from_center_size(
+                    egui::pos2(rect.max.x - 68.0, rect.center().y),
+                    egui::vec2(20.0, 20.0),
+                );
+                let row = mui.interact(
+                    egui::Rect::from_min_max(rect.min, egui::pos2(for_new.min.x - 2.0, rect.max.y)),
+                    menu_id.with(("row", key)),
+                    egui::Sense::click(),
+                );
+                // A built-in cannot be renamed or deleted.
+                let rn = (!builtin).then(|| {
+                    mui.interact(rename, menu_id.with(("rename", key)), egui::Sense::click())
+                });
+                let del = (!builtin).then(|| {
+                    mui.interact(delete, menu_id.with(("delete", key)), egui::Sense::click())
+                });
+                let nw = mui.interact(
+                    for_new,
+                    menu_id.with(("for-new", key)),
+                    egui::Sense::click(),
+                );
+                let hovered = |r: &Option<egui::Response>| r.as_ref().is_some_and(|r| r.hovered());
+                // The slot is a copy: marked only while it still
+                // matches this definition.
+                let is_new = self.layout_ui.new_project.as_ref() == Some(def);
+                let mp = mui.painter();
+                if row.hovered() || hovered(&rn) || hovered(&del) || nw.hovered() {
+                    mp.rect_filled(rect, 0.0, th.sel_bg);
+                }
+                if is_sel {
+                    paint_check(mp, egui::pos2(rect.min.x + 12.0, rect.center().y), th.caret);
+                }
+                let diagram = egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + 24.0, rect.center().y - 12.0),
+                    egui::vec2(40.0, 24.0),
+                );
+                paint_diagram(mp, def, diagram, th);
+                let name_min = diagram.max.x + 10.0;
+                let tag = (is_sel && self.layout.modified).then_some("Modified");
+                let name_max = for_new.min.x - 6.0;
+                let galley = mp.layout_no_wrap(def.name.clone(), font.clone(), th.text);
+                let name_y = if tag.is_some() {
+                    rect.center().y - 6.0
+                } else {
+                    rect.center().y
+                };
+                mp.with_clip_rect(egui::Rect::from_min_max(
+                    egui::pos2(name_min, rect.min.y),
+                    egui::pos2(name_max, rect.max.y),
+                ))
+                .galley(
+                    egui::pos2(name_min, name_y - galley.size().y / 2.0),
+                    galley,
+                    th.text,
+                );
+                if let Some(tag) = tag {
+                    mp.text(
+                        egui::pos2(name_min, rect.center().y + 7.0),
+                        egui::Align2::LEFT_CENTER,
+                        tag,
+                        small.clone(),
+                        th.caret,
+                    );
+                }
+                let icon = |r: &egui::Response| if r.hovered() { th.text } else { th.dim };
+                if nw.hovered() {
+                    mp.rect_filled(for_new, egui::CornerRadius::same(3), th.win_btn_hover);
+                }
+                paint_new_project(
+                    mp,
+                    for_new.center(),
+                    if is_new { th.caret } else { icon(&nw) },
+                );
+                if let Some(rn) = &rn {
+                    if rn.hovered() {
+                        mp.rect_filled(rename, egui::CornerRadius::same(3), th.win_btn_hover);
+                    }
+                    paint_pencil(mp, rename.center(), icon(rn));
+                }
+                if let Some(del) = &del {
+                    if del.hovered() {
+                        mp.rect_filled(
+                            delete,
+                            egui::CornerRadius::same(3),
+                            th.win_btn_danger_hover,
+                        );
+                    }
+                    paint_cross(mp, delete.center(), icon(del));
+                }
+                let nw = nw.on_hover_text(if is_new {
+                    "New Projects open with this layout"
+                } else {
+                    "Use for new Projects"
+                });
+                let rn = rn.map(|r| r.on_hover_text("Rename\u{2026}"));
+                let del = del.map(|r| r.on_hover_text("Delete\u{2026}"));
+                if row.clicked() {
+                    actions.push(PickerAction::Apply(def.id.clone()));
+                }
+                if nw.clicked() {
+                    actions.push(PickerAction::UseForNewProjects(def.id.clone()));
+                }
+                if rn.is_some_and(|r| r.clicked()) {
+                    actions.push(PickerAction::Rename(def.id.clone()));
+                }
+                if del.is_some_and(|r| r.clicked()) {
+                    actions.push(PickerAction::Delete(def.id.clone()));
+                }
+            }
+        }
     }
 
     fn show_layout_dialog(
@@ -1086,7 +1182,7 @@ impl WindowManager {
                         let (title, lead, primary) = match purpose {
                             NamePurpose::Save => (
                                 "Save layout",
-                                "Name this arrangement. It is saved for this Project.".to_string(),
+                                "Name this arrangement. Every Project can use it.".to_string(),
                                 "save",
                             ),
                             NamePurpose::SaveAs => (
@@ -1124,7 +1220,7 @@ impl WindowManager {
                         if let Some((_, name)) = conflict {
                             dui.label(
                                 egui::RichText::new(format!(
-                                    "A layout named \u{201c}{name}\u{201d} already exists in this Project. Replace it, or type another name."
+                                    "A layout named \u{201c}{name}\u{201d} already exists. Replace it, or type another name."
                                 ))
                                 .color(th.caret),
                             );
@@ -1150,7 +1246,7 @@ impl WindowManager {
                         dui.label(egui::RichText::new("Delete layout").strong().color(th.text));
                         dui.label(
                             egui::RichText::new(format!(
-                                "Delete \u{201c}{name}\u{201d} from this Project's layouts? Windows stay as they are."
+                                "Delete \u{201c}{name}\u{201d}? It goes for every Project. Windows stay as they are."
                             ))
                             .color(th.dim),
                         );
@@ -1533,8 +1629,22 @@ fn wrapped(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         });
 }
 
+/// Height of the menu below its list: a divider, Create, Save, Save As,
+/// then Revert under its own divider (with the reason when it is disabled),
+/// plus the frame's margins.
+fn menu_footer_h(revert: RevertStatus) -> f32 {
+    let mut h = DIVIDER_H + 3.0 * MENU_ITEM_H + 10.0;
+    if revert != RevertStatus::Unavailable {
+        h += DIVIDER_H + MENU_ITEM_H;
+    }
+    if revert == RevertStatus::Invalidated {
+        h += 40.0; // the two-line reason
+    }
+    h
+}
+
 fn divider(ui: &mut egui::Ui, th: &crate::theme::Theme) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 9.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, DIVIDER_H), egui::Sense::hover());
     ui.painter().line_segment(
         [
             egui::pos2(rect.min.x + 10.0, rect.center().y),
@@ -1552,7 +1662,7 @@ fn menu_item(
     hint: Option<&str>,
     enabled: bool,
 ) -> egui::Response {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 24.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, MENU_ITEM_H), egui::Sense::hover());
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() && enabled {
         ui.painter().rect_filled(rect, 0.0, th.sel_bg);
@@ -1763,7 +1873,14 @@ mod tests {
         }
 
         fn saved(&self) -> Vec<LayoutDefinition> {
-            self.store().project_layouts(&self.repo).unwrap()
+            self.store().layouts().unwrap()
+        }
+
+        /// A second directory beside the repo, for another Project.
+        fn other(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.repo.parent().unwrap().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
         }
     }
 
@@ -1988,6 +2105,7 @@ mod tests {
                     children: vec![TreeSpec::Leaf { window: 0 }, TreeSpec::Leaf { window: 1 }],
                 }),
             },
+            origin: None,
         };
         let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(40.0, 24.0));
         let cells = diagram_cells(&def, rect);
@@ -2321,7 +2439,7 @@ mod tests {
         let mut wm = fx.project();
         tile(&mut wm, "a");
         let id = save_new(&mut wm, "Gone");
-        fx.store().delete(&fx.repo, &id).unwrap();
+        fx.store().delete(&id).unwrap();
 
         act(&mut wm, PickerAction::Save);
         let Some(Dialog::Name {
@@ -2362,6 +2480,135 @@ mod tests {
         assert_eq!(b.cached_layouts()[0].id, id);
         assert_eq!(b.layout.selected, None, "selection is per instance");
         assert_eq!(arrangement(&b), b_live);
+    }
+
+    #[test]
+    fn every_project_lists_the_same_layouts_and_selects_its_own() {
+        let fx = fixture();
+        let mut a = fx.project();
+        let mut b = fx.project();
+        b.cwd = Some(fx.other("web"));
+        tile(&mut a, "a");
+        tile(&mut b, "b");
+        let pair = save_new(&mut a, "Pair");
+
+        // Another directory lists it, and picking it selects it there only.
+        act(&mut b, PickerAction::ToggleMenu);
+        let ids: Vec<_> = b.cached_layouts().iter().map(|d| d.id.clone()).collect();
+        assert_eq!(ids, [pair.clone()]);
+        assert_eq!(
+            b.layout_picker_label(),
+            "Custom",
+            "listing is not selecting"
+        );
+        act(&mut b, PickerAction::Apply(pair.clone()));
+        b.drain_layout_request(&egui::Context::default());
+        b.poll_layout_outcome(0.0);
+        assert_eq!(b.layout_picker_label(), "Pair");
+
+        // B moving on to its own layout leaves A where it was.
+        act(&mut b, PickerAction::SaveAs);
+        type_name(&mut b, "Web only");
+        act(&mut b, PickerAction::Submit);
+        assert_eq!(b.layout_picker_label(), "Web only");
+        assert_eq!(a.layout.selected.as_deref(), Some(pair.as_str()));
+        assert_eq!(a.layout_picker_label(), "Pair");
+        act(&mut a, PickerAction::ToggleMenu);
+        assert_eq!(a.cached_layouts().len(), 2, "A lists B's layout too");
+    }
+
+    #[test]
+    fn a_layout_saved_in_another_directory_fills_by_kind_not_by_id() {
+        let fx = fixture();
+        let mut wm = fx.project();
+        let a = tile(&mut wm, "a");
+        let b = tile(&mut wm, "b");
+        let ctx = egui::Context::default();
+        // By id: b on the left, a on the right.
+        let items = vec![
+            ItemRef::new(b, ItemKind::Project),
+            ItemRef::new(a, ItemKind::Project),
+        ];
+        let swapped = Arrangement {
+            windows: vec![WindowSpec::tiled(vec![b], 0), WindowSpec::tiled(vec![a], 0)],
+            tree: Some(TreeSpec::Split {
+                dir: SplitAxis::H,
+                ratios: vec![0.5, 0.5],
+                children: vec![TreeSpec::Leaf { window: 0 }, TreeSpec::Leaf { window: 1 }],
+            }),
+        };
+        let apply = |wm: &mut WindowManager, id: &str| {
+            act(wm, PickerAction::ToggleMenu);
+            act(wm, PickerAction::Apply(id.to_string()));
+            wm.drain_layout_request(&ctx);
+            wm.poll_layout_outcome(0.0);
+            assert_eq!(wm.layout.selected.as_deref(), Some(id));
+            arrangement(wm).windows[0].tabs.clone()
+        };
+
+        // Saved from another directory, its ids are not these tabs, however
+        // equal: slots fill by kind, lowest id first, so a takes the left.
+        let foreign = fx
+            .store()
+            .create(
+                &fx.other("web"),
+                "Foreign",
+                items.clone(),
+                swapped.clone(),
+                OnConflict::Reject,
+            )
+            .unwrap();
+        assert_eq!(apply(&mut wm, &foreign.id), vec![a]);
+
+        // Saved from this directory, they are: b goes left.
+        let local = fx
+            .store()
+            .create(&fx.repo, "Local", items, swapped, OnConflict::Reject)
+            .unwrap();
+        assert_eq!(apply(&mut wm, &local.id), vec![b]);
+    }
+
+    #[test]
+    fn save_with_a_builtin_selected_saves_a_copy() {
+        let fx = fixture();
+        let mut wm = fx.project();
+        tile(&mut wm, "a");
+        let grid = builtin_layouts().iter().find(|d| d.name == "Grid").unwrap();
+        wm.set_layout_selection(LayoutSelection {
+            selected: Some(grid.id.clone()),
+            modified: true,
+        });
+        assert_eq!(wm.layout_picker_label(), "Grid");
+
+        act(&mut wm, PickerAction::Save);
+        let Some(Dialog::Name { purpose, buf, .. }) = &wm.layout_ui.dialog else {
+            panic!("expected the name dialog, got {:?}", wm.layout_ui.dialog);
+        };
+        assert_eq!((purpose, buf.as_str()), (&NamePurpose::SaveAs, "Grid copy"));
+        act(&mut wm, PickerAction::Submit);
+        let saved = fx.saved();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Grid copy");
+        assert_eq!(wm.layout.selected.as_deref(), Some(saved[0].id.as_str()));
+        assert!(!wm.layout.modified);
+
+        // A built-in's name is not for the taking, in any case, and there
+        // is nothing to replace.
+        act(&mut wm, PickerAction::SaveAs);
+        type_name(&mut wm, "grid");
+        act(&mut wm, PickerAction::Submit);
+        let Some(Dialog::Name {
+            conflict, error, ..
+        }) = &wm.layout_ui.dialog
+        else {
+            panic!("the dialog stays open");
+        };
+        assert_eq!(conflict, &None);
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("built-in")),
+            "{error:?}"
+        );
+        assert_eq!(fx.saved().len(), 1);
     }
 
     #[test]
@@ -2560,7 +2807,7 @@ mod tests {
             &mut desk,
             area,
             t,
-            vec![egui::Event::Text("Grid".into())],
+            vec![egui::Event::Text("Quad".into())],
         );
         t += 0.05;
         frame(
@@ -2583,8 +2830,8 @@ mod tests {
             "dialog: {:?}",
             child(&mut desk).layout_ui.dialog
         );
-        assert_eq!(saved[0].name, "Grid");
-        assert_eq!(child(&mut desk).layout_picker_label(), "Grid");
+        assert_eq!(saved[0].name, "Quad");
+        assert_eq!(child(&mut desk).layout_picker_label(), "Quad");
         assert_eq!(child(&mut desk).layout_ui.dialog, None);
 
         // The picker opens the menu; a press elsewhere closes it.
@@ -2624,6 +2871,91 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&ctx, &mut desk, area, 0.0, vec![]);
         (ctx, desk, area, 0.0)
+    }
+
+    #[test]
+    fn a_long_list_scrolls_inside_the_window_and_opens_on_the_selection() {
+        let fx = fixture();
+        let mut project = fx.project();
+        let item = tile(&mut project, "a");
+        let items = vec![ItemRef::new(item, ItemKind::Project)];
+        let solo = Arrangement {
+            windows: vec![WindowSpec::tiled(vec![item], 0)],
+            tree: Some(TreeSpec::Leaf { window: 0 }),
+        };
+        let saved: Vec<_> = (0..30)
+            .map(|i| {
+                fx.store()
+                    .create(
+                        &fx.repo,
+                        &format!("L{i:02}"),
+                        items.clone(),
+                        solo.clone(),
+                        OnConflict::Reject,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        project.set_layout_selection(LayoutSelection {
+            selected: Some(saved[29].id.clone()),
+            modified: false,
+        });
+        let mut desk = WindowManager::new();
+        desk.desktop = true;
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 480.0));
+        desk.push_win(
+            1,
+            Tab::fixed("repo", Content::Project(Box::new(project))),
+            area,
+        );
+        desk.focused = Some(1);
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        frame(&ctx, &mut desk, area, t, vec![]);
+        let scr = desk.windows[0].rect.translate(area.min.to_vec2());
+        let ctl = header_layout(scr, true, false, HeaderSpec::Rename)
+            .layout
+            .unwrap();
+        click(&ctx, &mut desk, area, &mut t, ctl.picker.center());
+        assert!(child(&mut desk).layout_ui.menu_open);
+        // egui measures a new Area in an invisible first frame, placed as if
+        // 600px wide; the menu is where it belongs from the next one.
+        t += 0.05;
+        frame(&ctx, &mut desk, area, t, vec![]);
+
+        // Thirty-four rows would run far past the window; the menu stops
+        // short of its bottom edge.
+        let menu = ctx
+            .memory(|m| {
+                m.layer_ids()
+                    .filter(|l| l.order == egui::Order::Foreground)
+                    .filter_map(|l| m.area_rect(l.id))
+                    .find(|r| (r.width() - MENU_W).abs() < 4.0)
+            })
+            .expect("the menu is drawn");
+        assert!(
+            menu.max.y <= area.max.y - MENU_BOTTOM_GAP + 0.5,
+            "{menu:?} in {area:?}"
+        );
+        assert!(menu.height() < 34.0 * LAYOUT_ROW_H, "{menu:?}");
+
+        // It opened scrolled to the selection, the last row, which now sits
+        // at the bottom of the list, right above the footer, and takes a click.
+        let footer = DIVIDER_H + 3.0 * MENU_ITEM_H + 5.0;
+        let last_row = egui::pos2(menu.min.x + 100.0, menu.max.y - footer - LAYOUT_ROW_H / 2.0);
+        click(&ctx, &mut desk, area, &mut t, last_row);
+        let wm = child(&mut desk);
+        assert!(!wm.layout_ui.menu_open, "a row was clicked");
+        assert_eq!(
+            wm.layout_revert_status(),
+            RevertStatus::Ready,
+            "and applied"
+        );
+        assert_eq!(
+            wm.layout.selected.as_deref(),
+            Some(saved[29].id.as_str()),
+            "the row under the click was the selection: the list opened on it"
+        );
     }
 
     #[test]

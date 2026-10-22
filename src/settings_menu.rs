@@ -1579,6 +1579,7 @@ mod tests {
                 windows: vec![WindowSpec::tiled(vec![1], 0)],
                 tree: Some(TreeSpec::Leaf { window: 0 }),
             },
+            origin: None,
         };
         store.set_new_project_layout(Some(&quad)).unwrap();
         assert_eq!(

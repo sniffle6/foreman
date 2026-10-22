@@ -369,6 +369,7 @@ impl WindowManager {
             name: String::new(),
             items: point.items.clone(),
             arrangement: point.arrangement.clone(),
+            origin: None,
         };
         // Any inventory change invalidated the point, so every saved item
         // matches by id and the Apply's fresh items land in Additional
@@ -772,18 +773,18 @@ fn strict(rec: &Reconciliation, added: &[LayoutItemId]) -> Result<(), LayoutAppl
     }
 }
 
-/// The live tree as a `TreeSpec` over window indices. Leaves without an
-/// index (no layout tabs) drop out and single-child splits collapse.
 /// Where [`detach_ids`] numbers items: far above any minted id and below
 /// reconcile's placeholders, which count down from `u64::MAX`.
 const DETACHED_BASE: LayoutItemId = 1 << 62;
 
 /// `def` with every item renumbered so none can equal a live item's id.
-/// The New Project slot was saved in another Project, maybe another launch
-/// (ids restart at 1), so an exact-id match there would be a coincidence:
-/// without one, slots fill by kind in order, and the first terminal takes
-/// the first terminal slot.
-fn detach_ids(def: &LayoutDefinition) -> LayoutDefinition {
+/// For a definition whose ids are not this Project's: the New Project slot,
+/// a built-in, or a layout saved from another directory (the picker checks
+/// `origin`). Those ids come from another Project, maybe another launch
+/// (ids restart at 1), so an exact-id match would be a coincidence: without
+/// one, slots fill by kind in order, and the first terminal takes the first
+/// terminal slot.
+pub(super) fn detach_ids(def: &LayoutDefinition) -> LayoutDefinition {
     let map: HashMap<LayoutItemId, LayoutItemId> = def
         .items
         .iter()
@@ -805,6 +806,8 @@ fn detach_ids(def: &LayoutDefinition) -> LayoutDefinition {
     out
 }
 
+/// The live tree as a `TreeSpec` over window indices. Leaves without an
+/// index (no layout tabs) drop out and single-child splits collapse.
 fn tree_spec(n: &crate::layout::Node, index: &HashMap<WinId, usize>) -> Option<TreeSpec> {
     use crate::layout::{Node, SplitDir};
     match n {
@@ -977,6 +980,7 @@ mod tests {
             name: id.into(),
             items,
             arrangement,
+            origin: None,
         }
     }
 

@@ -397,6 +397,7 @@ pub fn parse_reply(raw: &str, inv: &Inventory) -> Result<Reply, String> {
                     name: String::new(),
                     items,
                     arrangement,
+                    origin: None,
                 },
                 added,
             })

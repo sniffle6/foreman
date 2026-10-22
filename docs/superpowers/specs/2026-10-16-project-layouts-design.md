@@ -8,6 +8,17 @@
 >   target. The reply only declares them; Apply opens them, and the strict
 >   Apply refuses any other open. This replaces the "no new Content" rule
 >   under Create Layout and Generation boundary.
+>
+> **PARTIALLY SUPERSEDED (2026-10-21):** the user reversed directory-owned
+> libraries. Saved layouts are now one list every Project shares, and Foreman
+> ships a few read-only built-in layouts. This replaces "Layouts belong to a
+> Project, not to a global preset library", the per-directory parts of
+> Ownership and boundaries and Persistence, the "Directory-owned libraries"
+> decision row, and the global-library exclusion. Still holding: selection
+> and Modified stay per Project instance, and the New Project layout stays a
+> copied slot. A definition now records the directory its item ids came from,
+> so a layout applied anywhere else fills by kind. See
+> `docs/project-layouts.md` (The library on disk, Built-in layouts).
 
 ## Intent
 

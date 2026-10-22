@@ -5611,6 +5611,15 @@ impl WindowManager {
         }
     }
 
+    /// Debug-only startup preview used by native screenshot validation: the
+    /// focused Project's Layout menu, open, since a capture cannot click.
+    #[cfg(debug_assertions)]
+    pub fn debug_open_layout_menu(&mut self, ctx: &egui::Context) {
+        if let Some(child) = self.focused_child() {
+            child.run_layout_action(layout_picker::PickerAction::ToggleMenu, ctx);
+        }
+    }
+
     /// Mutable borrow of the focused window's child manager, if it is a project.
     fn focused_child(&mut self) -> Option<&mut WindowManager> {
         let id = self.focused?;

@@ -254,6 +254,11 @@ pub struct LayoutDefinition {
     pub name: String,
     pub items: Vec<ItemRef>,
     pub arrangement: Arrangement,
+    /// The `project_key` of the directory whose live tabs `items` were
+    /// captured from. Item ids only mean something there; anywhere else
+    /// (and for a built-in, which has none) Apply fills slots by kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// One Project instance's picker state: which saved definition it shows and
@@ -1068,6 +1073,7 @@ mod tests {
                 ],
                 tree: Some(split(SplitAxis::H, &[0.6, 0.4], vec![leaf(0), leaf(1)])),
             },
+            origin: None,
         }
     }
 
@@ -1358,6 +1364,7 @@ mod tests {
             name: "n".into(),
             items,
             arrangement: Arrangement { windows, tree },
+            origin: None,
         }
     }
 
