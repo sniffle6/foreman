@@ -4,6 +4,14 @@
   "title": "Keep the integration queue's waiting toast up until the hold clears",
   "body": "When the integration queue is held (it cannot run and every card waits behind it), show a corner notification that says what it is waiting for, keep it up while the hold lasts, and remove it when the hold clears. Nothing more. No buttons, no agents.\n\nA hold toast already exists, and it fails in two ways (src/wm.rs report_integration, TurnEvent::Held):\n1. It shows for toast_secs, 6 s by default. A dirty main checkout can hold the queue for an hour, so if you weren't looking during those 6 s you never learn the queue is stuck.\n2. The dedup field `IntegrationDriver.last_hold` is set and never cleared. Once a hold clears, the same hold coming back later (same dirty files, same text) never toasts again for the life of that window.\n\nDo:\n- Add a keyed sticky toast to src/notify.rs: show or replace by key, clear by key, and click to dismiss. Keep the existing transient API unchanged.\n- Key the hold toast by repository, so two project windows on one clone show one toast. Show it on Held. Replace it when the hold text changes. Clear it when a turn runs without a hold or the queue empties. Clearing also resets the dedup, so a later hold toasts again.\n- The text leads with what it waits for and what clears it, e.g. \"Integration queue waiting: main has uncommitted changes (src/wm.rs, src/main.rs). Commit or stash to resume.\" Build it from the hold detail, with no new git calls.\n- Leave hand-back and other toasts as they are.\n- If w4ufci (the progress UI) has landed, keep its held banner. This toast is the alert, the banner is the status.\n\nPointers: docs/integration-queue.md (Held), src/wm.rs (IntegrationDriver, integration_tick, report_integration), src/notify.rs, src/integrate.rs (TurnEvent, HOLD_BACKOFF).\n\nDone when:\n- Unit tests cover: a hold shows one sticky toast; a repeated identical hold adds no duplicate; clearing the hold removes it; the same hold coming back shows it again (the regression); and click-dismiss works.\n- `cargo test --target-dir target/agent` passes.\n- A screenshot shows the toast while main is dirty (ask the user to run build-screenshot).\n- The Held bullet in docs/integration-queue.md is updated.",
   "state": "done",
+  "shipped": {
+    "name": "v0.8.2",
+    "at": "2026-10-23T03:44:51Z",
+    "commits": [
+      "520ba0e",
+      "d2d55f5"
+    ]
+  },
   "created": "2026-10-22T21:22:18Z",
-  "updated": "2026-10-23T03:20:08Z"
+  "updated": "2026-10-23T03:44:51Z"
 }

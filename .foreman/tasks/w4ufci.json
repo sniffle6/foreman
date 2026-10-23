@@ -4,6 +4,13 @@
   "title": "Integration queue progress UI",
   "body": "Show the integration queue's progress in the GUI. Right now you only see it one card at a time.\n\nToday: each card shows its own integration substate on its status line (\"queued #2\", \"integrating · check\", \"needs resolution · conflict\") and in the Integration section of its detail page (src/board.rs). Nothing shows the queue as a whole: what is running now, which stage it is on, how long it has been running, what is waiting behind it, and whether the queue is held (dirty destination checkout).\n\nScope (the shape is still open, so decide it before building):\n- A queue-level view for the project: an ordered list of requests with phase, position, stage, and elapsed time for the active request, plus a held banner that shows the hold reason.\n- Progress for the active request: show which stage it is on out of the stages it will run (rebase -> checks -> fast-forward), and that a long check is still alive (elapsed timer or spinner). Don't fake a percentage.\n- Placement could be a board header strip, a panel, or a badge that opens a list. Pick one and say why.\n\nData already exists: integrate::views / IntegrationView (phase, commit, position, stage, reason, detail, next, hold, prepared, checks, note, cancel_requested), which kanban list --json already exposes. wm.rs IntegrationDriver / integration_tick drive the refresh. The UI should only render that data. Don't add a new source of truth.\n\nPointers: docs/integration-queue.md (Progress, Key files), docs/kanban-board.md, src/integrate.rs, src/board.rs, src/wm.rs.\n\nDone when: with 2+ cards submitted, the view shows their order and the active request's stage live, without opening each card; a held queue shows why it is held; there is no per-frame allocation or git call in the paint path (read the cached views); cargo test passes; a screenshot proves it (ask the user to run build-screenshot); docs/integration-queue.md is updated.",
   "state": "done",
+  "shipped": {
+    "name": "v0.8.2",
+    "at": "2026-10-23T03:44:51Z",
+    "commits": [
+      "fb763bc"
+    ]
+  },
   "created": "2026-10-21T21:46:22Z",
-  "updated": "2026-10-23T00:35:05Z"
+  "updated": "2026-10-23T03:44:51Z"
 }
