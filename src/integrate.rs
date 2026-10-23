@@ -1093,10 +1093,16 @@ fn name_list(porcelain: &str) -> String {
         .map(|(_, path)| path.trim())
         .filter(|s| !s.is_empty())
         .collect();
+    shorten_names(&names)
+}
+
+/// At most five names, then how many more: `a, b, c, d, e, +2 more`. No
+/// parentheses, so the list nests inside a sentence's own.
+fn shorten_names(names: &[&str]) -> String {
     let shown: Vec<&str> = names.iter().take(5).copied().collect();
     let mut s = shown.join(", ");
     if names.len() > shown.len() {
-        s.push_str(&format!(" (+{} more)", names.len() - shown.len()));
+        s.push_str(&format!(", +{} more", names.len() - shown.len()));
     }
     s
 }
@@ -1468,9 +1474,13 @@ pub enum TurnEvent {
         reason: Reason,
         detail: String,
     },
-    /// Still queued; the destination refused. The turn stops here.
+    /// Still queued; the destination refused. The turn stops here. The
+    /// request's `hold` reads `<reason label>: <detail>`; [`hold_alert`]
+    /// turns the same facts into the corner alert.
     Held {
         card: String,
+        target: String,
+        reason: Reason,
         detail: String,
     },
     Cancelled {
@@ -1487,6 +1497,10 @@ pub enum TurnEvent {
         note: String,
     },
 }
+
+/// How a dirty destination's detail starts; [`hold_alert`] reads the file
+/// list back from behind it.
+const DIRTY_DETAIL: &str = "uncommitted changes in the destination checkout: ";
 
 /// The destination is on `target`, idle, and clean outside `.foreman/`
 /// (the app writes card files there); returns its HEAD.
@@ -1530,10 +1544,7 @@ fn dest_preflight(dest: &Path, target: &str) -> Result<String, (Reason, String)>
     if !dirty.trim().is_empty() {
         return Err((
             Reason::DestinationDirty,
-            format!(
-                "uncommitted changes in the destination checkout: {}",
-                name_list(&dirty)
-            ),
+            format!("{DIRTY_DETAIL}{}", name_list(&dirty)),
         ));
     }
     crate::kanban::git(dest, &["rev-parse", "HEAD"]).map_err(|e| (Reason::ProcessFailed, e))
@@ -1660,10 +1671,70 @@ fn hold(mut req: Request, reason: Reason, detail: String) -> (Request, TurnEvent
     req.phase = Phase::Queued;
     req.attempt = None;
     req.outcome = None;
-    let text = format!("{}: {detail}", reason.label());
-    req.hold = Some(text.clone());
-    let card = req.card.clone();
-    (req, TurnEvent::Held { card, detail: text })
+    req.hold = Some(format!("{}: {detail}", reason.label()));
+    let event = TurnEvent::Held {
+        card: req.card.clone(),
+        target: req.target.clone(),
+        reason,
+        detail,
+    };
+    (req, event)
+}
+
+/// The corner alert for a held queue: what every card waits for, then what
+/// clears it. Built from the hold's own detail, with no git call of its
+/// own.
+pub fn hold_alert(target: &str, reason: Reason, detail: &str) -> String {
+    let (waits, clears) = match reason {
+        Reason::DestinationDirty => {
+            let files = dirty_names(detail);
+            let files = if files.is_empty() {
+                String::new()
+            } else {
+                format!(" ({files})")
+            };
+            (
+                format!("{target} has uncommitted changes{files}"),
+                "Commit or stash to resume.".to_string(),
+            )
+        }
+        // Two of the three branch details name their own fix after a
+        // semicolon ("…; check out main", "…; switch that tree off it").
+        Reason::DestinationBranch => match detail.split_once("; ") {
+            Some((what, fix)) => (first_line(what), format!("{} to resume.", capitalized(fix))),
+            None => (first_line(detail), format!("Check out {target} to resume.")),
+        },
+        Reason::DestinationBusy => (first_line(detail), "Finish or abort it to resume.".into()),
+        _ => (
+            format!("{}: {}", reason.label(), first_line(detail)),
+            "Fix it to resume.".into(),
+        ),
+    };
+    format!("Integration queue waiting: {waits}. {clears}")
+}
+
+/// The files a dirty hold names: the preflight's own list, or the
+/// tab-indented paths of git's refusal when the fast-forward found the
+/// overlap. Empty when neither shape matches.
+fn dirty_names(detail: &str) -> String {
+    if let Some(list) = detail.strip_prefix(DIRTY_DETAIL) {
+        return list.lines().next().unwrap_or("").trim().to_string();
+    }
+    let names: Vec<&str> = detail
+        .lines()
+        .filter(|l| l.starts_with('\t'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    shorten_names(&names)
+}
+
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn requeue(mut req: Request, note: String) -> (Request, TurnEvent) {
@@ -3420,6 +3491,20 @@ mod tests {
             matches!(&events[0], TurnEvent::Held { detail, .. } if detail.contains("f.txt")),
             "{events:?}"
         );
+        let TurnEvent::Held {
+            target,
+            reason,
+            detail,
+            ..
+        } = &events[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            hold_alert(target, *reason, detail),
+            "Integration queue waiting: main has uncommitted changes (f.txt). Commit or stash to resume.",
+            "the alert reads the preflight's own detail"
+        );
         assert_eq!(
             std::fs::read_to_string(r.path().join("f.txt")).unwrap(),
             "user wip\n",
@@ -3451,6 +3536,72 @@ mod tests {
             "{events:?}"
         );
         assert!(!r.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn the_hold_alert_leads_with_the_wait_and_ends_with_the_fix() {
+        let alert = |reason, detail: &str| hold_alert("main", reason, detail);
+        let many = ["a", "b", "c", "d", "e", "f", "g"]
+            .map(|f| format!(" M {f}.rs"))
+            .join("\n");
+        assert_eq!(
+            alert(
+                Reason::DestinationDirty,
+                &format!("{DIRTY_DETAIL}{}", name_list(&many))
+            ),
+            "Integration queue waiting: main has uncommitted changes \
+             (a.rs, b.rs, c.rs, d.rs, e.rs, +2 more). Commit or stash to resume."
+        );
+        // The fast-forward found the overlap: git's own refusal text.
+        let refusal = "Updating 1a2b..3c4d\nerror: Your local changes to the following files \
+                       would be overwritten by merge:\n\tsrc/wm.rs\n\tsrc/main.rs\nPlease commit \
+                       your changes or stash them before you merge.\nAborting";
+        assert_eq!(
+            alert(Reason::DestinationDirty, refusal),
+            "Integration queue waiting: main has uncommitted changes (src/wm.rs, src/main.rs). \
+             Commit or stash to resume."
+        );
+        assert_eq!(
+            alert(Reason::DestinationDirty, "something else"),
+            "Integration queue waiting: main has uncommitted changes. Commit or stash to resume."
+        );
+        assert_eq!(
+            alert(
+                Reason::DestinationBranch,
+                "destination checkout is on card/x, expected main"
+            ),
+            "Integration queue waiting: destination checkout is on card/x, expected main. \
+             Check out main to resume."
+        );
+        assert_eq!(
+            alert(
+                Reason::DestinationBranch,
+                "destination checkout has no branch checked out; check out main"
+            ),
+            "Integration queue waiting: destination checkout has no branch checked out. \
+             Check out main to resume."
+        );
+        assert_eq!(
+            alert(
+                Reason::DestinationBranch,
+                "main is checked out in C:/w; switch that tree off it"
+            ),
+            "Integration queue waiting: main is checked out in C:/w. \
+             Switch that tree off it to resume."
+        );
+        assert_eq!(
+            alert(
+                Reason::DestinationBusy,
+                "a git rebase is in progress in the destination checkout"
+            ),
+            "Integration queue waiting: a git rebase is in progress in the destination \
+             checkout. Finish or abort it to resume."
+        );
+        assert_eq!(
+            alert(Reason::ProcessFailed, "target branch main does not exist"),
+            "Integration queue waiting: process failed: target branch main does not exist. \
+             Fix it to resume."
+        );
     }
 
     #[test]

@@ -65,7 +65,17 @@ against.
   queued with the hold reason. The coordinator backs off briefly and retries
   on its own; a new submission retries at once. Nothing in the destination
   is touched: git's own refusal text is preserved when the fast-forward is
-  what found the overlap.
+  what found the overlap. A hold raises a **sticky corner toast** that
+  leads with what the queue waits for and what clears it ("Integration
+  queue waiting: main has uncommitted changes (src/wm.rs). Commit or stash
+  to resume."). It stays up for the whole hold, not `toast_secs`, because
+  a dirty checkout can hold the queue for an hour. A changed hold replaces
+  the text. A turn that runs without a hold, or a queue with nothing left
+  waiting, takes it down, and the same hold coming back later shows it
+  again. ✕ dismisses it until the hold text changes or clears. The toast
+  is keyed by repository, so two project windows on one clone show one
+  toast. The toast is the alert; the queue strip and page banner are the
+  status.
 - **Moved target**: a target that advanced between preflight and
   fast-forward is re-prepared and re-checked, up to three times per turn,
   then the request goes back to the queue with a note. Git lock contention
@@ -168,7 +178,9 @@ detail page.
   APPDATA that shows both boards. It then holds both repositories' turns,
   so the launched instance only reads and paints them. Without the held
   turn, that instance would take the turn, find the fake worktrees
-  missing, and hand every request back.
+  missing, and hand every request back. `-LiveHold` instead gives the held
+  repository's head card a real worktree, dirties `main`, and leaves that
+  turn free: the instance is held for real and raises the hold toast.
 
 ## Recovery and ownership
 
@@ -280,12 +292,16 @@ the worktree is clean.
   `run_child` (bounded, cancellable, Job-owned subprocesses), `IntegrationView`
   (the wire projection), `views` / `QueueView` / `QueueEntry` (every view
   in turn order, with each attempt's start and stage list), `TurnHooks`
-  (test barriers).
+  (test barriers), `hold_alert` (the hold toast's text, from the
+  `TurnEvent::Held` reason, target, and detail).
 - `src/wm.rs` — `IntegrationDriver` (per-project coordinator state),
   `integration_tick` (re-read, bookkeeping, turn thread),
   `kanban_integrate` (the verb and the board's Submit/Cancel),
   `done_guard`, `integration_owns` (teardown / rm / discard / dispatch
-  guards), `report_integration` (toasts).
+  guards), `report_integration` (toasts; the hold toast's show and clear,
+  with `hold_toast_key` / `clear_hold_toast`).
+- `src/notify.rs` — keyed sticky toasts (`set_sticky`, `clear_sticky`,
+  `queue_sticky`, `queue_clear_sticky`) beside the transient ones.
 - `src/kanban.rs` — `CardStore::integration` / `integration_queue` /
   `integration_gen` / `set_integration`,
   `CardLine::integration`, `wait_verdict` + `WAIT_NEEDS_RESOLUTION`,

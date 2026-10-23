@@ -16,7 +16,13 @@
 # Run the screenshot while this waits:
 #   pwsh -NoProfile -File ".claude/skills/build-screenshot/screenshot.ps1" `
 #        -Exe ".\target\agent\debug\foreman.exe" -AppData ".\target\agent\appdata-queue"
-param([int] $HoldSeconds = 900)
+#
+# -LiveHold (card 3hw7za, the hold toast): the held repo's head card gets a
+# real worktree and commit, main gets uncommitted edits to two tracked
+# files, and that repo's turn is NOT held. The launched Foreman takes the
+# turn itself, is held by the dirty checkout, and raises the sticky corner
+# toast over the board's strip.
+param([int] $HoldSeconds = 900, [switch] $LiveHold)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -107,8 +113,28 @@ Add-Card $run "qa0004" "split the PTY reader off the frame path" 2 "needs_resolu
 
 # --- held queue ------------------------------------------------------------
 $held = New-Repo "queuefix-held"
-Add-Card $held "qb0001" "wire the caret gate to the new metrics" 1 "queued" @{
-    hold = "destination dirty: uncommitted changes in the destination checkout: src/board.rs"
+if ($LiveHold) {
+    $who = @("-c", "user.name=fixture", "-c", "user.email=fixture@localhost", "-c", "commit.gpgsign=false")
+    $src = Join-Path $held.proj "src"
+    New-Item -ItemType Directory -Force -Path $src | Out-Null
+    Set-Content -Path (Join-Path $src "wm.rs") -Value "// wm"
+    Set-Content -Path (Join-Path $src "main.rs") -Value "// main"
+    git -C $held.proj add src
+    git -C $held.proj @who commit -q -m src
+    $wt = Join-Path $held.proj ".foreman\worktrees\qb0001"
+    git -C $held.proj worktree add -q -b card/qb0001 $wt
+    Set-Content -Path (Join-Path $wt "caret.rs") -Value "// caret"
+    git -C $wt add caret.rs
+    git -C $wt @who commit -q -m "caret gate"
+    $tip = (git -C $wt rev-parse HEAD).Trim()
+    # The human's work in progress on main: what holds the queue.
+    Add-Content -Path (Join-Path $src "wm.rs") -Value "// wip"
+    Add-Content -Path (Join-Path $src "main.rs") -Value "// wip"
+    Add-Card $held "qb0001" "wire the caret gate to the new metrics" 1 "queued" @{ commit = $tip }
+} else {
+    Add-Card $held "qb0001" "wire the caret gate to the new metrics" 1 "queued" @{
+        hold = "destination dirty: uncommitted changes in the destination checkout: src/board.rs"
+    }
 }
 Add-Card $held "qb0002" "make the strip honour the theme" 2 "queued" @{}
 
@@ -159,7 +185,8 @@ $ws | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $cfg "workspace.js
 # --- hold both turns -------------------------------------------------------
 # std's File::try_lock locks the whole file; a one-byte range lock from here
 # overlaps it, so the app's try_turn sees WouldBlock ("another owner").
-$locks = foreach ($repo in @($run, $held)) {
+$turns = @(if ($LiveHold) { $run } else { $run; $held })
+$locks = foreach ($repo in $turns) {
     $path = Join-Path $repo.proj ".git\foreman\integration\turn.lock"
     $fs = [System.IO.File]::Open($path, "OpenOrCreate", "ReadWrite", "ReadWrite")
     $fs.Lock(0, 1)
@@ -171,7 +198,7 @@ Write-Host "  running : $($run.proj)"
 Write-Host "  held    : $($held.proj)"
 Write-Host "  appdata : $sandbox"
 Write-Host ""
-Write-Host "holding both turns for $HoldSeconds s; run now:"
+Write-Host "holding $($turns.Count) turn(s) for $HoldSeconds s; run now:"
 Write-Host "  pwsh -NoProfile -File `".claude/skills/build-screenshot/screenshot.ps1`" -Exe `".\target\agent\debug\foreman.exe`" -AppData `".\target\agent\appdata-queue`""
 Start-Sleep -Seconds $HoldSeconds
 $locks | ForEach-Object { $_.Dispose() }

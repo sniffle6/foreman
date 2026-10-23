@@ -675,8 +675,6 @@ struct IntegrationDriver {
     /// After a held turn (destination dirty / wrong branch / busy) no new
     /// turn starts before this; a kick clears it.
     held_until: Option<std::time::Instant>,
-    /// The last hold detail toasted, so a standing hold toasts once.
-    last_hold: Option<String>,
     /// The repository identity of `cwd`: `None` = not resolved yet;
     /// `Some(None)` = not a git repository (the driver stays inert).
     repo: Option<Option<PathBuf>>,
@@ -692,7 +690,6 @@ impl IntegrationDriver {
             last_poll: None,
             kick: false,
             held_until: None,
-            last_hold: None,
             repo: None,
         }
     }
@@ -5423,6 +5420,11 @@ impl WindowManager {
                 crate::integrate::Phase::Queued | crate::integrate::Phase::Integrating
             )
         });
+        if !pending {
+            // Nothing waits, so nothing is held (a cancel, or another
+            // window's turn, emptied it).
+            self.clear_hold_toast(ctx);
+        }
         let held_back = !kicked && self.integration.held_until.is_some_and(|t| now < t);
         if pending && !self.integration.in_flight && !held_back {
             self.integration.in_flight = true;
@@ -5439,13 +5441,15 @@ impl WindowManager {
 
     /// Toast what a turn did. Integrated requests are not toasted here —
     /// their bookkeeping (Done) reports on the next tick, from disk, so a
-    /// crash between the two still lands the same message.
+    /// crash between the two still lands the same message. A hold is a
+    /// sticky toast that stays up until a turn runs without one.
     fn report_integration(
         &mut self,
         events: Vec<crate::integrate::TurnEvent>,
         ctx: &egui::Context,
     ) {
         use crate::integrate::TurnEvent::*;
+        let mut held = false;
         for ev in events {
             match ev {
                 Integrated { .. } => {}
@@ -5462,15 +5466,27 @@ impl WindowManager {
                         detail.lines().next().unwrap_or("")
                     ),
                 ),
-                Held { card, detail } => {
+                Held {
+                    target,
+                    reason,
+                    detail,
+                    ..
+                } => {
                     self.integration.held_until =
                         Some(std::time::Instant::now() + crate::integrate::HOLD_BACKOFF);
-                    if self.integration.last_hold.as_deref() != Some(detail.as_str()) {
-                        self.integration.last_hold = Some(detail.clone());
-                        crate::notify::queue(
+                    // The turn's first hold is its head: what every card
+                    // behind it waits for. Re-asserting an unchanged hold
+                    // each retry is a no-op in the notification center.
+                    if held {
+                        continue;
+                    }
+                    held = true;
+                    if let Some(key) = self.hold_toast_key() {
+                        crate::notify::queue_sticky(
                             ctx,
+                            key,
                             crate::notify::Level::Warning,
-                            format!("card {card}: integration held — {detail}"),
+                            crate::integrate::hold_alert(&target, reason, &detail),
                         );
                     }
                 }
@@ -5490,6 +5506,24 @@ impl WindowManager {
                     format!("card {card}: integration {note}"),
                 ),
             }
+        }
+        if !held {
+            self.clear_hold_toast(ctx);
+        }
+    }
+
+    /// The hold toast's key: one per repository, so every project window on
+    /// one clone shares a single toast (and any of them can clear it).
+    fn hold_toast_key(&self) -> Option<String> {
+        let repo = self.integration.repo.as_ref()?.as_ref()?;
+        Some(format!("integration-hold:{}", repo.display()))
+    }
+
+    /// The queue is no longer held: take the toast down and let the next
+    /// hold, even an identical one, show again.
+    fn clear_hold_toast(&self, ctx: &egui::Context) {
+        if let Some(key) = self.hold_toast_key() {
+            crate::notify::queue_clear_sticky(ctx, key);
         }
     }
 
@@ -20203,6 +20237,150 @@ mod tests {
             c.kanban.borrow().get(&id).unwrap().worktree.is_none()
         });
         assert!(!std::path::Path::new(&wt.path).exists());
+    }
+
+    /// The hold toast's whole lifecycle from turn events, across two
+    /// project windows on one clone: one sticky toast per repository,
+    /// re-reported holds add nothing, a turn without a hold clears it, and
+    /// the same hold coming back shows again (it used to stay silent for
+    /// the life of the window).
+    #[test]
+    fn a_hold_is_one_sticky_toast_per_repository_until_a_turn_runs_without_one() {
+        use crate::integrate::{Reason, TurnEvent};
+        let ctx = egui::Context::default();
+        let on_clone = || {
+            let mut wm = WindowManager::new();
+            wm.integration.repo = Some(Some(PathBuf::from("C:/clone/.git")));
+            wm
+        };
+        let (mut a, mut b) = (on_clone(), on_clone());
+        let held = |files: &str| TurnEvent::Held {
+            card: "aa".into(),
+            target: "main".into(),
+            reason: Reason::DestinationDirty,
+            detail: format!("uncommitted changes in the destination checkout: {files}"),
+        };
+        let alert = "Integration queue waiting: main has uncommitted changes \
+                     (src/wm.rs, src/main.rs). Commit or stash to resume.";
+        let waiting = "Integration queue waiting";
+        let mut n = crate::notify::Notifications::new();
+
+        a.report_integration(vec![held("src/wm.rs, src/main.rs")], &ctx);
+        n.drain_pending(&ctx);
+        assert_eq!(n.count_text(alert), 1, "a hold shows one toast");
+
+        a.report_integration(vec![held("src/wm.rs, src/main.rs")], &ctx);
+        b.report_integration(vec![held("src/wm.rs, src/main.rs")], &ctx);
+        n.drain_pending(&ctx);
+        assert_eq!(
+            n.count_text(waiting),
+            1,
+            "retries and a second window add none"
+        );
+
+        a.report_integration(vec![held("src/wm.rs")], &ctx);
+        n.drain_pending(&ctx);
+        assert_eq!(
+            n.count_text(waiting),
+            1,
+            "a changed hold replaces the toast"
+        );
+        assert!(n.contains_text("(src/wm.rs)"));
+
+        // A branch-mode card held later in the same turn is not the head.
+        let other = TurnEvent::Held {
+            card: "cc".into(),
+            target: "main".into(),
+            reason: Reason::DestinationBranch,
+            detail: "main is checked out in C:/w; switch that tree off it".into(),
+        };
+        a.report_integration(vec![held("src/wm.rs"), other], &ctx);
+        n.drain_pending(&ctx);
+        assert!(
+            n.contains_text("(src/wm.rs)"),
+            "the first hold is the alert"
+        );
+
+        b.report_integration(
+            vec![TurnEvent::Integrated {
+                card: "aa".into(),
+                prepared: "abc".into(),
+            }],
+            &ctx,
+        );
+        n.drain_pending(&ctx);
+        assert_eq!(
+            n.count_text(waiting),
+            0,
+            "any window's clean turn clears it"
+        );
+
+        a.report_integration(vec![held("src/wm.rs")], &ctx);
+        n.drain_pending(&ctx);
+        assert_eq!(
+            n.count_text(waiting),
+            1,
+            "the same hold coming back shows again"
+        );
+
+        a.report_integration(Vec::new(), &ctx);
+        n.drain_pending(&ctx);
+        assert_eq!(
+            n.count_text(waiting),
+            0,
+            "an empty turn is a turn without a hold"
+        );
+    }
+
+    /// End to end on a real clone: a dirty main checkout holds a submitted
+    /// card, the toast stands through every retry, and cleaning the checkout
+    /// takes it down. A second card held by the same edit toasts again.
+    #[test]
+    fn a_dirty_main_checkout_holds_the_queue_with_a_toast_that_stays_until_cleaned() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let alert = "Integration queue waiting: main has uncommitted changes (f.txt). \
+                     Commit or stash to resume.";
+        let mut n = crate::notify::Notifications::new();
+        let is_held = |id: &str| {
+            let id = id.to_string();
+            move |c: &WindowManager| {
+                c.kanban
+                    .borrow()
+                    .integration(&id)
+                    .is_some_and(|v| v.hold.is_some())
+            }
+        };
+
+        for (title, file) in [("first", "a.txt"), ("second", "b.txt")] {
+            let (id, _, _) = worktree_card_with_a_commit(&mut m, pid, &ctx, title, file);
+            std::fs::write(repo.path().join("f.txt"), "human wip\n").unwrap();
+            m.kanban_dispatch(&integrate_req(&id)).unwrap();
+            tick_until(&mut m, pid, &ctx, is_held(&id));
+            // Keep kicking: several more turns hit the same wall.
+            let mut ticks = 0;
+            tick_until(&mut m, pid, &ctx, |_| {
+                ticks += 1;
+                ticks > 10
+            });
+            n.drain_pending(&ctx);
+            assert_eq!(n.count_text(alert), 1, "{title}: one standing toast");
+
+            git_q(repo.path(), &["checkout", "-q", "--", "f.txt"]);
+            tick_until(&mut m, pid, &ctx, |c| {
+                c.kanban.borrow().integration(&id).is_none()
+            });
+            n.drain_pending(&ctx);
+            assert!(
+                !n.contains_text("Integration queue waiting"),
+                "{title}: cleared"
+            );
+        }
     }
 
     #[test]
