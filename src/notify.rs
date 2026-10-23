@@ -104,10 +104,20 @@ pub fn queue_sticky(
 }
 
 /// [`Notifications::clear_sticky`] from a nested window manager. Cheap to
-/// call every poll: it requests no repaint, because the ops drain in the
-/// same frame they are queued from and a cleared toast needs no later one.
+/// call every poll: it requests no repaint, because a cleared toast needs no
+/// later frame. Every pass drains the ops, hidden or painted (`App`'s
+/// `service_background`), so a poll that clears nothing leaves nothing behind.
 pub fn queue_clear_sticky(ctx: &egui::Context, key: impl Into<String>) {
     queue_pending(ctx, Pending::Clear(key.into()));
+}
+
+/// Ops queued on `ctx` and not yet drained.
+#[cfg(test)]
+pub(crate) fn pending_ops(ctx: &egui::Context) -> usize {
+    ctx.data_mut(|data| {
+        data.get_temp::<Vec<Pending>>(egui::Id::new("pending_notifications"))
+            .map_or(0, |ops| ops.len())
+    })
 }
 
 impl Notifications {

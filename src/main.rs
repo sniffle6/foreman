@@ -455,6 +455,12 @@ impl App {
             ctrl_activity = true;
         }
         self.poll_hook_install(ctx);
+        // Apply what nested managers queued for the notification center. Only
+        // `ui` paints it, and a hidden window still runs the integration poll,
+        // which clears its hold toast every 2 s: undrained, those ops pile up
+        // until the window shows. A toast's TTL starts when it is first
+        // painted, so applying them early changes nothing a restore shows.
+        self.notify.drain_pending(ctx);
         ctrl_activity
     }
 
@@ -1839,6 +1845,54 @@ mod app_logic_tests {
             .expect("background service should answer the control request");
         assert!(reply.ok);
         assert_eq!(reply.history, Some(vec!["no projects".to_string()]));
+    }
+
+    #[test]
+    fn background_service_applies_queued_notifications_without_a_ui_pass() {
+        let (_ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+        let (_update_tx, update_rx) = std::sync::mpsc::channel();
+        let (update_fx, _update_fx_rx) = std::sync::mpsc::channel();
+        let (_title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(1);
+        let (title_request_tx, _title_request_rx) = std::sync::mpsc::sync_channel(1);
+        let (_title_result_tx, title_result_rx) = std::sync::mpsc::channel();
+        let title_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut app = App::new(
+            ctrl_rx,
+            update_rx,
+            update_fx,
+            TitleRuntime {
+                events: title_event_rx,
+                requests: title_request_tx,
+                results: title_result_rx,
+                epoch: title_epoch,
+                hook_install: None,
+            },
+            None,
+        );
+        let ctx = egui::Context::default();
+        let key = "integration-hold:C:/repo/.git";
+        // An idle queue's poll clears the hold toast whether or not one is up.
+        for _ in 0..100 {
+            notify::queue_clear_sticky(&ctx, key);
+        }
+        app.service_background(&ctx);
+        assert_eq!(
+            notify::pending_ops(&ctx),
+            0,
+            "a hidden window's polls leave nothing behind"
+        );
+
+        notify::queue_sticky(
+            &ctx,
+            key,
+            notify::Level::Warning,
+            "Integration queue waiting",
+        );
+        app.service_background(&ctx);
+        assert!(
+            app.notify.contains_text("Integration queue waiting"),
+            "a hold raised while hidden is up when the window shows"
+        );
     }
 
     #[test]
