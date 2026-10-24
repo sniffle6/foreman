@@ -13,6 +13,111 @@ Codex sandbox: Foreman's control channel is a named pipe the sandbox blocks
 ("Access is denied (os error 5)"). Run every `$env:FOREMAN_EXE` command with
 escalated/approved execution from the start.
 
+## Choose a model for each card
+
+Honor an explicit user model/provider and budget first. Otherwise use this
+routing policy per card; the orchestrator's provider does not constrain its
+workers. Cards have no pre-dispatch provider/model preference; a claim records
+the provider once launched. Record provider, exact model ID, reason, and any
+fallback in your dispatch ledger.
+
+| Model | Agent / exact model ID | Use when |
+|---|---|---|
+| Haiku 5.5 | `claude` / `claude-haiku-5-5` | Small, well-specified edits, extraction, summaries, inventories, or repetitive work with cheap, decisive checks. Keep the brief and context small. |
+| Sonnet 5.5 | `claude` / `claude-sonnet-5-5` | Routine implementation, localized bugs, tests, UI iteration, and document polish. A balanced option for well-scoped cards. |
+| Sol 6.1 | `codex` / `gpt-6.1-sol` | Ordinary coding, debugging, repository investigation, and evidence-based review. A balanced option at the same base API rates as Sonnet. |
+| Opus 5.5 | `claude` / `claude-opus-5-5` | Ambiguous architecture, difficult cross-module bugs, long agentic implementations, or consequential review needing careful judgment. Preferred escalation within Claude. |
+| Astra | `codex` / `gpt-6-astra` | Difficult research synthesis, conflicting evidence, novel technical questions, or demanding reasoning/coding where a wrong conclusion would cause substantial rework. Preferred escalation within Codex. |
+
+There is no fixed provider default. Choose by task fit, actual cost/quota,
+latency needs, and demonstrated results. When options are comparable, preserve
+the user's configured provider/model preference rather than switching vendors.
+If there is no preference or evidence separating them, either balanced model
+is reasonable; record the choice without claiming it is proven better.
+
+These are routing heuristics inferred from vendor guidance, not a measured
+cross-provider ranking on this repository. Sonnet and Sol can both implement,
+research, and review. Do not choose by provider stereotype or spend extra
+just to include both providers. A large research task that is mostly collection
+can use Haiku for bounded extraction or Sol/Sonnet for investigation; reserve
+Astra for the hard synthesis. Split collection and synthesis into separate
+cards/waves only when their outputs and ownership are independently useful.
+
+Choose a capable model upfront for high-risk or poorly understood work.
+For a bounded card that stalls, first distinguish missing context, permission
+prompts, tool/build failures, and model reasoning failures. Correct the brief
+or environment where needed; escalate the model after a substantive failed
+attempt rather than paying for repeated identical retries. Keep the board's
+restart rules below: do not launch a duplicate worker to bypass a live claim.
+
+### Cost and speed evidence
+
+Researched 2026-10-24. Standard API USD per million tokens, uncached input /
+output: Haiku **$0.10 / $0.50** for prompts up to 100K input tokens; Sonnet
+**$2 / $10**; Sol **$2 / $10**; Opus **$4 / $20**; Astra **$10 / $50**.
+Haiku above 100K is **$0.50 / $2.50**. Sol and Astra above 272K input tokens
+charge 2x input and 1.5x output for the full request. Cache, processing tier,
+tools, and regional charges can change the bill. Subscription CLI usage and
+quotas are not equivalent to these API rates; use the user's actual plan.
+
+Optimize cost per accepted result and time to completion, including retries,
+tool calls, review, and rework. At identical uncached token counts Astra costs
+5x Sol, but it can be economical if it avoids enough failed work. No local
+latency or success-rate comparison has been measured. Anthropic positions
+Haiku for latency-sensitive work and Sonnet for fast everyday iteration;
+OpenAI positions Sol as the balanced option and Astra for demanding work.
+Do not turn those descriptions into unsupported tokens/second rankings.
+
+Use the CLI's normal effort initially; lower effort can save time on bounded
+work and higher effort can help difficult reasoning. Foreman's `--model`
+does not set effort. Respect an explicit user effort setting and use only
+controls supported by the installed CLI. Record model/effort, elapsed time,
+acceptance result, retries, and usage/cost when exposed by the CLI on real
+cards; compare similar tasks before changing these defaults.
+
+Sources (recheck when names, pricing, or availability change):
+
+- [Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+  [Haiku 5.5](https://www.anthropic.com/claude-haiku-5-5),
+  [Sonnet 5.5](https://www.anthropic.com/claude-sonnet-5-5),
+  [Opus 5.5](https://www.anthropic.com/claude-opus-5-5).
+- [Sol model and pricing](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+  [Astra model and pricing](https://developers.openai.com/api/docs/models/gpt-6-astra),
+  [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model).
+- [Claude model controls](https://code.claude.com/docs/en/model-config),
+  [Codex CLI controls](https://learn.chatgpt.com/docs/developer-commands?surface=cli).
+
+### Dispatch the selected model
+
+Use explicit IDs so rolling aliases or saved CLI defaults do not silently
+change the choice. Examples (choose one per card):
+
+```powershell
+& $env:FOREMAN_EXE kanban dispatch <id> --agent claude --model claude-haiku-5-5
+& $env:FOREMAN_EXE kanban dispatch <id> --agent claude --model claude-sonnet-5-5
+& $env:FOREMAN_EXE kanban dispatch <id> --agent claude --model claude-opus-5-5
+& $env:FOREMAN_EXE kanban dispatch <id> --agent codex --model gpt-6.1-sol
+& $env:FOREMAN_EXE kanban dispatch <id> --agent codex --model gpt-6-astra
+```
+
+`--model` is a launch-local override for Claude/Codex, not persisted on the
+card or in user settings. Omission preserves the CLI default; Grok does not
+accept this Foreman flag. The provider CLI owns model access and validation:
+a successful spawn is not proof the requested model is available. Inspect
+the worker's startup/error report if it cannot begin, and record any reported
+model substitution. Honor the user's exact selection; do not silently downgrade.
+
+Both the CLI and running Foreman host must be updated for `--model`.
+`kanban --help` checks the CLI only; it cannot prove host support. A new
+CLI talking to an old host can have its model field silently ignored.
+Use the host's `FOREMAN_EXE`, confirm the host was launched from the updated
+build, and inspect the launched model before treating selection as honored.
+If the host is old or its support is unknown, report that limitation rather
+than claiming an exact selection. Do not invent flags, change global defaults,
+or substitute `open` to bypass cards.
+If a CLI/model is unavailable and the user did not require it, use an available
+model appropriate to the same task and budget and record why.
+
 ## The loop
 
 ```text
@@ -20,8 +125,8 @@ find plan -> dispatch current wave -> wait --any <ids> -> review the
   worker -> act on the board -> close its terminal -> dispatch -> ...
 ```
 
-Keep a short ledger as you go: card id, terminal id, state, and every board
-change you made. The ledger replaces re-reading the board.
+Keep a short ledger as you go: card id, terminal id, provider/model, state,
+and every board change you made. The ledger replaces re-reading the board.
 
 1. **Find the plan.** One `list --json` at the start: a card's plan is
    `planned.name` and `planned.wave`. Copy the name from a card and note each
@@ -33,12 +138,11 @@ change you made. The ledger replaces re-reading the board.
 3. **Dispatch one at a time**, recording each reply's `terminal`:
 
    ```powershell
-   & $env:FOREMAN_EXE kanban dispatch <id> --agent claude
+   & $env:FOREMAN_EXE kanban dispatch <id> --agent $agent --model $model
    ```
 
-   `--agent` is required and cards have no agent field: follow the user's
-   instruction, else `claude` (workers implement; the dispatch skill's
-   provider split applies to free-form chat teams, not cards).
+   Set `$agent` and `$model` for this card using the policy above.
+   `--agent` is required; `--model` pins the selected model for this launch.
 4. **Wait on your in-flight cards by id**:
    `kanban wait --any <id> <id> ... --timeout 600`, listing every ledger
    card you have not yet handled. It prints the line of the card that moved

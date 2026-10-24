@@ -2,6 +2,24 @@
 
 use std::path::{Path, PathBuf};
 
+/// Card workers stay interactive. Model selection is local to this launch,
+/// never a mutation of the provider's persisted default or a shell command.
+pub fn card_argv(agent: &str, prompt: &str, model: Option<&str>) -> Result<Vec<String>, String> {
+    let mut argv = vec![agent.to_owned(), prompt.to_owned()];
+    if let Some(model) = model {
+        if !matches!(agent, "claude" | "codex") {
+            return Err("--model is supported for claude and codex only".into());
+        }
+        if model.is_empty() || model.starts_with('-') || model.chars().any(char::is_whitespace) {
+            return Err(
+                "--model needs a non-empty model ID without whitespace or a leading '-'".into(),
+            );
+        }
+        argv.extend(["--model".to_owned(), model.to_owned()]);
+    }
+    Ok(argv)
+}
+
 /// The PATH a PTY session sees: `portable_pty` rebuilds it from the registry
 /// (machine entries, then user entries) on every spawn. The GUI's own PATH
 /// can lack the user entries entirely -- a launch from an installer or an
@@ -179,6 +197,28 @@ pub fn codex_in_process(argv: &[String]) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_models_are_launch_local_and_preserve_the_interactive_prompt() {
+        let prompt = "Implement the card.\nKeep its closeout commands.";
+        for (agent, model) in [
+            ("claude", "claude-haiku-5-5"),
+            ("claude", "claude-sonnet-5-5"),
+            ("claude", "claude-opus-5-5"),
+            ("codex", "gpt-6.1-sol"),
+            ("codex", "gpt-6-astra"),
+        ] {
+            assert_eq!(
+                card_argv(agent, prompt, Some(model)).unwrap(),
+                [agent, prompt, "--model", model]
+            );
+            assert_eq!(card_argv(agent, prompt, None).unwrap(), [agent, prompt]);
+        }
+        assert!(card_argv("grok", prompt, Some("anything")).is_err());
+        for model in ["", " ", "--help", "model id"] {
+            assert!(card_argv("codex", prompt, Some(model)).is_err());
+        }
+    }
 
     fn install(root: &Path) {
         std::fs::create_dir_all(root.join("node_modules/@openai/codex/bin")).unwrap();

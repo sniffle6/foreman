@@ -76,11 +76,13 @@ accepted.
   card's body.
 - `start` — self-service claim of a backlog card. Requires
   `FOREMAN_TERMINAL_ID` (be inside a foreman terminal).
-- `dispatch <id> --agent claude|codex|grok [--worktree|--branch|--no-worktree]`
+- `dispatch <id> --agent claude|codex|grok [--model ID] [--worktree|--branch|--no-worktree]`
   — what the board's "Start with" button does: spawn the agent in a new
   terminal with the generated dispatch prompt and claim the card for it.
   Backlog cards only. Reply is `{"ok":true,"terminal":"tN","project":"pN"}`.
   Never hand-roll `git worktree add` for a card.
+  `--model` selects a launch-local Claude/Codex model; omitted uses the CLI's
+  default. For task-based model selection, read `orchestrating-plans.md`.
 - `done` — closes a card you hold: in-progress -> done.
 - `block --reason R` — in-progress -> blocked; the reason is mandatory.
 - `rm` — deletes the card's file outright, from any state.

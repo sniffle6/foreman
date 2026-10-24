@@ -717,6 +717,7 @@ struct PendingCardDispatch {
     pid: WinId,
     id: String,
     agent: String,
+    model: Option<String>,
     rx: std::sync::mpsc::Receiver<Result<crate::kanban::BringUp, String>>,
     reply: std::sync::mpsc::Sender<crate::control::OpenReply>,
     sent: std::time::Instant,
@@ -731,6 +732,7 @@ enum CardDispatchBegun {
         pid: WinId,
         id: String,
         agent: String,
+        model: Option<String>,
         rx: std::sync::mpsc::Receiver<Result<crate::kanban::BringUp, String>>,
     },
 }
@@ -1930,11 +1932,18 @@ impl WindowManager {
                 ctx.request_repaint();
                 self.card_dispatch_reply(pid, &id, Ok(tid), reply);
             }
-            Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx }) => {
+            Ok(CardDispatchBegun::BringingUp {
+                pid,
+                id,
+                agent,
+                model,
+                rx,
+            }) => {
                 self.pending_card_dispatches.push(PendingCardDispatch {
                     pid,
                     id,
                     agent,
+                    model,
                     rx,
                     reply,
                     sent,
@@ -1950,6 +1959,8 @@ impl WindowManager {
     ) -> Result<CardDispatchBegun, String> {
         let id = req.id.clone().ok_or("missing id")?;
         let agent = req.agent.clone().ok_or("dispatch requires an agent")?;
+        // Validate before creating a worktree or changing the board.
+        crate::agent_command::card_argv(&agent, "", req.model.as_deref())?;
         let pid = self.resolve_project(req.project.as_deref())?;
         let child = self.project_child_mut(pid)?;
         let cwd = child
@@ -1977,7 +1988,7 @@ impl WindowManager {
         .map_err(|e| format!("card {id}: {e}"))?;
         let card = child.dispatch_precheck(&id, true)?;
         if mode == crate::kanban::DispatchMode::InPlace {
-            let tid = child.dispatch_spawn(card, &agent, None, ctx)?;
+            let tid = child.dispatch_spawn(card, &agent, req.model.as_deref(), None, ctx)?;
             return Ok(CardDispatchBegun::Spawned { pid, id, tid });
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1990,7 +2001,13 @@ impl WindowManager {
             });
             wake.request_repaint();
         });
-        Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx })
+        Ok(CardDispatchBegun::BringingUp {
+            pid,
+            id,
+            agent,
+            model: req.model.clone(),
+            rx,
+        })
     }
 
     /// Finish `kanban dispatch` requests whose bring-up thread has reported.
@@ -2019,7 +2036,7 @@ impl WindowManager {
                 // close-out): the guards run again before the spawn.
                 Ok(bring) => self.project_child_mut(p.pid).and_then(|child| {
                     let card = child.dispatch_precheck(&p.id, true)?;
-                    child.dispatch_spawn(card, &p.agent, Some(bring), ctx)
+                    child.dispatch_spawn(card, &p.agent, p.model.as_deref(), Some(bring), ctx)
                 }),
             };
             ctx.request_repaint();
@@ -3507,7 +3524,7 @@ impl WindowManager {
             (DispatchMode::Branch, Some(cwd)) => Some(crate::kanban::bring_up_branch(&cwd, &card)),
             _ => None,
         };
-        self.dispatch_spawn(card, agent, bring, ctx)
+        self.dispatch_spawn(card, agent, None, bring, ctx)
     }
 
     /// Every guard a dispatch passes before bring-up; returns the card to
@@ -3574,6 +3591,7 @@ impl WindowManager {
         &mut self,
         mut card: crate::kanban::Card,
         agent: &str,
+        model: Option<&str>,
         bring: Option<Result<crate::kanban::BringUp, String>>,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
@@ -3621,7 +3639,7 @@ impl WindowManager {
         // wake it for a full agent turn it has no use for. It still hears
         // posts that target it, so the orchestrator or human can steer it.
         let tid = match self.add_terminal_receiving(
-            &[agent.to_string(), prompt],
+            &crate::agent_command::card_argv(agent, &prompt, model)?,
             spawn_cwd.as_deref(),
             Some(&card.title),
             ctx,
@@ -19266,7 +19284,13 @@ mod tests {
             Ok(CardDispatchBegun::Spawned { pid, id, tid }) => {
                 m.card_dispatch_reply(pid, &id, Ok(tid), rtx)
             }
-            Ok(CardDispatchBegun::BringingUp { pid, id, agent, rx }) => {
+            Ok(CardDispatchBegun::BringingUp {
+                pid,
+                id,
+                agent,
+                model,
+                rx,
+            }) => {
                 // Wait out git first, then hand the verdict to the poll with
                 // a fresh `sent`: a loaded test machine can take longer than
                 // REPLY_TIMEOUT to add a worktree, and the drop-when-stale
@@ -19278,6 +19302,7 @@ mod tests {
                     pid,
                     id,
                     agent,
+                    model,
                     rx: brx,
                     reply: rtx,
                     sent: std::time::Instant::now(),
@@ -19401,6 +19426,40 @@ mod tests {
         let lines: Vec<&String> = d.iter().flat_map(|x| &x.lines).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].ends_with(&format!("@{worker} steer")), "{lines:?}");
+    }
+
+    #[test]
+    fn cli_dispatch_keeps_the_model_during_worktree_bringup_and_rejects_bad_models_early() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(repo.path().to_path_buf());
+        let pid = m.resolve_project(None).unwrap();
+        let id = add_card(&mut m, "Model dispatch");
+        let mut req = dispatch_req(&id, Some(true));
+        req.agent = Some("codex".into());
+        req.model = Some("--help".into());
+        assert!(m.card_dispatch_begin(&req, &ctx).is_err());
+        assert!(!repo.path().join(".foreman/worktrees").join(&id).exists());
+        let child = m.project_child_mut(pid).unwrap();
+        assert_eq!(
+            child.kanban.borrow().get(&id).unwrap().state,
+            crate::kanban::CardState::Backlog
+        );
+        assert!(child.windows.is_empty());
+
+        req.model = Some("gpt-6.1-sol".into());
+        let CardDispatchBegun::BringingUp {
+            agent, model, rx, ..
+        } = m.card_dispatch_begin(&req, &ctx).unwrap()
+        else {
+            panic!("worktree dispatch must bring up off-thread");
+        };
+        assert_eq!(agent, "codex");
+        assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+        assert!(rx.recv().unwrap().is_ok());
+        // No provider process is started by this test.
     }
 
     #[test]
@@ -19586,6 +19645,7 @@ mod tests {
             pid,
             id: id.clone(),
             agent: pause_argv()[0].clone(),
+            model: None,
             rx: brx,
             reply: rtx,
             sent: std::time::Instant::now()

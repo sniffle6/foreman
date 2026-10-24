@@ -284,7 +284,18 @@ tracking — instead of hand-rolling `git worktree add`. It runs the board's
 own code (`dispatch_precheck` → bring-up → `dispatch_spawn`), with two
 differences: it only starts **Backlog** cards (Restart of a Blocked or
 orphaned card stays a board action), and the agent must be one of the board's
-`AGENTS`. The reply is `open`'s shape, so the caller can `wait <id>`.
+`AGENTS`. The CLI also accepts `--model ID` for Claude/Codex: it appends
+`--model ID` to that interactive worker's argv, including after asynchronous
+worktree/branch bring-up. The override applies only to that dispatch; cards
+and CLI defaults are unchanged. Omission (including board clicks) preserves
+the provider CLI's default. Grok rejects this flag. The provider CLI validates
+model availability, so a successful spawn does not prove access to that model.
+Both CLI and host must be updated: CLI help alone cannot establish host
+support, and an older host ignores the new request field.
+The embedded skill's `orchestrating-plans.md` contains task-based routing,
+dated pricing sources, and escalation guidance for Haiku/Sonnet/Opus 5.5,
+Sol 6.1, and Astra; the orchestrator records its choice in its ledger.
+The reply is `open`'s shape, so the caller can `wait <id>`.
 Worktree bring-up runs on a thread and the reply waits for it, bounded by the
 control plane's 5 s reply timeout: a bring-up slower than that spawns nothing
 (the tree it made is reused next time), and a reply nobody is listening for
