@@ -374,6 +374,7 @@ pub(crate) fn assignment_provider(
     caller: u32,
     provider: &str,
     session: &str,
+    operation: &str,
 ) -> Result<ProviderProcess, String> {
     let snapshot = scanner().scan();
     let identity = assignment_provider_in(&snapshot.table, root, caller, provider)?;
@@ -387,7 +388,7 @@ pub(crate) fn assignment_provider(
     let process = system
         .process(pid)
         .ok_or("caller exited before session validation")?;
-    validate_assignment_session(provider, session, process.environ())?;
+    validate_assignment_session(provider, session, process.environ(), operation)?;
     if creation_time(identity.pid) != identity.started {
         return Err("provider process changed during identity validation".into());
     }
@@ -398,6 +399,7 @@ fn validate_assignment_session(
     provider: &str,
     session: &str,
     environ: &[std::ffi::OsString],
+    operation: &str,
 ) -> Result<(), String> {
     let key = match provider {
         "codex" => "CODEX_THREAD_ID=",
@@ -408,6 +410,12 @@ fn validate_assignment_session(
         .iter()
         .filter_map(|v| v.to_str())
         .find_map(|v| v.strip_prefix(key));
+    // Codex compact hooks provide session_id in JSON but omit the tool-only
+    // environment. Context grants no authority: recovery_brief still requires
+    // this session AND the validated root process to match the recorded owner.
+    if provider == "codex" && operation == "context" && actual.is_none() && !session.is_empty() {
+        return Ok(());
+    }
     if actual != Some(session) || session.is_empty() {
         return Err(format!(
             "provider session cannot be verified from the caller's {key} environment; use a supported root CLI tool process"
@@ -864,10 +872,37 @@ mod tests {
     #[test]
     fn assignment_session_must_match_the_live_tool_environment() {
         let env = vec![std::ffi::OsString::from("CODEX_THREAD_ID=new-thread")];
-        assert!(validate_assignment_session("codex", "old-thread", &env).is_err());
-        assert!(validate_assignment_session("codex", "new-thread", &env).is_ok());
-        assert!(validate_assignment_session("claude", "new-thread", &env).is_err());
-        assert!(validate_assignment_session("codex", "new-thread", &[]).is_err());
+        assert!(validate_assignment_session("codex", "old-thread", &env, "begin").is_err());
+        assert!(validate_assignment_session("codex", "new-thread", &env, "begin").is_ok());
+        assert!(validate_assignment_session("claude", "new-thread", &env, "begin").is_err());
+        for operation in [
+            "begin",
+            "continue",
+            "checkpoint",
+            "pause",
+            "resume",
+            "release",
+            "status",
+            "wait",
+        ] {
+            assert!(
+                validate_assignment_session("codex", "new-thread", &[], operation).is_err(),
+                "{operation} requires environment proof"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_context_fallback_only_accepts_a_missing_codex_environment() {
+        assert!(validate_assignment_session("codex", "hook-session", &[], "context").is_ok());
+        assert!(validate_assignment_session("codex", "", &[], "context").is_err());
+        assert!(validate_assignment_session("claude", "hook-session", &[], "context").is_err());
+        for actual in ["", "other-session"] {
+            let env = vec![std::ffi::OsString::from(format!(
+                "CODEX_THREAD_ID={actual}"
+            ))];
+            assert!(validate_assignment_session("codex", "hook-session", &env, "context").is_err());
+        }
     }
 
     #[test]

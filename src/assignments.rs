@@ -1973,6 +1973,18 @@ mod tests {
     #[test]
     fn recovery_context_is_read_only_owner_scoped_and_reports_observed_git_disagreement() {
         let repo = repository();
+        let owner = OwnerIdentity {
+            instance: "run".into(),
+            project: "p1".into(),
+            terminal: "t1".into(),
+            provider: "codex".into(),
+            session: "root-session".into(),
+            process: crate::proc::ProviderProcess {
+                pid: 10,
+                started: 100,
+            },
+        };
+        let owner_key = serde_json::to_string(&owner).unwrap();
         let mut board = crate::kanban::CardStore::default();
         board.set_dir(Some(repo.path()));
         let card = board
@@ -1984,7 +1996,7 @@ mod tests {
             .begin(&Begin {
                 id: "sequence".into(),
                 request_id: "begin".into(),
-                owner: "owner".into(),
+                owner: owner_key.clone(),
                 checkout: repo.path().into(),
                 target: "main".into(),
                 source_plan: None,
@@ -1993,12 +2005,57 @@ mod tests {
             .unwrap();
         let before = store.get("sequence").unwrap();
         crate::kanban::git(repo.path(), &["switch", "main"]).unwrap();
-        let brief = store.recovery_brief("owner").unwrap().unwrap();
+        let brief = store.recovery_brief(&owner_key).unwrap().unwrap();
         assert!(brief.contains(&format!("card/{card}")));
         assert!(brief.contains("observed branch: main"));
         assert!(brief.contains("disagreement"));
-        assert_eq!(store.recovery_brief("owner").unwrap(), Some(brief));
-        assert!(store.recovery_brief("forked-owner").unwrap().is_none());
+        assert_eq!(store.recovery_brief(&owner_key).unwrap(), Some(brief));
+        let mut unrelated = Vec::new();
+        for session in ["forked-session", "replacement-session"] {
+            unrelated.push(OwnerIdentity {
+                session: session.into(),
+                ..owner.clone()
+            });
+        }
+        unrelated.push(OwnerIdentity {
+            process: crate::proc::ProviderProcess {
+                pid: 10,
+                started: 200,
+            },
+            ..owner.clone()
+        });
+        unrelated.push(OwnerIdentity {
+            process: crate::proc::ProviderProcess {
+                pid: 20,
+                started: 100,
+            },
+            ..owner.clone()
+        });
+        unrelated.push(OwnerIdentity {
+            instance: "other-run".into(),
+            ..owner.clone()
+        });
+        unrelated.push(OwnerIdentity {
+            project: "p2".into(),
+            ..owner.clone()
+        });
+        unrelated.push(OwnerIdentity {
+            terminal: "t2".into(),
+            ..owner.clone()
+        });
+        unrelated.push(OwnerIdentity {
+            provider: "claude".into(),
+            ..owner.clone()
+        });
+        for other in unrelated {
+            assert!(
+                store
+                    .recovery_brief(&serde_json::to_string(&other).unwrap())
+                    .unwrap()
+                    .is_none(),
+                "unrelated owner received context: {other:?}"
+            );
+        }
         assert_eq!(store.get("sequence").unwrap(), before);
     }
 

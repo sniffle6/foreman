@@ -1931,6 +1931,7 @@ impl WindowManager {
                                         command.caller_pid,
                                         &command.provider,
                                         &command.session,
+                                        &command.operation,
                                     )?;
                                     if sent.elapsed() >= REPLY_TIMEOUT {
                                         return Err("assignment request expired before execution; retry the same request id".into());
@@ -18139,6 +18140,97 @@ mod tests {
         assert!(!tmp.path().join(".foreman/tasks").exists());
     }
 
+    #[test]
+    fn codex_compact_context_accepts_a_root_caller_without_thread_environment() {
+        const FIXTURE: &str = "FOREMAN_CONTEXT_CALLER_FIXTURE";
+        if let Ok(marker) = std::env::var(FIXTURE) {
+            assert!(std::env::var("CODEX_THREAD_ID").is_err());
+            std::fs::write(&marker, std::process::id().to_string()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::path::Path::new(&marker).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return;
+        }
+        let repo = kanban_git_repo().expect("git required");
+        let provider = repo.path().join("codex.exe");
+        // A native fixture process exercises the real OS ancestry/environment
+        // gate without making model requests or trusting provider hooks.
+        std::fs::copy(std::env::current_exe().unwrap(), &provider).unwrap();
+        let marker = repo.path().join("caller.txt");
+        let launch = repo.path().join("caller.ps1");
+        std::fs::write(
+            &launch,
+            format!(
+                "Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue\n$env:{FIXTURE} = '{}'\n& '{}' --exact wm::tests::codex_compact_context_accepts_a_root_caller_without_thread_environment --nocapture\n",
+                marker.display().to_string().replace('\'', "''"),
+                provider.display().to_string().replace('\'', "''"),
+            ),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut desktop = kanban_desktop(repo.path().into());
+        let project = desktop.resolve_project(None).unwrap();
+        let terminal = desktop
+            .project_child_mut(project)
+            .unwrap()
+            .add_terminal_cmd(
+                &[
+                    "powershell.exe".into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-File".into(),
+                    launch.to_string_lossy().into(),
+                ],
+                Some(repo.path()),
+                None,
+                &ctx,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let caller = loop {
+            if let Ok(pid) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = pid.parse::<u32>()
+            {
+                break pid;
+            }
+            desktop.keepalive();
+            assert!(std::time::Instant::now() < deadline, "caller did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut request = kanban_req("assignment");
+        request.project = Some(format!("p{project}"));
+        request.from = Some(term_tag(terminal));
+        request.assignment = Some(crate::assignments::Command {
+            operation: "context".into(),
+            provider: "codex".into(),
+            session: "hook-session".into(),
+            caller_pid: caller,
+            ..Default::default()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        desktop.handle_ctrl(
+            crate::control::CtrlMsg::Kanban(request, tx, std::time::Instant::now()),
+            &ctx,
+        );
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        assert!(
+            reply.ok,
+            "root compact hook was rejected: {:?}",
+            reply.error
+        );
+        assert_eq!(
+            reply.history,
+            Some(Vec::new()),
+            "unowned sessions get no brief"
+        );
+    }
+
     /// Explicit acceptance probe: runs installed Claude startup hooks, without
     /// model work or changing the user's hook configuration/trust decisions.
     #[test]
@@ -18291,7 +18383,20 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
             compact_hook.display()
         );
-        std::fs::write(&settings, serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":hook,"timeout":120}]},{"matcher":"compact","hooks":[{"type":"command","command":compact_command,"timeout":10}]}]}})).unwrap()).unwrap();
+        let mut session_hooks = vec![
+            serde_json::json!({"matcher":"compact","hooks":[{"type":"command","command":compact_command,"timeout":10}]}),
+        ];
+        // Codex's startup hook lacks the tool session environment. Begin and
+        // Checkpoint must run from its own shell, as an agent normally uses them.
+        if agent == "claude" {
+            session_hooks.insert(0, serde_json::json!({"matcher":"startup","hooks":[{"type":"command","command":hook,"timeout":120}]}));
+        }
+        std::fs::write(
+            &settings,
+            serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":session_hooks}}))
+                .unwrap(),
+        )
+        .unwrap();
         let launch = repo.path().join("launch.ps1");
         let invocation = if agent == "codex" {
             let isolated_home = repo.path().join("provider-home");
@@ -18315,7 +18420,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             )
             .unwrap();
             format!(
-                "$env:CODEX_HOME = '{}'\n$env:FOREMAN_PROBE_COMPACT = '1'\n& codex exec --json --skip-git-repo-check --dangerously-bypass-hook-trust -c model_auto_compact_token_limit=8000 'Run one shell command that reads fixture.txt. Do not edit files or delegate. Then report the recovery marker from restored context after compaction, or MISSING if none exists.' > provider.jsonl\nSet-Content accepted.json finished\n",
+                "$env:CODEX_HOME = '{}'\nRemove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue\n$env:FOREMAN_PROBE_COMPACT = '1'\n& codex --no-daemon exec --json --skip-git-repo-check --approve-for-me --dangerously-bypass-hook-trust -c model_auto_compact_token_limit=8000 'This isolated acceptance fixture is approved. First run probe.ps1 from your own PowerShell tool to begin and checkpoint the fixture assignment, then read fixture.txt to trigger compaction. Foreman uses a named pipe, so request escalated execution through automatic review if the sandbox blocks the script. Do not edit other files or delegate. After compaction, do not read assignment records or run assignment context/status yourself. Report the recovery marker only from automatically restored context, or MISSING if none exists.' > provider.jsonl\nSet-Content accepted.json finished\n",
                 isolated_home.display()
             )
         } else if compact {
@@ -18400,6 +18505,24 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             let event = std::fs::read_to_string(repo.path().join("compact-input.json"))
                 .expect("provider must invoke an actual compact hook");
             assert!(event.contains("compact"));
+            let restored = std::fs::read_to_string(repo.path().join("compact-output.json"))
+                .expect("compact hook output must be captured");
+            assert!(
+                restored.contains("FOREMAN-RECOVERED-ORCHID"),
+                "hook returned no recovery marker"
+            );
+            if agent == "codex" {
+                let calls = std::fs::read_to_string(repo.path().join("assignment-calls.txt"))
+                    .expect("Codex must begin and checkpoint from its own tool");
+                for operation in ["begin", "checkpoint"] {
+                    assert!(
+                        calls
+                            .lines()
+                            .any(|line| line.starts_with(operation) && line.contains("exit=0")),
+                        "Codex {operation} did not succeed: {calls}"
+                    );
+                }
+            }
             let provider = std::fs::read(repo.path().join("provider.jsonl")).unwrap();
             let provider = if provider.starts_with(&[0xff, 0xfe]) {
                 String::from_utf16_lossy(

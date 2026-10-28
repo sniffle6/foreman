@@ -561,6 +561,13 @@ checkout. It does not launch a worker or create a worktree per card. The paired
 `foreman-kanban/orchestrating-plans.md` instructions describe the execution loop
 and require commit/integration authorization before dependent work begins.
 
+Native Codex CLI 0.165.0 with `--no-daemon` passed shell Begin/Checkpoint and
+mid-card compaction recovery acceptance. The complete two-card integration
+lifecycle was verified with Claude. Codex commands run from the agent's own
+shell tools, which expose `CODEX_THREAD_ID`; startup hooks cannot begin an
+assignment without it. Use per-card dispatch when provider identity cannot be
+verified. See `docs/agent-state.md` for the read-only compact-hook exception.
+
 Begin accepts an assignment ID, request ID, explicit integration target, and
 cards or a plan name. It captures approved briefs and membership, reserves the
 canonical Git checkout, creates `card/<id>` with `--no-track`, verifies tracking,

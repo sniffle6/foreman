@@ -142,9 +142,14 @@ disabled (Claude's `disableAllHooks`); installed but runnable only once trusted
 agent to run `assignment status` when no brief arrives. The installer also
 warns the user about disabled hooks on every run, and about Codex trust whenever
 it changes the handler. It warns when `claude --version` or `codex --version`
-is older than the version the live probes verified (Claude Code 2.1.310,
-Codex 0.164.0), or cannot be read. Older versions are reported as unverified,
-not refused, because the true minimum is unknown. Only the user-level file
+is older than the configured warning threshold (Claude Code 2.1.310,
+Codex 0.164.0), or cannot be read. That threshold does not establish assignment
+delivery acceptance. Assignment
+Begin/Checkpoint from shell tools and mid-card recovery delivery were verified
+with Codex 0.165.0 and `--no-daemon`; its compact hooks omit `CODEX_THREAD_ID`.
+The complete two-card integration lifecycle was verified with Claude.
+Older versions are reported as unverified, not refused, because the true
+minimum is unknown. Only the user-level file
 Foreman manages is read: hooks or `disableAllHooks` in project, local,
 managed, or `--settings` configuration are not seen.
 
@@ -161,6 +166,12 @@ execution authority when hooks are missing, failed, timed out, or untrusted.
 Routing validates a fresh process tree, the native root provider's creation time,
 and the caller's provider session environment (`CODEX_THREAD_ID` or
 `CLAUDE_CODE_SESSION_ID`), in addition to Foreman instance/project/terminal IDs.
+Only Codex's read-only `context` request may omit the environment variable:
+compact hooks supply `session_id` in JSON instead. The complete owner key,
+including that session ID and validated provider process identity, must match
+the recorded assignment before any brief is returned. An available but
+mismatched environment variable is still rejected. All other operations retain
+environment proof, including Begin, Continue, and explicit Status.
 A same-provider child process does not inherit ownership. Daemon routing and
 unavailable identity fail closed. Trust is never enabled automatically. Hook
 installation alone is not evidence of delivery; supported-version and actual

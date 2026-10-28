@@ -8,6 +8,12 @@ ordinary sequential execution no longer requires a coordinator or a fresh worker
 and worktree for every card. This retains useful context and build artifacts.
 No measured performance improvement is claimed.
 
+Claude acceptance covers the complete two-card integration lifecycle. Codex CLI
+0.165.0 with `--no-daemon` passed shell Begin/Checkpoint and mid-card compaction
+recovery acceptance on 2026-10-28 after the context-only identity correction
+described below. Other Codex routes and the complete Codex integration lifecycle
+remain unverified.
+
 The governing design is
 [Continuing plan orchestration](superpowers/specs/2026-10-26-continuing-plan-orchestration-design.md).
 The implementation follows the later correction that unrelated dirty work must
@@ -27,7 +33,10 @@ the user's decision.
   identity and executes assignment work off-thread with bounded concurrency.
 - `src/proc.rs` checks fresh native provider ancestry and creation time, then
   matches the requested session to the actual caller's provider environment.
-  Nested native providers and ambiguous daemon routes fail closed.
+  Only read-only Codex compaction context may use the hook input session ID
+  when its environment variable is absent; the complete recorded owner must
+  still match before a brief is returned. Nested native providers and ambiguous
+  daemon routes fail closed.
 - `src/kanban.rs` and `src/integrate.rs` honor persistent reservations across
   legacy claims, dispatch, worktree preparation, closeout, teardown, and queue
   execution. Integration results survive removal of finished queue entries.
@@ -117,7 +126,7 @@ Commands and results on Windows, 2026-10-26:
 | Native Claude lifecycle probe | Passed: two fixture outcomes committed and integrated through one Session and one registered checkout; a nested same-provider caller was rejected. |
 | Native Claude compaction probe | Passed: an actual `SessionStart` event with `source: compact` returned the continuation note; the subsequent model response reported a marker present only in that note. The assignment remained mid-card. |
 | Built hook helper failure paths | Missing route, unreachable pipe, malformed input, duplicate calls, and blocked stdin exited quietly. The blocked-stdin process exited in approximately 1.7 seconds including startup. |
-| Codex automatic mid-turn compaction probe | Prepared; requires explicit approval for the isolated one-run hook-trust test. Normal trust settings are untouched. |
+| Codex automatic mid-turn compaction probe | Not run at this checkpoint. Subsequent failed runs and the corrected acceptance result are recorded below. |
 
 The installed native versions inspected were Claude Code 2.1.310 and Codex CLI
 0.164.0. The Claude provider probes are explicit ignored tests under `wm::tests`
@@ -132,14 +141,64 @@ pipe permissions or a test executable still holding the linker output; those
 checks were rerun after resolving the environment issue. The native Claude
 lifecycle/nested-provider probe was also rerun against the final binary.
 
+### Codex validation, 2026-10-28
+
+On `8546cd0`, Codex CLI 0.165.0 compact hooks fired without `CODEX_THREAD_ID`
+with and without `--no-daemon`. The helper therefore returned no brief. Startup
+hooks also lacked the variable and could not Begin. The agent's own shell does
+expose `CODEX_THREAD_ID`, so mutations can keep their existing identity proof.
+
+A deterministic native-process regression drove a real context request without
+the variable through the Windows ancestry/environment gate. It failed with the
+expected environment-verification error before the production change and passed
+afterward. The fix permits only read-only Codex `context` to omit the variable;
+the hook input session ID and complete validated owner must match a durable
+record. Mismatched available environment values and all other operations retain
+the environment check. Tests cover those restrictions and exact owner scoping
+across sessions, provider processes, creation times, instances, projects, and
+terminals.
+
+With fresh user approval for one isolated hook-trust probe, this command passed
+on the working tree based on `8546cd0`:
+
+```powershell
+$env:FOREMAN_ACCEPTANCE_TRUST_HOOKS = '1'
+cargo test --target-dir target/agent --bin foreman -- --ignored --exact wm::tests::live_codex_compaction_context_delivery --test-threads=1
+Remove-Item Env:FOREMAN_ACCEPTANCE_TRUST_HOOKS
+```
+
+The probe launched native Codex CLI 0.165.0 with `--no-daemon`, a temporary
+`CODEX_HOME`, invocation-only hook trust bypass, and automatic review for shell
+permissions. It began and checkpointed the assignment from the model's own
+shell, then triggered actual mid-card compaction. The compact hook returned the
+saved marker and the next model response reported it. The hook helper completed
+within its deadline, including approximately 1.7 seconds under concurrent suite
+load. Normal user configuration and trust were untouched; the temporary login
+cache was removed with the fixture. Non-secret artifacts are copied to
+`target/continuing-live-codex-*`.
+
+This proves Codex shell assignment setup and compaction recovery on that route.
+It does not prove the full Codex multi-card integration lifecycle or daemon
+routing. The full lifecycle acceptance remains the Claude result above.
+
+Local validation used the installed `stable-x86_64-pc-windows-msvc` toolchain
+(Cargo 1.99.0). `cargo check --target-dir target/agent` and
+`cargo build --target-dir target/agent` passed with the pre-existing warning
+baseline. The full `cargo test --target-dir target/agent` suite passed:
+1,746 passed, no failures, 19 ignored. The final paired skill text was rebuilt
+into the binary. Formatting, diff whitespace, and citation checks also passed.
+GNU verification was not run: that toolchain is not installed on this machine,
+although the existing build guide and CI specify it. No GUI behavior changed.
+
 ## Operational limits
 
 Use a rebuilt Foreman host; an older running host does not understand the new
 assignment commands. No GUI controls or rendering were added, and the running
 host was not replaced or killed during implementation.
 
-Native Windows Claude/Codex routing is supported by this implementation. WSL,
-ambiguous daemon routes, missing provider session environment, and multiple root
+Native Windows Claude routing and Codex shell setup/compaction routing with
+CLI 0.165.0 and `--no-daemon` are verified. WSL,
+ambiguous daemon routes, missing mutation-session environment, and multiple root
 providers fail closed. Hook support and trust remain provider prerequisites;
 installation does not establish delivery, and no normal trust decision is changed
 automatically. Status/Resume/Continue provide manual recovery without hooks.

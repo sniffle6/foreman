@@ -139,6 +139,9 @@ already say (orchestrating-plans.md, "Steering a running worker").
 
 Read `orchestrating-plans.md` before beginning. Execute related cards in this
 Session with `kanban assignment begin|continue|checkpoint|pause|resume`.
+Native Codex CLI 0.165.0 with `--no-daemon` passed shell Begin/Checkpoint and
+compaction recovery acceptance. The complete integration lifecycle was verified
+with Claude; see the reference for provider identity requirements and limits.
 Use `status` and bounded `wait` for read-only inspection. Preserve the checkout
 and conversation across card boundaries. Delegate only when authorized and
 useful; delegated card workers still use `kanban dispatch` and separate checkouts.

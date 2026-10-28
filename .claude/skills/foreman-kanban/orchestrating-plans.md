@@ -18,12 +18,24 @@ new cards appear. Preserve unrelated tracked and untracked files.
 
 ## Continue in this Session
 
+Native Windows Claude and Codex root CLIs support assignments. Codex CLI
+0.165.0 with `--no-daemon` passed shell Begin/Checkpoint and mid-card compaction
+recovery acceptance. The complete two-card integration lifecycle was verified
+with Claude. Other Codex routes and versions need their own acceptance evidence.
+
 Use `foreman kanban assignment` through `FOREMAN_EXE`. It requires a native
 root Codex or Claude CLI under this terminal, an explicit instance pipe,
 project/terminal identity, and the provider's current session identity.
+Use a rebuilt Foreman host with assignment support; rebuilding the CLI alone
+does not update a running host.
 Codex reads `CODEX_THREAD_ID`; Claude reads `CLAUDE_CODE_SESSION_ID`.
+Run Codex Begin/Continue and other commands from the agent's own shell tools,
+where `CODEX_THREAD_ID` is set. Codex startup hooks lack that variable and cannot
+begin an assignment. Only read-only compact context can use the hook's session
+ID without environment proof; it must still match the recorded owner.
 An inherited terminal ID alone is insufficient. If identity cannot be verified,
-report the unsupported route; do not copy another session's identity.
+report the unsupported route and use per-card dispatch; do not copy another
+session's identity.
 
 For example (PowerShell; substitute approved IDs and the actual target):
 
