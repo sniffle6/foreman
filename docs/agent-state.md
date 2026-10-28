@@ -135,6 +135,19 @@ The `assignment-context` helper emits only the provider's `additionalContext`
 JSON when the instance control pipe returns a matching owner's recovery brief.
 It ignores subagent events, unrelated sessions, and malformed input.
 
+Delivery is disclosed, never assumed. Every assignment result carries a
+`recovery` line read from the provider's own configuration: not installed;
+disabled (Claude's `disableAllHooks`); installed but runnable only once trusted
+(Codex, whose trust store Foreman cannot read); or installed. It tells the
+agent to run `assignment status` when no brief arrives. The installer also
+warns the user about disabled hooks on every run, and about Codex trust whenever
+it changes the handler. It warns when `claude --version` or `codex --version`
+is older than the version the live probes verified (Claude Code 2.1.310,
+Codex 0.164.0), or cannot be read. Older versions are reported as unverified,
+not refused, because the true minimum is unknown. Only the user-level file
+Foreman manages is read: hooks or `disableAllHooks` in project, local,
+managed, or `--settings` configuration are not seen.
+
 The helper caps stdin and exits quietly after a 5 s deadline; the managed hook
 allows 10 s. The context request starts several git processes, which took
 1.8-2 s under build load against 0.4 s idle, and compaction takes far longer. Server requests

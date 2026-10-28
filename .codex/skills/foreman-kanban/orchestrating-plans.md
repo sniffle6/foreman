@@ -99,6 +99,10 @@ Maintain one concise continuation note: intent, decisions with reasons,
 unfinished steps, useful discoveries, and verification gaps. Native provider
 compaction may load a read-only recovery brief through SessionStart/compact.
 Missing or untrusted hooks do not release ownership; use status/resume/continue.
+Every assignment result has a `recovery` line saying whether this provider can
+deliver the brief (not installed, disabled, needs Codex trust, or installed).
+If it cannot, or no brief arrives after compaction, run `assignment status`
+before acting on what you remember.
 Never enable trust automatically or treat installation as proof of delivery.
 
 ## Optional independent delegation

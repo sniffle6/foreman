@@ -71,7 +71,18 @@ impl Command {
     }
 
     /// Execute only after the control adapter validated this owner against the live process tree.
+    /// Each result also discloses whether the provider can deliver a compaction brief.
     pub fn execute(&self, cwd: &Path, owner: &OwnerIdentity) -> Result<Snapshot, String> {
+        let mut result = self.apply(cwd, owner)?;
+        result.recovery = Some(
+            crate::agent_hooks::recovery_for(&self.provider)
+                .disclosure()
+                .into(),
+        );
+        Ok(result)
+    }
+
+    fn apply(&self, cwd: &Path, owner: &OwnerIdentity) -> Result<Snapshot, String> {
         self.validate()?;
         let common = crate::integrate::repo_identity(cwd)?;
         let store = AssignmentStore::for_repo(&common);
@@ -330,6 +341,9 @@ pub(crate) struct Snapshot {
     pub scope: Vec<String>,
     pub next: String,
     pub integration: Option<String>,
+    /// Whether the provider can deliver a compaction brief; reported, not persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
 }
 
 impl Assignment {
@@ -385,7 +399,7 @@ impl Assignment {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { id: self.id.clone(), generation: self.generation, revision: self.revision, note: self.note.clone(), integration: None,
+        Snapshot { id: self.id.clone(), generation: self.generation, revision: self.revision, note: self.note.clone(), integration: None, recovery: None,
             outcome: self.outcome.clone(), current: self.current.clone(),
             branch: self.current.as_ref().map(|id| format!("card/{id}")),
             brief: self.current.as_ref().and_then(|id| self.approved.iter().find(|b| b.id == *id))
@@ -3144,6 +3158,45 @@ mod tests {
         let after = queue.get(&begin.cards[0]).unwrap();
         assert_eq!((after.seq, &after.commit), (queued.seq, &queued.commit));
         assert_eq!(queue.requests().len(), 1);
+    }
+
+    #[test]
+    fn every_command_result_discloses_compaction_recovery_for_its_provider() {
+        let repo = repository();
+        let mut board = crate::kanban::CardStore::default();
+        board.set_dir(Some(repo.path()));
+        let card = board.add("Outcome", None).unwrap();
+        let owner = OwnerIdentity {
+            instance: "instance".into(),
+            project: "p1".into(),
+            terminal: "t1".into(),
+            provider: "claude".into(),
+            session: "session".into(),
+            process: crate::proc::ProviderProcess { pid: 7, started: 9 },
+        };
+        let command = |operation: &str| Command {
+            operation: operation.into(),
+            id: "run".into(),
+            request_id: format!("{operation}-1"),
+            provider: "claude".into(),
+            session: "session".into(),
+            caller_pid: 1,
+            cards: vec![card.clone()],
+            target: "main".into(),
+            ..Default::default()
+        };
+        let begun = command("begin").execute(repo.path(), &owner).unwrap();
+        let status = command("status").execute(repo.path(), &owner).unwrap();
+        for result in [&begun, &status] {
+            let recovery = result.recovery.as_deref().unwrap_or_default();
+            assert!(recovery.contains("assignment status"), "{result:?}");
+        }
+        // Reported per response, never persisted into replayable receipts.
+        let stored =
+            AssignmentStore::for_repo(&crate::integrate::repo_identity(repo.path()).unwrap())
+                .get("run")
+                .unwrap();
+        assert!(stored.begin_result.unwrap().recovery.is_none());
     }
 
     #[test]

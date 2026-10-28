@@ -74,6 +74,152 @@ fn wanted_events(agent: &str, wants: HookWants) -> &'static [&'static str] {
 pub struct InstallReport {
     pub changed: usize,
     pub errors: Vec<String>,
+    pub notices: Vec<String>,
+}
+
+/// Whether a provider can deliver the compaction recovery brief, judged from
+/// its own configuration. Installation is not proof that the hook ran, and
+/// Codex's trust store is not readable here, so the strongest claim is
+/// "installed".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    NotInstalled,
+    /// Claude's `disableAllHooks` suppresses every hook.
+    Disabled,
+    /// Codex runs a hook only after the user trusts it.
+    NeedsTrust,
+    Installed,
+}
+
+impl Recovery {
+    /// Agent-facing: what this means and what to do when no brief arrives.
+    pub fn disclosure(self) -> &'static str {
+        match self {
+            Recovery::NotInstalled => {
+                "compaction recovery hook is not installed; after compaction, run assignment status before continuing"
+            }
+            Recovery::Disabled => {
+                "compaction recovery hook is installed but hooks are disabled (disableAllHooks); after compaction, run assignment status before continuing"
+            }
+            Recovery::NeedsTrust => {
+                "compaction recovery hook is installed; Codex runs it only once trusted, so if no brief arrives after compaction, run assignment status"
+            }
+            Recovery::Installed => {
+                "compaction recovery hook is installed; if no brief arrives after compaction, run assignment status"
+            }
+        }
+    }
+}
+
+/// The provider's recovery status from its configuration file under the
+/// user's provider homes; unreadable or missing configuration is NotInstalled.
+pub(crate) fn recovery_for(agent: &str) -> Recovery {
+    let Some(roots) = roots_from_env() else {
+        return Recovery::NotInstalled;
+    };
+    let path = match agent {
+        "claude" => roots.claude.join("settings.json"),
+        "codex" => roots.codex.join("hooks.json"),
+        _ => return Recovery::NotInstalled,
+    };
+    let config = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    recovery_in(agent, config.as_ref())
+}
+
+fn recovery_in(agent: &str, config: Option<&serde_json::Value>) -> Recovery {
+    let Some(config) = config else {
+        return Recovery::NotInstalled;
+    };
+    let installed = config["hooks"]["SessionStart"]
+        .as_array()
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group["hooks"]
+                    .as_array()
+                    .is_some_and(|handlers| handlers.iter().any(is_recovery_handler))
+            })
+        });
+    if !installed {
+        return Recovery::NotInstalled;
+    }
+    match agent {
+        "claude" if config["disableAllHooks"] == true => Recovery::Disabled,
+        "codex" => Recovery::NeedsTrust,
+        _ => Recovery::Installed,
+    }
+}
+
+/// Provider versions the live compaction probes verified (2026-10-26).
+/// Older ones may still work; they are disclosed as unverified, not refused.
+const VERIFIED_VERSIONS: [(&str, &str, [u64; 3]); 2] = [
+    ("claude", "Claude Code", [2, 1, 310]),
+    ("codex", "Codex", [0, 164, 0]),
+];
+
+/// A user-facing notice when `--version` output is older than the verified
+/// version or cannot be read.
+fn version_notice(agent: &str, output: Option<&str>) -> Option<String> {
+    let (_, label, verified) = VERIFIED_VERSIONS.iter().find(|(a, _, _)| *a == agent)?;
+    let shown = |v: &[u64; 3]| format!("{}.{}.{}", v[0], v[1], v[2]);
+    let parse = |word: &str| -> Option<[u64; 3]> {
+        let mut parts = word.trim_start_matches('v').split('.');
+        let mut next = || parts.next()?.parse::<u64>().ok();
+        Some([next()?, next()?, next()?])
+    };
+    match output.and_then(|o| o.split_whitespace().find_map(parse)) {
+        Some(version) if version >= *verified => None,
+        Some(version) => Some(format!(
+            "{label} {} is older than {} verified for compaction recovery; the brief may not arrive",
+            shown(&version),
+            shown(verified)
+        )),
+        None => Some(format!(
+            "Could not determine the {label} version; compaction recovery was verified with {}",
+            shown(verified)
+        )),
+    }
+}
+
+/// `<agent> --version` from the CLI found on `path`, bounded so a stuck CLI
+/// cannot hold the installer thread.
+fn cli_version(agent: &str, path: &std::ffi::OsStr) -> Option<String> {
+    use std::io::Read as _;
+    let program = std::env::split_paths(path).find_map(|dir| {
+        ["exe", "cmd", ""]
+            .iter()
+            .map(|ext| dir.join(agent).with_extension(ext))
+            .find(|candidate| candidate.is_file())
+    })?;
+    let mut command = std::process::Command::new(program);
+    command
+        .arg("--version")
+        .env("PATH", path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    reader.join().ok()
 }
 
 #[derive(Clone, Debug)]
@@ -103,12 +249,20 @@ pub fn spawn_install(
 fn install(wants: HookWants) -> InstallReport {
     let Some(roots) = roots_from_env() else {
         return InstallReport {
-            changed: 0,
             errors: vec!["user home is unavailable; agent hooks were not installed".into()],
+            ..Default::default()
         };
     };
-    let present = providers_on_path(&crate::agent_command::session_path());
-    install_in(&roots, wants, &present)
+    let path = crate::agent_command::session_path();
+    let present = providers_on_path(&path);
+    let mut report = install_in(&roots, wants, &present);
+    for agent in present {
+        let output = cli_version(agent, &path);
+        report
+            .notices
+            .extend(version_notice(agent, output.as_deref()));
+    }
+    report
 }
 
 fn roots_from_env() -> Option<HookRoots> {
@@ -163,10 +317,32 @@ fn install_in(roots: &HookRoots, wants: HookWants, present: &[&str]) -> InstallR
         if !recovery && wanted_events(agent, wants).is_empty() && !path.exists() {
             continue;
         }
-        match install_one(&path, agent, wants, recovery) {
-            Ok(true) => report.changed += 1,
-            Ok(false) => {}
-            Err(error) => report.errors.push(format!("{agent} hook: {error}")),
+        let changed = match install_one(&path, agent, wants, recovery) {
+            Ok(changed) => changed,
+            Err(error) => {
+                report.errors.push(format!("{agent} hook: {error}"));
+                continue;
+            }
+        };
+        report.changed += usize::from(changed);
+        if !recovery {
+            continue;
+        }
+        let config = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        match recovery_in(agent, config.as_ref()) {
+            // A setting the user can change at any time: say so on every run.
+            Recovery::Disabled => report.notices.push(
+                "Claude hooks are disabled (disableAllHooks), so compaction recovery will not run"
+                    .into(),
+            ),
+            // Every change to the handler needs trusting again.
+            Recovery::NeedsTrust if changed => report.notices.push(
+                "Codex runs Foreman's compaction recovery hook only after you trust it in Codex"
+                    .into(),
+            ),
+            _ => {}
         }
     }
     report
@@ -409,14 +585,7 @@ fn merge_recovery(
             continue;
         };
         for handler in handlers {
-            let managed = ["command", "commandWindows", "command_windows"]
-                .iter()
-                .filter_map(|key| handler[*key].as_str())
-                .any(|command| {
-                    let script = relay_script(command).unwrap_or_else(|| command.into());
-                    script.contains("FOREMAN_EXE") && script.contains("assignment-context --agent ")
-                });
-            if managed {
+            if is_recovery_handler(handler) {
                 *handler = desired.clone();
                 found = true;
             }
@@ -427,6 +596,17 @@ fn merge_recovery(
         groups.push(serde_json::json!({"matcher":"compact", "hooks":[desired]}));
     }
     Ok(())
+}
+
+/// Foreman's managed compaction recovery handler, in any of its encodings.
+fn is_recovery_handler(handler: &serde_json::Value) -> bool {
+    ["command", "commandWindows", "command_windows"]
+        .iter()
+        .filter_map(|key| handler[*key].as_str())
+        .any(|command| {
+            let script = relay_script(command).unwrap_or_else(|| command.into());
+            script.contains("FOREMAN_EXE") && script.contains("assignment-context --agent ")
+        })
 }
 
 /// Update one event's handler list in place: the first managed handler is
@@ -498,6 +678,92 @@ mod tests {
         state: true,
     };
     const BOTH: &[&str] = &["claude", "codex"];
+
+    #[test]
+    fn recovery_is_disclosed_from_the_providers_own_configuration() {
+        let empty = serde_json::json!({});
+        let claude = merge_hooks(empty.clone(), "claude", HookWants::default(), true).unwrap();
+        let codex = merge_hooks(empty.clone(), "codex", HookWants::default(), true).unwrap();
+        let mut disabled = claude.clone();
+        disabled["disableAllHooks"] = true.into();
+        for (agent, config, expected) in [
+            ("claude", None, Recovery::NotInstalled),
+            ("claude", Some(&empty), Recovery::NotInstalled),
+            ("claude", Some(&claude), Recovery::Installed),
+            ("claude", Some(&disabled), Recovery::Disabled),
+            ("codex", Some(&codex), Recovery::NeedsTrust),
+            ("codex", Some(&empty), Recovery::NotInstalled),
+        ] {
+            assert_eq!(recovery_in(agent, config), expected, "{agent} {config:?}");
+        }
+        // Every state tells the agent what to do when no brief arrives.
+        for state in [
+            Recovery::NotInstalled,
+            Recovery::Disabled,
+            Recovery::NeedsTrust,
+            Recovery::Installed,
+        ] {
+            assert!(
+                state.disclosure().contains("assignment status"),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_older_than_the_verified_ones_or_unreadable_are_disclosed() {
+        for (agent, output, disclosed) in [
+            ("claude", Some("2.1.310 (Claude Code)"), false),
+            ("claude", Some("2.2.0 (Claude Code)\n"), false),
+            ("claude", Some("2.0.99 (Claude Code)"), true),
+            ("codex", Some("codex-cli 0.164.0"), false),
+            ("codex", Some("codex-cli 1.0.0"), false),
+            ("codex", Some("codex-cli 0.150.1"), true),
+            ("codex", Some("unexpected"), true),
+            ("claude", None, true),
+        ] {
+            let notice = version_notice(agent, output);
+            assert_eq!(
+                notice.is_some(),
+                disclosed,
+                "{agent} {output:?}: {notice:?}"
+            );
+        }
+        let older = version_notice("codex", Some("codex-cli 0.150.1")).unwrap();
+        assert!(
+            older.contains("0.150.1") && older.contains("0.164.0"),
+            "{older}"
+        );
+    }
+
+    #[test]
+    fn install_discloses_trust_once_and_disabled_hooks_every_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = roots_in(&temp);
+        let first = install_in(&roots, HookWants::default(), BOTH);
+        assert!(
+            first
+                .notices
+                .iter()
+                .any(|n| n.contains("Codex") && n.contains("trust")),
+            "{:?}",
+            first.notices
+        );
+        let again = install_in(&roots, HookWants::default(), BOTH);
+        assert!(again.notices.is_empty(), "{:?}", again.notices);
+        let path = roots.claude.join("settings.json");
+        let mut settings = read_json(&path);
+        settings["disableAllHooks"] = true.into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        for _ in 0..2 {
+            let report = install_in(&roots, HookWants::default(), BOTH);
+            assert!(
+                report.notices.iter().any(|n| n.contains("disableAllHooks")),
+                "{:?}",
+                report.notices
+            );
+        }
+    }
 
     #[test]
     fn recovery_hook_is_installed_only_for_providers_on_the_path() {

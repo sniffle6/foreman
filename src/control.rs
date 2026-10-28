@@ -2542,6 +2542,7 @@ mod tests {
             scope: Vec::new(),
             next: String::new(),
             integration: integration.map(str::to_string),
+            recovery: None,
         };
         OpenReply {
             ok: true,

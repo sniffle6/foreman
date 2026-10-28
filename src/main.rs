@@ -429,6 +429,9 @@ impl App {
                 format!("Agent hook install failed: {}", report.errors.join("; ")),
             );
         }
+        for notice in report.notices {
+            self.notify.push(notify::Level::Warning, notice);
+        }
         if self.hook_reinstall {
             self.hook_reinstall = false;
             self.request_hook_install(ctx);
