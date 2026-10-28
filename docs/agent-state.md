@@ -135,7 +135,9 @@ The `assignment-context` helper emits only the provider's `additionalContext`
 JSON when the instance control pipe returns a matching owner's recovery brief.
 It ignores subagent events, unrelated sessions, and malformed input.
 
-The helper caps stdin and exits quietly after a short deadline. Server requests
+The helper caps stdin and exits quietly after a 5 s deadline; the managed hook
+allows 10 s. The context request starts several git processes, which took
+1.8-2 s under build load against 0.4 s idle, and compaction takes far longer. Server requests
 have bounded concurrency and short read-only Git probes. Context requests have
 their own capacity, so polling waits cannot starve them. A repeated invocation
 only reads scope, current brief, observed Git/queue state, and the continuation

@@ -18164,6 +18164,37 @@ mod tests {
         live_provider_probe("codex", true);
     }
 
+    /// Requests on this process's instance pipe, routed to the calling probe.
+    /// `serve` never returns and the pipe name is fixed per process, so a
+    /// second server would leave the first one listening after its probe
+    /// dropped the receiver. A client that reached it got "foreman is not
+    /// accepting requests". One server per process forwards to the latest probe.
+    fn probe_control_requests(
+        ctx: &egui::Context,
+    ) -> std::sync::mpsc::Receiver<crate::control::CtrlMsg> {
+        type Route = std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::control::CtrlMsg>>>;
+        static ROUTE: std::sync::OnceLock<Route> = std::sync::OnceLock::new();
+        let route = ROUTE.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<crate::control::CtrlMsg>();
+            let server_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                crate::control::serve(crate::control::instance_pipe(), tx, server_ctx)
+            });
+            std::thread::spawn(move || {
+                for message in rx {
+                    let route = ROUTE.get().expect("initialized before forwarding");
+                    if let Some(probe) = route.lock().unwrap().as_ref() {
+                        let _ = probe.send(message);
+                    }
+                }
+            });
+            std::sync::Mutex::new(None)
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        *route.lock().unwrap() = Some(tx);
+        rx
+    }
+
     fn live_provider_probe(agent: &str, compact: bool) {
         let repo = kanban_git_repo().expect("git required");
         let ctx = egui::Context::default();
@@ -18194,9 +18225,21 @@ mod tests {
         let script = r#"
 $ErrorActionPreference = 'Stop'
 function Call-Assignment([string[]]$Operation) {
-  $reply = & $env:FOREMAN_EXE kanban assignment @Operation --provider claude --id live-probe
-  if ($LASTEXITCODE -ne 0) { throw "Assignment command failed: $reply" }
-  return ($reply | ConvertFrom-Json)
+  # As the skill directs agents: a lost or busy reply is retried with the
+  # identical request, which replays once the server finishes.
+  for ($attempt = 1; ; $attempt++) {
+    $ErrorActionPreference = 'Continue'
+    $output = & $env:FOREMAN_EXE kanban assignment @Operation --provider claude --id live-probe 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    $reply = $output | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] }
+    "$($Operation[0]) attempt=$attempt exit=$code $output" | Add-Content assignment-calls.txt
+    if ($code -eq 0) { return ($reply | ConvertFrom-Json) }
+    if ($attempt -ge 30 -or -not ("$output" -match 'did not respond|busy')) {
+      throw "Assignment command failed: $output"
+    }
+    Start-Sleep -Seconds 1
+  }
 }
 $s = Call-Assignment @('begin','--request-id','begin','--cards','CARDS','--target','main')
 if ($env:FOREMAN_PROBE_COMPACT -eq '1') {
@@ -18248,7 +18291,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
             compact_hook.display()
         );
-        std::fs::write(&settings, serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":hook,"timeout":120}]},{"matcher":"compact","hooks":[{"type":"command","command":compact_command,"timeout":3}]}]}})).unwrap()).unwrap();
+        std::fs::write(&settings, serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":hook,"timeout":120}]},{"matcher":"compact","hooks":[{"type":"command","command":compact_command,"timeout":10}]}]}})).unwrap()).unwrap();
         let launch = repo.path().join("launch.ps1");
         let invocation = if agent == "codex" {
             let isolated_home = repo.path().join("provider-home");
@@ -18298,10 +18341,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             format!("& claude --init-only --settings '{}'\n", settings.display())
         };
         std::fs::write(&launch, format!("$env:FOREMAN_EXE = '{}'\nRemove-Item Env:FOREMAN_TITLE_PIPE -ErrorAction SilentlyContinue\n{}", client.display().to_string().replace('\'', "''"), invocation)).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let pipe = crate::control::instance_pipe().to_string();
-        let server_ctx = ctx.clone();
-        std::thread::spawn(move || crate::control::serve(&pipe, tx, server_ctx));
+        let rx = probe_control_requests(&ctx);
         let terminal = child
             .add_terminal_cmd(
                 &[
@@ -18347,6 +18387,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
                 "compact-input.json",
                 "compact-output.json",
                 "compact-timing.txt",
+                "assignment-calls.txt",
             ] {
                 if repo.path().join(file).exists() {
                     std::fs::copy(

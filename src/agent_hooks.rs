@@ -378,8 +378,9 @@ fn merge_recovery(
     let powershell = format!(
         "try {{ if ($env:FOREMAN_EXE -and $env:FOREMAN_PIPE) {{ & $env:FOREMAN_EXE assignment-context --agent {agent} 2>$null }} }} catch {{}}; exit 0"
     );
+    // Seconds: the helper's own 5 s deadline plus shell and process startup.
     let mut desired =
-        serde_json::json!({"type":"command", "command":portable, "timeout":3, "async":false});
+        serde_json::json!({"type":"command", "command":portable, "timeout":10, "async":false});
     if cfg!(windows) {
         if agent == "claude" {
             desired["command"] = powershell.into();

@@ -4,7 +4,11 @@ use crate::control::{KanbanRequest, OpenReply};
 use std::io::Read;
 
 const INPUT_LIMIT: u64 = 64 * 1024;
-const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// The context request starts several git processes; under a build's load it
+/// measured 1.8-2 s against 0.4 s idle. Compaction itself takes far longer,
+/// so this margin costs nothing visible. The managed hook timeout must exceed
+/// it plus shell startup (see `agent_hooks::merge_recovery`).
+const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounds workers even when a client times out before the server finishes.
 pub(crate) struct RequestPermit<'a>(&'a std::sync::atomic::AtomicUsize);
