@@ -3107,4 +3107,118 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         assert!(discover_checkout(plain.path()).is_none());
     }
+
+    #[test]
+    fn a_submit_whose_response_was_lost_after_queueing_is_never_queued_twice() {
+        let (repo, _board, store, begin, result) = begun();
+        commit_outcome(repo.path());
+        let submit = mutation(&begin, "submit", &result, Action::Continue { submit: true });
+        let answered = store.mutate(&begin.id, &submit).unwrap();
+        let queue = crate::integrate::Queue::for_repo(
+            &crate::integrate::repo_identity(repo.path()).unwrap(),
+        );
+        let queued = queue.get(&begin.cards[0]).unwrap();
+        // Crash after the queue write, before the receipt: roll the record
+        // back to the durable state such a crash leaves behind.
+        let mut record = store.get(&begin.id).unwrap();
+        record.receipts.retain(|r| r.request != submit);
+        record.revision = result.revision;
+        record.outcome = Outcome::Work;
+        record.pending = Some(Pending {
+            request: submit.clone(),
+            starting_card: record.current.clone(),
+        });
+        store.save(&record).unwrap();
+        let replayed = store.mutate(&begin.id, &submit).unwrap();
+        assert_eq!(replayed, answered);
+        let retry = mutation(
+            &begin,
+            "submit-again",
+            &replayed,
+            Action::Continue { submit: true },
+        );
+        assert_eq!(
+            store.mutate(&begin.id, &retry).unwrap().outcome,
+            Outcome::Waiting
+        );
+        let after = queue.get(&begin.cards[0]).unwrap();
+        assert_eq!((after.seq, &after.commit), (queued.seq, &queued.commit));
+        assert_eq!(queue.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_target_that_moves_while_waiting_returns_the_card_without_advancing() {
+        let repo = repository();
+        let mut board = crate::kanban::CardStore::default();
+        board.set_dir(Some(repo.path()));
+        let first = board.add("First outcome", None).unwrap();
+        let second = board.add("Second outcome", None).unwrap();
+        let common = crate::integrate::repo_identity(repo.path()).unwrap();
+        let store = AssignmentStore::for_repo(&common);
+        let begin = Begin {
+            id: "sequence".into(),
+            request_id: "begin".into(),
+            owner: "owner".into(),
+            checkout: repo.path().into(),
+            target: "main".into(),
+            source_plan: None,
+            cards: vec![first.clone(), second.clone()],
+        };
+        let result = store.begin(&begin).unwrap();
+        let current = result.current.clone().unwrap();
+        commit_outcome(repo.path());
+        let submit = Action::Continue { submit: true };
+        let result = store
+            .mutate(&begin.id, &mutation(&begin, "submit", &result, submit))
+            .unwrap();
+        assert_eq!(result.outcome, Outcome::Waiting);
+        // Someone else lands on main while the card waits in the queue.
+        let git = |args: &[&str]| crate::kanban::git(repo.path(), args).unwrap();
+        let tree = git(&["rev-parse", "main^{tree}"]);
+        let moved = git(&["commit-tree", &tree, "-p", "main", "-m", "External change"]);
+        git(&["update-ref", "refs/heads/main", &moved]);
+        let queue = crate::integrate::Queue::for_repo(&common);
+        crate::integrate::run_turn(
+            &queue,
+            &crate::integrate::Owner::this_process(),
+            &crate::integrate::NoHooks,
+        )
+        .unwrap();
+        let observe = Action::Continue { submit: false };
+        let result = store
+            .mutate(&begin.id, &mutation(&begin, "observe", &result, observe))
+            .unwrap();
+        assert_eq!(result.outcome, Outcome::RecoveryRequired);
+        assert_eq!(result.current.as_deref(), Some(current.as_str()));
+        board.reload();
+        let other = if current == first { &second } else { &first };
+        assert_eq!(
+            board.get(other).unwrap().state,
+            crate::kanban::CardState::Backlog
+        );
+        assert_eq!(
+            git(&["rev-parse", "main"]),
+            moved,
+            "the target keeps the external change"
+        );
+        // The same agent repairs onto the moved target and resubmits.
+        git(&["rebase", "-q", "main"]);
+        let submit = Action::Continue { submit: true };
+        let result = store
+            .mutate(&begin.id, &mutation(&begin, "resubmit", &result, submit))
+            .unwrap();
+        assert_eq!(result.outcome, Outcome::Waiting);
+        crate::integrate::run_turn(
+            &queue,
+            &crate::integrate::Owner::this_process(),
+            &crate::integrate::NoHooks,
+        )
+        .unwrap();
+        let advance = Action::Continue { submit: false };
+        let result = store
+            .mutate(&begin.id, &mutation(&begin, "advance", &result, advance))
+            .unwrap();
+        assert_eq!(result.outcome, Outcome::Work);
+        assert_eq!(result.current.as_deref(), Some(other.as_str()));
+    }
 }

@@ -18243,7 +18243,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
             probe.display()
         );
         let compact_hook = repo.path().join("compact.ps1");
-        std::fs::write(&compact_hook, format!("$eventJson = [Console]::In.ReadToEnd()\n$eventJson | Set-Content compact-input.json\n$reply = $eventJson | & $env:FOREMAN_EXE assignment-context --agent {agent}\n$reply | Set-Content compact-output.json\nWrite-Output $reply\n")).unwrap();
+        std::fs::write(&compact_hook, format!("$clock = [Diagnostics.Stopwatch]::StartNew()\n$eventJson = [Console]::In.ReadToEnd()\n$eventJson | Set-Content compact-input.json\n\"read $($clock.ElapsedMilliseconds)\" | Add-Content compact-timing.txt\n$reply = $eventJson | & $env:FOREMAN_EXE assignment-context --agent {agent} 2>> compact-timing.txt\n\"helper $($clock.ElapsedMilliseconds)\" | Add-Content compact-timing.txt\n$reply | Set-Content compact-output.json\nWrite-Output $reply\n")).unwrap();
         let compact_command = format!(
             "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
             compact_hook.display()
@@ -18346,6 +18346,7 @@ $s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
                 "provider.jsonl",
                 "compact-input.json",
                 "compact-output.json",
+                "compact-timing.txt",
             ] {
                 if repo.path().join(file).exists() {
                     std::fs::copy(

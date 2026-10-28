@@ -115,32 +115,136 @@ pub(crate) fn client_main(args: &[String]) -> i32 {
     else {
         return 0;
     };
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = (|| {
-            let mut bytes = Vec::new();
-            std::io::stdin()
-                .take(INPUT_LIMIT + 1)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            if bytes.len() as u64 > INPUT_LIMIT {
-                return None;
-            }
-            let input = serde_json::from_slice(&bytes).ok()?;
-            let (pipe, request) = request_for(&provider, &input, |key| std::env::var(key).ok())?;
-            hook_output(crate::control::request(&pipe, &request).ok()?)
-        })();
-        let _ = tx.send(result);
-    });
-    if let Ok(Some(output)) = rx.recv_timeout(HELPER_TIMEOUT) {
+    let output = context_output(
+        provider,
+        std::io::stdin(),
+        |key| std::env::var(key).ok(),
+        |pipe, request| crate::control::request(pipe, request),
+        HELPER_TIMEOUT,
+    );
+    if let Some(output) = output {
         println!("{output}");
     }
     0
 }
 
+/// The helper's whole job behind its deadline: a stalled stdin or host
+/// yields nothing in time rather than holding up the provider.
+fn context_output(
+    provider: String,
+    input: impl Read + Send + 'static,
+    env: impl Fn(&str) -> Option<String> + Send + 'static,
+    request: impl Fn(&str, &KanbanRequest) -> std::io::Result<OpenReply> + Send + 'static,
+    deadline: std::time::Duration,
+) -> Option<serde_json::Value> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut bytes = Vec::new();
+            input.take(INPUT_LIMIT + 1).read_to_end(&mut bytes).ok()?;
+            if bytes.len() as u64 > INPUT_LIMIT {
+                return None;
+            }
+            let input = serde_json::from_slice(&bytes).ok()?;
+            let (pipe, kanban) = request_for(&provider, &input, env)?;
+            hook_output(request(&pipe, &kanban).ok()?)
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(deadline).ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn routed(key: &str) -> Option<String> {
+        match key {
+            "FOREMAN_PIPE" => Some("foreman-instance".into()),
+            "FOREMAN_PROJECT_ID" => Some("p1".into()),
+            "FOREMAN_TERMINAL_ID" => Some("t2".into()),
+            _ => None,
+        }
+    }
+
+    fn compact_event() -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(
+            br#"{"hook_event_name":"SessionStart","source":"compact","session_id":"root"}"#
+                .to_vec(),
+        )
+    }
+
+    /// Never returns data, like a provider that keeps stdin open.
+    struct Stalled;
+    impl Read for Stalled {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(0)
+        }
+    }
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    fn brief(_: &str, _: &KanbanRequest) -> std::io::Result<OpenReply> {
+        Ok(OpenReply {
+            ok: true,
+            history: Some(vec!["Recovered brief".into()]),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_stalled_stdin_or_host_yields_nothing_within_the_deadline() {
+        let started = std::time::Instant::now();
+        assert!(context_output("claude".into(), Stalled, routed, brief, DEADLINE).is_none());
+        let hung = |_: &str, _: &KanbanRequest| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            brief("", &KanbanRequest::default())
+        };
+        assert!(context_output("claude".into(), compact_event(), routed, hung, DEADLINE).is_none());
+        assert!(started.elapsed() < DEADLINE * 2 + std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn malformed_or_oversized_input_never_reaches_the_host() {
+        let refuse = |_: &str, _: &KanbanRequest| -> std::io::Result<OpenReply> {
+            panic!("no request for unusable input")
+        };
+        for input in [b"{not json".to_vec(), vec![b' '; INPUT_LIMIT as usize + 1]] {
+            let input = std::io::Cursor::new(input);
+            assert!(context_output("claude".into(), input, routed, refuse, DEADLINE).is_none());
+        }
+        let unavailable = |_: &str, _: &KanbanRequest| -> std::io::Result<OpenReply> {
+            Err(std::io::ErrorKind::NotFound.into())
+        };
+        let event = compact_event();
+        assert!(context_output("claude".into(), event, routed, unavailable, DEADLINE).is_none());
+    }
+
+    #[test]
+    fn duplicate_invocations_only_ever_ask_for_read_only_context() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            let log = seen.clone();
+            let record = move |pipe: &str, request: &KanbanRequest| {
+                let operation = request.assignment.as_ref().unwrap().operation.clone();
+                log.lock().unwrap().push((pipe.to_string(), operation));
+                brief(pipe, request)
+            };
+            let output =
+                context_output("claude".into(), compact_event(), routed, record, DEADLINE).unwrap();
+            assert_eq!(
+                output["hookSpecificOutput"]["additionalContext"],
+                "Recovered brief"
+            );
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter()
+                .all(|(pipe, op)| pipe == "foreman-instance" && op == "context")
+        );
+    }
 
     #[test]
     fn compaction_context_keeps_capacity_while_waits_fill_the_general_pool() {
