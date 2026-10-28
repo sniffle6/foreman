@@ -6,18 +6,36 @@ use std::io::Read;
 const INPUT_LIMIT: u64 = 64 * 1024;
 const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Bounds workers even when a client times out before the server finishes.
 pub(crate) struct RequestPermit<'a>(&'a std::sync::atomic::AtomicUsize);
 
+/// Separate capacity for compaction context: polling waits and other
+/// assignment requests must not starve the time-bounded recovery hook.
+#[derive(Default)]
+struct Pools {
+    general: std::sync::atomic::AtomicUsize,
+    context: std::sync::atomic::AtomicUsize,
+}
+
+static POOLS: Pools = Pools {
+    general: std::sync::atomic::AtomicUsize::new(0),
+    context: std::sync::atomic::AtomicUsize::new(0),
+};
+
 impl RequestPermit<'static> {
-    pub fn acquire() -> Result<Self, String> {
-        Self::acquire_from(&INFLIGHT)
+    pub fn acquire(operation: &str) -> Result<Self, String> {
+        Self::acquire_in(&POOLS, operation)
     }
 }
 
 impl<'a> RequestPermit<'a> {
+    fn acquire_in(pools: &'a Pools, operation: &str) -> Result<Self, String> {
+        if operation == "context" {
+            return Self::acquire_from(&pools.context);
+        }
+        Self::acquire_from(&pools.general)
+    }
+
     fn acquire_from(counter: &'a std::sync::atomic::AtomicUsize) -> Result<Self, String> {
         use std::sync::atomic::Ordering;
         counter
@@ -123,6 +141,18 @@ pub(crate) fn client_main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_context_keeps_capacity_while_waits_fill_the_general_pool() {
+        let pools = Pools::default();
+        let held: Vec<_> = (0..4)
+            .map(|_| RequestPermit::acquire_in(&pools, "status").unwrap())
+            .collect();
+        assert!(RequestPermit::acquire_in(&pools, "status").is_err());
+        assert!(RequestPermit::acquire_in(&pools, "context").is_ok());
+        drop(held);
+        assert!(RequestPermit::acquire_in(&pools, "status").is_ok());
+    }
 
     #[test]
     fn request_capacity_is_released_even_when_a_worker_fails() {

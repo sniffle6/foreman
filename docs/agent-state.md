@@ -136,7 +136,8 @@ JSON when the instance control pipe returns a matching owner's recovery brief.
 It ignores subagent events, unrelated sessions, and malformed input.
 
 The helper caps stdin and exits quietly after a short deadline. Server requests
-have bounded concurrency and short read-only Git probes. A repeated invocation
+have bounded concurrency and short read-only Git probes. Context requests have
+their own capacity, so polling waits cannot starve them. A repeated invocation
 only reads scope, current brief, observed Git/queue state, and the continuation
 note. Disagreements are shown explicitly; the hook never claims a card, transfers
 ownership, submits integration, or modifies Git. Continue/Resume remain the

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// CLI/control command. Provider identity is verified by the adapter, never trusted from environment alone.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)] // a CLI and host from different builds share the pipe
 pub(crate) struct Command {
     pub operation: String,
     pub id: String,
@@ -77,7 +78,7 @@ impl Command {
         let owner_key = serde_json::to_string(owner).map_err(|e| e.to_string())?;
         if self.operation == "begin" {
             let cards = if let Some(plan) = &self.plan {
-                if store.path(&self.id)?.exists() {
+                if store.exists(&self.id)? {
                     let existing = store.get(&self.id)?;
                     let intent = existing.begin.ok_or("incomplete begin intent")?;
                     if intent.source_plan.as_ref() != Some(plan) {
@@ -337,6 +338,15 @@ impl Assignment {
         matches!(self.outcome, Outcome::Complete | Outcome::Released)
     }
 
+    fn keep_receipt(&mut self, request: &Mutation, result: &Snapshot) {
+        self.receipts.push(Receipt {
+            request: request.clone(),
+            result: result.clone(),
+        });
+        let excess = self.receipts.len().saturating_sub(RECEIPT_LIMIT);
+        self.receipts.drain(..excess);
+    }
+
     /// An unfinished transition keeps the checkout reserved even after the end.
     fn reserves_checkout(&self) -> bool {
         !self.finished() || self.pending.is_some()
@@ -394,6 +404,41 @@ impl Assignment {
     }
 }
 
+/// Git's discovery of an ordinary checkout from files alone, as (canonical
+/// common directory, checkout root). Legacy card guards run on the GUI thread
+/// and must not spawn git. `GIT_DIR` and bare layouts are not modeled; those
+/// and non-repositories return None, which the guards treat as unreserved.
+fn discover_checkout(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let start = dir.canonicalize().ok()?;
+    let root = start.ancestors().find(|p| p.join(".git").exists())?;
+    let dotgit = root.join(".git");
+    let gitdir = if dotgit.is_dir() {
+        dotgit
+    } else {
+        let text = std::fs::read_to_string(&dotgit).ok()?;
+        root.join(text.trim().strip_prefix("gitdir:")?.trim())
+    };
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(text) => gitdir.join(text.trim()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => gitdir,
+        Err(_) => return None,
+    };
+    let unverbatim = |p: PathBuf| {
+        let s = p.to_string_lossy();
+        s.strip_prefix(r"\\?\")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| p.clone())
+    };
+    Some((
+        unverbatim(common.canonicalize().ok()?),
+        unverbatim(root.to_path_buf()),
+    ))
+}
+
+/// Replays only need recent receipts: an older request ID carries a stale
+/// revision and is refused rather than applied again.
+const RECEIPT_LIMIT: usize = 16;
+
 /// Prefix of the error a contended assignment lock returns; callers may retry it.
 pub(crate) const BUSY: &str = "assignments busy; retry";
 
@@ -438,12 +483,12 @@ impl DispatchGuard {
 
 /// Hold through a cooperating legacy operation. A reservation never expires with a process lock.
 pub(crate) fn guard_checkout(checkout: &Path) -> Result<Option<File>, String> {
-    let Ok(common) = crate::integrate::repo_identity(checkout) else {
+    let Some((common, root)) = discover_checkout(checkout) else {
         return Ok(None);
     };
     let store = AssignmentStore::for_repo(&common);
     let lock = store.lock()?;
-    let root = crate::kanban::git(checkout, &["rev-parse", "--show-toplevel"])?;
+    let root = root.to_string_lossy();
     for record in store.records()? {
         if record.reserves_checkout()
             && crate::kanban::same_path(&root, &record.checkout.to_string_lossy())
@@ -485,10 +530,14 @@ pub(crate) fn archive_integration(request: &crate::integrate::Request) -> Result
 
 /// Guard legacy card release/closeout independently of the project's checkout.
 pub(crate) fn guard_card(root: &Path, id: &str) -> Result<Option<File>, String> {
-    let Ok(common) = crate::integrate::repo_identity(root) else {
+    let Some((common, _)) = discover_checkout(root) else {
         return Ok(None);
     };
     let store = AssignmentStore::for_repo(&common);
+    // No assignment has ever begun here: nothing to guard, nothing to create.
+    if !store.dir.exists() {
+        return Ok(None);
+    }
     let lock = store.lock()?;
     for record in store.records()? {
         if record.reserves_checkout() && record.approved.iter().any(|b| b.id == id) {
@@ -668,6 +717,17 @@ impl AssignmentStore {
         Ok(self.dir.join(format!("{id}.json")))
     }
 
+    /// Where a finished record moves, out of the set every guard parses.
+    fn finished_path(&self, id: &str) -> Result<PathBuf, String> {
+        self.path(id)?;
+        Ok(self.dir.join("finished").join(format!("{id}.json")))
+    }
+
+    /// An ID names one assignment forever, active or finished.
+    fn exists(&self, id: &str) -> Result<bool, String> {
+        Ok(self.path(id)?.exists() || self.finished_path(id)?.exists())
+    }
+
     fn lock(&self) -> Result<File, String> {
         self.lock_named("operation.lock")
     }
@@ -687,7 +747,13 @@ impl AssignmentStore {
 
     /// Read a complete durable record. Corruption fails closed, never frees a checkout.
     pub fn get(&self, id: &str) -> Result<Assignment, String> {
-        let data = std::fs::read(self.path(id)?).map_err(|e| e.to_string())?;
+        let data = match std::fs::read(self.path(id)?) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read(self.finished_path(id)?)
+            }
+            data => data,
+        }
+        .map_err(|e| e.to_string())?;
         let record: Assignment = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
         if record.v != 1 || record.id != id {
             return Err("unsupported or mismatched assignment record".into());
@@ -712,7 +778,18 @@ impl AssignmentStore {
 
     fn save(&self, record: &Assignment) -> Result<(), String> {
         let _metadata = self.lock_named("meta.lock")?;
-        let path = self.path(&record.id)?;
+        let active = self.path(&record.id)?;
+        // A finished record leaves the active set: guards stop parsing it,
+        // and damage to it can no longer block the repository. It is written
+        // before the active copy goes, and `get` prefers the active copy.
+        let archive = !record.reserves_checkout();
+        let path = if archive {
+            let path = self.finished_path(&record.id)?;
+            std::fs::create_dir_all(self.dir.join("finished")).map_err(|e| e.to_string())?;
+            path
+        } else {
+            active.clone()
+        };
         let tmp = path.with_extension("tmp");
         let mut file = File::create(&tmp).map_err(|e| e.to_string())?;
         file.write_all(&serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?)
@@ -720,6 +797,13 @@ impl AssignmentStore {
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
         std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
+        if archive {
+            match std::fs::remove_file(&active) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
         #[cfg(test)]
         if INTERRUPT_AFTER_SAVE.with(|remaining| match remaining.get() {
             Some(1) => {
@@ -746,7 +830,9 @@ impl AssignmentStore {
     }
 
     fn reservation(&self, id: &str, checkout: &Path, owner: &str) -> Result<Assignment, String> {
-        self.path(id)?;
+        if self.exists(id)? {
+            return Err(format!("assignment id {id} is already used"));
+        }
         if owner.trim().is_empty() {
             return Err("owner is required".into());
         }
@@ -798,7 +884,7 @@ impl AssignmentStore {
         let _lock = self.lock()?;
         let mut board = CardStore::default();
         board.set_dir(Some(&request.checkout));
-        if !self.path(&request.id)?.exists() {
+        if !self.exists(&request.id)? {
             let branch = git(&request.checkout, &["branch", "--show-current"])?;
             if branch != request.target {
                 return Err("checkout is not on the requested integration target".into());
@@ -1163,7 +1249,7 @@ impl AssignmentStore {
                         "an interrupted request must be reconciled before a new mutation".into(),
                     );
                 }
-                record.interrupted.push(pending);
+                // Dropped, not kept: only interrupted Resumes are ever consulted.
             }
             record.pending = Some(Pending {
                 request: request.clone(),
@@ -1194,10 +1280,7 @@ impl AssignmentStore {
             .checked_add(1)
             .ok_or("assignment revision exhausted")?;
         let result = record.snapshot();
-        record.receipts.push(Receipt {
-            request: request.clone(),
-            result: result.clone(),
-        });
+        record.keep_receipt(request, &result);
         record.pending = None;
         self.save(&record)?;
         Ok(result)
@@ -1251,7 +1334,13 @@ impl AssignmentStore {
             .as_ref()
             .is_some_and(|p| p.request == *request)
         {
-            if let Some(pending) = record.pending.take() {
+            // Claim repair recognizes predecessors only through interrupted
+            // Resumes; any other interrupted request needs no record.
+            if let Some(pending) = record
+                .pending
+                .take()
+                .filter(|p| matches!(p.request.action, Action::Resume { .. }))
+            {
                 record.interrupted.push(pending);
             }
             record.pending = Some(Pending {
@@ -1343,10 +1432,7 @@ impl AssignmentStore {
             .checked_add(1)
             .ok_or("assignment revision exhausted")?;
         let result = record.snapshot();
-        record.receipts.push(Receipt {
-            request: request.clone(),
-            result: result.clone(),
-        });
+        record.keep_receipt(request, &result);
         record.pending = None;
         self.save(&record)?;
         Ok(result)
@@ -2911,5 +2997,114 @@ mod tests {
         // Another request is not wedged by the refused release.
         let pause = mutation(&begin, "pause", &result, Action::Pause);
         assert!(store.mutate(&begin.id, &pause).is_ok());
+    }
+
+    #[test]
+    fn commands_from_another_version_tolerate_missing_fields() {
+        let command: Command =
+            serde_json::from_str(r#"{"operation":"status","id":"run"}"#).unwrap();
+        assert_eq!(command.operation, "status");
+        assert!(command.cards.is_empty() && command.generation.is_none());
+    }
+
+    #[test]
+    fn receipts_keep_recent_replays_and_old_request_ids_cannot_reapply() {
+        let repo = tempfile::tempdir().unwrap();
+        let store = AssignmentStore::for_repo(repo.path());
+        let reserved = store.reserve("notes", repo.path(), "owner").unwrap();
+        let (mut revision, mut last) = (reserved.revision, None);
+        for i in 0..40 {
+            let request = Mutation {
+                request_id: format!("note-{i}"),
+                owner: "owner".into(),
+                generation: reserved.generation,
+                revision,
+                action: Action::Checkpoint {
+                    note: format!("note {i}"),
+                },
+            };
+            let result = store.mutate("notes", &request).unwrap();
+            revision = result.revision;
+            last = Some((request, result));
+        }
+        let record = store.get("notes").unwrap();
+        assert!(record.receipts.len() <= 16, "{}", record.receipts.len());
+        let (request, result) = last.unwrap();
+        assert_eq!(store.mutate("notes", &request).unwrap(), result);
+        let first = Mutation {
+            request_id: "note-0".into(),
+            owner: "owner".into(),
+            generation: reserved.generation,
+            revision: reserved.revision,
+            action: Action::Checkpoint {
+                note: "note 0".into(),
+            },
+        };
+        assert!(store.mutate("notes", &first).is_err());
+        assert_eq!(store.get("notes").unwrap().note, "note 39");
+    }
+
+    #[test]
+    fn finished_assignments_leave_the_active_set_but_keep_their_replay_and_id() {
+        let (repo, mut board, store, begin, result) = begun();
+        board.reload();
+        board.block(&begin.cards[0], "Unclear acceptance").unwrap();
+        let observe = Action::Continue { submit: false };
+        let result = store
+            .mutate(&begin.id, &mutation(&begin, "observe", &result, observe))
+            .unwrap();
+        let release = mutation(&begin, "release", &result, Action::Release);
+        let released = store.mutate(&begin.id, &release).unwrap();
+        let common = crate::integrate::repo_identity(repo.path()).unwrap();
+        let assignments = common.join("foreman/assignments");
+        assert!(!assignments.join("sequence.json").exists());
+        assert_eq!(store.mutate(&begin.id, &release).unwrap(), released);
+        // A damaged finished record cannot block unrelated work.
+        std::fs::write(assignments.join("finished/sequence.json"), "{").unwrap();
+        assert!(guard_checkout(repo.path()).is_ok());
+        assert!(guard_card(repo.path(), "other").is_ok());
+        let card = board.add("Another outcome", None).unwrap();
+        crate::kanban::git(repo.path(), &["switch", "main"]).unwrap();
+        let reused = Begin {
+            request_id: "begin-again".into(),
+            cards: vec![card],
+            ..begin.clone()
+        };
+        assert!(
+            store.begin(&reused).is_err(),
+            "an assignment id is never reused"
+        );
+    }
+
+    #[test]
+    fn legacy_card_guards_touch_nothing_in_a_repository_without_assignments() {
+        let repo = repository();
+        assert!(guard_card(repo.path(), "card").unwrap().is_none());
+        let common = crate::integrate::repo_identity(repo.path()).unwrap();
+        assert!(!common.join("foreman").exists());
+    }
+
+    #[test]
+    fn file_discovery_matches_git_for_roots_subdirectories_and_linked_worktrees() {
+        let repo = repository();
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        let tree = linked.path().join("tree");
+        crate::kanban::git(
+            repo.path(),
+            &["worktree", "add", "-q", "--detach", &tree.to_string_lossy()],
+        )
+        .unwrap();
+        for dir in [repo.path().to_path_buf(), repo.path().join("sub"), tree] {
+            let (common, root) = discover_checkout(&dir).expect("discovered");
+            assert_eq!(common, crate::integrate::repo_identity(&dir).unwrap());
+            let git_root = crate::kanban::git(&dir, &["rev-parse", "--show-toplevel"]).unwrap();
+            assert!(
+                crate::kanban::same_path(&root.to_string_lossy(), &git_root),
+                "{root:?} vs {git_root}"
+            );
+        }
+        let plain = tempfile::tempdir().unwrap();
+        assert!(discover_checkout(plain.path()).is_none());
     }
 }

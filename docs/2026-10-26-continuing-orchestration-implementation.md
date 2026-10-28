@@ -78,7 +78,9 @@ the execution authority when hooks are unavailable.
 
 Records live in `<git-common-dir>/foreman/assignments/`, shared across project
 windows and Foreman instances. OS file locks coordinate operations; reservations
-persist after process exit and never expire by timer. Persisted intent bridges
+persist after process exit and never expire by timer. Records keep the 16
+latest retry receipts. Finished records move to `finished/`, out of the set
+guards parse, and still answer replays. Persisted intent bridges
 Git and card-file writes. No automatic stash, reset, clean, or unrelated staging
 is introduced. Manual Git remains possible and is checked at transitions.
 

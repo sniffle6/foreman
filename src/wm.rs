@@ -1906,7 +1906,8 @@ impl WindowManager {
                             .ok_or("project has no working directory")?;
                         let command = req.assignment.clone().ok_or("missing assignment command")?;
                         command.validate()?;
-                        let permit = crate::assignment_hook::RequestPermit::acquire()?;
+                        let permit =
+                            crate::assignment_hook::RequestPermit::acquire(&command.operation)?;
                         Ok::<_, String>((
                             root,
                             cwd,

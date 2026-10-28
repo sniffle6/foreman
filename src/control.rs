@@ -2232,24 +2232,13 @@ fn kanban_main(args: &[String]) -> i32 {
             request: req,
             timeout,
         } => {
-            let started = std::time::Instant::now();
-            loop {
-                let response = request(&client_pipe(), &req);
-                let pending = response
-                    .as_ref()
-                    .ok()
-                    .filter(|r| r.ok)
-                    .and_then(|r| r.history.as_ref()?.first())
-                    .and_then(|s| serde_json::from_str::<crate::assignments::Snapshot>(s).ok())
-                    .is_some_and(|s| {
-                        s.outcome != crate::assignments::Outcome::RecoveryRequired
-                            && matches!(s.integration.as_deref(), Some("queued" | "integrating"))
-                    });
-                if !pending || started.elapsed() >= std::time::Duration::from_secs(timeout) {
-                    return report("foreman kanban assignment wait", response);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+            let response = assignment_wait_with(
+                &req,
+                timeout,
+                |req| request(&client_pipe(), req),
+                std::thread::sleep,
+            );
+            report("foreman kanban assignment wait", response)
         }
         KanbanAction::Wait {
             project,
@@ -2290,6 +2279,55 @@ fn kanban_wait(
         |req| request(&client_pipe(), req),
         std::thread::sleep,
     )
+}
+
+/// Host replies that mean "ask again", never a verdict on the assignment.
+fn assignment_reply_is_transient(error: &str) -> bool {
+    matches!(
+        error,
+        "foreman did not respond" | "foreman: control server busy"
+    ) || error.starts_with("assignment service busy")
+        || error.starts_with(crate::assignments::BUSY)
+}
+
+/// Poll read-only assignment status while its integration is in flight or
+/// the host is momentarily busy, returning the last response once neither
+/// holds, or at the deadline. Each poll validates the caller's process tree,
+/// so the interval backs off from half a second to five.
+fn assignment_wait_with(
+    req: &KanbanRequest,
+    timeout: u64,
+    mut poll: impl FnMut(&KanbanRequest) -> std::io::Result<OpenReply>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<OpenReply> {
+    const FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+    const LONGEST: std::time::Duration = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(timeout);
+    let (mut delay, mut slept) = (FIRST, std::time::Duration::ZERO);
+    loop {
+        let response = poll(req);
+        let pending = match &response {
+            Ok(r) if !r.ok => assignment_reply_is_transient(r.error.as_deref().unwrap_or("")),
+            Ok(r) => r
+                .history
+                .as_ref()
+                .and_then(|h| h.first())
+                .and_then(|s| serde_json::from_str::<crate::assignments::Snapshot>(s).ok())
+                .is_some_and(|s| {
+                    s.outcome != crate::assignments::Outcome::RecoveryRequired
+                        && matches!(s.integration.as_deref(), Some("queued" | "integrating"))
+                }),
+            Err(_) => false,
+        };
+        // Sleeps count even when time is simulated; real polls only add to it.
+        if !pending || started.elapsed().max(slept) >= deadline {
+            return response;
+        }
+        sleep(delay);
+        slept += delay;
+        delay = (delay * 2).min(LONGEST);
+    }
 }
 
 fn kanban_wait_with(
@@ -2489,6 +2527,88 @@ mod tests {
             );
             assert_eq!(code, 2, "{error}");
         }
+    }
+
+    fn assignment_reply(integration: Option<&str>) -> OpenReply {
+        let snapshot = crate::assignments::Snapshot {
+            id: "run".into(),
+            generation: 1,
+            revision: 3,
+            note: String::new(),
+            outcome: crate::assignments::Outcome::Waiting,
+            current: Some("a1".into()),
+            branch: Some("card/a1".into()),
+            brief: None,
+            scope: Vec::new(),
+            next: String::new(),
+            integration: integration.map(str::to_string),
+        };
+        OpenReply {
+            ok: true,
+            history: Some(vec![serde_json::to_string(&snapshot).unwrap()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn assignment_wait_retries_busy_replies_until_integration_settles() {
+        let replies = [
+            OpenReply::err("assignment service busy; retry the same request id"),
+            OpenReply::err("foreman: control server busy"),
+            OpenReply::err("foreman did not respond"),
+            assignment_reply(Some("queued")),
+            assignment_reply(None),
+        ];
+        let mut polls = 0;
+        let last = assignment_wait_with(
+            &KanbanRequest::default(),
+            1800,
+            |_| {
+                polls += 1;
+                Ok(replies[polls - 1].clone())
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(polls, replies.len());
+        assert_eq!(last, replies[4]);
+        // A real refusal still ends the wait at once.
+        let refused = assignment_wait_with(
+            &KanbanRequest::default(),
+            1800,
+            |_| {
+                Ok(OpenReply::err(
+                    "assignment belongs to another project board",
+                ))
+            },
+            |_| panic!("a refusal is final"),
+        )
+        .unwrap();
+        assert!(!refused.ok);
+    }
+
+    #[test]
+    fn assignment_wait_backs_off_and_honors_its_deadline() {
+        let mut polls = 0;
+        let mut sleeps = Vec::new();
+        let last = assignment_wait_with(
+            &KanbanRequest::default(),
+            60,
+            |_| {
+                polls += 1;
+                assert!(polls < 200, "the wait must not spin");
+                Ok(assignment_reply(Some("integrating")))
+            },
+            |delay| sleeps.push(delay),
+        )
+        .unwrap();
+        assert_eq!(last, assignment_reply(Some("integrating")));
+        let ms = |d: &std::time::Duration| d.as_millis();
+        assert_eq!(ms(&sleeps[0]), 500);
+        assert!(ms(&sleeps[3]) > ms(&sleeps[0]), "{sleeps:?}");
+        assert!(sleeps.iter().all(|d| ms(d) <= 5000), "{sleeps:?}");
+        let waited: u128 = sleeps.iter().map(ms).sum();
+        assert!((60_000..65_000).contains(&waited), "{waited}");
     }
 
     #[test]

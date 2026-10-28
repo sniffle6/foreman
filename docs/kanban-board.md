@@ -588,7 +588,9 @@ if a submitted request was cancelled, it returns `recovery_required`.
 `status` is read-only and
 provides revision, generation, observed branch, and queue phase. `wait` polls
 status on the client, bounded to at most 1800 seconds; timeout remains waiting.
-It never submits work or claims the next card.
+Each poll validates the caller's process tree, so the interval backs off from
+0.5 to 5 seconds. A busy or unresponsive host is polled again rather than
+ending the wait. It never submits work or claims the next card.
 
 Results distinguish `work`, `waiting`, `blocked`, `scope_changed`, `paused`,
 `complete`, `released`, and `recovery_required`. Read the result's guidance; process success
@@ -598,8 +600,16 @@ whole mutable plan is complete. Blocked cards are not automatically reclaimed.
 `src/assignments.rs` owns versioned records under the Git common directory's
 `foreman/assignments/`. Records preserve preparation intent, ownership, retry
 receipts, approved scope, continuation note, and per-card integration evidence.
+Only the 16 latest receipts are kept; an older request ID has a stale revision
+and is refused, never applied again. A complete or released record moves to
+`foreman/assignments/finished/`. There it still answers replays and keeps its
+ID from reuse, but guards no longer parse it, so damage to it cannot block the
+repository. Damage to an active record still fails closed.
 OS file locks serialize cooperating operations; persistent reservations survive
-process death. Legacy dispatch, claim, release, teardown, and integration honor
+process death. Legacy card guards find the repository from its files instead of
+running git, because board actions call them on the GUI thread. A repository
+where no assignment ever began is not touched. `GIT_DIR` and bare layouts are
+not modeled and count as unreserved. Legacy dispatch, claim, release, teardown, and integration honor
 the reservations across windows/instances. Independent worktree mode remains
 available for other cards. Manual Git operations are outside this guardrail and
 are revalidated at transitions.
