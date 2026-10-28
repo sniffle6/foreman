@@ -1,6 +1,6 @@
 ---
 name: foreman-dispatch
-description: Use when running inside foreman (the FOREMAN env var is 1) and you launch or manage visible terminals — dispatch/spawn a worker, open a pane with a prompt or command, check on a worker, read or drive another pane, hand a pane to the human, close one. Kanban cards and plans dispatch through foreman-kanban (`kanban dispatch`) instead.
+description: Use when running inside foreman (the FOREMAN env var is 1) and you launch or manage visible terminals — dispatch/spawn a worker, open a pane with a prompt or command, check on a worker, read or drive another pane, hand a pane to the human, close one. Kanban cards and plans use foreman-kanban for continuing assignments or authorized delegation.
 ---
 
 # Launch and manage visible terminals in foreman
@@ -12,8 +12,10 @@ subject matter is separate and fine.
 Precondition: `$env:FOREMAN` is `1`; if not, tell the user this needs to run
 inside foreman.
 
-**Kanban card or plan work goes through foreman-kanban: `kanban dispatch <id>
---agent …`.** `open` is a bare terminal: no card claim, no worktree, no
+**Kanban cards and plans use foreman-kanban.** Continue related approved cards
+in the current Session with assignments. Delegate independent card work only
+when authorized and useful, using `kanban dispatch <id> --agent …`.
+`open` is a bare terminal: no card claim, no worktree, no
 `Card:` trailer, no integration queue, and the board never learns the worker
 exists. `kanban dispatch` is exactly what the board's "Start with" button does.
 

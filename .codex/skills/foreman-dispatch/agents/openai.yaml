@@ -1,4 +1,4 @@
 interface:
   display_name: "Foreman Dispatch"
   short_description: "Launch and manage visible Foreman panes"
-  default_prompt: "Use $foreman-dispatch to launch a visible worker, or to check on, read, drive, hand over, or close a pane in this Foreman project."
+  default_prompt: "Use $foreman-dispatch to launch a visible worker, or to check on, read, drive, hand over, or close a pane in this Foreman project. For kanban cards and plans, use $foreman-kanban for continuing assignments or authorized delegation."

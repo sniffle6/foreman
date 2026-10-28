@@ -76,8 +76,10 @@ Delivery timing:
 
 ## Coordinating a chat-capable team
 
-For kanban cards or plans, use `foreman-kanban` and `kanban dispatch`.
-Card workers receive only targeted posts; broadcasts never reach them.
+For kanban cards or plans, follow `foreman-kanban`: execute related approved
+cards in the current Session with assignments. Use `kanban dispatch` only
+for authorized, useful delegation of independent card work.
+Dispatched card workers receive only targeted posts; broadcasts never reach them.
 Their card prompt does not require chat replies, so expect no acknowledgement.
 
 For free-form workers, use `foreman-dispatch` for launch commands, provider
