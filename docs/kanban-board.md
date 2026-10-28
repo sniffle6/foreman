@@ -552,4 +552,61 @@ already gone (removed by hand) passes.
   default bindings (`K` and `L`).
 - `src/skills_install.rs` — embeds the foreman-kanban skill (Claude + Codex
   twins) and its reference files, `worktrees-and-integration.md` and
-  `orchestrating-plans.md` (the dispatch, review, board-fix, close loop).
+  `orchestrating-plans.md` (continued execution, recovery, and optional delegation).
+
+## Continuing assignments
+
+`kanban assignment` executes approved related cards in one existing Session and
+checkout. It does not launch a worker or create a worktree per card. The paired
+`foreman-kanban/orchestrating-plans.md` instructions describe the execution loop
+and require commit/integration authorization before dependent work begins.
+
+Begin accepts an assignment ID, request ID, explicit integration target, and
+cards or a plan name. It captures approved briefs and membership, reserves the
+canonical Git checkout, creates `card/<id>` with `--no-track`, verifies tracking,
+and records the claim before returning `work`. Eligibility uses the current
+plan wave; ties use creation time then card ID. New plan cards do not expand
+scope. Changed approved briefs return `scope_changed` before claim.
+
+Continue reconciles integration before claiming a successor. `--submit` is an
+explicit request to enqueue the current committed result; Foreman never creates
+commits itself. Checkpoint replaces a bounded continuation note. Pause prevents
+the next claim and keeps the reservation. Resume reconciles observed state and
+increments the owner generation; replacement Sessions require `--recover`.
+Release ends the assignment and frees the checkout without changing Git or the
+board. Use it to leave `blocked`, `scope_changed`, or an abandoned plan. It is
+refused while branch preparation is unfinished or the current card has a queue
+request; cancel or reconcile that first.
+
+Mutations require the last generation/revision and a stable request ID. An
+identical retry returns the recorded result, even after integration progressed.
+A reused ID with a different payload or a stale owner generation is refused.
+Use a new request ID for the next reconciliation. A failed request does not
+block the next one, unless it claimed a successor or was an interrupted
+Resume: those must be replayed. Continue without `--submit` never queues work;
+if a submitted request was cancelled, it returns `recovery_required`.
+`status` is read-only and
+provides revision, generation, observed branch, and queue phase. `wait` polls
+status on the client, bounded to at most 1800 seconds; timeout remains waiting.
+It never submits work or claims the next card.
+
+Results distinguish `work`, `waiting`, `blocked`, `scope_changed`, `paused`,
+`complete`, `released`, and `recovery_required`. Read the result's guidance; process success
+alone does not mean a card landed. Assignment completion does not imply the
+whole mutable plan is complete. Blocked cards are not automatically reclaimed.
+
+`src/assignments.rs` owns versioned records under the Git common directory's
+`foreman/assignments/`. Records preserve preparation intent, ownership, retry
+receipts, approved scope, continuation note, and per-card integration evidence.
+OS file locks serialize cooperating operations; persistent reservations survive
+process death. Legacy dispatch, claim, release, teardown, and integration honor
+the reservations across windows/instances. Independent worktree mode remains
+available for other cards. Manual Git operations are outside this guardrail and
+are revalidated at transitions.
+
+Ownership requires the actual native root provider process, its creation time,
+Foreman instance/project/terminal, and matching provider session environment.
+Nested native providers, ambiguous daemon routes, missing session identity, and
+stale owners fail closed. Automatic compaction context is a separate read-only
+path; see `docs/agent-state.md`. Neither hook availability nor idle state grants
+execution authority.

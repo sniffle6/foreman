@@ -1,6 +1,6 @@
 ---
 name: foreman-kanban
-description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, dispatching a worker onto a card, orchestrating or running a plan (dispatching its cards wave by wave), creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
+description: Use when running inside Foreman (the FOREMAN env var is 1) and Codex needs to coordinate work through the project's kanban board — picking up a card, dispatching a worker onto a card, orchestrating or running a plan (continuing through approved cards in one Session), creating cards, editing title/body, ordering cards into plans and waves, closing out with done/block, or waiting on workers.
 ---
 
 # The Foreman Project Kanban Board
@@ -18,8 +18,8 @@ escalated/approved execution from the start.
 
 Two reference files sit beside this one. Read each only when you need it:
 
-- `orchestrating-plans.md` — you run or orchestrate a plan: dispatching its
-  cards wave by wave, reviewing finished workers, closing their terminals.
+- `orchestrating-plans.md` — you run or orchestrate a plan: continuing in
+  this Session, recovering ownership, and optionally delegating independent work.
 - `worktrees-and-integration.md` — your prompt has a `# Workspace` section,
   `wait` exited 3, the queue is held, or you are inspecting worktrees,
   strays, or a Cut. Orchestrating a plan does not need it.
@@ -137,11 +137,9 @@ already say (orchestrating-plans.md, "Steering a running worker").
 
 ## Orchestrating a plan
 
-"Run / orchestrate the plan" means every worker is a card started with
-`kanban dispatch`. Never `open`, never `git worktree add` by hand — those
-skip the claim, the `Card:` trailer, the integration queue, and the board.
-
-**Read `orchestrating-plans.md` before dispatching the first card.** It
-carries the whole loop: dispatch a wave, wait, review each finished
-worker's report, fix the board from what it says, close its terminal, then
-dispatch more.
+Read `orchestrating-plans.md` before beginning. Execute related cards in this
+Session with `kanban assignment begin|continue|checkpoint|pause|resume`.
+Use `status` and bounded `wait` for read-only inspection. Preserve the checkout
+and conversation across card boundaries. Delegate only when authorized and
+useful; delegated card workers still use `kanban dispatch` and separate checkouts.
+Resolve commit and integration permission before dependent execution begins.

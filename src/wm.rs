@@ -1884,6 +1884,105 @@ impl WindowManager {
                     self.ctrl_card_dispatch(&req, reply, sent, ctx);
                     return;
                 }
+                if req.action == "assignment" {
+                    let context = (|| {
+                        let from = req
+                            .from
+                            .as_deref()
+                            .ok_or("assignment requires a terminal")?;
+                        let project = req
+                            .project
+                            .as_deref()
+                            .ok_or("assignment requires a project")?;
+                        let (pid, tid) = self.resolve_terminal(Some(project), from)?;
+                        let child = self.project_child(pid)?;
+                        let root = child
+                            .terminal_session(tid)
+                            .and_then(|s| s.root_pid())
+                            .ok_or("terminal has no root process")?;
+                        let cwd = child
+                            .cwd
+                            .clone()
+                            .ok_or("project has no working directory")?;
+                        let command = req.assignment.clone().ok_or("missing assignment command")?;
+                        command.validate()?;
+                        let permit = crate::assignment_hook::RequestPermit::acquire()?;
+                        Ok::<_, String>((
+                            root,
+                            cwd,
+                            command,
+                            project.to_string(),
+                            from.to_string(),
+                            permit,
+                        ))
+                    })();
+                    match context {
+                        Err(error) => {
+                            let _ = reply.send(OpenReply::err(error));
+                        }
+                        Ok((root, cwd, command, project, terminal, permit)) => {
+                            let ctx = ctx.clone();
+                            std::thread::spawn(move || {
+                                let _permit = permit;
+                                let result: Result<OpenReply, String> = (|| {
+                                    let process = crate::proc::assignment_provider(
+                                        root,
+                                        command.caller_pid,
+                                        &command.provider,
+                                        &command.session,
+                                    )?;
+                                    if sent.elapsed() >= REPLY_TIMEOUT {
+                                        return Err("assignment request expired before execution; retry the same request id".into());
+                                    }
+                                    let owner = crate::assignments::OwnerIdentity {
+                                        instance: crate::kanban::run_nonce().into(),
+                                        project,
+                                        terminal,
+                                        provider: command.provider.clone(),
+                                        session: command.session.clone(),
+                                        process,
+                                    };
+                                    if command.operation == "context" {
+                                        let common = crate::integrate::recovery_probe(
+                                            &cwd,
+                                            &[
+                                                "rev-parse",
+                                                "--path-format=absolute",
+                                                "--git-common-dir",
+                                            ],
+                                        )?;
+                                        let owner_key = serde_json::to_string(&owner)
+                                            .map_err(|e| e.to_string())?;
+                                        let context =
+                                            crate::assignments::AssignmentStore::for_repo(
+                                                std::path::Path::new(&common),
+                                            )
+                                            .recovery_brief(&owner_key)?;
+                                        return Ok(OpenReply {
+                                            ok: true,
+                                            history: Some(context.into_iter().collect()),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    let snapshot = command.execute(&cwd, &owner)?;
+                                    Ok(OpenReply {
+                                        ok: true,
+                                        id: Some(snapshot.id.clone()),
+                                        history: Some(vec![
+                                            serde_json::to_string(&snapshot)
+                                                .map_err(|e| e.to_string())?,
+                                        ]),
+                                        ..Default::default()
+                                    })
+                                })(
+                                );
+                                let _ = reply.send(result.unwrap_or_else(OpenReply::err));
+                                ctx.request_repaint();
+                            });
+                        }
+                    }
+                    return;
+                }
                 // Repaint only on a successful WRITE — an open board reacts
                 // to the app's own change; a `list` read changes nothing.
                 let is_write = req.action != "list";
@@ -3628,6 +3727,11 @@ impl WindowManager {
             Some(Err(e)) => return Err(format!("card {id}: bring-up failed: {e}")),
             None => card.worktree = None, // the prompt renders today's text
         }
+        let cwd = self
+            .cwd
+            .as_deref()
+            .ok_or("project has no working directory")?;
+        let reservation = crate::assignments::DispatchGuard::acquire(cwd, &id, record.as_ref())?;
         let prompt = crate::kanban::dispatch_prompt(&card, crate::kanban::closeout_style());
         // A branch-mode record's path is the checkout root; a project cwd
         // below the root stays where it was.
@@ -3671,13 +3775,14 @@ impl WindowManager {
         // `borrow_mut()` call directly would extend the `RefMut` temporary's
         // lifetime over the whole `if` body, which then can't borrow `self`
         // mutably for the undo path below.
-        let claimed = self.kanban.borrow_mut().claim_for_dispatch(
+        let claimed = self.kanban.borrow_mut().claim_dispatched(
             &id,
             &term_tag(tid),
             agent,
             crate::kanban::run_nonce(),
             existing_term,
             record,
+            &reservation,
         );
         if let Err(e) = claimed {
             // Open-undo: the card was closed out (or re-claimed) mid-frame —
@@ -17995,6 +18100,322 @@ mod tests {
             action: action.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn assignment_control_rejects_a_caller_without_a_root_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(tmp.path().into());
+        let pid = m.resolve_project(None).unwrap();
+        let tid = m
+            .project_child_mut(pid)
+            .unwrap()
+            .add_terminal_cmd(&pause_argv(), None, None, &ctx)
+            .unwrap();
+        let mut request = kanban_req("assignment");
+        request.project = Some(format!("p{pid}"));
+        request.from = Some(term_tag(tid));
+        request.assignment = Some(crate::assignments::Command {
+            operation: "begin".into(),
+            id: "test".into(),
+            request_id: "begin".into(),
+            provider: "codex".into(),
+            session: "session".into(),
+            caller_pid: std::process::id(),
+            cards: vec!["card".into()],
+            target: "main".into(),
+            ..Default::default()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.handle_ctrl(
+            crate::control::CtrlMsg::Kanban(request, tx, std::time::Instant::now()),
+            &ctx,
+        );
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("root provider"));
+        assert!(!tmp.path().join(".foreman/tasks").exists());
+    }
+
+    /// Explicit acceptance probe: runs installed Claude startup hooks, without
+    /// model work or changing the user's hook configuration/trust decisions.
+    #[test]
+    #[ignore = "requires installed native Claude; run explicitly for provider acceptance"]
+    fn live_claude_assignment_control_roundtrip() {
+        live_provider_probe("claude", false);
+    }
+
+    #[test]
+    #[ignore = "requires authenticated Claude and model requests; run explicitly"]
+    fn live_claude_compaction_context_delivery() {
+        live_provider_probe("claude", true);
+    }
+
+    #[test]
+    #[ignore = "requires explicit one-run hook-trust approval and authenticated Codex"]
+    fn live_codex_compaction_context_delivery() {
+        assert_eq!(
+            std::env::var("FOREMAN_ACCEPTANCE_TRUST_HOOKS").as_deref(),
+            Ok("1"),
+            "obtain explicit approval before enabling this isolated probe"
+        );
+        live_provider_probe("codex", true);
+    }
+
+    fn live_provider_probe(agent: &str, compact: bool) {
+        let repo = kanban_git_repo().expect("git required");
+        let ctx = egui::Context::default();
+        let mut desktop = kanban_desktop(repo.path().into());
+        let project = desktop.resolve_project(None).unwrap();
+        let child = desktop.project_child_mut(project).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let first = child
+            .kanban
+            .borrow_mut()
+            .add("First accepted outcome", None)
+            .unwrap();
+        let second = child
+            .kanban
+            .borrow_mut()
+            .add("Second accepted outcome", None)
+            .unwrap();
+        let client = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("foreman.exe");
+        assert!(client.is_file(), "build the CLI before this probe");
+        let probe = repo.path().join("probe.ps1");
+        let result = repo.path().join("accepted.json");
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+function Call-Assignment([string[]]$Operation) {
+  $reply = & $env:FOREMAN_EXE kanban assignment @Operation --provider claude --id live-probe
+  if ($LASTEXITCODE -ne 0) { throw "Assignment command failed: $reply" }
+  return ($reply | ConvertFrom-Json)
+}
+$s = Call-Assignment @('begin','--request-id','begin','--cards','CARDS','--target','main')
+if ($env:FOREMAN_PROBE_COMPACT -eq '1') {
+  $null = Call-Assignment @('checkpoint','--request-id','note','--generation',"$($s.generation)",'--revision',"$($s.revision)",'--note','Recovery marker: FOREMAN-RECOVERED-ORCHID')
+  return
+}
+& claude --init-only --settings nested-hooks.json
+if (-not (Test-Path nested-rejected.txt)) { throw 'Nested provider was not rejected' }
+$briefInput = @{hook_event_name='SessionStart';source='compact';session_id=$env:CLAUDE_CODE_SESSION_ID} | ConvertTo-Json -Compress
+$brief = $briefInput | & $env:FOREMAN_EXE assignment-context --agent claude
+if (-not $brief.Contains('live-probe')) { throw 'Native provider recovery helper returned no context' }
+for ($i=0; $i -lt 12 -and $s.outcome -ne 'complete'; $i++) {
+  if ($s.outcome -eq 'work') {
+    $file = "accepted-$($s.current).txt"
+    Set-Content -LiteralPath $file -Value 'fixture outcome'
+    git add -- $file
+    git -c user.name=Acceptance -c user.email=acceptance@example.invalid commit -m "Accept fixture outcome" -m "Card: $($s.current)"
+    if ($LASTEXITCODE -ne 0) { throw 'fixture commit failed' }
+    $s = Call-Assignment @('continue','--request-id',"submit-$i",'--generation',"$($s.generation)",'--revision',"$($s.revision)",'--submit')
+  }
+  $null = Call-Assignment @('wait','--timeout','10')
+  $s = Call-Assignment @('continue','--request-id',"advance-$i",'--generation',"$($s.generation)",'--revision',"$($s.revision)")
+}
+if ($s.outcome -ne 'complete') { throw "Unexpected outcome $($s.outcome)" }
+$s | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath accepted.json
+"#;
+        std::fs::write(
+            &probe,
+            script
+                .replace("CARDS", &format!("{first},{second}"))
+                .replace("--provider claude", &format!("--provider {agent}")),
+        )
+        .unwrap();
+        let settings = repo.path().join("hooks.json");
+        let nested = repo.path().join("nested.ps1");
+        std::fs::write(&nested, "$ErrorActionPreference = 'Continue'\n& $env:FOREMAN_EXE kanban assignment status --id live-probe --provider claude 2> nested-error.txt\nif ($LASTEXITCODE -ne 0) { Set-Content nested-rejected.txt rejected }\n").unwrap();
+        let nested_command = format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
+            nested.display()
+        );
+        std::fs::write(repo.path().join("nested-hooks.json"), serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":nested_command,"timeout":15}]}]}})).unwrap()).unwrap();
+        let hook = format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
+            probe.display()
+        );
+        let compact_hook = repo.path().join("compact.ps1");
+        std::fs::write(&compact_hook, format!("$eventJson = [Console]::In.ReadToEnd()\n$eventJson | Set-Content compact-input.json\n$reply = $eventJson | & $env:FOREMAN_EXE assignment-context --agent {agent}\n$reply | Set-Content compact-output.json\nWrite-Output $reply\n")).unwrap();
+        let compact_command = format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -File \"{}\"",
+            compact_hook.display()
+        );
+        std::fs::write(&settings, serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":hook,"timeout":120}]},{"matcher":"compact","hooks":[{"type":"command","command":compact_command,"timeout":3}]}]}})).unwrap()).unwrap();
+        let launch = repo.path().join("launch.ps1");
+        let invocation = if agent == "codex" {
+            let isolated_home = repo.path().join("provider-home");
+            std::fs::create_dir(&isolated_home).unwrap();
+            let actual_home = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".codex")
+                });
+            // The temporary provider home excludes every user hook/trust record.
+            // Copy only the login cache, never print it; TempDir removes it.
+            std::fs::copy(
+                actual_home.join("auth.json"),
+                isolated_home.join("auth.json"),
+            )
+            .expect("file-backed Codex authentication required for this opt-in probe");
+            std::fs::copy(&settings, isolated_home.join("hooks.json")).unwrap();
+            std::fs::write(
+                repo.path().join("fixture.txt"),
+                "Acceptance fixture line; read-only diagnostic context.\n".repeat(2500),
+            )
+            .unwrap();
+            format!(
+                "$env:CODEX_HOME = '{}'\n$env:FOREMAN_PROBE_COMPACT = '1'\n& codex exec --json --skip-git-repo-check --dangerously-bypass-hook-trust -c model_auto_compact_token_limit=8000 'Run one shell command that reads fixture.txt. Do not edit files or delegate. Then report the recovery marker from restored context after compaction, or MISSING if none exists.' > provider.jsonl\nSet-Content accepted.json finished\n",
+                isolated_home.display()
+            )
+        } else if compact {
+            let messages = [
+                "Do not use tools. Reply exactly READY.",
+                "/compact",
+                "Do not use tools. Report the recovery marker from restored context. If none exists say MISSING.",
+            ];
+            let messages = messages
+                .iter()
+                .map(|text| {
+                    serde_json::json!({"type":"user","message":{"role":"user","content":text}})
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(repo.path().join("messages.jsonl"), messages).unwrap();
+            format!(
+                "$env:FOREMAN_PROBE_COMPACT = '1'\nGet-Content messages.jsonl | & claude -p --input-format stream-json --output-format stream-json --verbose --settings '{}' > provider.jsonl\nSet-Content accepted.json finished\n",
+                settings.display()
+            )
+        } else {
+            format!("& claude --init-only --settings '{}'\n", settings.display())
+        };
+        std::fs::write(&launch, format!("$env:FOREMAN_EXE = '{}'\nRemove-Item Env:FOREMAN_TITLE_PIPE -ErrorAction SilentlyContinue\n{}", client.display().to_string().replace('\'', "''"), invocation)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pipe = crate::control::instance_pipe().to_string();
+        let server_ctx = ctx.clone();
+        std::thread::spawn(move || crate::control::serve(&pipe, tx, server_ctx));
+        let terminal = child
+            .add_terminal_cmd(
+                &[
+                    "powershell.exe".into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-File".into(),
+                    launch.to_string_lossy().into(),
+                ],
+                Some(repo.path()),
+                None,
+                &ctx,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        while !result.exists() && std::time::Instant::now() < deadline {
+            for message in rx.try_iter() {
+                desktop.handle_ctrl(message, &ctx);
+            }
+            desktop.keepalive();
+            desktop.kanban_tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = desktop
+            .project_child_mut(project)
+            .unwrap()
+            .terminal_session_mut(terminal)
+            .unwrap()
+            .snapshot_text(None)
+            .join("\n");
+        std::fs::write(
+            format!("target/continuing-live-{agent}-screen.txt"),
+            &output,
+        )
+        .unwrap();
+        assert!(
+            result.exists(),
+            "native provider probe did not finish: {output}"
+        );
+        if compact {
+            for file in [
+                "provider.jsonl",
+                "compact-input.json",
+                "compact-output.json",
+            ] {
+                if repo.path().join(file).exists() {
+                    std::fs::copy(
+                        repo.path().join(file),
+                        format!("target/continuing-live-{agent}-{file}"),
+                    )
+                    .unwrap();
+                }
+            }
+            let event = std::fs::read_to_string(repo.path().join("compact-input.json"))
+                .expect("provider must invoke an actual compact hook");
+            assert!(event.contains("compact"));
+            let provider = std::fs::read(repo.path().join("provider.jsonl")).unwrap();
+            let provider = if provider.starts_with(&[0xff, 0xfe]) {
+                String::from_utf16_lossy(
+                    &provider[2..]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                String::from_utf8_lossy(&provider).into_owned()
+            };
+            let assistant = provider
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|v| {
+                    v["type"] == "assistant"
+                        || (v["type"] == "item.completed" && v["item"]["type"] == "agent_message")
+                })
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                assistant.contains("FOREMAN-RECOVERED-ORCHID"),
+                "model did not receive recovery context: {assistant}"
+            );
+            return;
+        }
+        std::fs::copy(result, "target/continuing-live-claude-result.json").unwrap();
+        let worktrees =
+            crate::kanban::git(repo.path(), &["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(worktrees.matches("worktree ").count(), 1);
+        assert_eq!(desktop.project_child(project).unwrap().windows.len(), 1);
+    }
+
+    #[test]
+    fn assignment_reservation_is_checked_before_resolving_or_spawning_a_dispatch() {
+        let Some(repo) = kanban_git_repo() else {
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut m = kanban_desktop(repo.path().into());
+        let pid = m.resolve_project(None).unwrap();
+        let child = m.project_child_mut(pid).unwrap();
+        child.kanban.borrow_mut().set_dir(Some(repo.path()));
+        let id = child
+            .kanban
+            .borrow_mut()
+            .add("Competing writer", None)
+            .unwrap();
+        let card = child.kanban.borrow().get(&id).unwrap().clone();
+        let store = crate::assignments::AssignmentStore::for_repo(
+            &crate::integrate::repo_identity(repo.path()).unwrap(),
+        );
+        store.reserve("reserved", repo.path(), "owner").unwrap();
+        let error = child
+            .dispatch_spawn(card, "invalid-agent", None, None, &ctx)
+            .unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
+        assert!(child.windows.is_empty());
     }
 
     /// Pump `m` (via `keepalive`, so every nested project's Sessions advance)

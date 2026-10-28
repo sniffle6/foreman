@@ -316,3 +316,34 @@ the worktree is clean.
 - `.claude/skills/foreman-kanban/SKILL.md`, `.codex/skills/foreman-kanban/
   SKILL.md` — the worker-facing instructions (embedded; rebuild to
   propagate).
+
+## Continuing assignments and dirty validation
+
+Assignments submit through the existing queue. A turn may touch a reserved
+checkout only for that assignment's current card and recorded submitted commit.
+It checks the assignment operation guard when it starts and again across the
+final preflight and ref move, but never holds the guard through checks. Other
+assignment, dispatch, and queue operations stay available during a long check.
+Brief contention is retried; contention that persists requeues the turn. Legacy queued work must be reconciled
+before Begin reserves its destination. Completed queue entries are archived into
+the assignment before removal, so a lost reply cannot erase acceptance evidence.
+
+Branch mode preserves unrelated tracked and untracked files. If configured
+checks would observe dirty inputs, `run_branch_check` validates the submitted
+commit in Foreman's private shared clone at the Git common directory's
+`foreman/validation/checkout`. This does not register another working checkout or alter
+user files. Turns are serialized per repository, so one clone serves every
+check. It is forced to the submitted commit and cleaned before each run; it
+holds no user work. Cargo uses `foreman/validation/target`, never the working
+checkout's target. Git rewrites only changed files, so later checks rebuild
+incrementally. The clone stays as it was after a check, for diagnosis, until
+the next check. Policies must not hard-code external source or
+cache paths that defeat isolation; such policies need a repository-specific gate.
+
+Clean branch-mode checks reuse the checkout and build artifacts. Both clean and
+isolated checks refuse acceptance when the check changes tracked inputs or HEAD.
+Generated untracked output is allowed. A failed check or moved base returns the
+current card to the owning agent for repair; it does not demand human intervention
+for an obvious conflict. The agent preserves unrelated work, resolves clear
+conflicts, reruns affected checks, and explicitly resubmits. Ambiguous or destructive
+choices still require the user's decision.

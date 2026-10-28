@@ -345,6 +345,8 @@ pub struct KanbanRequest {
     /// no worktree). Skipped when false (wire compat v1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub branch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<crate::assignments::Command>,
 }
 
 /// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
@@ -1040,6 +1042,10 @@ pub fn parse_view_args(
 #[derive(Debug)]
 pub enum KanbanAction {
     Request(KanbanRequest),
+    AssignmentWait {
+        request: KanbanRequest,
+        timeout: u64,
+    },
     Wait {
         project: Option<String>,
         target: crate::kanban::WaitTarget,
@@ -1058,6 +1064,7 @@ pub fn parse_kanban_args(
     let action = args.first().ok_or("missing kanban action")?.clone();
     let rest = &args[1..];
     match action.as_str() {
+        "assignment" => parse_assignment(rest, default_project, self_terminal),
         "add" => parse_kanban_add(rest, default_project),
         "list" => parse_kanban_list(rest, default_project),
         "start" => parse_kanban_start(rest, default_project, self_terminal),
@@ -1073,6 +1080,95 @@ pub fn parse_kanban_args(
         "dispatch" => parse_kanban_dispatch(rest, default_project),
         other => Err(format!("unknown kanban action: {other}")),
     }
+}
+
+fn parse_assignment(
+    args: &[String],
+    project: Option<String>,
+    from: Option<String>,
+) -> Result<KanbanAction, String> {
+    let operation = args
+        .first()
+        .ok_or("assignment requires begin, continue, resume, checkpoint, pause, or release")?
+        .clone();
+    if !matches!(
+        operation.as_str(),
+        "begin" | "continue" | "resume" | "checkpoint" | "pause" | "release" | "status" | "wait"
+    ) {
+        return Err("unknown assignment operation".into());
+    }
+    let waiting = operation == "wait";
+    let mut command = crate::assignments::Command {
+        operation,
+        caller_pid: std::process::id(),
+        ..Default::default()
+    };
+    if waiting {
+        command.operation = "status".into();
+    }
+    let mut timeout = 30u64;
+    let mut project = project;
+    let mut i = 1;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if flag == "--submit" {
+            command.submit = true;
+            i += 1;
+            continue;
+        }
+        if flag == "--recover" {
+            command.recover = true;
+            i += 1;
+            continue;
+        }
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag {
+            "--id" => command.id = value.clone(),
+            "--request-id" => command.request_id = value.clone(),
+            "--provider" => command.provider = value.clone(),
+            "--session" => command.session = value.clone(),
+            "--generation" => {
+                command.generation = Some(value.parse().map_err(|_| "invalid generation")?)
+            }
+            "--revision" => command.revision = Some(value.parse().map_err(|_| "invalid revision")?),
+            "--cards" => command.cards = value.split(',').map(str::to_string).collect(),
+            "--plan" => command.plan = Some(value.clone()),
+            "--target" => command.target = value.clone(),
+            "--note" => command.note = value.clone(),
+            "--project" => project = Some(value.clone()),
+            "--timeout" if waiting => timeout = value.parse().map_err(|_| "invalid timeout")?,
+            other => return Err(format!("unknown assignment option: {other}")),
+        }
+        i += 2;
+    }
+    if command.session.is_empty() && command.provider == "codex" {
+        command.session = std::env::var("CODEX_THREAD_ID").unwrap_or_default();
+    }
+    if command.session.is_empty() && command.provider == "claude" {
+        command.session = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
+    }
+    command.validate()?;
+    if project.is_none() || from.is_none() {
+        return Err("assignments require an explicit Foreman project and terminal identity".into());
+    }
+    if timeout > 1800 {
+        return Err("assignment wait timeout must be at most 1800 seconds".into());
+    }
+    let request = KanbanRequest {
+        cmd: "kanban".into(),
+        action: "assignment".into(),
+        project,
+        from,
+        assignment: Some(command),
+        ..Default::default()
+    };
+    Ok(if waiting {
+        KanbanAction::AssignmentWait { request, timeout }
+    } else {
+        KanbanAction::Request(request)
+    })
 }
 
 /// `dispatch <id> --agent NAME [--model ID] [--worktree|--branch|--no-worktree] [--project P]` —
@@ -1794,6 +1890,15 @@ foreman kanban wait <id> [--timeout SECS] [--project P]
 foreman kanban wait --any [<id>...] [--timeout SECS] [--project P]
 foreman kanban worktrees [--stray] [--json] [--project P]
 foreman kanban integrate <id> [--cancel] [--json] [--project P]
+foreman kanban assignment begin --id A --request-id R --provider codex|claude --target BRANCH (--cards ID,ID | --plan NAME)
+foreman kanban assignment continue|checkpoint|pause|resume --id A --request-id R --provider codex|claude --generation N --revision N [--submit] [--note TEXT] [--recover]
+foreman kanban assignment status|wait --id A --provider codex|claude [--timeout SECS]
+
+Assignments also accept --session ID and --project P. Session defaults to the
+provider's tool environment. --submit is Continue-only; --recover is Resume-only.
+Wait is read-only, defaults to 30 seconds, and is capped at 1800 seconds.
+Retry lost mutation replies with the identical request ID and payload.
+Commit/integration permission must be established before dependent execution.
 
 Manage cards on project P's board (default: FOREMAN_PROJECT_ID, else the
 focused project).
@@ -2123,6 +2228,29 @@ fn kanban_main(args: &[String]) -> i32 {
             });
             report("foreman kanban", res)
         }
+        KanbanAction::AssignmentWait {
+            request: req,
+            timeout,
+        } => {
+            let started = std::time::Instant::now();
+            loop {
+                let response = request(&client_pipe(), &req);
+                let pending = response
+                    .as_ref()
+                    .ok()
+                    .filter(|r| r.ok)
+                    .and_then(|r| r.history.as_ref()?.first())
+                    .and_then(|s| serde_json::from_str::<crate::assignments::Snapshot>(s).ok())
+                    .is_some_and(|s| {
+                        s.outcome != crate::assignments::Outcome::RecoveryRequired
+                            && matches!(s.integration.as_deref(), Some("queued" | "integrating"))
+                    });
+                if !pending || started.elapsed() >= std::time::Duration::from_secs(timeout) {
+                    return report("foreman kanban assignment wait", response);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
         KanbanAction::Wait {
             project,
             target,
@@ -2451,6 +2579,106 @@ mod tests {
         let v1: KanbanRequest =
             serde_json::from_str(r#"{"cmd":"kanban","action":"list"}"#).unwrap();
         assert_eq!(v1, req);
+    }
+
+    #[test]
+    fn assignment_cli_release_requires_the_owner_generation_and_revision() {
+        let parse = |extra: &[&str]| {
+            let args: Vec<String> = [
+                "assignment",
+                "release",
+                "--id",
+                "run-1",
+                "--request-id",
+                "release-1",
+                "--provider",
+                "claude",
+                "--session",
+                "session-1",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|s| s.to_string())
+            .collect();
+            parse_kanban_args(&args, Some("p1".into()), Some("t1".into()))
+        };
+        assert!(parse(&[]).is_err());
+        let Ok(KanbanAction::Request(request)) = parse(&["--generation", "2", "--revision", "7"])
+        else {
+            panic!("expected request")
+        };
+        let release = request.assignment.unwrap();
+        assert_eq!(release.operation, "release");
+        assert_eq!((release.generation, release.revision), (Some(2), Some(7)));
+    }
+
+    #[test]
+    fn assignment_cli_requires_retry_identity_and_preserves_legacy_wire() {
+        let args: Vec<String> = [
+            "assignment",
+            "begin",
+            "--id",
+            "run-1",
+            "--request-id",
+            "begin-1",
+            "--provider",
+            "codex",
+            "--session",
+            "session-1",
+            "--cards",
+            "a,b",
+            "--target",
+            "main",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let KanbanAction::Request(request) =
+            parse_kanban_args(&args, Some("p1".into()), Some("t1".into())).unwrap()
+        else {
+            panic!("expected request")
+        };
+        let assignment = request.assignment.as_ref().unwrap();
+        assert_eq!(assignment.operation, "begin");
+        assert_eq!(assignment.cards, vec!["a", "b"]);
+        assert_eq!(assignment.request_id, "begin-1");
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<KanbanRequest>(&wire).unwrap(),
+            request
+        );
+        let legacy: KanbanRequest =
+            serde_json::from_str(r#"{"cmd":"kanban","action":"list"}"#).unwrap();
+        assert!(legacy.assignment.is_none());
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"cmd":"kanban","action":"list"}"#
+        );
+        assert!(
+            parse_kanban_args(
+                &["assignment".into(), "continue".into()],
+                Some("p1".into()),
+                Some("t1".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn assignment_wait_is_bounded_and_does_not_require_mutation_identity() {
+        let args = s(&[
+            "assignment",
+            "wait",
+            "--id",
+            "run-1",
+            "--provider",
+            "codex",
+            "--session",
+            "session",
+            "--timeout",
+            "30",
+        ]);
+        assert!(parse_kanban_args(&args, Some("p1".into()), Some("t1".into())).is_ok());
     }
 
     #[test]
@@ -2915,6 +3143,62 @@ mod tests {
         let reply = reply.expect("no reply");
         assert!(reply.ok);
         assert_eq!(reply.id.as_deref(), Some("a3f8k2"));
+    }
+
+    #[test]
+    fn assignment_pipe_roundtrip_preserves_retry_and_owner_fields() {
+        let pipe = format!("foreman-test-assignment-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = pipe.clone();
+        std::thread::spawn(move || serve(&server, tx, eframe::egui::Context::default()));
+        let command = crate::assignments::Command {
+            operation: "continue".into(),
+            id: "sequence".into(),
+            request_id: "retry-1".into(),
+            provider: "codex".into(),
+            session: "session".into(),
+            caller_pid: std::process::id(),
+            generation: Some(2),
+            revision: Some(8),
+            ..Default::default()
+        };
+        let expected = command.clone();
+        let handler = std::thread::spawn(move || {
+            let CtrlMsg::Kanban(req, reply, _) =
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()
+            else {
+                panic!("assignment request")
+            };
+            assert_eq!(req.assignment, Some(expected));
+            reply
+                .send(OpenReply {
+                    ok: true,
+                    history: Some(vec!["{\"outcome\":\"waiting\"}".into()]),
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+        let req = KanbanRequest {
+            cmd: "kanban".into(),
+            action: "assignment".into(),
+            assignment: Some(command),
+            project: Some("p1".into()),
+            from: Some("t1".into()),
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reply = loop {
+            match request(&pipe, &req) {
+                Ok(reply) => break reply,
+                Err(error) => {
+                    assert!(std::time::Instant::now() < deadline, "{error}");
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        assert!(reply.ok);
+        assert_eq!(reply.history.unwrap(), vec!["{\"outcome\":\"waiting\"}"]);
+        handler.join().unwrap();
     }
 
     #[test]

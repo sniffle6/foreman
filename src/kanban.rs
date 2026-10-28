@@ -1372,6 +1372,12 @@ impl CardStore {
         current_run: &str,
         term: TermState,
     ) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        let _reservation = crate::assignments::guard_checkout(root)?;
         self.claim_common(id, terminal, None, current_run, term, None)
     }
 
@@ -1386,13 +1392,95 @@ impl CardStore {
         term: TermState,
         worktree: Option<Worktree>,
     ) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        let reservation = crate::assignments::DispatchGuard::acquire(root, id, worktree.as_ref())?;
+        self.claim_dispatched(
+            id,
+            terminal,
+            agent,
+            current_run,
+            term,
+            worktree,
+            &reservation,
+        )
+    }
+
+    pub(crate) fn claim_dispatched(
+        &mut self,
+        id: &str,
+        terminal: &str,
+        agent: &str,
+        current_run: &str,
+        term: TermState,
+        worktree: Option<Worktree>,
+        reservation: &crate::assignments::DispatchGuard,
+    ) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        reservation.check(root, id)?;
         self.claim_common(id, terminal, Some(agent), current_run, term, worktree)
+    }
+
+    /// Assignment lifecycle already holds the repository operation lock and has
+    /// prepared the branch. Only that lifecycle may bypass legacy reservations.
+    pub(crate) fn claim_assignment(
+        &mut self,
+        id: &str,
+        terminal: &str,
+        run: &str,
+        worktree: Worktree,
+    ) -> Result<(), String> {
+        self.claim_common(
+            id,
+            terminal,
+            Some("assignment"),
+            run,
+            TermState::Missing,
+            Some(worktree),
+        )
+    }
+
+    /// Repair the claimant after a durable assignment owner-generation change.
+    pub(crate) fn reassign_assignment(
+        &mut self,
+        id: &str,
+        terminal: &str,
+        run: &str,
+    ) -> Result<(), String> {
+        let dir = self.dir_or_err()?.to_path_buf();
+        let mut card = self.read_one(id)?;
+        if card.state != CardState::InProgress {
+            return Err("assignment card is not in progress".into());
+        }
+        card.claim = Some(Claim {
+            terminal: terminal.into(),
+            run: run.into(),
+            agent: Some("assignment".into()),
+            at: now_stamp(),
+        });
+        card.updated = now_stamp();
+        self.write_card(&dir, &card)?;
+        self.replace_in_memory(card);
+        Ok(())
     }
 
     /// InProgress -> Done only; clears the claim. Missing card = error, never
     /// created (close-out never resurrects a card). No claimant check — same
     /// trust model as chat (guardrail, not a security boundary).
     pub fn done(&mut self, id: &str) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        let _reservation = crate::assignments::guard_card(root, id)?;
         let dir = self.dir_or_err()?.to_path_buf();
         let mut card = self.read_one(id)?;
         if card.state != CardState::InProgress {
@@ -1457,6 +1545,12 @@ impl CardStore {
     /// recovery action; deliberately NOT a wire verb (the spec's verb table
     /// is closed).
     pub fn release(&mut self, id: &str) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        let _reservation = crate::assignments::guard_card(root, id)?;
         let dir = self.dir_or_err()?.to_path_buf();
         let mut card = self.read_one(id)?;
         if !matches!(card.state, CardState::InProgress | CardState::Blocked) {
@@ -1476,6 +1570,12 @@ impl CardStore {
 
     /// Delete the card's file, from any state; error if it doesn't exist.
     pub fn rm(&mut self, id: &str) -> Result<(), String> {
+        let root = self
+            .dir_or_err()?
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or("missing board root")?;
+        let _reservation = crate::assignments::guard_card(root, id)?;
         let dir = self.dir_or_err()?.to_path_buf();
         let path = dir.join(format!("{id}.json"));
         std::fs::remove_file(&path).map_err(|_| format!("no such card: {id}"))?;
@@ -2185,6 +2285,7 @@ pub(crate) fn same_path(a: &str, b: &str) -> bool {
 /// `git worktree list`, not by the card's field, so a claim that failed
 /// after a successful bring-up cannot strand a tree.
 pub fn bring_up_worktree(project_cwd: &std::path::Path, card: &Card) -> Result<BringUp, String> {
+    let _reservation = crate::assignments::guard_card(project_cwd, &card.id)?;
     // 1. repo root (not a repo → in place, silently)
     let Ok(root) = git(project_cwd, &["rev-parse", "--show-toplevel"]) else {
         return Ok(BringUp::InPlace);
@@ -2271,6 +2372,7 @@ fn refuse_card_branch(current: &str, id: &str) -> Result<(), String> {
 /// worktree bring-up). A git operation in progress, or the checkout on
 /// another card's branch, is `Err`.
 pub fn bring_up_branch(project_cwd: &std::path::Path, card: &Card) -> Result<BringUp, String> {
+    let _reservation = crate::assignments::guard_checkout(project_cwd)?;
     let Ok(root) = git(project_cwd, &["rev-parse", "--show-toplevel"]) else {
         return Ok(BringUp::InPlace);
     };
@@ -2508,6 +2610,10 @@ pub fn teardown_worktree(
     force: bool,
 ) -> TeardownOutcome {
     if wt.in_place {
+        let _reservation = match crate::assignments::guard_checkout(project_cwd) {
+            Ok(guard) => guard,
+            Err(reason) => return TeardownOutcome::Held(reason),
+        };
         return teardown_branch(project_cwd, wt, force);
     }
     // Count only; a failed probe reads as 0 here because the outcome below

@@ -10,6 +10,8 @@ mod agent_hooks;
 mod agent_state;
 mod ai_oneshot;
 mod appearance;
+mod assignment_hook;
+mod assignments;
 mod board;
 mod caret;
 mod chat;
@@ -1532,6 +1534,9 @@ fn main() -> eframe::Result {
     }
     // Subcommand = thin pipe client (`foreman open ...`), no GUI.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "assignment-context") {
+        std::process::exit(assignment_hook::client_main(&args[2..]));
+    }
     if args.get(1).is_some_and(|arg| arg == "title-event") {
         std::process::exit(title_notify::client_main(&args[2..]));
     }
@@ -1629,8 +1634,7 @@ fn main() -> eframe::Result {
             let (title_request_tx, title_result_rx) =
                 terminal_titles::spawn_worker(title_epoch.clone(), cc.egui_ctx.clone());
             let wants = agent_hooks::HookWants::from_settings(&startup_settings);
-            let hook_install = (wants != agent_hooks::HookWants::default())
-                .then(|| agent_hooks::spawn_install(cc.egui_ctx.clone(), wants));
+            let hook_install = Some(agent_hooks::spawn_install(cc.egui_ctx.clone(), wants));
             let (upd_event_tx, upd_event_rx) = std::sync::mpsc::channel();
             let (upd_effect_tx, upd_effect_rx) = std::sync::mpsc::channel();
             // Release builds only; FOREMAN_NO_UPDATE=1 is the escape hatch

@@ -794,6 +794,12 @@ impl Queue {
     /// tail, never the head. An integrating request for another commit is
     /// refused: cancel it first.
     pub fn submit(&self, sub: Submission) -> Result<Submitted, String> {
+        let _reservation = crate::assignments::guard_card(Path::new(&sub.worktree), &sub.card)?;
+        self.submit_assignment(sub)
+    }
+
+    /// The assignment lifecycle already holds the checkout operation lock.
+    pub(crate) fn submit_assignment(&self, sub: Submission) -> Result<Submitted, String> {
         let _m = self.meta()?;
         if let Some(existing) = self.get(&sub.card) {
             let same = existing.commit == sub.commit;
@@ -886,6 +892,9 @@ impl Queue {
     /// Drop a request whose bookkeeping is complete (or that a cancel
     /// removed). Missing is fine — another instance may have done it.
     pub fn remove(&self, card: &str) -> Result<(), String> {
+        if let Some(request) = self.get(card) {
+            crate::assignments::archive_integration(&request)?;
+        }
         let _m = self.meta()?;
         self.remove_file(card)
     }
@@ -1329,6 +1338,23 @@ fn run_git_long(cwd: &Path, args: &[&str]) -> Result<ChildOutcome, String> {
     run_git_long_on_path(cwd, args, &crate::agent_command::session_path())
 }
 
+/// Short read-only probes used by compaction recovery. Never wait on Git indefinitely.
+pub(crate) fn recovery_probe(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let path = crate::agent_command::session_path();
+    let program = crate::agent_command::git_program(&path).ok_or("cannot find git")?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("PATH", path)
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let out = run_child(cmd, Duration::from_millis(750), &|| false)?;
+    if !out.ok || out.timed_out {
+        return Err("recovery Git probe failed or timed out".into());
+    }
+    Ok(out.stdout.trim().into())
+}
+
 /// `path` is the PATH `git` is resolved on and handed to the child. The GUI
 /// process PATH can miss a user-scoped Git the same way it misses cargo
 /// (`agent_command::session_path`).
@@ -1404,6 +1430,134 @@ fn run_check(
     )
 }
 
+/// Dirty branch-mode inputs belong to the human. Validate the committed tree in
+/// a separate local clone; never stash, reset, or clean the shared checkout.
+fn run_branch_check(
+    tree: &Path,
+    policy: Option<&CheckPolicy>,
+    prepared: &str,
+    target: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CheckRecord, CheckError> {
+    let dirty = crate::kanban::git(
+        tree,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--",
+            ".",
+            ":(exclude).foreman",
+        ],
+    )
+    .map_err(CheckError::Failed)?;
+    if policy.is_none() {
+        return run_check(tree, policy, prepared, target, cancelled);
+    }
+    // The untracked board directory is excluded above, but tracked policy or
+    // source inputs under .foreman must still participate in isolation.
+    let tracked_clean = crate::kanban::git(tree, &["diff", "--quiet", "HEAD", "--"]).is_ok();
+    if dirty.is_empty() && tracked_clean {
+        let result = run_check(tree, policy, prepared, target, cancelled)?;
+        verify_check_inputs(tree, prepared)?;
+        return Ok(result);
+    }
+    if cancelled() {
+        return Err(CheckError::Cancelled);
+    }
+    let common = repo_identity(tree).map_err(CheckError::Failed)?;
+    let parent = common.join("foreman/validation");
+    let isolated = parent.join("checkout");
+    validation_checkout(tree, &common, &isolated, prepared).map_err(CheckError::Failed)?;
+    // Cargo's own target directory, never the working checkout's: that one was
+    // built from the human's dirty inputs. Git rewrites only changed files in
+    // the stable checkout, so their newer mtimes rebuild exactly what changed.
+    let cargo_target = parent.join("target");
+    std::fs::create_dir_all(&cargo_target).map_err(|e| CheckError::Failed(e.to_string()))?;
+    let mut result = run_check_with_target(
+        &isolated,
+        policy,
+        prepared,
+        target,
+        &crate::agent_command::session_path(),
+        Some(&cargo_target),
+        cancelled,
+    )?;
+    verify_check_inputs(&isolated, prepared)?;
+    result.tail = format!(
+        "Validated committed inputs in {}\n{}",
+        isolated.display(),
+        result.tail
+    );
+    Ok(result)
+}
+
+/// Put Foreman's private validation checkout at `prepared`. Turns are
+/// serialized per repository, so one checkout serves them all and stays for
+/// diagnosis until the next check. It shares objects with the repository and
+/// holds no user work, so forcing it to the commit is safe.
+fn validation_checkout(
+    tree: &Path,
+    common: &Path,
+    isolated: &Path,
+    prepared: &str,
+) -> Result<(), String> {
+    let mut recloned = false;
+    loop {
+        if !isolated.join(".git").exists() {
+            match std::fs::remove_dir_all(isolated) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot reset validation checkout: {e}")),
+            }
+            std::fs::create_dir_all(isolated.parent().unwrap_or(isolated))
+                .map_err(|e| e.to_string())?;
+            let clone = run_git_long(
+                tree,
+                &[
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    "--",
+                    &common.to_string_lossy(),
+                    &isolated.to_string_lossy(),
+                ],
+            )?;
+            if !clone.ok {
+                return Err(clone.tail());
+            }
+            recloned = true;
+        }
+        let checkout = run_git_long(
+            isolated,
+            &["checkout", "--quiet", "--force", "--detach", prepared],
+        )?;
+        let clean = if checkout.ok {
+            run_git_long(isolated, &["clean", "-ffdxq"])?
+        } else {
+            checkout
+        };
+        if clean.ok {
+            return Ok(());
+        }
+        if recloned {
+            return Err(clean.tail());
+        }
+        // A damaged checkout is Foreman's own; start it over once.
+        std::fs::remove_dir_all(isolated)
+            .map_err(|e| format!("cannot reset validation checkout: {e}"))?;
+    }
+}
+
+fn verify_check_inputs(tree: &Path, prepared: &str) -> Result<(), CheckError> {
+    let head = crate::kanban::git(tree, &["rev-parse", "HEAD"]).map_err(CheckError::Failed)?;
+    if head != prepared || crate::kanban::git(tree, &["diff", "--quiet", prepared, "--"]).is_err() {
+        return Err(CheckError::Failed("validation changed committed inputs; inspect the changes, commit only intended work, and resubmit".into()));
+    }
+    Ok(())
+}
+
 /// `path` is the PATH the check command is resolved on and handed down. The
 /// GUI's own PATH may lack the user entries that hold cargo (see
 /// `agent_command::session_path`); a terminal in the app would find it.
@@ -1413,6 +1567,18 @@ fn run_check_on_path(
     prepared: &str,
     target: &str,
     path: &std::ffi::OsStr,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CheckRecord, CheckError> {
+    run_check_with_target(tree, policy, prepared, target, path, None, cancelled)
+}
+
+fn run_check_with_target(
+    tree: &Path,
+    policy: Option<&CheckPolicy>,
+    prepared: &str,
+    target: &str,
+    path: &std::ffi::OsStr,
+    cargo_target: Option<&Path>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<CheckRecord, CheckError> {
     let Some(p) = policy else {
@@ -1427,6 +1593,9 @@ fn run_check_on_path(
     let mut cmd = std::process::Command::new(&p.check[0]);
     // std resolves a bare program name on the child's PATH when one is set.
     cmd.args(&p.check[1..]).env("PATH", path).current_dir(tree);
+    if let Some(target) = cargo_target {
+        cmd.env("CARGO_TARGET_DIR", target);
+    }
     let out = run_child(cmd, Duration::from_secs(p.timeout_secs), cancelled)
         .map_err(CheckError::Failed)?;
     if out.cancelled {
@@ -1755,7 +1924,41 @@ fn cancelled(req: Request, note: String) -> (Request, TurnEvent) {
 /// One request's turn: preflight, rebase, check, final preflight,
 /// fast-forward — persisting the stage before each step. Cancel checkpoints
 /// sit between stages and inside the check runner.
+/// How many times a turn retries a contended assignment lock before requeueing.
+const RESERVATION_RETRIES: u32 = 20;
+
+/// Authorize a step against assignment reservations, waiting out brief
+/// contention. A turn never holds the lock across its checks: assignment and
+/// dispatch operations stay available meanwhile, and the merge reauthorizes.
+fn integration_reservation(req: &Request) -> Result<File, (Reason, String)> {
+    let mut busy = 0u32;
+    loop {
+        match crate::assignments::guard_integration(req) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if e.starts_with(crate::assignments::BUSY) && busy < RESERVATION_RETRIES => {
+                busy += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) if e.starts_with(crate::assignments::BUSY) => {
+                return Err((Reason::ProcessFailed, e));
+            }
+            Err(e) => return Err((Reason::DestinationBusy, e)),
+        }
+    }
+}
+
+/// Hold a turn whose destination is reserved; requeue one that only met contention.
+fn reservation_refused(req: Request, reason: Reason, detail: String) -> (Request, TurnEvent) {
+    if reason == Reason::DestinationBusy {
+        return hold(req, reason, detail);
+    }
+    requeue(req, format!("{detail}; queued again"))
+}
+
 fn integrate_one(queue: &Queue, mut req: Request, hooks: &dyn TurnHooks) -> (Request, TurnEvent) {
+    if let Err((reason, detail)) = integration_reservation(&req) {
+        return reservation_refused(req, reason, detail);
+    }
     if req.in_place {
         return integrate_in_place(queue, req, hooks);
     }
@@ -1870,6 +2073,10 @@ fn integrate_one(queue: &Queue, mut req: Request, hooks: &dyn TurnHooks) -> (Req
                 ),
             );
         }
+        let _reservation = match integration_reservation(&req) {
+            Ok(lock) => lock,
+            Err((reason, detail)) => return reservation_refused(req, reason, detail),
+        };
         // Final preflight: same source, same target, clean destination.
         if let Err((reason, detail)) = source_preflight(&tree, &req.branch, Some(&prepared)) {
             return resolve(req, reason, detail);
@@ -2035,7 +2242,7 @@ fn integrate_in_place(
             Ok(p) => p,
             Err(e) => return resolve(req, Reason::ProcessFailed, e),
         };
-        match run_check(
+        match run_branch_check(
             &tree,
             policy.as_ref(),
             &commit,
@@ -2062,6 +2269,10 @@ fn integrate_in_place(
         if is_cancelled() {
             return cancelled(req, "cancelled after the check; checkout untouched".into());
         }
+        let _reservation = match integration_reservation(&req) {
+            Ok(lock) => lock,
+            Err((reason, detail)) => return reservation_refused(req, reason, detail),
+        };
         // Final preflight: same branch commit, same target.
         if let Err((reason, detail)) = source_preflight_in_place(&tree, &req.branch, Some(&commit))
         {
@@ -2200,6 +2411,9 @@ fn recover(queue: &Queue) -> Result<Vec<TurnEvent>, String> {
         if req.phase != Phase::Integrating {
             continue;
         }
+        let Ok(_reservation) = crate::assignments::guard_integration(&req) else {
+            continue;
+        };
         let tree = PathBuf::from(&req.worktree);
         let dest = PathBuf::from(&req.dest);
         let prepared = req.attempt.as_ref().and_then(|a| a.prepared.clone());
@@ -3106,6 +3320,91 @@ mod tests {
     }
 
     #[test]
+    fn branch_checks_validate_committed_inputs_without_touching_dirty_work() {
+        let Some(r) = repo() else { return };
+        let wt = bring_up_branch(r.path(), "isolated");
+        let tip = commit_file(r.path(), "g.txt", "accepted\n", "card work");
+        std::fs::write(r.path().join("f.txt"), "unrelated human work\n").unwrap();
+        std::fs::write(r.path().join("notes.txt"), "keep untracked\n").unwrap();
+        write_policy(
+            r.path(),
+            &["git", "diff", "--exit-code", "HEAD", "--", "f.txt"],
+        );
+        let (q, _) = submit(r.path(), "isolated", &wt);
+        let events = turn(&q);
+        assert!(
+            matches!(&events[..], [TurnEvent::Integrated { prepared, .. }] if *prepared == tip),
+            "{events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("f.txt")).unwrap(),
+            "unrelated human work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("notes.txt")).unwrap(),
+            "keep untracked\n"
+        );
+        assert_eq!(
+            git_in(r.path(), &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn dirty_tracked_foreman_inputs_are_isolated_too() {
+        let Some(r) = repo() else { return };
+        std::fs::create_dir_all(r.path().join(".foreman")).unwrap();
+        std::fs::write(r.path().join(".foreman/tracked.txt"), "accepted").unwrap();
+        git_in(r.path(), &["add", "-f", ".foreman/tracked.txt"]);
+        git_in(r.path(), &["commit", "-m", "Track policy input"]);
+        let wt = bring_up_branch(r.path(), "tracked-config");
+        std::fs::write(r.path().join(".foreman/tracked.txt"), "unrelated edit").unwrap();
+        write_policy(
+            r.path(),
+            &[
+                "git",
+                "diff",
+                "--exit-code",
+                "HEAD",
+                "--",
+                ".foreman/tracked.txt",
+            ],
+        );
+        let (queue, _) = submit(r.path(), "tracked-config", &wt);
+        let events = turn(&queue);
+        assert!(
+            matches!(&events[..], [TurnEvent::Integrated { .. }]),
+            "{events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(r.path().join(".foreman/tracked.txt")).unwrap(),
+            "unrelated edit"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_check_that_changes_committed_inputs_cannot_accept_the_old_commit() {
+        for dirty in [false, true] {
+            let Some(r) = repo() else { return };
+            let wt = bring_up_branch(r.path(), "changed-inputs");
+            commit_file(r.path(), "g.txt", "accepted\n", "card work");
+            if dirty {
+                std::fs::write(r.path().join("notes.txt"), "unrelated").unwrap();
+            }
+            write_policy(r.path(), &["cmd", "/c", "echo changed > g.txt"]);
+            let (q, _) = submit(r.path(), "changed-inputs", &wt);
+            let events = turn(&q);
+            assert!(
+                matches!(&events[..], [TurnEvent::NeedsResolution { .. }]),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_branch_card_whose_base_moved_goes_back_to_the_worker_untouched() {
         let Some(r) = repo() else { return };
         let wt = bring_up_branch(r.path(), "cc");
@@ -3946,6 +4245,98 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(head(r.path()), main_before);
+    }
+
+    /// Records whether unrelated assignment-guarded operations stay available mid-turn.
+    struct ProbeAssignmentsDuringTurn {
+        root: PathBuf,
+        guarded: std::cell::RefCell<Vec<Result<(), String>>>,
+    }
+
+    impl TurnHooks for ProbeAssignmentsDuringTurn {
+        fn after_check(&self, _card: &str) {
+            let result = crate::assignments::guard_card(&self.root, "unrelated").map(|_| ());
+            self.guarded.borrow_mut().push(result);
+        }
+    }
+
+    #[test]
+    fn a_running_turn_leaves_unrelated_assignment_operations_available() {
+        let Some(r) = repo() else { return };
+        let wt = bring_up_branch(r.path(), "long");
+        commit_file(r.path(), "g.txt", "accepted\n", "card work");
+        let (q, _) = submit(r.path(), "long", &wt);
+        let probe = ProbeAssignmentsDuringTurn {
+            root: r.path().into(),
+            guarded: Default::default(),
+        };
+        let events = run_turn(&q, &owner(), &probe).unwrap().unwrap();
+        assert!(
+            matches!(&events[..], [TurnEvent::Integrated { .. }]),
+            "{events:?}"
+        );
+        assert_eq!(*probe.guarded.borrow(), vec![Ok(())]);
+    }
+
+    /// Every file named `name` under `dir`, at any depth up to `depth`.
+    fn find_files(dir: &Path, name: &str, depth: usize, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == name) {
+                found.push(path.clone());
+            }
+            if depth > 0 && path.is_dir() {
+                find_files(&path, name, depth - 1, found);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dirty_input_validation_reuses_one_private_checkout_and_build_directory() {
+        let Some(r) = repo() else { return };
+        std::fs::write(r.path().join("notes.txt"), "keep untracked\n").unwrap();
+        write_policy(
+            r.path(),
+            &[
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "New-Item -ItemType Directory -Force $env:CARGO_TARGET_DIR | Out-Null; Add-Content (Join-Path $env:CARGO_TARGET_DIR runs.txt) run",
+            ],
+        );
+        for card in ["first", "second"] {
+            let wt = bring_up_branch(r.path(), card);
+            commit_file(r.path(), &format!("{card}.txt"), "accepted\n", "card work");
+            let (q, _) = submit(r.path(), card, &wt);
+            let events = turn(&q);
+            assert!(
+                matches!(&events[..], [TurnEvent::Integrated { .. }]),
+                "{events:?}"
+            );
+            q.remove(card).unwrap();
+        }
+        let validation = repo_identity(r.path()).unwrap().join("foreman/validation");
+        let mut runs = Vec::new();
+        find_files(&validation, "runs.txt", 2, &mut runs);
+        assert_eq!(runs.len(), 1, "one shared build directory: {runs:?}");
+        assert_eq!(
+            std::fs::read_to_string(&runs[0])
+                .unwrap()
+                .matches("run")
+                .count(),
+            2
+        );
+        let mut checkouts = Vec::new();
+        find_files(&validation, ".git", 1, &mut checkouts);
+        assert_eq!(checkouts.len(), 1, "one private checkout: {checkouts:?}");
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("notes.txt")).unwrap(),
+            "keep untracked\n"
+        );
     }
 
     #[test]

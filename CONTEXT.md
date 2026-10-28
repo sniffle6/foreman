@@ -305,6 +305,23 @@ The named group a Cut creates; the Done column can show Current or any one
 Version. Exists only as the distinct `shipped.name` values on Cards.
 _Avoid_: changelog, milestone, ship (the event, not the group).
 
+**Assignment**:
+Approved Cards executed sequentially by one owning Session in one checkout.
+Its scope remains fixed when Plan membership changes. Each Card retains its
+own feature branch and acceptance checkpoint.
+_Avoid_: coordinator, worker pool, batch merge.
+
+**Checkout reservation**:
+Durable ownership held across an Assignment's Card transitions. A process exit
+or compaction does not release it; a safe completion or explicit recovery
+transition reconciles ownership.
+_Avoid_: lease, timeout lock.
+
+**Continuation note**:
+The Assignment's latest concise reasoning and unfinished steps. It complements
+Git and integration evidence without overriding them.
+_Avoid_: transcript, completion evidence.
+
 **Plan**:
 An ordered grouping of Cards, derived from their `planned.name` the way a
 Version is derived from `shipped.name` — there is no plan file and no plan

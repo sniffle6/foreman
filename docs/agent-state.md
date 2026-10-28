@@ -122,3 +122,34 @@ fires nothing and its rows show no badge.
 - `src/terminal.rs` — `Session::agent_state`, done marker cleared on focus in
   `Session::show`.
 - `src/config.rs`, `src/settings_menu.rs` — `agent_state_badges`.
+
+## Assignment compaction recovery
+
+Assignment context is independent of optional naming and badges. The installer
+adds a synchronous `SessionStart` matcher for `compact` to Claude and Codex
+hook settings, but only for a CLI found on the session PATH (`.exe`, npm
+`.cmd`, or a bare name). It never creates a configuration file for an absent
+CLI. With naming and badges off and neither CLI present, it writes nothing.
+A recovery handler stays installed after its CLI disappears. Existing user handlers and trust positions stay in place.
+The `assignment-context` helper emits only the provider's `additionalContext`
+JSON when the instance control pipe returns a matching owner's recovery brief.
+It ignores subagent events, unrelated sessions, and malformed input.
+
+The helper caps stdin and exits quietly after a short deadline. Server requests
+have bounded concurrency and short read-only Git probes. A repeated invocation
+only reads scope, current brief, observed Git/queue state, and the continuation
+note. Disagreements are shown explicitly; the hook never claims a card, transfers
+ownership, submits integration, or modifies Git. Continue/Resume remain the
+execution authority when hooks are missing, failed, timed out, or untrusted.
+
+Routing validates a fresh process tree, the native root provider's creation time,
+and the caller's provider session environment (`CODEX_THREAD_ID` or
+`CLAUDE_CODE_SESSION_ID`), in addition to Foreman instance/project/terminal IDs.
+A same-provider child process does not inherit ownership. Daemon routing and
+unavailable identity fail closed. Trust is never enabled automatically. Hook
+installation alone is not evidence of delivery; supported-version and actual
+mid-card compaction evidence must be checked separately.
+
+Provider contracts: [Codex hooks](https://learn.chatgpt.com/docs/hooks),
+[Claude hooks](https://code.claude.com/docs/en/hooks), and
+[Claude session environment](https://code.claude.com/docs/en/env-vars).

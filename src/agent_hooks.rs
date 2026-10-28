@@ -83,9 +83,10 @@ struct HookRoots {
     grok: PathBuf,
 }
 
-/// Install/update the guarded hooks off the GUI thread. Provider availability
-/// and login are deliberately not probed here: that would either spend a turn
-/// or duplicate each CLI's own authentication behavior.
+/// Install/update the guarded hooks off the GUI thread. Only CLI presence on
+/// the session PATH is checked, for the recovery hook; login is deliberately
+/// not probed: that would either spend a turn or duplicate each CLI's own
+/// authentication behavior.
 pub fn spawn_install(
     ctx: eframe::egui::Context,
     wants: HookWants,
@@ -106,7 +107,8 @@ fn install(wants: HookWants) -> InstallReport {
             errors: vec!["user home is unavailable; agent hooks were not installed".into()],
         };
     };
-    install_in(&roots, wants)
+    let present = providers_on_path(&crate::agent_command::session_path());
+    install_in(&roots, wants, &present)
 }
 
 fn roots_from_env() -> Option<HookRoots> {
@@ -127,15 +129,41 @@ fn roots_from(getenv: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<Hoo
     })
 }
 
-fn install_in(roots: &HookRoots, wants: HookWants) -> InstallReport {
+/// Providers whose CLI resolves on `path` (native `.exe`, npm `.cmd` shim, or
+/// a bare Unix name). Only these get the compaction recovery hook: Foreman
+/// does not write configuration for a CLI the user does not have.
+fn providers_on_path(path: &std::ffi::OsStr) -> Vec<&'static str> {
+    ["claude", "codex"]
+        .into_iter()
+        .filter(|name| {
+            std::env::split_paths(path).any(|dir| {
+                ["exe", "cmd", ""]
+                    .iter()
+                    .any(|ext| dir.join(name).with_extension(ext).is_file())
+            })
+        })
+        .collect()
+}
+
+fn install_in(roots: &HookRoots, wants: HookWants, present: &[&str]) -> InstallReport {
+    let mut report = InstallReport::default();
+    // Nothing to add, and nothing Foreman would need to clean: leave the
+    // users' configuration files exactly as they are.
+    if wants == HookWants::default() && present.is_empty() {
+        return report;
+    }
     let targets = [
         (roots.claude.join("settings.json"), "claude"),
         (roots.codex.join("hooks.json"), "codex"),
         (roots.grok.join("hooks").join(GROK_FILE), "grok"),
     ];
-    let mut report = InstallReport::default();
     for (path, agent) in targets {
-        match install_one(&path, agent, wants) {
+        let recovery = present.contains(&agent);
+        // Removing stale managed events needs an existing file; adding needs a wish.
+        if !recovery && wanted_events(agent, wants).is_empty() && !path.exists() {
+            continue;
+        }
+        match install_one(&path, agent, wants, recovery) {
             Ok(true) => report.changed += 1,
             Ok(false) => {}
             Err(error) => report.errors.push(format!("{agent} hook: {error}")),
@@ -144,7 +172,7 @@ fn install_in(roots: &HookRoots, wants: HookWants) -> InstallReport {
     report
 }
 
-fn install_one(path: &Path, agent: &str, wants: HookWants) -> Result<bool, String> {
+fn install_one(path: &Path, agent: &str, wants: HookWants, recovery: bool) -> Result<bool, String> {
     let original = match std::fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -158,7 +186,7 @@ fn install_one(path: &Path, agent: &str, wants: HookWants) -> Result<bool, Strin
     if !root.is_object() {
         return Err(format!("{} must contain a JSON object", path.display()));
     }
-    let merged = merge_hooks(root, agent, wants)?;
+    let merged = merge_hooks(root, agent, wants, recovery)?;
     let mut desired = serde_json::to_vec_pretty(&merged)
         .map_err(|error| format!("could not serialize hook: {error}"))?;
     desired.push(b'\n');
@@ -317,6 +345,7 @@ fn merge_hooks(
     mut root: serde_json::Value,
     agent: &str,
     wants: HookWants,
+    recovery: bool,
 ) -> Result<serde_json::Value, String> {
     let object = root
         .as_object_mut()
@@ -331,7 +360,72 @@ fn merge_hooks(
     for event in KNOWN_EVENTS {
         merge_event(hooks, agent, event, wanted.contains(&event))?;
     }
+    // An installed recovery handler is left alone when its CLI is no longer
+    // found: Foreman adds it for present CLIs but never edits it away.
+    if recovery && matches!(agent, "codex" | "claude") {
+        merge_recovery(hooks, agent)?;
+    }
     Ok(root)
+}
+
+fn merge_recovery(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    agent: &str,
+) -> Result<(), String> {
+    let portable = format!(
+        "if [ -n \"${{FOREMAN_EXE:-}}\" ] && [ -n \"${{FOREMAN_PIPE:-}}\" ]; then \"$FOREMAN_EXE\" assignment-context --agent {agent} 2>/dev/null || true; fi"
+    );
+    let powershell = format!(
+        "try {{ if ($env:FOREMAN_EXE -and $env:FOREMAN_PIPE) {{ & $env:FOREMAN_EXE assignment-context --agent {agent} 2>$null }} }} catch {{}}; exit 0"
+    );
+    let mut desired =
+        serde_json::json!({"type":"command", "command":portable, "timeout":3, "async":false});
+    if cfg!(windows) {
+        if agent == "claude" {
+            desired["command"] = powershell.into();
+            desired["shell"] = "powershell".into();
+        } else {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = powershell
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            desired["commandWindows"] = format!(
+                "{POWERSHELL_RELAY_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+            .into();
+        }
+    }
+    let groups = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("hooks.SessionStart must be an array")?;
+    let mut found = false;
+    for group in groups.iter_mut() {
+        let Some(handlers) = group.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for handler in handlers {
+            let managed = ["command", "commandWindows", "command_windows"]
+                .iter()
+                .filter_map(|key| handler[*key].as_str())
+                .any(|command| {
+                    let script = relay_script(command).unwrap_or_else(|| command.into());
+                    script.contains("FOREMAN_EXE") && script.contains("assignment-context --agent ")
+                });
+            if managed {
+                *handler = desired.clone();
+                found = true;
+            }
+        }
+    }
+    // Append only: never move an existing user handler or its trust position.
+    if !found {
+        groups.push(serde_json::json!({"matcher":"compact", "hooks":[desired]}));
+    }
+    Ok(())
 }
 
 /// Update one event's handler list in place: the first managed handler is
@@ -402,6 +496,47 @@ mod tests {
         naming: true,
         state: true,
     };
+    const BOTH: &[&str] = &["claude", "codex"];
+
+    #[test]
+    fn recovery_hook_is_installed_only_for_providers_on_the_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = roots_in(&temp);
+        let report = install_in(&roots, HookWants::default(), &["claude"]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let claude = read_json(&roots.claude.join("settings.json"));
+        assert!(claude["hooks"]["SessionStart"].is_array(), "{claude}");
+        assert!(!roots.codex.exists(), "no config for an absent CLI");
+        assert!(!roots.grok.exists());
+    }
+
+    #[test]
+    fn nothing_is_written_when_no_hook_is_wanted_and_no_provider_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let roots = roots_in(&temp);
+        std::fs::create_dir_all(&roots.codex).unwrap();
+        let user = "{\"hooks\":{}, \"keep\":\"formatting\"}";
+        std::fs::write(roots.codex.join("hooks.json"), user).unwrap();
+        let report = install_in(&roots, HookWants::default(), &[]);
+        assert_eq!(report.changed, 0);
+        assert!(!roots.claude.exists());
+        assert_eq!(
+            std::fs::read_to_string(roots.codex.join("hooks.json")).unwrap(),
+            user
+        );
+    }
+
+    #[test]
+    fn providers_are_found_by_their_cli_on_the_supplied_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("codex.cmd"), "").unwrap();
+        let path = std::env::join_paths([empty.path(), temp.path()]).unwrap();
+        assert_eq!(providers_on_path(&path), vec!["codex"]);
+        std::fs::write(temp.path().join("claude.exe"), "").unwrap();
+        assert_eq!(providers_on_path(&path), vec!["claude", "codex"]);
+        assert!(providers_on_path(&std::ffi::OsString::new()).is_empty());
+    }
 
     fn roots_in(temp: &tempfile::TempDir) -> HookRoots {
         HookRoots {
@@ -419,7 +554,7 @@ mod tests {
     fn state_install_adds_each_providers_events_with_the_event_name() {
         let temp = tempfile::tempdir().unwrap();
         let roots = roots_in(&temp);
-        let report = install_in(&roots, STATE);
+        let report = install_in(&roots, STATE, BOTH);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         for (agent, path) in [
             ("claude", roots.claude.join("settings.json")),
@@ -438,10 +573,7 @@ mod tests {
                     "{agent} {event}: {script}"
                 );
             }
-            assert!(
-                root["hooks"].get("SessionStart").is_none(),
-                "{agent} must not install SessionStart"
-            );
+            assert_eq!(root["hooks"].get("SessionStart").is_some(), agent != "grok");
         }
         assert!(
             read_json(&roots.codex.join("hooks.json"))["hooks"]
@@ -471,20 +603,55 @@ mod tests {
     fn turning_state_off_removes_its_events_and_keeps_naming() {
         let temp = tempfile::tempdir().unwrap();
         let roots = roots_in(&temp);
-        install_in(&roots, STATE);
-        let report = install_in(&roots, NAMING);
+        install_in(&roots, STATE, BOTH);
+        let report = install_in(&roots, NAMING, BOTH);
         assert!(report.changed > 0);
         let claude = read_json(&roots.claude.join("settings.json"));
         let hooks = claude["hooks"].as_object().unwrap();
         assert_eq!(
             hooks.keys().collect::<Vec<_>>(),
-            vec!["UserPromptSubmit"],
+            vec!["SessionStart", "UserPromptSubmit"],
             "{hooks:?}"
         );
-        let report = install_in(&roots, HookWants::default());
+        let report = install_in(&roots, HookWants::default(), BOTH);
         assert!(report.changed > 0);
         let claude = read_json(&roots.claude.join("settings.json"));
-        assert!(claude["hooks"].as_object().unwrap().is_empty(), "{claude}");
+        assert_eq!(
+            claude["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["SessionStart"]
+        );
+    }
+
+    #[test]
+    fn compaction_recovery_is_independent_and_preserves_existing_hook_positions() {
+        let original = serde_json::json!({"hooks":{"SessionStart":[{"matcher":"compact","hooks":[
+            {"type":"command","command":"user first"}, {"type":"command","command":"user second"}
+        ]}]}});
+        for provider in ["codex", "claude"] {
+            let installed =
+                merge_hooks(original.clone(), provider, HookWants::default(), true).unwrap();
+            assert_eq!(
+                installed["hooks"]["SessionStart"][0],
+                original["hooks"]["SessionStart"][0]
+            );
+            let managed = &installed["hooks"]["SessionStart"][1];
+            assert_eq!(managed["matcher"], "compact");
+            assert_eq!(managed["hooks"][0]["async"], false);
+            assert!(
+                managed["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("assignment-context")
+            );
+            assert_eq!(
+                merge_hooks(installed.clone(), provider, HookWants::default(), true).unwrap(),
+                installed
+            );
+        }
     }
 
     #[test]
@@ -499,9 +666,9 @@ mod tests {
             br#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"keep-me"}]}],"Stop":[{"hooks":[{"type":"command","command":"also-keep"}]}]}}"#,
         )
         .unwrap();
-        install_in(&roots, NAMING);
+        install_in(&roots, NAMING, BOTH);
         let after_naming = std::fs::read(&codex).unwrap();
-        install_in(&roots, STATE);
+        install_in(&roots, STATE, BOTH);
         let after_state = read_json(&codex);
         let prompt_groups = after_state["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(prompt_groups[0]["hooks"][0]["command"], "keep-me");
@@ -511,11 +678,11 @@ mod tests {
         assert_eq!(stop_groups[0]["hooks"][0]["command"], "also-keep");
         assert!(is_managed_handler(&stop_groups[1]["hooks"][0]));
         assert_eq!(
-            install_in(&roots, STATE).changed,
+            install_in(&roots, STATE, BOTH).changed,
             0,
             "state twice is a no-op"
         );
-        install_in(&roots, NAMING);
+        install_in(&roots, NAMING, BOTH);
         assert_eq!(
             std::fs::read(&codex).unwrap(),
             after_naming,
@@ -530,7 +697,7 @@ mod tests {
             {"hooks":[{"type":"command","command":"if [ -n \"${FOREMAN_EXE:-}\" ]; then \"$FOREMAN_EXE\" title-event --agent codex >/dev/null 2>&1 || true; fi"}]},
             {"hooks":[{"type":"command","command":"last"}]}
         ]}});
-        let merged = merge_hooks(old, "codex", NAMING).unwrap();
+        let merged = merge_hooks(old, "codex", NAMING, true).unwrap();
         let groups = merged["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0]["hooks"][0]["command"], "first");
@@ -552,8 +719,8 @@ mod tests {
                 "Stop": [{"hooks":[{"type":"command", "command":"also-keep"}]}]
             }
         });
-        let once = merge_hooks(original, "claude", NAMING).unwrap();
-        let twice = merge_hooks(once.clone(), "claude", NAMING).unwrap();
+        let once = merge_hooks(original, "claude", NAMING, true).unwrap();
+        let twice = merge_hooks(once.clone(), "claude", NAMING, true).unwrap();
         assert_eq!(once, twice);
         assert_eq!(once["theme"], "dark");
         let text = serde_json::to_string(&once).unwrap();
@@ -586,13 +753,14 @@ mod tests {
 
     #[test]
     fn merge_refuses_semantically_invalid_hook_containers() {
-        assert!(merge_hooks(serde_json::json!([]), "codex", NAMING).is_err());
-        assert!(merge_hooks(serde_json::json!({"hooks": []}), "codex", NAMING).is_err());
+        assert!(merge_hooks(serde_json::json!([]), "codex", NAMING, true).is_err());
+        assert!(merge_hooks(serde_json::json!({"hooks": []}), "codex", NAMING, true).is_err());
         assert!(
             merge_hooks(
                 serde_json::json!({"hooks": {"UserPromptSubmit": {}}}),
                 "codex",
-                NAMING
+                NAMING,
+                true
             )
             .is_err()
         );
@@ -613,12 +781,12 @@ mod tests {
             managed_command("grok", "UserPromptSubmit")
                 .starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ")
         );
-        let merged = merge_hooks(serde_json::json!({}), "claude", NAMING).unwrap();
+        let merged = merge_hooks(serde_json::json!({}), "claude", NAMING, true).unwrap();
         assert_eq!(
             merged["hooks"]["UserPromptSubmit"][0]["hooks"][0]["shell"],
             "powershell"
         );
-        let merged = merge_hooks(serde_json::json!({}), "codex", NAMING).unwrap();
+        let merged = merge_hooks(serde_json::json!({}), "codex", NAMING, true).unwrap();
         assert_eq!(
             merged["hooks"]["UserPromptSubmit"][0]["hooks"][0]["commandWindows"],
             windows_powershell_relay("codex", "UserPromptSubmit")
@@ -640,7 +808,7 @@ mod tests {
         use std::os::windows::process::CommandExt;
         use std::process::Stdio;
 
-        let merged = merge_hooks(serde_json::json!({}), "codex", NAMING).unwrap();
+        let merged = merge_hooks(serde_json::json!({}), "codex", NAMING, true).unwrap();
         let command = merged["hooks"]["UserPromptSubmit"][0]["hooks"][0]["commandWindows"]
             .as_str()
             .unwrap();
@@ -700,7 +868,7 @@ mod tests {
         let claude = roots.claude.join("settings.json");
         std::fs::write(&claude, br#"{"keep":true}"#).unwrap();
 
-        let first = install_in(&roots, NAMING);
+        let first = install_in(&roots, NAMING, BOTH);
         assert_eq!(first.changed, 3);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(
@@ -708,13 +876,13 @@ mod tests {
             br#"{"keep":true}"#
         );
         let installed = std::fs::read(&claude).unwrap();
-        let second = install_in(&roots, NAMING);
+        let second = install_in(&roots, NAMING, BOTH);
         assert_eq!(second.changed, 0);
         assert_eq!(std::fs::read(&claude).unwrap(), installed);
 
         let codex = roots.codex.join("hooks.json");
         std::fs::write(&codex, b"not-json").unwrap();
-        let report = install_in(&roots, NAMING);
+        let report = install_in(&roots, NAMING, BOTH);
         assert_eq!(std::fs::read(&codex).unwrap(), b"not-json");
         assert!(
             report

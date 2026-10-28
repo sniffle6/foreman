@@ -361,6 +361,117 @@ pub fn agent_for(root_pid: u32) -> Option<IconKind> {
         .or_insert_with(|| closest_agent(&snap.table, &snap.agent_rows, root_pid))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProviderProcess {
+    pub pid: u32,
+    pub started: u64,
+}
+
+/// Validate a CLI/hook caller against the terminal's actual root provider.
+/// Call off the GUI thread: authority requires a fresh OS snapshot, not the icon cache.
+pub(crate) fn assignment_provider(
+    root: u32,
+    caller: u32,
+    provider: &str,
+    session: &str,
+) -> Result<ProviderProcess, String> {
+    let snapshot = scanner().scan();
+    let identity = assignment_provider_in(&snapshot.table, root, caller, provider)?;
+    let pid = sysinfo::Pid::from_u32(caller);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_environ(sysinfo::UpdateKind::Always),
+    );
+    let process = system
+        .process(pid)
+        .ok_or("caller exited before session validation")?;
+    validate_assignment_session(provider, session, process.environ())?;
+    if creation_time(identity.pid) != identity.started {
+        return Err("provider process changed during identity validation".into());
+    }
+    Ok(identity)
+}
+
+fn validate_assignment_session(
+    provider: &str,
+    session: &str,
+    environ: &[std::ffi::OsString],
+) -> Result<(), String> {
+    let key = match provider {
+        "codex" => "CODEX_THREAD_ID=",
+        "claude" => "CLAUDE_CODE_SESSION_ID=",
+        _ => return Err("unsupported provider".into()),
+    };
+    let actual = environ
+        .iter()
+        .filter_map(|v| v.to_str())
+        .find_map(|v| v.strip_prefix(key));
+    if actual != Some(session) || session.is_empty() {
+        return Err(format!(
+            "provider session cannot be verified from the caller's {key} environment; use a supported root CLI tool process"
+        ));
+    }
+    Ok(())
+}
+
+fn assignment_provider_in(
+    table: &[ProcRow],
+    root: u32,
+    caller: u32,
+    provider: &str,
+) -> Result<ProviderProcess, String> {
+    if !matches!(provider, "codex" | "claude") {
+        return Err("unsupported assignment provider".into());
+    }
+    let native_provider = |row: &&ProcRow| {
+        matches!(
+            row.name.to_ascii_lowercase().as_str(),
+            "codex.exe" | "claude.exe"
+        )
+    };
+    let mut providers = table
+        .iter()
+        .filter(native_provider)
+        .filter_map(|row| depth_below(table, row, root).map(|depth| (depth, row)))
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|(depth, row)| (*depth, row.pid));
+    let (depth, root_provider) = providers
+        .first()
+        .ok_or("no root provider process in this terminal")?;
+    if providers.get(1).is_some_and(|(other, _)| other == depth) {
+        return Err("multiple root providers make terminal ownership ambiguous".into());
+    }
+    let caller = table
+        .iter()
+        .find(|r| r.pid == caller && r.started != 0)
+        .ok_or("caller process is unavailable")?;
+    let nearest = table
+        .iter()
+        .filter(native_provider)
+        .filter_map(|row| depth_below(table, caller, row.pid).map(|depth| (depth, row)))
+        .min_by_key(|(depth, _)| *depth)
+        .map(|(_, row)| row)
+        .ok_or("caller has no provider ancestor")?;
+    if nearest.pid != root_provider.pid
+        || root_provider.started == 0
+        || !root_provider
+            .name
+            .eq_ignore_ascii_case(&format!("{provider}.exe"))
+        || root_provider.cmd.iter().any(|arg| arg == "app-server")
+    {
+        return Err(
+            "caller is nested, belongs to another terminal, or uses ambiguous daemon routing"
+                .into(),
+        );
+    }
+    Ok(ProviderProcess {
+        pid: root_provider.pid,
+        started: root_provider.started,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +841,43 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+    #[test]
+    fn assignment_identity_rejects_nested_provider_and_foreign_daemon_callers() {
+        let table = vec![
+            born(10, 1, 0, "powershell.exe"),
+            born(20, 2, 1, "codex.exe"),
+            born(30, 3, 2, "powershell.exe"),
+            born(40, 4, 3, "foreman.exe"),
+            born(50, 5, 3, "codex.exe"),
+            born(60, 6, 5, "foreman.exe"),
+            born(70, 7, 0, "codex.exe"),
+            born(80, 8, 7, "foreman.exe"),
+        ];
+        let owner = assignment_provider_in(&table, 1, 4, "codex").unwrap();
+        assert_eq!((owner.pid, owner.started), (2, 20));
+        assert!(assignment_provider_in(&table, 1, 6, "codex").is_err());
+        assert!(assignment_provider_in(&table, 1, 8, "codex").is_err());
+        assert!(assignment_provider_in(&table, 1, 4, "claude").is_err());
+    }
+
+    #[test]
+    fn assignment_session_must_match_the_live_tool_environment() {
+        let env = vec![std::ffi::OsString::from("CODEX_THREAD_ID=new-thread")];
+        assert!(validate_assignment_session("codex", "old-thread", &env).is_err());
+        assert!(validate_assignment_session("codex", "new-thread", &env).is_ok());
+        assert!(validate_assignment_session("claude", "new-thread", &env).is_err());
+        assert!(validate_assignment_session("codex", "new-thread", &[]).is_err());
+    }
+
+    #[test]
+    fn assignment_identity_refuses_ambiguous_sibling_root_providers() {
+        let table = vec![
+            born(10, 1, 0, "powershell.exe"),
+            born(20, 2, 1, "codex.exe"),
+            born(30, 3, 1, "codex.exe"),
+            born(40, 4, 2, "foreman.exe"),
+        ];
+        assert!(assignment_provider_in(&table, 1, 4, "codex").is_err());
     }
 }

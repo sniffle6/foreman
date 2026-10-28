@@ -1,13 +1,109 @@
 # Kanban reference: orchestrating a plan
 
-Part of the foreman-kanban skill. Read it when you run or orchestrate a
-plan: dispatching a plan's cards wave by wave, reviewing finished workers,
-and keeping the board right as you learn.
+Execute related approved cards yourself in the current Session by default.
+Keep the conversation, checkout, and build artifacts across cards. Delegate
+independent work only when useful and authorized. Concurrent writers need
+separate checkouts; ordinary sequential execution does not.
 
-"Run / orchestrate the plan" means every worker is a card started with
-`kanban dispatch`. Never `open`, never `git worktree add` by hand — those
-skip the claim, the `Card:` trailer, the integration queue, and the board.
-You coordinate; you do not do the cards' work yourself.
+## Before beginning
+
+Read the plan goal, constraints, acceptance criteria, and relevant repo rules.
+Confirm existing authorization covers commits and local integration. If either
+is missing, ask before beginning dependent execution. Publication requires its
+own authorization. This skill does not grant permission to push.
+
+Use independently acceptable outcomes as cards. Keep implementation, regression
+tests, and necessary documentation together. Do not expand approved scope when
+new cards appear. Preserve unrelated tracked and untracked files.
+
+## Continue in this Session
+
+Use `foreman kanban assignment` through `FOREMAN_EXE`. It requires a native
+root Codex or Claude CLI under this terminal, an explicit instance pipe,
+project/terminal identity, and the provider's current session identity.
+Codex reads `CODEX_THREAD_ID`; Claude reads `CLAUDE_CODE_SESSION_ID`.
+An inherited terminal ID alone is insufficient. If identity cannot be verified,
+report the unsupported route; do not copy another session's identity.
+
+For example (PowerShell; substitute approved IDs and the actual target):
+
+```powershell
+& $env:FOREMAN_EXE kanban assignment begin --id plan-run --request-id begin-1 --provider PROVIDER --cards a1,b2 --target main
+```
+
+Replace `PROVIDER` with `codex` or `claude`. `--plan "Plan name"` may replace
+`--cards`; it captures the currently unfinished membership once. Save the JSON
+result's generation and revision. Every mutation requires a new request ID and
+those expected values. Retry a lost response with the identical command,
+including its original request ID, generation, revision, and payload.
+
+1. Begin returns `work` only after preparing `card/<id>` with no upstream and
+   claiming the card. Implement only the returned brief on that feature branch.
+2. Follow repo TDD, checks, and required review. Fix findings in this Session.
+3. Checkpoint consequential decisions and verification gaps during long cards.
+   Use `checkpoint --note "..."`; it replaces the note, not acceptance evidence.
+4. When authorized, commit with the repo's required `Card: <id>` trailer.
+5. Call `continue --submit` with the latest generation/revision and a new
+   request ID. This submits committed work to the serialized integration queue.
+6. Use `assignment wait --id plan-run --provider PROVIDER --timeout 30` while
+   integration is queued. Waiting is bounded and read-only; timeout grants no
+   permission to advance. Follow it with Continue to reconcile durable evidence.
+7. Continue returns the current brief, the next prepared card, or completion.
+   Never implement a successor while its predecessor is integrating.
+
+Mutation example:
+
+```powershell
+& $env:FOREMAN_EXE kanban assignment continue --id plan-run --request-id submit-a1 --provider PROVIDER --generation 1 --revision 2 --submit
+```
+
+Read the result, not just the exit code. `work`, `waiting`, `blocked`,
+`scope_changed`, `paused`, `complete`, `released`, and `recovery_required` are
+distinct. Continue without `--submit` never queues work; after a cancelled
+integration it returns `recovery_required`, and resubmitting is your decision.
+Current wave eligibility is preserved; ties use creation time then card ID.
+Completion covers the approved assignment, not all future plan membership.
+
+A changed brief requires scope review. Blocked work is not automatically
+reclaimed. Resolve obvious conflicts yourself, preserve others' work, rerun
+checks, and resubmit. Ask the user only for unclear intent, consequential choices,
+or destructive actions. Dirty files alone do not block integration: configured
+checks use isolated committed inputs when necessary.
+
+## Pause and recover
+
+`pause` prevents the next claim after the current safe checkpoint. It does not
+cancel in-flight integration or release the checkout. Silence, a dead process,
+and compaction never grant another writer ownership.
+
+Use `assignment status --id plan-run --provider PROVIDER` to inspect revision,
+generation, observed branch, and queue phase without changing anything. Resume
+with the observed generation/revision. A replacement Session must use
+`resume --recover` explicitly after inspecting unfinished work. Resume fences
+the previous owner, repairs interrupted claims, and returns recovery guidance.
+Then Continue reconciles integration or finishes branch preparation.
+
+A failed request does not block the next one. Replay the identical request only
+when its response was lost, or when the refusal says it must be reconciled.
+
+Use `release` with the latest generation/revision to end an assignment that
+cannot continue, such as `blocked` or `scope_changed`, after the user decides.
+It frees the checkout and leaves Git and the board unchanged. It is refused
+while the current card has an integration request or branch preparation is
+unfinished.
+
+Maintain one concise continuation note: intent, decisions with reasons,
+unfinished steps, useful discoveries, and verification gaps. Native provider
+compaction may load a read-only recovery brief through SessionStart/compact.
+Missing or untrusted hooks do not release ownership; use status/resume/continue.
+Never enable trust automatically or treat installation as proof of delivery.
+
+## Optional independent delegation
+
+The sections below apply only when delegation is authorized and useful.
+Use `kanban dispatch` for delegated card workers. Do not hand-roll worktrees or
+use `open` to bypass claims. Keep each concurrent writer in its own checkout.
+No permanent coordinator or per-card worker is required for sequential work.
 
 ## Choose a model for each card
 
@@ -114,7 +210,7 @@ or substitute `open` to bypass cards.
 If a CLI/model is unavailable and the user did not require it, use an available
 model appropriate to the same task and budget and record why.
 
-## The loop
+## The delegated-worker loop
 
     find plan -> dispatch current wave -> wait --any <ids> -> review the
       worker -> act on the board -> close its terminal -> dispatch -> ...
