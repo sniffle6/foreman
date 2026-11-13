@@ -135,6 +135,13 @@ pub struct ChatRequest {
     /// Bypass Working for urgent steers; omitted on ordinary v1 requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now: Option<bool>,
+    /// The allowlisted tailnet peer this request arrived from. Never set by a
+    /// client: [`dispatch_line`] stamps it from the connection's source
+    /// address on the remote listener and clears it on the pipe, so a value
+    /// on the wire is always overwritten. `Some` switches the post to the
+    /// remote path (sender `peer/pN/tN`, no membership).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 /// List projects and their terminals. `project` is an explicit opt-in filter;
@@ -413,6 +420,9 @@ pub enum CtrlMsg {
     Focus(FocusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Kanban(KanbanRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    /// Settings are App-owned, so `App::service_background` answers this one
+    /// before the window manager sees it.
+    Peers(PeersRequest, mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Create the pipe listener, retrying briefly: after an update-restart the
@@ -477,59 +487,7 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
             let mut conn = BufReader::new(conn);
             let mut line = String::new();
             if conn.read_line(&mut line).is_ok() {
-                #[derive(serde::Deserialize)]
-                struct Verb {
-                    cmd: String,
-                }
-                let now = std::time::Instant::now();
-                let (rtx, rrx) = mpsc::channel();
-                let msg = match serde_json::from_str::<Verb>(&line) {
-                    Err(e) => Err(format!("bad request: {e}")),
-                    Ok(v) => match v.cmd.as_str() {
-                        "open" => serde_json::from_str::<OpenRequest>(&line)
-                            .map(|r| CtrlMsg::Open(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "chat" => serde_json::from_str::<ChatRequest>(&line)
-                            .map(|r| CtrlMsg::Chat(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "status" => serde_json::from_str::<StatusRequest>(&line)
-                            .map(|r| CtrlMsg::Status(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "close" => serde_json::from_str::<CloseRequest>(&line)
-                            .map(|r| CtrlMsg::Close(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "send" => serde_json::from_str::<SendRequest>(&line)
-                            .map(|r| CtrlMsg::Send(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "snapshot" => serde_json::from_str::<SnapshotRequest>(&line)
-                            .map(|r| CtrlMsg::Snapshot(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "focus" => serde_json::from_str::<FocusRequest>(&line)
-                            .map(|r| CtrlMsg::Focus(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "view" => serde_json::from_str::<ViewRequest>(&line)
-                            .map(|r| CtrlMsg::View(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        "kanban" => serde_json::from_str::<KanbanRequest>(&line)
-                            .map(|r| CtrlMsg::Kanban(r, rtx, now))
-                            .map_err(|e| format!("bad request: {e}")),
-                        other => Err(format!("unknown cmd: {other}")),
-                    },
-                };
-                let reply = match msg {
-                    Err(e) => OpenReply::err(e),
-                    Ok(m) => {
-                        if tx.send(m).is_err() {
-                            OpenReply::err("foreman is not accepting requests")
-                        } else {
-                            // Wake the (possibly idle) render loop so it drains this
-                            // message and replies now, not on the idle repaint tick.
-                            ctx.request_repaint();
-                            rrx.recv_timeout(REPLY_TIMEOUT)
-                                .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
-                        }
-                    }
-                };
+                let reply = dispatch_line(&line, Origin::Local, &tx, &ctx);
                 let mut out =
                     serde_json::to_string(&reply).expect("OpenReply is always serializable");
                 out.push('\n');
@@ -538,6 +496,506 @@ pub fn serve(pipe: &str, tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) 
             inflight.fetch_sub(1, Ordering::Relaxed);
         });
     }
+}
+
+/// Where a request line came from: a local pipe client (same-user trust) or
+/// an allowlisted tailnet peer, named by its `Settings::remote_peers` entry.
+#[derive(Clone, Copy)]
+enum Origin<'a> {
+    Local,
+    Peer(&'a str),
+}
+
+/// The only verbs a peer may send. Everything else on the Control plane
+/// spawns, types into, or closes a Session — remote command execution, which
+/// the remote listener does not offer.
+const REMOTE_VERBS: [&str; 3] = ["chat", "status", "snapshot"];
+
+/// Parse one request line, hand it to the GUI, and wait for its reply. Shared
+/// by the pipe and the remote listener; `origin` decides which verbs are
+/// allowed and whether a chat request is stamped as a peer's.
+fn dispatch_line(
+    line: &str,
+    origin: Origin<'_>,
+    tx: &mpsc::Sender<CtrlMsg>,
+    ctx: &eframe::egui::Context,
+) -> OpenReply {
+    #[derive(serde::Deserialize)]
+    struct Verb {
+        cmd: String,
+    }
+    let now = std::time::Instant::now();
+    let (rtx, rrx) = mpsc::channel();
+    let msg = match serde_json::from_str::<Verb>(line) {
+        Err(e) => Err(format!("bad request: {e}")),
+        Ok(v) if matches!(origin, Origin::Peer(_)) && !REMOTE_VERBS.contains(&v.cmd.as_str()) => {
+            Err(format!(
+                "{} is not available to remote peers (only chat, status, snapshot)",
+                v.cmd
+            ))
+        }
+        Ok(v) => match v.cmd.as_str() {
+            "open" => serde_json::from_str::<OpenRequest>(line)
+                .map(|r| CtrlMsg::Open(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "chat" => serde_json::from_str::<ChatRequest>(line)
+                .map_err(|e| format!("bad request: {e}"))
+                .and_then(|mut r| {
+                    stamp_peer(&mut r, origin)?;
+                    Ok(CtrlMsg::Chat(r, rtx, now))
+                }),
+            "status" => serde_json::from_str::<StatusRequest>(line)
+                .map(|r| CtrlMsg::Status(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "close" => serde_json::from_str::<CloseRequest>(line)
+                .map(|r| CtrlMsg::Close(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "send" => serde_json::from_str::<SendRequest>(line)
+                .map(|r| CtrlMsg::Send(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "snapshot" => serde_json::from_str::<SnapshotRequest>(line)
+                .map(|mut r| {
+                    // The GUI thread builds the reply. Same-user pipe callers
+                    // may ask for the whole scrollback; a peer may not.
+                    if matches!(origin, Origin::Peer(_)) {
+                        let cap = if r.attrs { 200 } else { MAX_REMOTE_TAIL };
+                        r.tail = r.tail.map(|n| n.min(cap));
+                    }
+                    CtrlMsg::Snapshot(r, rtx, now)
+                })
+                .map_err(|e| format!("bad request: {e}")),
+            "focus" => serde_json::from_str::<FocusRequest>(line)
+                .map(|r| CtrlMsg::Focus(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "view" => serde_json::from_str::<ViewRequest>(line)
+                .map(|r| CtrlMsg::View(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "kanban" => serde_json::from_str::<KanbanRequest>(line)
+                .map(|r| CtrlMsg::Kanban(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "peers" => serde_json::from_str::<PeersRequest>(line)
+                .map(|r| CtrlMsg::Peers(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            other => Err(format!("unknown cmd: {other}")),
+        },
+    };
+    match msg {
+        Err(e) => OpenReply::err(e),
+        Ok(m) => {
+            if tx.send(m).is_err() {
+                OpenReply::err("foreman is not accepting requests")
+            } else {
+                // Wake the (possibly idle) render loop so it drains this
+                // message and replies now, not on the idle repaint tick.
+                ctx.request_repaint();
+                rrx.recv_timeout(REPLY_TIMEOUT)
+                    .unwrap_or_else(|_| OpenReply::err("foreman did not respond"))
+            }
+        }
+    }
+}
+
+/// Make `req.peer` trustworthy: cleared for pipe clients, set to the
+/// authenticated label for a peer (whose post must also name a well-formed
+/// sender, since that string is shown to agents as the reply address).
+fn stamp_peer(req: &mut ChatRequest, origin: Origin<'_>) -> Result<(), String> {
+    let Origin::Peer(label) = origin else {
+        req.peer = None;
+        return Ok(());
+    };
+    if req.text.is_some() {
+        let from = req
+            .from
+            .as_deref()
+            .ok_or("posting requires a sender (use --host from inside a foreman terminal)")?;
+        if !valid_remote_from(from) {
+            return Err(format!("bad remote sender: {from} (expected pN/tN)"));
+        }
+    }
+    if req.re.is_some() {
+        return Err("--re does not work across PCs".into());
+    }
+    req.peer = Some(label.to_string());
+    Ok(())
+}
+
+/// `pN/tN` only. A bare `tN` (a desktop-level Session, no Project) is refused:
+/// the receiver could not form the `--host H --project P --to T` reply.
+fn valid_remote_from(s: &str) -> bool {
+    let id = |s: &str, prefix: char| {
+        s.strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    s.split_once('/')
+        .is_some_and(|(p, t)| id(p, 'p') && id(t, 't'))
+}
+
+/// TCP port of the remote listener. A constant, not a setting: both PCs must
+/// agree on it and nothing else on a tailnet address competes for it.
+pub const REMOTE_PORT: u16 = 47626;
+
+/// Request-line cap for peers. The pipe trusts its same-user clients with an
+/// unbounded `read_line`; a network client gets a bound.
+const MAX_REMOTE_LINE: u64 = 64 * 1024;
+
+/// Read/write deadline on a peer connection, so a stalled peer costs one
+/// handler thread for seconds, not forever.
+const REMOTE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Client-side wait for a peer's reply; must outlast the peer's own
+/// [`REPLY_TIMEOUT`] so its "foreman did not respond" arrives as a reply.
+const REMOTE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+const MAX_REMOTE_INFLIGHT: usize = 16;
+
+/// Most buffer lines a peer's `snapshot --tail` returns (200 with `--attrs`).
+const MAX_REMOTE_TAIL: usize = 2000;
+
+/// How often the remote listener re-reads its setting and the tailnet address.
+const REMOTE_RECHECK: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Tailscale hands out addresses from the CGNAT block 100.64.0.0/10.
+pub fn is_tailnet(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && o[1] & 0xC0 == 64
+}
+
+/// This PC's Tailscale IPv4 address, or None when Tailscale is down. Asks the
+/// OS which source address it would use to reach Tailscale's resolver — a UDP
+/// `connect` only consults the routing table and sends nothing.
+pub fn tailscale_ip() -> Option<std::net::Ipv4Addr> {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect((Ipv4Addr::new(100, 100, 100, 100), 53)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if is_tailnet(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+/// The `remote_peers` entry that `addr` matches: an entry is an IP literal or
+/// a name that resolves to it. The entry doubles as the peer's label in chat,
+/// so the name an agent sees is one `--host` can dial back.
+fn peer_label(
+    addr: std::net::IpAddr,
+    peers: &[String],
+    resolve: impl Fn(&str) -> Vec<std::net::IpAddr>,
+) -> Option<String> {
+    peers
+        .iter()
+        .find(|p| match p.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip == addr,
+            Err(_) => resolve(p).contains(&addr),
+        })
+        .cloned()
+}
+
+fn resolve_host(name: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    (name, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// Remote listener: chat, status and snapshot for allowlisted tailnet peers.
+/// Runs for the GUI's lifetime but only holds a socket while
+/// `Settings::remote_listen` is on AND Tailscale is up — it binds the tailnet
+/// address alone, never a LAN or wildcard address, and drops the socket when
+/// either stops being true.
+pub fn serve_remote(tx: mpsc::Sender<CtrlMsg>, ctx: eframe::egui::Context) {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    loop {
+        std::thread::sleep(REMOTE_RECHECK);
+        if !crate::config::live(&ctx).remote_listen {
+            continue;
+        }
+        let Some(ip) = tailscale_ip() else { continue };
+        let Ok(listener) = std::net::TcpListener::bind((ip, REMOTE_PORT)) else {
+            continue;
+        };
+        if listener.set_nonblocking(true).is_err() {
+            continue;
+        }
+        let mut checked = std::time::Instant::now();
+        loop {
+            // First in the loop, so no path below (a flood over the cap
+            // included) can keep the socket open after the setting goes off.
+            if checked.elapsed() >= REMOTE_RECHECK {
+                checked = std::time::Instant::now();
+                if !crate::config::live(&ctx).remote_listen || tailscale_ip() != Some(ip) {
+                    break;
+                }
+            }
+            match listener.accept() {
+                Ok((conn, addr)) => {
+                    if inflight.load(Ordering::Relaxed) >= MAX_REMOTE_INFLIGHT {
+                        // Over the cap: no thread, no reply, and no hot loop.
+                        drop(conn);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    inflight.fetch_add(1, Ordering::Relaxed);
+                    let (tx, ctx, inflight) = (tx.clone(), ctx.clone(), inflight.clone());
+                    std::thread::spawn(move || {
+                        let peers = crate::config::live(&ctx).remote_peers.clone();
+                        handle_remote_conn(conn, addr.ip(), &peers, &tx, &ctx);
+                        inflight.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Read from `conn` until `stop` says the buffer is complete, the peer hangs
+/// up, or `deadline` passes. The deadline covers the whole exchange: a socket
+/// read timeout alone restarts on every byte, so a peer dripping one byte at
+/// a time would hold its handler thread indefinitely.
+fn read_until(
+    conn: &std::net::TcpStream,
+    deadline: std::time::Instant,
+    mut stop: impl FnMut(&[u8]) -> bool,
+) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !stop(&buf) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match (&*conn).read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    buf
+}
+
+/// `foreman peers [add|rm <peer>]`: read or edit this PC's `remote_peers`
+/// allowlist on the running instance. A hand edit of `settings.json` cannot
+/// do this while foreman runs — settings load once and the next save
+/// overwrites the file. Local pipe only; never in [`REMOTE_VERBS`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PeersRequest {
+    pub cmd: String, // always "peers"
+    /// "add" | "rm"; None lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
+
+/// Parse `foreman peers`, `foreman peers add <peer>`, `foreman peers rm <peer>`.
+pub fn parse_peers_args(args: &[String]) -> Result<PeersRequest, String> {
+    let (action, peer) = match args {
+        [] => (None, None),
+        [a, p] if a == "add" || a == "rm" => (Some(a.clone()), Some(p.clone())),
+        _ => return Err("usage: foreman peers [add <peer> | rm <peer>]".into()),
+    };
+    Ok(PeersRequest {
+        cmd: "peers".into(),
+        action,
+        peer,
+    })
+}
+
+/// Apply a [`PeersRequest`] to the settings. `Ok(true)` = changed, so the
+/// caller saves. Adding a peer also turns `remote_listen` on: an allowlist
+/// entry with the listener off does nothing, and the reply says which it is.
+pub fn apply_peers(s: &mut crate::config::Settings, req: &PeersRequest) -> Result<bool, String> {
+    let Some(action) = req.action.as_deref() else {
+        return Ok(false);
+    };
+    let peer = req.peer.as_deref().unwrap_or_default().trim();
+    if !crate::config::valid_peer(peer) {
+        return Err(format!(
+            "bad peer: {peer:?} (a Tailscale name or 100.x address: letters, digits, '.', '-')"
+        ));
+    }
+    let listed = s.remote_peers.iter().any(|p| p == peer);
+    match action {
+        "add" if listed && s.remote_listen => Ok(false),
+        "add" => {
+            if !listed {
+                if s.remote_peers.len() >= crate::config::MAX_PEERS {
+                    return Err(format!("already {} peers", crate::config::MAX_PEERS));
+                }
+                s.remote_peers.push(peer.to_string());
+            }
+            s.remote_listen = true;
+            Ok(true)
+        }
+        "rm" if listed => {
+            s.remote_peers.retain(|p| p != peer);
+            Ok(true)
+        }
+        "rm" => Err(format!("{peer} is not a peer")),
+        other => Err(format!("unknown peers action: {other}")),
+    }
+}
+
+/// The `foreman peers` reply: this PC's address (what the OTHER PC adds),
+/// whether it is listening, and who it accepts.
+pub fn peers_lines(s: &crate::config::Settings, ip: Option<std::net::Ipv4Addr>) -> Vec<String> {
+    let me = match (ip, s.remote_listen) {
+        (None, _) => "this pc: Tailscale is down (no tailnet address)".to_string(),
+        (Some(ip), true) => format!("this pc: {ip} port {REMOTE_PORT}, listening"),
+        (Some(ip), false) => format!("this pc: {ip} port {REMOTE_PORT}, NOT listening"),
+    };
+    let peers = if s.remote_peers.is_empty() {
+        "accepts: nobody".to_string()
+    } else {
+        format!("accepts: {}", s.remote_peers.join(", "))
+    };
+    vec![me, peers]
+}
+
+/// One peer connection: allowlist check first, then one capped,
+/// deadline-bounded request line through [`dispatch_line`].
+fn handle_remote_conn(
+    conn: std::net::TcpStream,
+    addr: std::net::IpAddr,
+    peers: &[String],
+    tx: &mpsc::Sender<CtrlMsg>,
+    ctx: &eframe::egui::Context,
+) {
+    let deadline = std::time::Instant::now() + REMOTE_IO_TIMEOUT;
+    // An accepted socket inherits the listener's non-blocking mode on Windows.
+    if conn.set_nonblocking(false).is_err()
+        || conn.set_write_timeout(Some(REMOTE_IO_TIMEOUT)).is_err()
+    {
+        return;
+    }
+    let reply = match peer_label(addr, peers, resolve_host) {
+        None => OpenReply::err(format!(
+            "foreman: {addr} is not in this PC's remote_peers setting"
+        )),
+        Some(label) => {
+            let buf = read_until(&conn, deadline, |b| {
+                b.contains(&b'\n') || b.len() as u64 >= MAX_REMOTE_LINE
+            });
+            let line = buf
+                .iter()
+                .position(|&b| b == b'\n')
+                .filter(|&end| end as u64 <= MAX_REMOTE_LINE)
+                .and_then(|end| std::str::from_utf8(&buf[..end]).ok());
+            match line {
+                Some(line) => dispatch_line(line, Origin::Peer(&label), tx, ctx),
+                None if buf.is_empty() => return,
+                None => OpenReply::err("bad request: no complete line within 64 KiB and 5s"),
+            }
+        }
+    };
+    let mut out = serde_json::to_string(&reply).expect("OpenReply is always serializable");
+    out.push('\n');
+    let _ = (&conn).write_all(out.as_bytes());
+    // Closing with request bytes still unread (refused peer, oversized line)
+    // resets the connection on Windows and the client loses the reply it was
+    // just sent. Send FIN, then swallow a bounded remainder until it hangs up.
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let linger = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    read_until(&conn, linger, |b| b.len() >= 1 << 20);
+}
+
+/// Client side of [`serve_remote`]: one request to the foreman on `host`.
+pub fn request_remote(
+    host: &str,
+    port: u16,
+    req: &impl serde::Serialize,
+) -> std::io::Result<OpenReply> {
+    use std::net::ToSocketAddrs;
+    let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "host did not resolve");
+    for addr in (host, port).to_socket_addrs()? {
+        let conn = match std::net::TcpStream::connect_timeout(&addr, REMOTE_IO_TIMEOUT) {
+            Ok(c) => c,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        conn.set_read_timeout(Some(REMOTE_REPLY_TIMEOUT))?;
+        conn.set_write_timeout(Some(REMOTE_IO_TIMEOUT))?;
+        let mut line = serde_json::to_string(req).map_err(std::io::Error::other)?;
+        line.push('\n');
+        (&conn).write_all(line.as_bytes())?;
+        // From here the request is on the wire. A failure is no longer "could
+        // not reach": the peer may have acted, and a blind retry would
+        // duplicate a post.
+        let mut reply = String::new();
+        let read = BufReader::new(&conn).read_line(&mut reply);
+        return Ok(match (read, serde_json::from_str(&reply)) {
+            (Ok(_), Ok(reply)) => reply,
+            _ => OpenReply::err(format!(
+                "sent to {host}, but no usable reply came back - it may have been delivered; check there (chat --history / status) before retrying"
+            )),
+        });
+    }
+    Err(last)
+}
+
+/// Split a leading `--host <peer>` off a verb's arguments. It must come
+/// first: `chat` treats everything after its first positional word as the
+/// message, so a `--host` found anywhere else could be message text.
+fn take_host(args: &[String]) -> Result<(Option<&str>, &[String]), String> {
+    if args.first().map(String::as_str) != Some("--host") {
+        return Ok((None, args));
+    }
+    let host = args
+        .get(1)
+        .filter(|h| !h.is_empty() && !h.starts_with('-'))
+        .ok_or("--host needs a peer name or address")?;
+    Ok((Some(host), &args[2..]))
+}
+
+/// Send to this instance's pipe, or to the foreman on `host`. An unreachable
+/// peer becomes an error reply so it reads as a peer problem, not as "is
+/// foreman running?".
+fn send_to(host: Option<&str>, req: &impl serde::Serialize) -> std::io::Result<OpenReply> {
+    let Some(host) = host else {
+        return request(&client_pipe(), req);
+    };
+    Ok(request_remote(host, REMOTE_PORT, req).unwrap_or_else(|e| {
+        OpenReply::err(format!(
+            "cannot reach foreman on {host}:{REMOTE_PORT} ({e}) - is Tailscale up, remote_listen on there, and this PC in its remote_peers?"
+        ))
+    }))
+}
+
+/// `foreman chat --host H ...`: nothing defaults from this PC's env — a local
+/// `pN` means a different Project over there — and the sender becomes
+/// `pN/tN` so the receiver can address a reply.
+fn parse_remote_chat_args(
+    args: &[String],
+    local_project: Option<String>,
+    self_terminal: Option<String>,
+) -> Result<ChatRequest, String> {
+    let mut req = parse_chat_args(args, None, self_terminal)?;
+    if req.project.is_none() {
+        return Err(
+            "--host needs --project, the other PC's project id (list them: foreman status --host H)"
+                .into(),
+        );
+    }
+    if req.re.is_some() {
+        return Err("--re does not work across PCs".into());
+    }
+    req.from = match (req.text.is_some(), local_project, req.from.take()) {
+        (false, _, _) => None,
+        (true, Some(p), Some(t)) => Some(format!("{p}/{t}")),
+        (true, _, _) => {
+            return Err(
+                "posting to another PC needs FOREMAN_PROJECT_ID (run it from a terminal inside a project, so the other side can reply)"
+                    .into(),
+            );
+        }
+    };
+    Ok(req)
 }
 
 /// Client side: send one request, wait for the one-line reply.
@@ -651,6 +1109,7 @@ pub fn parse_chat_args(
                 history: None,
                 re,
                 now,
+                peer: None,
             })
         }
         (true, Some(n)) => {
@@ -674,6 +1133,7 @@ pub fn parse_chat_args(
                 history: Some(n),
                 re: None,
                 now: None,
+                peer: None,
             })
         }
         (true, None) => Err("nothing to do: give a message or --history".into()),
@@ -1732,6 +2192,10 @@ USAGE
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman kanban <action> ...                add/list/start/dispatch/edit/done/block/rm/wait a card
+  foreman chat|status|snapshot --host H ... the same verb against the foreman on another
+                                            PC over Tailscale (see chat --help)
+  foreman peers [add|rm <peer>]             list / allow / remove the PCs that may do that
+                                            to this one (see peers --help)
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help, focus --help, view --help,
@@ -1775,6 +2239,34 @@ terminal); --history works for any caller and never joins the room.
   --now         bypass Working; still wait for Ready and through Needs you
   --            end flag parsing (post a message that starts with -)
 Replies: a post prints {\"ok\":true,\"seq\":N}; history prints line per line.
+
+ANOTHER PC (Tailscale)
+  foreman chat --host H --project P [--to T]... [--now] [--] <message...>
+--host H must be the FIRST flag; H is the other PC's Tailscale name or
+address. --project is required and is THAT PC's project id (find ids with
+foreman status --host H). You arrive there as H2/pN/tN (H2 = that PC's name
+for yours) and join nothing, so nothing is delivered back: a reply is the
+other side running the same command toward you. --re is not available.
+The other PC must accept this one first: run foreman peers add <this-pc>
+there (see peers --help). status and snapshot take --host the same way.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_PEERS: &str = "\
+foreman peers
+foreman peers add <peer>
+foreman peers rm <peer>
+
+The other PCs this foreman accepts chat, status and snapshot from over
+Tailscale. <peer> is that PC's Tailscale name or 100.x address.
+  (no args)  print this PC's tailnet address, whether it is listening, and
+             the accepted peers. The address is what the OTHER PC must add.
+  add        accept <peer>, and start listening if it was off. Takes effect
+             at once and is saved to settings.json.
+  rm         stop accepting <peer>.
+Pairing is two-sided: run add on EACH PC, naming the other. Anyone listed can
+post into your agents' prompts and read your terminals — add a PC only when
+the human asked for it. Do not edit settings.json by hand while foreman runs;
+the edit is not read and is overwritten.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_STATUS: &str = "\
@@ -2029,6 +2521,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("view") => view_main(&args[1..]),
         Some("kanban") => kanban_main(&args[1..]),
+        Some("peers") => peers_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
@@ -2076,18 +2569,23 @@ fn chat_main(args: &[String]) -> i32 {
         println!("{HELP_CHAT}");
         return 0;
     }
-    let req = match parse_chat_args(
-        args,
-        std::env::var("FOREMAN_PROJECT_ID").ok(),
-        std::env::var("FOREMAN_TERMINAL_ID").ok(),
-    ) {
-        Ok(r) => r,
+    let project = std::env::var("FOREMAN_PROJECT_ID").ok();
+    let me = std::env::var("FOREMAN_TERMINAL_ID").ok();
+    let parsed = take_host(args).and_then(|(host, args)| {
+        let req = match host {
+            None => parse_chat_args(args, project, me),
+            Some(_) => parse_remote_chat_args(args, project, me),
+        }?;
+        Ok((host, req))
+    });
+    let (host, req) = match parsed {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("foreman chat: {e}");
             return 2;
         }
     };
-    report("foreman chat", request(&client_pipe(), &req))
+    report("foreman chat", send_to(host, &req))
 }
 
 fn status_main(args: &[String]) -> i32 {
@@ -2095,14 +2593,30 @@ fn status_main(args: &[String]) -> i32 {
         println!("{HELP_STATUS}");
         return 0;
     }
-    let req = match parse_status_args(args) {
-        Ok(r) => r,
+    let parsed = take_host(args).and_then(|(host, args)| Ok((host, parse_status_args(args)?)));
+    let (host, req) = match parsed {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("foreman status: {e}");
             return 2;
         }
     };
-    report("foreman status", request(&client_pipe(), &req))
+    report("foreman status", send_to(host, &req))
+}
+
+fn peers_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_PEERS}");
+        return 0;
+    }
+    let req = match parse_peers_args(args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman peers: {e}");
+            return 2;
+        }
+    };
+    report("foreman peers", request(&client_pipe(), &req))
 }
 
 fn close_main(args: &[String]) -> i32 {
@@ -2150,18 +2664,32 @@ fn snapshot_main(args: &[String]) -> i32 {
         println!("{HELP_SNAPSHOT}");
         return 0;
     }
-    let req = match parse_snapshot_args(
-        args,
-        std::env::var("FOREMAN_PROJECT_ID").ok(),
-        std::env::var("FOREMAN_TERMINAL_ID").ok(),
-    ) {
-        Ok(r) => r,
+    let parsed = take_host(args).and_then(|(host, args)| {
+        let req = match host {
+            None => parse_snapshot_args(
+                args,
+                std::env::var("FOREMAN_PROJECT_ID").ok(),
+                std::env::var("FOREMAN_TERMINAL_ID").ok(),
+            ),
+            // No env defaults: this PC's pN/tN name different things over there.
+            Some(_) => parse_snapshot_args(args, None, None).and_then(|r| match r.project {
+                Some(_) => Ok(r),
+                None => Err(
+                    "--host needs --project and --terminal (list them: foreman status --host H)"
+                        .to_string(),
+                ),
+            }),
+        }?;
+        Ok((host, req))
+    });
+    let (host, req) = match parsed {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("foreman snapshot: {e}");
             return 2;
         }
     };
-    report("foreman snapshot", request(&client_pipe(), &req))
+    report("foreman snapshot", send_to(host, &req))
 }
 
 fn focus_main(args: &[String]) -> i32 {
@@ -3770,6 +4298,7 @@ mod tests {
             history: None,
             re: None,
             now: None,
+            peer: None,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -3809,6 +4338,304 @@ mod tests {
         // a plain post carries no targets
         let req = parse_chat_args(&s(&["hi"]), None, Some("t2".into())).unwrap();
         assert!(req.to.is_empty());
+    }
+
+    #[test]
+    fn chat_request_peer_is_wire_compatible_with_v1() {
+        let req = parse_chat_args(&s(&["hi"]), Some("p1".into()), Some("t2".into())).unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"peer\""), "{json}");
+        let v1 = r#"{"cmd":"chat","project":"p1","from":"t2","text":"hi"}"#;
+        let req: ChatRequest = serde_json::from_str(v1).unwrap();
+        assert_eq!(req.peer, None);
+    }
+
+    #[test]
+    fn peer_stamp_is_set_only_by_the_listener_never_by_the_client() {
+        let mut req = parse_chat_args(&s(&["hi"]), Some("p1".into()), Some("t2".into())).unwrap();
+        // a pipe client that claims to be a peer is not one
+        req.peer = Some("desk".into());
+        stamp_peer(&mut req, Origin::Local).unwrap();
+        assert_eq!(req.peer, None);
+        // a peer cannot pick its own label
+        req.peer = Some("somebody-else".into());
+        req.from = Some("p2/t3".into());
+        stamp_peer(&mut req, Origin::Peer("desk")).unwrap();
+        assert_eq!(req.peer.as_deref(), Some("desk"));
+        // the sender string is shown to agents as a reply address: shape-checked
+        // (a bare tN has no project, so no reply could be addressed to it)
+        for bad in ["you", "t3", "p2/t3/x", "p2/", "t3 rm -rf", "desk/p2/t3"] {
+            req.from = Some(bad.into());
+            assert!(stamp_peer(&mut req, Origin::Peer("desk")).is_err(), "{bad}");
+        }
+        req.from = Some("p2/t3".into());
+        req.re = Some(4);
+        assert!(stamp_peer(&mut req, Origin::Peer("desk")).is_err());
+    }
+
+    #[test]
+    fn peers_add_lists_and_starts_listening_rm_removes() {
+        let mut st = crate::config::Settings::default();
+        let req = |a: &[&str]| parse_peers_args(&s(a)).unwrap();
+        // bare = list, changes nothing
+        assert_eq!(apply_peers(&mut st, &req(&[])), Ok(false));
+        assert_eq!(apply_peers(&mut st, &req(&["add", "desk"])), Ok(true));
+        assert!(st.remote_listen, "adding a peer turns the listener on");
+        assert_eq!(st.remote_peers, vec!["desk"]);
+        // idempotent, so a retry does not rewrite settings.json
+        assert_eq!(apply_peers(&mut st, &req(&["add", "desk"])), Ok(false));
+        // a listed peer with the listener switched off: add turns it back on
+        st.remote_listen = false;
+        assert_eq!(apply_peers(&mut st, &req(&["add", "desk"])), Ok(true));
+        assert_eq!(st.remote_peers, vec!["desk"]);
+        // the entry becomes a chat label and a --host argument: shape-checked
+        for bad in ["a/b", "two words", "", "x;rm"] {
+            assert!(apply_peers(&mut st, &req(&["add", bad])).is_err(), "{bad}");
+        }
+        assert!(apply_peers(&mut st, &req(&["rm", "laptop"])).is_err());
+        assert_eq!(apply_peers(&mut st, &req(&["rm", "desk"])), Ok(true));
+        assert!(st.remote_peers.is_empty());
+        assert!(parse_peers_args(&s(&["add"])).is_err());
+        assert!(parse_peers_args(&s(&["nuke", "desk"])).is_err());
+    }
+
+    #[test]
+    fn peers_lines_say_what_the_other_pc_must_add() {
+        let mut st = crate::config::Settings::default();
+        let ip = Some(std::net::Ipv4Addr::new(100, 64, 0, 7));
+        assert_eq!(
+            peers_lines(&st, ip),
+            vec![
+                format!("this pc: 100.64.0.7 port {REMOTE_PORT}, NOT listening"),
+                "accepts: nobody".to_string()
+            ]
+        );
+        st.remote_listen = true;
+        st.remote_peers = s(&["desk", "100.64.0.9"]);
+        let lines = peers_lines(&st, ip);
+        assert!(lines[0].ends_with(", listening"), "{lines:?}");
+        assert_eq!(lines[1], "accepts: desk, 100.64.0.9");
+        assert!(peers_lines(&st, None)[0].contains("Tailscale is down"));
+    }
+
+    #[test]
+    fn peers_is_local_only() {
+        let (reply, msg) = remote_roundtrip(&["127.0.0.1"], "{\"cmd\":\"peers\"}\n");
+        assert!(
+            reply
+                .error
+                .unwrap()
+                .contains("not available to remote peers")
+        );
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn tailnet_range_is_exactly_the_cgnat_block() {
+        let ip = |a, b| std::net::Ipv4Addr::new(a, b, 0, 1);
+        assert!(is_tailnet(ip(100, 64)));
+        assert!(is_tailnet(ip(100, 127)));
+        assert!(!is_tailnet(ip(100, 63)));
+        assert!(!is_tailnet(ip(100, 128)));
+        assert!(!is_tailnet(ip(192, 168)));
+    }
+
+    #[test]
+    fn peer_label_matches_ip_literals_and_resolved_names() {
+        let peers = s(&["100.64.0.9", "desk"]);
+        let resolve = |name: &str| match name {
+            "desk" => vec!["100.64.0.7".parse().unwrap()],
+            _ => Vec::new(),
+        };
+        let label = |ip: &str| peer_label(ip.parse().unwrap(), &peers, resolve);
+        assert_eq!(label("100.64.0.9").as_deref(), Some("100.64.0.9"));
+        assert_eq!(label("100.64.0.7").as_deref(), Some("desk"));
+        assert_eq!(label("100.64.0.8"), None);
+        assert_eq!(
+            peer_label("100.64.0.7".parse().unwrap(), &[], resolve),
+            None
+        );
+    }
+
+    #[test]
+    fn take_host_only_reads_a_leading_flag() {
+        let args = s(&["--host", "desk", "--project", "p2", "hi"]);
+        let (host, rest) = take_host(&args).unwrap();
+        assert_eq!(host, Some("desk"));
+        assert_eq!(rest, &args[2..]);
+        // later in the line it is somebody's message text, not ours to eat
+        let args = s(&["say", "--host", "desk"]);
+        assert_eq!(take_host(&args).unwrap(), (None, &args[..]));
+        assert!(take_host(&s(&["--host"])).is_err());
+        assert!(take_host(&s(&["--host", "--project"])).is_err());
+    }
+
+    #[test]
+    fn remote_chat_args_drop_local_defaults_and_qualify_the_sender() {
+        let local = || (Some("p1".to_string()), Some("t2".to_string()));
+        let (p, t) = local();
+        let req =
+            parse_remote_chat_args(&s(&["--project", "p7", "--to", "t3", "go"]), p, t).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p7"));
+        assert_eq!(req.from.as_deref(), Some("p1/t2"));
+        assert!(valid_remote_from(req.from.as_deref().unwrap()));
+        // this PC's project id means nothing over there
+        let (p, t) = local();
+        let e = parse_remote_chat_args(&s(&["go"]), p, t).unwrap_err();
+        assert!(e.contains("--project"), "{e}");
+        let (p, t) = local();
+        assert!(parse_remote_chat_args(&s(&["--project", "p7", "--re", "4", "go"]), p, t).is_err());
+        // a desktop-level terminal has no project to be replied at
+        let e = parse_remote_chat_args(&s(&["--project", "p7", "go"]), None, Some("t2".into()))
+            .unwrap_err();
+        assert!(e.contains("FOREMAN_PROJECT_ID"), "{e}");
+        // history is anonymous
+        let (p, t) = local();
+        let req = parse_remote_chat_args(&s(&["--project", "p7", "--history"]), p, t).unwrap();
+        assert_eq!(req.from, None);
+    }
+
+    /// One loopback connection through the real handler; returns the reply and
+    /// whatever reached the GUI channel.
+    fn remote_roundtrip(peers: &[&str], line: &str) -> (OpenReply, Option<CtrlMsg>) {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let peers = s(peers);
+        let server = std::thread::spawn(move || {
+            let (conn, addr) = listener.accept().unwrap();
+            handle_remote_conn(
+                conn,
+                addr.ip(),
+                &peers,
+                &tx,
+                &eframe::egui::Context::default(),
+            );
+        });
+        let gui = std::thread::spawn(move || {
+            let msg = rx.recv_timeout(std::time::Duration::from_secs(2)).ok()?;
+            if let CtrlMsg::Chat(_, reply, _)
+            | CtrlMsg::Status(_, reply, _)
+            | CtrlMsg::Snapshot(_, reply, _) = &msg
+            {
+                let _ = reply.send(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                });
+            }
+            Some(msg)
+        });
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        conn.write_all(line.as_bytes()).unwrap();
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply).unwrap();
+        drop(conn); // hang up, or the server's closing drain waits out its deadline
+        server.join().unwrap();
+        (serde_json::from_str(&reply).unwrap(), gui.join().unwrap())
+    }
+
+    #[test]
+    fn remote_listener_refuses_unlisted_peers_and_non_remote_verbs() {
+        let chat = "{\"cmd\":\"chat\",\"project\":\"p1\",\"from\":\"p2/t3\",\"text\":\"hi\"}\n";
+        // not on the allowlist: nothing reaches the GUI
+        let (reply, msg) = remote_roundtrip(&["100.64.0.7"], chat);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("remote_peers"));
+        assert!(msg.is_none());
+        // allowlisted, but open/send/close are local-only
+        let open = "{\"cmd\":\"open\",\"command\":[\"cmd\"]}\n";
+        let (reply, msg) = remote_roundtrip(&["127.0.0.1"], open);
+        assert!(
+            reply
+                .error
+                .unwrap()
+                .contains("not available to remote peers")
+        );
+        assert!(msg.is_none());
+        // allowlisted chat arrives stamped with the allowlist label
+        let (reply, msg) = remote_roundtrip(&["127.0.0.1"], chat);
+        assert!(reply.ok);
+        match msg {
+            Some(CtrlMsg::Chat(req, _, _)) => assert_eq!(req.peer.as_deref(), Some("127.0.0.1")),
+            _ => panic!("expected CtrlMsg::Chat"),
+        }
+    }
+
+    #[test]
+    fn a_dripping_peer_cannot_outlive_the_connection_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // one byte every 50ms, never a newline: each byte restarts a plain
+        // socket read timeout, so only an overall deadline ends this
+        std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            while conn.write_all(b"x").is_ok() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let (conn, _) = listener.accept().unwrap();
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(400);
+        let buf = read_until(&conn, deadline, |b| b.contains(&b'\n'));
+        assert!(!buf.is_empty());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "held for {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_peer_snapshot_cannot_ask_for_the_whole_scrollback() {
+        let line =
+            "{\"cmd\":\"snapshot\",\"project\":\"p1\",\"terminal\":\"t1\",\"tail\":1000000}\n";
+        let (_, msg) = remote_roundtrip(&["127.0.0.1"], line);
+        match msg {
+            Some(CtrlMsg::Snapshot(req, _, _)) => assert_eq!(req.tail, Some(MAX_REMOTE_TAIL)),
+            _ => panic!("expected CtrlMsg::Snapshot"),
+        }
+    }
+
+    #[test]
+    fn remote_listener_caps_the_request_line() {
+        let huge = format!(
+            "{{\"cmd\":\"status\",\"pad\":\"{}\"}}\n",
+            "x".repeat(70_000)
+        );
+        let (reply, msg) = remote_roundtrip(&["127.0.0.1"], &huge);
+        assert!(reply.error.unwrap().contains("64 KiB"));
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn request_remote_reaches_a_listening_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (conn, addr) = listener.accept().unwrap();
+            let peers = vec!["127.0.0.1".to_string()];
+            handle_remote_conn(
+                conn,
+                addr.ip(),
+                &peers,
+                &tx,
+                &eframe::egui::Context::default(),
+            );
+        });
+        std::thread::spawn(move || {
+            if let Ok(CtrlMsg::Status(_, reply, _)) = rx.recv() {
+                let _ = reply.send(OpenReply {
+                    ok: true,
+                    history: Some(vec!["p1  focused  repo".into()]),
+                    ..Default::default()
+                });
+            }
+        });
+        let req = parse_status_args(&[]).unwrap();
+        let reply = request_remote("127.0.0.1", port, &req).unwrap();
+        assert_eq!(reply.history.unwrap(), vec!["p1  focused  repo"]);
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub enum Field {
     NewProjectLayout,
     InstallSkills,
     DispatchWorktrees,
+    RemoteListen,
     AutoNameAgentSessions,
     AgentStateBadges,
     TitleProvider,
@@ -199,6 +200,12 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
                 field: Field::DispatchWorktrees,
                 label: "Dispatch cards into git worktrees",
                 desc: "Each dispatched card works in .foreman/worktrees/<id> on branch card/<id>",
+                kind: Kind::Toggle,
+            },
+            RowSpec {
+                field: Field::RemoteListen,
+                label: "Accept chat from other PCs (Tailscale)",
+                desc: "Lets the PCs you allow (foreman peers add <name>) chat with and read your terminals",
                 kind: Kind::Toggle,
             },
             RowSpec {
@@ -371,6 +378,7 @@ pub fn adjust(field: Field, a: Adjust, s: &mut Settings) -> bool {
         Field::DimUnfocused => flip(&mut s.dim_unfocused),
         Field::InstallSkills => flip(&mut s.install_skills),
         Field::DispatchWorktrees => flip(&mut s.dispatch_worktrees),
+        Field::RemoteListen => flip(&mut s.remote_listen),
         Field::AutoNameAgentSessions => flip(&mut s.auto_name_agent_sessions),
         Field::AgentStateBadges => flip(&mut s.agent_state_badges),
         Field::TitleProvider => {
@@ -417,6 +425,7 @@ pub fn display(field: Field, s: &Settings) -> String {
         Field::DimUnfocused => s.dim_unfocused.to_string(),
         Field::InstallSkills => s.install_skills.to_string(),
         Field::DispatchWorktrees => s.dispatch_worktrees.to_string(),
+        Field::RemoteListen => s.remote_listen.to_string(),
         Field::AutoNameAgentSessions => s.auto_name_agent_sessions.to_string(),
         Field::AgentStateBadges => s.agent_state_badges.to_string(),
         Field::TitleProvider => s.title_provider.label().to_string(),

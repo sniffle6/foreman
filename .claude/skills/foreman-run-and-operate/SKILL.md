@@ -325,6 +325,59 @@ agents, NOT a security boundary** — stated in code in `src/control.rs`
 Do not build anything that treats a pipe caller as authenticated. Changing this
 posture is a design decision → **foreman-change-control**.
 
+## Remote peers (Tailscale)
+
+`chat`, `status` and `snapshot` take a leading `--host <peer>` and then talk
+TCP to the foreman on another PC (`control::serve_remote`, `REMOTE_PORT`)
+instead of the local pipe.
+
+Setup, on the PC that should RECEIVE (do both PCs for two-way):
+
+1. `foreman peers add <other-pc>` — its Tailscale name or `100.x` address.
+   Adds it to `Settings::remote_peers`, turns `remote_listen` on, saves, and
+   takes effect at once. Bare `foreman peers` prints this PC's address (what
+   the other PC adds) and the current list; `peers rm` removes one.
+2. Allow the Windows Firewall prompt that appears the first time it listens.
+3. From the other PC: `foreman status --host <this-pc>`.
+
+`peers` exists because a hand edit of `settings.json` only works with
+foreman CLOSED: settings load once at launch and a running app's next save
+overwrites the file. It is the one verb answered by `App::service_background`
+instead of `WindowManager::handle_ctrl`, because the App owns the settings.
+It re-seeds `config::seed_live` itself: without that, the frame-end
+read-back adopts the stale copy and silently undoes the change.
+
+Gotchas:
+
+- **The allowlist is the security boundary, not Tailscale's encryption.** A
+  chat post is pasted into an agent's prompt; whoever may connect may
+  instruct your agents. That is why only three verbs are served
+  (`REMOTE_VERBS`) and why `open`/`send`/`close` must stay off it.
+- **The `remote_peers` entry is the peer's chat label** (`laptop/p2/t3`) and
+  what agents pass to `--host` when replying. A name entry is matched by
+  resolving it on every connection, so it trusts this PC's name resolution
+  (a single-label name can fall back to LLMNR/mDNS on the LAN). A `100.x`
+  entry is the strict form; agents then see and dial the IP.
+- **Posting needs a Project on both ends.** A desktop-level terminal (no
+  `FOREMAN_PROJECT_ID`) is refused: its sender id would have no project, so
+  nobody could address a reply to it.
+- **A peer's `snapshot --tail` is clamped** (`MAX_REMOTE_TAIL`; 200 with
+  `--attrs`). The GUI thread builds that reply.
+- **A remote sender is not a Member.** No join, no cursor, no delivery back,
+  no `--re`. A reply is a second `--host` call in the other direction, so
+  one-way config gives one-way conversation.
+- **Nothing defaults across PCs.** With `--host`, `--project` is required:
+  this PC's `FOREMAN_PROJECT_ID` names a different Project over there.
+- **It binds the tailnet address only**, found by asking the OS which source
+  address routes to `100.100.100.100` (`tailscale_ip`). Tailscale down =
+  no socket at all; it rebinds within a few seconds of coming back.
+- **Windows Firewall rules are per exe path.** A dismissed prompt leaves a
+  block rule and the peer just times out; a `target\` build needs its own
+  allow rule even when the installed foreman already has one.
+- "is not in this PC's remote_peers" names the address the listener saw —
+  that is the value to add. "cannot reach foreman on H" means the listener
+  is off, Tailscale is down, or a Tailscale ACL blocks the port.
+
 ## When NOT to use this skill
 
 - Agent running **inside** foreman that just needs to dispatch, chat, or show

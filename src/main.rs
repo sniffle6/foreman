@@ -442,9 +442,50 @@ impl App {
     /// [`eframe::App::logic`] instead of [`eframe::App::ui`] while the native
     /// window is minimized or fully occluded, so this path must stay usable by
     /// both lifecycle callbacks.
+    /// Answer one `foreman peers` request against the live settings.
+    fn peers_ctrl(
+        &mut self,
+        req: &control::PeersRequest,
+        ctx: &egui::Context,
+    ) -> control::OpenReply {
+        match control::apply_peers(&mut self.settings, req) {
+            Err(e) => return control::OpenReply::err(e),
+            Ok(false) => {}
+            Ok(true) => {
+                // Re-seed now: this can run after the frame's seed, and the
+                // frame-end read-back would adopt the stale copy and undo it.
+                config::seed_live(ctx, &self.settings);
+                if let Err(e) = self.settings.save() {
+                    return control::OpenReply::err(format!(
+                        "changed for this run, but settings.json was not saved: {e}"
+                    ));
+                }
+            }
+        }
+        control::OpenReply {
+            ok: true,
+            history: Some(control::peers_lines(
+                &self.settings,
+                control::tailscale_ip(),
+            )),
+            ..Default::default()
+        }
+    }
+
     fn service_background(&mut self, ctx: &egui::Context) -> bool {
         let mut ctrl_activity = false;
         while let Ok(msg) = self.ctrl.try_recv() {
+            // `peers` edits settings, which the App owns, not the window manager.
+            let msg = match msg {
+                control::CtrlMsg::Peers(req, reply, sent) => {
+                    if sent.elapsed() < control::REPLY_TIMEOUT {
+                        let _ = reply.send(self.peers_ctrl(&req, ctx));
+                    }
+                    ctrl_activity = true;
+                    continue;
+                }
+                other => other,
+            };
             // Drops server-abandoned requests and undoes orphaned spawns; see
             // WindowManager::handle_ctrl for the reply-timeout contract.
             self.desktop.handle_ctrl(msg, ctx);
@@ -1622,6 +1663,9 @@ fn main() -> eframe::Result {
             let ctx = cc.egui_ctx.clone();
             let inst_tx = tx.clone();
             let inst_ctx = cc.egui_ctx.clone();
+            // Tailscale peers: idle until Settings::remote_listen is on.
+            let (remote_tx, remote_ctx) = (tx.clone(), cc.egui_ctx.clone());
+            std::thread::spawn(move || control::serve_remote(remote_tx, remote_ctx));
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
             // Second listener on this instance's own pipe: terminals we spawn
             // carry FOREMAN_PIPE pointing here, so their CLI calls reach THIS

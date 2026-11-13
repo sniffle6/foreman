@@ -379,6 +379,14 @@ pub struct Settings {
     pub crew_stale_secs: u32,
     /// Default quiescence wait for `foreman send` when the caller omits one.
     pub send_settle_ms: u64,
+    /// Accept chat/status/snapshot from the PCs in `remote_peers` over
+    /// Tailscale (`control::serve_remote`). Off by default: a chat post lands
+    /// in an agent's prompt, so this is who may instruct your agents.
+    pub remote_listen: bool,
+    /// Tailscale names or IPs allowed to connect. An entry is also that PC's
+    /// label in chat (`desk/p2/t3`), so prefer the name `--host` would dial.
+    /// No settings-menu row by choice: edited live with `foreman peers add|rm`.
+    pub remote_peers: Vec<String>,
     // -- startup --
     /// Reopen last session's projects and layout on launch.
     pub restore_workspace: bool,
@@ -429,6 +437,8 @@ impl Default for Settings {
             title_model: "gpt-5.6-luna".into(),
             crew_stale_secs: 300,
             send_settle_ms: 120,
+            remote_listen: false,
+            remote_peers: Vec::new(),
             restore_workspace: true,
             default_project_dir: String::new(),
             update_check: true,
@@ -463,6 +473,14 @@ impl Settings {
         self.toast_secs = self.toast_secs.clamp(1.0, 30.0);
         self.crew_stale_secs = self.crew_stale_secs.clamp(30, 3600);
         self.send_settle_ms = self.send_settle_ms.min(2000);
+        // A peer entry becomes a chat sender label and a `--host` argument:
+        // keep only hostname/IPv4 characters (no `/`, no spaces).
+        self.remote_peers = std::mem::take(&mut self.remote_peers)
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| valid_peer(p))
+            .take(MAX_PEERS)
+            .collect();
         self.title_model = self
             .title_model
             .trim()
@@ -481,6 +499,19 @@ impl Settings {
             self.window = None;
         }
     }
+}
+
+/// Most entries `Settings::remote_peers` keeps.
+pub const MAX_PEERS: usize = 32;
+
+/// A `remote_peers` entry: hostname or IPv4 characters only. The entry is
+/// shown to agents as a chat sender label and passed to `--host`, so no `/`,
+/// no whitespace, nothing a shell or the `host/pN/tN` id could misread.
+pub fn valid_peer(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 253
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 /// Seed the frame's settings into egui context data so deep consumers
@@ -739,6 +770,20 @@ mod tests {
         s.theme = String::new();
         s.sanitize();
         assert_eq!(s.theme, "Foreman Warm"); // empty self-heals
+    }
+
+    #[test]
+    fn remote_is_off_by_default_and_peer_entries_are_sanitized() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.remote_listen);
+        assert!(s.remote_peers.is_empty());
+        let mut s: Settings = serde_json::from_str(
+            r#"{"remote_listen":true,"remote_peers":[" desk ","100.101.102.103","a/b","two words",""]}"#,
+        )
+        .unwrap();
+        s.sanitize();
+        assert!(s.remote_listen);
+        assert_eq!(s.remote_peers, vec!["desk", "100.101.102.103"]);
     }
 
     #[test]

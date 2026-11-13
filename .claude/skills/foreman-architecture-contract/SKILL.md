@@ -188,7 +188,7 @@ to **foreman-validation-and-qa**.
 | src/geom.rs | Cell metrics (see seam map) |
 | src/frame.rs | Paint plan (see seam map) |
 | src/ready.rs, src/keymap.rs, src/theme.rs, src/panel.rs, … | Same shape — decision logic with plain-data inputs. `rg -l "mod tests" src/` lists the current set; the list grows and is not worth reproducing here |
-| src/control.rs | **Transport-first**: it parses/serializes and never touches `wm` or `terminal`. It does reach into `crate::inspect` (reply payload types), `crate::chat` (target validation) and `crate::icat` (subcommand dispatch) — those are leaf, GUI-free modules, and that boundary is the one to hold. `WindowManager::handle_ctrl` (`src/wm.rs`) is the sole production consumer of `CtrlMsg` |
+| src/control.rs | **Transport-first**: it parses/serializes and never touches `wm` or `terminal`. It does reach into `crate::inspect` (reply payload types), `crate::chat` (target validation) and `crate::icat` (subcommand dispatch) — those are leaf, GUI-free modules, and that boundary is the one to hold. `WindowManager::handle_ctrl` (`src/wm.rs`) consumes every `CtrlMsg` except `Peers`, which `App::service_background` (`src/main.rs`) answers first because the App owns the settings |
 
 ## Threading model
 

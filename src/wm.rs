@@ -1746,6 +1746,11 @@ impl WindowManager {
                     }
                 }
             }
+            // Unreachable in the app: `App::service_background` answers it,
+            // because settings are App-owned. Refuse rather than go silent.
+            CtrlMsg::Peers(_, reply, _) => {
+                let _ = reply.send(OpenReply::err("peers is answered by the app"));
+            }
             CtrlMsg::Status(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return;
@@ -2232,8 +2237,18 @@ impl WindowManager {
                     .from
                     .as_deref()
                     .ok_or("posting requires a sender (FOREMAN_TERMINAL_ID)")?;
-                let seq =
-                    child.chat_post_now(from, text, &req.to, req.re, req.now == Some(true))?;
+                let now = req.now == Some(true);
+                let seq = match &req.peer {
+                    // A peer's sender has no Session here: skip the
+                    // live-terminal check and the room membership.
+                    Some(peer) => child.chat.borrow_mut().post_remote(
+                        &format!("{peer}/{from}"),
+                        text,
+                        &req.to,
+                        now,
+                    )?,
+                    None => child.chat_post_now(from, text, &req.to, req.re, now)?,
+                };
                 Ok(ChatOutcome::Posted { seq: Some(seq) })
             }
             _ => Err("chat needs exactly one of text/history".into()),
@@ -14860,7 +14875,36 @@ mod tests {
             history,
             re: None,
             now: None,
+            peer: None,
         }
+    }
+
+    #[test]
+    fn peer_post_lands_under_its_remote_id_without_a_local_sender() {
+        let ctx = egui::Context::default();
+        let (mut d, a, b) = chat_fixture(&ctx);
+        let ask = |d: &mut WindowManager, req| {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            d.handle_ctrl(
+                crate::control::CtrlMsg::Chat(req, rtx, std::time::Instant::now()),
+                &ctx,
+            );
+            rrx.try_recv().expect("no reply")
+        };
+        // t3 in the peer's p2 is not a terminal here; a local post from it fails
+        let mut req = chat_req(a, Some("ping"), None);
+        req.from = Some("p2/t3".into());
+        req.to = vec![format!("t{b}")];
+        assert!(!ask(&mut d, req.clone()).ok);
+        req.peer = Some("desk".into());
+        assert!(ask(&mut d, req).ok);
+        let history = ask(&mut d, chat_req(a, None, Some(5))).history.unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|l| l.ends_with(&format!("desk/p2/t3→t{b}: ping"))),
+            "{history:?}"
+        );
     }
 
     #[test]

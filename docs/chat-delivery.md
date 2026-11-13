@@ -139,6 +139,12 @@ The engine adapter (`src/wm.rs`):
   for the next post. No second queue holds state-gated messages. Their age stamp
   is computed at handoff. State remains advisory: late hooks, same-provider
   children, and invisible interrupts retain the limits in `docs/agent-state.md`.
+- **A sender from another PC (`desk/p2/t3`) is deliberately not a member.**
+  `post_remote` skips auto-join: with no local Session, `tick` would mark it
+  exited on the next frame and no delivery could ever reach it. Mentioning one
+  is refused (`remote_mention`) because it would silently broadcast here and
+  never leave this machine. Setup and transport: **foreman-run-and-operate**,
+  "Remote peers".
 - **Not yet persistent.** The log is still in memory; a restart wipes it and the
   cursors. That's the next transport piece (feature #2). Independent of this —
   on restart there are no live members to deliver to anyway (PTYs don't survive).

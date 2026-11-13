@@ -394,6 +394,26 @@ pub fn effective_targets(to_flags: &[String], text: &str) -> Vec<String> {
     out
 }
 
+/// A leading `@host/pN/tN`: the sender is trying to mention a terminal on
+/// another PC. That is not a mention (it would broadcast locally and never
+/// leave this machine), so the strict path refuses it with the command that
+/// does reach the peer. `None` for any other text.
+pub fn remote_mention(text: &str) -> Option<String> {
+    let id = text
+        .split_whitespace()
+        .next()?
+        .strip_prefix('@')?
+        .trim_end_matches(|c: char| ",:;.!?".contains(c));
+    let mut parts = id.split('/');
+    let (host, project, term) = (parts.next()?, parts.next()?, parts.next()?);
+    if host.is_empty() || parts.next().is_some() || !valid_chat_target(term) {
+        return None;
+    }
+    Some(format!(
+        "@{id} is on another PC and cannot be mentioned here - reply with: foreman chat --host {host} --project {project} --to {term} <message>"
+    ))
+}
+
 /// A `@t<digits>` / `@you` that sits within the first few tokens but NOT in
 /// the leading run — so it parsed as prose and the post would broadcast. The
 /// classic slip is a stray word first (`post @t6 ...`). Trailing punctuation
@@ -603,6 +623,32 @@ impl ChatRoom {
         re: Option<u64>,
         now: bool,
     ) -> Result<u64, String> {
+        self.post_inner(from, text, to, re, now, true)
+    }
+
+    /// A post from a terminal on another PC (`from` = `host/pN/tN`). Same
+    /// strict validation as [`Self::post_now`], but the sender never joins:
+    /// it has no local Session, so as a member `tick` would mark it exited on
+    /// the next frame and nothing could ever be delivered to it.
+    pub fn post_remote(
+        &mut self,
+        from: &str,
+        text: &str,
+        to: &[String],
+        now: bool,
+    ) -> Result<u64, String> {
+        self.post_inner(from, text, to, None, now, false)
+    }
+
+    fn post_inner(
+        &mut self,
+        from: &str,
+        text: &str,
+        to: &[String],
+        re: Option<u64>,
+        now: bool,
+        auto_join: bool,
+    ) -> Result<u64, String> {
         if text.trim().is_empty() {
             return Err("empty message".to_string());
         }
@@ -611,6 +657,9 @@ impl ChatRoom {
             return Err(format!(
                 "post is {len} chars (max {MAX_POST_CHARS}) - keep it to 1-3 sentences, put detail in a file and cite the path"
             ));
+        }
+        if let Some(hint) = remote_mention(text) {
+            return Err(hint);
         }
         let targets = effective_targets(to, text);
         if let Some(id) = misplaced_mention(text).filter(|id| !targets.contains(id)) {
@@ -631,7 +680,7 @@ impl ChatRoom {
         }
         // Auto-join a new sender (never the pre-registered human), join line
         // BEFORE the post so the transcript reads join-then-speak.
-        if from != HUMAN_ID && self.member(from).is_none() {
+        if auto_join && from != HUMAN_ID && self.member(from).is_none() {
             self.join(from, from);
         }
         let name = self
@@ -874,6 +923,52 @@ mod tests {
             agent_state: None,
             exited,
         }
+    }
+
+    #[test]
+    fn remote_post_reaches_its_target_without_joining_or_exiting() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "t1");
+        let seq = room
+            .post_remote("desk/p2/t3", "ping", &["t1".to_string()], false)
+            .unwrap();
+        // not a member: no Joined line, no crew row, nothing to mark exited
+        assert!(!room.is_member("desk/p2/t3"));
+        let out = room.tick("p1", &[live("t1", true, false)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].lines,
+            vec![format!("[chat p1 #{seq}] desk/p2/t3→t1: ping")]
+        );
+        let before = room.last_seq();
+        room.tick("p1", &[live("t1", true, false)]);
+        assert_eq!(
+            room.last_seq(),
+            before,
+            "no Exited line for a remote sender"
+        );
+        // same strict target validation as a local post
+        let e = room
+            .post_remote("desk/p2/t3", "x", &["t9".to_string()], false)
+            .unwrap_err();
+        assert!(e.contains("unknown member t9"), "{e}");
+    }
+
+    #[test]
+    fn mentioning_a_remote_sender_is_refused_with_the_reply_command() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "t1");
+        let before = room.last_seq();
+        let e = room.post("t1", "@desk/p2/t3, done", &[], None).unwrap_err();
+        assert!(
+            e.contains("foreman chat --host desk --project p2 --to t3"),
+            "{e}"
+        );
+        assert_eq!(room.last_seq(), before, "refused post mutates nothing");
+        // prose with slashes and plain mentions are untouched
+        assert_eq!(remote_mention("see src/chat.rs"), None);
+        assert_eq!(remote_mention("@t1 hi"), None);
+        assert_eq!(remote_mention("@a/b hi"), None);
     }
 
     #[test]
