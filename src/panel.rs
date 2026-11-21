@@ -106,6 +106,8 @@ pub struct TabEntry {
     /// Hook-driven agent state; `None` = no badge (not an agent, no event yet,
     /// or exited). Not gated by the setting here: the panel gates at paint.
     pub agent: Option<crate::agent_state::AgentBadge>,
+    /// The Remote a terminal row runs on: its icon wears the globe.
+    pub remote: Option<String>,
     /// Panel presentation rank (drives row order; `None` = unranked).
     pub rank: Option<u64>,
     /// Stable identity for drag-drop resolution across frames: the row's
@@ -500,6 +502,7 @@ impl PanelView {
                             exited: false,
                             bell: folded && bell_gate && proj.bell,
                             agent: None,
+                            remote: None,
                             project_row: true,
                             folder_collapsed: Some(folded),
                             drag_ref: Some(PanelRowRef {
@@ -535,6 +538,7 @@ impl PanelView {
                                 exited: t.exited,
                                 bell: bell_gate && t.bell,
                                 agent: state_gate.then_some(t.agent).flatten(),
+                                remote: t.remote.clone(),
                                 project_row: false,
                                 folder_collapsed: None,
                                 drag_ref: Some(PanelRowRef {
@@ -1013,6 +1017,7 @@ impl PanelView {
                     exited: false,
                     bell: folded && bell_gate && proj.bell,
                     agent: None,
+                    remote: None,
                     project_row: true,
                     folder_collapsed: Some(folded),
                     drag_ref: Some(PanelRowRef {
@@ -1047,6 +1052,7 @@ impl PanelView {
                         exited: t.exited,
                         bell: bell_gate && t.bell,
                         agent: state_gate.then_some(t.agent).flatten(),
+                        remote: t.remote.clone(),
                         project_row: false,
                         folder_collapsed: None,
                         drag_ref: Some(PanelRowRef {
@@ -1148,6 +1154,8 @@ impl PanelView {
             path: TargetPath,
             galley: std::sync::Arc<egui::Galley>,
             kind: Option<RowKind>, // None = project chip
+            /// The Remote a terminal chip runs on (globe badge + tooltip).
+            remote: Option<String>,
             focused: bool,
             dim: bool,
             bell: bool,
@@ -1189,6 +1197,7 @@ impl PanelView {
                 w: pad + icon_w + text_gap + galley.size().x + pad,
                 galley,
                 kind: None,
+                remote: None,
                 focused: proj.focused,
                 dim: proj.minimized,
                 bell: folded && bell_gate && proj.bell,
@@ -1211,6 +1220,7 @@ impl PanelView {
                     w: pad + icon_w + text_gap + galley.size().x + pad,
                     galley,
                     kind: Some(t.kind),
+                    remote: t.remote.clone(),
                     focused: t.focused,
                     dim: t.minimized || !t.active_tab || t.exited,
                     bell: bell_gate && t.bell,
@@ -1356,6 +1366,7 @@ impl PanelView {
                 th.dim
             };
             let mut folder_hit = false;
+            let mut globe_tip = None;
             match chip.kind {
                 None => {
                     let tint = if chip.dim {
@@ -1390,6 +1401,22 @@ impl PanelView {
                 Some(RowKind::Terminal(k)) => {
                     let tint = if chip.dim { th.dim } else { k.tint() };
                     paint_icon(ui, &p, icon_c, 12.0, k, tint);
+                    if let Some(remote) = &chip.remote {
+                        let globe = if chip.dim {
+                            th.dim
+                        } else {
+                            crate::icons::GLOBE_TINT
+                        };
+                        let backing = if chip.focused || over {
+                            th.sel_bg
+                        } else {
+                            th.bg
+                        };
+                        globe_tip = Some((
+                            paint_globe(ui, &p, icon_c, 12.0, globe, backing),
+                            remote.clone(),
+                        ));
+                    }
                 }
                 Some(RowKind::Chat) => {
                     p.text(
@@ -1405,11 +1432,9 @@ impl PanelView {
             // Full-title tooltip when the chip label was … truncated
             // (suppressed while a reorder drag is live). The layout job keeps
             // the untruncated string, so no extra title field is needed.
-            let resp = if chip.galley.elided && self.drag.is_none() {
-                resp.on_hover_text(chip.galley.job.text.clone())
-            } else {
-                resp
-            };
+            let elided =
+                (chip.galley.elided && self.drag.is_none()).then(|| chip.galley.job.text.clone());
+            let resp = row_tooltip(resp, globe_tip, elided);
             let tp = egui::pos2(
                 chip_rect.min.x + pad + icon_w + text_gap,
                 cy - chip.galley.size().y / 2.0,
@@ -1700,6 +1725,7 @@ impl PanelView {
 
         // Icon
         let mut folder_hit = false;
+        let mut globe_tip = None;
         match rp.kind {
             None => {
                 let tint = if rp.minimized {
@@ -1731,12 +1757,21 @@ impl PanelView {
                 }
             }
             Some(RowKind::Terminal(k)) => {
-                let tint = if rp.minimized || rp.background_tab || rp.exited {
-                    th.dim
-                } else {
-                    k.tint()
-                };
+                let dim = rp.minimized || rp.background_tab || rp.exited;
+                let tint = if dim { th.dim } else { k.tint() };
                 paint_icon(ui, &p, icon_c, 12.0, k, tint);
+                if let Some(remote) = &rp.remote {
+                    let globe = if dim {
+                        th.dim
+                    } else {
+                        crate::icons::GLOBE_TINT
+                    };
+                    let backing = if rp.focused || over { th.sel_bg } else { th.bg };
+                    globe_tip = Some((
+                        paint_globe(ui, &p, icon_c, 12.0, globe, backing),
+                        remote.clone(),
+                    ));
+                }
             }
             Some(RowKind::Chat) => {
                 p.text(
@@ -1772,11 +1807,8 @@ impl PanelView {
         let text_size = galley.size();
         // Full-title tooltip when the … truncation kicked in (suppressed
         // while a reorder drag is live — a popup mid-drag is noise).
-        let resp = if galley.elided && self.drag.is_none() {
-            resp.on_hover_text(rp.title.clone())
-        } else {
-            resp
-        };
+        let elided = (galley.elided && self.drag.is_none()).then(|| rp.title.clone());
+        let resp = row_tooltip(resp, globe_tip, elided);
         p.galley(
             egui::pos2(text_x, row.center().y - text_size.y / 2.0),
             galley,
@@ -1942,6 +1974,8 @@ struct RowPaintOwned {
     bell: bool,
     /// Agent state label for this terminal row (already gated by the setting).
     agent: Option<crate::agent_state::AgentBadge>,
+    /// The Remote this terminal row runs on (globe badge + tooltip).
+    remote: Option<String>,
     project_row: bool,
     /// `Some` on project rows: whether nested session rows are hidden.
     folder_collapsed: Option<bool>,
@@ -2118,6 +2152,52 @@ fn paint_icon(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         tint,
     );
+}
+
+/// [`crate::icons::paint_globe_badge`] over a [`paint_icon`] of the same
+/// `center`/`size`. Returns the icon and badge together, the tooltip's
+/// hover area.
+fn paint_globe(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    tint: egui::Color32,
+    backing: egui::Color32,
+) -> egui::Rect {
+    let icon = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    icon.union(crate::icons::paint_globe_badge(
+        p,
+        ui.ctx(),
+        icon,
+        tint,
+        backing,
+    ))
+}
+
+/// A row/chip's one tooltip: the globe's (the Remote and its target) while
+/// the pointer is on the icon, else the full title of an elided label.
+fn row_tooltip(
+    resp: egui::Response,
+    globe: Option<(egui::Rect, String)>,
+    elided: Option<String>,
+) -> egui::Response {
+    match (globe, elided) {
+        (Some((hit, remote)), _)
+            if resp
+                .ctx
+                .pointer_hover_pos()
+                .is_some_and(|p| hit.contains(p)) =>
+        {
+            let text = {
+                let live = crate::config::live(&resp.ctx);
+                crate::remote::badge_tooltip(&live.remotes, &remote)
+            };
+            resp.on_hover_text(text)
+        }
+        (_, Some(title)) => resp.on_hover_text(title),
+        _ => resp,
+    }
 }
 
 #[cfg(test)]

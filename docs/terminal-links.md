@@ -31,6 +31,10 @@ by hand was the gap flagged in the competitor review.
   Windows shell *runs* a `file:///…/x.exe` link, and OSC 8 lets any program
   hide that behind innocent text. Unopenable links are not underlined, so an
   underline always means "Ctrl+Click will work".
+- **A Remote Session's paths are on another PC.** There are no file-path
+  links or file drops today; whoever adds either must make it inert when
+  `Session::remote()` is `Some` (URLs still open). Image paste already
+  refuses there with a toast: the agent would read the Remote's clipboard.
 - **Ctrl+Click beats app mouse mode.** Inside a mouse-reporting TUI (vim with
   `mouse=a`, htop…) Ctrl+Click on a link opens it instead of being sent to
   the app. Ctrl+Click *off* a link still goes to the app as before.

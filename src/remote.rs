@@ -117,6 +117,16 @@ pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String>
     ))
 }
 
+/// The globe badge's tooltip: the Session's copy of the Remote name, plus
+/// the target while the Remote is still set up (a deleted one leaves only
+/// the name the Session carries).
+pub fn badge_tooltip(remotes: &[Remote], name: &str) -> String {
+    match find(remotes, name) {
+        Ok(r) => format!("On {name} ({})", r.target),
+        Err(_) => format!("On {name}"),
+    }
+}
+
 /// Provider program → the arguments that reopen its latest conversation in
 /// the launch directory. The one table reconnect reads; a provider missing
 /// here relaunches fresh.
@@ -460,6 +470,21 @@ pub(crate) fn utf16le_b64(script: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_badge_tooltip_names_the_remote_and_its_target_while_it_exists() {
+        let desk = super::Remote {
+            name: "desk".into(),
+            target: "me@desk.lan".into(),
+            shell: super::RemoteShell::default(),
+            dirs: Default::default(),
+        };
+        assert_eq!(
+            super::badge_tooltip(std::slice::from_ref(&desk), "desk"),
+            "On desk (me@desk.lan)"
+        );
+        assert_eq!(super::badge_tooltip(&[desk], "garage"), "On garage");
+    }
+
     use super::*;
 
     #[test]

@@ -326,6 +326,15 @@ impl Content {
         }
     }
 
+    /// The Remote a terminal runs on (its tab icon wears the globe); `None`
+    /// for a local terminal and for every other content.
+    fn remote(&self) -> Option<&str> {
+        match self {
+            Content::Terminal(s) => s.remote(),
+            _ => None,
+        }
+    }
+
     /// Whether this content is a terminal with a latched Bell. Projects do
     /// not bubble up on window chrome (the panel carries project-level Bell).
     fn bell_active(&self) -> bool {
@@ -4805,6 +4814,7 @@ impl WindowManager {
                             },
                             bell: t.content.bell_active(),
                             agent: t.content.agent_badge(),
+                            remote: t.content.remote().map(str::to_owned),
                             rank: t.panel_order,
                             uid: t.tab_uid,
                         });
@@ -6559,6 +6569,7 @@ impl WindowManager {
         };
         let tab = &w.tabs[w.active];
         let is_project = matches!(tab.content, Content::Project(_));
+        let remote = tab.content.remote().map(str::to_owned);
         // Fresh scan at the instant of the request so a child spawned inside the
         // throttle window is seen before we decide whether to warn (or close now).
         crate::proc::refresh_now();
@@ -6569,7 +6580,7 @@ impl WindowManager {
         }
         self.pending_close = Some(PendingClose {
             target: CloseTarget::ActiveTab(id),
-            view: build_confirm(is_project, groups),
+            view: build_confirm(is_project, remote.as_deref(), groups),
         });
     }
 
@@ -6585,6 +6596,7 @@ impl WindowManager {
             return;
         };
         let is_project = matches!(tab.content, Content::Project(_));
+        let remote = tab.content.remote().map(str::to_owned);
         crate::proc::refresh_now();
         let groups = groups_in_tab(tab);
         if groups.is_empty() {
@@ -6593,7 +6605,7 @@ impl WindowManager {
         }
         self.pending_close = Some(PendingClose {
             target: CloseTarget::Tab(id, idx),
-            view: build_confirm(is_project, groups),
+            view: build_confirm(is_project, remote.as_deref(), groups),
         });
     }
 
@@ -6647,6 +6659,7 @@ impl WindowManager {
 
     /// (title, root_pid) for every terminal tab in THIS manager whose shell
     /// reported a pid. Pure tree read — the testable surface for grouping.
+    #[cfg(test)]
     fn terminal_shells(&self) -> Vec<(String, u32)> {
         let mut out = Vec::new();
         for w in &self.windows {
@@ -6668,12 +6681,16 @@ impl WindowManager {
     /// One group per terminal tab in THIS manager that has running processes
     /// (label = the tab title, empties skipped). Used for project-close.
     fn terminal_groups(&self) -> Vec<crate::confirm::ProcGroup> {
-        self.terminal_shells()
-            .into_iter()
-            .filter_map(|(label, pid)| {
-                let procs = crate::proc::top_children(pid);
+        self.windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .filter_map(|t| {
+                let Content::Terminal(s) = &t.content else {
+                    return None;
+                };
+                let procs = session_procs(s);
                 (!procs.is_empty()).then(|| crate::confirm::ProcGroup {
-                    label,
+                    label: t.title.clone(),
                     scope: None,
                     procs,
                 })
@@ -8068,17 +8085,15 @@ impl WindowManager {
                             );
                         }
                         let txt_col = if is_active_tab { th.text } else { th.dim };
+                        // The globe's hover area and the Remote it names.
+                        let mut globe_tip: Option<(egui::Rect, String)> = None;
                         // Leading icon: agent logo / shell glyph / project folder.
                         if let (Some(kind), Some(icon_rect)) = (icon, ch.icon) {
                             let px = (icon_rect.width() * ui.ctx().pixels_per_point())
                                 .round()
                                 .max(1.0) as u32;
                             let tex = crate::icons::texture(ui.ctx(), kind, px);
-                            let tint = if is_active_tab {
-                                kind.tint()
-                            } else {
-                                kind.tint().gamma_multiply(0.55)
-                            };
+                            let dim = if is_active_tab { 1.0 } else { 0.55 };
                             p.image(
                                 tex.id(),
                                 icon_rect,
@@ -8086,8 +8101,18 @@ impl WindowManager {
                                     egui::pos2(0.0, 0.0),
                                     egui::pos2(1.0, 1.0),
                                 ),
-                                tint,
+                                kind.tint().gamma_multiply(dim),
                             );
+                            if let Some(remote) = self.windows[i].tabs[ti].content.remote() {
+                                let badge = crate::icons::paint_globe_badge(
+                                    &p,
+                                    ui.ctx(),
+                                    icon_rect,
+                                    crate::icons::GLOBE_TINT.gamma_multiply(dim),
+                                    bg,
+                                );
+                                globe_tip = Some((icon_rect.union(badge), remote.to_owned()));
+                            }
                         }
                         let overflowing = paint_header_label(
                             &p,
@@ -8099,7 +8124,16 @@ impl WindowManager {
                         );
                         // Reuse the chip response so a tooltip cannot steal tab
                         // clicks or drag-out. The close button has its own response.
-                        let chip_resp = if overflowing {
+                        let chip_resp = if let Some((hit, remote)) = globe_tip.take()
+                            && ui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .is_some_and(|p| hit.contains(p))
+                        {
+                            let live = crate::config::live(ui.ctx());
+                            chip_resp
+                                .on_hover_text(crate::remote::badge_tooltip(&live.remotes, &remote))
+                        } else if overflowing {
                             chip_resp.on_hover_text(&label)
                         } else {
                             chip_resp
@@ -8260,17 +8294,36 @@ impl WindowManager {
                             .round()
                             .max(1.0) as u32;
                         let tex = crate::icons::texture(ui.ctx(), kind, px);
-                        let tint = if is_focus {
-                            kind.tint()
-                        } else {
-                            kind.tint().gamma_multiply(0.55)
-                        };
+                        let dim = if is_focus { 1.0 } else { 0.55 };
                         p.image(
                             tex.id(),
                             icon_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            tint,
+                            kind.tint().gamma_multiply(dim),
                         );
+                        let content = &self.windows[i].tabs[self.windows[i].active].content;
+                        if let Some(remote) = content.remote() {
+                            let badge = crate::icons::paint_globe_badge(
+                                &p,
+                                ui.ctx(),
+                                icon_rect,
+                                crate::icons::GLOBE_TINT.gamma_multiply(dim),
+                                th.bg,
+                            );
+                            let hit = icon_rect.union(badge);
+                            if dr.hovered()
+                                && ui
+                                    .ctx()
+                                    .pointer_hover_pos()
+                                    .is_some_and(|p| hit.contains(p))
+                            {
+                                let live = crate::config::live(ui.ctx());
+                                dr.show_tooltip_text(crate::remote::badge_tooltip(
+                                    &live.remotes,
+                                    remote,
+                                ));
+                            }
+                        }
                     }
                     // Collapsed panel rail: 36px can't fit a label — a clipped
                     // "Sessions" reads as garbage, so the header shows only
@@ -9831,6 +9884,16 @@ fn show_tab_overflow(
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         kind.tint(),
                     );
+                    if tab.content.remote().is_some() {
+                        let backing = if resp.hovered() { th.sel_bg } else { th.bg };
+                        crate::icons::paint_globe_badge(
+                            mp,
+                            mui.ctx(),
+                            icon_rect,
+                            crate::icons::GLOBE_TINT,
+                            backing,
+                        );
+                    }
                 }
                 let (agent, bell) = cue(tab);
                 let text_x = row.min.x + text_dx;
@@ -10074,20 +10137,41 @@ fn dispatch_banner(argv: &[String]) -> String {
     }
 }
 
+/// What closing terminal `s` would kill, as confirm rows. A Remote Session's
+/// programs run on another PC, out of sight of the process scan (the local
+/// `ssh` has no children), so it is one row for that `ssh`, named after the
+/// Remote, for as long as the connection is up: an idle remote prompt and a
+/// running agent look the same from here.
+fn session_procs(s: &Session) -> Vec<crate::proc::ProcInfo> {
+    // A dead shell's root_pid may be recycled — don't scan it (see
+    // terminal_shells). An exited terminal has nothing left to warn about.
+    if s.has_exited() {
+        return Vec::new();
+    }
+    let Some(pid) = s.root_pid() else {
+        return Vec::new();
+    };
+    match s.remote() {
+        Some(remote) => vec![remote_row(remote, pid)],
+        None => crate::proc::top_children(pid),
+    }
+}
+
+/// The close confirm's row for a live Remote Session: its local `ssh`.
+fn remote_row(remote: &str, ssh_pid: u32) -> crate::proc::ProcInfo {
+    crate::proc::ProcInfo {
+        pid: ssh_pid,
+        name: format!("connection to {remote}"),
+        background: 0,
+    }
+}
+
 /// Processes that closing this one tab would kill: a terminal → at most its own
 /// group; a project → one group per terminal inside it; chat → none.
 fn groups_in_tab(tab: &Tab) -> Vec<crate::confirm::ProcGroup> {
     match &tab.content {
         Content::Terminal(s) => {
-            // A dead shell's root_pid may be recycled — don't scan it (see
-            // terminal_shells). An exited terminal has nothing left to warn about.
-            let procs = if s.has_exited() {
-                Vec::new()
-            } else {
-                s.root_pid()
-                    .map(crate::proc::top_children)
-                    .unwrap_or_default()
-            };
+            let procs = session_procs(s);
             if procs.is_empty() {
                 Vec::new()
             } else {
@@ -10143,9 +10227,17 @@ fn running_lead(top: usize, bg: usize, across: Option<(usize, &str)>) -> String 
     format!("{top} {procs}{bg_clause} still running{across_clause}:")
 }
 
+/// The lead line for closing a live Remote Session.
+fn remote_lead(remote: &str) -> String {
+    format!("Connected to {remote}. Closing ends whatever runs there:")
+}
+
 /// Compose the confirm copy for a pane/project close from the gathered groups.
+/// `remote` is the Remote a lone terminal runs on: its lead names the Remote,
+/// because its one row is the connection, not what runs over it.
 fn build_confirm(
     is_project: bool,
+    remote: Option<&str>,
     groups: Vec<crate::confirm::ProcGroup>,
 ) -> crate::confirm::ConfirmClose {
     let top = top_count(&groups);
@@ -10154,6 +10246,13 @@ fn build_confirm(
         crate::confirm::ConfirmClose::new(
             "close this project?",
             running_lead(top, bg, Some((groups.len(), "terminal"))),
+            "close anyway",
+            groups,
+        )
+    } else if let Some(remote) = remote {
+        crate::confirm::ConfirmClose::new(
+            "close this terminal?",
+            remote_lead(remote),
             "close anyway",
             groups,
         )
@@ -11541,6 +11640,39 @@ mod tests {
             !json[0].contains("cwd") && !json[0].contains("app"),
             "{json:?}"
         );
+    }
+
+    /// The process scan sees only the local `ssh`, which has no children, so
+    /// a live Remote Session confirms with a row naming the Remote, and a
+    /// disconnected one (nothing running) closes without asking.
+    #[test]
+    fn closing_a_live_remote_session_confirms_with_the_remote() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (_, remote) = wm
+            .open_dispatch(open_on("desk", Some("/tmp"), &["codex"]), &ctx)
+            .expect("ssh spawns");
+        let child = wm.project_child_mut(pid).unwrap();
+        let w = child.windows.iter().find(|w| w.id == remote).unwrap();
+        let groups = groups_in_tab(&w.tabs[w.active]);
+        let rows: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| &g.procs)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(rows, ["connection to desk"]);
+        assert_eq!(child.terminal_groups().len(), 1, "project close agrees");
+        child.request_close_active_tab(remote);
+        let view = &child.pending_close.as_ref().expect("a confirm").view;
+        assert_eq!(view.lead(), remote_lead("desk"));
+
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let mut m = WindowManager::new();
+        let dead = crate::terminal::Session::disconnected_remote("desk", ctx.clone());
+        m.push_win(1, Tab::fixed("dead", Content::Terminal(dead)), r);
+        assert!(groups_in_tab(&m.windows[0].tabs[0]).is_empty());
     }
 
     #[test]
@@ -17315,7 +17447,7 @@ mod tests {
             procs,
         };
         // Terminal: one top-level process with a rolled-up subtree.
-        let term = build_confirm(false, vec![g("claude", vec![proc(1, 16)])]);
+        let term = build_confirm(false, None, vec![g("claude", vec![proc(1, 16)])]);
         assert_eq!(term.title(), "close this terminal?");
         assert!(
             term.lead()
@@ -17326,6 +17458,7 @@ mod tests {
         // Project: two terminals → the "across" clause appears.
         let proj = build_confirm(
             true,
+            None,
             vec![
                 g("a", vec![proc(2, 0), proc(3, 0)]),
                 g("b", vec![proc(4, 0)]),

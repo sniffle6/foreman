@@ -16,6 +16,14 @@ const GROK_SVG: &str = include_str!("../assets/icons/grok.svg");
 const TERMINAL_SVG: &str = include_str!("../assets/icons/terminal.svg");
 const FOLDER_SVG: &str = include_str!("../assets/icons/folder.svg");
 
+/// The Remote Session badge (see [`paint_globe_badge`]); `(name, svg)` like
+/// the Material Symbols.
+pub const GLOBE: (&str, &str) = ("globe", include_str!("../assets/icons/globe.svg"));
+
+/// Tint multiplied onto the globe's white silhouette: a sky blue that reads
+/// apart from every agent and shell tint it sits over.
+pub const GLOBE_TINT: egui::Color32 = egui::Color32::from_rgb(110, 180, 255);
+
 /// Google Material Symbols Outlined (Apache 2.0; `assets/icons/material/README.md`).
 /// Each is `(name, svg)`: the name keys the texture cache.
 pub mod material {
@@ -199,6 +207,34 @@ pub fn texture_svg(
     handle
 }
 
+/// Paint the Remote badge over the bottom-right corner of a tab/row `icon`:
+/// a globe on a disc of `backing` (the colour behind the icon), so it reads
+/// over the logo and the logo stays visible around it. Returns the badge's
+/// rect, for a hover test.
+pub fn paint_globe_badge(
+    p: &egui::Painter,
+    ctx: &egui::Context,
+    icon: egui::Rect,
+    tint: egui::Color32,
+    backing: egui::Color32,
+) -> egui::Rect {
+    let d = (icon.width() * 0.62).max(7.0);
+    // Mostly inside the icon, a little past its corner: enough logo stays
+    // uncovered to tell which agent it is.
+    let c = icon.right_bottom() - egui::vec2(d * 0.38, d * 0.38);
+    let rect = egui::Rect::from_center_size(c, egui::vec2(d, d));
+    p.circle_filled(c, d / 2.0 + 1.0, backing);
+    let px = (d * ctx.pixels_per_point()).round().max(1.0) as u32;
+    let tex = texture_svg(ctx, GLOBE.0, GLOBE.1, px);
+    p.image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        tint,
+    );
+    rect
+}
+
 /// Render an SVG (square viewBox) to a `px`×`px` unmultiplied-RGBA image.
 fn rasterize(svg: &str, px: u32) -> egui::ColorImage {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px).expect("nonzero icon size");
@@ -235,7 +271,8 @@ mod tests {
     #[test]
     fn embedded_svgs_rasterize_to_nonblank_icons() {
         // One per SVG file: Claude, Codex, Grok, the shared terminal glyph
-        // (PowerShell), the folder, and the eight Material Symbols.
+        // (PowerShell), the folder, the Remote globe, and the eight Material
+        // Symbols.
         let tabs = [
             IconKind::Claude,
             IconKind::Codex,
@@ -244,7 +281,11 @@ mod tests {
             IconKind::Folder,
         ]
         .map(IconKind::svg);
-        for (name, svg) in tabs.iter().chain(material::ALL.iter()) {
+        for (name, svg) in tabs
+            .iter()
+            .chain(std::iter::once(&GLOBE))
+            .chain(material::ALL.iter())
+        {
             let img = rasterize(svg, 32);
             assert_eq!(img.size, [32, 32]);
             // A parse failure or all-transparent fill would leave zero ink; even

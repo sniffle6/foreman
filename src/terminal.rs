@@ -814,6 +814,13 @@ fn clipboard_has_image() -> bool {
     arboard::Clipboard::new().is_ok_and(|mut c| c.get_image().is_ok())
 }
 
+/// The toast for an image paste on a Remote Session. Foreman pastes an image
+/// by sending Ctrl+V for the agent to read the clipboard itself, and that
+/// agent runs on the Remote.
+fn image_paste_refusal(remote: &str) -> String {
+    format!("Image paste doesn't reach {remote}: copy the image on {remote} instead")
+}
+
 /// Pure gate for the multi-line paste confirm: true when the setting is on
 /// and `text` spans more than one line (either newline style, since a raw
 /// clipboard may carry either).
@@ -1859,6 +1866,15 @@ impl Session {
         if outcome.paste_clipboard {
             if let Some(txt) = read_clipboard().filter(|txt| !txt.is_empty()) {
                 self.request_paste(txt, ui);
+            } else if let Some(remote) = self.remote.as_deref()
+                && clipboard_has_image()
+            {
+                // The agent would read the Remote's clipboard, not this one.
+                crate::notify::queue(
+                    ui.ctx(),
+                    crate::notify::Level::Warning,
+                    image_paste_refusal(remote),
+                );
             } else if clipboard_has_image() {
                 // Image-only clipboard: forward raw Ctrl+V so agents (Claude,
                 // Codex) run their native clipboard-image paste. Plain shells
