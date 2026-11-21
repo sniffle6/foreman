@@ -108,6 +108,9 @@ pub struct TabEntry {
     pub agent: Option<crate::agent_state::AgentBadge>,
     /// The Remote a terminal row runs on: its icon wears the globe.
     pub remote: Option<String>,
+    /// A Remote Session whose connection is down: its icon wears the
+    /// danger dot, the cue that survives a cut title.
+    pub disconnected: bool,
     /// Panel presentation rank (drives row order; `None` = unranked).
     pub rank: Option<u64>,
     /// Stable identity for drag-drop resolution across frames: the row's
@@ -505,6 +508,7 @@ impl PanelView {
                             bell: folded && bell_gate && proj.bell,
                             agent: None,
                             remote: None,
+                            disconnected: false,
                             project_row: true,
                             folder_collapsed: Some(folded),
                             drag_ref: Some(PanelRowRef {
@@ -541,6 +545,7 @@ impl PanelView {
                                 bell: bell_gate && t.bell,
                                 agent: state_gate.then_some(t.agent).flatten(),
                                 remote: t.remote.clone(),
+                                disconnected: t.disconnected,
                                 project_row: false,
                                 folder_collapsed: None,
                                 drag_ref: Some(PanelRowRef {
@@ -1020,6 +1025,7 @@ impl PanelView {
                     bell: folded && bell_gate && proj.bell,
                     agent: None,
                     remote: None,
+                    disconnected: false,
                     project_row: true,
                     folder_collapsed: Some(folded),
                     drag_ref: Some(PanelRowRef {
@@ -1055,6 +1061,7 @@ impl PanelView {
                         bell: bell_gate && t.bell,
                         agent: state_gate.then_some(t.agent).flatten(),
                         remote: t.remote.clone(),
+                        disconnected: t.disconnected,
                         project_row: false,
                         folder_collapsed: None,
                         drag_ref: Some(PanelRowRef {
@@ -1158,6 +1165,8 @@ impl PanelView {
             kind: Option<RowKind>, // None = project chip
             /// The Remote a terminal chip runs on (globe badge + tooltip).
             remote: Option<String>,
+            /// Its connection is down (danger dot on the icon).
+            disconnected: bool,
             focused: bool,
             dim: bool,
             bell: bool,
@@ -1200,6 +1209,7 @@ impl PanelView {
                 galley,
                 kind: None,
                 remote: None,
+                disconnected: false,
                 focused: proj.focused,
                 dim: proj.minimized,
                 bell: folded && bell_gate && proj.bell,
@@ -1223,6 +1233,7 @@ impl PanelView {
                     galley,
                     kind: Some(t.kind),
                     remote: t.remote.clone(),
+                    disconnected: t.disconnected,
                     focused: t.focused,
                     dim: t.minimized || !t.active_tab || t.exited,
                     bell: bell_gate && t.bell,
@@ -1403,17 +1414,20 @@ impl PanelView {
                 Some(RowKind::Terminal(k)) => {
                     let tint = if chip.dim { th.dim } else { k.tint() };
                     paint_icon(ui, &p, icon_c, 12.0, k, tint);
+                    let backing = if chip.focused || over {
+                        th.sel_bg
+                    } else {
+                        th.bg
+                    };
                     if let Some(remote) = &chip.remote {
                         let globe = if chip.dim { th.dim } else { th.text };
-                        let backing = if chip.focused || over {
-                            th.sel_bg
-                        } else {
-                            th.bg
-                        };
                         globe_tip = Some((
                             paint_globe(ui, &p, icon_c, 12.0, globe, backing),
                             remote.clone(),
                         ));
+                    }
+                    if chip.disconnected {
+                        paint_down(ui, &p, icon_c, 12.0, th.danger, backing);
                     }
                 }
                 Some(RowKind::Chat) => {
@@ -1758,13 +1772,16 @@ impl PanelView {
                 let dim = rp.minimized || rp.background_tab || rp.exited;
                 let tint = if dim { th.dim } else { k.tint() };
                 paint_icon(ui, &p, icon_c, 12.0, k, tint);
+                let backing = if rp.focused || over { th.sel_bg } else { th.bg };
                 if let Some(remote) = &rp.remote {
                     let globe = if dim { th.dim } else { th.text };
-                    let backing = if rp.focused || over { th.sel_bg } else { th.bg };
                     globe_tip = Some((
                         paint_globe(ui, &p, icon_c, 12.0, globe, backing),
                         remote.clone(),
                     ));
+                }
+                if rp.disconnected {
+                    paint_down(ui, &p, icon_c, 12.0, th.danger, backing);
                 }
             }
             Some(RowKind::Chat) => {
@@ -1969,6 +1986,8 @@ struct RowPaintOwned {
     agent: Option<crate::agent_state::AgentBadge>,
     /// The Remote this terminal row runs on (globe badge + tooltip).
     remote: Option<String>,
+    /// Its connection is down (danger dot on the icon).
+    disconnected: bool,
     project_row: bool,
     /// `Some` on project rows: whether nested session rows are hidden.
     folder_collapsed: Option<bool>,
@@ -2166,6 +2185,20 @@ fn paint_globe(
         tint,
         backing,
     ))
+}
+
+/// [`crate::icons::paint_down_dot`] over a [`paint_icon`] of the same
+/// `center`/`size`.
+fn paint_down(
+    ui: &egui::Ui,
+    p: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: egui::Color32,
+    backing: egui::Color32,
+) {
+    let icon = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    crate::icons::paint_down_dot(p, ui.ctx(), icon, color, backing);
 }
 
 /// A row/chip's one tooltip: the globe's (the Remote and its target) while

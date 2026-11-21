@@ -1131,6 +1131,12 @@ impl Session {
         self.remote.is_some() && self.exit.is_some()
     }
 
+    /// Whether this Session ever had a connection: false for a restored one
+    /// still waiting for its first Enter.
+    pub fn ever_connected(&self) -> bool {
+        self.child.is_some()
+    }
+
     /// The disconnect bar's line for this Session's state.
     pub fn disconnect_text(&self) -> String {
         disconnect_bar_text(

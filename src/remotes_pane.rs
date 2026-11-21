@@ -46,20 +46,46 @@ pub fn cycle_shell(s: RemoteShell, forward: bool) -> RemoteShell {
     }]
 }
 
-/// The edit form's fields, in Tab order.
+/// The edit form's fields, in Tab order: then one per Project directory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Field {
     Name,
     Target,
     Shell,
+    /// The Remote directory of the draft's `dirs[i]`.
+    Dir(usize),
 }
 
 impl Field {
-    fn step(self, forward: bool) -> Field {
-        const ORDER: [Field; 3] = [Field::Name, Field::Target, Field::Shell];
-        let i = ORDER.iter().position(|f| *f == self).unwrap_or(0);
-        ORDER[if forward { (i + 1) % 3 } else { (i + 2) % 3 }]
+    /// The next field in Tab order, over a form with `dirs` directory rows.
+    fn step(self, forward: bool, dirs: usize) -> Field {
+        let n = 3 + dirs;
+        let i = match self {
+            Field::Name => 0,
+            Field::Target => 1,
+            Field::Shell => 2,
+            Field::Dir(k) => 3 + k.min(dirs.saturating_sub(1)),
+        };
+        match if forward {
+            (i + 1) % n
+        } else {
+            (i + n - 1) % n
+        } {
+            0 => Field::Name,
+            1 => Field::Target,
+            2 => Field::Shell,
+            k => Field::Dir(k - 3),
+        }
     }
+}
+
+/// One Project directory mapping in the edit form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DirRow {
+    /// The `Remote::dirs` key as stored: the seat-PC Project directory.
+    pub project: String,
+    /// The directory on the Remote; blank is its home.
+    pub remote: String,
 }
 
 /// An add or edit in progress.
@@ -76,6 +102,12 @@ pub struct Draft {
     /// Why the last save was refused, drawn in the form. Dropped with the
     /// draft, so a cancel leaves nothing behind.
     pub error: Option<String>,
+    /// The entry's Project directory mappings, editable.
+    pub dirs: Vec<DirRow>,
+    /// Project keys cleared in this draft; removed on save. Kept apart from
+    /// `dirs` so a mapping the directory prompt adds while the form is open
+    /// survives the save.
+    pub cleared: Vec<String>,
 }
 
 /// Why a draft cannot be saved, and the field to fix.
@@ -102,6 +134,8 @@ impl Draft {
             field: Field::Name,
             pick: None,
             error: None,
+            dirs: Vec::new(),
+            cleared: Vec::new(),
         }
     }
 
@@ -114,6 +148,32 @@ impl Draft {
             field: Field::Name,
             pick: None,
             error: None,
+            dirs: r
+                .dirs
+                .iter()
+                .map(|(project, remote)| DirRow {
+                    project: project.clone(),
+                    remote: remote.clone(),
+                })
+                .collect(),
+            cleared: Vec::new(),
+        }
+    }
+
+    /// Drop the mapping at `k`: the next launch from that Project asks
+    /// again. The active field stays on a row that still exists.
+    pub fn clear_dir(&mut self, k: usize) {
+        if k >= self.dirs.len() {
+            return;
+        }
+        let gone = self.dirs.remove(k);
+        self.cleared.push(gone.project);
+        self.error = None;
+        if let Field::Dir(j) = self.field {
+            self.field = match self.dirs.len() {
+                0 => Field::Shell,
+                n => Field::Dir(if j > k { j - 1 } else { j.min(n - 1) }),
+            };
         }
     }
 
@@ -167,7 +227,7 @@ impl Draft {
         }
         let dirs = match self.index {
             Some(i) => match remotes.get(i) {
-                Some(r) => r.dirs.clone(),
+                Some(r) => self.merge_dirs(&r.dirs)?,
                 None => {
                     return Err(invalid(Name, "That Remote was removed while you edited it"));
                 }
@@ -186,6 +246,30 @@ impl Draft {
             shell: self.shell,
             dirs,
         })
+    }
+
+    /// The saved mappings with this draft's edits and clears applied. Starts
+    /// from `live`, not from what the form opened with, so a mapping added
+    /// meanwhile is kept. Keys are written without a verbatim prefix.
+    fn merge_dirs(
+        &self,
+        live: &std::collections::BTreeMap<String, String>,
+    ) -> Result<std::collections::BTreeMap<String, String>, Invalid> {
+        let mut out = live.clone();
+        for key in &self.cleared {
+            out.retain(|seat, _| !remote::same_dir(seat, key));
+        }
+        for (k, row) in self.dirs.iter().enumerate() {
+            let dir = crate::remote_dir_prompt::validate(&row.remote).map_err(|e| {
+                invalid(
+                    Field::Dir(k),
+                    format!("{}: {e}", remote::plain_dir(&row.project)),
+                )
+            })?;
+            out.retain(|seat, _| !remote::same_dir(seat, &row.project));
+            out.insert(remote::plain_dir(&row.project), dir);
+        }
+        Ok(out)
     }
 
     /// Fill the target from a suggestion, and the name too while it is blank
@@ -314,6 +398,10 @@ pub struct RemotesView {
     /// The keyboard moved the selection, or a form opened; scroll it into
     /// view once.
     scroll_to: bool,
+    /// A save was just refused: frames left to bring the error and buttons
+    /// into view. More than one, because the frame the error first shows
+    /// has grown the form past what that frame's scroll can reach.
+    show_error: u8,
     /// Last frame's widget rects, for the layout test.
     laid: Laid,
 }
@@ -326,6 +414,15 @@ pub struct Laid {
     pub form: Vec<egui::Rect>,
     /// Per row: its painted text, and its status and buttons.
     pub rows: Vec<(egui::Rect, egui::Rect)>,
+    /// The key hint line, and whether it fit without its "…" cut.
+    pub hint: egui::Rect,
+    pub hint_fits: bool,
+    /// The scrolling list's viewport: what is on screen of the rows.
+    pub list: egui::Rect,
+    /// Per row: its status line.
+    pub status: Vec<egui::Rect>,
+    /// The form's error line, while it shows one.
+    pub error: Option<egui::Rect>,
 }
 
 impl Default for RemotesView {
@@ -343,10 +440,16 @@ impl RemotesView {
             hosts: None,
             tests: HashMap::new(),
             scroll_to: false,
+            show_error: 0,
             laid: Laid {
                 pane: egui::Rect::NOTHING,
                 form: Vec::new(),
                 rows: Vec::new(),
+                hint: egui::Rect::NOTHING,
+                hint_fits: true,
+                list: egui::Rect::NOTHING,
+                status: Vec::new(),
+                error: None,
             },
         }
     }
@@ -359,6 +462,13 @@ impl RemotesView {
     #[cfg(test)]
     pub fn laid(&self) -> &Laid {
         &self.laid
+    }
+
+    /// Test hook: a finished Test for `target`, as if its probe answered.
+    #[cfg(test)]
+    pub fn set_test_result(&mut self, target: &str, outcome: TestOutcome) {
+        self.tests
+            .insert(target.to_string(), TestState::Done(outcome));
     }
 
     /// Open the add form below the list: select it and scroll it into view.
@@ -436,17 +546,22 @@ impl RemotesView {
                                     d.field = e.field;
                                     d.pick = None;
                                     d.error = Some(e.text);
+                                    // The error and the buttons, on screen.
+                                    self.scroll_to = true;
+                                    self.show_error = 3;
                                 }
                             }
                         }
                     }
                     Key::Tab => {
-                        d.field = d.field.step(true);
+                        d.field = d.field.step(true, d.dirs.len());
                         d.pick = None;
+                        self.scroll_to = true;
                     }
                     Key::BackTab => {
-                        d.field = d.field.step(false);
+                        d.field = d.field.step(false, d.dirs.len());
                         d.pick = None;
+                        self.scroll_to = true;
                     }
                     Key::Down if !offered.is_empty() => {
                         d.pick = Some(d.pick.map_or(0, |p| (p + 1).min(offered.len() - 1)));
@@ -456,8 +571,14 @@ impl RemotesView {
                         d.pick = d.pick.and_then(|p| p.checked_sub(1));
                         self.scroll_to = true;
                     }
-                    Key::Down => d.field = d.field.step(true),
-                    Key::Up => d.field = d.field.step(false),
+                    Key::Down => {
+                        d.field = d.field.step(true, d.dirs.len());
+                        self.scroll_to = true;
+                    }
+                    Key::Up => {
+                        d.field = d.field.step(false, d.dirs.len());
+                        self.scroll_to = true;
+                    }
                     Key::Left | Key::Right | Key::Space if d.field == Field::Shell => {
                         d.shell = cycle_shell(d.shell, k != Key::Left);
                     }
@@ -522,16 +643,17 @@ impl RemotesView {
         );
     }
 
-    /// This frame's key hint. Browsing offers only what the selection can
-    /// do: the Add row cannot be edited, tested or deleted.
+    /// This frame's key hint, one line at the pane's minimum width. Browsing
+    /// offers only what the selection can do: the Add row cannot be edited,
+    /// tested or deleted.
     fn hint(&self, len: usize) -> &'static str {
         match self.mode {
             Mode::Browse if self.selected < len => {
-                "j/k or ↑/↓ select · Enter edit · A add · T test · Del delete · Esc back"
+                "↑/↓ select · Enter edit · A add · T test · Del delete · Esc back"
             }
             Mode::Browse if len == 0 => "Enter or A add · Esc back",
-            Mode::Browse => "j/k or ↑/↓ select · Enter add · Esc back",
-            Mode::Edit(_) => "Tab next field · ↓ suggestions · ←/→ shell · Enter save · Esc cancel",
+            Mode::Browse => "↑/↓ select · Enter add · Esc back",
+            Mode::Edit(_) => "Tab next field · ←/→ shell · Enter save · Esc cancel",
             Mode::ConfirmDelete(_) => "Enter delete · Esc keep",
         }
     }
@@ -572,6 +694,8 @@ impl RemotesView {
         self.laid.pane = rect;
         self.laid.form.clear();
         self.laid.rows.clear();
+        self.laid.status.clear();
+        self.laid.error = None;
 
         let th = crate::theme::live(ui.ctx());
         ui.painter_at(rect).rect_filled(rect, 0.0, th.win_bg);
@@ -588,19 +712,28 @@ impl RemotesView {
                 .size(16.0)
                 .strong(),
         );
-        ui.label(
-            egui::RichText::new(self.hint(remotes.len()))
-                .color(th.dim)
-                .size(11.5),
-        );
+        // Truncated, never wrapped: a second line would push the list down
+        // whenever the hint changes. The copy is short enough not to need
+        // the cut at the pane's minimum width; `hint_fits` proves it.
+        let hint = self.hint(remotes.len());
+        self.laid.hint_fits = ui
+            .painter()
+            .layout_no_wrap(hint.into(), egui::FontId::proportional(11.5), th.dim)
+            .size()
+            .x
+            <= ui.available_width();
+        self.laid.hint = ui
+            .add(egui::Label::new(egui::RichText::new(hint).color(th.dim).size(11.5)).truncate())
+            .rect;
         ui.add_space(8.0);
 
         let mut acts: Vec<Act> = Vec::new();
-        egui::ScrollArea::vertical()
+        self.laid.list = egui::ScrollArea::vertical()
             .id_salt("remotes_pane")
             .auto_shrink([false, false])
             .max_height((rect.height() - 110.0).max(60.0))
-            .show(ui, |ui| self.render_rows(ui, remotes, active, &mut acts));
+            .show(ui, |ui| self.render_rows(ui, remotes, active, &mut acts))
+            .inner_rect;
 
         ui.add_space(6.0);
         ui.separator();
@@ -642,6 +775,11 @@ impl RemotesView {
                 Act::Accept(host) => {
                     if let Mode::Edit(d) = &mut self.mode {
                         d.accept(&host, remotes);
+                    }
+                }
+                Act::ClearDir(k) => {
+                    if let Mode::Edit(d) = &mut self.mode {
+                        d.clear_dir(k);
                     }
                 }
             }
@@ -779,7 +917,7 @@ impl RemotesView {
                 None if selected => why.map(|w| (w, th.dim)),
                 None => None,
             };
-            status_line(ui, status);
+            self.laid.status.push(status_line(ui, status));
             ui.add_space(2.0);
         }
 
@@ -825,6 +963,8 @@ impl RemotesView {
         acts: &mut Vec<Act>,
     ) {
         let th = crate::theme::live(ui.ctx());
+        let show_error = std::mem::take(&mut self.show_error);
+        let ctx = ui.ctx().clone();
         let Mode::Edit(d) = &mut self.mode else {
             return;
         };
@@ -832,17 +972,27 @@ impl RemotesView {
         let hosts = self.hosts.as_deref().unwrap_or_default();
         let name_id = egui::Id::new("remotes_edit_name");
         let target_id = egui::Id::new("remotes_edit_target");
+        let dir_id = |k: usize| egui::Id::new(("remotes_edit_dir", k));
         // The model owns which field is active and egui focus follows it,
         // but only while this Win reads the keyboard: typing in a terminal
         // must never land in a field.
+        let dirs = d.dirs.len();
         ui.memory_mut(|m| match (active, d.field) {
             (true, Field::Name) => m.request_focus(name_id),
             (true, Field::Target) => m.request_focus(target_id),
+            (true, Field::Dir(k)) => m.request_focus(dir_id(k)),
             _ => {
                 m.surrender_focus(name_id);
                 m.surrender_focus(target_id);
+                for k in 0..dirs {
+                    m.surrender_focus(dir_id(k));
+                }
             }
         });
+        // Where this frame's scroll request goes: the active field, or the
+        // error and buttons after a refused save.
+        let mut active_rect = None;
+        let mut error_rect = None;
         let frame = egui::Frame::new()
             .fill(th.sel_bg)
             .corner_radius(egui::CornerRadius::same(4))
@@ -860,6 +1010,9 @@ impl RemotesView {
                 )
             });
             laid.push(r.rect);
+            if d.field == Field::Name {
+                active_rect = Some(r.rect);
+            }
             if r.clicked() {
                 acts.push(Act::Field(Field::Name));
             }
@@ -876,6 +1029,9 @@ impl RemotesView {
                 )
             });
             laid.push(r.rect);
+            if d.field == Field::Target {
+                active_rect = Some(r.rect);
+            }
             if r.clicked() {
                 acts.push(Act::Field(Field::Target));
             }
@@ -933,25 +1089,95 @@ impl RemotesView {
                 ui.add(chip).on_hover_text("Test fills this in")
             });
             laid.push(r.rect);
+            if d.field == Field::Shell {
+                active_rect = Some(r.rect);
+            }
             if r.clicked() {
                 acts.push(Act::Field(Field::Shell));
                 acts.push(Act::Key(Key::Right));
             }
-            // A refused save, in the danger colour like a Keybindings
-            // conflict, under the fields; focus is already on the bad one.
-            if let Some(e) = &d.error {
-                ui.horizontal_top(|ui| {
+            // The Project directories this Remote has answered for: the one
+            // place a wrong directory-prompt answer can be fixed.
+            if d.index.is_some() {
+                let small = |t: &str| egui::RichText::new(t).color(th.dim).size(11.0);
+                ui.horizontal(|ui| {
                     ui.add_space(LABEL_W + FORM_GAP);
                     ui.add(
-                        egui::Label::new(egui::RichText::new(e).color(th.danger).size(11.5)).wrap(),
+                        egui::Label::new(small(if d.dirs.is_empty() {
+                            "No Project directories yet: a Project's first launch asks"
+                        } else {
+                            "Project directories (blank is the home directory)"
+                        }))
+                        .truncate(),
                     );
                 });
             }
+            for k in 0..d.dirs.len() {
+                let row = &mut d.dirs[k];
+                form_row(ui, "Project", th.dim, |ui| {
+                    let shown = remote::plain_dir(&row.project);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&shown)
+                                .monospace()
+                                .size(11.0)
+                                .color(th.text),
+                        )
+                        .truncate(),
+                    );
+                });
+                let r = form_row(ui, "Directory", th.dim, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clear = ui.small_button("clear").on_hover_text(
+                            "Forget it: the next launch from this Project asks again",
+                        );
+                        if clear.clicked() {
+                            acts.push(Act::ClearDir(k));
+                        }
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut row.remote)
+                                .id(dir_id(k))
+                                .lock_focus(true)
+                                .hint_text("home directory")
+                                .desired_width(f32::INFINITY),
+                        );
+                        (edit, clear.rect)
+                    })
+                    .inner
+                });
+                let (edit, clear) = r;
+                laid.push(edit.rect);
+                laid.push(clear);
+                if d.field == Field::Dir(k) {
+                    active_rect = Some(edit.rect);
+                }
+                if edit.clicked() {
+                    acts.push(Act::Field(Field::Dir(k)));
+                }
+                if edit.changed() {
+                    d.error = None;
+                }
+            }
+            // A refused save, in the danger colour like a Keybindings
+            // conflict, under the fields; focus is already on the bad one.
+            // The line is reserved, so an error appearing does not push the
+            // buttons down.
+            ui.horizontal_top(|ui| {
+                ui.set_min_height(LINE_H);
+                ui.add_space(LABEL_W + FORM_GAP);
+                if let Some(e) = &d.error {
+                    let r = ui.add(
+                        egui::Label::new(egui::RichText::new(e).color(th.danger).size(11.5)).wrap(),
+                    );
+                    error_rect = Some(r.rect);
+                }
+            });
             ui.horizontal(|ui| {
                 ui.add_space(LABEL_W + FORM_GAP);
                 let save = if d.index.is_some() { "save" } else { "add" };
                 let r = ui.small_button(save);
                 laid.push(r.rect);
+                let buttons = r.rect;
                 if r.clicked() {
                     acts.push(Act::Key(Key::Enter));
                 }
@@ -960,11 +1186,24 @@ impl RemotesView {
                 if r.clicked() {
                     acts.push(Act::Key(Key::Esc));
                 }
+                error_rect = error_rect.map(|e| e.union(buttons.union(r.rect)));
             });
         });
+        self.laid.error = error_rect;
         // After the hosts strip's own scroll, so this one wins the list's.
-        if scroll {
-            ui.scroll_to_rect(shown.response.rect, None);
+        // A refused save shows its error with the buttons; otherwise the
+        // active field, which on opening is Name at the top of the form.
+        let error_to = error_rect.filter(|_| show_error > 0);
+        if let Some(to) = error_to {
+            // At once, not animated: the buttons must be there for the next
+            // click, not on their way. Again next frame until they are.
+            ui.scroll_to_rect_animation(to, None, egui::style::ScrollAnimation::none());
+            if !ui.clip_rect().contains_rect(to) {
+                self.show_error = show_error - 1;
+                ctx.request_repaint();
+            }
+        } else if scroll {
+            ui.scroll_to_rect(active_rect.unwrap_or(shown.response.rect), None);
         }
         ui.add_space(4.0);
     }
@@ -975,7 +1214,7 @@ const ROW_H: f32 = 42.0;
 /// Row text inset, the Keybindings pane's.
 const ROW_PAD: f32 = 6.0;
 /// The line reserved under each row, and for the hosts strip.
-const LINE_H: f32 = 18.0;
+pub(crate) const LINE_H: f32 = 18.0;
 /// The form's label column.
 pub(crate) const LABEL_W: f32 = 52.0;
 pub(crate) const FORM_GAP: f32 = 8.0;
@@ -997,6 +1236,11 @@ fn one_line(
     ui.painter().layout_job(job)
 }
 
+/// The form's label font: every label must fit [`LABEL_W`] in it.
+pub(crate) fn label_font() -> egui::FontId {
+    egui::FontId::proportional(11.5)
+}
+
 /// A form row: a dim label in a fixed column, then the field.
 pub(crate) fn form_row<R>(
     ui: &mut egui::Ui,
@@ -1011,7 +1255,7 @@ pub(crate) fn form_row<R>(
             r.left_center(),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(11.5),
+            label_font(),
             color,
         );
         field(ui)
@@ -1019,17 +1263,19 @@ pub(crate) fn form_row<R>(
     .inner
 }
 
-/// The line under a row for its Test or reach reason. Always there, so a
-/// result arriving does not push the rows below down; a long one wraps,
-/// indented by layout so its wrapped lines keep the row's text edge.
-fn status_line(ui: &mut egui::Ui, status: Option<(String, egui::Color32)>) {
-    ui.horizontal_top(|ui| {
-        ui.set_min_height(LINE_H);
+/// The line under a row for its Test or reach reason. Always there and
+/// always one line, so a result arriving or the selection passing never
+/// moves the rows below; a long one is cut with "…", whole on hover.
+fn status_line(ui: &mut egui::Ui, status: Option<(String, egui::Color32)>) -> egui::Rect {
+    ui.horizontal(|ui| {
+        ui.set_height(LINE_H);
         ui.add_space(ROW_PAD);
         if let Some((text, color)) = status {
-            ui.add(egui::Label::new(egui::RichText::new(text).color(color).size(11.0)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(text).color(color).size(11.0)).truncate());
         }
-    });
+    })
+    .response
+    .rect
 }
 
 /// A mouse action, applied after the rows are drawn so the draw never
@@ -1042,6 +1288,7 @@ enum Act {
     Test(usize),
     Field(Field),
     Accept(String),
+    ClearDir(usize),
     /// Same path as the keyboard (Save, Cancel, confirm delete).
     Key(Key),
 }
@@ -1139,6 +1386,7 @@ mod tests {
             match field {
                 Field::Name => d.name = text.into(),
                 Field::Target => d.target = text.into(),
+                Field::Dir(k) => d.dirs[k].remote = text.into(),
                 Field::Shell => {}
             }
         }
@@ -1186,6 +1434,98 @@ mod tests {
         assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
         assert_eq!(list[0].name, "desk2");
         assert_eq!(list[0].dirs[r"H:\src"], "/home/andy/src");
+    }
+
+    fn mapped() -> Remote {
+        let mut desk = r("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/app".into());
+        desk.dirs
+            .insert(r"\\?\H:\src\tool".into(), "/srv/tool".into());
+        desk
+    }
+
+    #[test]
+    fn a_project_directory_is_edited_in_the_form_and_saved() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        assert_eq!(draft(&v).dirs.len(), 2);
+        // Tab walks Name, Target, Shell, then each directory.
+        for _ in 0..3 {
+            v.key(Key::Tab, &mut list);
+        }
+        assert_eq!(draft(&v).field, Field::Dir(0));
+        typed(&mut v, Field::Dir(0), "  /home/andy/app  ");
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert_eq!(list[0].dirs[r"H:\src\app"], "/home/andy/app");
+        // Saving rewrites an old verbatim key in the plain spelling.
+        assert_eq!(list[0].dirs[r"H:\src\tool"], "/srv/tool");
+        assert!(!list[0].dirs.contains_key(r"\\?\H:\src\tool"));
+        assert_eq!(list[0].dirs.len(), 2);
+    }
+
+    #[test]
+    fn a_cleared_project_directory_is_forgotten_so_the_prompt_asks_again() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        let Mode::Edit(d) = &mut v.mode else { panic!() };
+        d.field = Field::Dir(1);
+        d.clear_dir(1);
+        assert_eq!(d.field, Field::Dir(0), "focus stays on a row that exists");
+        d.clear_dir(0);
+        assert_eq!(d.field, Field::Shell);
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert!(list[0].dirs.is_empty(), "{:?}", list[0].dirs);
+        let e = crate::remote::launch_dir(&list[0], None, Some(r"H:\src\app")).unwrap_err();
+        assert!(e.contains("prompt"), "{e}");
+    }
+
+    #[test]
+    fn cancel_keeps_the_mappings_and_a_bad_directory_is_refused() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        let Mode::Edit(d) = &mut v.mode else { panic!() };
+        d.clear_dir(0);
+        v.key(Key::Esc, &mut list);
+        assert_eq!(list[0], mapped(), "cancel saves nothing");
+        v.key(Key::Enter, &mut list);
+        typed(&mut v, Field::Dir(1), "/a\tb");
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
+        let d = draft(&v);
+        assert_eq!(d.field, Field::Dir(1), "focus moves to the bad directory");
+        assert!(
+            d.error
+                .as_deref()
+                .is_some_and(|e| e.contains(r"H:\src\tool")),
+            "{:?}",
+            d.error
+        );
+        assert_eq!(list[0], mapped());
+    }
+
+    #[test]
+    fn a_mapping_added_while_the_form_is_open_survives_its_save() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        // The directory prompt answers for another Project meanwhile.
+        list[0].dirs.insert(r"H:\src\new".into(), "/srv/new".into());
+        let Mode::Edit(d) = &mut v.mode else { panic!() };
+        d.clear_dir(0);
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert_eq!(list[0].dirs[r"H:\src\new"], "/srv/new");
+        assert!(!list[0].dirs.contains_key(r"H:\src\app"));
+    }
+
+    #[test]
+    fn tab_order_wraps_through_the_directory_fields() {
+        assert_eq!(Field::Shell.step(true, 0), Field::Name);
+        assert_eq!(Field::Shell.step(true, 2), Field::Dir(0));
+        assert_eq!(Field::Dir(1).step(true, 2), Field::Name);
+        assert_eq!(Field::Name.step(false, 2), Field::Dir(1));
+        assert_eq!(Field::Dir(0).step(false, 2), Field::Shell);
     }
 
     fn draft(v: &RemotesView) -> &Draft {

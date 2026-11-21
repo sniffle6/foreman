@@ -1564,6 +1564,123 @@ mod tests {
         }
     }
 
+    /// At the narrowest pane the hint and every row's status line stay one
+    /// line tall in each state, so nothing below them moves when the state
+    /// changes or a long Test result lands.
+    #[test]
+    fn remotes_pane_hint_and_status_are_one_line_at_minimum_width() {
+        use crate::remotes_pane::LINE_H;
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let none = egui::Modifiers::NONE;
+        let one_line = |menu: &SettingsMenu, state: &str| {
+            let laid = menu.remotes.laid();
+            assert!(
+                laid.hint.height() > 0.0 && laid.hint.height() < 16.0,
+                "{state}: hint {:?}",
+                laid.hint
+            );
+            assert!(laid.hint_fits, "{state}: the hint is cut at {:?}", laid.pane);
+            for r in &laid.status {
+                assert!(r.height() <= LINE_H + 0.5, "{state}: status {r:?}");
+            }
+        };
+        // No Remotes: the Add-row hint.
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings::default();
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        one_line(&menu, "empty");
+
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![
+                remote("desk", "someone@a-very-long-host-name.example.internal.lan"),
+                remote("pi", "pi"),
+            ],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        // The longest results there are, on both rows.
+        menu.remotes.set_test_result(
+            "someone@a-very-long-host-name.example.internal.lan",
+            crate::remote_probe::TestOutcome::NeedsLogin,
+        );
+        menu.remotes.set_test_result(
+            "pi",
+            crate::remote_probe::TestOutcome::Ok(crate::remote_probe::TestReport {
+                shell: crate::remote::RemoteShell::Posix,
+                login_shell: Some("/usr/local/bin/a-rather-long-shell-path".into()),
+                curl: false,
+                agents: vec!["claude".into()],
+            }),
+        );
+        for (key, state) in [
+            (None, "row selected"),
+            (Some(egui::Key::Delete), "confirm delete"),
+            (Some(egui::Key::Escape), "kept"),
+            (Some(egui::Key::ArrowDown), "second row"),
+            (Some(egui::Key::ArrowDown), "Add row"),
+            (Some(egui::Key::ArrowUp), "back up"),
+            (Some(egui::Key::Enter), "edit form"),
+        ] {
+            frame_at(&ctx, &mut menu, &mut s, Some(size), key.map(|k| (k, none)));
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+            one_line(&menu, state);
+            if key.is_none() {
+                assert_eq!(menu.remotes.laid().status.len(), 2);
+            }
+        }
+        assert!(menu.remotes.is_editing());
+    }
+
+    /// A refused save at the smallest pane: the error shows and the save and
+    /// cancel buttons are still on screen, not under the list's scroll edge.
+    #[test]
+    fn remotes_form_buttons_stay_on_screen_with_an_error() {
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "desk");
+        for i in 0..4 {
+            desk.dirs
+                .insert(format!(r"H:\src\project-{i}"), format!("/srv/project-{i}"));
+        }
+        // A directory no save accepts, so Enter is refused.
+        desk.dirs.insert(r"H:\src\zz".into(), "/a\tb".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let enter = Some((egui::Key::Enter, egui::Modifiers::NONE));
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), enter);
+        assert!(menu.remotes.is_editing());
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), enter);
+        for _ in 0..3 {
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        }
+        assert!(menu.remotes.is_editing(), "the save was refused");
+        let laid = menu.remotes.laid();
+        let error = laid.error.expect("the error shows");
+        assert!(
+            laid.list.contains_rect(error),
+            "{error:?} not in {:?}",
+            laid.list
+        );
+        let buttons = &laid.form[laid.form.len() - 2..];
+        for b in buttons {
+            assert!(laid.list.contains_rect(*b), "{b:?} not in {:?}", laid.list);
+            assert!(laid.pane.contains_rect(*b), "{b:?}");
+        }
+    }
+
     #[test]
     fn ctrl_d_does_not_ask_to_delete_a_remote() {
         let mut menu = SettingsMenu::new();

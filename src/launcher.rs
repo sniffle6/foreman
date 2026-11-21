@@ -6,7 +6,7 @@ use crate::remote_probe::Reach;
 use crate::terminal::Shell;
 use std::collections::HashSet;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Launch {
     /// On this PC.
     Agent(SessionKind),
@@ -18,9 +18,10 @@ pub enum Launch {
     RemoteShell,
     /// The "+" itself: the default shell wherever the where-strip points.
     Default,
-    /// Point the Project's where-strip at this PC (`None`) or at
-    /// `Settings::remotes[i]` as listed this frame. Opens nothing.
-    Where(Option<usize>),
+    /// Point the Project's where-strip at this PC (`None`) or at the Remote
+    /// of that name. A name, not an index: the act is applied a frame after
+    /// the click, against a list that may have changed. Opens nothing.
+    Where(Option<String>),
     Tool(Tool),
     NewProject,
 }
@@ -31,6 +32,8 @@ pub struct Spot<'a> {
     pub target: &'a str,
     pub shell: crate::remote::RemoteShell,
     pub reach: Reach,
+    /// The SSH port the probe resolved, for the state line.
+    pub port: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,6 +81,7 @@ pub fn menu(
             target: &r.target,
             shell: r.shell,
             reach: crate::remote_probe::reach(ctx, &r.target),
+            port: crate::remote_probe::ssh_port(&r.target),
         })
         .collect();
     let on = launch_on.and_then(|n| {
@@ -119,8 +123,15 @@ pub fn entries_on(
     let mut rows = Vec::new();
     if !spots.is_empty() {
         rows.push(Entry::Strip(strip(spots, on)));
+        rows.push(Entry::Note(state_line(spots, on)));
     }
-    rows.push(Entry::Header("AGENTS"));
+    // Under a Remote the headers say where a launch goes, which is also why
+    // the local shells are gone.
+    let header = |label: &'static str| match on {
+        None => Entry::Header(label),
+        Some(i) => Entry::HeaderText(format!("{label} ON {}", spots[i].name.to_uppercase())),
+    };
+    rows.push(header("AGENTS"));
     for agent in [SessionKind::Claude, SessionKind::Codex, SessionKind::Grok] {
         rows.push(Entry::Item {
             label: agent.label(),
@@ -132,7 +143,7 @@ pub fn entries_on(
             },
         });
     }
-    rows.push(Entry::Header("SHELLS"));
+    rows.push(header("SHELLS"));
     if let Some(i) = on {
         rows.push(Entry::Item {
             label: "Shell",
@@ -178,10 +189,29 @@ pub fn entries_on(
     rows
 }
 
+/// The dim line under the strip: the selected Remote and its state in words,
+/// so the state is not hover-only. Always present while the strip is, so
+/// moving the selection never changes the menu's height.
+fn state_line(spots: &[Spot], on: Option<usize>) -> String {
+    let Some(s) = on.and_then(|i| spots.get(i)) else {
+        return "Local: opens on this PC".into();
+    };
+    let name = s.name;
+    match &s.reach {
+        Reach::Reachable => format!("{name}: reachable"),
+        Reach::Checking => format!("{name}: checking whether it answers…"),
+        Reach::Offline => match s.port {
+            Some(port) => format!("{name}: offline — no answer on port {port}"),
+            None => format!("{name}: offline — no answer on its SSH port"),
+        },
+        Reach::Unknown(why) => format!("{name}: unknown — {why}"),
+    }
+}
+
 /// `Local | desk | laptop …`. Every Remote carries a status glyph (in a slot
 /// that exists before the first answer, so nothing moves when it lands) and
-/// a tooltip that says the state in words. Offline is dimmed, not disabled:
-/// the probe cannot see through a `ProxyJump`.
+/// a short tooltip; the state line under the strip says the rest. Offline is
+/// dimmed, not disabled: the probe cannot see through a `ProxyJump`.
 fn strip(spots: &[Spot], on: Option<usize>) -> Vec<crate::hover_menu::Seg<Launch>> {
     use crate::hover_menu::{Seg, SegMark};
     let mut segs = vec![Seg {
@@ -189,26 +219,33 @@ fn strip(spots: &[Spot], on: Option<usize>) -> Vec<crate::hover_menu::Seg<Launch
         selected: on.is_none(),
         mark: SegMark::None,
         dim: false,
-        tip: "Open on this PC".into(),
+        tip: "This PC".into(),
         act: Launch::Where(None),
     }];
     for (i, s) in spots.iter().enumerate() {
         let (mark, state) = match &s.reach {
-            Reach::Reachable => (SegMark::Up, "reachable".to_string()),
+            Reach::Reachable => (SegMark::Up, "reachable"),
             Reach::Offline => (
                 SegMark::Down,
-                format!("offline. {}", crate::remotes_pane::OFFLINE_WHY),
+                "offline (the check cannot see past a ProxyJump)",
             ),
-            Reach::Checking => (SegMark::Pending, "checking whether it answers…".into()),
-            Reach::Unknown(why) => (SegMark::Unsure, format!("reachability unknown: {why}")),
+            Reach::Checking => (SegMark::Pending, "checking…"),
+            Reach::Unknown(_) => (SegMark::Unsure, "reachability unknown"),
+        };
+        // The label is the name; the tip adds the target only when it says
+        // something the name does not.
+        let tip = if s.target.eq_ignore_ascii_case(s.name) {
+            format!("{}: {state}", s.name)
+        } else {
+            format!("{} ({}): {state}", s.name, s.target)
         };
         segs.push(Seg {
             label: s.name.to_string(),
             selected: on == Some(i),
             mark,
             dim: s.reach == Reach::Offline,
-            tip: format!("Open on {} ({}): {state}", s.name, s.target),
-            act: Launch::Where(Some(i)),
+            tip,
+            act: Launch::Where(Some(s.name.to_string())),
         });
     }
     segs
@@ -260,18 +297,21 @@ mod tests {
                 target: "andy@desk",
                 shell: RemoteShell::Posix,
                 reach: Reach::Reachable,
+                port: Some(22),
             },
             Spot {
                 name: "garage",
                 target: "garage",
                 shell: RemoteShell::Pwsh,
                 reach: Reach::Offline,
+                port: Some(2222),
             },
             Spot {
                 name: "laptop",
                 target: "laptop",
                 shell: RemoteShell::Posix,
                 reach: Reach::Checking,
+                port: None,
             },
         ]
     }
@@ -288,7 +328,7 @@ mod tests {
         assert_eq!(names, ["Local", "desk", "garage", "laptop"]);
         assert!(segs[0].selected && segs.iter().skip(1).all(|s| !s.selected));
         assert_eq!(segs[0].act, Launch::Where(None));
-        assert_eq!(segs[2].act, Launch::Where(Some(1)));
+        assert_eq!(segs[2].act, Launch::Where(Some("garage".into())));
         // Each state has its own glyph and says itself in words.
         let marks: Vec<_> = segs.iter().map(|s| s.mark).collect();
         assert_eq!(
@@ -299,24 +339,46 @@ mod tests {
         assert!(segs[2].dim && !segs[1].dim && !segs[3].dim);
         assert!(segs[2].tip.contains("offline"), "{}", segs[2].tip);
         assert!(segs[3].tip.contains("checking"), "{}", segs[3].tip);
-        // Under Local, the rest of the menu is today's, one row down.
+        // Short tips: the target only where it differs from the name.
+        assert_eq!(segs[1].tip, "desk (andy@desk): reachable");
+        assert_eq!(segs[3].tip, "laptop: checking…");
+        // The state line, under the strip, names where a launch goes.
+        assert!(matches!(&rows[1], Entry::Note(n) if n == "Local: opens on this PC"));
+        // Under Local, the rest of the menu is today's, two rows down.
         let plain = entries(&keymap, Shell::Cmd, &HashSet::new());
-        assert_eq!(rows.len(), plain.len() + 1);
-        assert!(matches!(rows[1], Entry::Header("AGENTS")));
+        assert_eq!(rows.len(), plain.len() + 2);
+        assert!(matches!(rows[2], Entry::Header("AGENTS")));
         assert!(matches!(
-            rows[2],
+            rows[3],
             Entry::Item {
                 act: Launch::Agent(SessionKind::Claude),
                 ..
             }
         ));
         assert!(matches!(
-            rows[6],
+            rows[7],
             Entry::Item {
                 act: Launch::Shell(Shell::PowerShell),
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_state_line_says_the_selected_remote_and_its_state() {
+        let s = spots();
+        assert_eq!(state_line(&s, Some(0)), "desk: reachable");
+        assert_eq!(
+            state_line(&s, Some(1)),
+            "garage: offline — no answer on port 2222"
+        );
+        assert_eq!(
+            state_line(&s, Some(2)),
+            "laptop: checking whether it answers…"
+        );
+        let mut s = spots();
+        s[1].port = None;
+        assert!(state_line(&s, Some(1)).ends_with("its SSH port"));
     }
 
     #[test]
@@ -331,22 +393,27 @@ mod tests {
         let Entry::Strip(segs) = &rows[0] else {
             panic!("the strip comes first")
         };
-        assert!(segs[2].selected && !segs[0].selected, "garage, offline, still selectable");
+        assert!(
+            segs[2].selected && !segs[0].selected,
+            "garage, offline, still selectable"
+        );
+        // The headers say where a launch goes.
+        assert!(matches!(&rows[2], Entry::HeaderText(h) if h == "AGENTS ON GARAGE"));
         for (i, agent) in [SessionKind::Claude, SessionKind::Codex, SessionKind::Grok]
             .into_iter()
             .enumerate()
         {
             assert!(
-                matches!(rows[2 + i], Entry::Item { act, .. } if act == Launch::RemoteAgent(agent))
+                matches!(&rows[3 + i], Entry::Item { act, .. } if *act == Launch::RemoteAgent(agent))
             );
         }
-        assert!(matches!(rows[5], Entry::Header("SHELLS")));
+        assert!(matches!(&rows[6], Entry::HeaderText(h) if h == "SHELLS ON GARAGE"));
         assert!(matches!(
-            &rows[6],
+            &rows[7],
             Entry::Item { label: "Shell", act: Launch::RemoteShell, hint: Some(h), .. }
                 if h == "(PowerShell)"
         ));
-        assert!(matches!(rows[7], Entry::Header("PROJECT")));
+        assert!(matches!(rows[8], Entry::Header("PROJECT")));
         // A stale index reads as Local.
         let rows = entries_on(
             &Keymap::default(),
@@ -356,8 +423,9 @@ mod tests {
             Some(9),
         );
         assert!(matches!(&rows[0], Entry::Strip(s) if s[0].selected));
+        assert!(matches!(rows[2], Entry::Header("AGENTS")));
         assert!(matches!(
-            rows[2],
+            rows[3],
             Entry::Item {
                 act: Launch::Agent(_),
                 ..

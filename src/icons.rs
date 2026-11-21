@@ -288,6 +288,35 @@ pub fn globe_badge_rect(icon: egui::Rect, ppp: f32) -> (egui::Rect, u32) {
     (egui::Rect::from_min_size(min, egui::vec2(d, d)), px)
 }
 
+/// Paint the disconnected mark over the top-right corner of a tab/row
+/// `icon`: a dot of `color` (the theme's danger) on a ring of `backing`. It
+/// is the cue that survives a cut title, where the text marker at the end
+/// is the first thing to go. Clear of the globe at the bottom-right.
+pub fn paint_down_dot(
+    p: &egui::Painter,
+    ctx: &egui::Context,
+    icon: egui::Rect,
+    color: egui::Color32,
+    backing: egui::Color32,
+) -> egui::Rect {
+    let ppp = ctx.pixels_per_point();
+    let rect = down_dot_rect(icon, ppp);
+    p.circle_filled(rect.center(), rect.width() / 2.0 + 1.0 / ppp, backing);
+    p.circle_filled(rect.center(), rect.width() / 2.0, color);
+    rect
+}
+
+/// Where [`paint_down_dot`] goes over `icon`: size and origin on whole
+/// device pixels, like [`globe_badge_rect`], so the dot's edge stays crisp.
+pub fn down_dot_rect(icon: egui::Rect, ppp: f32) -> egui::Rect {
+    let px = (icon.width() * 0.4 * ppp).round().max(4.0);
+    let d = px / ppp;
+    let c = icon.right_top() + egui::vec2(-d * 0.3, d * 0.3);
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let min = egui::pos2(snap(c.x - d / 2.0), snap(c.y - d / 2.0));
+    egui::Rect::from_min_size(min, egui::vec2(d, d))
+}
+
 /// Render an SVG (square viewBox) to a `px`×`px` unmultiplied-RGBA image.
 fn rasterize(svg: &str, px: u32) -> egui::ColorImage {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px).expect("nonzero icon size");
@@ -319,6 +348,29 @@ mod tests {
 
     fn opaque_pixels(img: &egui::ColorImage) -> usize {
         img.pixels.iter().filter(|p| p.a() > 0).count()
+    }
+
+    #[test]
+    fn the_down_dot_is_crisp_and_clear_of_the_globe() {
+        let whole = |v: f32| (v - v.round()).abs() < 1e-3;
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            for size in [12.0, 14.0] {
+                for at in [egui::pos2(10.0, 4.0), egui::pos2(37.3, 11.6)] {
+                    let icon = egui::Rect::from_min_size(at, egui::vec2(size, size));
+                    let dot = down_dot_rect(icon, ppp);
+                    let (globe, _) = globe_badge_rect(icon, ppp);
+                    assert!(whole(dot.min.x * ppp) && whole(dot.min.y * ppp));
+                    assert!(whole(dot.width() * ppp), "{dot:?} at {ppp}");
+                    // Its backing ring included, it does not cover the globe.
+                    let ring = dot.expand(1.0 / ppp);
+                    let overlap = ring.intersect(globe);
+                    assert!(
+                        overlap.width() <= 0.0 || overlap.height() <= 0.0,
+                        "{ring:?} over {globe:?} at {ppp}x, {size} pt"
+                    );
+                }
+            }
+        }
     }
 
     /// The badge maps 1:1 onto device pixels at every common scale, for the

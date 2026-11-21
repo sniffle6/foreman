@@ -175,8 +175,11 @@ the brief by chat. It never truncates. `Posix` has no practical cap.
 
 **Directory.** The first launch on a Remote from a Project with no mapping
 asks once in a small text prompt and saves the answer to `Remote::dirs`.
-Splits always use the mapping, not wherever the Remote shell has `cd`'d to
-(there is no OSC 7 tracking).
+The prompt names what it is about to open and where ("Split right: open a
+shell on desk"), and says the answer is changed in Settings > Remotes, whose
+edit form lists each Project directory with its Remote directory to edit or
+clear. Splits always use the mapping, not wherever the Remote shell has
+`cd`'d to (there is no OSC 7 tracking).
 
 ## The way back
 
@@ -275,10 +278,13 @@ is now):
 ```
 
 The selection is per Project, lasts for the app run, and starts at Local.
-Past the width that fits, the strip scrolls sideways (Shift+wheel or drag)
-and long names are cut with "…" (full name in the tooltip). Built that way
-instead of a dropdown: a dropdown inside a hover menu is a second popup
-that closes the first.
+Past the width that fits, the strip scrolls sideways (Shift+wheel or drag),
+fades at an edge with more past it, and long names are cut with "…" (full
+name in the tooltip). Built that way instead of a dropdown: a dropdown
+inside a hover menu is a second popup that closes the first. One dim line
+under the strip says the selection's state in words ("desk: offline — no
+answer on port 22"), and under a Remote the headers read "AGENTS ON DESK" /
+"SHELLS ON DESK".
 
 **Reachability.** `ssh -G <target>` resolves the real host and port once per
 target; a TCP connect with a short timeout answers reachable or offline.
@@ -289,6 +295,10 @@ clickable, because the probe cannot see through `ProxyJump`.
 **Globe.** A small globe overlays the corner of the tab icon and the
 Sessions-panel row icon; the agent logo stays. Tooltip: name and target.
 One white-silhouette SVG in `assets/icons/`, tinted like the rest.
+
+**Splits inherit, but never redirect.** A split from a Session whose Remote
+was deleted, or whose name now points at another target, opens Local with a
+toast saying so.
 
 **Splits inherit.** Splitting or adding a terminal while a Remote Session is
 focused opens on that Remote. Anything else opens Local. A Remote is never
@@ -309,7 +319,9 @@ of the name.
 
 **Disconnect.** When a Remote Session's `ssh` exits, the Win stays, shows a
 one-line "Disconnected from desk — Enter to reconnect" bar, and writes
-nothing to the PTY. Selection, copy, scrollback and search stay live, so
+nothing to the PTY. A danger dot on the top corner of the tab and row icon
+says the same thing where the title is cut. Selection, copy, scrollback and
+search stay live, so
 the ssh error can be copied. A fresh Enter (not key repeat) or a click on
 the bar relaunches the same Remote and directory; the tab title and the
 Sessions-panel row read "disconnected" until then. An agent Session

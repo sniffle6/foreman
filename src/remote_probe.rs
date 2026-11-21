@@ -126,6 +126,15 @@ impl ReachCache {
         (e.reach.clone().unwrap_or(Reach::Checking), job)
     }
 
+    /// The SSH port the last resolve found for `target`; `None` before the
+    /// first resolve or behind a proxy hop.
+    pub fn port(&self, target: &str) -> Option<u16> {
+        match self.entries.get(target)?.endpoint.as_ref()? {
+            Endpoint::Direct { port, .. } => Some(*port),
+            Endpoint::Proxied => None,
+        }
+    }
+
     pub fn finish(&mut self, target: &str, endpoint: Option<Endpoint>, reach: Reach, now: Instant) {
         let e = self.entries.entry(target.to_string()).or_default();
         if endpoint.is_some() {
@@ -166,6 +175,14 @@ pub fn reach(ctx: &egui::Context, target: &str) -> Reach {
     }
     ctx.request_repaint_after(REACH_TTL);
     reach
+}
+
+/// The SSH port [`reach`] probes for `target`, once it has resolved it.
+pub fn ssh_port(target: &str) -> Option<u16> {
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .port(target)
 }
 
 fn run_reach(job: &Job) -> (Option<Endpoint>, Reach) {

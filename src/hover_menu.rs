@@ -4,6 +4,9 @@ use eframe::egui;
 
 pub enum Entry<A> {
     Header(&'static str),
+    /// A header built at run time ("AGENTS ON DESK"). It does not widen the
+    /// menu: past the width it is cut with "…".
+    HeaderText(String),
     Item {
         label: &'static str,
         hint: Option<String>,
@@ -13,6 +16,9 @@ pub enum Entry<A> {
     /// Choices side by side (the launcher's where-strip). A click returns
     /// its act and keeps the menu open. Too many to fit scroll sideways.
     Strip(Vec<Seg<A>>),
+    /// One dim line of state (under the where-strip). Fixed height and cut
+    /// to the menu's width, so a change of text never moves or widens it.
+    Note(String),
     Divider,
 }
 
@@ -53,6 +59,34 @@ const MARK_SLOT: f32 = 11.0;
 /// Widest the strip may make the menu before it scrolls instead.
 const STRIP_MAX_W: f32 = 280.0;
 const STRIP_H: f32 = 28.0;
+const NOTE_H: f32 = 16.0;
+/// How far a strip's overflow fade reaches in from the cut edge.
+const FADE_W: f32 = 18.0;
+
+/// Which edges of a horizontally scrolled strip have more segments past
+/// them: `(left, right)`.
+fn overflow(offset_x: f32, view_w: f32, content_w: f32) -> (bool, bool) {
+    (offset_x > 0.5, offset_x + view_w < content_w - 0.5)
+}
+
+/// Fade the strip into the menu background at a cut edge, so the cut reads
+/// as "more this way" instead of a clipped segment.
+fn paint_fade(p: &egui::Painter, strip: egui::Rect, left: bool, bg: egui::Color32) {
+    let (x0, x1) = if left {
+        (strip.min.x, strip.min.x + FADE_W)
+    } else {
+        (strip.max.x, strip.max.x - FADE_W)
+    };
+    let clear = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 0);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(x0, strip.min.y), bg);
+    mesh.colored_vertex(egui::pos2(x0, strip.max.y), bg);
+    mesh.colored_vertex(egui::pos2(x1, strip.min.y), clear);
+    mesh.colored_vertex(egui::pos2(x1, strip.max.y), clear);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    p.add(egui::Shape::mesh(mesh));
+}
 
 /// The menu's width: its rows' own, widened by a strip up to
 /// [`STRIP_MAX_W`] (past it the strip scrolls), and never wider than the
@@ -141,7 +175,7 @@ pub fn show<A: Clone>(
                     .size()
                     .x
             }
-            Entry::Divider | Entry::Strip(_) => 0.0,
+            Entry::HeaderText(_) | Entry::Note(_) | Entry::Divider | Entry::Strip(_) => 0.0,
         })
         .fold(0.0f32, f32::max);
     // Each strip label's natural width, laid out once for sizing and drawing.
@@ -190,7 +224,8 @@ pub fn show<A: Clone>(
         (label_w + if hint_w > 0.0 { hint_w + 40.0 } else { 0.0 } + pad * 2.0 + 16.0).max(100.0);
     let w = menu_width(rows_w, strip_w + (pad - SEG_PAD) * 2.0, area.width());
     let height = |entry: &Entry<A>| match entry {
-        Entry::Header(_) => 19.0,
+        Entry::Header(_) | Entry::HeaderText(_) => 19.0,
+        Entry::Note(_) => NOTE_H,
         Entry::Item { .. } => 22.0,
         Entry::Strip(_) => STRIP_H,
         Entry::Divider => 10.0,
@@ -240,6 +275,19 @@ pub fn show<A: Clone>(
                             th.dim,
                         );
                     }
+                    Entry::HeaderText(text) | Entry::Note(text) => {
+                        let mut job = egui::text::LayoutJob::simple_singleline(
+                            text.clone(),
+                            small.clone(),
+                            th.dim,
+                        );
+                        job.wrap = egui::text::TextWrapping::truncate_at_width(
+                            (rr.width() - pad * 2.0).max(0.0),
+                        );
+                        let galley = mui.painter().layout_job(job);
+                        let at = egui::pos2(rr.min.x + pad, rr.center().y - galley.size().y / 2.0);
+                        mui.painter().galley(at, galley, th.dim);
+                    }
                     Entry::Strip(segs) => {
                         let inset = pad - SEG_PAD;
                         let strip = egui::Rect::from_min_max(
@@ -251,7 +299,14 @@ pub fn show<A: Clone>(
                                 .max_rect(strip)
                                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
-                        egui::ScrollArea::horizontal()
+                        // Scroll the selection into view when the menu opens
+                        // and whenever it changes, not only on open.
+                        let sel_id = menu_id.with(("strip_sel", ri));
+                        let sel = segs.iter().position(|s| s.selected);
+                        let follow = !was_open
+                            || mui.ctx().data(|d| d.get_temp::<Option<usize>>(sel_id)) != Some(sel);
+                        mui.ctx().data_mut(|d| d.insert_temp(sel_id, sel));
+                        let out = egui::ScrollArea::horizontal()
                             .id_salt(menu_id.with(("strip", ri)))
                             .auto_shrink([false, true])
                             .show(&mut sui, |sui| {
@@ -275,7 +330,7 @@ pub fn show<A: Clone>(
                                             egui::Stroke::new(1.0, th.border_focus),
                                             egui::StrokeKind::Inside,
                                         );
-                                        if !was_open {
+                                        if follow {
                                             sui.scroll_to_rect(sr, None);
                                         }
                                     } else if resp.hovered() {
@@ -310,6 +365,18 @@ pub fn show<A: Clone>(
                                     }
                                 }
                             });
+                        let (more_left, more_right) = overflow(
+                            out.state.offset.x,
+                            out.inner_rect.width(),
+                            out.content_size.x,
+                        );
+                        let fp = mui.painter_at(out.inner_rect);
+                        if more_left {
+                            paint_fade(&fp, out.inner_rect, true, th.bg);
+                        }
+                        if more_right {
+                            paint_fade(&fp, out.inner_rect, false, th.bg);
+                        }
                     }
                     Entry::Divider => {
                         mui.painter().line_segment(
@@ -406,6 +473,18 @@ mod tests {
     }
 
     #[test]
+    fn a_strip_wider_than_its_view_shows_which_edges_have_more() {
+        // Fits: no cue.
+        assert_eq!(overflow(0.0, 280.0, 200.0), (false, false));
+        // Scrolled to the start of a long strip: more to the right only.
+        assert_eq!(overflow(0.0, 280.0, 900.0), (false, true));
+        // In the middle: both ways.
+        assert_eq!(overflow(300.0, 280.0, 900.0), (true, true));
+        // At the end: more to the left only.
+        assert_eq!(overflow(620.0, 280.0, 900.0), (true, false));
+    }
+
+    #[test]
     fn a_long_name_is_cut_and_every_remote_reserves_its_status_slot() {
         let long = seg(&"x".repeat(200), SegMark::Pending);
         assert_eq!(
@@ -414,10 +493,21 @@ mod tests {
         );
         // The slot is there before the first answer, so nothing moves when
         // it lands.
-        for mark in [SegMark::Pending, SegMark::Up, SegMark::Down, SegMark::Unsure] {
-            assert_eq!(seg_width(&seg("desk", mark), 30.0), 30.0 + SEG_PAD * 2.0 + MARK_SLOT);
+        for mark in [
+            SegMark::Pending,
+            SegMark::Up,
+            SegMark::Down,
+            SegMark::Unsure,
+        ] {
+            assert_eq!(
+                seg_width(&seg("desk", mark), 30.0),
+                30.0 + SEG_PAD * 2.0 + MARK_SLOT
+            );
         }
-        assert_eq!(seg_width(&seg("Local", SegMark::None), 30.0), 30.0 + SEG_PAD * 2.0);
+        assert_eq!(
+            seg_width(&seg("Local", SegMark::None), 30.0),
+            30.0 + SEG_PAD * 2.0
+        );
     }
 
     #[test]
@@ -458,9 +548,7 @@ mod tests {
                 );
             });
         }
-        let rect = ctx
-            .memory(|m| m.area_rect(id))
-            .expect("the menu drew");
+        let rect = ctx.memory(|m| m.area_rect(id)).expect("the menu drew");
         assert!(rect.width() <= STRIP_MAX_W + 0.5, "{rect:?}");
         assert!(area.contains_rect(rect), "{rect:?}");
     }

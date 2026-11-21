@@ -206,14 +206,21 @@ pub fn reconnect_argv(original: &[String]) -> Vec<String> {
 /// returns) do not make a different Project directory.
 pub fn same_dir(a: &str, b: &str) -> bool {
     let norm = |s: &str| {
-        let s = s.replace('/', "\\");
-        let s = match s.strip_prefix(r"\\?\UNC\") {
-            Some(rest) => format!(r"\\{rest}"),
-            None => s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s),
-        };
+        let s = plain_dir(&s.replace('/', "\\"));
         s.trim_end_matches('\\').to_string()
     };
     norm(a).eq_ignore_ascii_case(&norm(b))
+}
+
+/// `dir` without a `\\?\` verbatim prefix (`\\?\UNC\x` becomes `\\x`): the
+/// spelling a `Remote::dirs` key is written in, so settings.json and the
+/// Remotes pane show the path the user knows. Old verbatim keys still match
+/// through [`same_dir`].
+pub fn plain_dir(dir: &str) -> String {
+    match dir.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => dir.strip_prefix(r"\\?\").unwrap_or(dir).to_string(),
+    }
 }
 
 /// The directory on `remote` a launch from a Project at `project_dir` runs
@@ -978,6 +985,14 @@ mod tests {
         );
         let e = launch_dir(&r, None, None).unwrap_err();
         assert!(e.contains("--cwd"), "{e}");
+    }
+
+    #[test]
+    fn a_dirs_key_is_written_without_the_verbatim_prefix() {
+        assert_eq!(plain_dir(r"\\?\H:\src\app"), r"H:\src\app");
+        assert_eq!(plain_dir(r"\\?\UNC\nas\share"), r"\\nas\share");
+        assert_eq!(plain_dir(r"H:\src\app"), r"H:\src\app");
+        assert!(same_dir(&plain_dir(r"\\?\H:\src\app"), r"\\?\H:\src\app\"));
     }
 
     #[test]

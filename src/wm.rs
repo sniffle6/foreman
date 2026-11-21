@@ -335,6 +335,12 @@ impl Content {
         }
     }
 
+    /// A Remote Session whose connection is down: its icon wears the danger
+    /// dot, which survives a title cut before its text marker.
+    fn disconnected(&self) -> bool {
+        matches!(self, Content::Terminal(s) if s.disconnected())
+    }
+
     /// Whether this content is a terminal with a latched Bell. Projects do
     /// not bubble up on window chrome (the panel carries project-level Bell).
     fn bell_active(&self) -> bool {
@@ -3131,14 +3137,51 @@ impl WindowManager {
         Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
     }
 
-    /// The Remote the focused Session runs on: what a split or new terminal
-    /// inherits. Anything else (a local Session, a tool Win, nothing
-    /// focused) is `None`, so a Remote is never chosen by a default.
-    fn focused_remote(&self) -> Option<String> {
-        let w = self.windows.iter().find(|w| Some(w.id) == self.focused)?;
-        match &w.tabs[w.active].content {
-            Content::Terminal(s) => s.remote().map(str::to_string),
-            _ => None,
+    /// What a split or new terminal from the focused Session opens on: its
+    /// Remote, while that is still the same Remote. Anything else (a local
+    /// Session, a tool Win, nothing focused) is Local, so a Remote is never
+    /// chosen by a default.
+    fn inherited(&self, ctx: &egui::Context) -> Inherit {
+        let from = self
+            .windows
+            .iter()
+            .find(|w| Some(w.id) == self.focused)
+            .and_then(|w| match &w.tabs[w.active].content {
+                Content::Terminal(s) => s.remote().map(|r| (r, s.remote_target())),
+                _ => None,
+            });
+        inherit(&crate::config::live(ctx).remotes, from)
+    }
+
+    /// [`Self::inherited`] as the name to open on, toasting a fallback.
+    fn inherited_remote(&self, ctx: &egui::Context) -> Option<String> {
+        match self.inherited(ctx) {
+            Inherit::Local => None,
+            Inherit::Remote(name) => Some(name),
+            Inherit::Fallback(why) => {
+                crate::notify::queue(ctx, crate::notify::Level::Warning, why);
+                None
+            }
+        }
+    }
+
+    /// Forget a where-strip selection whose Remote is gone, here and in
+    /// every nested Project, so re-adding a Remote of that name later does
+    /// not silently select it again.
+    fn prune_launch_on(&mut self, remotes: &[crate::remote::Remote]) {
+        if self
+            .launch_on
+            .as_deref()
+            .is_some_and(|n| crate::remote::find(remotes, n).is_err())
+        {
+            self.launch_on = None;
+        }
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Project(child) = &mut t.content {
+                    child.prune_launch_on(remotes);
+                }
+            }
         }
     }
 
@@ -3195,7 +3238,8 @@ impl WindowManager {
                     Some(crate::remote_dir_prompt::Ask {
                         remote: remote.name.clone(),
                         shell: remote.shell,
-                        project_dir,
+                        // The spelling the prompt shows and the mapping saves.
+                        project_dir: crate::remote::plain_dir(&project_dir),
                         project,
                         what,
                         place,
@@ -3254,7 +3298,7 @@ impl WindowManager {
     /// Leader N: a new terminal on the focused Session's Remote, else the
     /// local default shell. `Some` asks the desktop for a directory first.
     fn new_terminal(&mut self, ctx: &egui::Context) -> Option<crate::remote_dir_prompt::Ask> {
-        if let Some(name) = self.focused_remote() {
+        if let Some(name) = self.inherited_remote(ctx) {
             return self.start_remote(
                 &name,
                 crate::remote_dir_prompt::What::Shell,
@@ -3375,12 +3419,15 @@ impl WindowManager {
             None => crate::remote::launch_dir(&remote, None, project_dir.as_deref())?.to_string(),
         };
         let argv = crate::remote::reconnect_argv(&original);
+        // A restored Session that never connected says "connecting", as its
+        // bar said "Enter to connect".
+        let ran = s.ever_connected();
         // The at-launch rule is "a brief rides on this launch". A reconnect
         // never resends the brief, so the note waits for the first chat
         // delivery after the reconnect.
         let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, false, ctx)?;
         fresh.set_term_id(id);
-        fresh.inject_note(&reconnect_banner(&remote.name, &argv));
+        fresh.inject_note(&reconnect_banner(&remote.name, &argv, ran));
         let Some((win, tab)) = self.terminal_location(id) else {
             return Ok(());
         };
@@ -5019,6 +5066,7 @@ impl WindowManager {
                             bell: t.content.bell_active(),
                             agent: t.content.agent_badge(),
                             remote: t.content.remote().map(str::to_owned),
+                            disconnected: t.content.disconnected(),
                             rank: t.panel_order,
                             uid: t.tab_uid,
                         });
@@ -5504,11 +5552,11 @@ impl WindowManager {
         let mut ask = None;
         match launch {
             // A strip click only moves the selection: no spawn, no surfacing.
-            Launch::Where(i) => {
-                inner.launch_on = i.and_then(|i| {
-                    crate::config::live(ctx)
-                        .remotes
-                        .get(i)
+            // A Remote deleted since the click reads as Local.
+            Launch::Where(name) => {
+                inner.launch_on = name.and_then(|n| {
+                    crate::remote::find(&crate::config::live(ctx).remotes, &n)
+                        .ok()
                         .map(|r| r.name.clone())
                 });
                 return;
@@ -5582,6 +5630,7 @@ impl WindowManager {
     /// then run the launch that asked. The mapping goes through the settings
     /// seed, like a Settings edit, so main.rs writes settings.json.
     fn answer_dir(&mut self, ask: crate::remote_dir_prompt::Ask, dir: String, ctx: &egui::Context) {
+        use crate::notify::{Level, queue};
         let mut settings = (*crate::config::live(ctx)).clone();
         let Some(remote) = settings
             .remotes
@@ -5595,18 +5644,55 @@ impl WindowManager {
             );
             return;
         };
-        // One key per Project directory, however it was spelled before.
+        // One key per Project directory, however it was spelled before, and
+        // written without a verbatim prefix.
+        let key = crate::remote::plain_dir(&ask.project_dir);
+        // Settings may have answered for this Project while the prompt was
+        // up; the prompt's answer wins, but not silently.
+        let earlier = remote
+            .dirs
+            .iter()
+            .find(|(seat, _)| crate::remote::same_dir(seat, &key))
+            .map(|(_, d)| d.clone());
         remote
             .dirs
-            .retain(|seat, _| !crate::remote::same_dir(seat, &ask.project_dir));
-        remote.dirs.insert(ask.project_dir.clone(), dir.clone());
+            .retain(|seat, _| !crate::remote::same_dir(seat, &key));
+        remote.dirs.insert(key.clone(), dir.clone());
         let remote = remote.clone();
         crate::config::seed_live(ctx, &settings);
+        let shown = |d: &str| {
+            if d.is_empty() {
+                "the home directory".to_string()
+            } else {
+                d.to_string()
+            }
+        };
+        if let Some(old) = earlier.filter(|old| *old != dir) {
+            queue(
+                ctx,
+                Level::Warning,
+                format!(
+                    "{key} on {} was set to {} in Settings meanwhile; it is now {}",
+                    remote.name,
+                    shown(&old),
+                    shown(&dir)
+                ),
+            );
+        }
         let Some(child) = self.child_tagged_mut(&ask.project) else {
-            return; // The Project closed while the prompt was up.
+            queue(
+                ctx,
+                Level::Warning,
+                format!(
+                    "Saved {} for {key} on {}, but the Project closed, so nothing opened",
+                    shown(&dir),
+                    remote.name
+                ),
+            );
+            return;
         };
         if let Err(e) = child.open_remote_win(&remote, &dir, ask.what, ask.place, ctx) {
-            crate::notify::queue(ctx, crate::notify::Level::Error, e);
+            queue(ctx, Level::Error, e);
         }
     }
 
@@ -7285,7 +7371,7 @@ impl WindowManager {
     /// on the focused Session's Remote when it has one. `Some` asks the
     /// desktop for that Remote's directory first.
     fn split_dir(&mut self, d: Dir, ctx: &egui::Context) -> Option<crate::remote_dir_prompt::Ask> {
-        if let Some(name) = self.focused_remote() {
+        if let Some(name) = self.inherited_remote(ctx) {
             return self.start_remote(
                 &name,
                 crate::remote_dir_prompt::What::Shell,
@@ -7839,6 +7925,7 @@ impl WindowManager {
         }
 
         if self.desktop {
+            self.prune_launch_on(&crate::config::live(ui.ctx()).remotes);
             self.refresh_reconnects(ui.ctx());
             self.refresh_exit_titles();
             self.refresh_auto_titles();
@@ -8418,6 +8505,15 @@ impl WindowManager {
                                 );
                                 globe_tip = Some((icon_rect.union(badge), remote.to_owned()));
                             }
+                            if self.windows[i].tabs[ti].content.disconnected() {
+                                crate::icons::paint_down_dot(
+                                    &p,
+                                    ui.ctx(),
+                                    icon_rect,
+                                    th.danger,
+                                    bg,
+                                );
+                            }
                         }
                         let overflowing = paint_header_label(
                             &p,
@@ -8607,6 +8703,9 @@ impl WindowManager {
                             kind.tint().gamma_multiply(dim),
                         );
                         let content = &self.windows[i].tabs[self.windows[i].active].content;
+                        if content.disconnected() {
+                            crate::icons::paint_down_dot(&p, ui.ctx(), icon_rect, th.danger, th.bg);
+                        }
                         if let Some(remote) = content.remote() {
                             let badge = crate::icons::paint_globe_badge(
                                 &p,
@@ -10194,6 +10293,10 @@ fn show_tab_overflow(
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         kind.tint(),
                     );
+                    if tab.content.disconnected() {
+                        let backing = if resp.hovered() { th.sel_bg } else { th.bg };
+                        crate::icons::paint_down_dot(mp, mui.ctx(), icon_rect, th.danger, backing);
+                    }
                     if let Some(remote) = tab.content.remote() {
                         let backing = if resp.hovered() { th.sel_bg } else { th.bg };
                         let badge = crate::icons::paint_globe_badge(
@@ -10445,12 +10548,44 @@ fn dispatch_stack_target(cands: &[StackCandidate]) -> Option<WinId> {
 /// task prompt can't flood the pane.
 /// The pane note a reconnect opens with: where, and what it runs. Written
 /// as in progress: it lands before ssh has connected, and with the PC off
-/// the next line is ssh's error.
-fn reconnect_banner(remote: &str, argv: &[String]) -> String {
+/// the next line is ssh's error. `ran` = this Session had a connection; a
+/// restored one that never connected is "connecting", not "reconnecting".
+fn reconnect_banner(remote: &str, argv: &[String], ran: bool) -> String {
+    let verb = if ran { "reconnecting" } else { "connecting" };
     if argv.is_empty() {
-        format!("── reconnecting to {remote}… ──")
+        format!("── {verb} to {remote}… ──")
     } else {
-        format!("── reconnecting to {remote}: {}… ──", argv.join(" "))
+        format!("── {verb} to {remote}: {}… ──", argv.join(" "))
+    }
+}
+
+/// What a split or new terminal from a Session opens on. `from` is the
+/// Session's Remote name and the target its connection used (`None` for a
+/// restored Session not yet connected, which can only be matched by name).
+#[derive(Debug, PartialEq)]
+enum Inherit {
+    Local,
+    Remote(String),
+    /// The Session's Remote is gone, or the name now points at another PC:
+    /// open Local, and the toast says why. Never a silent redirect.
+    Fallback(String),
+}
+
+fn inherit(remotes: &[crate::remote::Remote], from: Option<(&str, Option<&str>)>) -> Inherit {
+    let Some((name, target)) = from else {
+        return Inherit::Local;
+    };
+    match crate::remote::find(remotes, name) {
+        Err(_) => Inherit::Fallback(format!(
+            "{name} is no longer a Remote, so this opened on this PC"
+        )),
+        Ok(r) => match target {
+            Some(t) if t != r.target => Inherit::Fallback(format!(
+                "{name} now goes to {}, not {t} like this Session, so this opened on this PC",
+                r.target
+            )),
+            _ => Inherit::Remote(r.name.clone()),
+        },
     }
 }
 
@@ -11778,6 +11913,138 @@ mod tests {
         assert_eq!(child.split_dir(Dir::Down, &ctx), None);
     }
 
+    fn toasts(ctx: &egui::Context) -> crate::notify::Notifications {
+        let mut notes = crate::notify::Notifications::new();
+        notes.drain_pending(ctx);
+        notes
+    }
+
+    #[test]
+    fn a_split_from_a_session_whose_remote_was_deleted_opens_local_and_says_so() {
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx);
+        let mut wm = WindowManager::new();
+        let (pid, _) = project_focused_on_desk(&mut wm, &ctx);
+        let _ = toasts(&ctx);
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.split_dir(Dir::Right, &ctx), None);
+        assert_eq!(child.windows.len(), 2, "the split still opens");
+        assert_eq!(focused_where(&mut wm, pid), (None, None), "on this PC");
+        assert!(toasts(&ctx).contains_text("no longer a Remote"));
+    }
+
+    #[test]
+    fn a_split_from_a_session_whose_remote_now_points_elsewhere_opens_local() {
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx);
+        let mut wm = WindowManager::new();
+        let (pid, _) = project_focused_on_desk(&mut wm, &ctx);
+        let _ = toasts(&ctx);
+        let mut s = (*crate::config::live(&ctx)).clone();
+        s.remotes[0].target = "someone@another-pc".into();
+        crate::config::seed_live(&ctx, &s);
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.new_terminal(&ctx), None);
+        assert_eq!(focused_where(&mut wm, pid), (None, None), "never redirected");
+        assert!(toasts(&ctx).contains_text("someone@another-pc"));
+    }
+
+    #[test]
+    fn a_where_strip_selection_is_forgotten_when_its_remote_goes() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        wm.project_child_mut(pid).unwrap().launch_on = Some("desk".into());
+        wm.prune_launch_on(&crate::config::live(&ctx).remotes);
+        assert_eq!(
+            wm.project_child_mut(pid).unwrap().launch_on.as_deref(),
+            Some("desk")
+        );
+        wm.prune_launch_on(&[]);
+        assert_eq!(wm.project_child_mut(pid).unwrap().launch_on, None);
+        // Re-adding a Remote of that name does not select it again.
+        wm.prune_launch_on(&crate::config::live(&ctx).remotes);
+        assert_eq!(wm.project_child_mut(pid).unwrap().launch_on, None);
+    }
+
+    fn desk_ask(project: &str, project_dir: &str) -> crate::remote_dir_prompt::Ask {
+        crate::remote_dir_prompt::Ask {
+            remote: "desk".into(),
+            shell: crate::remote::RemoteShell::Posix,
+            project_dir: project_dir.into(),
+            project: project.into(),
+            what: crate::remote_dir_prompt::What::Shell,
+            place: crate::remote_dir_prompt::Place::Default,
+            prefill: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_for_a_closed_project_is_saved_without_a_verbatim_key_and_says_so() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let mut wm = WindowManager::new();
+        let _ = toasts(&ctx);
+        wm.answer_dir(desk_ask("p999", r"\\?\H:\src\app"), "/srv/app".into(), &ctx);
+        let dirs = &crate::config::live(&ctx).remotes[0].dirs;
+        assert_eq!(dirs.get(r"H:\src\app").map(String::as_str), Some("/srv/app"));
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        assert!(toasts(&ctx).contains_text("nothing opened"));
+    }
+
+    #[test]
+    fn an_answer_over_a_mapping_set_in_settings_meanwhile_says_so() {
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx); // H:\src\app -> /srv/app, as if set meanwhile
+        let mut wm = WindowManager::new();
+        let _ = toasts(&ctx);
+        wm.answer_dir(desk_ask("p999", r"H:\src\app\"), "/home/andy/app".into(), &ctx);
+        let dirs = &crate::config::live(&ctx).remotes[0].dirs;
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        assert_eq!(dirs[r"H:\src\app\"], "/home/andy/app");
+        let notes = toasts(&ctx);
+        assert!(notes.contains_text("/srv/app"), "the old answer is named");
+        // The same answer again is not news.
+        let _ = toasts(&ctx);
+        wm.answer_dir(desk_ask("p999", r"H:\src\app"), "/home/andy/app".into(), &ctx);
+        assert!(!toasts(&ctx).contains_text("meanwhile"));
+    }
+
+    #[test]
+    fn a_disconnected_background_session_wears_a_non_text_cue() {
+        let ctx = egui::Context::default();
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let child = wm.project_child_mut(pid).unwrap();
+        let dead = crate::terminal::Session::disconnected_remote("desk", None, None, ctx.clone());
+        child.push_win(
+            7,
+            Tab::fixed("a very long tab title that the chip will cut", Content::Terminal(dead)),
+            r,
+        );
+        let model = wm.panel_model();
+        let tab = model
+            .projects
+            .iter()
+            .flat_map(|p| &p.tabs)
+            .find(|t| t.remote.as_deref() == Some("desk"))
+            .expect("the Remote row");
+        assert!(tab.disconnected, "the icon cue does not depend on the title");
+        assert!(!tab.exited, "disconnected is not finished");
+        // A live Remote Session and a local one carry no cue.
+        assert!(
+            model
+                .projects
+                .iter()
+                .flat_map(|p| &p.tabs)
+                .filter(|t| t.remote.is_none())
+                .all(|t| !t.disconnected)
+        );
+    }
+
     fn launch(wm: &mut WindowManager, pid: WinId, l: crate::launcher::Launch, ctx: &egui::Context) {
         let path = crate::panel::TargetPath {
             project: pid,
@@ -11806,9 +12073,13 @@ mod tests {
         launch(&mut wm, pid, Launch::Default, &ctx);
         assert_eq!(focused_where(&mut wm, pid), (None, None));
         // A strip click selects and opens nothing.
-        launch(&mut wm, pid, Launch::Where(Some(0)), &ctx);
+        launch(&mut wm, pid, Launch::Where(Some("DESK".into())), &ctx);
         let child = wm.project_child_mut(pid).unwrap();
-        assert_eq!(child.launch_on.as_deref(), Some("desk"));
+        assert_eq!(
+            child.launch_on.as_deref(),
+            Some("desk"),
+            "the list's spelling"
+        );
         assert_eq!(child.windows.len(), 1);
         launch(&mut wm, pid, Launch::RemoteShell, &ctx);
         assert_eq!(
@@ -11834,7 +12105,7 @@ mod tests {
         let mut wm = WindowManager::new();
         let pid = push(&mut wm, "proj");
         wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
-        launch(&mut wm, pid, Launch::Where(Some(0)), &ctx);
+        launch(&mut wm, pid, Launch::Where(Some("desk".into())), &ctx);
         launch(
             &mut wm,
             pid,
@@ -12261,11 +12532,50 @@ mod tests {
 
     #[test]
     fn a_reconnect_banner_says_in_progress_not_done() {
-        assert_eq!(reconnect_banner("desk", &[]), "── reconnecting to desk… ──");
         assert_eq!(
-            reconnect_banner("desk", &["claude".into(), "--continue".into()]),
+            reconnect_banner("desk", &[], true),
+            "── reconnecting to desk… ──"
+        );
+        assert_eq!(
+            reconnect_banner("desk", &["claude".into(), "--continue".into()], true),
             "── reconnecting to desk: claude --continue… ──"
         );
+        // A restored Session that never connected.
+        assert_eq!(
+            reconnect_banner("desk", &[], false),
+            "── connecting to desk… ──"
+        );
+    }
+
+    #[test]
+    fn a_split_inherits_only_the_same_remote() {
+        let desk = crate::remote::Remote {
+            name: "desk".into(),
+            target: "andy@desk".into(),
+            shell: Default::default(),
+            dirs: Default::default(),
+        };
+        let list = [desk];
+        assert_eq!(inherit(&list, None), Inherit::Local);
+        assert_eq!(
+            inherit(&list, Some(("DESK", Some("andy@desk")))),
+            Inherit::Remote("desk".into())
+        );
+        // Restored, never connected: only the name to go on.
+        assert_eq!(
+            inherit(&list, Some(("desk", None))),
+            Inherit::Remote("desk".into())
+        );
+        // Deleted: Local, and the toast says so.
+        assert!(matches!(
+            inherit(&[], Some(("desk", Some("andy@desk")))),
+            Inherit::Fallback(w) if w.contains("no longer a Remote") && w.contains("this PC")
+        ));
+        // Same name, another PC: a different Remote, never a silent redirect.
+        assert!(matches!(
+            inherit(&list, Some(("desk", Some("andy@old-desk")))),
+            Inherit::Fallback(w) if w.contains("andy@desk") && w.contains("andy@old-desk")
+        ));
     }
 
     #[test]

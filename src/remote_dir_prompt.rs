@@ -82,6 +82,39 @@ pub fn validate(text: &str) -> Result<String, String> {
     Ok(dir.to_string())
 }
 
+/// The prompt's title: what it is about to open, and where. A prompt raised
+/// by a keyboard split says so, or it would come out of nowhere.
+pub fn title(ask: &Ask) -> String {
+    let what = match ask.what {
+        What::Agent(kind) => kind.label(),
+        What::Shell => "a shell",
+    };
+    let on = &ask.remote;
+    match ask.place {
+        Place::Default => format!("Open {what} on {on}"),
+        Place::Split(d) => {
+            let side = match d {
+                Dir::Left => "left",
+                Dir::Right => "right",
+                Dir::Up => "up",
+                Dir::Down => "down",
+            };
+            format!("Split {side}: open {what} on {on}")
+        }
+    }
+}
+
+/// The line under the title: what the answer is for, that it is kept, and
+/// where to change it, since a wrong answer otherwise sticks.
+pub fn explain(ask: &Ask) -> String {
+    format!(
+        "Which directory on {on} do Sessions from {dir} start in? Blank is the home \
+         directory. Saved for this Project; change it in Settings > Remotes.",
+        on = ask.remote,
+        dir = ask.project_dir,
+    )
+}
+
 impl DirPrompt {
     pub fn new(ask: Ask) -> Self {
         Self {
@@ -146,21 +179,20 @@ impl DirPrompt {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(width);
                     ui.visuals_mut().override_text_color = Some(th.text);
-                    ui.label(
-                        egui::RichText::new(format!("Directory on {}", self.ask.remote))
-                            .color(th.border_focus)
-                            .size(14.0)
-                            .strong(),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(title(&self.ask))
+                                .color(th.border_focus)
+                                .size(14.0)
+                                .strong(),
+                        )
+                        .wrap(),
                     );
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!(
-                                "Where Sessions from {} start on {}. Asked once and saved for \
-                                 this Project; blank is the home directory.",
-                                self.ask.project_dir, self.ask.remote
-                            ))
-                            .color(th.dim)
-                            .size(11.5),
+                            egui::RichText::new(explain(&self.ask))
+                                .color(th.dim)
+                                .size(11.5),
                         )
                         .wrap(),
                     );
@@ -275,6 +307,38 @@ mod tests {
         p.text = "/a\tb".into();
         assert_eq!(p.key(Key::Enter), Outcome::Pending);
         assert_eq!(p.key(Key::Esc), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn the_prompt_names_the_action_the_remote_and_where_to_change_it() {
+        let mut a = ask(None);
+        assert_eq!(title(&a), "Open a shell on desk");
+        a.what = What::Agent(SessionKind::Claude);
+        assert_eq!(title(&a), "Open Claude on desk");
+        a.place = Place::Split(Dir::Right);
+        assert_eq!(title(&a), "Split right: open Claude on desk");
+        let e = explain(&a);
+        assert!(e.contains(r"H:\src\app") && e.contains("desk"), "{e}");
+        assert!(e.contains("Settings > Remotes"), "{e}");
+    }
+
+    #[test]
+    fn the_directory_label_fits_the_form_label_column() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for label in ["Directory", "Project", "Name", "Target", "Shell"] {
+                let w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        label.into(),
+                        crate::remotes_pane::label_font(),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x;
+                assert!(w <= crate::remotes_pane::LABEL_W, "{label}: {w}");
+            }
+        });
     }
 
     #[test]
