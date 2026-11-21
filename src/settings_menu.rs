@@ -1457,29 +1457,136 @@ mod tests {
 
     /// One frame of the whole menu with `key` pressed.
     fn frame_with_key(menu: &mut SettingsMenu, s: &mut Settings, key: egui::Key, shift: bool) {
-        let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                shift,
-                ..Default::default()
-            },
-        });
+        let mods = egui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        frame_at(&egui::Context::default(), menu, s, None, Some((key, mods)));
+    }
+
+    /// One frame of the whole menu on `ctx`, filling a window of `size`
+    /// (egui's default screen when `None`), with an optional key press.
+    fn frame_at(
+        ctx: &egui::Context,
+        menu: &mut SettingsMenu,
+        s: &mut Settings,
+        size: Option<egui::Vec2>,
+        key: Option<(egui::Key, egui::Modifiers)>,
+    ) {
+        let mut input = egui::RawInput {
+            screen_rect: size.map(|sz| egui::Rect::from_min_size(egui::Pos2::ZERO, sz)),
+            ..Default::default()
+        };
+        if let Some((key, modifiers)) = key {
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            input.modifiers = modifiers;
+        }
         let mut km = Keymap::default();
         let mut theme = crate::theme::Theme::default();
         let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let r = ui.max_rect();
-                let outcome = menu.show(ui, r, true, s, &mut km, &mut theme);
-                if matches!(outcome, MenuOutcome::Changed) {
-                    s.sanitize(); // what the debounced save's reload would do
-                }
-            });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    let r = ui.max_rect();
+                    let outcome = menu.show(ui, r, true, s, &mut km, &mut theme);
+                    if matches!(outcome, MenuOutcome::Changed) {
+                        s.sanitize(); // what the debounced save's reload would do
+                    }
+                });
         });
+    }
+
+    fn remote(name: &str, target: &str) -> crate::remote::Remote {
+        crate::remote::Remote {
+            name: name.into(),
+            target: target.into(),
+            shell: Default::default(),
+            dirs: Default::default(),
+        }
+    }
+
+    /// At the narrowest pane the whole add form is on screen and no row's
+    /// text runs under its status or buttons.
+    #[test]
+    fn remotes_pane_fits_at_its_minimum_width() {
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![
+                remote(
+                    "a-remote-with-a-long-name",
+                    "someone@a-very-long-host-name.example.internal.lan",
+                ),
+                remote("pi", "pi"),
+            ],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let ctx = egui::Context::default();
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let none = egui::Modifiers::NONE;
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::A, none)),
+        );
+        assert!(menu.remotes.is_editing());
+        for _ in 0..3 {
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        }
+        let laid = menu.remotes.laid();
+        assert!(
+            (laid.pane.width() - PANE_MIN_W).abs() < 0.5,
+            "{:?}",
+            laid.pane
+        );
+        // Name, Target, Shell, add, cancel.
+        assert_eq!(laid.form.len(), 5, "{:?}", laid.form);
+        for r in &laid.form {
+            assert!(laid.pane.contains_rect(*r), "{r:?} outside {:?}", laid.pane);
+        }
+        assert_eq!(laid.rows.len(), 2);
+        for (text, controls) in &laid.rows {
+            assert!(laid.pane.contains_rect(*controls), "{controls:?}");
+            assert!(
+                text.max.x <= controls.min.x,
+                "text {text:?} runs under {controls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_d_does_not_ask_to_delete_a_remote() {
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![remote("desk", "desk")],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let ctx = egui::Context::default();
+        frame_at(&ctx, &mut menu, &mut s, None, None);
+        let ctrl = egui::Modifiers::CTRL;
+        frame_at(&ctx, &mut menu, &mut s, None, Some((egui::Key::D, ctrl)));
+        // Not confirming, so Enter edits rather than deletes.
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            None,
+            Some((egui::Key::Enter, egui::Modifiers::NONE)),
+        );
+        assert_eq!(s.remotes.len(), 1);
+        assert!(menu.remotes.is_editing());
     }
 
     #[test]

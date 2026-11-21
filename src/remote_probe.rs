@@ -222,7 +222,7 @@ pub struct TestReport {
 pub enum TestOutcome {
     Ok(TestReport),
     /// `BatchMode` refused: a password, a key passphrase, or an unknown host
-    /// key. Only a pane can answer those.
+    /// key. Only an interactive Remote Session can answer those.
     NeedsLogin,
     Failed(String),
 }
@@ -231,11 +231,11 @@ impl TestOutcome {
     /// One plain line for the pane.
     pub fn summary(&self) -> String {
         match self {
-            TestOutcome::NeedsLogin => "Needs an interactive login (a password, passphrase or new host key), which only a pane can do".into(),
+            TestOutcome::NeedsLogin => "Needs an interactive login (a password, passphrase or new host key): open a Remote Session on it once and log in there".into(),
             TestOutcome::Failed(e) => format!("Test failed: {e}"),
             TestOutcome::Ok(r) => {
                 let shell = match (&r.shell, &r.login_shell) {
-                    (RemoteShell::Posix, Some(path)) => format!("Posix ({path})"),
+                    (RemoteShell::Posix, Some(path)) => format!("SH ({path})"),
                     (shell, _) => crate::remotes_pane::shell_label(*shell).to_string(),
                 };
                 let curl = if r.curl {
@@ -721,7 +721,7 @@ mod tests {
         });
         assert_eq!(
             r.summary(),
-            "Login works · Posix (/bin/zsh) · no curl (chat and badges need it) · agents: claude (codex, grok not found)"
+            "Login works · SH (/bin/zsh) · no curl (chat and badges need it) · agents: claude (codex, grok not found)"
         );
         let r = TestOutcome::Ok(TestReport {
             shell: RemoteShell::Pwsh,
@@ -731,12 +731,12 @@ mod tests {
         });
         assert_eq!(
             r.summary(),
-            "Login works · pwsh · curl found · no agent CLIs on PATH"
+            "Login works · PowerShell · curl found · no agent CLIs on PATH"
         );
         assert!(
             TestOutcome::NeedsLogin
                 .summary()
-                .contains("only a pane can do")
+                .contains("open a Remote Session on it once and log in there")
         );
     }
 

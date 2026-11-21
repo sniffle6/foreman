@@ -295,7 +295,8 @@ chosen by a default.
 Remote (name, target, shell, reachability, Test, delete), inline add and
 edit, ssh-config `Host` names offered as suggestions. **Test** runs one
 `ssh -o BatchMode=yes` probe off-thread and reports: login works without a
-prompt (or "needs an interactive login, which only a pane can do"), which
+prompt (or "needs an interactive login: open a Remote Session on it once
+and log in there"), which
 shell it found, whether `curl` is there, which agent CLIs are on PATH.
 Deleting a Remote does not touch live Sessions; each carries its own copy
 of the name.
