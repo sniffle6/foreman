@@ -52,6 +52,7 @@ mod psreadline;
 mod ready;
 mod recents;
 mod release;
+mod remote;
 mod search;
 mod settings;
 mod settings_menu;

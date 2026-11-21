@@ -368,6 +368,14 @@ available; every Windows half of the experiments above is still open.
   delivered argv elements containing spaces, both quote kinds and a `$`
   unchanged. A missing directory stopped the launch with exit status 1.
   zsh was not tried.
+- **2, PowerShell quoting, seat PC only (no SSH).** The builder's encoded
+  lines run through local cmd → pwsh 7 and cmd → Windows PowerShell 5.1 into
+  a program printing its argv. pwsh passed everything. 5.1 drops embedded
+  `"` and empty arguments when calling a native program, so the
+  `WindowsPowerShell` script pre-escapes argv for the program's own parser.
+  An argument where every space follows an odd number of `"` (`"a b"`)
+  cannot get through 5.1 at all; the builder refuses it and says to use
+  pwsh or chat.
 - **3, Claude: partly passed.** `--settings` with inline hook JSON fired
   `UserPromptSubmit` through the Tunnel with the token from the launch
   environment. `Stop` and `PostToolUse` were not observed because Claude on

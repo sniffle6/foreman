@@ -109,6 +109,21 @@ The two kinds of program a Session runs — a Shell (cmd, PowerShell, bash) or a
 agent CLI (Claude Code, Codex).
 _Avoid_: program, command (too generic to disambiguate the two).
 
+**Remote**:
+A named PC foreman can open Sessions on over SSH. Not a foreman instance: it
+needs nothing from foreman. `--on` names one; `--host` is a different feature.
+_Avoid_: host (taken by ConPTY host), peer (an allowlisted foreman for `--host`),
+server.
+
+**Remote Session**:
+A Session whose process is an SSH client into a Remote. Its screen, input and
+Chat membership stay on this PC like any other Session.
+_Avoid_: SSH tab, remote terminal.
+
+**Tunnel**:
+The per-Session reverse forward a Remote Session's agent uses to reach this PC.
+_Avoid_: port forward (generic), connection.
+
 **Ready**:
 The state a Session reaches once it has answered the program's startup
 device-status query; injected input only lands after a Session is Ready.

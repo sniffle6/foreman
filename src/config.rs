@@ -387,6 +387,11 @@ pub struct Settings {
     /// label in chat (`desk/p2/t3`), so prefer the name `--host` would dial.
     /// No settings-menu row by choice: edited live with `foreman peers add|rm`.
     pub remote_peers: Vec<String>,
+    /// PCs this foreman opens Remote Sessions on over SSH. Unrelated to
+    /// `remote_peers` and Tailscale. An entry that does not parse is dropped
+    /// alone, not the whole file.
+    #[serde(deserialize_with = "crate::remote::deserialize_lenient")]
+    pub remotes: Vec<crate::remote::Remote>,
     // -- startup --
     /// Reopen last session's projects and layout on launch.
     pub restore_workspace: bool,
@@ -439,6 +444,7 @@ impl Default for Settings {
             send_settle_ms: 120,
             remote_listen: false,
             remote_peers: Vec::new(),
+            remotes: Vec::new(),
             restore_workspace: true,
             default_project_dir: String::new(),
             update_check: true,
@@ -481,6 +487,7 @@ impl Settings {
             .filter(|p| valid_peer(p))
             .take(MAX_PEERS)
             .collect();
+        self.remotes = crate::remote::sanitize(std::mem::take(&mut self.remotes));
         self.title_model = self
             .title_model
             .trim()
@@ -784,6 +791,33 @@ mod tests {
         s.sanitize();
         assert!(s.remote_listen);
         assert_eq!(s.remote_peers, vec!["desk", "100.101.102.103"]);
+    }
+
+    #[test]
+    fn remotes_round_trip_and_bad_entries_drop_alone() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"font_size":20.0,"remotes":[
+                {"name":"desk","target":"andy@desk","shell":"Pwsh","dirs":{"H:\\src\\foreman":"C:\\src\\foreman"}},
+                {"name":"desk","target":"dup"},
+                {"name":"local","target":"x"},
+                {"name":"evil","target":"-oProxyCommand=calc"},
+                {"name":"typo","target":"x","shell":"Bash"},
+                {"name":"linux","target":"box"}
+            ]}"#,
+        )
+        .unwrap();
+        s.sanitize();
+        assert_eq!(
+            s.font_size, 20.0,
+            "a bad Remote must not reset other settings"
+        );
+        let names: Vec<_> = s.remotes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["desk", "linux"]);
+        assert_eq!(s.remotes[0].shell, crate::remote::RemoteShell::Pwsh);
+        assert_eq!(s.remotes[0].dirs[r"H:\src\foreman"], r"C:\src\foreman");
+        assert_eq!(s.remotes[1].shell, crate::remote::RemoteShell::Posix);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]
