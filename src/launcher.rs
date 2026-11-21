@@ -191,7 +191,9 @@ pub fn entries_on(
 
 /// The dim line under the strip: the selected Remote and its state in words,
 /// so the state is not hover-only. Always present while the strip is, so
-/// moving the selection never changes the menu's height.
+/// moving the selection never changes the menu's height. Short enough to
+/// fit the narrowest menu: a reason too long for it lives in the segment's
+/// tooltip.
 fn state_line(spots: &[Spot], on: Option<usize>) -> String {
     let Some(s) = on.and_then(|i| spots.get(i)) else {
         return "Local: opens on this PC".into();
@@ -199,12 +201,12 @@ fn state_line(spots: &[Spot], on: Option<usize>) -> String {
     let name = s.name;
     match &s.reach {
         Reach::Reachable => format!("{name}: reachable"),
-        Reach::Checking => format!("{name}: checking whether it answers…"),
+        Reach::Checking => format!("{name}: checking…"),
         Reach::Offline => match s.port {
-            Some(port) => format!("{name}: offline — no answer on port {port}"),
-            None => format!("{name}: offline — no answer on its SSH port"),
+            Some(port) => format!("{name}: offline (port {port})"),
+            None => format!("{name}: offline"),
         },
-        Reach::Unknown(why) => format!("{name}: unknown — {why}"),
+        Reach::Unknown(_) => format!("{name}: cannot check"),
     }
 }
 
@@ -224,13 +226,14 @@ fn strip(spots: &[Spot], on: Option<usize>) -> Vec<crate::hover_menu::Seg<Launch
     }];
     for (i, s) in spots.iter().enumerate() {
         let (mark, state) = match &s.reach {
-            Reach::Reachable => (SegMark::Up, "reachable"),
+            Reach::Reachable => (SegMark::Up, "reachable".into()),
+            // The Remotes pane's words, so the two never disagree.
             Reach::Offline => (
                 SegMark::Down,
-                "offline (the check cannot see past a ProxyJump)",
+                format!("offline. {}", crate::remotes_pane::OFFLINE_WHY),
             ),
-            Reach::Checking => (SegMark::Pending, "checking…"),
-            Reach::Unknown(_) => (SegMark::Unsure, "reachability unknown"),
+            Reach::Checking => (SegMark::Pending, "checking…".into()),
+            Reach::Unknown(why) => (SegMark::Unsure, format!("unknown — {why}")),
         };
         // The label is the name; the tip adds the target only when it says
         // something the name does not.
@@ -368,17 +371,61 @@ mod tests {
     fn the_state_line_says_the_selected_remote_and_its_state() {
         let s = spots();
         assert_eq!(state_line(&s, Some(0)), "desk: reachable");
-        assert_eq!(
-            state_line(&s, Some(1)),
-            "garage: offline — no answer on port 2222"
-        );
-        assert_eq!(
-            state_line(&s, Some(2)),
-            "laptop: checking whether it answers…"
-        );
+        assert_eq!(state_line(&s, Some(1)), "garage: offline (port 2222)");
+        assert_eq!(state_line(&s, Some(2)), "laptop: checking…");
         let mut s = spots();
         s[1].port = None;
-        assert!(state_line(&s, Some(1)).ends_with("its SSH port"));
+        assert_eq!(state_line(&s, Some(1)), "garage: offline");
+    }
+
+    /// Every state's line fits the narrowest launcher (one Remote, an SH
+    /// login shell) uncut, for a name of ordinary length.
+    #[test]
+    fn every_state_line_fits_the_narrowest_menu() {
+        use crate::remote::RemoteShell;
+        let proxied = "through a proxy hop the probe cannot see past";
+        for reach in [
+            Reach::Reachable,
+            Reach::Checking,
+            Reach::Offline,
+            Reach::Unknown(proxied.into()),
+            Reach::Unknown("ssh: Could not resolve hostname workshop: no such host".into()),
+        ] {
+            for port in [Some(65535), None] {
+                for on in [Some(0), None] {
+                    let spot = [Spot {
+                        name: "workshop",
+                        target: "workshop",
+                        shell: RemoteShell::Posix,
+                        reach: reach.clone(),
+                        port,
+                    }];
+                    let notes = crate::hover_menu::notes_fit(|| {
+                        entries_on(&Keymap::default(), Shell::Cmd, &HashSet::new(), &spot, on)
+                    });
+                    assert_eq!(notes.len(), 1);
+                    for (text, fits) in notes {
+                        assert!(fits, "{reach:?}: {text:?} is cut");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tooltip_keeps_the_reason_the_state_line_leaves_out() {
+        let mut s = spots();
+        let why = "through a proxy hop the probe cannot see past";
+        s[2].reach = Reach::Unknown(why.into());
+        let segs = strip(&s, None);
+        assert_eq!(segs[3].tip, format!("laptop: unknown — {why}"));
+        assert!(!state_line(&s, Some(2)).contains(why));
+        // Offline says the Remotes pane's reason, word for word.
+        assert!(
+            segs[2].tip.ends_with(crate::remotes_pane::OFFLINE_WHY),
+            "{}",
+            segs[2].tip
+        );
     }
 
     #[test]

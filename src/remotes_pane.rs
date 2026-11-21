@@ -357,6 +357,9 @@ pub enum Key {
     Delete,
     Add,
     Test,
+    /// Forget the focused Project directory row (Ctrl+Backspace, or Delete
+    /// in an empty one).
+    Clear,
 }
 
 /// What a key asks of the caller beyond the model's own state.
@@ -423,6 +426,8 @@ pub struct Laid {
     pub status: Vec<egui::Rect>,
     /// The form's error line, while it shows one.
     pub error: Option<egui::Rect>,
+    /// The form's Project directories heading fit without its "…" cut.
+    pub dirs_note_fits: bool,
 }
 
 impl Default for RemotesView {
@@ -450,6 +455,7 @@ impl RemotesView {
                 list: egui::Rect::NOTHING,
                 status: Vec::new(),
                 error: None,
+                dirs_note_fits: true,
             },
         }
     }
@@ -582,6 +588,12 @@ impl RemotesView {
                     Key::Left | Key::Right | Key::Space if d.field == Field::Shell => {
                         d.shell = cycle_shell(d.shell, k != Key::Left);
                     }
+                    Key::Clear => {
+                        if let Field::Dir(j) = d.field {
+                            d.clear_dir(j);
+                            self.scroll_to = true;
+                        }
+                    }
                     _ => {}
                 }
                 self.mode = Mode::Edit(d);
@@ -653,6 +665,10 @@ impl RemotesView {
             }
             Mode::Browse if len == 0 => "Enter or A add · Esc back",
             Mode::Browse => "↑/↓ select · Enter add · Esc back",
+            Mode::Edit(Draft {
+                field: Field::Dir(_),
+                ..
+            }) => "Tab next field · Ctrl+Backspace clear · Enter save · Esc cancel",
             Mode::Edit(_) => "Tab next field · ←/→ shell · Enter save · Esc cancel",
             Mode::ConfirmDelete(_) => "Enter delete · Esc keep",
         }
@@ -993,6 +1009,7 @@ impl RemotesView {
         // error and buttons after a refused save.
         let mut active_rect = None;
         let mut error_rect = None;
+        let mut note_fits = true;
         let frame = egui::Frame::new()
             .fill(th.sel_bg)
             .corner_radius(egui::CornerRadius::same(4))
@@ -1099,32 +1116,43 @@ impl RemotesView {
             // The Project directories this Remote has answered for: the one
             // place a wrong directory-prompt answer can be fixed.
             if d.index.is_some() {
-                let small = |t: &str| egui::RichText::new(t).color(th.dim).size(11.0);
+                let text = if d.dirs.is_empty() {
+                    "No Project directories yet: a Project's first launch asks"
+                } else {
+                    "Project directories (blank is the home directory)"
+                };
                 ui.horizontal(|ui| {
                     ui.add_space(LABEL_W + FORM_GAP);
+                    note_fits = ui
+                        .painter()
+                        .layout_no_wrap(text.into(), egui::FontId::proportional(11.0), th.dim)
+                        .size()
+                        .x
+                        <= ui.available_width();
                     ui.add(
-                        egui::Label::new(small(if d.dirs.is_empty() {
-                            "No Project directories yet: a Project's first launch asks"
-                        } else {
-                            "Project directories (blank is the home directory)"
-                        }))
-                        .truncate(),
+                        egui::Label::new(egui::RichText::new(text).color(th.dim).size(11.0))
+                            .truncate(),
                     );
                 });
             }
             for k in 0..d.dirs.len() {
                 let row = &mut d.dirs[k];
+                // Each Project starts a pair; the gap ties a Directory to
+                // the Project above it, not the one below.
+                ui.add_space(PAIR_GAP);
                 form_row(ui, "Project", th.dim, |ui| {
-                    let shown = remote::plain_dir(&row.project);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&shown)
-                                .monospace()
-                                .size(11.0)
-                                .color(th.text),
-                        )
-                        .truncate(),
+                    // Cut from the front: Projects under one long parent
+                    // differ at the end.
+                    let full = remote::plain_dir(&row.project);
+                    let font = egui::FontId::monospace(11.0);
+                    let (shown, cut) = elide_front(ui, &full, &font, ui.available_width());
+                    let label = ui.add(
+                        egui::Label::new(egui::RichText::new(shown).font(font).color(th.text))
+                            .extend(),
                     );
+                    if cut {
+                        label.on_hover_text(full);
+                    }
                 });
                 let r = form_row(ui, "Directory", th.dim, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1190,6 +1218,7 @@ impl RemotesView {
             });
         });
         self.laid.error = error_rect;
+        self.laid.dirs_note_fits = note_fits;
         // After the hosts strip's own scroll, so this one wins the list's.
         // A refused save shows its error with the buttons; otherwise the
         // active field, which on opening is Name at the top of the form.
@@ -1222,6 +1251,36 @@ pub(crate) const FORM_GAP: f32 = 8.0;
 /// The offline tooltip, and the selected row's reason line.
 pub(crate) const OFFLINE_WHY: &str = "No TCP answer on its SSH port. This check cannot see past a \
      ProxyJump, so Test it or open a Remote Session to be sure.";
+
+/// Space before each Project/Directory pair in the form.
+const PAIR_GAP: f32 = 6.0;
+
+/// `text` on one line, its front cut with "…" so the rest fits `width`;
+/// and whether it was cut.
+fn elide_front(ui: &egui::Ui, text: &str, font: &egui::FontId, width: f32) -> (String, bool) {
+    let w = |t: &str| {
+        ui.painter()
+            .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    if w(text) <= width {
+        return (text.to_owned(), false);
+    }
+    // The longest tail that fits: tails only shrink as the start moves right.
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let (mut lo, mut hi) = (0, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if w(&format!("…{}", &text[starts[mid]..])) <= width {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let tail = starts.get(lo).map_or("", |&i| &text[i..]);
+    (format!("…{tail}"), true)
+}
 
 /// `text` on one line, cut with "…" to `width`.
 fn one_line(
@@ -1313,6 +1372,20 @@ fn browse_letter(key: egui::Key, mods: egui::Modifiers) -> Option<Key> {
 /// browsing: in the form they are typing.
 fn read_keys(ui: &egui::Ui, mode: &Mode) -> Vec<Key> {
     use egui::Key as K;
+    // Consumed, not peeked: the row goes before the form draws, and the
+    // TextEdit that takes its place (and its Id) would delete a word or a
+    // character of the next directory.
+    let clear = ui.input_mut(|i| match mode {
+        Mode::Edit(d) => match d.field {
+            Field::Dir(k) => {
+                i.consume_key(egui::Modifiers::CTRL, K::Backspace)
+                    || (d.dirs.get(k).is_some_and(|r| r.remote.is_empty())
+                        && i.consume_key(egui::Modifiers::NONE, K::Delete))
+            }
+            _ => false,
+        },
+        _ => false,
+    });
     ui.input(|i| {
         let mut out = Vec::new();
         let p = |k: K| i.key_pressed(k);
@@ -1362,6 +1435,9 @@ fn read_keys(ui: &egui::Ui, mode: &Mode) -> Vec<Key> {
                 }
             }
             Mode::ConfirmDelete(_) => {}
+        }
+        if clear {
+            out.push(Key::Clear);
         }
         out
     })
@@ -1517,6 +1593,56 @@ mod tests {
         assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
         assert_eq!(list[0].dirs[r"H:\src\new"], "/srv/new");
         assert!(!list[0].dirs.contains_key(r"H:\src\app"));
+    }
+
+    #[test]
+    fn the_clear_key_forgets_the_focused_directory_row_only() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        // On a field that is not a directory, nothing to clear.
+        v.key(Key::Clear, &mut list);
+        assert_eq!(draft(&v).dirs.len(), 2);
+        for _ in 0..4 {
+            v.key(Key::Tab, &mut list);
+        }
+        assert_eq!(draft(&v).field, Field::Dir(1));
+        assert!(v.hint(1).contains("Ctrl+Backspace clear"), "{}", v.hint(1));
+        v.key(Key::Clear, &mut list);
+        let d = draft(&v);
+        assert_eq!(d.dirs.len(), 1);
+        assert_eq!(d.dirs[0].project, r"H:\src\app");
+        assert_eq!(d.field, Field::Dir(0));
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert_eq!(list[0].dirs.len(), 1, "{:?}", list[0].dirs);
+        assert!(!list[0].dirs.contains_key(r"\\?\H:\src\tool"));
+    }
+
+    #[test]
+    fn a_long_project_path_is_cut_from_the_front() {
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let font = egui::FontId::monospace(11.0);
+            let w = |t: &str| {
+                ui.painter()
+                    .layout_no_wrap(t.into(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            };
+            let parent = r"H:\clients\a-long-parent-directory\projects\";
+            for leaf in ["alpha", "beta"] {
+                let full = format!("{parent}{leaf}");
+                out.push(elide_front(ui, &full, &font, 120.0));
+                assert!(w(&out.last().unwrap().0) <= 120.0);
+            }
+            out.push(elide_front(ui, "H:\\src", &font, 120.0));
+            out.push(elide_front(ui, "H:\\src", &font, 1.0));
+        });
+        assert!(out[0].1 && out[0].0.starts_with('…') && out[0].0.ends_with("alpha"));
+        assert!(out[1].0.ends_with("beta"));
+        assert_eq!(out[2], ("H:\\src".to_string(), false));
+        assert_eq!(out[3], ("…".to_string(), true));
     }
 
     #[test]

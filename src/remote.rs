@@ -117,13 +117,30 @@ pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String>
     ))
 }
 
+/// Whether two ssh targets name the same PC: the host part (an ssh-config
+/// Host or a host name, both matched without case by ssh) compared without
+/// case, the user before an `@` exactly.
+pub fn same_target(a: &str, b: &str) -> bool {
+    let split = |t: &str| match t.rsplit_once('@') {
+        Some((user, host)) => (Some(user.to_string()), host.to_ascii_lowercase()),
+        None => (None, t.to_ascii_lowercase()),
+    };
+    split(a) == split(b)
+}
+
 /// The globe badge's tooltip: the Session's copy of the Remote name, plus
 /// the target while the Remote is still set up (a deleted one leaves only
-/// the name the Session carries).
-pub fn badge_tooltip(remotes: &[Remote], name: &str) -> String {
-    match find(remotes, name) {
+/// the name the Session carries). `disconnected` is the down dot's state,
+/// said in words so the dot is not colour-only.
+pub fn badge_tooltip(remotes: &[Remote], name: &str, disconnected: bool) -> String {
+    let base = match find(remotes, name) {
         Ok(r) => format!("Remote: {name} ({})", r.target),
         Err(_) => format!("Remote: {name}"),
+    };
+    if disconnected {
+        format!("{base} · disconnected")
+    } else {
+        base
     }
 }
 
@@ -531,10 +548,28 @@ mod tests {
             dirs: Default::default(),
         };
         assert_eq!(
-            super::badge_tooltip(std::slice::from_ref(&desk), "desk"),
+            super::badge_tooltip(std::slice::from_ref(&desk), "desk", false),
             "Remote: desk (me@desk.lan)"
         );
-        assert_eq!(super::badge_tooltip(&[desk], "garage"), "Remote: garage");
+        assert_eq!(
+            super::badge_tooltip(std::slice::from_ref(&desk), "desk", true),
+            "Remote: desk (me@desk.lan) · disconnected"
+        );
+        assert_eq!(
+            super::badge_tooltip(&[desk], "garage", false),
+            "Remote: garage"
+        );
+    }
+
+    #[test]
+    fn a_target_retyped_in_another_case_is_the_same_pc() {
+        assert!(super::same_target("andy@desk", "andy@DESK"));
+        assert!(super::same_target("Desk", "desk"));
+        assert!(super::same_target("andy@Desk.LAN", "andy@desk.lan"));
+        // The user is not a host name.
+        assert!(!super::same_target("Andy@desk", "andy@desk"));
+        assert!(!super::same_target("andy@desk", "andy@old-desk"));
+        assert!(!super::same_target("desk", "andy@desk"));
     }
 
     use super::*;

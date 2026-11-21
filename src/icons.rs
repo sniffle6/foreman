@@ -292,6 +292,9 @@ pub fn globe_badge_rect(icon: egui::Rect, ppp: f32) -> (egui::Rect, u32) {
 /// `icon`: a dot of `color` (the theme's danger) on a ring of `backing`. It
 /// is the cue that survives a cut title, where the text marker at the end
 /// is the first thing to go. Clear of the globe at the bottom-right.
+///
+/// A bar of `backing` crosses it, a "no entry" sign: a plain filled dot is
+/// the launcher strip's "reachable" mark, the opposite meaning.
 pub fn paint_down_dot(
     p: &egui::Painter,
     ctx: &egui::Context,
@@ -303,7 +306,24 @@ pub fn paint_down_dot(
     let rect = down_dot_rect(icon, ppp);
     p.circle_filled(rect.center(), rect.width() / 2.0 + 1.0 / ppp, backing);
     p.circle_filled(rect.center(), rect.width() / 2.0, color);
+    p.rect_filled(down_dot_bar(rect, ppp), 0.0, backing);
     rect
+}
+
+/// The bar across a [`down_dot_rect`]: whole device pixels, centred, with
+/// the dot's colour left on both ends.
+fn down_dot_bar(dot: egui::Rect, ppp: f32) -> egui::Rect {
+    let px = (dot.width() * ppp).round() as i32;
+    let mut h = (px / 4).max(1);
+    if (px - h) % 2 == 1 {
+        h += 1; // same parity as the dot, so it sits dead centre
+    }
+    let inset = (px / 5).max(1);
+    let at = |v: i32| v as f32 / ppp;
+    egui::Rect::from_min_size(
+        dot.min + egui::vec2(at(inset), at((px - h) / 2)),
+        egui::vec2(at(px - 2 * inset), at(h)),
+    )
 }
 
 /// Where [`paint_down_dot`] goes over `icon`: size and origin on whole
@@ -361,6 +381,14 @@ mod tests {
                     let (globe, _) = globe_badge_rect(icon, ppp);
                     assert!(whole(dot.min.x * ppp) && whole(dot.min.y * ppp));
                     assert!(whole(dot.width() * ppp), "{dot:?} at {ppp}");
+                    // The bar: crisp, dead centre, the dot showing past
+                    // both ends.
+                    let bar = down_dot_bar(dot, ppp);
+                    for v in [bar.min.x, bar.min.y, bar.max.x, bar.max.y] {
+                        assert!(whole(v * ppp), "{bar:?} at {ppp}");
+                    }
+                    assert!((bar.center() - dot.center()).length() < 1e-3);
+                    assert!(bar.height() > 0.0 && bar.min.x > dot.min.x, "{bar:?}");
                     // Its backing ring included, it does not cover the globe.
                     let ring = dot.expand(1.0 / ppp);
                     let overlap = ring.intersect(globe);

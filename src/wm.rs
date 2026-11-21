@@ -3418,14 +3418,16 @@ impl WindowManager {
             Some(d) => d,
             None => crate::remote::launch_dir(&remote, None, project_dir.as_deref())?.to_string(),
         };
-        let argv = crate::remote::reconnect_argv(&original);
+        let re = crate::remote::relaunch(&original);
+        let argv = re.argv;
         // A restored Session that never connected says "connecting", as its
         // bar said "Enter to connect".
         let ran = s.ever_connected();
-        // The at-launch rule is "a brief rides on this launch". A reconnect
-        // never resends the brief, so the note waits for the first chat
-        // delivery after the reconnect.
-        let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, false, ctx)?;
+        // An agent gets the note at launch: a resumed one still has the dead
+        // token's curl command in its conversation and would use it, 401,
+        // until a post came. A shell would run the note as commands.
+        let at_launch = re.agent.is_some();
+        let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, at_launch, ctx)?;
         fresh.set_term_id(id);
         fresh.inject_note(&reconnect_banner(&remote.name, &argv, ran));
         let Some((win, tab)) = self.terminal_location(id) else {
@@ -8478,7 +8480,7 @@ impl WindowManager {
                         }
                         let txt_col = if is_active_tab { th.text } else { th.dim };
                         // The globe's hover area and the Remote it names.
-                        let mut globe_tip: Option<(egui::Rect, String)> = None;
+                        let mut globe_tip: Option<(egui::Rect, String, bool)> = None;
                         // Leading icon: agent logo / shell glyph / project folder.
                         if let (Some(kind), Some(icon_rect)) = (icon, ch.icon) {
                             let px = (icon_rect.width() * ui.ctx().pixels_per_point())
@@ -8503,7 +8505,11 @@ impl WindowManager {
                                     th.text.gamma_multiply(dim),
                                     bg,
                                 );
-                                globe_tip = Some((icon_rect.union(badge), remote.to_owned()));
+                                globe_tip = Some((
+                                    icon_rect.union(badge),
+                                    remote.to_owned(),
+                                    self.windows[i].tabs[ti].content.disconnected(),
+                                ));
                             }
                             if self.windows[i].tabs[ti].content.disconnected() {
                                 crate::icons::paint_down_dot(
@@ -8525,15 +8531,18 @@ impl WindowManager {
                         );
                         // Reuse the chip response so a tooltip cannot steal tab
                         // clicks or drag-out. The close button has its own response.
-                        let chip_resp = if let Some((hit, remote)) = globe_tip.take()
+                        let chip_resp = if let Some((hit, remote, down)) = globe_tip.take()
                             && ui
                                 .ctx()
                                 .pointer_hover_pos()
                                 .is_some_and(|p| hit.contains(p))
                         {
                             let live = crate::config::live(ui.ctx());
-                            chip_resp
-                                .on_hover_text(crate::remote::badge_tooltip(&live.remotes, &remote))
+                            chip_resp.on_hover_text(crate::remote::badge_tooltip(
+                                &live.remotes,
+                                &remote,
+                                down,
+                            ))
                         } else if overflowing {
                             chip_resp.on_hover_text(&label)
                         } else {
@@ -8725,6 +8734,7 @@ impl WindowManager {
                                 dr.show_tooltip_text(crate::remote::badge_tooltip(
                                     &live.remotes,
                                     remote,
+                                    content.disconnected(),
                                 ));
                             }
                         }
@@ -10315,8 +10325,11 @@ fn show_tab_overflow(
                                 .is_some_and(|p| hit.contains(p))
                         {
                             let live = crate::config::live(mui.ctx());
-                            resp.clone()
-                                .on_hover_text(crate::remote::badge_tooltip(&live.remotes, remote));
+                            resp.clone().on_hover_text(crate::remote::badge_tooltip(
+                                &live.remotes,
+                                remote,
+                                tab.content.disconnected(),
+                            ));
                         }
                     }
                 }
@@ -10580,8 +10593,9 @@ fn inherit(remotes: &[crate::remote::Remote], from: Option<(&str, Option<&str>)>
             "{name} is no longer a Remote, so this opened on this PC"
         )),
         Ok(r) => match target {
-            Some(t) if t != r.target => Inherit::Fallback(format!(
-                "{name} now goes to {}, not {t} like this Session, so this opened on this PC",
+            Some(t) if !crate::remote::same_target(t, &r.target) => Inherit::Fallback(format!(
+                "{name} now points to {}; this Session is on {t}. \
+                 Opened the new terminal on this PC.",
                 r.target
             )),
             _ => Inherit::Remote(r.name.clone()),
@@ -11946,7 +11960,11 @@ mod tests {
         crate::config::seed_live(&ctx, &s);
         let child = wm.project_child_mut(pid).unwrap();
         assert_eq!(child.new_terminal(&ctx), None);
-        assert_eq!(focused_where(&mut wm, pid), (None, None), "never redirected");
+        assert_eq!(
+            focused_where(&mut wm, pid),
+            (None, None),
+            "never redirected"
+        );
         assert!(toasts(&ctx).contains_text("someone@another-pc"));
     }
 
@@ -11989,7 +12007,10 @@ mod tests {
         let _ = toasts(&ctx);
         wm.answer_dir(desk_ask("p999", r"\\?\H:\src\app"), "/srv/app".into(), &ctx);
         let dirs = &crate::config::live(&ctx).remotes[0].dirs;
-        assert_eq!(dirs.get(r"H:\src\app").map(String::as_str), Some("/srv/app"));
+        assert_eq!(
+            dirs.get(r"H:\src\app").map(String::as_str),
+            Some("/srv/app")
+        );
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert!(toasts(&ctx).contains_text("nothing opened"));
     }
@@ -12000,7 +12021,11 @@ mod tests {
         seed_mapped_desk(&ctx); // H:\src\app -> /srv/app, as if set meanwhile
         let mut wm = WindowManager::new();
         let _ = toasts(&ctx);
-        wm.answer_dir(desk_ask("p999", r"H:\src\app\"), "/home/andy/app".into(), &ctx);
+        wm.answer_dir(
+            desk_ask("p999", r"H:\src\app\"),
+            "/home/andy/app".into(),
+            &ctx,
+        );
         let dirs = &crate::config::live(&ctx).remotes[0].dirs;
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert_eq!(dirs[r"H:\src\app\"], "/home/andy/app");
@@ -12008,7 +12033,11 @@ mod tests {
         assert!(notes.contains_text("/srv/app"), "the old answer is named");
         // The same answer again is not news.
         let _ = toasts(&ctx);
-        wm.answer_dir(desk_ask("p999", r"H:\src\app"), "/home/andy/app".into(), &ctx);
+        wm.answer_dir(
+            desk_ask("p999", r"H:\src\app"),
+            "/home/andy/app".into(),
+            &ctx,
+        );
         assert!(!toasts(&ctx).contains_text("meanwhile"));
     }
 
@@ -12022,7 +12051,10 @@ mod tests {
         let dead = crate::terminal::Session::disconnected_remote("desk", None, None, ctx.clone());
         child.push_win(
             7,
-            Tab::fixed("a very long tab title that the chip will cut", Content::Terminal(dead)),
+            Tab::fixed(
+                "a very long tab title that the chip will cut",
+                Content::Terminal(dead),
+            ),
             r,
         );
         let model = wm.panel_model();
@@ -12032,7 +12064,10 @@ mod tests {
             .flat_map(|p| &p.tabs)
             .find(|t| t.remote.as_deref() == Some("desk"))
             .expect("the Remote row");
-        assert!(tab.disconnected, "the icon cue does not depend on the title");
+        assert!(
+            tab.disconnected,
+            "the icon cue does not depend on the title"
+        );
         assert!(!tab.exited, "disconnected is not finished");
         // A live Remote Session and a local one carry no cue.
         assert!(
@@ -12413,6 +12448,70 @@ mod tests {
         assert!(notes.contains_text("desk"), "a toast says why");
     }
 
+    /// Kill `command`'s Remote Session and press Enter on its bar: the fresh
+    /// Session's queued input, and whether a chat delivery still carries
+    /// the reply note.
+    fn reconnected(
+        open: impl FnOnce(&mut WindowManager, &crate::remote::Remote, &egui::Context) -> WinId,
+    ) -> (Vec<String>, bool) {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx);
+        let remote = crate::config::live(&ctx).remotes[0].clone();
+        let child = wm.project_child_mut(pid).unwrap();
+        let tid = open(child, &remote, &ctx);
+        let s = child.terminal_session_mut(tid).unwrap();
+        s.kill_for_test();
+        s.request_reconnect_for_test();
+        wm.refresh_reconnects(&ctx);
+        let s = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session(tid)
+            .unwrap();
+        assert!(!s.disconnected(), "reconnected");
+        let token = s.tunnel_token().expect("a new lease").to_string();
+        let queued = s.pending_injects().to_vec();
+        for q in queued.iter().filter(|q| q.contains("[foreman] You run on")) {
+            assert!(q.contains(&token), "only the new token is taught: {q}");
+        }
+        (queued, s.reply_note_waits())
+    }
+
+    #[test]
+    fn an_agent_reconnect_gets_the_reply_note_at_launch_once() {
+        // Launched with a brief, so the dead connection queued its own note
+        // too: that one is not carried over.
+        let (queued, waits) = reconnected(|wm, remote, ctx| {
+            let argv = ["codex".to_string(), "do the card".into()];
+            wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
+                .expect("ssh spawns")
+        });
+        let notes = queued
+            .iter()
+            .filter(|q| q.contains("[foreman] You run on"))
+            .count();
+        assert_eq!(notes, 1, "{queued:?}");
+        assert!(!waits, "no chat delivery repeats it");
+    }
+
+    #[test]
+    fn a_shell_reconnect_leaves_the_reply_note_for_the_first_post() {
+        let (queued, waits) = reconnected(|wm, remote, ctx| {
+            use crate::remote_dir_prompt::{Place, What};
+            wm.open_remote_win(remote, "/tmp", What::Shell, Place::Default, ctx)
+                .expect("ssh spawns")
+        });
+        assert!(
+            !queued.iter().any(|q| q.contains("[foreman] You run on")),
+            "a shell would run it: {queued:?}"
+        );
+        assert!(waits, "the first chat delivery carries it");
+    }
+
     fn remote_terminal_snap(remote: &str) -> crate::workspace::ManagerSnap {
         remote_agent_snap(remote, None, None)
     }
@@ -12572,10 +12671,19 @@ mod tests {
             Inherit::Fallback(w) if w.contains("no longer a Remote") && w.contains("this PC")
         ));
         // Same name, another PC: a different Remote, never a silent redirect.
-        assert!(matches!(
+        assert_eq!(
             inherit(&list, Some(("desk", Some("andy@old-desk")))),
-            Inherit::Fallback(w) if w.contains("andy@desk") && w.contains("andy@old-desk")
-        ));
+            Inherit::Fallback(
+                "desk now points to andy@desk; this Session is on andy@old-desk. \
+                 Opened the new terminal on this PC."
+                    .into()
+            )
+        );
+        // The target retyped in another case is the same PC.
+        assert_eq!(
+            inherit(&list, Some(("desk", Some("andy@DESK")))),
+            Inherit::Remote("desk".into())
+        );
     }
 
     #[test]

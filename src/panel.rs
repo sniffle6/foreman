@@ -1424,6 +1424,7 @@ impl PanelView {
                         globe_tip = Some((
                             paint_globe(ui, &p, icon_c, 12.0, globe, backing),
                             remote.clone(),
+                            chip.disconnected,
                         ));
                     }
                     if chip.disconnected {
@@ -1778,6 +1779,7 @@ impl PanelView {
                     globe_tip = Some((
                         paint_globe(ui, &p, icon_c, 12.0, globe, backing),
                         remote.clone(),
+                        rp.disconnected,
                     ));
                 }
                 if rp.disconnected {
@@ -2201,15 +2203,16 @@ fn paint_down(
     crate::icons::paint_down_dot(p, ui.ctx(), icon, color, backing);
 }
 
-/// A row/chip's one tooltip: the globe's (the Remote and its target) while
-/// the pointer is on the icon, else the full title of an elided label.
+/// A row/chip's one tooltip: the globe's (the Remote, its target, and
+/// whether it is disconnected) while the pointer is on the icon, else the
+/// full title of an elided label.
 fn row_tooltip(
     resp: egui::Response,
-    globe: Option<(egui::Rect, String)>,
+    globe: Option<(egui::Rect, String, bool)>,
     elided: Option<String>,
 ) -> egui::Response {
     match (globe, elided) {
-        (Some((hit, remote)), _)
+        (Some((hit, remote, down)), _)
             if resp
                 .ctx
                 .pointer_hover_pos()
@@ -2217,7 +2220,7 @@ fn row_tooltip(
         {
             let text = {
                 let live = crate::config::live(&resp.ctx);
-                crate::remote::badge_tooltip(&live.remotes, &remote)
+                crate::remote::badge_tooltip(&live.remotes, &remote, down)
             };
             resp.on_hover_text(text)
         }

@@ -23,10 +23,13 @@ is for changing the feature.
   posts hook events, so posts to it are delivered Ready-only and `status`
   carries no `agent_state` for it.
 - **The token is per connection.** `spawn_remote_session` leases a new one on
-  every launch and every reconnect, and the old one dies with its `ssh`. After
-  a reconnect the fresh reply note rides on the first chat delivery, not the
-  launch. A resumed agent still has the old `curl` command in its
-  conversation and gets 401 until a post brings the new note.
+  every launch and every reconnect, and the old one dies with its `ssh`. A
+  reconnect that relaunches an agent injects the fresh reply note at launch,
+  because a resumed agent still has the old `curl` command in its
+  conversation and would get 401 until a post came. A shell reconnect waits
+  for the first post: a shell would run the note as commands. Input queued on
+  the dead connection is carried over without its note (`ReplyNote::strip`),
+  or the agent would be taught the dead token too.
 - **The forwarded port is open to everyone on the Remote.** Any user or
   process there can connect to it. The token is the only credential, and it
   sits base64-encoded on the `ssh` command line on both PCs. On Linux any user

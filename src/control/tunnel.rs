@@ -770,27 +770,57 @@ pub fn reply_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
 /// brief gets the note at launch, since no chat post may ever come to carry
 /// it; anything else gets it with its first chat delivery.
 #[derive(Debug, Default)]
-pub struct ReplyNote(Option<String>);
+pub struct ReplyNote {
+    /// Waiting for the first chat delivery.
+    pending: Option<String>,
+    /// This connection's note, however it goes out.
+    armed: Option<String>,
+}
 
 impl ReplyNote {
     /// Arm `note` for a new connection. With `at_launch` it comes straight
     /// back for the caller to inject, and no chat delivery carries it.
     pub fn arm(&mut self, note: String, at_launch: bool) -> Option<String> {
+        self.armed = Some(note.clone());
         if at_launch {
-            self.0 = None;
+            self.pending = None;
             Some(note)
         } else {
-            self.0 = Some(note);
+            self.pending = Some(note);
             None
         }
     }
 
     /// `line` with the note appended if this connection has not had it yet.
     pub fn on_delivery<'a>(&mut self, line: &'a str) -> std::borrow::Cow<'a, str> {
-        match self.0.take() {
+        match self.pending.take() {
             Some(n) => format!("{line}\n\n{n}").into(),
             None => line.into(),
         }
+    }
+
+    /// Whether the next chat delivery carries the note.
+    #[cfg(test)]
+    pub fn waits(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Input queued on this connection with its note taken out. A reconnect
+    /// carries the queue over, and the note names a token that died with
+    /// this connection; the fresh one brings its own.
+    pub fn strip(&self, queued: Vec<String>) -> Vec<String> {
+        let Some(n) = &self.armed else {
+            return queued;
+        };
+        let tail = format!("\n\n{n}");
+        queued
+            .into_iter()
+            .filter(|q| q != n)
+            .map(|q| match q.strip_suffix(&tail) {
+                Some(line) => line.to_string(),
+                None => q,
+            })
+            .collect()
     }
 }
 
@@ -992,6 +1022,22 @@ mod tests {
         // A new connection re-arms it, whichever way the last one went.
         assert_eq!(note.arm("NOTE2".into(), false), None);
         assert!(note.on_delivery("x").ends_with("\n\nNOTE2"));
+    }
+
+    #[test]
+    fn a_queue_handed_to_a_reconnect_loses_the_dead_connection_s_note() {
+        assert_eq!(ReplyNote::default().strip(vec!["a".into()]), ["a"]);
+        let mut note = ReplyNote::default();
+        note.arm("NOTE".into(), true);
+        let queued = vec![
+            "NOTE".to_string(),
+            "[chat p1 #1] t1→t2: hi\n\nNOTE".into(),
+            "[chat p1 #2] t1→t2: NOTE".into(),
+        ];
+        assert_eq!(
+            note.strip(queued),
+            ["[chat p1 #1] t1→t2: hi", "[chat p1 #2] t1→t2: NOTE"]
+        );
     }
 
     #[test]

@@ -39,7 +39,8 @@ pub struct Seg<A> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SegMark {
     None,
-    /// Filled dot.
+    /// Filled dot. A tab's disconnected dot carries a bar across it
+    /// ([`crate::icons::paint_down_dot`]), so the two never read alike.
     Up,
     /// Hollow ring.
     Down,
@@ -139,6 +140,49 @@ fn paint_mark(
     }
 }
 
+/// Test hook: open `build`'s menu in a fresh context and say, per Note,
+/// whether its text fits the width the menu opened at without the "…" cut.
+#[cfg(test)]
+pub(crate) fn notes_fit<A: Clone>(build: impl Fn() -> Vec<Entry<A>>) -> Vec<(String, bool)> {
+    let ctx = egui::Context::default();
+    let id = egui::Id::new("notes_fit");
+    let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+    let anchor = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(16.0, 16.0));
+    ctx.data_mut(|d| d.insert_temp(id.with("open"), true));
+    let mut out = Vec::new();
+    for pass in 0..2 {
+        let input = egui::RawInput {
+            screen_rect: Some(area),
+            events: vec![egui::Event::PointerMoved(anchor.center())],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            show(ui, id, anchor, area, &build, false, false);
+            let Some(width) = ui.ctx().data(|d| d.get_temp::<f32>(id.with("width"))) else {
+                return;
+            };
+            if pass == 1 {
+                for entry in build() {
+                    if let Entry::Note(text) = entry {
+                        let w = ui
+                            .painter()
+                            .layout_no_wrap(text.clone(), NOTE_FONT, egui::Color32::WHITE)
+                            .size()
+                            .x;
+                        out.push((text, w <= width - MENU_PAD * 2.0));
+                    }
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Inset of every row's text from the menu's edges.
+const MENU_PAD: f32 = 10.0;
+/// Headers, hints and Notes.
+const NOTE_FONT: egui::FontId = egui::FontId::proportional(10.0);
+
 /// The builder runs only when the anchor's menu is open.
 pub fn show<A: Clone>(
     ui: &mut egui::Ui,
@@ -164,8 +208,8 @@ pub fn show<A: Clone>(
     let items = build();
     let th = crate::theme::live(ui.ctx());
     let font = egui::FontId::proportional(12.0);
-    let small = egui::FontId::proportional(10.0);
-    let pad = 10.0;
+    let small = NOTE_FONT;
+    let pad = MENU_PAD;
     let label_w = items
         .iter()
         .map(|entry| match entry {
@@ -223,6 +267,8 @@ pub fn show<A: Clone>(
     let rows_w =
         (label_w + if hint_w > 0.0 { hint_w + 40.0 } else { 0.0 } + pad * 2.0 + 16.0).max(100.0);
     let w = menu_width(rows_w, strip_w + (pad - SEG_PAD) * 2.0, area.width());
+    #[cfg(test)]
+    ui.ctx().data_mut(|d| d.insert_temp(menu_id.with("width"), w));
     let height = |entry: &Entry<A>| match entry {
         Entry::Header(_) | Entry::HeaderText(_) => 19.0,
         Entry::Note(_) => NOTE_H,
@@ -331,7 +377,12 @@ pub fn show<A: Clone>(
                                             egui::StrokeKind::Inside,
                                         );
                                         if follow {
-                                            sui.scroll_to_rect(sr, None);
+                                            // Clear of the edge fade, which
+                                            // would cover its mark.
+                                            sui.scroll_to_rect(
+                                                sr.expand2(egui::vec2(FADE_W, 0.0)),
+                                                None,
+                                            );
                                         }
                                     } else if resp.hovered() {
                                         sp.rect_filled(sr, radius, th.win_btn_hover);

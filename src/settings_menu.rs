@@ -1579,7 +1579,11 @@ mod tests {
                 "{state}: hint {:?}",
                 laid.hint
             );
-            assert!(laid.hint_fits, "{state}: the hint is cut at {:?}", laid.pane);
+            assert!(
+                laid.hint_fits,
+                "{state}: the hint is cut at {:?}",
+                laid.pane
+            );
             for r in &laid.status {
                 assert!(r.height() <= LINE_H + 0.5, "{state}: status {r:?}");
             }
@@ -1679,6 +1683,81 @@ mod tests {
             assert!(laid.list.contains_rect(*b), "{b:?} not in {:?}", laid.list);
             assert!(laid.pane.contains_rect(*b), "{b:?}");
         }
+    }
+
+    /// At the narrowest pane: with a directory focused the hint offers its
+    /// clear key on one line, and the key forgets that row without the
+    /// TextEdit that takes its place deleting a word of the next one.
+    #[test]
+    fn ctrl_backspace_clears_the_focused_project_directory() {
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/app".into());
+        desk.dirs
+            .insert(r"H:\src\tool".into(), "/srv/the tool".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let size = Some(egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y));
+        let none = egui::Modifiers::NONE;
+        frame_at(&ctx, &mut menu, &mut s, size, None);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            size,
+            Some((egui::Key::Enter, none)),
+        );
+        for _ in 0..3 {
+            frame_at(&ctx, &mut menu, &mut s, size, Some((egui::Key::Tab, none)));
+        }
+        frame_at(&ctx, &mut menu, &mut s, size, None);
+        let laid = menu.remotes.laid();
+        assert!(laid.hint_fits, "the hint is cut at {:?}", laid.pane);
+        assert!(laid.dirs_note_fits);
+        let ctrl = egui::Modifiers::CTRL;
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            size,
+            Some((egui::Key::Backspace, ctrl)),
+        );
+        frame_at(&ctx, &mut menu, &mut s, size, None);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            size,
+            Some((egui::Key::Enter, none)),
+        );
+        assert!(!menu.remotes.is_editing(), "saved");
+        let dirs = &s.remotes[0].dirs;
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        assert_eq!(dirs[r"H:\src\tool"], "/srv/the tool", "untouched");
+    }
+
+    #[test]
+    fn the_no_directories_line_fits_at_minimum_width() {
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![remote("desk", "desk")],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let size = Some(egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y));
+        frame_at(&ctx, &mut menu, &mut s, size, None);
+        let enter = Some((egui::Key::Enter, egui::Modifiers::NONE));
+        frame_at(&ctx, &mut menu, &mut s, size, enter);
+        frame_at(&ctx, &mut menu, &mut s, size, None);
+        assert!(menu.remotes.is_editing());
+        assert!(menu.remotes.laid().dirs_note_fits);
     }
 
     #[test]

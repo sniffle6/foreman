@@ -1149,8 +1149,22 @@ impl Session {
 
     /// Chat input queued here and not yet written, handed over on reconnect
     /// so it reaches the fresh connection instead of dying with this one.
+    /// This connection's reply note is left behind: its token is dead.
     pub fn take_pending_injects(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ready_gate.pending_inject)
+        self.reply_note
+            .strip(std::mem::take(&mut self.ready_gate.pending_inject))
+    }
+
+    /// Test hook: the input waiting for Ready.
+    #[cfg(test)]
+    pub fn pending_injects(&self) -> &[String] {
+        &self.ready_gate.pending_inject
+    }
+
+    /// Test hook: whether a chat delivery would still carry the reply note.
+    #[cfg(test)]
+    pub fn reply_note_waits(&self) -> bool {
+        self.reply_note.waits()
     }
 
     /// Queue `texts` ahead of anything already waiting (they were older).
