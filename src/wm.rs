@@ -6008,6 +6008,7 @@ impl WindowManager {
             "appearance" => crate::settings_menu::Pane::Appearance,
             "agents" => crate::settings_menu::Pane::Agents,
             "window-manager" => crate::settings_menu::Pane::WindowManager,
+            "remotes" => crate::settings_menu::Pane::Remotes,
             _ => return,
         };
         self.open_settings();

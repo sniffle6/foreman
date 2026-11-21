@@ -329,7 +329,7 @@ fn posix_script(dir: &str, env: &[(&str, String)], argv: &[String]) -> String {
     s
 }
 
-fn posix_line(script: &str) -> String {
+pub(crate) fn posix_line(script: &str) -> String {
     let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
     format!("sh -c \"$(printf %s {b64} | base64 -d)\"")
 }
@@ -417,7 +417,7 @@ fn legacy_native(a: &str) -> String {
     out
 }
 
-fn utf16le_b64(script: &str) -> String {
+pub(crate) fn utf16le_b64(script: &str) -> String {
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }

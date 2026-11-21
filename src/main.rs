@@ -53,6 +53,8 @@ mod ready;
 mod recents;
 mod release;
 mod remote;
+mod remote_probe;
+mod remotes_pane;
 mod search;
 mod settings;
 mod settings_menu;

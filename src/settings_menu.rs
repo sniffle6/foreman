@@ -16,17 +16,19 @@ pub enum Pane {
     WindowManager,
     Keybindings,
     Agents,
+    Remotes,
     Startup,
 }
 
 impl Pane {
-    pub const ALL: [Pane; 7] = [
+    pub const ALL: [Pane; 8] = [
         Pane::Appearance,
         Pane::Terminal,
         Pane::Bell,
         Pane::WindowManager,
         Pane::Keybindings,
         Pane::Agents,
+        Pane::Remotes,
         Pane::Startup,
     ];
     pub fn label(self) -> &'static str {
@@ -37,6 +39,7 @@ impl Pane {
             Pane::WindowManager => "Window Manager",
             Pane::Keybindings => "Keybindings",
             Pane::Agents => "Agents",
+            Pane::Remotes => "Remotes",
             Pane::Startup => "Startup & Updates",
         }
     }
@@ -189,6 +192,8 @@ pub fn rows(pane: Pane) -> &'static [RowSpec] {
         // touching rows()); handle_keys also delegates to it before rows()
         // could be indexed, so this is never read.
         Pane::Keybindings => &[],
+        // Custom body too: `remotes_pane` draws and reads its own keys.
+        Pane::Remotes => &[],
         Pane::Agents => &[
             RowSpec {
                 field: Field::InstallSkills,
@@ -471,6 +476,8 @@ pub struct SettingsMenu {
     /// The appearance/theme editor, rendered inline when the Appearance pane is
     /// active (custom body, like Keybindings).
     pub appearance: crate::appearance::AppearanceView,
+    /// The Remotes editor, rendered inline when the Remotes pane is active.
+    pub remotes: crate::remotes_pane::RemotesView,
     /// Set for exactly one frame when the rail dives into the Keybindings pane
     /// (Enter/→). `draw_pane` consumes it to skip that frame's editor input —
     /// otherwise the same un-consumed Enter that dove in is read by the
@@ -499,6 +506,7 @@ impl SettingsMenu {
             scroll_to_selected: false,
             keybindings: SettingsView::new(),
             appearance: crate::appearance::AppearanceView::new(),
+            remotes: crate::remotes_pane::RemotesView::new(),
             editor_just_entered: false,
             new_project_layout: None,
             was_active: false,
@@ -798,6 +806,15 @@ impl SettingsMenu {
             return MenuOutcome::Pending;
         }
 
+        // Same for Remotes, except Tab moves between the edit form's fields
+        // while the form is open.
+        if self.pane == Pane::Remotes && !self.in_rail {
+            if tab && !self.remotes.is_editing() {
+                self.in_rail = true;
+            }
+            return MenuOutcome::Pending;
+        }
+
         if esc {
             return MenuOutcome::Close;
         }
@@ -959,6 +976,15 @@ impl SettingsMenu {
                 EditorOutcome::Changed => bump(outcome, MenuOutcome::Changed),
                 EditorOutcome::Close => self.in_rail = true, // Esc/back-out returns to the rail
                 EditorOutcome::Pending => {}
+            }
+            return;
+        }
+        if self.pane == Pane::Remotes {
+            let reads_input = active && !self.in_rail && !just_entered;
+            match self.remotes.show(ui, rect, reads_input, &mut s.remotes) {
+                crate::remotes_pane::Outcome::Changed => bump(outcome, MenuOutcome::Changed),
+                crate::remotes_pane::Outcome::Close => self.in_rail = true,
+                crate::remotes_pane::Outcome::Pending => {}
             }
             return;
         }
@@ -1423,10 +1449,60 @@ mod tests {
             assert!(!p.label().is_empty());
             // Keybindings and Appearance have no RowSpecs — draw_pane/handle_keys
             // special-case them and delegate to their embedded editors instead.
-            if p != Pane::Keybindings && p != Pane::Appearance {
+            if p != Pane::Keybindings && p != Pane::Appearance && p != Pane::Remotes {
                 assert!(!rows(p).is_empty(), "{:?} has no rows", p);
             }
         }
+    }
+
+    /// One frame of the whole menu with `key` pressed.
+    fn frame_with_key(menu: &mut SettingsMenu, s: &mut Settings, key: egui::Key, shift: bool) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift,
+                ..Default::default()
+            },
+        });
+        let mut km = Keymap::default();
+        let mut theme = crate::theme::Theme::default();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.max_rect();
+                let outcome = menu.show(ui, r, true, s, &mut km, &mut theme);
+                if matches!(outcome, MenuOutcome::Changed) {
+                    s.sanitize(); // what the debounced save's reload would do
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn remotes_pane_keeps_tab_while_its_form_is_open() {
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings::default();
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        frame_with_key(&mut menu, &mut s, egui::Key::A, false);
+        assert!(menu.remotes.is_editing(), "A opens the add form");
+        frame_with_key(&mut menu, &mut s, egui::Key::Tab, false);
+        assert!(!menu.in_rail, "Tab moves between the form's fields");
+        frame_with_key(&mut menu, &mut s, egui::Key::Escape, false);
+        assert!(!menu.remotes.is_editing());
+        frame_with_key(&mut menu, &mut s, egui::Key::Tab, false);
+        assert!(menu.in_rail, "browsing, Tab backs out to the rail");
+        assert!(s.remotes.is_empty());
+    }
+
+    #[test]
+    fn remotes_is_a_custom_body_pane() {
+        assert!(Pane::ALL.contains(&Pane::Remotes));
+        assert!(rows(Pane::Remotes).is_empty());
     }
 
     #[test]
