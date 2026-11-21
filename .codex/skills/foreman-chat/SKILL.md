@@ -74,6 +74,24 @@ Delivery timing:
   Claude Esc leaves stale Working, so `--now` also releases steers in that case.
 - `--now` is post-only.
 
+## A Member On Another PC (`--on`)
+
+A Remote Session (`open --on R`, see `foreman-dispatch`) runs its process
+on another PC but is a member of THIS room with a plain `tN` id. Target it,
+`--re` it and snapshot it like any member. Prefer it to `--host` (next
+section) whenever the worker should be part of this room.
+
+- Its agent has no Foreman CLI. It posts with the `curl` command in the
+  reply note Foreman gave it at launch or with its first post. It can post
+  (`to`, `re`, `now`), read history and read status. It cannot open, send
+  to, close or snapshot panes, or use the kanban board.
+- No agent state on a Remote Session yet: posts to it are delivered once
+  the pane takes input, even mid-turn. Keep them few and targeted.
+- While its connection is down (`disconnected: true` in `status --json`)
+  `--to` it fails as exited. Broadcasts sent meanwhile reach it after the
+  human reconnects. A reconnect gets a fresh reply note, and the old
+  `curl` command stops working.
+
 ## Another PC (Foreman On A Second Machine, Over Tailscale)
 
 A sender shaped `desk/p2/t3` is a terminal on ANOTHER PC: host / its project

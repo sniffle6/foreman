@@ -1,6 +1,6 @@
 ---
 name: foreman-dispatch
-description: Use when running inside foreman (the FOREMAN env var is 1) and you launch or manage visible terminals — dispatch/spawn a worker, open a pane with a prompt or command, check on a worker, read or drive another pane, hand a pane to the human, close one. Kanban cards and plans use foreman-kanban for continuing assignments or authorized delegation.
+description: Use when running inside foreman (the FOREMAN env var is 1) and you launch or manage visible terminals — dispatch/spawn a worker (here or on another PC with --on), open a pane with a prompt or command, check on a worker, read or drive another pane, hand a pane to the human, close one. Kanban cards and plans use foreman-kanban for continuing assignments or authorized delegation.
 ---
 
 # Launch and manage visible terminals in foreman
@@ -79,6 +79,43 @@ and pass the variable — this is the entire quoting story:
   the user the agent is running and where.
 - A `-p` worker's scrolled-away transcript is recoverable at
   `~\.claude\projects\<munged-cwd>\<session>.jsonl`.
+
+## Another PC: `--on`
+
+`--on R` runs the command on Remote R over ssh. The pane is here, the
+process is there, and it is an ordinary member of THIS project's chat.
+
+    & $env:FOREMAN_EXE remotes                    # names --on accepts, with ssh targets
+    & $env:FOREMAN_EXE open --on desk --title "agent · x" -- claude "<task prompt>"
+
+- **`--on` or `--host`?** Use `--on` to put a worker on another PC and run
+  it from here: you chat, snapshot, send to and close it like any pane.
+  `--host` talks to a separate foreman already running on that PC, with its
+  own room and panes (foreman-chat, "Another PC"). A PC that `remotes` lists
+  takes `--on`.
+- It starts in the Project's directory mapped on R. `--cwd D` names a
+  directory on R instead, for this launch only. With neither, open is
+  refused: pass `--cwd` or ask the human. Never guess a directory.
+- Remotes are added by the human in Settings > Remotes. Do not edit
+  settings.json for them.
+- **The agent on R has no foreman CLI and no skills.** Opened with a prompt,
+  it gets a reply note at launch with the exact `curl` command that posts to
+  this room; a bare agent gets the note with its first chat post. Ask it to
+  report by chat and leave the foreman commands out of its brief.
+- A Remote agent can post chat (with `to`, `re`, `now`), read chat history
+  and read `status`. It cannot open, send to, close or snapshot panes, or
+  use the kanban board. You drive; it reports.
+- No `agent_state` on a Remote Session yet, so posts to it are not held for
+  Idle and `status` never says idle. Snapshot to see where it is.
+- In `status --json` its line carries `remote` (the Remote's name). Its ssh
+  dropping shows as `state: exited` with `disconnected: true`: the pane
+  waits for the human's Enter to reconnect, and foreman never reconnects by
+  itself. Until then `chat --to` it fails as exited.
+- A reconnected agent resumes its last conversation (Claude, Codex) without
+  its original prompt or flags, or starts fresh. Re-brief it by chat.
+- A Windows Remote may refuse a long prompt for its command-line limit. Do
+  what the error says: open without the prompt and send the brief by chat.
+- `kanban dispatch` has no `--on`; card work runs on this PC.
 
 ## Your panes after launch
 
