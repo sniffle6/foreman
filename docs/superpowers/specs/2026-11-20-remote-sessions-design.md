@@ -2,11 +2,14 @@
 
 Direction settled with the user 2026-11-20: Sessions that run on another PC,
 opened from this foreman over SSH, living in the same Project as local ones
-and marked with a globe. Decisions tagged *(proposed)* were written into this
-spec without being discussed and need a yes or no before tickets are cut.
+and marked with a globe. **The other PC needs nothing from foreman**: sshd,
+the agent CLI and `curl`. Windows and Linux Remotes are both in scope, and
+the whole design ships as one run of work. Decisions tagged *(proposed)*
+were written into this spec without being discussed and need a yes or no
+before tickets are cut.
 
 Nothing here has been run. The experiments at the end gate the build; a
-failure in the first two changes the design.
+failure in the first three changes the design.
 
 ## Problem
 
@@ -24,11 +27,15 @@ badge, and the pane itself is on the other PC's monitor.
   `send` and `snapshot` need no change. Still `Content::Terminal`: no new
   Content kind, no third window state.
 - **One Chat room, on the seat PC.** A Remote Session has a local Session, so
-  it is an ordinary Member. Delivery to it is the existing PTY write. Only the
-  agent's way *back* (posting, hook events) is new.
-- **The way back is an SSH reverse tunnel plus a per-Session token**
-  *(proposed; recommended over the alternatives below)*. It rides the
-  connection that already exists, so adding a PC is one SSH target.
+  it is an ordinary Member. Delivery to it is the existing PTY write, and an
+  orchestrator reads it with `snapshot` like any local Session. The Bell and
+  the OSC title also arrive in-band.
+- **Nothing is installed on a Remote.** No foreman, no skills, no hook
+  files. What the agent there needs to know or run travels with the launch.
+- **The way back is an SSH reverse tunnel, a per-Session token, and plain
+  HTTP** *(proposed)*. The client is `curl`, which ships with Windows and
+  Linux. It carries the two things that originate on the Remote: the agent
+  pushing a chat post, and hook events for the state badge.
 - **Remotes are structured settings, not command templates.** Foreman builds
   the argv, because it has to inject the directory, the agent and the
   credentials, and one pure builder is testable where a user string is not.
@@ -45,13 +52,19 @@ Rejected:
   display protocol, late-attach snapshots, a controller lease and a resize
   policy. It is the only design that survives a dropped connection, and it is
   the follow-up if that turns out to matter; it is not the first step.
+- *The foreman CLI on the Remote as the way-back client*: the first draft of
+  this spec. It forced an install on every PC and ruled out Linux, to send
+  one line of text.
 - *Tailscale listener for the way back* (`control::serve_remote`): it exists,
   but it identifies a caller by source address, which cannot tell two
   Sessions on one PC apart, and it needs a second network configured per PC.
 - *In-band escape sequence for the way back*: no listener at all, but any
   text printed in the pane (a `cat` of a hostile file) could forge a chat
-  post into other agents' prompts, and the Remote's own ConPTY may drop
+  post into other agents' prompts, and a Windows Remote's ConPTY may drop
   sequences it does not know.
+- *No way back at all*: workable, since an orchestrator can pull with
+  `snapshot`. Kept in because push reporting and badges are small once the
+  tunnel exists, and idle-aware chat delivery depends on the badge.
 - *Remote `open` on the other PC's foreman*: exactly what the local-only rule
   forbids, and the pane would be on the wrong monitor.
 - *Auto-reconnect*: an uncertain shell input must never be resent on its own.
@@ -62,14 +75,15 @@ Rejected:
 
 Goals: pick a PC by name and get a terminal on it in the Project's directory
 there; agents dispatch to a Remote with one flag; a Remote Session is a full
-Member; a dropped connection is visible and one keypress from recovery.
+Member that can post and show state; a dropped connection is visible and one
+keypress from recovery; none of it needs setup on the Remote beyond sshd.
 
-Non-goals (v1): non-Windows Remotes (the builder leaves room; there is no
-foreman CLI to answer on them); surviving a dropped connection; kanban card
-dispatch or Assignments onto a Remote (worktree, integration queue and
-process-tree ownership checks are all local); `icat`, image paste, file drops
-and file-path links across PCs; browsing the Remote's directories; installing
-anything on a Remote over SSH; syncing the repo between PCs.
+Non-goals (v1): surviving a dropped connection; kanban card dispatch or
+Assignments onto a Remote (worktree, integration queue and process-tree
+ownership checks are all local); `icat`, image paste, file drops and
+file-path links across PCs; browsing the Remote's directories; syncing the
+repo between PCs; automatic Session naming for Remote Sessions; optional
+foreman tooling that runs on a Remote (see Follow-ups).
 
 ## Vocabulary
 
@@ -81,7 +95,7 @@ Lands in `CONTEXT.md` with the first implementing commit.
 - **Remote Session** — a Session whose process is an SSH client into a
   Remote. _Avoid_: SSH tab, remote terminal.
 - **Tunnel** — the per-Session reverse forward a Remote Session's agent uses
-  to reach the seat PC's Control plane.
+  to reach the seat PC.
 
 `--host` (talk to another PC's foreman) and `--on` (run a Session on a Remote
 from this foreman) are different features and stay different words. Remotes
@@ -96,7 +110,7 @@ need neither Tailscale nor `Settings::remote_peers`.
 |---|---|---|
 | `name` | The label in the launcher, on tabs, and for `--on` | Same character rule as `config::valid_peer`, short cap, unique, not `local` |
 | `target` | SSH destination: `user@pc` or an ssh-config alias | Non-empty, no whitespace, must not start with `-` |
-| `shell` | `Pwsh` or `WindowsPowerShell`: the PowerShell on that PC | Enum; Test fills it in |
+| `shell` | `Pwsh`, `WindowsPowerShell` or `Posix` | Enum; Test fills it in |
 | `dirs` | Seat-PC Project directory → directory on this Remote | Plain strings |
 
 No port field: a non-default port belongs in the target's ssh-config entry.
@@ -120,39 +134,49 @@ ssh -t -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
     -o ServerAliveCountMax=3 -R <rport>:127.0.0.1:<lport> -- <target> <remote line>
 ```
 
-Remote line: `pwsh -NoLogo [-NoExit] -EncodedCommand <base64>` (or
-`powershell` per `shell`). The script is base64 of UTF-16LE, so the line is
-letters, digits and `+/=` only. That survives whichever login shell sshd
-runs first (cmd or PowerShell) with no per-shell quoting. Inside the script
-there is one quoting rule: PowerShell single quotes, `'` doubled.
+The remote line carries a script as base64, so the line itself is letters,
+digits and `+/=` plus a fixed wrapper. Whatever login shell sshd runs first
+never sees a quote or a space from the user's data.
 
-The script, in order:
+| `shell` | Remote line | Script |
+|---|---|---|
+| `Pwsh` / `WindowsPowerShell` | `pwsh -NoLogo [-NoExit] -EncodedCommand <b64>` (or `powershell`) | PowerShell, UTF-16LE; quoting rule: single quotes, `'` doubled |
+| `Posix` | `sh -c "$(printf %s <b64> \| base64 -d)"` | POSIX sh, UTF-8; quoting rule: single quotes, `'` as `'\''` |
 
-1. `Set-Location -LiteralPath <dir>` with errors terminating. A missing
-   directory stops the launch with the error on screen; it never starts an
-   agent in the wrong place. A blank mapping skips this step (home).
-2. Set `FOREMAN=1`, `FOREMAN_TERMINAL_ID`, `FOREMAN_PROJECT_ID`,
-   `COLORTERM`, `FOREMAN_REMOTE=127.0.0.1:<rport>`, `FOREMAN_TOKEN`.
-3. Set `FOREMAN_EXE` to the Remote's own CLI: the installed
-   `%LOCALAPPDATA%\Programs\foreman\foreman.com` if present, else PATH, else
-   unset.
-4. Run the logical argv, each element a quoted literal. A Shell launch has
-   no argv and uses `-NoExit`; an agent or Dispatch ends with its process,
-   the same as locally.
+Both scripts do the same steps:
 
-Not injected: `FOREMAN_PIPE`, `FOREMAN_TITLE_PIPE` (seat-PC pipe names that
-mean nothing there) and `KITTY_WINDOW_ID` (graphics are a non-goal).
+1. Change to the mapped directory and stop with the error on screen if it
+   does not exist. Never start an agent in the wrong place. A blank mapping
+   skips this step (home).
+2. Export `FOREMAN=1`, `FOREMAN_TERMINAL_ID`, `FOREMAN_PROJECT_ID`,
+   `COLORTERM`, `FOREMAN_URL=http://127.0.0.1:<rport>`, `FOREMAN_TOKEN`.
+3. Run the logical argv, each element a quoted literal. A Shell launch has
+   no argv and leaves an interactive shell; an agent or Dispatch ends with
+   its process, the same as locally.
 
-**Length cap.** If the Remote's login shell is cmd, the whole remote line
-must fit cmd's 8191-character limit, and the encoding costs about 2.7 line
-characters per script character. The builder refuses a launch over the cap
-with an error that says to open without the prompt and send the brief by
-chat. It never truncates.
+On `Posix` step 3 runs through the user's own login shell with its login
+and interactive startup files, not bare `sh`:
+`exec "$SHELL" -lic 'exec "$@"' foreman-launch <argv…>`. An SSH command
+line otherwise skips those files, and an agent installed under the user's
+home is then not on PATH even though it works when the user logs in by
+hand (seen on the test Remote: `codex` was missing from the bare PATH and
+found this way). Passing the argv as positional parameters also means no
+second quoting layer: each element is quoted once, by the one rule.
+
+Not injected: `FOREMAN_PIPE`, `FOREMAN_TITLE_PIPE`, `FOREMAN_EXE` (seat-PC
+names that mean nothing there) and `KITTY_WINDOW_ID` (graphics are a
+non-goal).
+
+**Length cap.** If a Windows Remote's login shell is cmd, the whole remote
+line must fit cmd's 8191-character limit, and the encoding costs about 2.7
+line characters per script character. The builder refuses a Windows launch
+over the cap with an error that says to open without the prompt and send
+the brief by chat. It never truncates. `Posix` has no practical cap.
 
 **Directory.** The first launch on a Remote from a Project with no mapping
-asks once in a small text prompt, prefilled with the seat-PC path, and
-saves the answer to `Remote::dirs`. Splits always use the mapping, not
-wherever the Remote shell has `cd`'d to (there is no OSC 7 tracking).
+asks once in a small text prompt and saves the answer to `Remote::dirs`.
+Splits always use the mapping, not wherever the Remote shell has `cd`'d to
+(there is no OSC 7 tracking).
 
 ## The way back
 
@@ -164,47 +188,78 @@ exit; reconnect picks a new port.
 
 A forwarded loopback port is reachable by every process on the Remote, so
 the port is not the credential. At spawn foreman mints a random token from
-the OS RNG and records token → (Project id, terminal id). A connection's
-first line is the token; the request line follows. Request structs are
+the OS RNG and records token → (Project id, terminal id). Every request
+carries it as `Authorization: Bearer`. A token dies with its Session.
+
+The listener speaks just enough HTTP/1.1 for `curl`: a request line, the
+`Authorization`, `Content-Length` and `Expect` headers, a body. Hand-parsed,
+no new dependency. It is a separate front door onto the same GUI channel
+the pipe uses (`CtrlMsg`); the pipe protocol and its request structs are
 untouched, so v1 wire compatibility holds by construction.
 
-`control::Origin` gains a Tunnel variant carrying those ids, and
-`dispatch_line` gains a third allow-list next to `REMOTE_VERBS`:
+| Request | Does |
+|---|---|
+| `POST /chat` (body is the text; `to`, `re`, `now` as query) | Posts as the token's Session down the normal Member path, not `ChatRoom::post_remote` |
+| `GET /chat?history=N` | Last N lines |
+| `GET /status` | The Project's Sessions, read-only |
+| `POST /hook?agent=…&event=…` | An agent-state event for the token's Session |
 
-- `chat` — post and history. The sender is stamped from the token; a `from`
-  in the request is ignored. The post goes down the normal Member path, not
-  `ChatRoom::post_remote`.
-- `status` — read-only.
-- the hook event (below).
+Anything else is refused. There is no route for `open`, `send`, `close`,
+`snapshot` or kanban. Guards match the peer listener: a body cap, one
+per-connection deadline, bounded in-flight handlers.
 
-The Tunnel listener keeps the peer listener's guards: the request-line cap,
-one per-connection deadline, bounded in-flight handlers. A token dies with
-its Session.
+Gotchas the listener must handle:
 
-On the Remote, the CLI checks `FOREMAN_REMOTE` first. When it is set the
-CLI uses the Tunnel and **never** falls back to a pipe: the Remote may be
-running its own foreman, and the well-known pipe there is the wrong
-instance.
+- **`Expect: 100-continue`.** `curl` sends it for larger bodies and stalls
+  for a second if the server stays silent. Answer it.
+- **`curl` on Windows PowerShell 5.1 is an alias**, not the program. Every
+  command foreman hands a Windows Remote says `curl.exe`.
+
+**Teaching the agent.** The Remote's agent has no foreman skills. The first
+chat delivery to a Remote Session, and the first after a reconnect, carries
+a short note with the exact reply command for that Remote's shell. A
+Dispatch brief built for `--on` carries the same note. It is sent once per
+connection, not on every message.
 
 Accepted risk: the token sits on a command line (base64, not secret) on
-both PCs, so another process running as the same user can read it. It
-buys posting chat as that one Session until it exits. The local pipe
+both PCs, so another process running as the same user can read it, and on
+Linux any user can read a process's arguments. It buys posting chat as that
+one Session, and feeding its badge, until the Session exits. The local pipe
 already trusts same-user processes with more than that.
 
-## Agent state and naming
+## Agent state
 
-The managed hook helper (`src/title_notify.rs`) reports over
-`FOREMAN_TITLE_PIPE`. When `FOREMAN_REMOTE` is set it sends the same small
-message through the Tunnel instead. `WindowManager::apply_hook_event`
-already matches on Project id, terminal id and icon; the token supplies the
-first two and the logical argv supplies the icon.
+Locally the badge comes from hooks foreman installs in each provider's
+config. On a Remote nothing is installed, so the hooks travel with the
+launch: where a provider accepts hook settings on its command line, the
+builder adds them, and each hook is one `curl` to `/hook` with the event
+name. `WindowManager::apply_hook_event` already matches on Project id,
+terminal id and icon; the token supplies the first two and the logical argv
+supplies the icon.
 
-The hooks must exist in the provider config **on the Remote**. v1 does not
-install them over SSH: the Remote's own foreman installs them when its
-settings ask for them. Test (below) reports whether the helper is
-reachable, so a missing badge has an explanation. A hand-typed agent in a
-Remote shell gets its icon from the OSC title only; the process-tree scan
-sees `ssh.exe`.
+Per provider (see Results):
+
+- **Claude** takes hook settings as JSON on `--settings`. Confirmed to fire
+  through the Tunnel.
+- **Codex** reads hooks from a file and only runs ones the user has trusted.
+  The one launch-time route is its trust-bypass flag. Foreman does not pass
+  that flag on its own; Codex gets no badge on a bare Remote in v1.
+- **Grok** is unverified.
+
+A provider with no per-launch hooks gets no badge on a Remote Session, and
+its chat delivery behaves as it does for any Session with no state.
+
+`/hook` answers with an empty body, and the hook's `curl` discards output
+anyway. A `UserPromptSubmit` hook's stdout is fed into the agent's context,
+so a reply line there would land in every prompt. A hand-typed
+agent in a Remote shell has no hooks either, and gets its icon from the OSC
+title only; the process-tree scan sees `ssh.exe`.
+
+The local helper filters subagent events using the hook's stdin payload
+(`title_notify::normalize_event`). Whether the remote hook forwards enough
+of that payload, within the body cap, to keep the same filtering is part of
+experiment 3. If it cannot, a subagent finishing may mark its parent idle
+early on a Remote Session; that is recorded as a gotcha, not papered over.
 
 ## UI
 
@@ -241,9 +296,9 @@ Remote (name, target, shell, reachability, Test, delete), inline add and
 edit, ssh-config `Host` names offered as suggestions. **Test** runs one
 `ssh -o BatchMode=yes` probe off-thread and reports: login works without a
 prompt (or "needs an interactive login, which only a pane can do"), which
-PowerShell exists, whether the foreman CLI is installed and its version,
-which agent CLIs are on PATH. Deleting a Remote does not touch live
-Sessions; each carries its own copy of the name.
+shell it found, whether `curl` is there, which agent CLIs are on PATH.
+Deleting a Remote does not touch live Sessions; each carries its own copy
+of the name.
 
 **Disconnect.** When a Remote Session's `ssh` exits, the Win stays, shows a
 one-line "Disconnected from desk — Enter to reconnect" bar, and takes no
@@ -279,39 +334,81 @@ exists restores as a local Shell with a toast.
 
 ## Experiments that gate the build
 
-1. `ssh -R` between two Windows PCs with the inbox OpenSSH, and a line sent
-   back through it. Failure reopens the way-back decision.
-2. The encoded launch line through a cmd login shell and a PowerShell one,
-   into a directory with spaces, starting each agent CLI. Failure reopens
-   the builder.
-3. Resize and the resize-then-Up-arrow case through two ConPTYs. Record it;
-   `docs/conpty-resize-reflow.md` is settled and this is not a reason to
-   reopen it.
-4. Kill the local `ssh.exe` and check the Remote for orphaned agent
+1. `ssh -R` from the seat PC to a Windows Remote (inbox OpenSSH) and to a
+   Linux one, and a `curl` back through each. Failure reopens the way back.
+2. The encoded launch line: through a cmd login shell and a PowerShell one
+   on Windows, and through bash and zsh on Linux; into a directory with
+   spaces; starting each agent CLI, including one installed through a
+   version manager. Failure reopens the builder.
+3. Per-launch hook settings for each agent CLI: does the flag exist, do the
+   hooks fire, and how much of the payload the subagent filter needs.
+   Decides which providers get a badge on a Remote.
+4. Resize and the resize-then-Up-arrow case, Windows Remote (two ConPTYs)
+   and Linux Remote (one). Record it; `docs/conpty-resize-reflow.md` is
+   settled and this is not a reason to reopen it.
+5. Kill the local `ssh.exe` and check the Remote for orphaned agent
    processes.
-5. Sleep the seat PC mid-run. Time how long the keepalive takes to end the
+6. Sleep the seat PC mid-run. Time how long the keepalive takes to end the
    Session, and confirm the resume argv recovers the conversation.
-6. Password and host-key prompts against the Ready gate: typed input must
+7. Password and host-key prompts against the Ready gate: typed input must
    reach `ssh` before the remote shell has ever answered a DSR.
-7. A hook fired by an agent on the Remote sees `FOREMAN_REMOTE` and
-   `FOREMAN_TOKEN`.
+
+## Results, 2026-11-20, one Linux Remote
+
+Run by hand from the seat PC (Windows, inbox OpenSSH client) against a
+Debian machine with bash as the login shell. No Windows Remote was
+available; every Windows half of the experiments above is still open.
+
+- **1, Linux half: passed.** `ssh -R` plus `curl` with a bearer header
+  reached a listener on the seat PC, for a short post, a 2000-byte post and
+  a GET. That `curl` sent no `Expect` header at 2000 bytes; versions differ,
+  so the listener still handles it.
+- **2, bash only: passed.** The base64 line changed into a directory
+  containing spaces and a `'`, exported the variables, kept a tty, and
+  delivered argv elements containing spaces, both quote kinds and a `$`
+  unchanged. A missing directory stopped the launch with exit status 1.
+  zsh was not tried.
+- **3, Claude: partly passed.** `--settings` with inline hook JSON fired
+  `UserPromptSubmit` through the Tunnel with the token from the launch
+  environment. `Stop` and `PostToolUse` were not observed because Claude on
+  that machine was not logged in, so the turn never ran.
+- **3, Codex: not run.** It needs the trust-bypass flag; see Agent state.
+- **3, Grok: not run.** Not installed there.
+- **Real pane, existing build.** `foreman open -- ssh -t …` to the same
+  machine: the Session latched Ready, `send` and `snapshot` worked, and a
+  targeted chat post was delivered into the pane. An interactive Codex
+  started through the base64 line drew its full TUI. This is the core claim
+  of the design, shown with no new code.
+- **5, Linux half: passed.** Closing the pane left no process behind on the
+  Remote, for a plain `sleep` and for Codex.
+- **7, key login only: passed.** Ready latched with no prompt in the way.
+  Password and host-key prompts were not exercised.
+- **4 and 6: not run.** Resize needs a human at the window; sleep needs the
+  seat PC to sleep.
 
 ## Order of work
 
-1. Remote model, builder, `--on`, where-strip, globe, Remotes pane,
-   disconnect bar, persistence. Nothing on a Remote talks back; no wire
-   change beyond `on`.
-2. Tunnel listener, token, CLI transport, chat.
-3. Hook helper over the Tunnel: badges and naming.
+One run, in this order, each step usable when it lands:
 
-Each slice is usable alone. Slice 1 needs experiments 2–6; slice 2 needs
-experiment 1; slice 3 needs experiment 7.
+1. Remote model, builder (all three shells), `--on`, where-strip, globe,
+   Remotes pane, disconnect bar, persistence.
+2. Tunnel listener, token, the chat and status routes, the reply note.
+3. Per-launch hooks and the `/hook` route.
+
+## Follow-ups
+
+- Optional foreman tooling on a Remote, for things that need a presence
+  there: hooks for providers with no per-launch flag, repo sync helpers,
+  images across PCs. Always an addition; a bare Remote keeps working.
+- Kanban card dispatch onto a Remote.
+- Surviving a dropped connection (the mirror design above).
 
 ## Tests
 
-Pure and table-driven: the builder (quoting, spaces, `'`, `-`-leading
-target, over-cap refusal, logical argv kept for the icon); `sanitize` for
-`remotes`; Tunnel verb gating and sender stamping in `dispatch_line`;
-`OpenRequest` wire compat for `on`; `launcher::entries` with and without
-Remotes; `ContentSnap` round-trip. Nothing in the unit suite opens a
-socket to another PC; the experiments cover that by hand.
+Pure and table-driven: the builder per shell (quoting, spaces, `'`,
+`-`-leading target, over-cap refusal on Windows, logical argv kept for the
+icon); `sanitize` for `remotes`; the HTTP parser (caps, missing or wrong
+token, `Expect`, unknown route); sender stamping; `OpenRequest` wire compat
+for `on`; `launcher::entries` with and without Remotes; `ContentSnap`
+round-trip. Nothing in the unit suite opens a socket to another PC; the
+experiments cover that by hand.
