@@ -748,6 +748,9 @@ pub struct Session {
     /// The Remote this Session runs on (its process is `ssh`); `None` = local.
     /// A copy of the name, so deleting the Remote leaves live Sessions alone.
     remote: Option<String>,
+    /// The ssh target this connection was opened with, for the close confirm.
+    /// `None` until a connection is made.
+    remote_target: Option<String>,
     /// The directory on the Remote this connection launched in, so a
     /// reconnect lands in the same place. `None` = resolve it from the
     /// Project's mapping at reconnect (a restored Session).
@@ -863,7 +866,10 @@ fn clipboard_has_image() -> bool {
 /// by sending Ctrl+V for the agent to read the clipboard itself, and that
 /// agent runs on the Remote.
 fn image_paste_refusal(remote: &str) -> String {
-    format!("Image paste doesn't reach {remote}: copy the image on {remote} instead")
+    format!(
+        "Image paste can't reach {remote}: the agent reads {remote}'s clipboard. \
+         Save the image on {remote} and give the agent its path."
+    )
 }
 
 /// Pure gate for the multi-line paste confirm: true when the setting is on
@@ -1059,7 +1065,7 @@ impl Session {
     /// logical argv for the tab icon, since the wrapped line hides the agent.
     pub fn spawn_remote(
         built: crate::remote::Built,
-        remote: &str,
+        remote: &crate::remote::Remote,
         dir: &str,
         env: &[(String, String)],
         ctx: egui::Context,
@@ -1081,7 +1087,8 @@ impl Session {
             std::io::Error::new(e.kind(), format!("could not start {program}: {e}"))
         })?;
         session.dispatch_argv = Some(built.dispatched);
-        session.remote = Some(remote.to_string());
+        session.remote = Some(remote.name.clone());
+        session.remote_target = Some(remote.target.clone());
         session.remote_dir = Some(dir.to_string());
         Ok(session)
     }
@@ -1207,6 +1214,12 @@ impl Session {
     /// The Remote this Session runs on; `None` for a local Session.
     pub fn remote(&self) -> Option<&str> {
         self.remote.as_deref()
+    }
+
+    /// The ssh target its connection was opened with; `None` for a local
+    /// Session or a restored one not yet reconnected.
+    pub fn remote_target(&self) -> Option<&str> {
+        self.remote_target.as_deref()
     }
 
     /// The latest OSC window title the running program set, if any.
@@ -1390,6 +1403,7 @@ impl Session {
             shell,
             dispatch_argv: None,
             remote: None,
+            remote_target: None,
             remote_dir: None,
             reconnect_requested: false,
             tunnel_token: None,

@@ -1402,11 +1402,7 @@ impl PanelView {
                     let tint = if chip.dim { th.dim } else { k.tint() };
                     paint_icon(ui, &p, icon_c, 12.0, k, tint);
                     if let Some(remote) = &chip.remote {
-                        let globe = if chip.dim {
-                            th.dim
-                        } else {
-                            crate::icons::GLOBE_TINT
-                        };
+                        let globe = if chip.dim { th.dim } else { th.text };
                         let backing = if chip.focused || over {
                             th.sel_bg
                         } else {
@@ -1761,11 +1757,7 @@ impl PanelView {
                 let tint = if dim { th.dim } else { k.tint() };
                 paint_icon(ui, &p, icon_c, 12.0, k, tint);
                 if let Some(remote) = &rp.remote {
-                    let globe = if dim {
-                        th.dim
-                    } else {
-                        crate::icons::GLOBE_TINT
-                    };
+                    let globe = if dim { th.dim } else { th.text };
                     let backing = if rp.focused || over { th.sel_bg } else { th.bg };
                     globe_tip = Some((
                         paint_globe(ui, &p, icon_c, 12.0, globe, backing),

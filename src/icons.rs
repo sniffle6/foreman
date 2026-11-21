@@ -17,12 +17,20 @@ const TERMINAL_SVG: &str = include_str!("../assets/icons/terminal.svg");
 const FOLDER_SVG: &str = include_str!("../assets/icons/folder.svg");
 
 /// The Remote Session badge (see [`paint_globe_badge`]); `(name, svg)` like
-/// the Material Symbols.
+/// the Material Symbols. Callers tint it with the theme's text colour: no
+/// hue of its own to confuse with an agent or shell tint.
 pub const GLOBE: (&str, &str) = ("globe", include_str!("../assets/icons/globe.svg"));
 
-/// Tint multiplied onto the globe's white silhouette: a sky blue that reads
-/// apart from every agent and shell tint it sits over.
-pub const GLOBE_TINT: egui::Color32 = egui::Color32::from_rgb(110, 180, 255);
+/// The globe below [`GLOBE_SMALL_PX`]: a ring, one meridian and the equator.
+/// The full globe's ellipse and gaps fall under a device pixel there and
+/// blur into a dot.
+pub const GLOBE_SMALL: (&str, &str) = (
+    "globe-small",
+    include_str!("../assets/icons/globe_small.svg"),
+);
+
+/// Device-pixel size below which the badge draws [`GLOBE_SMALL`].
+pub const GLOBE_SMALL_PX: u32 = 12;
 
 /// Google Material Symbols Outlined (Apache 2.0; `assets/icons/material/README.md`).
 /// Each is `(name, svg)`: the name keys the texture cache.
@@ -244,14 +252,14 @@ pub fn paint_globe_badge(
     tint: egui::Color32,
     backing: egui::Color32,
 ) -> egui::Rect {
-    let d = (icon.width() * 0.62).max(7.0);
-    // Mostly inside the icon, a little past its corner: enough logo stays
-    // uncovered to tell which agent it is.
-    let c = icon.right_bottom() - egui::vec2(d * 0.38, d * 0.38);
-    let rect = egui::Rect::from_center_size(c, egui::vec2(d, d));
-    p.circle_filled(c, d / 2.0 + 1.0, backing);
-    let px = (d * ctx.pixels_per_point()).round().max(1.0) as u32;
-    let tex = texture_svg(ctx, GLOBE.0, GLOBE.1, px);
+    let (rect, px) = globe_badge_rect(icon, ctx.pixels_per_point());
+    p.circle_filled(rect.center(), rect.width() / 2.0 + 1.0, backing);
+    let (name, svg) = if px < GLOBE_SMALL_PX {
+        GLOBE_SMALL
+    } else {
+        GLOBE
+    };
+    let tex = texture_svg(ctx, name, svg, px);
     p.image(
         tex.id(),
         rect,
@@ -259,6 +267,25 @@ pub fn paint_globe_badge(
         tint,
     );
     rect
+}
+
+/// Where the badge goes over `icon`, and its size in device pixels. Size
+/// and origin sit on whole device pixels, so the texture maps 1:1 onto the
+/// screen instead of being resampled into a blur. A small badge is an odd
+/// number of pixels wide, so the 1 px meridian and equator land on a pixel
+/// centre.
+pub fn globe_badge_rect(icon: egui::Rect, ppp: f32) -> (egui::Rect, u32) {
+    let mut px = (icon.width() * 0.62 * ppp).round().max(7.0) as u32;
+    if px < GLOBE_SMALL_PX && px.is_multiple_of(2) {
+        px += 1;
+    }
+    let d = px as f32 / ppp;
+    // Mostly inside the icon, a little past its corner: enough logo stays
+    // uncovered to tell which agent it is.
+    let c = icon.right_bottom() - egui::vec2(d * 0.38, d * 0.38);
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let min = egui::pos2(snap(c.x - d / 2.0), snap(c.y - d / 2.0));
+    (egui::Rect::from_min_size(min, egui::vec2(d, d)), px)
 }
 
 /// Render an SVG (square viewBox) to a `px`×`px` unmultiplied-RGBA image.
@@ -294,10 +321,41 @@ mod tests {
         img.pixels.iter().filter(|p| p.a() > 0).count()
     }
 
+    /// The badge maps 1:1 onto device pixels at every common scale, for the
+    /// tab icon (14 pt) and the Sessions-panel icon (12 pt), wherever the
+    /// icon itself lands.
+    #[test]
+    fn the_globe_badge_sits_on_whole_device_pixels() {
+        let whole = |v: f32| (v - v.round()).abs() < 1e-3;
+        for ppp in [1.0, 1.25, 1.5] {
+            for size in [14.0, 12.0] {
+                for origin in [egui::pos2(0.0, 0.0), egui::pos2(37.3, 11.65)] {
+                    let icon = egui::Rect::from_min_size(origin, egui::vec2(size, size));
+                    let (r, px) = globe_badge_rect(icon, ppp);
+                    let dev = [r.min.x, r.min.y, r.max.x, r.max.y].map(|v| v * ppp);
+                    assert!(
+                        dev.iter().all(|v| whole(*v)),
+                        "ppp {ppp} size {size}: {dev:?}"
+                    );
+                    assert!(whole(r.width() * ppp) && (r.width() * ppp).round() as u32 == px);
+                    if px < GLOBE_SMALL_PX {
+                        assert_eq!(px % 2, 1, "a small badge is odd-sized: {px}");
+                    }
+                    // Still over the icon's corner.
+                    assert!(icon.contains(r.center()), "{r:?} vs {icon:?}");
+                }
+            }
+        }
+        // At 100% the tab badge is the small glyph; at 150% the full globe.
+        let tab = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(14.0, 14.0));
+        assert!(globe_badge_rect(tab, 1.0).1 < GLOBE_SMALL_PX);
+        assert!(globe_badge_rect(tab, 1.5).1 >= GLOBE_SMALL_PX);
+    }
+
     #[test]
     fn embedded_svgs_rasterize_to_nonblank_icons() {
         // One per SVG file: Claude, Codex, Grok, the shared terminal glyph
-        // (PowerShell), the folder, the Remote globe, and the eight Material
+        // (PowerShell), the folder, the Remote globe at both sizes, and the eight Material
         // Symbols.
         let tabs = [
             IconKind::Claude,
@@ -309,7 +367,7 @@ mod tests {
         .map(IconKind::svg);
         for (name, svg) in tabs
             .iter()
-            .chain(std::iter::once(&GLOBE))
+            .chain([&GLOBE, &GLOBE_SMALL])
             .chain(material::ALL.iter())
         {
             let img = rasterize(svg, 32);

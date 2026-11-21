@@ -122,8 +122,8 @@ pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String>
 /// the name the Session carries).
 pub fn badge_tooltip(remotes: &[Remote], name: &str) -> String {
     match find(remotes, name) {
-        Ok(r) => format!("On {name} ({})", r.target),
-        Err(_) => format!("On {name}"),
+        Ok(r) => format!("Remote: {name} ({})", r.target),
+        Err(_) => format!("Remote: {name}"),
     }
 }
 
@@ -517,9 +517,9 @@ mod tests {
         };
         assert_eq!(
             super::badge_tooltip(std::slice::from_ref(&desk), "desk"),
-            "On desk (me@desk.lan)"
+            "Remote: desk (me@desk.lan)"
         );
-        assert_eq!(super::badge_tooltip(&[desk], "garage"), "On garage");
+        assert_eq!(super::badge_tooltip(&[desk], "garage"), "Remote: garage");
     }
 
     use super::*;

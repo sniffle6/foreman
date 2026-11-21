@@ -126,9 +126,13 @@ impl ConfirmClose {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.label(
-                                                egui::RichText::new(p.pid.to_string())
-                                                    .color(th.dim)
-                                                    .monospace(),
+                                                egui::RichText::new(
+                                                    p.detail
+                                                        .clone()
+                                                        .unwrap_or_else(|| p.pid.to_string()),
+                                                )
+                                                .color(th.dim)
+                                                .monospace(),
                                             );
                                             // Rollup of the child's own subtree,
                                             // shown left of the pid: "(+16)".
@@ -186,6 +190,7 @@ mod tests {
                     pid,
                     name: format!("p{pid}.exe"),
                     background: 0,
+                    detail: None,
                 })
                 .collect(),
         }

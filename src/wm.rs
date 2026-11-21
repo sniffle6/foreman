@@ -3171,7 +3171,7 @@ impl WindowManager {
         // The local env reaches only ssh.exe; ssh sends TERM with the pty
         // request, and the builder exports the rest on the Remote.
         let env = self.term_env(id);
-        let mut s = Session::spawn_remote(built, &remote.name, dir, &env, ctx.clone())
+        let mut s = Session::spawn_remote(built, remote, dir, &env, ctx.clone())
             .map_err(|e| format!("spawn failed: {e}"))?;
         if let Some(l) = lease {
             let note =
@@ -8175,7 +8175,7 @@ impl WindowManager {
                                     &p,
                                     ui.ctx(),
                                     icon_rect,
-                                    crate::icons::GLOBE_TINT.gamma_multiply(dim),
+                                    th.text.gamma_multiply(dim),
                                     bg,
                                 );
                                 globe_tip = Some((icon_rect.union(badge), remote.to_owned()));
@@ -8374,7 +8374,7 @@ impl WindowManager {
                                 &p,
                                 ui.ctx(),
                                 icon_rect,
-                                crate::icons::GLOBE_TINT.gamma_multiply(dim),
+                                th.text.gamma_multiply(dim),
                                 th.bg,
                             );
                             let hit = icon_rect.union(badge);
@@ -9951,15 +9951,27 @@ fn show_tab_overflow(
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         kind.tint(),
                     );
-                    if tab.content.remote().is_some() {
+                    if let Some(remote) = tab.content.remote() {
                         let backing = if resp.hovered() { th.sel_bg } else { th.bg };
-                        crate::icons::paint_globe_badge(
+                        let badge = crate::icons::paint_globe_badge(
                             mp,
                             mui.ctx(),
                             icon_rect,
-                            crate::icons::GLOBE_TINT,
+                            th.text,
                             backing,
                         );
+                        // The tab strip's tooltip, over the same icon + badge.
+                        let hit = icon_rect.union(badge);
+                        if resp.hovered()
+                            && mui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .is_some_and(|p| hit.contains(p))
+                        {
+                            let live = crate::config::live(mui.ctx());
+                            resp.clone()
+                                .on_hover_text(crate::remote::badge_tooltip(&live.remotes, remote));
+                        }
                     }
                 }
                 let (agent, bell) = cue(tab);
@@ -10253,17 +10265,19 @@ fn session_procs(s: &Session) -> Vec<crate::proc::ProcInfo> {
         return Vec::new();
     };
     match s.remote() {
-        Some(remote) => vec![remote_row(remote, pid)],
+        Some(remote) => vec![remote_row(remote, s.remote_target(), pid)],
         None => crate::proc::top_children(pid),
     }
 }
 
-/// The close confirm's row for a live Remote Session: its local `ssh`.
-fn remote_row(remote: &str, ssh_pid: u32) -> crate::proc::ProcInfo {
+/// The close confirm's row for a live Remote Session: its local `ssh`,
+/// shown by the target it reaches rather than its pid.
+fn remote_row(remote: &str, target: Option<&str>, ssh_pid: u32) -> crate::proc::ProcInfo {
     crate::proc::ProcInfo {
         pid: ssh_pid,
         name: format!("connection to {remote}"),
         background: 0,
+        detail: Some(target.unwrap_or(remote).to_string()),
     }
 }
 
@@ -10330,7 +10344,7 @@ fn running_lead(top: usize, bg: usize, across: Option<(usize, &str)>) -> String 
 
 /// The lead line for closing a live Remote Session.
 fn remote_lead(remote: &str) -> String {
-    format!("Connected to {remote}. Closing ends whatever runs there:")
+    format!("Connected to {remote}. Closing ends whatever runs there")
 }
 
 /// Compose the confirm copy for a pane/project close from the gathered groups.
@@ -11943,6 +11957,16 @@ mod tests {
             .map(|p| p.name.as_str())
             .collect();
         assert_eq!(rows, ["connection to desk"]);
+        let shown: Vec<Option<&str>> = groups
+            .iter()
+            .flat_map(|g| &g.procs)
+            .map(|p| p.detail.as_deref())
+            .collect();
+        assert_eq!(
+            shown,
+            [Some("foreman-test@127.0.0.1")],
+            "the target, not the pid"
+        );
         assert_eq!(child.terminal_groups().len(), 1, "project close agrees");
         child.request_close_active_tab(remote);
         let view = &child.pending_close.as_ref().expect("a confirm").view;
@@ -17736,6 +17760,7 @@ mod tests {
             pid,
             name: "x.exe".into(),
             background: bg,
+            detail: None,
         };
         let g = |label: &str, procs: Vec<crate::proc::ProcInfo>| crate::confirm::ProcGroup {
             label: label.into(),

@@ -136,6 +136,9 @@ pub struct ProcInfo {
     /// How many further processes sit under this one (its own subtree, minus
     /// console-host plumbing). Rendered as "(+n)"; closing kills them too.
     pub background: usize,
+    /// Shown in the pid's place when set: a Remote Session's row names its
+    /// target, since the local `ssh` pid means nothing to the user.
+    pub detail: Option<String>,
 }
 
 /// Console-host plumbing ConPTY spawns around a shell — never real user work.
@@ -173,6 +176,7 @@ fn collect_top_level(table: &[ProcRow], root: u32) -> Vec<ProcInfo> {
             pid: r.pid,
             name: r.name.clone(),
             background: count_descendants(table, r.pid),
+            detail: None,
         })
         .collect()
 }
