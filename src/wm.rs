@@ -3006,8 +3006,9 @@ impl WindowManager {
     }
 
     /// `open --on`: [`Self::add_terminal_cmd`] for a Remote Session. `argv`
-    /// is the logical command; the builder wraps it in `ssh`. No Tunnel yet,
-    /// so the agent there has no way back. Errors are already user-facing.
+    /// is the logical command; the builder wraps it in `ssh`, with a Tunnel
+    /// back to this instance when one is installed (always, in the app).
+    /// Errors are already user-facing.
     fn add_remote_terminal(
         &mut self,
         argv: &[String],
@@ -3016,19 +3017,38 @@ impl WindowManager {
         title: Option<&str>,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
+        let terminal_id = term_tag(self.next);
+        // A token names a Project and a Member; outside a Project there is no
+        // room to post into, so no Tunnel.
+        let lease = match (crate::control::tunnel::hub(ctx), self.tag.as_deref()) {
+            (Some(hub), Some(project)) => Some(
+                hub.lease(project, &terminal_id)
+                    .map_err(|e| format!("could not start the Tunnel listener: {e}"))?,
+            ),
+            _ => None,
+        };
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
             dir,
-            terminal_id: &term_tag(self.next),
+            terminal_id: &terminal_id,
             project_id: self.tag.as_deref(),
-            tunnel: None,
+            tunnel: lease.as_ref().map(|l| crate::remote::Tunnel {
+                remote_port: l.remote_port,
+                local_port: l.local_port,
+                token: l.token.value(),
+            }),
             argv,
         })?;
         // The local env reaches only ssh.exe; ssh sends TERM with the pty
         // request, and the builder exports the rest on the Remote.
         let env = self.term_env(self.next);
-        let s = Session::spawn_remote(built, &remote.name, &env, ctx.clone())
+        let mut s = Session::spawn_remote(built, &remote.name, &env, ctx.clone())
             .map_err(|e| format!("spawn failed: {e}"))?;
+        if let Some(l) = lease {
+            let note =
+                crate::control::tunnel::reply_note(remote.shell, l.remote_port, l.token.value());
+            s.attach_tunnel(l.token, note);
+        }
         Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
     }
 
@@ -5312,7 +5332,7 @@ impl WindowManager {
                         && term_tag(s.term_id()) == d.id
                     {
                         for line in &d.lines {
-                            s.inject_input(line);
+                            s.inject_chat(line);
                         }
                         hit = true;
                         break;
@@ -11037,6 +11057,61 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("--cwd") && e.contains("dirs"), "{e}");
         assert_eq!(project_terminal_count(&wm), 0);
+    }
+
+    #[test]
+    fn tunnel_chat_post_lands_in_the_room_as_the_remote_session() {
+        use std::io::{Read, Write};
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx);
+        let (_, tid) = wm
+            .open_dispatch(open_on("desk", Some("/tmp"), &["codex"]), &ctx)
+            .expect("ssh spawns");
+        let token = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session(tid)
+            .unwrap()
+            .tunnel_token()
+            .expect("a Remote Session in a Project gets a token")
+            .to_string();
+        let port = crate::control::tunnel::hub(&ctx)
+            .unwrap()
+            .bound_port()
+            .expect("the first Remote Session starts the listener");
+        let client = std::thread::spawn(move || {
+            let body = "hello from desk";
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                c,
+                "POST /chat?from=t999 HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut out = String::new();
+            c.read_to_string(&mut out).unwrap();
+            out
+        });
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the post reaches the GUI channel");
+        wm.handle_ctrl(msg, &ctx);
+        let out = client.join().unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        let history = wm.project_child_mut(pid).unwrap().chat_history(10);
+        let post = history
+            .iter()
+            .find(|l| l.contains("hello from desk"))
+            .unwrap_or_else(|| panic!("{history:?}"));
+        assert!(post.contains(&format!("t{tid}")), "{post}");
+        assert!(
+            !post.contains("t999"),
+            "the claimed sender is ignored: {post}"
+        );
     }
 
     #[test]

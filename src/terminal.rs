@@ -666,6 +666,12 @@ pub struct Session {
     /// The Remote this Session runs on (its process is `ssh`); `None` = local.
     /// A copy of the name, so deleting the Remote leaves live Sessions alone.
     remote: Option<String>,
+    /// A Remote Session's Tunnel token. Dropped (revoked) the frame its `ssh`
+    /// is seen to exit, so a dead connection's token stops working.
+    tunnel_token: Option<crate::control::tunnel::Token>,
+    /// The reply command for this connection's agent, sent with its first
+    /// chat delivery and then gone (`inject_chat`).
+    reply_note: Option<String>,
     /// Hook-driven agent state for the Sessions panel badge. Pure; fed by
     /// `WindowManager::apply_hook_event`, never by the PTY.
     agent_state: crate::agent_state::AgentStateSlot,
@@ -982,6 +988,18 @@ impl Session {
         Ok(session)
     }
 
+    /// Give a Remote Session its way back: the token that names it to the
+    /// Tunnel listener, and the note teaching its agent to use it.
+    pub fn attach_tunnel(&mut self, token: crate::control::tunnel::Token, note: String) {
+        self.tunnel_token = Some(token);
+        self.reply_note = Some(note);
+    }
+
+    #[cfg(test)]
+    pub fn tunnel_token(&self) -> Option<&str> {
+        self.tunnel_token.as_ref().map(|t| t.value())
+    }
+
     /// The Remote this Session runs on; `None` for a local Session.
     pub fn remote(&self) -> Option<&str> {
         self.remote.as_deref()
@@ -1144,6 +1162,8 @@ impl Session {
             shell,
             dispatch_argv: None,
             remote: None,
+            tunnel_token: None,
+            reply_note: None,
             agent_state: Default::default(),
             root_pid,
             term_id: 0,
@@ -1218,6 +1238,9 @@ impl Session {
     pub fn exited(&mut self) -> Option<u32> {
         if self.exit.is_none() {
             self.exit = self.child.try_wait().ok().flatten().map(|s| s.exit_code());
+            if self.exit.is_some() {
+                self.tunnel_token = None;
+            }
         }
         self.exit
     }
@@ -1276,6 +1299,13 @@ impl Session {
         if let Some(crate::ready::Action::Write(bytes)) = self.ready_gate.try_inject(text, now) {
             self.send_external_input(&bytes);
         }
+    }
+
+    /// [`Self::inject_input`] for a chat delivery: a Remote Session's first
+    /// one on this connection also carries the reply note.
+    pub fn inject_chat(&mut self, line: &str) {
+        let line = crate::control::tunnel::with_reply_note(line, &mut self.reply_note);
+        self.inject_input(&line);
     }
 
     /// Raw PTY write — bypasses bracketed-paste and the submit delay. Used by

@@ -156,7 +156,6 @@ pub fn launch_dir<'a>(
 
 /// The per-Session reverse forward back to the seat PC's listener.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // the listener lands in a later card
 pub struct Tunnel<'a> {
     /// Port the Remote's agent dials on its own loopback.
     pub remote_port: u16,
@@ -175,7 +174,7 @@ pub struct Launch<'a> {
     pub terminal_id: &'a str,
     /// `p{id}`; `None` outside a Project, as locally.
     pub project_id: Option<&'a str>,
-    /// `None` until the way-back listener exists: no forward, no URL/token.
+    /// `None` = no way back: no forward, no URL/token.
     pub tunnel: Option<Tunnel<'a>>,
     /// What the user asked to run (`claude …`). Empty = an interactive shell.
     pub argv: &'a [String],

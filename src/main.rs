@@ -1668,6 +1668,8 @@ fn main() -> eframe::Result {
             let inst_ctx = cc.egui_ctx.clone();
             // Tailscale peers: idle until Settings::remote_listen is on.
             let (remote_tx, remote_ctx) = (tx.clone(), cc.egui_ctx.clone());
+            // Remote Sessions' way back: binds on the first Remote Session.
+            control::tunnel::install(&cc.egui_ctx, tx.clone());
             std::thread::spawn(move || control::serve_remote(remote_tx, remote_ctx));
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
             // Second listener on this instance's own pipe: terminals we spawn

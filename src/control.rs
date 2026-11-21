@@ -2,6 +2,8 @@
 //! process can use to open a terminal inside the running foreman. See
 //! docs/epics/agent-dispatch-epic.md.
 
+pub mod tunnel;
+
 /// Pipe name; `GenericNamespaced` maps it to `\\.\pipe\foreman` on Windows.
 pub const PIPE: &str = "foreman";
 
