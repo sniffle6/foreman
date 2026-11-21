@@ -2580,7 +2580,11 @@ impl WindowManager {
                 rows.push(Row::Project(StatusProjectLine {
                     project: format!("p{pid}"),
                     name,
-                    cwd: child.cwd.as_deref().map(|p| p.display().to_string()),
+                    cwd: child
+                        .cwd
+                        .as_deref()
+                        .filter(|_| !req.no_cwd)
+                        .map(|p| p.display().to_string()),
                     placement: project_place.into(),
                 }));
                 // Only the focused Project's focused window holds the keyboard.
@@ -2640,6 +2644,11 @@ impl WindowManager {
         let mut lines: Vec<String> = rows
             .iter()
             .map(|row| match row {
+                // No cwd column at all for `no_cwd`: a "-" would claim the
+                // Project has no directory.
+                Row::Project(p) if req.no_cwd => {
+                    format!("{}  {}  {}", p.project, p.placement, p.name)
+                }
                 Row::Project(p) => format!(
                     "{}  {}  {}  {}",
                     p.project,
@@ -3025,7 +3034,19 @@ impl WindowManager {
                 hub.lease(project, &terminal_id)
                     .map_err(|e| format!("could not start the Tunnel listener: {e}"))?,
             ),
-            _ => None,
+            (Some(_), None) => {
+                crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Warning,
+                    format!(
+                        "{terminal_id} on {} has no way back: it is outside a Project, \
+                         so its agent cannot post to chat",
+                        remote.name
+                    ),
+                );
+                None
+            }
+            (None, _) => None,
         };
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
@@ -3047,7 +3068,11 @@ impl WindowManager {
         if let Some(l) = lease {
             let note =
                 crate::control::tunnel::reply_note(remote.shell, l.remote_port, l.token.value());
-            s.attach_tunnel(l.token, note);
+            // An agent with arguments may be working a brief and never get a
+            // chat post, so it needs the note now. A bare agent waits for a
+            // post anyway, and a shell would run the note as commands.
+            let at_launch = argv.len() > 1 && crate::icons::IconKind::from_argv(argv).is_some();
+            s.attach_tunnel(l.token, note, at_launch);
         }
         Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
     }
@@ -11115,6 +11140,52 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_session_outside_a_project_says_it_has_no_way_back() {
+        let mut wm = WindowManager::new();
+        assert_eq!(wm.tag, None, "the desk is not a Project");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx);
+        let remote = crate::config::live(&ctx).remotes[0].clone();
+        let tid = wm
+            .add_remote_terminal(&["codex".into()], &remote, "/tmp", None, &ctx)
+            .expect("ssh spawns");
+        assert_eq!(wm.terminal_session(tid).unwrap().tunnel_token(), None);
+        let mut notes = crate::notify::Notifications::new();
+        notes.drain_pending(&ctx);
+        assert!(notes.contains_text("no way back"), "a toast says so");
+    }
+
+    #[test]
+    fn the_tunnel_s_status_leaves_cwd_out_and_the_pipe_s_keeps_it() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
+        let mut req = crate::control::StatusRequest {
+            cmd: "status".into(),
+            project: None,
+            json: false,
+            no_cwd: false,
+        };
+        let pipe = wm.status_dispatch(&req, false).unwrap();
+        assert!(pipe[0].ends_with(r"  H:\src\app"), "{pipe:?}");
+        req.no_cwd = true;
+        let tunnel = wm.status_dispatch(&req, false).unwrap();
+        assert_eq!(
+            tunnel[0],
+            pipe[0].trim_end_matches(r"H:\src\app").trim_end(),
+            "the same line minus the cwd column"
+        );
+        req.json = true;
+        let json = wm.status_dispatch(&req, false).unwrap();
+        assert!(
+            !json[0].contains("cwd") && !json[0].contains("app"),
+            "{json:?}"
+        );
+    }
+
+    #[test]
     fn remote_open_spawns_ssh_keeps_the_agent_icon_and_status_names_the_remote() {
         let mut wm = WindowManager::new();
         let pid = push(&mut wm, "proj");
@@ -11137,6 +11208,7 @@ mod tests {
             cmd: "status".into(),
             project: None,
             json: false,
+            no_cwd: false,
         };
         let text = wm.status_dispatch(&req, false).unwrap();
         let line = |tid: WinId| {
@@ -15358,6 +15430,7 @@ mod tests {
             cmd: "status".into(),
             project: project.map(str::to_string),
             json: false,
+            no_cwd: false,
         };
         (crate::control::CtrlMsg::Status(req, rtx, sent), rrx)
     }
@@ -15939,6 +16012,7 @@ mod tests {
             cmd: "status".into(),
             project: None,
             json: true,
+            no_cwd: false,
         };
         d.handle_ctrl(
             crate::control::CtrlMsg::Status(req, rtx, std::time::Instant::now()),

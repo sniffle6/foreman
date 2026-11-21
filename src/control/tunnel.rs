@@ -25,11 +25,35 @@ const MAX_HEAD: usize = 8 * 1024;
 /// Largest body (`POST /chat` text). Matches the peer listener's line cap.
 const MAX_BODY: usize = 64 * 1024;
 
-/// One deadline for reading a whole request, head and body. A client that
-/// drips bytes or stops mid-request is answered 408 when it passes.
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long each stage of one connection may take, all measured from accept.
+/// A caller that drips bytes or stops is answered 408 when its stage's
+/// deadline passes. The forwarded port is open to every user on the Remote,
+/// and [`MAX_INFLIGHT`] slots are shared by every Remote Session, so a
+/// caller with no token must give its slot back fast.
+#[derive(Clone, Copy, Debug)]
+struct Deadlines {
+    /// A complete head, which is where the token is. Short: until the token
+    /// checks out, the caller is anyone on the Remote.
+    head: Duration,
+    /// The whole request, body included, once the token checked out.
+    request: Duration,
+    /// Writing the whole response. A per-call socket timeout restarts on
+    /// every chunk the caller takes, so a slow reader of a long history could
+    /// otherwise hold its thread for as long as it liked.
+    response: Duration,
+}
 
+const DEADLINES: Deadlines = Deadlines {
+    head: Duration::from_secs(2),
+    request: Duration::from_secs(5),
+    response: Duration::from_secs(10),
+};
+
+/// Most connections served at once; the next is answered 503.
 const MAX_INFLIGHT: usize = 16;
+
+/// Largest single socket write, so [`write_by`] re-checks its deadline often.
+const WRITE_CHUNK: usize = 16 * 1024;
 
 /// Most chat lines one `GET /chat?history=N` returns.
 const MAX_HISTORY: usize = 1000;
@@ -55,7 +79,7 @@ pub struct Hub {
     ctx: eframe::egui::Context,
     owners: Mutex<HashMap<String, Owner>>,
     port: Mutex<Option<u16>>,
-    io_timeout: Duration,
+    deadlines: Deadlines,
 }
 
 /// A Remote Session's Tunnel: its token (revoked on drop) and both ports.
@@ -92,7 +116,7 @@ fn ctx_id() -> eframe::egui::Id {
 
 /// Make the Tunnel available to the window manager. Binds nothing yet.
 pub fn install(ctx: &eframe::egui::Context, tx: mpsc::Sender<CtrlMsg>) {
-    let hub = Hub::new(tx, ctx.clone(), IO_TIMEOUT);
+    let hub = Hub::new(tx, ctx.clone(), DEADLINES);
     ctx.data_mut(|d| d.insert_temp(ctx_id(), hub));
 }
 
@@ -106,14 +130,14 @@ impl Hub {
     fn new(
         tx: mpsc::Sender<CtrlMsg>,
         ctx: eframe::egui::Context,
-        io_timeout: Duration,
+        deadlines: Deadlines,
     ) -> Arc<Hub> {
         Arc::new(Hub {
             tx,
             ctx,
             owners: Mutex::new(HashMap::new()),
             port: Mutex::new(None),
-            io_timeout,
+            deadlines,
         })
     }
 
@@ -193,83 +217,90 @@ impl Hub {
             }
             inflight.fetch_add(1, Ordering::Relaxed);
             let (hub, slot) = (self.clone(), Slot(inflight.clone()));
-            std::thread::spawn(move || {
-                let _slot = slot;
-                hub.handle(conn);
-            });
+            // A second handle, so a refused thread can still be answered: the
+            // closure and its stream are dropped with the error. `spawn` would
+            // panic instead and take this accept loop down with it.
+            let spare = conn.try_clone();
+            let spawned = std::thread::Builder::new()
+                .name("tunnel-conn".into())
+                .spawn(move || {
+                    let _slot = slot;
+                    hub.handle(conn);
+                });
+            if spawned.is_err()
+                && let Ok(spare) = spare
+            {
+                let _ = (&spare).write_all(&response(503, "foreman: tunnel busy\n"));
+            }
         }
     }
 
     fn handle(&self, conn: TcpStream) {
-        let deadline = Instant::now() + self.io_timeout;
-        if conn.set_nonblocking(false).is_err()
-            || conn.set_write_timeout(Some(self.io_timeout)).is_err()
-        {
+        let start = Instant::now();
+        if conn.set_nonblocking(false).is_err() {
             return;
         }
-        let Some(out) = self.exchange(&conn, deadline) else {
-            return;
+        let (out, drain) = match self.exchange(&conn, start) {
+            Ok(out) => (out, true),
+            // A stalled caller has sent nothing we left unread, so there is
+            // nothing to drain, and lingering would only hold its slot longer.
+            Err(r) => (refusal(&r), r.status != 408),
         };
-        let _ = (&conn).write_all(&out);
+        let sent = write_by(&conn, &out, Instant::now() + self.deadlines.response);
         // Same as the peer listener: closing with unread request bytes resets
         // the connection on Windows and the client loses the reply. FIN, then
         // swallow a bounded remainder.
         let _ = conn.shutdown(std::net::Shutdown::Write);
-        let linger = Instant::now() + Duration::from_secs(1);
-        read_until(&conn, linger, |b| b.len() >= 1 << 20);
+        if sent && drain {
+            let linger = Instant::now() + Duration::from_secs(1);
+            read_until(&conn, linger, |b| b.len() >= 1 << 20);
+        }
     }
 
-    /// Read one request and produce the bytes to answer it with. `None` = the
-    /// client connected and left without sending anything.
-    fn exchange(&self, conn: &TcpStream, deadline: Instant) -> Option<Vec<u8>> {
-        let mut buf = read_until(conn, deadline, |b| {
+    /// Read one request and produce the bytes to answer it with, or the
+    /// refusal. A caller that connects and sends nothing gets a 408 too.
+    fn exchange(&self, conn: &TcpStream, start: Instant) -> Result<Vec<u8>, Refusal> {
+        let d = self.deadlines;
+        let head_by = start + d.head.min(d.request);
+        let mut buf = read_until(conn, head_by, |b| {
             head_end(b).is_some() || b.len() >= MAX_HEAD
         });
-        if buf.is_empty() {
-            return None;
-        }
-        let refuse = |r: Refusal| Some(response(r.status, &format!("{}\n", r.msg)));
-        let (head, body_at) = match parse_head(&buf) {
-            Ok(Some(h)) => h,
-            Ok(None) => return refuse(timeout()),
-            Err(r) => return refuse(r),
-        };
+        let (head, body_at) = parse_head(&buf)?.ok_or_else(|| stalled(d.head))?;
         // Token before routing: without one, the listener says nothing about
         // which routes exist (only a malformed head is refused ahead of it).
-        let Some(owner) = head.bearer.as_deref().and_then(|t| self.owner(t)) else {
-            return refuse(Refusal::new(
-                401,
-                "missing or unknown token (Authorization: Bearer $FOREMAN_TOKEN)",
-            ));
-        };
-        let route = match route(&head.method, &head.path) {
-            Ok(r) => r,
-            Err(r) => return refuse(r),
-        };
+        let owner = head
+            .bearer
+            .as_deref()
+            .and_then(|t| self.owner(t))
+            .ok_or_else(|| {
+                Refusal::new(
+                    401,
+                    "missing or unknown token (Authorization: Bearer $FOREMAN_TOKEN)",
+                )
+            })?;
+        let route = route(&head.method, &head.path)?;
         let len = match (route, head.content_length) {
             (_, Some(n)) if n > MAX_BODY => {
-                return refuse(Refusal::new(413, format!("body over {MAX_BODY} bytes")));
+                return Err(Refusal::new(413, format!("body over {MAX_BODY} bytes")));
             }
-            (Route::Post, None) => return refuse(Refusal::new(411, "POST needs Content-Length")),
+            (Route::Post, None) => return Err(Refusal::new(411, "POST needs Content-Length")),
             (_, n) => n.unwrap_or(0),
         };
+        let request_by = start + d.request;
         if head.expect_continue && len > 0 {
-            let _ = (&*conn).write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+            write_by(conn, b"HTTP/1.1 100 Continue\r\n\r\n", request_by);
         }
         let mut body = buf.split_off(body_at);
         if body.len() < len {
             let need = len - body.len();
-            body.extend(read_until(conn, deadline, |b| b.len() >= need));
+            body.extend(read_until(conn, request_by, |b| b.len() >= need));
             if body.len() < len {
-                return refuse(timeout());
+                return Err(stalled(d.request));
             }
         }
         body.truncate(len);
-        let call = match build_call(route, &head.query, &body, &owner) {
-            Ok(c) => c,
-            Err(r) => return refuse(r),
-        };
-        Some(self.dispatch(call))
+        let call = build_call(route, &head.query, &body, &owner)?;
+        Ok(self.dispatch(call))
     }
 
     /// Hand the request to the GUI exactly as the pipe does, and wait for it.
@@ -295,11 +326,34 @@ fn poisoned() -> std::io::Error {
     std::io::Error::other("tunnel token table poisoned")
 }
 
-fn timeout() -> Refusal {
-    Refusal::new(
-        408,
-        format!("incomplete request after {}s", IO_TIMEOUT.as_secs()),
-    )
+/// The 408 for a caller that missed the deadline of `limit`.
+fn stalled(limit: Duration) -> Refusal {
+    Refusal::new(408, format!("incomplete request after {limit:?}"))
+}
+
+fn refusal(r: &Refusal) -> Vec<u8> {
+    response(r.status, &format!("{}\n", r.msg))
+}
+
+/// Write all of `bytes`, giving up at `deadline`; `false` = not all sent.
+/// Chunked, so a reader that takes a little at a time still meets the one
+/// deadline rather than restarting a per-call timeout on every chunk.
+fn write_by(conn: &TcpStream, bytes: &[u8], deadline: Instant) -> bool {
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || conn.set_write_timeout(Some(left)).is_err() {
+            return false;
+        }
+        let end = (sent + WRITE_CHUNK).min(bytes.len());
+        match (&*conn).write(&bytes[sent..end]) {
+            Ok(0) => return false,
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// The OS CSPRNG (BCryptGenRandom, system-preferred RNG).
@@ -566,6 +620,7 @@ pub fn build_call(
             cmd: "status".into(),
             project: Some(owner.project.clone()),
             json: matches!(get("json"), Some("" | "1" | "true")),
+            no_cwd: true,
         })),
     }
 }
@@ -615,8 +670,8 @@ fn response(status: u16, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// What a Remote Session's agent is told, once per connection, with its first
-/// chat delivery: the exact command to post back. URL and token are written
+/// What a Remote Session's agent is told, once per connection (see
+/// [`ReplyNote`]): the exact command to post back. URL and token are written
 /// out rather than named as `$FOREMAN_URL`, because a Windows agent's tool
 /// shell may be PowerShell or Git Bash and each spells variables differently.
 /// Windows says `curl.exe`: in Windows PowerShell 5.1 `curl` is an alias for
@@ -635,12 +690,31 @@ pub fn reply_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
     )
 }
 
-/// `line` with the one-time note appended, taking it so the next delivery on
-/// this connection goes out bare.
-pub fn with_reply_note<'a>(line: &'a str, note: &mut Option<String>) -> std::borrow::Cow<'a, str> {
-    match note.take() {
-        Some(n) => format!("{line}\n\n{n}").into(),
-        None => line.into(),
+/// The reply note's once-per-connection state. An agent Dispatched with its
+/// brief gets the note at launch, since no chat post may ever come to carry
+/// it; anything else gets it with its first chat delivery.
+#[derive(Debug, Default)]
+pub struct ReplyNote(Option<String>);
+
+impl ReplyNote {
+    /// Arm `note` for a new connection. With `at_launch` it comes straight
+    /// back for the caller to inject, and no chat delivery carries it.
+    pub fn arm(&mut self, note: String, at_launch: bool) -> Option<String> {
+        if at_launch {
+            self.0 = None;
+            Some(note)
+        } else {
+            self.0 = Some(note);
+            None
+        }
+    }
+
+    /// `line` with the note appended if this connection has not had it yet.
+    pub fn on_delivery<'a>(&mut self, line: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.0.take() {
+            Some(n) => format!("{line}\n\n{n}").into(),
+            None => line.into(),
+        }
     }
 }
 
@@ -817,25 +891,50 @@ mod tests {
         for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
             assert!(reply_note(shell, 21000, "tok").contains("\ncurl.exe -sS"));
         }
-        let mut note = Some("NOTE".to_string());
+    }
+
+    #[test]
+    fn the_reply_note_goes_once_per_connection_at_launch_or_on_first_delivery() {
+        // Not at launch: the first chat delivery carries it, the next is bare.
+        let mut note = ReplyNote::default();
+        assert_eq!(note.arm("NOTE".into(), false), None);
         assert_eq!(
-            with_reply_note("[chat p1 #1] t1→t2: hi", &mut note),
+            note.on_delivery("[chat p1 #1] t1→t2: hi"),
             "[chat p1 #1] t1→t2: hi\n\nNOTE"
         );
         assert_eq!(
-            with_reply_note("[chat p1 #2] t1→t2: again", &mut note),
+            note.on_delivery("[chat p1 #2] t1→t2: again"),
             "[chat p1 #2] t1→t2: again"
+        );
+        // At launch: handed back to inject now, and no delivery repeats it.
+        let mut note = ReplyNote::default();
+        assert_eq!(note.arm("NOTE".into(), true).as_deref(), Some("NOTE"));
+        assert_eq!(
+            note.on_delivery("[chat p1 #1] t1→t2: hi"),
+            "[chat p1 #1] t1→t2: hi"
+        );
+        // A new connection re-arms it, whichever way the last one went.
+        assert_eq!(note.arm("NOTE2".into(), false), None);
+        assert!(note.on_delivery("x").ends_with("\n\nNOTE2"));
+    }
+
+    #[test]
+    fn the_tunnel_s_status_request_leaves_cwd_out() {
+        let Call::Status(s) = build_call(Route::Status, &[], b"", &owner()).unwrap() else {
+            panic!()
+        };
+        assert!(s.no_cwd);
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"cmd":"status","project":"p2"}"#,
+            "no_cwd never reaches the wire"
         );
     }
 
     #[test]
     fn os_random_tokens_differ_and_ports_stay_in_range() {
         let (tx, _rx) = mpsc::channel();
-        let hub = Hub::new(
-            tx,
-            eframe::egui::Context::default(),
-            Duration::from_millis(300),
-        );
+        let hub = Hub::new(tx, eframe::egui::Context::default(), FAST);
         let a = hub.lease("p1", "t1").unwrap();
         let b = hub.lease("p1", "t2").unwrap();
         assert_eq!(a.token.value().len(), 64);
@@ -856,8 +955,23 @@ mod tests {
 
     // ---- over a real loopback socket, with a stand-in GUI ----
 
-    /// A Hub whose GUI side answers every request and reports what it got.
+    /// Test deadlines: every stage short.
+    const FAST: Deadlines = Deadlines {
+        head: Duration::from_millis(300),
+        request: Duration::from_millis(400),
+        response: Duration::from_millis(600),
+    };
+
     fn live_hub() -> (Arc<Hub>, mpsc::Receiver<String>) {
+        live_hub_with(FAST, vec!["a".into(), "b".into()])
+    }
+
+    /// A Hub whose GUI side answers every request and reports what it got;
+    /// a history read returns `history`.
+    fn live_hub_with(
+        deadlines: Deadlines,
+        history: Vec<String>,
+    ) -> (Arc<Hub>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<CtrlMsg>();
         let (seen_tx, seen_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -871,7 +985,7 @@ mod tests {
                         let _ = reply.send(match r.history {
                             Some(_) => OpenReply {
                                 ok: true,
-                                history: Some(vec!["a".into(), "b".into()]),
+                                history: Some(history.clone()),
                                 ..Default::default()
                             },
                             None => OpenReply {
@@ -892,11 +1006,7 @@ mod tests {
             }
         });
         (
-            Hub::new(
-                tx,
-                eframe::egui::Context::default(),
-                Duration::from_millis(400),
-            ),
+            Hub::new(tx, eframe::egui::Context::default(), deadlines),
             seen_rx,
         )
     }
@@ -1068,15 +1178,119 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_that_sends_nothing_gets_a_408() {
+        let (hub, _seen) = live_hub();
+        let lease = hub.lease("p2", "t7").unwrap();
+        let out = roundtrip(lease.local_port, b"");
+        assert!(out.starts_with("HTTP/1.1 408 "), "{out}");
+        assert!(out.ends_with("incomplete request after 300ms\n"), "{out}");
+    }
+
+    #[test]
+    fn stalled_callers_without_a_token_free_their_slots_at_the_head_deadline() {
+        // A long request deadline, so only the short head one can free a slot.
+        let deadlines = Deadlines {
+            head: Duration::from_millis(300),
+            request: Duration::from_secs(30),
+            response: Duration::from_secs(30),
+        };
+        let (hub, _seen) = live_hub_with(deadlines, vec!["a".into()]);
+        let lease = hub.lease("p2", "t7").unwrap();
+        let port = lease.local_port;
+        let stalled: Vec<TcpStream> = (0..MAX_INFLIGHT)
+            .map(|i| {
+                let mut c = connect(port);
+                // Half send a partial head, half send nothing at all.
+                if i % 2 == 0 {
+                    c.write_all(b"GET /status HTTP/1.1\r\n").unwrap();
+                }
+                c
+            })
+            .collect();
+        // Every slot is taken: the next caller is turned away.
+        std::thread::sleep(Duration::from_millis(100));
+        let busy = roundtrip(port, b"");
+        assert!(busy.starts_with("HTTP/1.1 503 "), "{busy}");
+        let t0 = Instant::now();
+        let ask = format!(
+            "GET /chat HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+            lease.token.value()
+        );
+        loop {
+            let out = roundtrip(port, ask.as_bytes());
+            if out.starts_with("HTTP/1.1 200 ") {
+                break;
+            }
+            assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "still busy after {:?}",
+                t0.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        drop(stalled);
+    }
+
+    #[test]
+    fn a_slow_reader_of_a_large_history_is_cut_off_at_the_response_deadline() {
+        let deadlines = Deadlines {
+            head: Duration::from_secs(2),
+            request: Duration::from_secs(5),
+            response: Duration::from_millis(600),
+        };
+        // 32 MiB: far more than loopback buffers hold, so the writer blocks.
+        let line = "x".repeat(32 * 1024);
+        let (hub, _seen) = live_hub_with(deadlines, vec![line; 1024]);
+        let lease = hub.lease("p2", "t7").unwrap();
+        let mut c = connect(lease.local_port);
+        c.write_all(
+            format!(
+                "GET /chat?history=1000 HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                lease.token.value()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        // Read a little at a time, never stalling long enough for a per-call
+        // write timeout to fire, for well past the response deadline…
+        let t0 = Instant::now();
+        let mut got = 0usize;
+        let mut chunk = [0u8; 4096];
+        while t0.elapsed() < Duration::from_millis(1500) {
+            match c.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // …then drain everything left as fast as possible.
+        let mut big = vec![0u8; 1 << 20];
+        loop {
+            match c.read(&mut big) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        let full = 1024 * (32 * 1024 + 1);
+        assert!(
+            got < full,
+            "the whole {full}-byte body arrived: {got} bytes"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    }
+
+    #[test]
     fn a_session_s_token_dies_when_its_process_exits() {
         let (tx, _rx) = mpsc::channel();
         let ctx = eframe::egui::Context::default();
-        let hub = Hub::new(tx, ctx.clone(), IO_TIMEOUT);
+        let hub = Hub::new(tx, ctx.clone(), DEADLINES);
         let lease = hub.lease("p1", "t1").unwrap();
         let value = lease.token.value().to_string();
         let argv: Vec<String> = ["cmd.exe", "/c", "exit 0"].map(String::from).to_vec();
         let mut s = crate::terminal::Session::spawn_argv(&argv, None, &[], ctx).unwrap();
-        s.attach_tunnel(lease.token, "note".into());
+        s.attach_tunnel(lease.token, "note".into(), false);
         assert!(hub.owner(&value).is_some());
         let t0 = Instant::now();
         while s.exited().is_none() {

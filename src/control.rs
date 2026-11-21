@@ -162,6 +162,11 @@ pub struct StatusRequest {
     /// line instead of text. Skipped when false (wire compat v1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub json: bool,
+    /// Leave each Project's `cwd` out: set by the Tunnel listener, whose
+    /// caller is on another PC and has no use for a seat-PC path. Never on
+    /// the wire, so the pipe cannot set it and its reply is unchanged.
+    #[serde(skip)]
+    pub no_cwd: bool,
 }
 
 /// `status --json` project line. Field names are the contract: add fields,
@@ -1199,6 +1204,7 @@ pub fn parse_status_args(args: &[String]) -> Result<StatusRequest, String> {
         cmd: "status".into(),
         project,
         json,
+        no_cwd: false,
     })
 }
 
@@ -4010,6 +4016,7 @@ mod tests {
             cmd: "status".into(),
             project: Some("p2".into()),
             json: false,
+            no_cwd: false,
         };
         let back: StatusRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -4022,6 +4029,7 @@ mod tests {
             cmd: "status".into(),
             project: None,
             json: false,
+            no_cwd: false,
         };
         assert_eq!(
             serde_json::to_string(&plain).unwrap(),
@@ -4083,6 +4091,7 @@ mod tests {
             cmd: "status".into(),
             project: None,
             json: false,
+            no_cwd: false,
         };
         let mut reply = None;
         for _ in 0..100 {

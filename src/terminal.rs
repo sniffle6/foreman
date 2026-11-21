@@ -669,9 +669,9 @@ pub struct Session {
     /// A Remote Session's Tunnel token. Dropped (revoked) the frame its `ssh`
     /// is seen to exit, so a dead connection's token stops working.
     tunnel_token: Option<crate::control::tunnel::Token>,
-    /// The reply command for this connection's agent, sent with its first
-    /// chat delivery and then gone (`inject_chat`).
-    reply_note: Option<String>,
+    /// The reply command for this connection's agent, sent once: at launch
+    /// or with its first chat delivery (`inject_chat`).
+    reply_note: crate::control::tunnel::ReplyNote,
     /// Hook-driven agent state for the Sessions panel badge. Pure; fed by
     /// `WindowManager::apply_hook_event`, never by the PTY.
     agent_state: crate::agent_state::AgentStateSlot,
@@ -989,10 +989,19 @@ impl Session {
     }
 
     /// Give a Remote Session its way back: the token that names it to the
-    /// Tunnel listener, and the note teaching its agent to use it.
-    pub fn attach_tunnel(&mut self, token: crate::control::tunnel::Token, note: String) {
+    /// Tunnel listener, and the note teaching its agent to use it. With
+    /// `at_launch` the note is injected now (Ready-gated like any chat post)
+    /// instead of riding on the first chat delivery.
+    pub fn attach_tunnel(
+        &mut self,
+        token: crate::control::tunnel::Token,
+        note: String,
+        at_launch: bool,
+    ) {
         self.tunnel_token = Some(token);
-        self.reply_note = Some(note);
+        if let Some(note) = self.reply_note.arm(note, at_launch) {
+            self.inject_input(&note);
+        }
     }
 
     #[cfg(test)]
@@ -1163,7 +1172,7 @@ impl Session {
             dispatch_argv: None,
             remote: None,
             tunnel_token: None,
-            reply_note: None,
+            reply_note: Default::default(),
             agent_state: Default::default(),
             root_pid,
             term_id: 0,
@@ -1304,7 +1313,7 @@ impl Session {
     /// [`Self::inject_input`] for a chat delivery: a Remote Session's first
     /// one on this connection also carries the reply note.
     pub fn inject_chat(&mut self, line: &str) {
-        let line = crate::control::tunnel::with_reply_note(line, &mut self.reply_note);
+        let line = self.reply_note.on_delivery(line);
         self.inject_input(&line);
     }
 

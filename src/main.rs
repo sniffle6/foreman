@@ -1889,6 +1889,7 @@ mod app_logic_tests {
                     cmd: "status".into(),
                     project: None,
                     json: false,
+                    no_cwd: false,
                 },
                 reply_tx,
                 std::time::Instant::now(),
