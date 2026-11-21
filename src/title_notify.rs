@@ -110,28 +110,10 @@ fn normalize_event(
         return None;
     }
     let value: serde_json::Value = serde_json::from_slice(input).ok()?;
-    let nonempty = |name: &str| {
-        value
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    };
-    let subagent = [
-        "agent_id",
-        "agentId",
-        "agent_type",
-        "agentType",
-        "subagent_type",
-        "subagentType",
-    ]
-    .into_iter()
-    .any(nonempty);
-    // A subagent's turn is not the Session's turn, but its permission prompt
-    // waits on the human and its tool finishing is what leaves Needs you.
-    if subagent && !matches!(event, HookEvent::PermissionRequest | HookEvent::PostToolUse) {
+    if drops_subagent_event(event, &value) {
         return None;
     }
-    let prompt = if event == HookEvent::UserPromptSubmit && !subagent {
+    let prompt = if event == HookEvent::UserPromptSubmit {
         value
             .get("prompt")
             .and_then(serde_json::Value::as_str)
@@ -178,6 +160,30 @@ fn normalize_event(
         terminal_id,
         prompt,
     })
+}
+
+/// Whether `event` is a subagent's and does not count for the Session. A
+/// subagent's turn is not the Session's turn, but its permission prompt waits
+/// on the human and its tool finishing is what leaves Needs you. Shared with
+/// the Tunnel's `/hook` route, so a Remote Session filters the same way.
+pub(crate) fn drops_subagent_event(event: HookEvent, payload: &serde_json::Value) -> bool {
+    let nonempty = |name: &str| {
+        payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let subagent = [
+        "agent_id",
+        "agentId",
+        "agent_type",
+        "agentType",
+        "subagent_type",
+        "subagentType",
+    ]
+    .into_iter()
+    .any(nonempty);
+    subagent && !matches!(event, HookEvent::PermissionRequest | HookEvent::PostToolUse)
 }
 
 fn send_event(pipe: &str, event: &TitlePromptEvent) -> std::io::Result<()> {

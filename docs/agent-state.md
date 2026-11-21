@@ -107,6 +107,26 @@ fires nothing and its rows show no badge.
   picks the one closest to the shell, so the pane keeps its Claude identity and
   Codex's events are dropped.
 
+## Remote Sessions
+
+Nothing is installed on a Remote, so a Claude launch there carries its hooks
+as `--settings` JSON, one `curl` per event to the Tunnel's `/hook`. Events
+take the local hook lane from there.
+
+- **Only a bare `claude` on a POSIX Remote gets hooks.** A wrapper (`npx …`),
+  a user's own `--settings`, Codex, Grok and every Windows Remote get none,
+  so no badge. Windows is unproved, and the encoded hooks would take about
+  3 KB of the 8000-character line a dispatched brief has to fit in.
+- **Subagent filtering is partial and unproved.** Only `UserPromptSubmit`,
+  `Stop` and `StopFailure` forward their stdin, which is all the filter
+  needs. The other two events count for a subagent anyway, and their payload
+  is tool input or output of any size. Observed 2026-11-20 (Claude 2.1.105,
+  logged out): main-agent payloads of 246 and 289 bytes with no agent
+  fields. No subagent payload was seen, because no turn could run. A payload
+  over the Tunnel's 64 KB cap counts as the main agent's.
+- **No naming on a Remote.** The prompt is not forwarded, and the transcript
+  naming reads lives on the Remote.
+
 ## Key files
 
 - `src/agent_state.rs` — `HookEvent`, `AgentStateSlot` (pure event → state

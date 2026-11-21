@@ -70,6 +70,18 @@ fn wanted_events(agent: &str, wants: HookWants) -> &'static [&'static str] {
     }
 }
 
+/// Every event the installer manages for `agent` with badges on. A Remote
+/// Session's per-launch hooks use the same list, so the two cannot drift.
+pub(crate) fn state_events(agent: &str) -> &'static [&'static str] {
+    wanted_events(
+        agent,
+        HookWants {
+            naming: true,
+            state: true,
+        },
+    )
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InstallReport {
     pub changed: usize,

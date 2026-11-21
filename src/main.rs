@@ -1672,17 +1672,18 @@ fn main() -> eframe::Result {
             let inst_ctx = cc.egui_ctx.clone();
             // Tailscale peers: idle until Settings::remote_listen is on.
             let (remote_tx, remote_ctx) = (tx.clone(), cc.egui_ctx.clone());
+            // Tool-heavy turns across several panes send more than one hook
+            // event between frames.
+            let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(64);
             // Remote Sessions' way back: binds on the first Remote Session.
-            control::tunnel::install(&cc.egui_ctx, tx.clone());
+            // Its hook events join the local hook lane.
+            control::tunnel::install(&cc.egui_ctx, tx.clone(), title_event_tx.clone());
             std::thread::spawn(move || control::serve_remote(remote_tx, remote_ctx));
             std::thread::spawn(move || control::serve(control::PIPE, tx, ctx));
             // Second listener on this instance's own pipe: terminals we spawn
             // carry FOREMAN_PIPE pointing here, so their CLI calls reach THIS
             // host even when another foreman also serves the well-known name.
             std::thread::spawn(move || control::serve(control::instance_pipe(), inst_tx, inst_ctx));
-            // Tool-heavy turns across several panes send more than one hook
-            // event between frames.
-            let (title_event_tx, title_event_rx) = std::sync::mpsc::sync_channel(64);
             let title_ctx = cc.egui_ctx.clone();
             let title_pipe = title_pipe.clone();
             std::thread::spawn(move || title_notify::serve(&title_pipe, title_event_tx, title_ctx));

@@ -472,6 +472,12 @@ pub struct Built {
 pub fn build(l: &Launch) -> Result<Built, String> {
     // Same rule as a local spawn, applied before the argv is buried in base64.
     let run = crate::agent_command::codex_in_process(l.argv).unwrap_or_else(|| l.argv.to_vec());
+    // Nothing is installed on a Remote, so Claude's state hooks ride the
+    // launch. Without a Tunnel there is nowhere for them to go.
+    let run = match l.tunnel {
+        Some(_) => claude_with_hooks(&run, l.remote.shell).unwrap_or(run),
+        None => run,
+    };
 
     let mut env: Vec<(&str, String)> = vec![
         ("FOREMAN", "1".into()),
@@ -547,6 +553,61 @@ pub fn build(l: &Launch) -> Result<Built, String> {
     Ok(Built {
         ssh,
         dispatched: l.argv.to_vec(),
+    })
+}
+
+/// Events whose hook sends its stdin payload, so the `/hook` route can drop a
+/// subagent's the way the local helper does. The others count for a subagent
+/// anyway, and their payload carries tool input or output of any size.
+const PAYLOAD_EVENTS: &[&str] = &["UserPromptSubmit", "Stop", "StopFailure"];
+
+/// `argv` with Claude's state hooks as `--settings` JSON after the program:
+/// one `curl` per event to the Tunnel's `/hook`, the token read from the
+/// launch environment (never written into argv, which every user on the
+/// Remote can read). `None` when the program is not Claude itself (a wrapper
+/// gets no hooks, as with [`crate::agent_command::codex_in_process`]), the
+/// user passed their own `--settings`, or the Remote is Windows: unproved
+/// there, and the encoded hooks would take ~3 KB of the brief's room under
+/// [`WINDOWS_LINE_CAP`].
+fn claude_with_hooks(argv: &[String], shell: RemoteShell) -> Option<Vec<String>> {
+    let stem = std::path::Path::new(argv.first()?).file_stem()?.to_str()?;
+    if shell != RemoteShell::Posix
+        || !stem.eq_ignore_ascii_case("claude")
+        || argv[1..]
+            .iter()
+            .any(|a| a == "--settings" || a.starts_with("--settings="))
+    {
+        return None;
+    }
+    let mut hooks = serde_json::Map::new();
+    for &event in crate::agent_hooks::state_events("claude") {
+        hooks.insert(
+            event.into(),
+            serde_json::json!([{ "hooks": [posix_hook(event)] }]),
+        );
+    }
+    let settings = serde_json::json!({ "hooks": hooks }).to_string();
+    let mut out = argv.to_vec();
+    out.splice(1..1, ["--settings".to_string(), settings]);
+    Some(out)
+}
+
+/// One hook handler: a quiet `curl` whose output and failure never reach the
+/// agent (a `UserPromptSubmit` hook's stdout lands in its context). Async, as
+/// the local handlers are, so a slow Tunnel never delays a turn.
+fn posix_hook(event: &str) -> serde_json::Value {
+    let body = if PAYLOAD_EVENTS.contains(&event) {
+        "--data-binary @-"
+    } else {
+        "-d ''"
+    };
+    serde_json::json!({
+        "type": "command",
+        "command": format!(
+            "curl -s -m 3 -o /dev/null -H \"Authorization: Bearer $FOREMAN_TOKEN\" {body} \"$FOREMAN_URL/hook?agent=claude&event={event}\" 2>/dev/null || true"
+        ),
+        "timeout": 5,
+        "async": true,
     })
 }
 
@@ -903,16 +964,20 @@ mod tests {
             b64.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c))
         );
+        let settings = &claude_with_hooks(&a, RemoteShell::Posix).unwrap()[2];
         assert_eq!(
             script(&b, RemoteShell::Posix),
-            "cd -- '/home/andy/src' || exit 1\n\
-             export FOREMAN='1'\n\
-             export FOREMAN_TERMINAL_ID='t7'\n\
-             export FOREMAN_PROJECT_ID='p3'\n\
-             export COLORTERM='truecolor'\n\
-             export FOREMAN_URL='http://127.0.0.1:41234'\n\
-             export FOREMAN_TOKEN='tok'\n\
-             exec \"${SHELL:-sh}\" -lic 'exec \"$@\"' foreman-launch 'claude' '--model' 'x'\n"
+            format!(
+                "cd -- '/home/andy/src' || exit 1\n\
+                 export FOREMAN='1'\n\
+                 export FOREMAN_TERMINAL_ID='t7'\n\
+                 export FOREMAN_PROJECT_ID='p3'\n\
+                 export COLORTERM='truecolor'\n\
+                 export FOREMAN_URL='http://127.0.0.1:41234'\n\
+                 export FOREMAN_TOKEN='tok'\n\
+                 exec \"${{SHELL:-sh}}\" -lic 'exec \"$@\"' foreman-launch 'claude' '--settings' {} '--model' 'x'\n",
+                sh_quote(settings)
+            )
         );
     }
 
@@ -1085,6 +1150,76 @@ mod tests {
             script(&b, RemoteShell::Posix)
                 .contains("foreman-launch 'codex' '--no-daemon' 'do the thing'\n")
         );
+    }
+
+    #[test]
+    fn remote_claude_launch_carries_the_installer_s_state_hooks() {
+        let a = argv(&["claude", "--model", "x"]);
+        let run = claude_with_hooks(&a, RemoteShell::Posix).unwrap();
+        assert_eq!(run[..2], argv(&["claude", "--settings"])[..]);
+        assert_eq!(run[3..], a[1..]);
+        let settings: serde_json::Value = serde_json::from_str(&run[2]).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        let mut want = crate::agent_hooks::state_events("claude").to_vec();
+        let mut got: Vec<&str> = hooks.keys().map(String::as_str).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want, "the same events the local installer manages");
+        for (event, groups) in hooks {
+            let h = &groups[0]["hooks"][0];
+            let cmd = h["command"].as_str().unwrap();
+            assert!(
+                cmd.starts_with("curl -s ")
+                    && cmd.contains("\"Authorization: Bearer $FOREMAN_TOKEN\"")
+                    && cmd.contains(&format!("\"$FOREMAN_URL/hook?agent=claude&event={event}\""))
+                    && cmd.contains("-o /dev/null")
+                    && cmd.ends_with("|| true"),
+                "{cmd}"
+            );
+            assert_eq!(
+                cmd.contains("--data-binary @-"),
+                PAYLOAD_EVENTS.contains(&event.as_str()),
+                "only the events the subagent filter reads send stdin: {cmd}"
+            );
+            assert_eq!(h["async"], true);
+        }
+        // The token is read from the environment, never written into argv.
+        assert!(!run[2].contains("tok"));
+        let r = remote(RemoteShell::Posix);
+        let s = script(&build(&launch(&r, "", &a)).unwrap(), RemoteShell::Posix);
+        assert!(s.contains(&format!("'claude' '--settings' {} ", sh_quote(&run[2]))));
+    }
+
+    #[test]
+    fn remote_hooks_are_left_out_of_every_other_launch() {
+        for words in [
+            vec!["codex", "task"],
+            vec!["grok", "task"],
+            vec!["npx", "@anthropic-ai/claude-code", "task"],
+            vec!["claude", "--settings", "/mine.json"],
+            vec!["claude", "--settings={}"],
+        ] {
+            assert_eq!(
+                claude_with_hooks(&argv(&words), RemoteShell::Posix),
+                None,
+                "{words:?}"
+            );
+        }
+        let r = remote(RemoteShell::Posix);
+        let s = script(
+            &build(&launch(&r, "", &argv(&["grok", "task"]))).unwrap(),
+            r.shell,
+        );
+        assert!(s.ends_with("foreman-launch 'grok' 'task'\n"), "{s}");
+        for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
+            let r = remote(shell);
+            let s = script(&build(&launch(&r, "", &argv(&["claude"]))).unwrap(), shell);
+            assert!(!s.contains("--settings"), "{s}");
+        }
+        let a = argv(&["claude"]);
+        let mut l = launch(&r, "", &a);
+        l.tunnel = None;
+        assert!(!script(&build(&l).unwrap(), r.shell).contains("--settings"));
     }
 
     #[test]

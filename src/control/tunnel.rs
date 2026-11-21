@@ -17,12 +17,16 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::{ChatRequest, CtrlMsg, OpenReply, REPLY_TIMEOUT, StatusRequest, read_until};
+use crate::agent_state::HookEvent;
 use crate::remote::RemoteShell;
+use crate::terminal_titles::SourceAgent;
+use crate::title_notify::TitlePromptEvent;
 
 /// Request line plus headers. curl sends a few hundred bytes.
 const MAX_HEAD: usize = 8 * 1024;
 
 /// Largest body (`POST /chat` text). Matches the peer listener's line cap.
+/// A `/hook` payload over it is not refused; see [`Route::Hook`].
 const MAX_BODY: usize = 64 * 1024;
 
 /// How long each stage of one connection may take, all measured from accept.
@@ -76,6 +80,10 @@ pub struct Owner {
 /// binds on the first [`Hub::lease`].
 pub struct Hub {
     tx: mpsc::Sender<CtrlMsg>,
+    /// The local hook lane (`title_notify::serve` feeds the same channel), so
+    /// a Remote Session's hook events reach `apply_hook_event` exactly as a
+    /// local one's do.
+    hooks: mpsc::SyncSender<TitlePromptEvent>,
     ctx: eframe::egui::Context,
     owners: Mutex<HashMap<String, Owner>>,
     port: Mutex<Option<u16>>,
@@ -115,8 +123,12 @@ fn ctx_id() -> eframe::egui::Id {
 }
 
 /// Make the Tunnel available to the window manager. Binds nothing yet.
-pub fn install(ctx: &eframe::egui::Context, tx: mpsc::Sender<CtrlMsg>) {
-    let hub = Hub::new(tx, ctx.clone(), DEADLINES);
+pub fn install(
+    ctx: &eframe::egui::Context,
+    tx: mpsc::Sender<CtrlMsg>,
+    hooks: mpsc::SyncSender<TitlePromptEvent>,
+) {
+    let hub = Hub::new(tx, hooks, ctx.clone(), DEADLINES);
     ctx.data_mut(|d| d.insert_temp(ctx_id(), hub));
 }
 
@@ -129,11 +141,13 @@ pub fn hub(ctx: &eframe::egui::Context) -> Option<Arc<Hub>> {
 impl Hub {
     fn new(
         tx: mpsc::Sender<CtrlMsg>,
+        hooks: mpsc::SyncSender<TitlePromptEvent>,
         ctx: eframe::egui::Context,
         deadlines: Deadlines,
     ) -> Arc<Hub> {
         Arc::new(Hub {
             tx,
+            hooks,
             ctx,
             owners: Mutex::new(HashMap::new()),
             port: Mutex::new(None),
@@ -281,6 +295,8 @@ impl Hub {
         *trusted = true;
         let route = route(&head.method, &head.path)?;
         let len = match (route, head.content_length) {
+            // Left unread (the reply drains it): the event still counts.
+            (Route::Hook, Some(n)) if n > MAX_BODY => 0,
             (_, Some(n)) if n > MAX_BODY => {
                 return Err(Refusal::new(413, format!("body over {MAX_BODY} bytes")));
             }
@@ -305,12 +321,22 @@ impl Hub {
     }
 
     /// Hand the request to the GUI exactly as the pipe does, and wait for it.
+    /// A hook event is queued and answered at once, with nothing to wait for.
     fn dispatch(&self, call: Call) -> Vec<u8> {
         let (rtx, rrx) = mpsc::channel();
         let now = Instant::now();
         let msg = match call {
             Call::Chat(r) => CtrlMsg::Chat(r, rtx, now),
             Call::Status(r) => CtrlMsg::Status(r, rtx, now),
+            Call::Hook(event) => {
+                // A full lane drops the event, as the local hook lane does.
+                if let Some(e) = event
+                    && self.hooks.try_send(e).is_ok()
+                {
+                    self.ctx.request_repaint();
+                }
+                return response(200, "");
+            }
         };
         if self.tx.send(msg).is_err() {
             return response(503, "foreman is not accepting requests\n");
@@ -596,8 +622,9 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The three routes. Nothing else exists: no open, send, close, snapshot or
-/// kanban, so a token can post and read, never drive or spawn.
+/// The four routes. Nothing else exists: no open, send, close, snapshot or
+/// kanban, so a token can post, read and report its own agent state, never
+/// drive or spawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Route {
     /// `POST /chat`
@@ -606,6 +633,12 @@ pub enum Route {
     History,
     /// `GET /status`
     Status,
+    /// `POST /hook?agent=A&event=E`, body the hook's stdin payload or empty.
+    /// The answer is always an empty body: a `UserPromptSubmit` hook's
+    /// stdout lands in the agent's context. A payload over [`MAX_BODY`] (a
+    /// huge pasted prompt) is left unread and the event counts as the main
+    /// agent's, rather than being lost to a 413.
+    Hook,
 }
 
 pub fn route(method: &str, path: &str) -> Result<Route, Refusal> {
@@ -613,12 +646,13 @@ pub fn route(method: &str, path: &str) -> Result<Route, Refusal> {
         ("POST", "/chat") => Ok(Route::Post),
         ("GET", "/chat") => Ok(Route::History),
         ("GET", "/status") => Ok(Route::Status),
-        (_, "/chat" | "/status") => {
+        ("POST", "/hook") => Ok(Route::Hook),
+        (_, "/chat" | "/status" | "/hook") => {
             Err(Refusal::new(405, format!("{method} {path} is not a route")))
         }
         _ => Err(Refusal::new(
             404,
-            format!("no route {path} (only POST /chat, GET /chat, GET /status)"),
+            format!("no route {path} (only POST /chat, GET /chat, GET /status, POST /hook)"),
         )),
     }
 }
@@ -628,6 +662,8 @@ pub fn route(method: &str, path: &str) -> Result<Route, Refusal> {
 pub enum Call {
     Chat(ChatRequest),
     Status(StatusRequest),
+    /// `None`: a subagent's event the local helper would drop too.
+    Hook(Option<TitlePromptEvent>),
 }
 
 /// Turn a routed request into the GUI's own request type, stamped with the
@@ -698,6 +734,37 @@ pub fn build_call(
             json: matches!(get("json"), Some("" | "1" | "true")),
             no_cwd: true,
         })),
+        Route::Hook => {
+            let agent = get("agent").unwrap_or_default();
+            let source =
+                SourceAgent::parse(agent).ok_or_else(|| bad(format!("bad agent: {agent:?}")))?;
+            let name = get("event").unwrap_or_default();
+            let event =
+                HookEvent::parse(name).ok_or_else(|| bad(format!("bad event: {name:?}")))?;
+            // No payload, or one that is not a JSON object (the events that
+            // never send one), is the main agent's.
+            let payload = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_default();
+            if crate::title_notify::drops_subagent_event(event, &payload) {
+                return Ok(Call::Hook(None));
+            }
+            let session = ["session_id", "sessionId"]
+                .iter()
+                .find_map(|k| payload.get(*k).and_then(serde_json::Value::as_str))
+                .unwrap_or_default();
+            // No prompt: naming reads the transcript, which is on the Remote.
+            Ok(Call::Hook(Some(TitlePromptEvent {
+                source_agent: source,
+                hook_event: event,
+                vendor_session_id: session.to_string(),
+                transcript_path: None,
+                project_id: Some(owner.project.clone()),
+                terminal_id: owner.terminal.clone(),
+                prompt: None,
+            })))
+        }
     }
 }
 
@@ -891,20 +958,14 @@ mod tests {
     }
 
     #[test]
-    fn only_chat_and_status_are_routes() {
+    fn only_chat_status_and_hook_are_routes() {
         assert_eq!(route("POST", "/chat"), Ok(Route::Post));
         assert_eq!(route("GET", "/chat"), Ok(Route::History));
         assert_eq!(route("GET", "/status"), Ok(Route::Status));
+        assert_eq!(route("POST", "/hook"), Ok(Route::Hook));
         assert_eq!(route("DELETE", "/chat").unwrap_err().status, 405);
-        for path in [
-            "/open",
-            "/send",
-            "/close",
-            "/snapshot",
-            "/kanban",
-            "/hook",
-            "/",
-        ] {
+        assert_eq!(route("GET", "/hook").unwrap_err().status, 405);
+        for path in ["/open", "/send", "/close", "/snapshot", "/kanban", "/"] {
             assert_eq!(route("POST", path).unwrap_err().status, 404, "{path}");
             assert_eq!(route("GET", path).unwrap_err().status, 404, "{path}");
         }
@@ -983,6 +1044,67 @@ mod tests {
         assert_eq!((s.project.as_deref(), s.json), (Some("p2"), false));
     }
 
+    fn hook(query: &[(&str, &str)], body: &[u8]) -> Result<Option<TitlePromptEvent>, u16> {
+        match build_call(Route::Hook, &q(query), body, &owner()) {
+            Ok(Call::Hook(e)) => Ok(e),
+            Ok(other) => panic!("a hook is a hook call: {other:?}"),
+            Err(r) => Err(r.status),
+        }
+    }
+
+    #[test]
+    fn a_hook_is_stamped_with_the_token_s_session_and_its_named_event() {
+        let e = hook(
+            &[
+                ("agent", "claude"),
+                ("event", "Stop"),
+                ("project", "p9"),
+                ("terminal", "t1"),
+            ],
+            br#"{"session_id":"s-1","prompt":"rename me"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            e,
+            TitlePromptEvent {
+                source_agent: SourceAgent::Claude,
+                hook_event: HookEvent::Stop,
+                vendor_session_id: "s-1".into(),
+                transcript_path: None,
+                project_id: Some("p2".into()),
+                terminal_id: "t7".into(),
+                prompt: None,
+            }
+        );
+        // The events that send no payload, and an unreadable one, still count.
+        for body in [&b""[..], b"{}", b"1", b"{\"trunc"] {
+            assert!(
+                hook(&[("agent", "claude"), ("event", "PostToolUse")], body)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(hook(&[("agent", "claude")], b""), Err(400));
+        assert_eq!(
+            hook(&[("agent", "claude"), ("event", "PreToolUse")], b""),
+            Err(400)
+        );
+        assert_eq!(hook(&[("agent", "bard"), ("event", "Stop")], b""), Err(400));
+    }
+
+    #[test]
+    fn a_hook_drops_the_subagent_events_the_local_helper_drops() {
+        let sub = br#"{"session_id":"s","agent_id":"a1","agent_type":"Explore"}"#;
+        let ev = |event: &str| hook(&[("agent", "claude"), ("event", event)], sub).unwrap();
+        for event in ["UserPromptSubmit", "Stop", "StopFailure"] {
+            assert_eq!(ev(event), None, "{event}");
+        }
+        for event in ["PermissionRequest", "PostToolUse"] {
+            assert!(ev(event).is_some(), "{event} counts for a subagent");
+        }
+    }
+
     #[test]
     fn reply_note_spells_curl_for_the_remote_s_shell_and_goes_once() {
         let posix = reply_note(RemoteShell::Posix, 21000, "tok");
@@ -1056,7 +1178,12 @@ mod tests {
     #[test]
     fn os_random_tokens_differ_and_ports_stay_in_range() {
         let (tx, _rx) = mpsc::channel();
-        let hub = Hub::new(tx, eframe::egui::Context::default(), FAST);
+        let hub = Hub::new(
+            tx,
+            mpsc::sync_channel(1).0,
+            eframe::egui::Context::default(),
+            FAST,
+        );
         let a = hub.lease("p1", "t1").unwrap();
         let b = hub.lease("p1", "t2").unwrap();
         assert_eq!(a.token.value().len(), 64);
@@ -1096,6 +1223,7 @@ mod tests {
     ) -> (Arc<Hub>, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<CtrlMsg>();
         let (seen_tx, seen_rx) = mpsc::channel();
+        let hook_seen = seen_tx.clone();
         std::thread::spawn(move || {
             for msg in rx {
                 match msg {
@@ -1127,8 +1255,17 @@ mod tests {
                 }
             }
         });
+        let (hook_tx, hook_rx) = mpsc::sync_channel::<TitlePromptEvent>(8);
+        std::thread::spawn(move || {
+            for e in hook_rx {
+                let _ = hook_seen.send(format!(
+                    "hook {:?} {:?} {:?} {:?}",
+                    e.source_agent, e.hook_event, e.project_id, e.terminal_id
+                ));
+            }
+        });
         (
-            Hub::new(tx, eframe::egui::Context::default(), deadlines),
+            Hub::new(tx, hook_tx, eframe::egui::Context::default(), deadlines),
             seen_rx,
         )
     }
@@ -1251,6 +1388,54 @@ mod tests {
         refused(
             format!("GET /status HTTP/1.1\r\nAuthorization: Bearer {tok}\r\n\r\n"),
             "401",
+        );
+    }
+
+    #[test]
+    fn listener_answers_a_hook_with_an_empty_body_and_queues_its_event() {
+        let (hub, seen) = live_hub();
+        let lease = hub.lease("p2", "t7").unwrap();
+        let (port, tok) = (lease.local_port, lease.token.value().to_string());
+        let post = |event: &str, body: &str, length: usize| {
+            roundtrip(
+                port,
+                format!(
+                    "POST /hook?agent=claude&event={event} HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: {length}\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+        };
+        let out = post("Stop", r#"{"session_id":"s"}"#, 18);
+        assert!(
+            out.starts_with("HTTP/1.1 200 OK\r\n")
+                && out.ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n"),
+            "{out}"
+        );
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+            r#"hook Claude Stop Some("p2") "t7""#
+        );
+        // A subagent's Stop is answered the same way and goes nowhere.
+        let sub = r#"{"agent_id":"a"}"#;
+        assert!(post("Stop", sub, sub.len()).starts_with("HTTP/1.1 200 "));
+        // A payload over the cap is left unread, and its event still counts.
+        let big = "x".repeat(MAX_BODY + 1);
+        let out = post("UserPromptSubmit", &big, big.len());
+        assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+            r#"hook Claude UserPromptSubmit Some("p2") "t7""#
+        );
+        // No token, no event: refused like every other route.
+        let out = roundtrip(
+            port,
+            b"POST /hook?agent=claude&event=Stop HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+        assert!(post("Nope", "", 0).starts_with("HTTP/1.1 400 "));
+        assert!(
+            seen.try_recv().is_err(),
+            "the subagent Stop and refusals queue nothing"
         );
     }
 
@@ -1473,7 +1658,7 @@ mod tests {
     fn a_session_s_token_dies_when_its_process_exits() {
         let (tx, _rx) = mpsc::channel();
         let ctx = eframe::egui::Context::default();
-        let hub = Hub::new(tx, ctx.clone(), DEADLINES);
+        let hub = Hub::new(tx, mpsc::sync_channel(1).0, ctx.clone(), DEADLINES);
         let lease = hub.lease("p1", "t1").unwrap();
         let value = lease.token.value().to_string();
         let argv: Vec<String> = ["cmd.exe", "/c", "exit 0"].map(String::from).to_vec();

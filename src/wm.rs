@@ -12557,7 +12557,7 @@ mod tests {
         let ctx = egui::Context::default();
         seed_desk_remote(&ctx);
         let (tx, rx) = std::sync::mpsc::channel();
-        crate::control::tunnel::install(&ctx, tx);
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let (_, tid) = wm
             .open_dispatch(open_on("desk", Some("/tmp"), &["codex"]), &ctx)
             .expect("ssh spawns");
@@ -12605,13 +12605,64 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_hook_sets_the_remote_session_s_agent_state() {
+        use std::io::{Read, Write};
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (hook_tx, hook_rx) = std::sync::mpsc::sync_channel(4);
+        crate::control::tunnel::install(&ctx, tx, hook_tx);
+        let (_, tid) = wm
+            .open_dispatch(open_on("desk", Some("/tmp"), &["claude"]), &ctx)
+            .expect("ssh spawns");
+        let token = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session(tid)
+            .unwrap()
+            .tunnel_token()
+            .unwrap()
+            .to_string();
+        let port = crate::control::tunnel::hub(&ctx)
+            .unwrap()
+            .bound_port()
+            .unwrap();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            c,
+            "POST /hook?agent=claude&event=UserPromptSubmit HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        let event = hook_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the hook joins the local hook lane");
+        assert!(wm.apply_hook_event(&event), "{event:?}");
+        let session = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session(tid)
+            .unwrap();
+        // The icon comes from the logical argv, not ssh.exe.
+        let badge = session
+            .agent_state()
+            .badge(session.icon_kind(), false)
+            .expect("a badge once the event landed");
+        assert_eq!(badge.state, crate::agent_state::AgentState::Working);
+    }
+
+    #[test]
     fn a_remote_session_outside_a_project_says_it_has_no_way_back() {
         let mut wm = WindowManager::new();
         assert_eq!(wm.tag, None, "the desk is not a Project");
         let ctx = egui::Context::default();
         seed_desk_remote(&ctx);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::control::tunnel::install(&ctx, tx);
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let remote = crate::config::live(&ctx).remotes[0].clone();
         let tid = wm
             .add_remote_terminal(&["codex".into()], &remote, "/tmp", None, &ctx)
@@ -12657,7 +12708,7 @@ mod tests {
         let ctx = egui::Context::default();
         seed_desk_remote(&ctx);
         let (tx, rx) = std::sync::mpsc::channel();
-        crate::control::tunnel::install(&ctx, tx);
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let (_, tid) = wm
             .open_dispatch(
                 open_on("desk", Some("/tmp"), &["codex", "do the card"]),
@@ -12823,7 +12874,7 @@ mod tests {
         let ctx = egui::Context::default();
         seed_desk_remote(&ctx);
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::control::tunnel::install(&ctx, tx);
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let remote = crate::config::live(&ctx).remotes[0].clone();
         let child = wm.project_child_mut(pid).unwrap();
         let tid = open(child, &remote, &ctx);
