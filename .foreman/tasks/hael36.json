@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "hael36",
+  "title": "Disconnect bar, reconnect and restore-disconnected",
+  "body": "When a Remote Session's ssh exits, keep the Win and show a one-line bar offering reconnect on Enter. Reconnect relaunches the same Remote and directory, with the provider's resume argv for agents, and never resends the original prompt. Persist the Remote name in the workspace snapshot and restore such Sessions disconnected.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: UI > Disconnect, Persistence)\nBlocked by: Open a Remote Session from the CLI with --on\nDone when:\n- a dead ssh leaves the Win in place with the bar; Enter reconnects; other input is ignored\n- the resume argv lives in one table; a provider with no entry relaunches fresh\n- workspace files without a Remote name load as today; a Terminal with one restores disconnected and opens no connection until Enter\n- a Remote name that no longer exists restores as a local Shell with a toast\n- snapshot round-trip and the reconnect argv have unit tests\nGate: cargo test --target-dir target/agent workspace; cargo test --target-dir target/agent remote",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 3
+  },
+  "created": "2026-11-21T00:06:52Z",
+  "updated": "2026-11-21T00:06:53Z"
+}

@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "2zrqf2",
+  "title": "Launcher where-strip, directory prompt and split inheritance",
+  "body": "Add the `Local | <remote names>` strip to the Project launcher so agents and shells can be started on a Remote by mouse, ask once for the Remote directory when a Project has no mapping, and make splits and new terminals inherit the focused Session's Remote.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: UI > Launcher, UI > Splits inherit, Launch > Directory)\nBlocked by: Open a Remote Session from the CLI with --on; Remotes pane in Settings with Test and reachability\nDone when:\n- with no Remotes configured the launcher model is exactly what it is today (the existing test passes unchanged)\n- with Remotes, the strip shows above AGENTS, the selection is per Project for the app run and starts at Local, and offline names are dimmed but clickable\n- choosing an agent or Shell under a Remote opens it there; a Remote shows one Shell row\n- the first launch with no mapping prompts for the directory and saves it\n- a split or new terminal from a focused Remote Session opens on that Remote; from anything else it opens Local\nGate: cargo test --target-dir target/agent launcher; cargo test --target-dir target/agent remote",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 3
+  },
+  "created": "2026-11-21T00:06:52Z",
+  "updated": "2026-11-21T00:06:52Z"
+}

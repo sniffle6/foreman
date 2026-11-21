@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "rx7exb",
+  "title": "Remote settings model and the SSH launch builder",
+  "body": "Add the Remote list to settings (name, target, shell, per-Project directories) with load-time sanitizing, and a pure builder that turns a Remote plus a logical argv into the local ssh argv for all three shells (Pwsh, WindowsPowerShell, Posix). No UI and no spawning in this card. Add the Remote, Remote Session and Tunnel glossary entries.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: Vocabulary, Remote model, Launch)\nBlocked by: None\nDone when:\n- settings round-trip and sanitize Remotes; a target starting with a dash and a duplicate or reserved name are dropped\n- the builder output for Posix matches the form the spec's Results section proved by hand, including the login-shell wrapper\n- table tests cover spaces, both quote kinds, a dollar sign, a blank directory, the Windows over-cap refusal, and that the logical argv is returned unchanged for icon detection\n- the Codex in-process rule is applied to the logical argv before wrapping\nGate: cargo test --target-dir target/agent remote",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 1
+  },
+  "created": "2026-11-21T00:06:51Z",
+  "updated": "2026-11-21T00:06:52Z"
+}

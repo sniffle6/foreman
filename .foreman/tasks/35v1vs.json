@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "35v1vs",
+  "title": "Remote Sessions skills and feature doc",
+  "body": "Teach agents and readers the finished feature: add a short \"another PC\" section using --on to the dispatch and chat skills (both providers' copies), write the feature doc with its gotchas and Key files, and add a pointer row in the agent guides if one is needed. Read the foreman-docs-and-writing skill first for the house style and the embedded-skill rebuild rule.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (whole file)\nBlocked by: Launcher where-strip, directory prompt and split inheritance; Disconnect bar, reconnect and restore-disconnected; Tunnel listener: token, chat and status routes, reply note\nDone when:\n- the skill sections say when to use --on versus --host, and that a Remote agent can post chat but cannot open, send or close\n- the Claude and Codex skill copies agree, and the rebuild rule for embedded skills is followed\n- the feature doc records only gotchas, whys and procedures, cites symbols not line numbers, and passes the cite guard\nGate: pwsh -File .claude/hooks/cite-guard.ps1 -All; cargo test --target-dir target/agent skills",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 4
+  },
+  "created": "2026-11-21T00:06:53Z",
+  "updated": "2026-11-21T00:06:53Z"
+}

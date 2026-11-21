@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "tc0yte",
+  "title": "Tunnel listener: token, chat and status routes, reply note",
+  "body": "Give a Remote Session's agent a way back. Start a loopback HTTP listener, mint a token per Remote Session, add the reverse-forward flags and FOREMAN_URL / FOREMAN_TOKEN to the launch, and serve chat post, chat history and status for the token's Session. Include the exact reply command in the first chat delivery to each Remote Session and after a reconnect.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: The way back, Results)\nBlocked by: Open a Remote Session from the CLI with --on\nDone when:\n- the listener binds 127.0.0.1 only, on an OS-assigned port, and starts with the first Remote Session\n- a post with a valid token appears in the room as that Session, down the normal Member path; a sender supplied by the caller is ignored\n- a missing or wrong token, an unknown route, an oversized body and a stalled client are each refused within the deadline; Expect: 100-continue is answered\n- there is no route for open, send, close, snapshot or kanban\n- a token stops working when its Session exits\n- the reply note uses curl.exe for Windows shells and curl for Posix, and is sent once per connection\n- the HTTP parser and sender stamping have unit tests; the pipe protocol structs are unchanged\nGate: cargo test --target-dir target/agent control; cargo test --target-dir target/agent chat",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 3
+  },
+  "created": "2026-11-21T00:06:53Z",
+  "updated": "2026-11-21T00:06:53Z"
+}

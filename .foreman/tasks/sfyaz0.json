@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "sfyaz0",
+  "title": "Launch-time hooks and the hook route for Remote Session badges",
+  "body": "Make the agent-state badge work for Claude on a Remote Session with nothing installed there: add hook settings to the Claude launch argv, each hook one curl to the Tunnel, and add the hook route that feeds the existing state mapping. Codex and Grok get no hooks in this card.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: Agent state, Results)\nBlocked by: Tunnel listener: token, chat and status routes, reply note\nDone when:\n- a Claude launch on a Remote carries hook settings for the same events the local installer manages; other providers' argv is unchanged\n- the hook route answers with an empty body and maps events through the existing state slot for the token's Session\n- the subagent filtering question in the spec is answered in the commit body with what was observed, and any gap is written as a gotcha in the agent-state doc\n- Stop and PostToolUse are confirmed against a real Remote where Claude is logged in, or the card is blocked with that reason\nGate: cargo test --target-dir target/agent agent_state; cargo test --target-dir target/agent remote",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 4
+  },
+  "created": "2026-11-21T00:06:53Z",
+  "updated": "2026-11-21T00:06:53Z"
+}

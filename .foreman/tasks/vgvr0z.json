@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "vgvr0z",
+  "title": "Remotes pane in Settings with Test and reachability",
+  "body": "Add a Settings pane to list, add, edit and delete Remotes, in the same custom-body style as the Keybindings pane. Includes the reachability probe (ssh -G to resolve host and port, then a TCP connect) and a Test action that reports login, shell, curl and agent CLIs. Both run off the UI thread.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: UI > Reachability, UI > Settings > Remotes)\nBlocked by: Remote settings model and the SSH launch builder\nDone when:\n- Remotes can be added, edited and deleted from the pane with keyboard and mouse, and changes save through the existing debounced write\n- reachability is probed only while the pane or the launcher is open, is cached, and never runs on the frame path\n- Test fills in the shell field and shows a plain message when login needs a prompt\n- ssh-config Host names are offered when adding\n- probe parsing and the pane's pure model have unit tests\nGate: cargo test --target-dir target/agent settings_menu; cargo test --target-dir target/agent remote",
+  "state": "backlog",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 2
+  },
+  "created": "2026-11-21T00:06:52Z",
+  "updated": "2026-11-21T00:06:52Z"
+}
