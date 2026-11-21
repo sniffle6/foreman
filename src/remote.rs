@@ -117,6 +117,43 @@ pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String>
     ))
 }
 
+/// Provider program → the arguments that reopen its latest conversation in
+/// the launch directory. The one table reconnect reads; a provider missing
+/// here relaunches fresh.
+const RESUME: &[(&str, &[&str])] = &[
+    ("claude", &["--continue"]),
+    ("codex", &["resume", "--last"]),
+];
+
+/// Agents a reconnect must not re-run with their original arguments, which
+/// carry the Dispatch prompt.
+const AGENTS: &[&str] = &["claude", "codex", "grok"];
+
+/// What a reconnect runs for a Session launched with `original`. An agent
+/// gets its provider's resume arguments, or none at all (fresh), and never
+/// the original prompt. A shell stays a shell, and any other command runs
+/// again as it was.
+pub fn reconnect_argv(original: &[String]) -> Vec<String> {
+    let Some(program) = original.first() else {
+        return Vec::new();
+    };
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if !AGENTS.contains(&stem.as_str()) {
+        return original.to_vec();
+    }
+    let resume = RESUME
+        .iter()
+        .find(|(p, _)| *p == stem)
+        .map_or(&[][..], |(_, args)| *args);
+    std::iter::once(program.clone())
+        .chain(resume.iter().map(|a| a.to_string()))
+        .collect()
+}
+
 /// Windows path equality for `Remote::dirs` keys: case, slash direction and
 /// a trailing separator do not make a different Project directory.
 fn same_dir(a: &str, b: &str) -> bool {
@@ -424,6 +461,37 @@ pub(crate) fn utf16le_b64(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_resumes_agents_without_their_prompt() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (original, want) in [
+            (
+                v(&["claude", "--model", "opus", "do the card"]),
+                v(&["claude", "--continue"]),
+            ),
+            (
+                v(&["codex", "do the card"]),
+                v(&["codex", "resume", "--last"]),
+            ),
+            (
+                v(&[r"C:\bin\Claude.exe", "brief"]),
+                v(&[r"C:\bin\Claude.exe", "--continue"]),
+            ),
+            // No table entry: fresh, and still no prompt.
+            (v(&["grok", "do the card"]), v(&["grok"])),
+            // A shell stays a shell; anything else runs again unchanged.
+            (v(&[]), v(&[])),
+            (v(&["htop", "-d", "5"]), v(&["htop", "-d", "5"])),
+            // The agent check is the program, not a word in its arguments.
+            (
+                v(&["python", "claude_tool.py"]),
+                v(&["python", "claude_tool.py"]),
+            ),
+        ] {
+            assert_eq!(reconnect_argv(&original), want, "{original:?}");
+        }
+    }
 
     fn remote(shell: RemoteShell) -> Remote {
         Remote {

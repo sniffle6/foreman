@@ -122,6 +122,10 @@ impl Default for TabSnap {
 pub enum ContentSnap {
     Terminal {
         shell: String,
+        /// The Remote this Terminal ran on; absent for a local one, so files
+        /// written before Remotes load unchanged. Restores disconnected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
     },
     Chat,
     /// Per-project kanban board (`Content::Board`). Unit variant — the store
@@ -479,6 +483,7 @@ mod tests {
                                         layout_id: None,
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
+                                            remote: None,
                                         },
                                     }],
                                     minimized: false,
@@ -523,7 +528,7 @@ mod tests {
         );
         assert!(matches!(
             &child.windows[0].tabs[0].content,
-            ContentSnap::Terminal { shell } if shell == "powershell"
+            ContentSnap::Terminal { shell, .. } if shell == "powershell"
         ));
     }
 
@@ -545,6 +550,33 @@ mod tests {
         match back.content {
             ContentSnap::Image { path } => assert_eq!(path, PathBuf::from(r"C:\shots\armed.png")),
             _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn a_terminal_s_remote_round_trips_and_is_absent_when_local() {
+        let terminal = |remote: Option<&str>| ContentSnap::Terminal {
+            shell: "cmd".into(),
+            remote: remote.map(str::to_string),
+        };
+        let json = serde_json::to_string(&terminal(Some("desk"))).unwrap();
+        assert!(json.contains(r#""remote":"desk""#), "{json}");
+        match serde_json::from_str(&json).unwrap() {
+            ContentSnap::Terminal { remote, .. } => assert_eq!(remote.as_deref(), Some("desk")),
+            _ => panic!("expected Terminal"),
+        }
+        let local = serde_json::to_string(&terminal(None)).unwrap();
+        assert_eq!(
+            local, r#"{"kind":"Terminal","shell":"cmd"}"#,
+            "old builds see no new key"
+        );
+        // A file written before Remotes loads as a local Terminal.
+        match serde_json::from_str(r#"{"kind":"Terminal","shell":"powershell"}"#).unwrap() {
+            ContentSnap::Terminal { shell, remote } => {
+                assert_eq!(shell, "powershell");
+                assert_eq!(remote, None);
+            }
+            _ => panic!("expected Terminal"),
         }
     }
 
@@ -592,6 +624,7 @@ mod tests {
                         layout_id: None,
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
+                            remote: None,
                         },
                     }],
                     ..Default::default()

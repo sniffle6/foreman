@@ -719,6 +719,22 @@ impl ChatRoom {
         self.log.sys(ChatKind::Joined, id, name);
     }
 
+    /// A reconnected Remote Session comes back as the same Member: present
+    /// again, with a Joined line, its cursor where it stopped so posts sent
+    /// while it was down still reach it. Unknown ids stay out (a restored
+    /// Session was never a Member).
+    pub fn rejoin(&mut self, id: &str, name: &str) {
+        let Some(m) = self.member_mut(id) else {
+            return;
+        };
+        if !m.exited {
+            return;
+        }
+        m.exited = false;
+        m.name = name.to_string();
+        self.log.sys(ChatKind::Joined, id, name);
+    }
+
     /// Append a post from the chat pane's input line. The human (`you`) is
     /// never a terminal: leading `@mentions` narrow delivery like a CLI post,
     /// but an invalid mention (unknown, exited, or the human's own seat)
@@ -923,6 +939,34 @@ mod tests {
             agent_state: None,
             exited,
         }
+    }
+
+    #[test]
+    fn a_rejoined_member_gets_the_posts_it_missed_while_down() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "t1");
+        room.tick("p1", &[live("t1", true, true)]);
+        let seq = room.post_human("while you were away").unwrap();
+        assert!(room.tick("p1", &[live("t1", true, true)]).is_empty());
+        let before = room.last_seq();
+        room.rejoin("t1", "worker");
+        assert_eq!(room.last_seq(), before + 1, "one Joined line");
+        room.rejoin("t1", "worker");
+        assert_eq!(
+            room.last_seq(),
+            before + 1,
+            "a present member is left alone"
+        );
+        let out = room.tick("p1", &[live("t1", true, false)]);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].lines[0].contains(&format!("#{seq}]")),
+            "{:?}",
+            out[0].lines
+        );
+        // Never a Member (a restored Session): rejoin does not invent one.
+        room.rejoin("t9", "t9");
+        assert!(!room.is_member("t9"));
     }
 
     #[test]

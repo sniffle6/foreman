@@ -640,6 +640,41 @@ fn mono_paint_items_for_test(
     mono_paint_items(plan, &mut atlas, 0, layout)
 }
 
+/// The disconnect bar's line. One line at any width: the Win elides it.
+pub fn disconnect_bar_text(remote: &str) -> String {
+    format!("Disconnected from {remote} — Enter to reconnect")
+}
+
+/// One line across the bottom of a dead Remote Session; dimmed when the Win
+/// is not focused, since Enter only reaches the focused one.
+fn paint_disconnect_bar(
+    ui: &egui::Ui,
+    bar: egui::Rect,
+    remote: &str,
+    active: bool,
+    th: &crate::theme::Theme,
+) {
+    let painter = ui.painter_at(bar);
+    painter.rect_filled(bar, egui::CornerRadius::ZERO, th.search_bar_bg);
+    painter.hline(
+        bar.x_range(),
+        bar.min.y,
+        egui::Stroke::new(1.0, th.search_bar_border),
+    );
+    let mut job = egui::text::LayoutJob::single_section(
+        disconnect_bar_text(remote),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional((bar.height() * 0.7).clamp(9.0, 14.0)),
+            color: if active { th.text } else { th.dim },
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width((bar.width() - 12.0).max(0.0));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let pos = egui::pos2(bar.min.x + 6.0, bar.center().y - galley.size().y / 2.0);
+    painter.galley(pos, galley, th.text);
+}
+
 pub struct Session {
     term: Term<Listener>,
     parser: Processor,
@@ -650,8 +685,10 @@ pub struct Session {
     /// Visual Bell latch (shared with the `Listener`).
     bell: Arc<Mutex<Option<std::time::Instant>>>,
     writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// `None` only for a restored Remote Session that has not connected yet
+    /// ([`Session::disconnected_remote`]): there is no process behind it.
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Kill-on-close job the child lives in: dropping the Session kills the
     /// whole process tree (see src/job.rs). None = assignment failed; the
     /// session still works, its tree just isn't reaped (old behavior).
@@ -666,6 +703,13 @@ pub struct Session {
     /// The Remote this Session runs on (its process is `ssh`); `None` = local.
     /// A copy of the name, so deleting the Remote leaves live Sessions alone.
     remote: Option<String>,
+    /// The directory on the Remote this connection launched in, so a
+    /// reconnect lands in the same place. `None` = resolve it from the
+    /// Project's mapping at reconnect (a restored Session).
+    remote_dir: Option<String>,
+    /// Enter was pressed on the disconnect bar; the window manager takes it
+    /// (`take_reconnect`) and swaps in a fresh connection.
+    reconnect_requested: bool,
     /// A Remote Session's Tunnel token. Dropped (revoked) the frame its `ssh`
     /// is seen to exit, so a dead connection's token stops working.
     tunnel_token: Option<crate::control::tunnel::Token>,
@@ -964,6 +1008,7 @@ impl Session {
     pub fn spawn_remote(
         built: crate::remote::Built,
         remote: &str,
+        dir: &str,
         env: &[(String, String)],
         ctx: egui::Context,
     ) -> std::io::Result<Session> {
@@ -985,7 +1030,74 @@ impl Session {
         })?;
         session.dispatch_argv = Some(built.dispatched);
         session.remote = Some(remote.to_string());
+        session.remote_dir = Some(dir.to_string());
         Ok(session)
+    }
+
+    /// A restored Remote Session: the Win and its disconnect bar, with no
+    /// process and no connection until Enter. Restore must not open a batch
+    /// of SSH connections at launch, some to PCs that are off.
+    pub fn disconnected_remote(remote: &str, ctx: egui::Context) -> Session {
+        // A closed channel: pump() reads nothing from it.
+        let (_, rx) = channel::<Vec<u8>>();
+        let mut session = Self::assemble(
+            Box::new(std::io::sink()),
+            None,
+            None,
+            rx,
+            None,
+            Shell::Cmd,
+            &ctx,
+        );
+        session.exit = Some(0);
+        // No exit to announce: it never ran.
+        session.exit_noted = true;
+        session.dispatch_argv = Some(Vec::new());
+        session.remote = Some(remote.to_string());
+        session
+    }
+
+    /// True while a Remote Session's `ssh` is gone: the disconnect bar shows
+    /// and only Enter (reconnect) is read.
+    pub fn disconnected(&self) -> bool {
+        self.remote.is_some() && self.exit.is_some()
+    }
+
+    /// The Remote directory this connection used; `None` = use the mapping.
+    pub fn remote_dir(&self) -> Option<&str> {
+        self.remote_dir.as_deref()
+    }
+
+    /// The logical argv this Session was launched with (empty for a shell).
+    pub fn dispatched(&self) -> &[String] {
+        self.dispatch_argv.as_deref().unwrap_or_default()
+    }
+
+    /// Whether Enter was pressed on the disconnect bar since the last call.
+    pub fn take_reconnect(&mut self) -> bool {
+        std::mem::take(&mut self.reconnect_requested)
+    }
+
+    #[cfg(test)]
+    pub fn request_reconnect_for_test(&mut self) {
+        self.reconnect_requested = true;
+    }
+
+    /// Test hook: end the child and wait until `exited` has seen it, so a
+    /// test does not depend on how fast (or whether) a real ssh fails.
+    #[cfg(test)]
+    pub fn kill_for_test(&mut self) {
+        if let Some(c) = self.child.as_mut() {
+            let _ = c.kill();
+        }
+        let t0 = std::time::Instant::now();
+        while self.exited().is_none() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Give a Remote Session its way back: the token that names it to the
@@ -1117,10 +1229,10 @@ impl Session {
             .take_writer()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let scrollback_lines = crate::config::live(&ctx).scrollback_lines as usize;
-
         let (tx, rx) = channel::<Vec<u8>>();
+        let reader_ctx = ctx.clone();
         std::thread::spawn(move || {
+            let ctx = reader_ctx;
             // 64 KiB: read() returns whatever is already available (never waits
             // to fill), so this only cuts chunk count under flood — fewer
             // to_vec()/channel/repaint/parse-setup ops per MiB. No latency or
@@ -1139,7 +1251,31 @@ impl Session {
                 }
             }
         });
+        Ok(Self::assemble(
+            writer,
+            Some(pair.master),
+            Some(child),
+            rx,
+            root_pid,
+            shell,
+            &ctx,
+        ))
+    }
 
+    /// A Session around already-opened PTY parts (none for a restored,
+    /// never-connected Remote Session). The grid starts at the 80x24
+    /// placeholder; the first `show` resizes it.
+    fn assemble(
+        writer: Box<dyn Write + Send>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+        child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+        rx: Receiver<Vec<u8>>,
+        root_pid: Option<u32>,
+        shell: Shell,
+        ctx: &egui::Context,
+    ) -> Session {
+        let (cols, rows) = (80usize, 24usize);
+        let scrollback_lines = crate::config::live(ctx).scrollback_lines as usize;
         let resp = Arc::new(Mutex::new(Vec::new()));
         let osc_title = Arc::new(Mutex::new(None));
         let bell = Arc::new(Mutex::new(None));
@@ -1155,7 +1291,7 @@ impl Session {
                 bell: bell.clone(),
             },
         );
-        Ok(Session {
+        Session {
             term,
             parser: Processor::new(),
             rx,
@@ -1163,7 +1299,7 @@ impl Session {
             osc_title,
             bell,
             writer,
-            master: pair.master,
+            master,
             child,
             job: root_pid.and_then(crate::job::Job::assign),
             exit: None,
@@ -1171,6 +1307,8 @@ impl Session {
             shell,
             dispatch_argv: None,
             remote: None,
+            remote_dir: None,
+            reconnect_requested: false,
             tunnel_token: None,
             reply_note: Default::default(),
             agent_state: Default::default(),
@@ -1206,7 +1344,7 @@ impl Session {
                     .ok()
             }),
             pending_paste: None,
-        })
+        }
     }
 
     /// The Session's stable Member id (see the `term_id` field). 0 until the
@@ -1246,7 +1384,11 @@ impl Session {
     /// is a cheap non-blocking poll until then.
     pub fn exited(&mut self) -> Option<u32> {
         if self.exit.is_none() {
-            self.exit = self.child.try_wait().ok().flatten().map(|s| s.exit_code());
+            self.exit = self
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+                .map(|s| s.exit_code());
             if self.exit.is_some() {
                 self.tunnel_token = None;
             }
@@ -1508,15 +1650,15 @@ impl Session {
             // Reflow under a preserved scroll offset points the viewport at stale
             // content; snap back to the live prompt like a normal terminal.
             self.term.scroll_display(Scroll::Bottom);
-            let pty_ok = self
-                .master
-                .resize(PtySize {
+            let pty_ok = self.master.as_ref().is_some_and(|m| {
+                m.resize(PtySize {
                     rows: rows as u16,
                     cols: cols as u16,
                     pixel_width: 0,
                     pixel_height: 0,
                 })
-                .is_ok();
+                .is_ok()
+            });
             // Diagnostic marker in the FOREMAN_RX_DUMP stream: interleaves the
             // resize (and what the anchor compensation did) with the raw ConPTY
             // bytes, so a live repro attributes divergence without guesswork.
@@ -2096,6 +2238,15 @@ impl Session {
             .layout_no_wrap("M".to_string(), font.clone(), th.fg);
         let cw = probe.rect.width().max(1.0);
         let rh = probe.rect.height().max(1.0);
+        // A dead Remote Session gives its bottom line to the disconnect bar, so
+        // the grid shrinks instead of the bar covering ssh's last words.
+        let disconnected = self.disconnected();
+        let (rect, bar) = if disconnected && rect.height() > rh * 2.0 {
+            let (grid, bar) = rect.split_top_bottom_at_y(rect.max.y - rh);
+            (grid, Some(bar))
+        } else {
+            (rect, disconnected.then_some(rect))
+        };
         let cols = ((rect.width() / cw).floor() as usize).clamp(2, 600);
         let rows = ((rect.height() / rh).floor() as usize).clamp(1, 300);
         self.resize(cols, rows);
@@ -2134,7 +2285,23 @@ impl Session {
         // A pending multi-line paste owns this pane's mouse/keyboard input —
         // it must resolve (Paste/Cancel) before any of it reaches the shell.
         let paste_pending = self.pending_paste.is_some();
-        if active && !paste_pending {
+        if active && disconnected {
+            // The bar takes no other input: only a bare Enter reconnects.
+            let enter = ui.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.is_none())
+                })
+            });
+            if enter {
+                self.reconnect_requested = true;
+                ui.ctx().request_repaint();
+            }
+        } else if active && !paste_pending {
             // --- Mouse: raw events before selection (press must be immediate) ---
             let suppress_local = self.handle_mouse(
                 ui,
@@ -2772,6 +2939,10 @@ impl Session {
         // cannot steal keyboard input.
         if self.search.is_open() {
             self.paint_search_bar(ui, rect, active);
+        }
+
+        if let (Some(bar), Some(remote)) = (bar, self.remote.as_deref()) {
+            paint_disconnect_bar(ui, bar, remote, active, &th);
         }
 
         // Multi-line-paste confirm, last so it draws on top of everything else
@@ -5823,7 +5994,9 @@ mod tests {
             s.pump();
             if Instant::now() >= deadline {
                 let remaining = screen(&s);
-                let _ = s.child.kill();
+                if let Some(c) = s.child.as_mut() {
+                    let _ = c.kill();
+                }
                 panic!("composer did not open:\n{remaining}");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -5837,7 +6010,9 @@ mod tests {
             }
             if Instant::now() >= deadline {
                 let remaining = screen(&s);
-                let _ = s.child.kill();
+                if let Some(c) = s.child.as_mut() {
+                    let _ = c.kill();
+                }
                 panic!("initial prompt was not submitted:\n{remaining}");
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -5853,7 +6028,9 @@ mod tests {
         let remaining = screen(&s);
         let transcript = crate::inspect::snapshot_tail(&s.term, 1000).join("\n");
         let exited = s.exited();
-        let _ = s.child.kill();
+        if let Some(c) = s.child.as_mut() {
+            let _ = c.kill();
+        }
         println!("final screen:\n{remaining}");
         assert!(exited.is_none(), "Codex exited before chat was submitted");
         assert!(
@@ -5922,7 +6099,9 @@ mod tests {
         for r in 0..s.rows as i32 {
             println!("|{}|", grid_row(&s, r, s.cols));
         }
-        let _ = s.child.kill();
+        if let Some(c) = s.child.as_mut() {
+            let _ = c.kill();
+        }
         let bytes = std::fs::read(&dump).expect("no dump written");
         println!("captured {} bytes -> {}", bytes.len(), dump.display());
         assert!(!bytes.is_empty(), "no rx captured");
@@ -6226,5 +6405,74 @@ mod tests {
             );
         }
         let _ = term.selection_to_string();
+    }
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_disconnected_remote_session_reads_only_a_bare_enter() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+            std::fs::read(p)
+        }));
+        let mut s = Session::disconnected_remote("desk", ctx.clone());
+        assert!(s.disconnected());
+        assert_eq!(s.root_pid(), None, "restored: no process behind it");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        s.writer = Box::new(SharedWriter(sent.clone()));
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut frame = |s: &mut Session, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(rect),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let resp = ui.interact(rect, egui::Id::new("pane"), egui::Sense::click_and_drag());
+                s.show(ui, rect, true, &resp);
+            });
+        };
+        frame(&mut s, vec![]);
+        frame(
+            &mut s,
+            vec![
+                egui::Event::Text("ls".into()),
+                key(egui::Key::A, egui::Modifiers::NONE),
+                key(egui::Key::Enter, egui::Modifiers::CTRL),
+                egui::Event::Paste("rm -rf".into()),
+            ],
+        );
+        assert!(!s.take_reconnect(), "only a bare Enter reconnects");
+        frame(&mut s, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert!(s.take_reconnect());
+        assert!(!s.take_reconnect(), "taken once");
+        assert!(sent.lock().unwrap().is_empty(), "nothing reached the PTY");
+        assert!(s.pending_paste.is_none());
+    }
+
+    #[test]
+    fn the_disconnect_bar_names_the_remote() {
+        assert_eq!(
+            disconnect_bar_text("desk"),
+            "Disconnected from desk — Enter to reconnect"
+        );
     }
 }
