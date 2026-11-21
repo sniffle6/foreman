@@ -1751,6 +1751,18 @@ impl WindowManager {
             CtrlMsg::Peers(_, reply, _) => {
                 let _ = reply.send(OpenReply::err("peers is answered by the app"));
             }
+            CtrlMsg::Remotes(reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(OpenReply {
+                    ok: true,
+                    history: Some(crate::control::remotes_lines(
+                        &crate::config::live(ctx).remotes,
+                    )),
+                    ..Default::default()
+                });
+            }
             CtrlMsg::Status(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return;
@@ -2196,17 +2208,32 @@ impl WindowManager {
         if req.command.is_empty() || req.command[0].is_empty() {
             return Err("empty command".into());
         }
+        // Looked up before anything else so an unknown name spawns nothing.
+        let remote = match req.on.as_deref() {
+            Some(name) => {
+                Some(crate::remote::find(&crate::config::live(ctx).remotes, name)?.clone())
+            }
+            None => None,
+        };
         let pid = self.resolve_project(req.project.as_deref())?;
         let child = self.project_child_mut(pid)?;
+        let Some(remote) = remote else {
+            return child
+                .add_terminal_cmd(
+                    &req.command,
+                    req.cwd.as_deref().map(std::path::Path::new),
+                    req.title.as_deref(),
+                    ctx,
+                )
+                .map(|tid| (pid, tid))
+                .map_err(|e| format!("spawn failed: {e}"));
+        };
+        let project_dir = child.cwd.as_deref().map(|p| p.display().to_string());
+        let dir = crate::remote::launch_dir(&remote, req.cwd.as_deref(), project_dir.as_deref())?
+            .to_string();
         child
-            .add_terminal_cmd(
-                &req.command,
-                req.cwd.as_deref().map(std::path::Path::new),
-                req.title.as_deref(),
-                ctx,
-            )
+            .add_remote_terminal(&req.command, &remote, &dir, req.title.as_deref(), ctx)
             .map(|tid| (pid, tid))
-            .map_err(|e| format!("spawn failed: {e}"))
     }
 
     /// Resolve + open a persistent `Content::Image` window for `foreman view`.
@@ -2594,6 +2621,7 @@ impl WindowManager {
                             placement: place.into(),
                             ready: s.ready(),
                             agent_state: agent_state.map(str::to_string),
+                            remote: s.remote().map(str::to_string),
                         }));
                     }
                 }
@@ -2620,7 +2648,7 @@ impl WindowManager {
                     p.cwd.as_deref().unwrap_or("-")
                 ),
                 Row::Terminal(t) => format!(
-                    "  {}  {}  {}  {}  {}",
+                    "  {}  {}  {}  {}  {}{}",
                     t.terminal,
                     match t.exit_code {
                         Some(code) => format!("exited({code})"),
@@ -2628,6 +2656,10 @@ impl WindowManager {
                     },
                     if t.chat { "chat" } else { "-" },
                     t.placement,
+                    t.remote
+                        .as_deref()
+                        .map(|r| format!("on:{r}  "))
+                        .unwrap_or_default(),
                     t.title
                 ),
             })
@@ -2969,7 +3001,46 @@ impl WindowManager {
     ) -> std::io::Result<WinId> {
         let env = self.term_env(self.next);
         let cwd = cwd.or(self.cwd.as_deref());
-        let mut s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
+        let s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
+        Ok(self.place_dispatched(s, argv, title, reception))
+    }
+
+    /// `open --on`: [`Self::add_terminal_cmd`] for a Remote Session. `argv`
+    /// is the logical command; the builder wraps it in `ssh`. No Tunnel yet,
+    /// so the agent there has no way back. Errors are already user-facing.
+    fn add_remote_terminal(
+        &mut self,
+        argv: &[String],
+        remote: &crate::remote::Remote,
+        dir: &str,
+        title: Option<&str>,
+        ctx: &egui::Context,
+    ) -> Result<WinId, String> {
+        let built = crate::remote::build(&crate::remote::Launch {
+            remote,
+            dir,
+            terminal_id: &term_tag(self.next),
+            project_id: self.tag.as_deref(),
+            tunnel: None,
+            argv,
+        })?;
+        // The local env reaches only ssh.exe; ssh sends TERM with the pty
+        // request, and the builder exports the rest on the Remote.
+        let env = self.term_env(self.next);
+        let s = Session::spawn_remote(built, &remote.name, &env, ctx.clone())
+            .map_err(|e| format!("spawn failed: {e}"))?;
+        Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
+    }
+
+    /// Banner, title, room membership and placement for a just-spawned
+    /// dispatched Session. Shared by local and Remote launches.
+    fn place_dispatched(
+        &mut self,
+        mut s: Session,
+        argv: &[String],
+        title: Option<&str>,
+        reception: crate::chat::Reception,
+    ) -> WinId {
         s.inject_note(&dispatch_banner(argv));
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
         s.set_term_id(id); // stable Member id == the FOREMAN_TERMINAL_ID just baked in
@@ -2998,7 +3069,7 @@ impl WindowManager {
         }
         self.focused = prev_focus;
         self.mark_workspace_dirty();
-        Ok(id)
+        id
     }
 
     /// The window a dispatched terminal stacks onto, if any
@@ -10871,6 +10942,7 @@ mod tests {
             cwd: None,
             title: Some("agent · test".into()),
             command: vec!["cmd.exe".into(), "/c".into(), "exit 0".into()],
+            on: None,
         };
         (crate::control::CtrlMsg::Open(req, rtx, sent), rrx)
     }
@@ -10920,6 +10992,99 @@ mod tests {
         assert!(reply.terminal.is_some_and(|t| t.starts_with('t')));
         assert!(reply.project.is_some_and(|p| p.starts_with('p')));
         assert_eq!(project_terminal_count(&wm), 1);
+    }
+
+    /// Live settings holding one Remote, `desk`, mapped from nothing. Its
+    /// target is this PC's loopback, so a spawned ssh never dials another PC.
+    fn seed_desk_remote(ctx: &egui::Context) {
+        let settings = crate::config::Settings {
+            remotes: vec![crate::remote::Remote {
+                name: "desk".into(),
+                target: "foreman-test@127.0.0.1".into(),
+                shell: crate::remote::RemoteShell::Posix,
+                dirs: Default::default(),
+            }],
+            ..Default::default()
+        };
+        crate::config::seed_live(ctx, &settings);
+    }
+
+    fn open_on(on: &str, cwd: Option<&str>, command: &[&str]) -> crate::control::OpenRequest {
+        crate::control::OpenRequest {
+            cmd: "open".into(),
+            project: None,
+            cwd: cwd.map(str::to_string),
+            title: None,
+            command: command.iter().map(|w| w.to_string()).collect(),
+            on: Some(on.into()),
+        }
+    }
+
+    #[test]
+    fn remote_open_refuses_unknown_name_and_missing_dir_without_spawning() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let e = wm
+            .open_dispatch(open_on("garage", Some("/tmp"), &["codex"]), &ctx)
+            .unwrap_err();
+        assert!(e.contains("garage") && e.contains("desk"), "{e}");
+        wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
+        let e = wm
+            .open_dispatch(open_on("desk", None, &["codex"]), &ctx)
+            .unwrap_err();
+        assert!(e.contains("--cwd") && e.contains("dirs"), "{e}");
+        assert_eq!(project_terminal_count(&wm), 0);
+    }
+
+    #[test]
+    fn remote_open_spawns_ssh_keeps_the_agent_icon_and_status_names_the_remote() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (_, remote) = wm
+            .open_dispatch(open_on("desk", Some("/tmp"), &["codex"]), &ctx)
+            .expect("ssh spawns");
+        let mut local_req = open_on("desk", None, &[]);
+        local_req.on = None;
+        local_req.command = pause_argv();
+        let (_, local) = wm.open_dispatch(local_req, &ctx).unwrap();
+        let child = wm.project_child_mut(pid).unwrap();
+        let s = child.terminal_session(remote).unwrap();
+        assert_eq!(s.remote(), Some("desk"));
+        assert_eq!(s.icon_kind(), crate::icons::IconKind::Codex);
+        assert_eq!(child.terminal_session(local).unwrap().remote(), None);
+
+        let mut req = crate::control::StatusRequest {
+            cmd: "status".into(),
+            project: None,
+            json: false,
+        };
+        let text = wm.status_dispatch(&req, false).unwrap();
+        let line = |tid: WinId| {
+            let tag = format!("  t{tid}  ");
+            text.iter().find(|l| l.starts_with(&tag)).unwrap().clone()
+        };
+        assert!(line(remote).ends_with("on:desk  agent · codex"), "{text:?}");
+        assert!(!line(local).contains("on:"), "{text:?}");
+        req.json = true;
+        let json = wm.status_dispatch(&req, false).unwrap();
+        let rows: Vec<crate::control::StatusTerminalLine> = json
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|t: &crate::control::StatusTerminalLine| !t.terminal.is_empty())
+            .collect();
+        let remote_of = |tid: WinId| {
+            rows.iter()
+                .find(|t| t.terminal == format!("t{tid}"))
+                .unwrap()
+                .remote
+                .clone()
+        };
+        assert_eq!(remote_of(remote).as_deref(), Some("desk"));
+        assert_eq!(remote_of(local), None);
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct OpenRequest {
     #[serde(default)]
     pub title: Option<String>,
     pub command: Vec<String>,
+    /// `--on NAME`: run on that Remote over SSH. `cwd` is then a directory
+    /// on the Remote. Skipped when unset (wire compat v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
@@ -193,6 +197,9 @@ pub struct StatusTerminalLine {
     /// absent while state is off in Settings or no hook has fired yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<String>,
+    /// The Remote's name for a Remote Session; absent for a local one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 /// Close terminal panes in one project. Self-close is resolved CLIENT-side:
@@ -356,14 +363,14 @@ pub struct KanbanRequest {
     pub assignment: Option<crate::assignments::Command>,
 }
 
-/// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] -- <command...>`.
+/// Parse `foreman open` args: `[--project P] [--title T] [--cwd D] [--on R] -- <command...>`.
 /// `default_project` is the dispatcher's own project (from FOREMAN_PROJECT_ID).
 pub fn parse_open_args(
     args: &[String],
     default_project: Option<String>,
 ) -> Result<OpenRequest, String> {
     let mut project = default_project;
-    let (mut title, mut cwd) = (None, None);
+    let (mut title, mut cwd, mut on) = (None, None, None);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -378,9 +385,10 @@ pub fn parse_open_args(
                     cwd,
                     title,
                     command,
+                    on,
                 });
             }
-            flag @ ("--project" | "--title" | "--cwd") => {
+            flag @ ("--project" | "--title" | "--cwd" | "--on") => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| format!("{flag} needs a value"))?
@@ -388,6 +396,7 @@ pub fn parse_open_args(
                 match flag {
                     "--project" => project = Some(v),
                     "--title" => title = Some(v),
+                    "--on" => on = Some(v),
                     _ => cwd = Some(v),
                 }
                 i += 2;
@@ -423,6 +432,8 @@ pub enum CtrlMsg {
     /// Settings are App-owned, so `App::service_background` answers this one
     /// before the window manager sees it.
     Peers(PeersRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    /// `remotes` carries nothing past its verb.
+    Remotes(mpsc::Sender<OpenReply>, std::time::Instant),
 }
 
 /// Create the pipe listener, retrying briefly: after an update-restart the
@@ -575,6 +586,9 @@ fn dispatch_line(
                 .map_err(|e| format!("bad request: {e}")),
             "peers" => serde_json::from_str::<PeersRequest>(line)
                 .map(|r| CtrlMsg::Peers(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "remotes" => serde_json::from_str::<RemotesRequest>(line)
+                .map(|_| CtrlMsg::Remotes(rtx, now))
                 .map_err(|e| format!("bad request: {e}")),
             other => Err(format!("unknown cmd: {other}")),
         },
@@ -803,6 +817,24 @@ pub fn parse_peers_args(args: &[String]) -> Result<PeersRequest, String> {
         action,
         peer,
     })
+}
+
+/// `foreman remotes`: list the Remotes `open --on` can name. Local pipe
+/// only; never in [`REMOTE_VERBS`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RemotesRequest {
+    pub cmd: String, // always "remotes"
+}
+
+/// One line per Remote: name and target, or a hint when there are none.
+pub fn remotes_lines(remotes: &[crate::remote::Remote]) -> Vec<String> {
+    if remotes.is_empty() {
+        return vec!["no remotes (add them under remotes in settings.json)".into()];
+    }
+    remotes
+        .iter()
+        .map(|r| format!("{}  {}", r.name, r.target))
+        .collect()
 }
 
 /// Apply a [`PeersRequest`] to the settings. `Ok(true)` = changed, so the
@@ -2196,6 +2228,7 @@ USAGE
                                             PC over Tailscale (see chat --help)
   foreman peers [add|rm <peer>]             list / allow / remove the PCs that may do that
                                             to this one (see peers --help)
+  foreman remotes                           list the Remotes open --on can run a Session on
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help, focus --help, view --help,
@@ -2213,7 +2246,7 @@ ENVIRONMENT (injected into every foreman-spawned terminal)
   FOREMAN_PIPE         this instance's control pipe (outside a Session: well-known name)";
 
 const HELP_OPEN: &str = "\
-foreman open [--project P] [--title T] [--cwd D] -- <command...>
+foreman open [--project P] [--title T] [--cwd D] [--on R] -- <command...>
 
 Spawn <command...> in a new visible terminal of project P (default: your
 FOREMAN_PROJECT_ID, else the focused project). Everything after -- is passed
@@ -2223,6 +2256,17 @@ Ids are assigned by foreman — record \"terminal\", it is how the worker is
 addressed in chat. The reply is NOT the command's output or result.
 A target that is a .cmd/.bat shim (npm installs) cannot receive newlines
 or \" in arguments — foreman refuses such dispatches loudly.
+--on R runs <command...> on Remote R (see foreman remotes) over ssh: the
+pane is here, the process is there. It starts in the Project's mapped
+directory on R; --cwd D names a directory on R instead (not saved). With
+no mapping and no --cwd, open is refused rather than guessing.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_REMOTES: &str = "foreman remotes
+
+List the Remotes (other PCs reached over ssh) that open --on can name, one
+per line: name, then the ssh target. They live under remotes in
+settings.json. Not the same as peers (Tailscale, for --host).
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_CHAT: &str = "\
@@ -2277,7 +2321,8 @@ List every project and its terminals, line per line:
     t3  running  chat  focused  agent · parser
     t5  exited(0)  -  background  cmd
 Project fields: id, placement, name, cwd. Terminal fields: id, state
-(running | exited(code)), chat membership (chat | -), placement, title.
+(running | exited(code)), chat membership (chat | -), placement, title. A
+Remote Session adds on:R (its Remote) before the title.
 Placement is where the tab sits: focused (holds the keyboard — at most one
 project and one terminal), front (the tab its window shows), background
 (behind another tab in its window), minimized (its window is minimized).
@@ -2290,8 +2335,9 @@ project (unknown pN is an error).
 --json prints one JSON object per line instead (nothing when there are no
 projects). Project lines: project, name, cwd, placement. Terminal lines:
 project, terminal, title, agent (claude|codex|grok), state (running|exited),
-exit_code, chat (bool), placement, ready (bool: takes input yet), and
-agent_state (working|needs_you|idle, from the agent's hooks). A missing
+exit_code, chat (bool), placement, ready (bool: takes input yet),
+agent_state (working|needs_you|idle, from the agent's hooks), and remote
+(the Remote's name, Remote Sessions only). A missing
 field means unknown, not a default: no agent_state is not idle.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
@@ -2522,12 +2568,15 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("view") => view_main(&args[1..]),
         Some("kanban") => kanban_main(&args[1..]),
         Some("peers") => peers_main(&args[1..]),
+        Some("remotes") => remotes_main(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             0
         }
         _ => {
-            eprintln!("usage: foreman open [--project P] [--title T] [--cwd D] -- <command...>");
+            eprintln!(
+                "usage: foreman open [--project P] [--title T] [--cwd D] [--on R] -- <command...>"
+            );
             eprintln!(
                 "       foreman chat [--project P] [--to T]... [--re N] [--now] [--] <message...>"
             );
@@ -2617,6 +2666,24 @@ fn peers_main(args: &[String]) -> i32 {
         }
     };
     report("foreman peers", request(&client_pipe(), &req))
+}
+
+fn remotes_main(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => {
+            println!("{HELP_REMOTES}");
+            return 0;
+        }
+        Some(other) => {
+            eprintln!("foreman remotes: unexpected argument: {other}");
+            return 2;
+        }
+        None => {}
+    }
+    let req = RemotesRequest {
+        cmd: "remotes".into(),
+    };
+    report("foreman remotes", request(&client_pipe(), &req))
 }
 
 fn close_main(args: &[String]) -> i32 {
@@ -3007,6 +3074,45 @@ mod tests {
         assert_eq!(req.cmd, "open");
         assert_eq!(req.project, None);
         assert_eq!(req.command, vec!["claude", "-p", "fix tests"]);
+        assert_eq!(req.on, None);
+    }
+
+    #[test]
+    fn open_request_on_is_wire_compatible_with_v1() {
+        // Without --on the request is byte-identical to v1…
+        let req = parse_open_args(&s(&["--cwd", "C:\\x", "--", "claude"]), None).unwrap();
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"open","project":null,"cwd":"C:\\x","title":null,"command":["claude"]}"#
+        );
+        // …and with it the key rides along and round-trips.
+        let req = parse_open_args(&s(&["--on", "desk", "--", "codex"]), None).unwrap();
+        assert_eq!(req.on.as_deref(), Some("desk"));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.ends_with(r#""command":["codex"],"on":"desk"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<OpenRequest>(&json).unwrap(), req);
+        assert!(parse_open_args(&s(&["--on"]), None).is_err());
+    }
+
+    #[test]
+    fn remotes_lines_list_name_and_target() {
+        use crate::remote::{Remote, RemoteShell};
+        let r = |name: &str, target: &str| Remote {
+            name: name.into(),
+            target: target.into(),
+            shell: RemoteShell::Posix,
+            dirs: Default::default(),
+        };
+        assert_eq!(
+            remotes_lines(&[r("desk", "andy@desk"), r("box", "box-alias")]),
+            vec!["desk  andy@desk", "box  box-alias"]
+        );
+        assert!(remotes_lines(&[])[0].starts_with("no remotes"));
+        assert_eq!(client_main(&s(&["remotes", "--help"])), 0);
+        assert_eq!(client_main(&s(&["remotes", "extra"])), 2);
     }
 
     #[test]
@@ -3940,9 +4046,10 @@ mod tests {
             placement: "front".into(),
             ready: true,
             agent_state: None,
+            remote: None,
         };
         let json = serde_json::to_string(&line).unwrap();
-        for absent in ["agent", "exit_code", "agent_state"] {
+        for absent in ["agent", "exit_code", "agent_state", "remote"] {
             assert!(!json.contains(&format!("\"{absent}\"")), "{json}");
         }
         assert_eq!(
@@ -4053,6 +4160,7 @@ mod tests {
             cwd: None,
             title: None,
             command: vec!["x".into()],
+            on: None,
         };
         let t0 = std::time::Instant::now();
         let r = request(
@@ -4078,6 +4186,7 @@ mod tests {
             cwd: None,
             title: None,
             command: vec!["x".into()],
+            on: None,
         };
         let mut reply = None;
         for _ in 0..100 {
@@ -4126,6 +4235,7 @@ mod tests {
             cwd: None,
             title: None,
             command: vec!["cmd.exe".into(), "/c".into(), "echo hi".into()],
+            on: None,
         };
         // Retry while the listener binds (no sleep-and-hope).
         let mut reply = None;

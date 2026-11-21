@@ -99,6 +99,61 @@ where
         .collect())
 }
 
+/// The Remote `--on <name>` names. Case-insensitive, like `sanitize`'s
+/// uniqueness rule.
+pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String> {
+    if let Some(r) = remotes.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        return Ok(r);
+    }
+    if remotes.is_empty() {
+        return Err(format!(
+            "no Remote named {name:?}: none are set up (remotes in settings.json)"
+        ));
+    }
+    let known: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
+    Err(format!(
+        "no Remote named {name:?} (known: {})",
+        known.join(", ")
+    ))
+}
+
+/// Windows path equality for `Remote::dirs` keys: case, slash direction and
+/// a trailing separator do not make a different Project directory.
+fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim_end_matches(['\\', '/']).replace('/', "\\");
+    norm(a).eq_ignore_ascii_case(&norm(b))
+}
+
+/// The directory on `remote` a launch from a Project at `project_dir` runs
+/// in. An explicit `cwd` wins and is not saved; otherwise the Project's
+/// mapping (blank = the Remote's home). Neither is an error naming both fixes,
+/// because guessing would start an agent in the wrong place.
+pub fn launch_dir<'a>(
+    remote: &'a Remote,
+    cwd: Option<&'a str>,
+    project_dir: Option<&str>,
+) -> Result<&'a str, String> {
+    if let Some(dir) = cwd {
+        return Ok(dir);
+    }
+    let name = &remote.name;
+    let Some(project_dir) = project_dir else {
+        return Err(format!(
+            "this Project has no directory to map to one on {name}; pass --cwd <directory on {name}>"
+        ));
+    };
+    remote
+        .dirs
+        .iter()
+        .find(|(seat, _)| same_dir(seat, project_dir))
+        .map(|(_, there)| there.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{name} has no directory for this Project ({project_dir}); pass --cwd <directory on {name}>, or map {project_dir} in {name}'s dirs in settings.json (edit it with foreman closed)"
+            )
+        })
+}
+
 /// The per-Session reverse forward back to the seat PC's listener.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(test), allow(dead_code))] // the listener lands in a later card
@@ -112,7 +167,6 @@ pub struct Tunnel<'a> {
 }
 
 /// Everything one Remote Session launch needs.
-#[cfg_attr(not(test), allow(dead_code))] // spawning lands in a later card
 pub struct Launch<'a> {
     pub remote: &'a Remote,
     /// Directory on the Remote. Blank = the Remote's home.
@@ -128,7 +182,6 @@ pub struct Launch<'a> {
 }
 
 #[derive(Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Built {
     /// The local process: `ssh … -- <target> <remote line>`.
     pub ssh: Vec<String>,
@@ -139,7 +192,6 @@ pub struct Built {
 
 /// Build the local `ssh` argv for a launch. Refuses (never truncates) a
 /// Windows launch whose remote line would not fit cmd.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn build(l: &Launch) -> Result<Built, String> {
     // Same rule as a local spawn, applied before the argv is buried in base64.
     let run = crate::agent_command::codex_in_process(l.argv).unwrap_or_else(|| l.argv.to_vec());
@@ -688,5 +740,51 @@ mod tests {
             names,
             vec![("desk", "andy@desk"), ("laptop", "laptop-alias")]
         );
+    }
+
+    #[test]
+    fn remote_find_is_case_insensitive_and_names_the_known_ones() {
+        let list = vec![remote(RemoteShell::Posix), {
+            let mut r = remote(RemoteShell::Pwsh);
+            r.name = "laptop".into();
+            r
+        }];
+        assert_eq!(find(&list, "DESK").unwrap().name, "desk");
+        let e = find(&list, "garage").unwrap_err();
+        assert!(
+            e.contains("\"garage\"") && e.contains("desk, laptop"),
+            "{e}"
+        );
+        let e = find(&[], "desk").unwrap_err();
+        assert!(e.contains("none are set up"), "{e}");
+    }
+
+    #[test]
+    fn remote_launch_dir_prefers_cwd_then_mapping_and_names_both_fixes() {
+        let mut r = remote(RemoteShell::Posix);
+        r.dirs.insert(
+            r"H:\claude code\foreman".into(),
+            "/home/andy/foreman".into(),
+        );
+        r.dirs.insert(r"H:\scratch".into(), String::new());
+        // --cwd wins over a mapping.
+        assert_eq!(
+            launch_dir(&r, Some("/tmp"), Some(r"H:\claude code\foreman")),
+            Ok("/tmp")
+        );
+        // Case, slash direction and a trailing separator still match.
+        assert_eq!(
+            launch_dir(&r, None, Some("h:/Claude Code/foreman/")),
+            Ok("/home/andy/foreman")
+        );
+        // A blank mapping is a saved answer: the Remote's home.
+        assert_eq!(launch_dir(&r, None, Some(r"H:\scratch")), Ok(""));
+        let e = launch_dir(&r, None, Some(r"H:\other")).unwrap_err();
+        assert!(
+            e.contains("--cwd") && e.contains("dirs") && e.contains(r"H:\other"),
+            "{e}"
+        );
+        let e = launch_dir(&r, None, None).unwrap_err();
+        assert!(e.contains("--cwd"), "{e}");
     }
 }

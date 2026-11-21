@@ -663,6 +663,9 @@ pub struct Session {
     /// `spawn_argv`); `None` for a plain interactive shell. Drives the tab's
     /// agent logo (claude/codex) — see `icon_kind`.
     dispatch_argv: Option<Vec<String>>,
+    /// The Remote this Session runs on (its process is `ssh`); `None` = local.
+    /// A copy of the name, so deleting the Remote leaves live Sessions alone.
+    remote: Option<String>,
     /// Hook-driven agent state for the Sessions panel badge. Pure; fed by
     /// `WindowManager::apply_hook_event`, never by the PTY.
     agent_state: crate::agent_state::AgentStateSlot,
@@ -949,6 +952,41 @@ impl Session {
         Ok(session)
     }
 
+    /// A Remote Session: run the builder's local `ssh` argv directly (never
+    /// through `cmd /c`, which would re-parse the remote line) and keep the
+    /// logical argv for the tab icon, since the wrapped line hides the agent.
+    pub fn spawn_remote(
+        built: crate::remote::Built,
+        remote: &str,
+        env: &[(String, String)],
+        ctx: egui::Context,
+    ) -> std::io::Result<Session> {
+        let Some((program, args)) = built.ssh.split_first() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ssh argv is empty",
+            ));
+        };
+        let mut c = CommandBuilder::new(program);
+        for a in args {
+            c.arg(a);
+        }
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let mut session = Self::spawn_with(c, Shell::Cmd, ctx).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("could not start {program}: {e}"))
+        })?;
+        session.dispatch_argv = Some(built.dispatched);
+        session.remote = Some(remote.to_string());
+        Ok(session)
+    }
+
+    /// The Remote this Session runs on; `None` for a local Session.
+    pub fn remote(&self) -> Option<&str> {
+        self.remote.as_deref()
+    }
+
     /// The latest OSC window title the running program set, if any.
     pub fn osc_title(&self) -> Option<String> {
         self.osc_title.lock().ok().and_then(|t| t.clone())
@@ -1105,6 +1143,7 @@ impl Session {
             exit_noted: false,
             shell,
             dispatch_argv: None,
+            remote: None,
             agent_state: Default::default(),
             root_pid,
             term_id: 0,
