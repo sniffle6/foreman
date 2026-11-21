@@ -135,6 +135,8 @@ pub struct ProjectEntry {
     pub uid: u64,
     /// Singleton project tools currently present in the nested manager.
     pub open_tools: HashSet<crate::launcher::Tool>,
+    /// The launcher's where-strip selection (a Remote name; `None` = Local).
+    pub launch_on: Option<String>,
 }
 
 /// Display variant for the update chip; one per Phase-4 `update::State` case
@@ -1928,16 +1930,15 @@ impl PanelView {
                 anchor,
                 ctx.content_rect(),
                 || {
-                    let open_tools = self
+                    let project = self
                         .model
                         .projects
                         .iter()
-                        .find(|project| project.path == rp.path)
-                        .map(|project| &project.open_tools);
-                    crate::launcher::entries(
-                        &crate::keymap::live(&ctx),
-                        crate::config::live(&ctx).default_shell.to_shell(),
-                        open_tools.unwrap_or(&HashSet::new()),
+                        .find(|project| project.path == rp.path);
+                    crate::launcher::menu(
+                        &ctx,
+                        project.map_or(&HashSet::new(), |p| &p.open_tools),
+                        project.and_then(|p| p.launch_on.as_deref()),
                     )
                 },
                 false,

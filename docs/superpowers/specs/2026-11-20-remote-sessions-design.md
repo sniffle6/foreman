@@ -275,7 +275,10 @@ is now):
 ```
 
 The selection is per Project, lasts for the app run, and starts at Local.
-Past the width that fits, the strip becomes a dropdown instead of wrapping.
+Past the width that fits, the strip scrolls sideways (Shift+wheel or drag)
+and long names are cut with "…" (full name in the tooltip). Built that way
+instead of a dropdown: a dropdown inside a hover menu is a second popup
+that closes the first.
 
 **Reachability.** `ssh -G <target>` resolves the real host and port once per
 target; a TCP connect with a short timeout answers reachable or offline.
@@ -289,7 +292,10 @@ One white-silhouette SVG in `assets/icons/`, tinted like the rest.
 
 **Splits inherit.** Splitting or adding a terminal while a Remote Session is
 focused opens on that Remote. Anything else opens Local. A Remote is never
-chosen by a default.
+chosen by a default. The launcher's own "+" (titlebar and Sessions panel)
+follows the where-strip instead, not the focused Session: the strip is on
+screen under the pointer when it is clicked, so that is what the user sees
+choosing.
 
 **Settings → Remotes.** A custom-body pane like Keybindings: one row per
 Remote (name, target, shell, reachability, Test, delete), inline add and

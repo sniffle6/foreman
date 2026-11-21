@@ -107,7 +107,7 @@ pub fn find<'a>(remotes: &'a [Remote], name: &str) -> Result<&'a Remote, String>
     }
     if remotes.is_empty() {
         return Err(format!(
-            "no Remote named {name:?}: none are set up (remotes in settings.json)"
+            "no Remote named {name:?}: none are set up (add one in Settings > Remotes)"
         ));
     }
     let known: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
@@ -201,10 +201,18 @@ pub fn reconnect_argv(original: &[String]) -> Vec<String> {
     relaunch(original).argv
 }
 
-/// Windows path equality for `Remote::dirs` keys: case, slash direction and
-/// a trailing separator do not make a different Project directory.
-fn same_dir(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim_end_matches(['\\', '/']).replace('/', "\\");
+/// Windows path equality for `Remote::dirs` keys: case, slash direction, a
+/// trailing separator and a `\\?\` verbatim prefix (what `canonicalize`
+/// returns) do not make a different Project directory.
+pub fn same_dir(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.replace('/', "\\");
+        let s = match s.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s),
+        };
+        s.trim_end_matches('\\').to_string()
+    };
     norm(a).eq_ignore_ascii_case(&norm(b))
 }
 
@@ -233,7 +241,7 @@ pub fn launch_dir<'a>(
         .map(|(_, there)| there.as_str())
         .ok_or_else(|| {
             format!(
-                "{name} has no directory for this Project ({project_dir}); pass --cwd <directory on {name}>, or map {project_dir} in {name}'s dirs in settings.json (edit it with foreman closed)"
+                "{name} has no directory for this Project ({project_dir}); pass --cwd <directory on {name}>, or open a Session on {name} from this Project's launcher once and answer its directory prompt"
             )
         })
 }
@@ -965,10 +973,30 @@ mod tests {
         assert_eq!(launch_dir(&r, None, Some(r"H:\scratch")), Ok(""));
         let e = launch_dir(&r, None, Some(r"H:\other")).unwrap_err();
         assert!(
-            e.contains("--cwd") && e.contains("dirs") && e.contains(r"H:\other"),
+            e.contains("--cwd") && e.contains("directory prompt") && e.contains(r"H:\other"),
             "{e}"
         );
         let e = launch_dir(&r, None, None).unwrap_err();
         assert!(e.contains("--cwd"), "{e}");
+    }
+
+    #[test]
+    fn remote_launch_dir_matches_through_a_verbatim_prefix() {
+        let mut r = remote(RemoteShell::Posix);
+        r.dirs
+            .insert(r"H:\claude code\foreman".into(), "/srv/foreman".into());
+        r.dirs
+            .insert(r"\\?\UNC\nas\share\proj".into(), "/srv/proj".into());
+        // A canonicalized Project directory still finds its mapping...
+        assert_eq!(
+            launch_dir(&r, None, Some(r"\\?\H:\claude code\foreman\")),
+            Ok("/srv/foreman")
+        );
+        // ...in both directions, and through the UNC form.
+        assert_eq!(
+            launch_dir(&r, None, Some(r"\\nas\share\proj")),
+            Ok("/srv/proj")
+        );
+        assert!(launch_dir(&r, None, Some(r"\\?\H:\claude code")).is_err());
     }
 }

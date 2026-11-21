@@ -844,6 +844,13 @@ pub struct WindowManager {
     /// When `Some`, the directory picker modal is open (desktop only). Opening it
     /// defers project creation until the user accepts a directory.
     picker: Option<DirPicker>,
+    /// The one-time Remote directory prompt (desktop only); it holds the
+    /// launch that asked until it is answered. Modal like `picker`.
+    dir_prompt: Option<crate::remote_dir_prompt::DirPrompt>,
+    /// The launcher's where-strip for this Project: the Remote name it
+    /// points at, `None` for this PC. Runtime only, so every app run starts
+    /// at Local; a name that is no longer a Remote reads as Local.
+    launch_on: Option<String>,
     /// When `Some`, that window's title is being edited inline (double-click the
     /// name). `rename_buf` holds the in-progress text; `rename_focus` requests
     /// keyboard focus on the first frame of editing.
@@ -959,6 +966,8 @@ impl WindowManager {
             teardowns_in_flight: std::collections::HashSet::new(),
             integration: IntegrationDriver::new(),
             picker: None,
+            dir_prompt: None,
+            launch_on: None,
             renaming: None,
             rename_buf: String::new(),
             rename_focus: false,
@@ -3122,6 +3131,142 @@ impl WindowManager {
         Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
     }
 
+    /// The Remote the focused Session runs on: what a split or new terminal
+    /// inherits. Anything else (a local Session, a tool Win, nothing
+    /// focused) is `None`, so a Remote is never chosen by a default.
+    fn focused_remote(&self) -> Option<String> {
+        let w = self.windows.iter().find(|w| Some(w.id) == self.focused)?;
+        match &w.tabs[w.active].content {
+            Content::Terminal(s) => s.remote().map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// The Remote the where-strip names, when it still is one.
+    fn chosen_remote(&self, ctx: &egui::Context) -> Option<crate::remote::Remote> {
+        let name = self.launch_on.as_deref()?;
+        crate::remote::find(&crate::config::live(ctx).remotes, name)
+            .ok()
+            .cloned()
+    }
+
+    /// Open `what` on Remote `name` from this Project, placed by `place`.
+    /// With no mapping for this Project's directory, returns the [`Ask`] for
+    /// the desktop's directory prompt instead; every other failure is a toast.
+    ///
+    /// [`Ask`]: crate::remote_dir_prompt::Ask
+    fn start_remote(
+        &mut self,
+        name: &str,
+        what: crate::remote_dir_prompt::What,
+        place: crate::remote_dir_prompt::Place,
+        ctx: &egui::Context,
+    ) -> Option<crate::remote_dir_prompt::Ask> {
+        let fail = |e: String| {
+            crate::notify::queue(ctx, crate::notify::Level::Error, e);
+            None
+        };
+        let remote = match crate::remote::find(&crate::config::live(ctx).remotes, name) {
+            Ok(r) => r.clone(),
+            Err(_) => return fail(format!("{name} is no longer a Remote")),
+        };
+        let project_dir = self.cwd.as_deref().map(|p| p.display().to_string());
+        match crate::remote::launch_dir(&remote, None, project_dir.as_deref()) {
+            Ok(dir) => match self.open_remote_win(&remote, dir, what, place, ctx) {
+                Ok(_) => None,
+                Err(e) => fail(e),
+            },
+            Err(e) => match (project_dir, self.tag.clone()) {
+                (Some(project_dir), Some(project)) => {
+                    // A split from a Session on this Remote offers where that
+                    // Session started.
+                    let prefill = self
+                        .windows
+                        .iter()
+                        .find(|w| Some(w.id) == self.focused)
+                        .and_then(|w| match &w.tabs[w.active].content {
+                            Content::Terminal(s)
+                                if s.remote().is_some_and(|r| r.eq_ignore_ascii_case(name)) =>
+                            {
+                                s.remote_dir().filter(|d| !d.is_empty()).map(str::to_string)
+                            }
+                            _ => None,
+                        });
+                    Some(crate::remote_dir_prompt::Ask {
+                        remote: remote.name.clone(),
+                        shell: remote.shell,
+                        project_dir,
+                        project,
+                        what,
+                        place,
+                        prefill,
+                    })
+                }
+                _ => fail(e),
+            },
+        }
+    }
+
+    /// A user-opened Remote Session (launcher, split, new terminal), placed
+    /// like the local one it stands in for and focused. Unlike a dispatch
+    /// there is no banner, no chat join and no stacking.
+    fn open_remote_win(
+        &mut self,
+        remote: &crate::remote::Remote,
+        dir: &str,
+        what: crate::remote_dir_prompt::What,
+        place: crate::remote_dir_prompt::Place,
+        ctx: &egui::Context,
+    ) -> Result<WinId, String> {
+        use crate::remote_dir_prompt::{Place, What};
+        let argv: Vec<String> = match what {
+            What::Agent(kind) => kind
+                .launch_command()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            What::Shell => Vec::new(),
+        };
+        let id = self.next;
+        // A bare agent or shell carries no brief: the reply note waits for
+        // the first chat post, as for `open --on` without arguments.
+        let mut s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
+        self.next += 1;
+        s.set_term_id(id);
+        let src = self.focused;
+        self.z += 1;
+        let rect = self.cascade_rect(egui::vec2(580.0, 380.0));
+        let title = format!("{}  ·  #{}", remote.name, id);
+        self.push_win(id, Tab::shell_default(title, Content::Terminal(s)), rect);
+        match place {
+            Place::Default => {
+                self.tile_new(id, src);
+                if crate::config::live(ctx).new_windows_float {
+                    self.toggle_float_for(id);
+                }
+            }
+            Place::Split(d) => self.place_split(src, id, d),
+        }
+        self.mark_workspace_dirty();
+        Ok(id)
+    }
+
+    /// Leader N: a new terminal on the focused Session's Remote, else the
+    /// local default shell. `Some` asks the desktop for a directory first.
+    fn new_terminal(&mut self, ctx: &egui::Context) -> Option<crate::remote_dir_prompt::Ask> {
+        if let Some(name) = self.focused_remote() {
+            return self.start_remote(
+                &name,
+                crate::remote_dir_prompt::What::Shell,
+                crate::remote_dir_prompt::Place::Default,
+                ctx,
+            );
+        }
+        // `add_terminal` handles default placement (and `new_windows_float`).
+        self.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx);
+        None
+    }
+
     /// One connection to `remote` for Member `t{id}`: a fresh Tunnel lease
     /// (so a reconnect renews the token), the `ssh` launch, and the reply
     /// note armed for this connection. Launch and reconnect both come here.
@@ -4881,6 +5026,7 @@ impl WindowManager {
                 }
                 let open_tools = inner.open_tools();
                 projects.push(ProjectEntry {
+                    launch_on: inner.launch_on.clone(),
                     path: ppath,
                     title: pt.title.clone(),
                     minimized: w.minimized,
@@ -5211,7 +5357,7 @@ impl WindowManager {
     }
 
     /// Drain panel-row interactions recorded during the draw into deferred Acts.
-    fn drain_panel_acts(&mut self, acts: &mut Vec<Act>, ctx: &egui::Context) {
+    fn drain_panel_acts(&mut self, acts: &mut Vec<Act>) {
         let mut click = None;
         let mut hover = None;
         let mut launch = None;
@@ -5263,12 +5409,9 @@ impl WindowManager {
             acts.push(match b {
                 crate::panel::PanelBtn::Min => Act::MinPath(p),
                 crate::panel::PanelBtn::Close => Act::ClosePath(p),
-                crate::panel::PanelBtn::AddTerm => Act::LaunchPath(
-                    p,
-                    crate::launcher::Launch::Shell(
-                        crate::config::live(ctx).default_shell.to_shell(),
-                    ),
-                ),
+                crate::panel::PanelBtn::AddTerm => {
+                    Act::LaunchPath(p, crate::launcher::Launch::Default)
+                }
             });
         }
         if let Some((p, a)) = launch {
@@ -5357,7 +5500,40 @@ impl WindowManager {
         let Content::Project(inner) = &mut self.windows[pidx].tabs[pi].content else {
             return;
         };
+        use crate::remote_dir_prompt::{Place, What};
+        let mut ask = None;
         match launch {
+            // A strip click only moves the selection: no spawn, no surfacing.
+            Launch::Where(i) => {
+                inner.launch_on = i.and_then(|i| {
+                    crate::config::live(ctx)
+                        .remotes
+                        .get(i)
+                        .map(|r| r.name.clone())
+                });
+                return;
+            }
+            Launch::Default => match inner.chosen_remote(ctx) {
+                Some(r) => ask = inner.start_remote(&r.name, What::Shell, Place::Default, ctx),
+                None => {
+                    inner.add_terminal(crate::config::live(ctx).default_shell.to_shell(), ctx);
+                }
+            },
+            Launch::RemoteAgent(_) | Launch::RemoteShell => {
+                let what = match launch {
+                    Launch::RemoteAgent(agent) => What::Agent(agent),
+                    _ => What::Shell,
+                };
+                match inner.chosen_remote(ctx) {
+                    Some(r) => ask = inner.start_remote(&r.name, what, Place::Default, ctx),
+                    // Deleted in Settings while the menu was open.
+                    None => crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Error,
+                        "That Remote is no longer set up".to_string(),
+                    ),
+                }
+            }
             Launch::Shell(shell) => {
                 inner.add_terminal(shell, ctx);
             }
@@ -5391,6 +5567,60 @@ impl WindowManager {
             window: None,
             tab: Some(pi),
         });
+        self.ask_dir(ask);
+    }
+
+    /// Open the directory prompt for a launch that needs one (desktop only;
+    /// nested managers hand their `Ask` up).
+    fn ask_dir(&mut self, ask: Option<crate::remote_dir_prompt::Ask>) {
+        if let Some(ask) = ask {
+            self.dir_prompt = Some(crate::remote_dir_prompt::DirPrompt::new(ask));
+        }
+    }
+
+    /// The prompt's answer: save it as the Project's mapping on that Remote,
+    /// then run the launch that asked. The mapping goes through the settings
+    /// seed, like a Settings edit, so main.rs writes settings.json.
+    fn answer_dir(&mut self, ask: crate::remote_dir_prompt::Ask, dir: String, ctx: &egui::Context) {
+        let mut settings = (*crate::config::live(ctx)).clone();
+        let Some(remote) = settings
+            .remotes
+            .iter_mut()
+            .find(|r| r.name.eq_ignore_ascii_case(&ask.remote))
+        else {
+            crate::notify::queue(
+                ctx,
+                crate::notify::Level::Error,
+                format!("{} is no longer a Remote", ask.remote),
+            );
+            return;
+        };
+        // One key per Project directory, however it was spelled before.
+        remote
+            .dirs
+            .retain(|seat, _| !crate::remote::same_dir(seat, &ask.project_dir));
+        remote.dirs.insert(ask.project_dir.clone(), dir.clone());
+        let remote = remote.clone();
+        crate::config::seed_live(ctx, &settings);
+        let Some(child) = self.child_tagged_mut(&ask.project) else {
+            return; // The Project closed while the prompt was up.
+        };
+        if let Err(e) = child.open_remote_win(&remote, &dir, ask.what, ask.place, ctx) {
+            crate::notify::queue(ctx, crate::notify::Level::Error, e);
+        }
+    }
+
+    /// The nested Project manager whose tag is `tag` (`p7`).
+    fn child_tagged_mut(&mut self, tag: &str) -> Option<&mut WindowManager> {
+        self.windows
+            .iter_mut()
+            .flat_map(|w| w.tabs.iter_mut())
+            .find_map(|t| match &mut t.content {
+                Content::Project(child) if child.tag.as_deref() == Some(tag) => {
+                    Some(child.as_mut())
+                }
+                _ => None,
+            })
     }
 
     /// Index of the project tab on `self.windows[pidx]` that owns child window
@@ -6154,12 +6384,13 @@ impl WindowManager {
 
             // ---- terminal (inner) level: act on the focused project's child ----
             other => {
+                let mut ask = None;
                 if let Some(child) = self.focused_child() {
                     match other {
                         Command::TermFocus(d) => child.focus_dir(d),
                         Command::TermSnap(d) => child.move_dir(d),
                         Command::TermFloat => child.toggle_float(),
-                        Command::Split(d) => child.split_dir(d, &ctx),
+                        Command::Split(d) => ask = child.split_dir(d, &ctx),
                         Command::ZoomTerm => {
                             if let Some(id) = child.focused {
                                 child.toggle_zoom(id);
@@ -6171,14 +6402,7 @@ impl WindowManager {
                             }
                         }
                         Command::Rename => child.begin_rename(),
-                        Command::NewTerm => {
-                            // `add_terminal` handles default placement (and
-                            // `new_windows_float`) itself.
-                            child.add_terminal(
-                                crate::config::live(&ctx).default_shell.to_shell(),
-                                &ctx,
-                            );
-                        }
+                        Command::NewTerm => ask = child.new_terminal(&ctx),
                         Command::LastTerm => child.toggle_last(),
                         Command::TabCycle => child.cycle_tab(true),
                         Command::TabPrev => child.cycle_tab(false),
@@ -6191,6 +6415,7 @@ impl WindowManager {
                         _ => {}
                     }
                 }
+                self.ask_dir(ask);
             }
         }
         // Keyboard commands bypass `apply_acts`; over-mark is fine (extra saves).
@@ -6581,6 +6806,7 @@ impl WindowManager {
         self.app_modal
             || self.pending_close.is_some()
             || self.picker.is_some()
+            || self.dir_prompt.is_some()
             || self.renaming.is_some()
             || self.any_layout_capture()
     }
@@ -7055,17 +7281,28 @@ impl WindowManager {
         self.focus(id);
     }
 
-    /// Split: create a new terminal next to the focused window in the tree.
-    fn split_dir(&mut self, d: Dir, ctx: &egui::Context) {
+    /// Split: create a new terminal next to the focused window in the tree,
+    /// on the focused Session's Remote when it has one. `Some` asks the
+    /// desktop for that Remote's directory first.
+    fn split_dir(&mut self, d: Dir, ctx: &egui::Context) -> Option<crate::remote_dir_prompt::Ask> {
+        if let Some(name) = self.focused_remote() {
+            return self.start_remote(
+                &name,
+                crate::remote_dir_prompt::What::Shell,
+                crate::remote_dir_prompt::Place::Split(d),
+                ctx,
+            );
+        }
         let src = self.focused;
         // Raw spawn, not `add_terminal`: an explicit directional split always
         // tiles in that direction — it's not subject to `new_windows_float`.
         let Some(new_id) =
             self.spawn_terminal_win(crate::config::live(ctx).default_shell.to_shell(), ctx)
         else {
-            return;
+            return None;
         };
         self.place_split(src, new_id, d);
+        None
     }
 
     /// The pure placement half of [`split_dir`] (no PTY/spawn), testable without
@@ -7694,7 +7931,8 @@ impl WindowManager {
         // this stops the focused terminal from consuming keystrokes meant for
         // the overlay, and (below) stops a hover under the overlay from
         // stealing focus either.
-        let no_modal = live && self.picker.is_none() && self.renaming.is_none();
+        let no_modal =
+            live && self.picker.is_none() && self.dir_prompt.is_none() && self.renaming.is_none();
         // An open tab-overflow list owns Escape and the pointer: no terminal
         // here reads keys, but window chrome keeps its focus look (unlike
         // the overlays above, which dim it).
@@ -8605,12 +8843,7 @@ impl WindowManager {
                             tab: None,
                         };
                         if presp.clicked() {
-                            acts.push(Act::LaunchPath(
-                                path,
-                                crate::launcher::Launch::Shell(
-                                    crate::config::live(ui.ctx()).default_shell.to_shell(),
-                                ),
-                            ));
+                            acts.push(Act::LaunchPath(path, crate::launcher::Launch::Default));
                         }
                         let menu_ctx = ui.ctx().clone();
                         if let Some(launch) = crate::hover_menu::show(
@@ -8618,16 +8851,13 @@ impl WindowManager {
                             base.with((id, "plusmenu")),
                             pr,
                             area,
-                            || {
-                                let open_tools = match self.windows[i].active_content() {
-                                    Content::Project(inner) => inner.open_tools(),
-                                    _ => Default::default(),
-                                };
-                                crate::launcher::entries(
-                                    &crate::keymap::live(&menu_ctx),
-                                    crate::config::live(&menu_ctx).default_shell.to_shell(),
-                                    &open_tools,
-                                )
+                            || match self.windows[i].active_content() {
+                                Content::Project(inner) => crate::launcher::menu(
+                                    &menu_ctx,
+                                    &inner.open_tools(),
+                                    inner.launch_on.as_deref(),
+                                ),
+                                _ => crate::launcher::menu(&menu_ctx, &Default::default(), None),
                             },
                             false,
                             presp.clicked(),
@@ -8943,7 +9173,7 @@ impl WindowManager {
         let ctx = ui.ctx().clone();
         // Panel drains join the same act list before apply (focus/min/close paths).
         if self.desktop {
-            self.drain_panel_acts(&mut acts, &ctx);
+            self.drain_panel_acts(&mut acts);
         }
         // Any Act means a window in this manager was interacted with this frame.
         // Captured before the apply loop consumes `acts`, returned at the end so
@@ -9049,6 +9279,7 @@ impl WindowManager {
     /// Follow the same active-tab chain as rendering, stopping at local overlays.
     fn terminal_owns_keyboard(&self) -> bool {
         if self.picker.is_some()
+            || self.dir_prompt.is_some()
             || self.renaming.is_some()
             || self.pending_close.is_some()
             || self.layout_ui.captures_keyboard()
@@ -9095,6 +9326,7 @@ impl WindowManager {
         if self.desktop
             && active
             && self.picker.is_none()
+            && self.dir_prompt.is_none()
             && self.renaming.is_none()
             && !self.settings_capturing()
             // A layout menu or dialog owns the keys (the Delete dialog has
@@ -9167,7 +9399,7 @@ impl WindowManager {
         // hide the dialog (minimize → app-wide keyboard freeze with no visible
         // modal), or stack a second overlay on top. These fields still hold the
         // pre-open state the frame a modal OPENS, so that opening act applies.
-        if self.app_modal || self.picker.is_some() {
+        if self.app_modal || self.picker.is_some() || self.dir_prompt.is_some() {
             return;
         }
         if acts.is_empty() {
@@ -9243,6 +9475,17 @@ impl WindowManager {
                         ctx,
                     );
                     self.tile_new(nid, anchor);
+                }
+            }
+        }
+
+        if let Some(mut prompt) = self.dir_prompt.take() {
+            match prompt.show(ui) {
+                crate::remote_dir_prompt::Outcome::Pending => self.dir_prompt = Some(prompt),
+                // Nothing saved, nothing opened, no toast.
+                crate::remote_dir_prompt::Outcome::Cancelled => {}
+                crate::remote_dir_prompt::Outcome::Accepted(dir) => {
+                    self.answer_dir(prompt.ask, dir, ctx)
                 }
             }
         }
@@ -10451,7 +10694,7 @@ mod tests {
                 view.folder_toggle = Some(uid);
             }
         }
-        wm.drain_panel_acts(&mut Vec::new(), &egui::Context::default());
+        wm.drain_panel_acts(&mut Vec::new());
         assert!(wm.poll_workspace_dirty());
         let json = serde_json::to_string(&wm.capture_workspace()).unwrap();
         let snap = crate::workspace::parse_workspace_json(&json);
@@ -10470,7 +10713,7 @@ mod tests {
             }
         }
         restored.poll_workspace_dirty();
-        restored.drain_panel_acts(&mut Vec::new(), &egui::Context::default());
+        restored.drain_panel_acts(&mut Vec::new());
         assert!(restored.poll_workspace_dirty());
         let expanded = serde_json::to_string(&restored.capture_workspace()).unwrap();
         assert!(!expanded.contains("panel_collapsed"));
@@ -11412,6 +11655,212 @@ mod tests {
         }
     }
 
+    /// `seed_desk_remote` with `H:\src\app` mapped to `/srv/app` on desk.
+    fn seed_mapped_desk(ctx: &egui::Context) {
+        seed_desk_remote(ctx);
+        let mut s = (*crate::config::live(ctx)).clone();
+        s.remotes[0]
+            .dirs
+            .insert(r"H:\src\app".into(), "/srv/app".into());
+        crate::config::seed_live(ctx, &s);
+    }
+
+    /// A Project at `H:\src\app` holding one focused Remote Session on desk,
+    /// launched with `--cwd /tmp`. Returns (project id, its terminal id).
+    fn project_focused_on_desk(wm: &mut WindowManager, ctx: &egui::Context) -> (WinId, WinId) {
+        let pid = push(wm, "proj");
+        wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
+        let (_, tid) = wm
+            .open_dispatch(open_on("desk", Some("/tmp"), &["codex"]), ctx)
+            .expect("ssh spawns");
+        wm.project_child_mut(pid).unwrap().focused = Some(tid);
+        (pid, tid)
+    }
+
+    /// (Remote name, Remote directory) of the focused Session in `pid`.
+    fn focused_where(wm: &mut WindowManager, pid: WinId) -> (Option<String>, Option<String>) {
+        let child = wm.project_child_mut(pid).unwrap();
+        let w = child
+            .windows
+            .iter()
+            .find(|w| Some(w.id) == child.focused)
+            .expect("a focused window");
+        let Content::Terminal(s) = &w.tabs[w.active].content else {
+            panic!("focused window is not a terminal")
+        };
+        (
+            s.remote().map(str::to_string),
+            s.remote_dir().map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn a_split_inherits_the_focused_remote_and_uses_the_mapping() {
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx);
+        let mut wm = WindowManager::new();
+        let (pid, tid) = project_focused_on_desk(&mut wm, &ctx);
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.split_dir(Dir::Right, &ctx), None, "mapped: no prompt");
+        assert_ne!(child.focused, Some(tid), "the split takes focus");
+        assert_eq!(child.windows.len(), 2);
+        // The mapping, not the source Session's --cwd.
+        assert_eq!(
+            focused_where(&mut wm, pid),
+            (Some("desk".into()), Some("/srv/app".into()))
+        );
+        // A new terminal from it stays on desk too.
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.new_terminal(&ctx), None);
+        assert_eq!(focused_where(&mut wm, pid).0.as_deref(), Some("desk"));
+    }
+
+    #[test]
+    fn a_split_from_a_local_session_stays_local() {
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx);
+        let mut wm = WindowManager::new();
+        let (pid, _) = project_focused_on_desk(&mut wm, &ctx);
+        let child = wm.project_child_mut(pid).unwrap();
+        child.add_terminal(Shell::Cmd, &ctx).expect("cmd spawns");
+        assert_eq!(child.split_dir(Dir::Down, &ctx), None);
+        assert_eq!(focused_where(&mut wm, pid), (None, None));
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.new_terminal(&ctx), None);
+        assert_eq!(focused_where(&mut wm, pid), (None, None));
+    }
+
+    #[test]
+    fn an_unmapped_split_asks_once_and_the_answer_is_saved_and_opened() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let mut wm = WindowManager::new();
+        let (pid, tid) = project_focused_on_desk(&mut wm, &ctx);
+        let ask = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .split_dir(Dir::Right, &ctx)
+            .expect("no mapping: ask");
+        assert_eq!(
+            project_terminal_count(&wm),
+            1,
+            "nothing opens before the answer"
+        );
+        assert_eq!(ask.remote, "desk");
+        assert_eq!(ask.project_dir, r"H:\src\app");
+        assert_eq!(
+            ask.prefill.as_deref(),
+            Some("/tmp"),
+            "the source's directory"
+        );
+        assert_eq!(
+            ask.place,
+            crate::remote_dir_prompt::Place::Split(Dir::Right)
+        );
+        wm.ask_dir(Some(ask.clone()));
+        assert!(wm.dir_prompt.is_some());
+        assert!(!wm.terminal_owns_keyboard(), "the prompt owns the keyboard");
+        let ask = wm.dir_prompt.take().unwrap().ask;
+        wm.answer_dir(ask, "/srv/app".into(), &ctx);
+        assert_eq!(
+            crate::config::live(&ctx).remotes[0].dirs[r"H:\src\app"],
+            "/srv/app"
+        );
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.windows.len(), 2);
+        assert_ne!(child.focused, Some(tid));
+        assert_eq!(
+            focused_where(&mut wm, pid),
+            (Some("desk".into()), Some("/srv/app".into()))
+        );
+        // Asked once: the next split goes straight there.
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.split_dir(Dir::Down, &ctx), None);
+    }
+
+    fn launch(wm: &mut WindowManager, pid: WinId, l: crate::launcher::Launch, ctx: &egui::Context) {
+        let path = crate::panel::TargetPath {
+            project: pid,
+            ptab: None,
+            window: None,
+            tab: None,
+        };
+        wm.apply_acts(
+            vec![Act::LaunchPath(path, l)],
+            egui::vec2(0.0, 0.0),
+            egui::Id::new("t"),
+            ctx,
+        );
+    }
+
+    #[test]
+    fn the_where_strip_picks_the_remote_for_launcher_rows_and_the_plus() {
+        use crate::launcher::Launch;
+        let ctx = egui::Context::default();
+        seed_mapped_desk(&ctx);
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
+        // Starts at Local, and the "+" opens the local default shell.
+        assert_eq!(wm.project_child_mut(pid).unwrap().launch_on, None);
+        launch(&mut wm, pid, Launch::Default, &ctx);
+        assert_eq!(focused_where(&mut wm, pid), (None, None));
+        // A strip click selects and opens nothing.
+        launch(&mut wm, pid, Launch::Where(Some(0)), &ctx);
+        let child = wm.project_child_mut(pid).unwrap();
+        assert_eq!(child.launch_on.as_deref(), Some("desk"));
+        assert_eq!(child.windows.len(), 1);
+        launch(&mut wm, pid, Launch::RemoteShell, &ctx);
+        assert_eq!(
+            focused_where(&mut wm, pid),
+            (Some("desk".into()), Some("/srv/app".into()))
+        );
+        launch(&mut wm, pid, Launch::Default, &ctx);
+        assert_eq!(focused_where(&mut wm, pid).0.as_deref(), Some("desk"));
+        // Back to Local; a deleted Remote reads as Local too.
+        launch(&mut wm, pid, Launch::Where(None), &ctx);
+        assert_eq!(wm.project_child_mut(pid).unwrap().launch_on, None);
+        wm.project_child_mut(pid).unwrap().launch_on = Some("garage".into());
+        launch(&mut wm, pid, Launch::Default, &ctx);
+        assert_eq!(focused_where(&mut wm, pid), (None, None));
+        assert_eq!(wm.project_child_mut(pid).unwrap().windows.len(), 4);
+    }
+
+    #[test]
+    fn an_unmapped_launcher_agent_waits_for_the_directory_and_esc_drops_it() {
+        use crate::launcher::Launch;
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        wm.project_child_mut(pid).unwrap().cwd = Some(PathBuf::from(r"H:\src\app"));
+        launch(&mut wm, pid, Launch::Where(Some(0)), &ctx);
+        launch(
+            &mut wm,
+            pid,
+            Launch::RemoteAgent(crate::landing::SessionKind::Claude),
+            &ctx,
+        );
+        let prompt = wm.dir_prompt.as_ref().expect("asks for the directory");
+        assert_eq!(
+            prompt.ask.what,
+            crate::remote_dir_prompt::What::Agent(crate::landing::SessionKind::Claude)
+        );
+        assert_eq!(prompt.text, "", "no Session to offer a directory from");
+        // While it is up, background acts are dropped.
+        launch(&mut wm, pid, Launch::Default, &ctx);
+        assert_eq!(project_terminal_count(&wm), 0);
+        // Esc: nothing saved, nothing opened.
+        let prompt = wm.dir_prompt.as_mut().unwrap();
+        assert_eq!(
+            prompt.key(crate::remote_dir_prompt::Key::Esc),
+            crate::remote_dir_prompt::Outcome::Cancelled
+        );
+        wm.dir_prompt = None;
+        assert!(crate::config::live(&ctx).remotes[0].dirs.is_empty());
+        assert_eq!(project_terminal_count(&wm), 0);
+    }
+
     #[test]
     fn remote_open_refuses_unknown_name_and_missing_dir_without_spawning() {
         let mut wm = WindowManager::new();
@@ -11426,7 +11875,7 @@ mod tests {
         let e = wm
             .open_dispatch(open_on("desk", None, &["codex"]), &ctx)
             .unwrap_err();
-        assert!(e.contains("--cwd") && e.contains("dirs"), "{e}");
+        assert!(e.contains("--cwd") && e.contains("directory prompt"), "{e}");
         assert_eq!(project_terminal_count(&wm), 0);
     }
 

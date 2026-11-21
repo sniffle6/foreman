@@ -977,11 +977,11 @@ const ROW_PAD: f32 = 6.0;
 /// The line reserved under each row, and for the hosts strip.
 const LINE_H: f32 = 18.0;
 /// The form's label column.
-const LABEL_W: f32 = 52.0;
-const FORM_GAP: f32 = 8.0;
+pub(crate) const LABEL_W: f32 = 52.0;
+pub(crate) const FORM_GAP: f32 = 8.0;
 
 /// The offline tooltip, and the selected row's reason line.
-const OFFLINE_WHY: &str = "No TCP answer on its SSH port. This check cannot see past a \
+pub(crate) const OFFLINE_WHY: &str = "No TCP answer on its SSH port. This check cannot see past a \
      ProxyJump, so Test it or open a Remote Session to be sure.";
 
 /// `text` on one line, cut with "…" to `width`.
@@ -998,7 +998,7 @@ fn one_line(
 }
 
 /// A form row: a dim label in a fixed column, then the field.
-fn form_row<R>(
+pub(crate) fn form_row<R>(
     ui: &mut egui::Ui,
     label: &str,
     color: egui::Color32,
