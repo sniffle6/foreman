@@ -132,20 +132,46 @@ impl IconKind {
         }
     }
 
+    /// The provider name an agent icon stands for, as `board::AGENTS` spells
+    /// it. `None` for shells and chrome icons.
+    pub fn provider(self) -> Option<&'static str> {
+        match self {
+            IconKind::Claude => Some("claude"),
+            IconKind::Codex => Some("codex"),
+            IconKind::Grok => Some("grok"),
+            IconKind::PowerShell | IconKind::Cmd | IconKind::Bash | IconKind::Folder => None,
+        }
+    }
+
     /// Map a dispatched program's argv to an agent icon, if recognized. Scans
     /// every token (so `npx @anthropic-ai/claude-code` and a bare `claude` both
-    /// hit) for a `claude`/`codex`/`grok` substring.
+    /// hit) for a `claude`/`codex`/`grok` substring. Reconnect and the
+    /// workspace snapshot run and save whatever this returns, so the provider
+    /// is the one that launches, not the one a prompt mentions: a program
+    /// whose file stem IS a provider wins (`C:\claude code\bin\codex.exe` is
+    /// Codex), then the earliest mention in argv order (`wsl codex "compare
+    /// with claude"` is Codex).
     pub fn from_argv(argv: &[String]) -> Option<Self> {
-        let hay = argv.join(" ").to_ascii_lowercase();
-        if hay.contains("claude") {
-            Some(IconKind::Claude)
-        } else if hay.contains("codex") {
-            Some(IconKind::Codex)
-        } else if hay.contains("grok") {
-            Some(IconKind::Grok)
-        } else {
-            None
+        const AGENTS: [(&str, IconKind); 3] = [
+            ("claude", IconKind::Claude),
+            ("codex", IconKind::Codex),
+            ("grok", IconKind::Grok),
+        ];
+        let stem = argv.first().and_then(|p| {
+            std::path::Path::new(p)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_ascii_lowercase)
+        });
+        if let Some(&(_, k)) = AGENTS.iter().find(|(n, _)| stem.as_deref() == Some(*n)) {
+            return Some(k);
         }
+        let hay = argv.join(" ").to_ascii_lowercase();
+        AGENTS
+            .iter()
+            .filter_map(|&(n, k)| hay.find(n).map(|at| (at, k)))
+            .min_by_key(|&(at, _)| at)
+            .map(|(_, k)| k)
     }
 
     /// Map a program's OSC window title to an agent icon. Used for a hand-launched
@@ -324,6 +350,32 @@ mod tests {
         );
         assert_eq!(IconKind::from_argv(&["grok".into()]), Some(IconKind::Grok));
         assert_eq!(IconKind::from_argv(&["powershell.exe".into()]), None);
+        // The launched agent, not the one a prompt or a folder names.
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            IconKind::from_argv(&argv(&["codex", "exec", "compare with claude"])),
+            Some(IconKind::Codex)
+        );
+        assert_eq!(
+            IconKind::from_argv(&argv(&[r"C:\claude code\bin\codex.exe"])),
+            Some(IconKind::Codex)
+        );
+        assert_eq!(
+            IconKind::from_argv(&argv(&["wsl", "grok", "ask claude"])),
+            Some(IconKind::Grok)
+        );
+    }
+
+    #[test]
+    fn agent_providers_are_the_board_s_agents() {
+        let providers: Vec<_> = [IconKind::Claude, IconKind::Codex, IconKind::Grok]
+            .into_iter()
+            .map(|k| k.provider().unwrap())
+            .collect();
+        assert_eq!(providers, crate::board::AGENTS);
+        for k in [IconKind::PowerShell, IconKind::Cmd, IconKind::Bash] {
+            assert_eq!(k.provider(), None);
+        }
     }
 
     #[test]

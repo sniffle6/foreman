@@ -301,11 +301,16 @@ Deleting a Remote does not touch live Sessions; each carries its own copy
 of the name.
 
 **Disconnect.** When a Remote Session's `ssh` exits, the Win stays, shows a
-one-line "Disconnected from desk — Enter to reconnect" bar, and takes no
-other input. Enter relaunches the same Remote and directory. An agent
-Session relaunches with that provider's resume argv from one small table; a
-provider with no entry starts fresh. The original Dispatch prompt is never
-sent again.
+one-line "Disconnected from desk — Enter to reconnect" bar, and writes
+nothing to the PTY. Selection, copy, scrollback and search stay live, so
+the ssh error can be copied. A fresh Enter (not key repeat) or a click on
+the bar relaunches the same Remote and directory; the tab title and the
+Sessions-panel row read "disconnected" until then. An agent Session
+relaunches with that provider's resume argv from one small table; a
+provider with no entry, or an agent launched through a wrapper (`npx`,
+`wsl`, a script), starts the bare provider fresh. "Is an agent" is the tab
+icon's test, so the icon and reconnect never disagree. The original
+Dispatch prompt is never sent again.
 
 **Inert on a Remote Session:** file-path links (URLs still open), file
 drops and image paste (refused with a toast). The close confirm names the
@@ -315,7 +320,8 @@ Remote instead of listing a process tree it cannot see.
 
 - `OpenRequest` gains `on: Option<String>`, absent on the wire when `None`,
   with a compat test beside the existing ones. `--cwd` with `--on` is a
-  directory on the Remote and is not saved. No mapping and no `--cwd` is an
+  directory on the Remote and is not saved as the Project's mapping (the
+  Session's own snapshot keeps it). No mapping and no `--cwd` is an
   error that says which one to supply.
 - `foreman remotes` lists name, target and last known reachability in
   `OpenReply::history`. Local callers only.
@@ -326,9 +332,12 @@ Remote instead of listing a process tree it cannot see.
 
 ## Persistence
 
-`ContentSnap::Terminal` gains an optional Remote name, absent when local.
-Restore creates the Win **in the disconnected state** and connects on
-Enter. Restoring must not open a batch of SSH connections at launch, some
+`ContentSnap::Terminal` gains an optional Remote name, and for a Remote
+Session the agent's provider name (never its prompt or other arguments)
+and the Remote directory, so a restored agent resumes and an explicit
+`--cwd` survives a restart. All three are absent when local, so a local
+Terminal saves byte-identically. Restore creates the Win **in the
+disconnected state** and connects on Enter. Restoring must not open a batch of SSH connections at launch, some
 to PCs that are off and some asking for a password. A name that no longer
 exists restores as a local Shell with a toast.
 

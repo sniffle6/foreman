@@ -207,6 +207,11 @@ pub struct StatusTerminalLine {
     /// The Remote's name for a Remote Session; absent for a local one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// A Remote Session whose connection is down: `state` reads "exited"
+    /// (its ssh did), but the pane is waiting to reconnect, not finished.
+    /// Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disconnected: bool,
 }
 
 /// Close terminal panes in one project. Self-close is resolved CLIENT-side:
@@ -2344,8 +2349,10 @@ project (unknown pN is an error).
 projects). Project lines: project, name, cwd, placement. Terminal lines:
 project, terminal, title, agent (claude|codex|grok), state (running|exited),
 exit_code, chat (bool), placement, ready (bool: takes input yet),
-agent_state (working|needs_you|idle, from the agent's hooks), and remote
-(the Remote's name, Remote Sessions only). A missing
+agent_state (working|needs_you|idle, from the agent's hooks), remote
+(the Remote's name, Remote Sessions only), and disconnected (true while a
+Remote Session's connection is down and waits for Enter to reconnect; its
+state still reads exited). A missing
 field means unknown, not a default: no agent_state is not idle.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
@@ -4057,15 +4064,42 @@ mod tests {
             ready: true,
             agent_state: None,
             remote: None,
+            disconnected: false,
         };
         let json = serde_json::to_string(&line).unwrap();
-        for absent in ["agent", "exit_code", "agent_state", "remote"] {
+        for absent in [
+            "agent",
+            "exit_code",
+            "agent_state",
+            "remote",
+            "disconnected",
+        ] {
             assert!(!json.contains(&format!("\"{absent}\"")), "{json}");
         }
         assert_eq!(
             serde_json::from_str::<StatusTerminalLine>(&json).unwrap(),
             line
         );
+    }
+
+    #[test]
+    fn status_terminal_line_disconnected_is_wire_compatible() {
+        // A line from a build before the field parses, as connected.
+        let old = r#"{"project":"p1","terminal":"t3","title":"w","state":"exited","exit_code":255,"chat":true,"placement":"front","ready":true,"remote":"desk"}"#;
+        let line: StatusTerminalLine = serde_json::from_str(old).unwrap();
+        assert!(!line.disconnected);
+        // A disconnected Session keeps every existing field as it was and
+        // only adds the flag.
+        let down = StatusTerminalLine {
+            disconnected: true,
+            ..line.clone()
+        };
+        let json = serde_json::to_string(&down).unwrap();
+        assert_eq!(
+            json,
+            old.trim_end_matches('}').to_string() + r#","disconnected":true}"#
+        );
+        assert_eq!(serde_json::to_string(&line).unwrap(), old);
     }
 
     #[test]

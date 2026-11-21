@@ -75,6 +75,7 @@ What that costs foreman:
 | §10 | egui steals Ctrl+wheel & Ctrl+0/± | terminal zoom dead, `smooth_scroll_delta` reads 0 with Ctrl held | disable `zoom_modifier` + `zoom_with_keyboard` at startup |
 | §11 | No `raw_scroll_delta` in 0.34; wheel arrives smoothed/fractional | gentle scroll does nothing, fast flick over-scrolls | accumulator: `input::wheel_steps` + per-Session `scroll_accum`/`zoom_accum` |
 | §13 | 0.34 API drift | `rect_stroke` arity errors; `screen_rect` deprecation warnings | pass `StrokeKind`; deprecation baseline is catalogued in foreman-build-and-env |
+| — | egui rewrites `Event::Key { repeat }` from its own keys-down set | a test's second `pressed: true` Enter arrives as `repeat: true`; a hand-set `repeat: true` on a fresh press arrives `false` | in tests, tap = press + release in one frame; to fake a held key, press it in a frame that does not show the widget, then press again (`PaneDriver::idle` in `src/terminal.rs` tests) |
 
 ## 4. Text layout: go through the painter
 

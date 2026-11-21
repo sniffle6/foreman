@@ -641,31 +641,76 @@ fn mono_paint_items_for_test(
 }
 
 /// The disconnect bar's line. One line at any width: the Win elides it.
-pub fn disconnect_bar_text(remote: &str) -> String {
-    format!("Disconnected from {remote} — Enter to reconnect")
+/// `ran` = a connection existed and dropped (a restored Session that never
+/// connected reads "Not connected"); `code` is ssh's exit code, shown when it
+/// is neither 0 (a clean logout) nor 255 (ssh's own "connection failed",
+/// whose message is already on the grid above).
+pub fn disconnect_bar_text(
+    remote: &str,
+    ran: bool,
+    code: u32,
+    next: &crate::remote::Relaunch,
+) -> String {
+    let lead = match (ran, code) {
+        (false, _) => format!("Not connected to {remote}"),
+        (true, 0 | 255) => format!("Disconnected from {remote}"),
+        (true, c) => format!("Disconnected from {remote} (ssh exit {c})"),
+    };
+    let verb = match (next.agent, next.resumes, ran) {
+        (Some(a), true, _) => format!("resume {a}"),
+        (Some(a), false, _) => format!("start {a} fresh"),
+        (None, _, true) => "reconnect".to_string(),
+        (None, _, false) => "connect".to_string(),
+    };
+    format!("{lead} — Enter to {verb}")
+}
+
+/// A bare Enter press this frame that is not key repeat: the disconnect
+/// bar's reconnect key.
+fn bare_enter_pressed(events: &[egui::Event]) -> bool {
+    events.iter().any(|e| {
+        matches!(e, egui::Event::Key {
+            key: egui::Key::Enter,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } if modifiers.is_none())
+    })
+}
+
+/// The disconnect bar's height: one line of UI text, fixed like the search
+/// bar's, so it does not grow and shrink with terminal zoom.
+fn disconnect_bar_height(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + 8.0
 }
 
 /// One line across the bottom of a dead Remote Session; dimmed when the Win
-/// is not focused, since Enter only reaches the focused one.
+/// is not focused, since Enter only reaches the focused one. `hovered` lights
+/// it as the click target it is.
 fn paint_disconnect_bar(
     ui: &egui::Ui,
     bar: egui::Rect,
-    remote: &str,
+    text: String,
     active: bool,
+    hovered: bool,
     th: &crate::theme::Theme,
 ) {
     let painter = ui.painter_at(bar);
-    painter.rect_filled(bar, egui::CornerRadius::ZERO, th.search_bar_bg);
+    // Borrowed search-bar tokens: no theme token exists for in-pane chrome
+    // bars, and the search bar is the one other bar a pane paints.
+    let fill = if hovered { th.sel_bg } else { th.search_bar_bg };
+    painter.rect_filled(bar, egui::CornerRadius::ZERO, fill);
     painter.hline(
         bar.x_range(),
         bar.min.y,
         egui::Stroke::new(1.0, th.search_bar_border),
     );
     let mut job = egui::text::LayoutJob::single_section(
-        disconnect_bar_text(remote),
+        text,
         egui::TextFormat {
-            font_id: egui::FontId::proportional((bar.height() * 0.7).clamp(9.0, 14.0)),
-            color: if active { th.text } else { th.dim },
+            font_id: egui::TextStyle::Body.resolve(ui.style()),
+            color: if active || hovered { th.text } else { th.dim },
             ..Default::default()
         },
     );
@@ -1043,8 +1088,16 @@ impl Session {
 
     /// A restored Remote Session: the Win and its disconnect bar, with no
     /// process and no connection until Enter. Restore must not open a batch
-    /// of SSH connections at launch, some to PCs that are off.
-    pub fn disconnected_remote(remote: &str, ctx: egui::Context) -> Session {
+    /// of SSH connections at launch, some to PCs that are off. `agent` is
+    /// the saved provider name (never a prompt), so Enter resumes it through
+    /// the one resume table and the tab keeps its icon; `dir` is the saved
+    /// Remote directory (`None` = the Project's mapping decides at Enter).
+    pub fn disconnected_remote(
+        remote: &str,
+        agent: Option<&str>,
+        dir: Option<&str>,
+        ctx: egui::Context,
+    ) -> Session {
         // A closed channel: pump() reads nothing from it.
         let (_, rx) = channel::<Vec<u8>>();
         let mut session = Self::assemble(
@@ -1059,15 +1112,38 @@ impl Session {
         session.exit = Some(0);
         // No exit to announce: it never ran.
         session.exit_noted = true;
-        session.dispatch_argv = Some(Vec::new());
+        session.dispatch_argv = Some(agent.map(|a| vec![a.to_string()]).unwrap_or_default());
         session.remote = Some(remote.to_string());
+        session.remote_dir = dir.map(str::to_string);
         session
     }
 
     /// True while a Remote Session's `ssh` is gone: the disconnect bar shows
-    /// and only Enter (reconnect) is read.
+    /// and nothing reaches the PTY; Enter (or a click on the bar) reconnects.
     pub fn disconnected(&self) -> bool {
         self.remote.is_some() && self.exit.is_some()
+    }
+
+    /// The disconnect bar's line for this Session's state.
+    pub fn disconnect_text(&self) -> String {
+        disconnect_bar_text(
+            self.remote.as_deref().unwrap_or_default(),
+            self.child.is_some(),
+            self.exit.unwrap_or(0),
+            &crate::remote::relaunch(self.dispatched()),
+        )
+    }
+
+    /// Chat input queued here and not yet written, handed over on reconnect
+    /// so it reaches the fresh connection instead of dying with this one.
+    pub fn take_pending_injects(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ready_gate.pending_inject)
+    }
+
+    /// Queue `texts` ahead of anything already waiting (they were older).
+    pub fn queue_injects_front(&mut self, mut texts: Vec<String>) {
+        texts.append(&mut self.ready_gate.pending_inject);
+        self.ready_gate.pending_inject = texts;
     }
 
     /// The Remote directory this connection used; `None` = use the mapping.
@@ -1453,6 +1529,14 @@ impl Session {
     /// is its own paste+submit turn: a second post inside the window queues in
     /// the gate and goes out after the first one's submit.
     pub fn inject_input(&mut self, text: &str) {
+        if self.disconnected() {
+            // Held, not dropped: a reconnect hands the queue to the fresh
+            // connection (`take_pending_injects`).
+            if !text.is_empty() {
+                self.ready_gate.pending_inject.push(text.to_string());
+            }
+            return;
+        }
         let now = std::time::Instant::now();
         if let Some(crate::ready::Action::Write(bytes)) = self.ready_gate.try_inject(text, now) {
             self.send_external_input(&bytes);
@@ -1584,6 +1668,10 @@ impl Session {
         self.flush_graphics_replies(&mut greplies);
         self.flush_pty_replies();
         // Ready gate: flush queued injects + deferred submit (pure; we write).
+        // Not while disconnected: the queue waits for the reconnect.
+        if self.disconnected() {
+            return;
+        }
         for action in self.ready_gate.poll(now) {
             match action {
                 crate::ready::Action::Write(bytes) => self.send_external_input(&bytes),
@@ -1710,6 +1798,11 @@ impl Session {
     }
 
     fn send(&mut self, bytes: &[u8]) {
+        // The one choke point for input to the PTY (keys, paste, mouse
+        // reports, wheel, injects): a disconnected Session writes nothing.
+        if self.disconnected() {
+            return;
+        }
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
     }
@@ -1845,6 +1938,15 @@ impl Session {
             .is_some();
         let mut outcome =
             ui.input(|i| crate::input::process_input(&i.events, i.modifiers, mode, has_selection));
+        if self.disconnected() {
+            // Nothing is behind the PTY: keep the local side (copy, search,
+            // scrollback keys, zoom) and drop everything bound for the child,
+            // so a paste cannot sit in a confirm dialog for a dead connection.
+            outcome.pty_bytes.clear();
+            outcome.paste_clipboard = false;
+            outcome.paste_text = None;
+            outcome.interrupt = false;
+        }
         if let Some(s) = outcome.scroll {
             self.term.scroll_display(s);
         }
@@ -2132,6 +2234,50 @@ impl Session {
         suppress_local
     }
 
+    /// Ctrl+Click opens the link under the pointer — the one piece of
+    /// [`Self::handle_mouse`] a disconnected Session keeps, since the hover
+    /// still paints the hand cursor and tooltip. Returns true while the link
+    /// press owns the button (through its release frame), like there.
+    fn ctrl_click_link(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        metrics: &crate::geom::CellMetrics,
+        search_bar: Option<egui::Rect>,
+    ) -> bool {
+        let presses: Vec<egui::Pos2> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        pos,
+                        modifiers,
+                    } if modifiers.ctrl || modifiers.command => Some(*pos),
+                    _ => None,
+                })
+                .collect()
+        });
+        for pos in presses {
+            if resp.rect.contains(pos)
+                && search_bar.is_none_or(|b| !b.contains(pos))
+                && Self::content_is_topmost_at(ui, resp, pos)
+                && let Some(link) = self.link_under(metrics, pos)
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(link.uri));
+                self.link_press = true;
+            }
+        }
+        if !self.link_press {
+            return false;
+        }
+        if !ui.input(|i| i.pointer.primary_down()) {
+            self.link_press = false;
+        }
+        true
+    }
+
     /// Navigation / Esc / Ctrl+F while search is open. Text editing is owned by
     /// the focused TextEdit in `paint_search_bar` (so WM leader stays dormant).
     /// Does **not** tick the search model — one shared tick runs in `show`.
@@ -2254,15 +2400,38 @@ impl Session {
             .layout_no_wrap("M".to_string(), font.clone(), th.fg);
         let cw = probe.rect.width().max(1.0);
         let rh = probe.rect.height().max(1.0);
-        // A dead Remote Session gives its bottom line to the disconnect bar, so
-        // the grid shrinks instead of the bar covering ssh's last words.
+        // A dead Remote Session gives its bottom strip to the disconnect bar,
+        // so the grid shrinks instead of the bar covering ssh's last words. A
+        // Win too short for both shows only the bar.
         let disconnected = self.disconnected();
-        let (rect, bar) = if disconnected && rect.height() > rh * 2.0 {
-            let (grid, bar) = rect.split_top_bottom_at_y(rect.max.y - rh);
+        let bar_h = disconnect_bar_height(ui);
+        let (rect, bar) = if disconnected && rect.height() >= bar_h + rh {
+            let (grid, bar) = rect.split_top_bottom_at_y(rect.max.y - bar_h);
             (grid, Some(bar))
         } else {
             (rect, disconnected.then_some(rect))
         };
+        if disconnected {
+            // A held multi-line paste has nowhere to go now.
+            self.pending_paste = None;
+        }
+        // The bar is a button too: a click reconnects, focused or not.
+        let bar_resp = bar.map(|b| {
+            ui.interact(
+                b,
+                resp.id.with(("foreman_disconnect_bar", self.term_id)),
+                egui::Sense::click(),
+            )
+        });
+        if let Some(r) = &bar_resp {
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                self.reconnect_requested = true;
+                ui.ctx().request_repaint();
+            }
+        }
         let cols = ((rect.width() / cw).floor() as usize).clamp(2, 600);
         let rows = ((rect.height() / rh).floor() as usize).clamp(1, 300);
         self.resize(cols, rows);
@@ -2301,32 +2470,31 @@ impl Session {
         // A pending multi-line paste owns this pane's mouse/keyboard input —
         // it must resolve (Paste/Cancel) before any of it reaches the shell.
         let paste_pending = self.pending_paste.is_some();
-        if active && disconnected {
-            // The bar takes no other input: only a bare Enter reconnects.
-            let enter = ui.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(e, egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.is_none())
-                })
-            });
-            if enter {
+        if active && !paste_pending {
+            // Disconnected: a bare, fresh Enter reconnects (a held one at the
+            // moment ssh died must not reconnect and then submit an empty
+            // password). While search is open, its keys come first: Esc
+            // closes it, and only then does Enter mean reconnect.
+            if disconnected && !search_was_open && ui.input(|i| bare_enter_pressed(&i.events)) {
                 self.reconnect_requested = true;
                 ui.ctx().request_repaint();
             }
-        } else if active && !paste_pending {
             // --- Mouse: raw events before selection (press must be immediate) ---
-            let suppress_local = self.handle_mouse(
-                ui,
-                resp,
-                &metrics,
-                search_was_open,
-                search_bar,
-                block_new_presses,
-            );
+            // Disconnected: no app owns the mouse any more, so every gesture
+            // is local (selection, copy-on-select, the thumb).
+            let suppress_local = if disconnected {
+                self.cancel_all_mouse_captures();
+                self.ctrl_click_link(ui, resp, &metrics, search_bar)
+            } else {
+                self.handle_mouse(
+                    ui,
+                    resp,
+                    &metrics,
+                    search_was_open,
+                    search_bar,
+                    block_new_presses,
+                )
+            };
 
             // Local selection allowed when not app-owned, including while search
             // is open — but never when the pointer is over the search bar.
@@ -2443,7 +2611,7 @@ impl Session {
                     self.copy_selection(ui);
                 }
                 // Secondary click over the search bar must not paste into the PTY.
-                if resp.secondary_clicked() {
+                if resp.secondary_clicked() && !disconnected {
                     let paste_ok = resp
                         .interact_pointer_pos()
                         .is_none_or(|p| search_bar.is_none_or(|b| !b.contains(p)));
@@ -2516,8 +2684,9 @@ impl Session {
                 let notches = steps as i32;
                 let lines_per_notch = crate::config::live(ui.ctx()).scroll_speed;
                 if notches != 0 {
-                    // Search open: wheel is always local history scroll.
-                    if self.search.is_open() {
+                    // Search open or disconnected: wheel is always local
+                    // history scroll (nothing may reach the PTY).
+                    if self.search.is_open() || disconnected {
                         let lines = (notches as f32 * lines_per_notch).round() as i32;
                         self.term
                             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
@@ -2957,8 +3126,9 @@ impl Session {
             self.paint_search_bar(ui, rect, active);
         }
 
-        if let (Some(bar), Some(remote)) = (bar, self.remote.as_deref()) {
-            paint_disconnect_bar(ui, bar, remote, active, &th);
+        if let Some(bar) = bar {
+            let hovered = bar_resp.as_ref().is_some_and(|r| r.hovered());
+            paint_disconnect_bar(ui, bar, self.disconnect_text(), active, hovered, &th);
         }
 
         // Multi-line-paste confirm, last so it draws on top of everything else
@@ -6436,59 +6606,320 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_disconnected_remote_session_reads_only_a_bare_enter() {
-        let ctx = egui::Context::default();
-        ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
-            std::fs::read(p)
-        }));
-        let mut s = Session::disconnected_remote("desk", ctx.clone());
-        assert!(s.disconnected());
-        assert_eq!(s.root_pid(), None, "restored: no process behind it");
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        s.writer = Box::new(SharedWriter(sent.clone()));
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
-        let key = |key, modifiers| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        };
-        let mut frame = |s: &mut Session, events| {
+    /// Drives `show` for a disconnected Session one frame at a time; returns
+    /// the text each frame copied to the clipboard.
+    struct PaneDriver {
+        ctx: egui::Context,
+        rect: egui::Rect,
+        t: f64,
+    }
+
+    impl PaneDriver {
+        fn new(size: egui::Vec2) -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::terminal_font::load_font_definitions(&|p| {
+                std::fs::read(p)
+            }));
+            Self {
+                ctx,
+                rect: egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                t: 0.0,
+            }
+        }
+
+        fn frame(&mut self, s: &mut Session, events: Vec<egui::Event>) -> Vec<String> {
+            self.run(s, events)
+                .into_iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(t) => Some(t),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn run(&mut self, s: &mut Session, events: Vec<egui::Event>) -> Vec<egui::OutputCommand> {
+            self.t += 0.05;
             let input = egui::RawInput {
-                screen_rect: Some(rect),
+                screen_rect: Some(self.rect),
+                time: Some(self.t),
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run_ui(input, |ui| {
+            let rect = self.rect;
+            let out = self.ctx.run_ui(input, |ui| {
                 let resp = ui.interact(rect, egui::Id::new("pane"), egui::Sense::click_and_drag());
                 s.show(ui, rect, true, &resp);
             });
+            out.platform_output.commands
+        }
+
+        /// A frame in which this pane is not shown (input landed elsewhere,
+        /// e.g. while the Session was still connected).
+        fn idle(&mut self, events: Vec<egui::Event>) {
+            self.t += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(self.rect),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let _ = self.ctx.run_ui(input, |_| {});
+        }
+    }
+
+    /// Press and release `key` in one frame: a fresh press, never repeat
+    /// (egui derives `repeat` from its own keys-down state).
+    fn tap(key: egui::Key) -> Vec<egui::Event> {
+        let up = egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
         };
-        frame(&mut s, vec![]);
-        frame(
-            &mut s,
-            vec![
-                egui::Event::Text("ls".into()),
-                key(egui::Key::A, egui::Modifiers::NONE),
-                key(egui::Key::Enter, egui::Modifiers::CTRL),
-                egui::Event::Paste("rm -rf".into()),
-            ],
-        );
-        assert!(!s.take_reconnect(), "only a bare Enter reconnects");
-        frame(&mut s, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
-        assert!(s.take_reconnect());
-        assert!(!s.take_reconnect(), "taken once");
-        assert!(sent.lock().unwrap().is_empty(), "nothing reached the PTY");
-        assert!(s.pending_paste.is_none());
+        vec![key_event(key, egui::Modifiers::NONE, false), up]
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        }
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn watched_disconnected(ctx: &egui::Context) -> (Session, Arc<Mutex<Vec<u8>>>) {
+        let mut s = Session::disconnected_remote("desk", None, None, ctx.clone());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        s.writer = Box::new(SharedWriter(sent.clone()));
+        (s, sent)
     }
 
     #[test]
-    fn the_disconnect_bar_names_the_remote() {
+    fn a_disconnected_remote_session_reads_only_a_bare_fresh_enter() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, sent) = watched_disconnected(&d.ctx);
+        assert!(s.disconnected());
+        assert_eq!(s.root_pid(), None, "restored: no process behind it");
+        d.frame(&mut s, vec![]);
+        d.frame(
+            &mut s,
+            vec![
+                egui::Event::Text("ls".into()),
+                key_event(egui::Key::A, egui::Modifiers::NONE, false),
+                key_event(egui::Key::Enter, egui::Modifiers::CTRL, false),
+                egui::Event::Paste("rm -rf\nfor real".into()),
+            ],
+        );
+        assert!(!s.take_reconnect(), "only a bare Enter reconnects");
+        assert!(s.pending_paste.is_none(), "no paste confirm for a dead PTY");
+        // Enter went down while the connection was alive, and is still held
+        // when ssh dies: what arrives now is key repeat.
+        let enter = key_event(egui::Key::Enter, egui::Modifiers::NONE, false);
+        d.idle(vec![enter.clone()]);
+        d.frame(&mut s, vec![enter.clone(), enter]);
+        assert!(
+            !s.take_reconnect(),
+            "a held Enter (key repeat) does not reconnect"
+        );
+        d.frame(&mut s, tap(egui::Key::Enter));
+        assert!(!s.take_reconnect(), "still held: that press was repeat too");
+        d.frame(&mut s, tap(egui::Key::Enter));
+        assert!(s.take_reconnect());
+        assert!(!s.take_reconnect(), "taken once");
+        assert!(sent.lock().unwrap().is_empty(), "nothing reached the PTY");
+    }
+
+    /// The user must be able to copy the ssh error they are looking at:
+    /// selection, copy-on-select, the copy shortcut and the wheel all stay
+    /// local while disconnected, even when the dead app had mouse reporting
+    /// on; nothing is written to the PTY.
+    #[test]
+    fn a_disconnected_session_keeps_selection_and_copy_and_writes_nothing() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, sent) = watched_disconnected(&d.ctx);
+        // ssh's last words, under a TUI that owned the mouse when it died.
+        s.parser.advance(
+            &mut s.term,
+            b"\x1b[?1000h\x1b[?1006hssh: connect to host desk port 22: timed out",
+        );
+        d.frame(&mut s, vec![]);
+        let row = 5.0;
+        let (a, b) = (egui::pos2(2.0, row), egui::pos2(160.0, row));
+        d.frame(&mut s, vec![egui::Event::PointerMoved(a), pointer(a, true)]);
+        for x in [40.0, 100.0, 160.0] {
+            d.frame(&mut s, vec![egui::Event::PointerMoved(egui::pos2(x, row))]);
+        }
+        let copied = d.frame(&mut s, vec![pointer(b, false)]);
+        let selected = s.term.selection_to_string().expect("a local selection");
+        assert!(selected.contains("connect to host"), "{selected:?}");
+        if crate::config::live(&d.ctx).copy_on_select {
+            assert_eq!(copied, [selected.clone()], "copy-on-select");
+        }
+        let copied = d.frame(&mut s, vec![egui::Event::Copy]);
+        assert_eq!(copied, [selected], "the copy shortcut");
+        // The wheel scrolls locally instead of reaching the app.
+        d.frame(
+            &mut s,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(300.0, 100.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 3.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // Ctrl+C with nothing selected is not an interrupt either.
+        s.term.selection = None;
+        d.frame(
+            &mut s,
+            vec![key_event(egui::Key::C, egui::Modifiers::CTRL, false)],
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing reached the PTY: {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn ctrl_click_opens_a_link_while_disconnected() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, sent) = watched_disconnected(&d.ctx);
+        // Mouse reporting was on when the app died; the link still opens.
+        s.parser
+            .advance(&mut s.term, b"\x1b[?1000hhttps://a.io/x is the log");
+        d.frame(&mut s, vec![]);
+        let on_url = egui::pos2(20.0, 5.0);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let press = |pressed| egui::Event::PointerButton {
+            pos: on_url,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: ctrl,
+        };
+        let urls = |out: Vec<egui::OutputCommand>| -> Vec<String> {
+            out.into_iter()
+                .filter_map(|c| match c {
+                    egui::OutputCommand::OpenUrl(u) => Some(u.url),
+                    _ => None,
+                })
+                .collect()
+        };
+        let out = d.run(&mut s, vec![egui::Event::PointerMoved(on_url), press(true)]);
+        assert_eq!(urls(out), ["https://a.io/x"]);
+        d.run(&mut s, vec![press(false)]);
+        assert!(!s.link_press, "released");
+        assert!(!s.take_reconnect());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn with_search_open_esc_closes_it_before_enter_means_reconnect() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, _) = watched_disconnected(&d.ctx);
+        d.frame(&mut s, vec![]);
+        s.search.apply(crate::search::SearchCmd::Open);
+        d.frame(&mut s, tap(egui::Key::Enter));
+        assert!(!s.take_reconnect(), "Enter belongs to search while open");
+        d.frame(&mut s, tap(egui::Key::Escape));
+        assert!(!s.search_is_open(), "Esc closed search");
+        assert!(!s.take_reconnect());
+        d.frame(&mut s, tap(egui::Key::Enter));
+        assert!(s.take_reconnect(), "now Enter reconnects");
+    }
+
+    #[test]
+    fn a_click_on_the_disconnect_bar_reconnects() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, sent) = watched_disconnected(&d.ctx);
+        d.frame(&mut s, vec![]);
+        let on_bar = egui::pos2(100.0, 296.0);
+        d.frame(
+            &mut s,
+            vec![egui::Event::PointerMoved(on_bar), pointer(on_bar, true)],
+        );
+        d.frame(&mut s, vec![pointer(on_bar, false)]);
+        assert!(s.take_reconnect());
+        // A click in the grid above is a selection click, not a reconnect.
+        let in_grid = egui::pos2(100.0, 40.0);
+        d.frame(
+            &mut s,
+            vec![egui::Event::PointerMoved(in_grid), pointer(in_grid, true)],
+        );
+        d.frame(&mut s, vec![pointer(in_grid, false)]);
+        assert!(!s.take_reconnect());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn injects_while_disconnected_are_held_and_handed_over() {
+        let ctx = egui::Context::default();
+        let (mut s, sent) = watched_disconnected(&ctx);
+        s.inject_input("posted while down");
+        s.pump();
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(s.take_pending_injects(), ["posted while down"]);
+        let (mut fresh, _) = watched_disconnected(&ctx);
+        fresh.ready_gate.pending_inject = vec!["newer".into()];
+        fresh.queue_injects_front(vec!["older".into()]);
+        assert_eq!(fresh.ready_gate.pending_inject, ["older", "newer"]);
+    }
+
+    #[test]
+    fn the_disconnect_bar_says_what_enter_will_do() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let text = |ran, code, argv: &[String]| {
+            disconnect_bar_text("desk", ran, code, &crate::remote::relaunch(argv))
+        };
         assert_eq!(
-            disconnect_bar_text("desk"),
+            text(true, 255, &[]),
             "Disconnected from desk — Enter to reconnect"
+        );
+        assert_eq!(
+            text(true, 0, &[]),
+            "Disconnected from desk — Enter to reconnect"
+        );
+        assert_eq!(
+            text(true, 1, &[]),
+            "Disconnected from desk (ssh exit 1) — Enter to reconnect"
+        );
+        assert_eq!(
+            text(false, 0, &[]),
+            "Not connected to desk — Enter to connect"
+        );
+        assert_eq!(
+            text(true, 255, &v(&["claude", "do X"])),
+            "Disconnected from desk — Enter to resume claude"
+        );
+        assert_eq!(
+            text(false, 0, &v(&["claude"])),
+            "Not connected to desk — Enter to resume claude"
+        );
+        assert_eq!(
+            text(true, 255, &v(&["grok", "do X"])),
+            "Disconnected from desk — Enter to start grok fresh"
+        );
+        assert_eq!(
+            text(true, 255, &v(&["npx", "@anthropic-ai/claude-code", "do X"])),
+            "Disconnected from desk — Enter to start claude fresh"
         );
     }
 }

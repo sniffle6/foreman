@@ -126,6 +126,15 @@ pub enum ContentSnap {
         /// written before Remotes load unchanged. Restores disconnected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<String>,
+        /// A Remote agent's provider (`claude` / `codex` / `grok`): the
+        /// program name only, never its prompt or other arguments, so a
+        /// restored tab resumes through the one resume table. Remote only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// The directory on the Remote it ran in, so an explicit `--cwd`
+        /// survives a restart. Absent = the Project's mapping. Remote only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_dir: Option<String>,
     },
     Chat,
     /// Per-project kanban board (`Content::Board`). Unit variant — the store
@@ -484,6 +493,8 @@ mod tests {
                                         content: ContentSnap::Terminal {
                                             shell: "powershell".into(),
                                             remote: None,
+                                            agent: None,
+                                            remote_dir: None,
                                         },
                                     }],
                                     minimized: false,
@@ -558,6 +569,8 @@ mod tests {
         let terminal = |remote: Option<&str>| ContentSnap::Terminal {
             shell: "cmd".into(),
             remote: remote.map(str::to_string),
+            agent: None,
+            remote_dir: None,
         };
         let json = serde_json::to_string(&terminal(Some("desk"))).unwrap();
         assert!(json.contains(r#""remote":"desk""#), "{json}");
@@ -568,13 +581,62 @@ mod tests {
         let local = serde_json::to_string(&terminal(None)).unwrap();
         assert_eq!(
             local, r#"{"kind":"Terminal","shell":"cmd"}"#,
-            "old builds see no new key"
+            "a local Terminal is byte-identical to before Remotes"
         );
         // A file written before Remotes loads as a local Terminal.
         match serde_json::from_str(r#"{"kind":"Terminal","shell":"powershell"}"#).unwrap() {
-            ContentSnap::Terminal { shell, remote } => {
+            ContentSnap::Terminal {
+                shell,
+                remote,
+                agent,
+                remote_dir,
+            } => {
                 assert_eq!(shell, "powershell");
                 assert_eq!(remote, None);
+                assert_eq!(agent, None);
+                assert_eq!(remote_dir, None);
+            }
+            _ => panic!("expected Terminal"),
+        }
+    }
+
+    #[test]
+    fn a_remote_agent_s_provider_and_directory_round_trip() {
+        let snap = ContentSnap::Terminal {
+            shell: "cmd".into(),
+            remote: Some("desk".into()),
+            agent: Some("claude".into()),
+            remote_dir: Some("/home/me/app".into()),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"Terminal","shell":"cmd","remote":"desk","agent":"claude","remote_dir":"/home/me/app"}"#
+        );
+        match serde_json::from_str(&json).unwrap() {
+            ContentSnap::Terminal {
+                remote,
+                agent,
+                remote_dir,
+                ..
+            } => {
+                assert_eq!(remote.as_deref(), Some("desk"));
+                assert_eq!(agent.as_deref(), Some("claude"));
+                assert_eq!(remote_dir.as_deref(), Some("/home/me/app"));
+            }
+            _ => panic!("expected Terminal"),
+        }
+        // A file from the first Remote build (name only) still loads.
+        match serde_json::from_str(r#"{"kind":"Terminal","shell":"cmd","remote":"desk"}"#).unwrap()
+        {
+            ContentSnap::Terminal {
+                remote,
+                agent,
+                remote_dir,
+                ..
+            } => {
+                assert_eq!(remote.as_deref(), Some("desk"));
+                assert_eq!((agent, remote_dir), (None, None));
             }
             _ => panic!("expected Terminal"),
         }
@@ -625,6 +687,8 @@ mod tests {
                         content: ContentSnap::Terminal {
                             shell: "powershell".into(),
                             remote: None,
+                            agent: None,
+                            remote_dir: None,
                         },
                     }],
                     ..Default::default()
