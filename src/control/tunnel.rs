@@ -198,39 +198,23 @@ impl Hub {
 
     fn serve(self: Arc<Self>, listener: TcpListener) {
         let inflight = Arc::new(AtomicUsize::new(0));
-        /// Gives the slot back even if the handler panics.
-        struct Slot(Arc<AtomicUsize>);
-        impl Drop for Slot {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        let refusing = Arc::new(AtomicUsize::new(0));
         for conn in listener.incoming() {
             let Ok(conn) = conn else {
                 // No hot loop on a persistent accept error.
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             };
-            if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
-                let _ = (&conn).write_all(&response(503, "foreman: tunnel busy\n"));
-                continue;
-            }
-            inflight.fetch_add(1, Ordering::Relaxed);
-            let (hub, slot) = (self.clone(), Slot(inflight.clone()));
-            // A second handle, so a refused thread can still be answered: the
-            // closure and its stream are dropped with the error. `spawn` would
-            // panic instead and take this accept loop down with it.
-            let spare = conn.try_clone();
-            let spawned = std::thread::Builder::new()
-                .name("tunnel-conn".into())
-                .spawn(move || {
-                    let _slot = slot;
-                    hub.handle(conn);
-                });
-            if spawned.is_err()
-                && let Ok(spare) = spare
-            {
-                let _ = (&spare).write_all(&response(503, "foreman: tunnel busy\n"));
+            if inflight.load(Ordering::Relaxed) < MAX_INFLIGHT {
+                let hub = self.clone();
+                spawn_in(&inflight, "tunnel-conn", conn, move |c| hub.handle(c));
+            } else if refusing.load(Ordering::Relaxed) < MAX_INFLIGHT {
+                // A thread of its own, so the 503 can wait out the request the
+                // caller already sent instead of resetting over it.
+                let by = Instant::now() + self.deadlines.head.min(self.deadlines.request);
+                spawn_in(&refusing, "tunnel-busy", conn, move |c| answer_busy(&c, by));
+            } else {
+                answer_busy_now(&conn);
             }
         }
     }
@@ -240,26 +224,42 @@ impl Hub {
         if conn.set_nonblocking(false).is_err() {
             return;
         }
-        let (out, drain) = match self.exchange(&conn, start) {
-            Ok(out) => (out, true),
+        let d = self.deadlines;
+        let mut trusted = false;
+        let (out, drain_by) = match self.exchange(&conn, start, &mut trusted) {
+            Ok(out) => (out, Some(Instant::now() + Duration::from_secs(1))),
             // A stalled caller has sent nothing we left unread, so there is
             // nothing to drain, and lingering would only hold its slot longer.
-            Err(r) => (refusal(&r), r.status != 408),
+            Err(r) if r.status == 408 => (refusal(&r), None),
+            // Until its token checks out the caller is anyone on the Remote,
+            // so it gives its thread back at the head deadline, drained or not.
+            Err(r) => {
+                let stage = if trusted {
+                    d.request
+                } else {
+                    d.head.min(d.request)
+                };
+                (refusal(&r), Some(start + stage))
+            }
         };
-        let sent = write_by(&conn, &out, Instant::now() + self.deadlines.response);
-        // Same as the peer listener: closing with unread request bytes resets
-        // the connection on Windows and the client loses the reply. FIN, then
-        // swallow a bounded remainder.
-        let _ = conn.shutdown(std::net::Shutdown::Write);
-        if sent && drain {
-            let linger = Instant::now() + Duration::from_secs(1);
-            read_until(&conn, linger, |b| b.len() >= 1 << 20);
+        let sent = write_by(&conn, &out, Instant::now() + d.response);
+        match drain_by {
+            Some(by) if sent => close_after_reply(&conn, by),
+            _ => {
+                let _ = conn.shutdown(std::net::Shutdown::Write);
+            }
         }
     }
 
     /// Read one request and produce the bytes to answer it with, or the
     /// refusal. A caller that connects and sends nothing gets a 408 too.
-    fn exchange(&self, conn: &TcpStream, start: Instant) -> Result<Vec<u8>, Refusal> {
+    /// `trusted` is set once the caller's token checks out.
+    fn exchange(
+        &self,
+        conn: &TcpStream,
+        start: Instant,
+        trusted: &mut bool,
+    ) -> Result<Vec<u8>, Refusal> {
         let d = self.deadlines;
         let head_by = start + d.head.min(d.request);
         let mut buf = read_until(conn, head_by, |b| {
@@ -278,6 +278,7 @@ impl Hub {
                     "missing or unknown token (Authorization: Bearer $FOREMAN_TOKEN)",
                 )
             })?;
+        *trusted = true;
         let route = route(&head.method, &head.path)?;
         let len = match (route, head.content_length) {
             (_, Some(n)) if n > MAX_BODY => {
@@ -322,6 +323,40 @@ impl Hub {
     }
 }
 
+/// Run `serve` on a thread counted in `count`, which gives its slot back
+/// even if `serve` panics. With no thread to be had, the caller is answered
+/// busy.
+fn spawn_in(
+    count: &Arc<AtomicUsize>,
+    name: &str,
+    conn: TcpStream,
+    serve: impl FnOnce(TcpStream) + Send + 'static,
+) {
+    struct Slot(Arc<AtomicUsize>);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    count.fetch_add(1, Ordering::Relaxed);
+    let slot = Slot(count.clone());
+    // A second handle, so a refused thread can still be answered: the
+    // closure and its stream are dropped with the error. `spawn` would panic
+    // instead and take the accept loop down with it.
+    let spare = conn.try_clone();
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _slot = slot;
+            serve(conn);
+        });
+    if spawned.is_err()
+        && let Ok(spare) = spare
+    {
+        answer_busy_now(&spare);
+    }
+}
+
 fn poisoned() -> std::io::Error {
     std::io::Error::other("tunnel token table poisoned")
 }
@@ -333,6 +368,47 @@ fn stalled(limit: Duration) -> Refusal {
 
 fn refusal(r: &Refusal) -> Vec<u8> {
     response(r.status, &format!("{}\n", r.msg))
+}
+
+/// Largest remainder of a request swallowed after its reply.
+const MAX_DRAIN: usize = 1 << 20;
+
+/// Send FIN, then swallow what the caller already sent until it closes or
+/// `deadline`. Closing a socket with unread request bytes resets the
+/// connection on Windows, and the caller loses the reply it was sent.
+fn close_after_reply(conn: &TcpStream, deadline: Instant) {
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    read_until(conn, deadline, |b| b.len() >= MAX_DRAIN);
+}
+
+/// Answer a caller that arrived with every slot taken: 503, then drain
+/// until `deadline`, the head deadline — the most any tokenless caller holds
+/// a thread.
+fn answer_busy(conn: &TcpStream, deadline: Instant) {
+    if conn.set_nonblocking(false).is_ok() && write_by(conn, &busy(), deadline) {
+        close_after_reply(conn, deadline);
+    }
+}
+
+/// [`answer_busy`] without a thread to spare: the accept loop must not
+/// block, so only what has already arrived is drained.
+fn answer_busy_now(conn: &TcpStream) {
+    let _ = (&*conn).write_all(&busy());
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    if conn.set_nonblocking(true).is_ok() {
+        let mut chunk = [0u8; 4096];
+        let mut left = MAX_DRAIN;
+        while left > 0 {
+            match std::io::Read::read(&mut &*conn, &mut chunk) {
+                Ok(n) if n > 0 => left = left.saturating_sub(n),
+                _ => break,
+            }
+        }
+    }
+}
+
+fn busy() -> Vec<u8> {
+    response(503, "foreman: tunnel busy\n")
 }
 
 /// Write all of `bytes`, giving up at `deadline`; `false` = not all sent.
@@ -1231,6 +1307,72 @@ mod tests {
         }
         assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
         drop(stalled);
+    }
+
+    #[test]
+    fn a_caller_refused_as_busy_after_sending_its_request_reads_the_503() {
+        // A long head deadline, so the stalled callers hold every slot for
+        // the whole test.
+        let deadlines = Deadlines {
+            head: Duration::from_secs(5),
+            request: Duration::from_secs(5),
+            response: Duration::from_secs(5),
+        };
+        let (hub, seen) = live_hub_with(deadlines, vec!["a".into()]);
+        let lease = hub.lease("p2", "t7").unwrap();
+        let port = lease.local_port;
+        let stalled: Vec<TcpStream> = (0..MAX_INFLIGHT).map(|_| connect(port)).collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let ask = format!(
+            "POST /chat HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: 5\r\n\r\nhello",
+            lease.token.value()
+        );
+        for i in 0..20 {
+            let mut c = connect(port);
+            c.write_all(ask.as_bytes()).unwrap();
+            // Let the request land in the listener's receive buffer before
+            // the busy reply is read: closing over it is what reset.
+            std::thread::sleep(Duration::from_millis(30));
+            let mut out = String::new();
+            let read = c.read_to_string(&mut out);
+            assert!(
+                read.is_ok() && out.starts_with("HTTP/1.1 503 "),
+                "try {i}: {read:?} {out:?}"
+            );
+        }
+        assert!(seen.try_recv().is_err());
+        drop(stalled);
+    }
+
+    #[test]
+    fn a_refused_caller_cannot_hold_its_thread_past_the_head_deadline() {
+        let (hub, _seen) = live_hub();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let by = |f: fn(&Hub, TcpStream)| {
+            // A tokenless caller that sends its request, reads the refusal,
+            // and then keeps the connection open.
+            let mut c = connect(port);
+            c.write_all(b"POST /chat HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc")
+                .unwrap();
+            let (conn, _) = listener.accept().unwrap();
+            let t0 = Instant::now();
+            let h = hub.clone();
+            let server = std::thread::spawn(move || {
+                f(&h, conn);
+                t0.elapsed()
+            });
+            let mut out = String::new();
+            c.read_to_string(&mut out).unwrap();
+            (out, server.join().unwrap(), c)
+        };
+        let limit = FAST.head + Duration::from_millis(150);
+        let (out, took, _c) = by(|h, conn| h.handle(conn));
+        assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+        assert!(took < limit, "401 held its thread {took:?}");
+        let (out, took, _c) = by(|h, conn| answer_busy(&conn, Instant::now() + h.deadlines.head));
+        assert!(out.starts_with("HTTP/1.1 503 "), "{out}");
+        assert!(took < limit, "503 held its thread {took:?}");
     }
 
     #[test]

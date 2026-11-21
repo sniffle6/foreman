@@ -45,6 +45,7 @@ lands you on it.
 | A PTY test fails only on CI: blank grid at the deadline, child alive | Its first launch of a big binary pays cold-disk paging inside the deadline | §14 |
 | A process-tree scan lists a process the shell never launched; flakes only on a long-lived dev box, never CI | Recycled PID: an orphan's dead parent's PID went to the new shell | §15 |
 | App vanished after sleep, resume, or a display power transition | GPU device loss. Under wgpu that is an unconditional `panic!` + abort — SETTLED: foreman renders on glow | §13 |
+| A TCP client (curl, a test) gets "connection reset" / os error 10054 / an empty reply instead of the listener's answer | The listener closed a socket with unread request bytes — Windows sends RST and the client loses the reply | §16 |
 
 ---
 
@@ -427,6 +428,24 @@ live table the pre-fix rule also listed `csrss.exe` and `winlogon.exe` under a
 `crashpad_handler.exe` holding their dead parent's PID. The fixed scan lists
 neither. Pure-table tests in `src/proc.rs` pin the recycled cases (removing
 the time check turns exactly those red).
+
+## §16 TCP caller gets a reset instead of the reply — closing over unread bytes
+
+**Symptom.** A caller of the peer or Tunnel listener reads `ConnectionReset`
+(os error 10054) or an empty string where a 4xx/503 should be. The
+`stalled_callers_without_a_token...` Tunnel test flaked 4 in 13 this way.
+
+**Cause.** On Windows, closing a socket while request bytes sit unread in its
+receive buffer sends RST, and the RST discards the reply still unread on the
+client side. Any early refusal (busy, 401, 413, 400) closes before reading the
+rest of the request.
+
+**Fix / fence.** After a reply: `shutdown(Write)` (FIN), then drain with
+`read_until` to a deadline (`close_after_reply` in src/control/tunnel.rs).
+Never write-and-drop on a socket the caller may already have written to. Bound
+the drain by the stage the caller has earned: a tokenless caller by the head
+deadline, so lingering cannot become a way to hold a slot. The busy 503 gets its own
+capped pool of threads for this, because the accept loop must not block.
 
 ---
 
