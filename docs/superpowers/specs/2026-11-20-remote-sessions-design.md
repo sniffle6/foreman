@@ -189,24 +189,34 @@ the directory the text names up to its last separator, filtered by the
 case-insensitive prefix after it. Choosing one writes `dir/name/` into the
 field and lists the next level; `..` goes up (above home it uses where the
 listing found home); home is written `~/…`. The area is a fixed height in
-every state (listing, listed, empty, cut, failed), the prompt's list gives
-up rows rather than push its buttons off a small window, and the field and
-the list never both look focused. Keys: Down from the field enters the
-list; Up/Down move; Enter or Right goes in; Left, or Backspace with no
-filter, goes up; Tab, or Up from the first row, returns to the field. Enter
-in the field opens (or saves) whatever is typed, as before, and never
-descends. Esc cancels the prompt; in the edit form it hands the keyboard
-back to the field, as it first drops a Target suggestion. Each listing is
-one `ssh -T -o BatchMode=yes` run off the UI thread with a 15 s deadline,
-debounced 300 ms while typing, and cached per (target, shell, directory)
-for the life of the prompt or form. The typed path rides only inside a
-base64 script, quoted once. Posix runs plain `sh`: `cd`, then each entry
-that is a directory (dot-folders included, sorted after the rest), at most
-500, saying so when cut. PowerShell uses `Get-ChildItem -Directory -Force`
-and lists the drive roots beside home, where a bare drive is typed; that
-script is untested (no Windows Remote exists). A Remote that needs a
-password, or that cannot be reached, says so in the list area and typing
-works as before. Nothing is copied to or installed on the Remote.
+every state (listing, listed, empty, cut, failed, retry), the prompt's list
+gives up rows rather than push its buttons off a small window, and the field
+and the list never both look focused. Its breadcrumb names the directory
+(in the edit form also whose: "Folders for app on desk in /srv/") and says
+"first 500" when cut. Keys: Down from the field enters the list, and while
+the directory is still listing it waits there and selects the first folder
+on arrival; Up/Down move; Enter or Right goes in; Left, or Backspace with no
+filter, goes up; Tab, Esc, or Up from the first row returns to the field,
+and typing in the list goes to the field. Enter in the field opens (or
+saves) whatever is typed, as before, and never descends; Esc there cancels.
+Each listing is one `ssh -T -o BatchMode=yes` run off the UI thread with a
+15 s deadline, at most two at once, debounced 300 ms while typing, killed
+when the prompt or form closes. The Remote's answer (folders, or missing, a
+file, denied) is cached per (target, shell, directory) for the life of the
+prompt or form. A failure to reach the Remote (an ssh error, a timeout, a
+login that needs a password) is shown with a retry row and asked again when
+the directory or Remote changes or Down enters the list. Every failure says
+what to do next, with ssh's own words only in a hover. After 3 s a listing
+says it is still trying. The typed path rides only inside a base64 script,
+quoted once. Posix runs plain `sh`: `cd`, then each entry that is a
+directory (dot-folders included, sorted after the rest), at most 500; a
+name or resolved path holding a line break is skipped or refused. A name
+that is not UTF-8, or holds a control character, is shown dimmed and cannot
+be chosen, and control and bidi characters are painted as a placeholder.
+PowerShell uses `Get-ChildItem -Directory -Force` and lists the drive roots
+beside home, where a bare drive is typed; that script is untested (no
+Windows Remote exists), and a line past the Windows command-line cap says so
+instead of running. Nothing is copied to or installed on the Remote.
 
 ## The way back
 

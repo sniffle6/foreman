@@ -42,14 +42,28 @@ is for changing the feature.
   beside each entry). Vendors move them; Codex's docs have already changed
   domain once. When an install fails, check the vendor page before
   changing foreman.
-- **A folder listing is cached for the life of its prompt or edit form.**
-  A folder made on the Remote while the prompt is open does not show until
-  the prompt is opened again. The cache belongs to the `Browser`, not to the
-  process, so a new prompt always lists afresh.
-- **Unit tests never run a listing.** Under `cfg(test)`
+- **A folder listing is cached for the life of its prompt or edit form,
+  except a failure to reach the Remote.** A folder made on the Remote while
+  the prompt is open does not show until the prompt is opened again. The
+  script's own answers (missing, a file, denied) are kept too. An
+  `Unreachable` answer (ssh error, timeout, needs a password) is dropped by
+  `Cache::forget` whenever the directory or the Remote changes, or Down or
+  the retry row asks again. So a test that seeds an `Unreachable` and then
+  moves to that directory sees Loading, not the failure: seed it after
+  landing. The cache belongs to the `Browser`, and dropping the `Browser`
+  kills its running ssh (the Remotes pane drops it the frame after the form
+  closes).
+- **Unit tests never run a listing over ssh.** Under `cfg(test)`
   `remote_browse::spawn` does nothing, so an unseeded listing stays
-  "Listing folders…" forever. Seed one with `Browser::put`. The real script
-  is checked by hand (procedure below).
+  "Listing folders…" forever. Seed one with `Browser::put`.
+  `the_posix_script_runs_against_hostile_names` does run the real Posix
+  script through a local `sh` (Git Bash on Windows) and skips when there is
+  none. Its denied branch runs only on Unix, because Windows ignores the
+  mode bits.
+- **Don't `request_focus` a TextEdit that already has focus.** The request
+  resets the field's focus-lock filter, so egui then treats ArrowUp/Down as
+  focus moves and parks the keyboard on a button for a frame. The directory
+  prompt requests focus only when the field lacks it.
 - **Agent-state badges are not available on a Remote Session yet.** Nothing
   posts hook events, so posts to it are delivered Ready-only and `status`
   carries no `agent_state` for it.

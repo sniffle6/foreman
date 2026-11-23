@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn remotes_folder_list_fits_at_minimum_width_and_moves_nothing() {
         use crate::remote::RemoteShell::Posix;
-        use crate::remote_browse::{Entry, Listed, NEEDS_LOGIN, State};
+        use crate::remote_browse::{Entry, Failure, Listed, State};
         let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
         let none = egui::Modifiers::NONE;
         let ctx = egui::Context::default();
@@ -1662,7 +1662,9 @@ mod tests {
             "andy@desk",
             Posix,
             "/nope/",
-            State::Failed(NEEDS_LOGIN.into()),
+            crate::remote_browse::unreachable(
+                "ssh: connect to host desk port 22: Connection refused",
+            ),
         );
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
@@ -1671,9 +1673,25 @@ mod tests {
         for _ in 0..3 {
             tab(&mut menu, &mut s, egui::Key::Tab);
         }
-        // Directory 1, listed.
+        // Directory 1, listed: the rows in view, the area naming whose
+        // Directory it lists, and the field and its list both in view.
         let n = fits(&mut menu, "Dir field");
-        assert_eq!(n, names.len() + 1, "every folder and ..");
+        assert!((4..=names.len() + 1).contains(&n), "rows in view: {n}");
+        assert_eq!(
+            menu.remotes.browse().laid.crumb_text,
+            "Folders for app on desk in /srv/"
+        );
+        // The scroll animates: let it land.
+        for _ in 0..40 {
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        }
+        {
+            let laid = menu.remotes.laid();
+            let (seen, field) = (laid.list, laid.form[3]);
+            let area = menu.remotes.browse().laid.area;
+            assert!(seen.contains_rect(field), "field {field:?} out of {seen:?}");
+            assert!(seen.contains_rect(area), "list {area:?} out of {seen:?}");
+        }
         assert_eq!(
             shape(&mut menu),
             idle,
@@ -1689,13 +1707,149 @@ mod tests {
         tab(&mut menu, &mut s, egui::Key::ArrowRight);
         assert_eq!(fits(&mut menu, "loading"), 0);
         assert_eq!(shape(&mut menu).1, idle.1, "Loading changed the height");
-        // Directory 2 cannot be listed.
+        // Directory 2 cannot be reached: a retry row and why.
         tab(&mut menu, &mut s, egui::Key::Tab);
         tab(&mut menu, &mut s, egui::Key::Tab);
         assert!(!menu.remotes.browse().list_focused());
+        assert_eq!(
+            menu.remotes.browse().laid.crumb_text,
+            "Folders for tool on desk in /nope/"
+        );
+        // Landing here asked again (an unreachable answer is not kept);
+        // it still refuses.
+        menu.remotes.browse().put(
+            "andy@desk",
+            Posix,
+            "/nope/",
+            crate::remote_browse::unreachable(
+                "ssh: connect to host desk port 22: Connection refused",
+            ),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        assert_eq!(fits(&mut menu, "retry"), 1);
+        assert!(menu.remotes.browse().laid.message.is_some());
+        assert_eq!(
+            shape(&mut menu).1,
+            idle.1,
+            "the retry state changed the height"
+        );
+        // ...or answers that it cannot be listed.
+        menu.remotes.browse().put(
+            "andy@desk",
+            Posix,
+            "/nope/",
+            State::Failed(Failure::new(
+                "No such directory on this Remote. Check the path, or type another.",
+            )),
+        );
+        tab(&mut menu, &mut s, egui::Key::F13);
         assert_eq!(fits(&mut menu, "failed"), 0);
         assert!(menu.remotes.browse().laid.message.is_some());
         assert_eq!(shape(&mut menu).1, idle.1, "Failed changed the height");
+    }
+
+    /// In the Remotes form, the first Esc in the folder list goes back to
+    /// the Directory field and the second cancels the form; typing while
+    /// the list has the keyboard lands in the field.
+    #[test]
+    fn remotes_folder_list_esc_returns_and_typing_lands_in_the_field() {
+        use crate::remote::RemoteShell::Posix;
+        use crate::remote_browse::{Entry, Listed, State};
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let none = egui::Modifiers::NONE;
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let open = |menu: &mut SettingsMenu, s: &mut Settings| {
+            frame_at(&ctx, menu, s, Some(size), None);
+            frame_at(&ctx, menu, s, Some(size), Some((egui::Key::Enter, none)));
+            assert!(menu.remotes.is_editing());
+            menu.remotes.browse().put(
+                "andy@desk",
+                Posix,
+                "/srv/",
+                State::Listed(Listed {
+                    resolved: "/srv".into(),
+                    entries: ["app", "data"].iter().map(|n| Entry::dir(n)).collect(),
+                    truncated: false,
+                }),
+            );
+            for _ in 0..3 {
+                frame_at(&ctx, menu, s, Some(size), Some((egui::Key::Tab, none)));
+            }
+            frame_at(
+                &ctx,
+                menu,
+                s,
+                Some(size),
+                Some((egui::Key::ArrowDown, none)),
+            );
+            frame_at(&ctx, menu, s, Some(size), None);
+            assert!(menu.remotes.browse().list_focused());
+        };
+        open(&mut menu, &mut s);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::Escape, none)),
+        );
+        assert!(
+            menu.remotes.is_editing(),
+            "the first Esc only left the list"
+        );
+        assert!(!menu.remotes.browse().list_focused());
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::Escape, none)),
+        );
+        assert!(!menu.remotes.is_editing(), "the second cancelled");
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        assert!(
+            !menu.remotes.browse().used(),
+            "the closed form's listings are dropped"
+        );
+
+        open(&mut menu, &mut s);
+        let typed = |menu: &mut SettingsMenu, s: &mut Settings, t: &str| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![egui::Event::Text(t.into())],
+                ..Default::default()
+            };
+            let mut km = Keymap::default();
+            let mut theme = crate::theme::Theme::default();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| {
+                        let r = ui.max_rect();
+                        menu.show(ui, r, true, s, &mut km, &mut theme);
+                    });
+            });
+        };
+        typed(&mut menu, &mut s, "da");
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/da"));
+        assert!(!menu.remotes.browse().list_focused());
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        typed(&mut menu, &mut s, "ta");
+        assert_eq!(
+            menu.remotes.draft_dir(0),
+            Some("/srv/data"),
+            "the field types on"
+        );
     }
 
     /// At the narrowest pane the hint and every row's status line stay one

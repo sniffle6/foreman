@@ -645,6 +645,29 @@ pub(crate) fn last_line(text: &str, fallback: &str) -> String {
 /// Run the system `ssh` with `args`, no window, no stdin, killed at `timeout`.
 /// Blocks: call it from a worker thread only.
 pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let out = run_raw(args, timeout, None)?;
+    Ok(Output {
+        code: out.code,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// [`run`]'s output as bytes, for a reader that must tell a name that is
+/// not UTF-8 from one that is.
+pub(crate) struct RawOutput {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// [`run`] as bytes, also killed as soon as `cancel` is set (its owner went
+/// away). Each pipe keeps its first 64 KiB.
+pub(crate) fn run_raw(
+    args: &[&str],
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<RawOutput, String> {
     let mut cmd = Command::new("ssh");
     cmd.args(args)
         .stdin(Stdio::null())
@@ -659,22 +682,26 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
     let pipe = |r: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut s = String::new();
+            let mut buf = Vec::new();
             if let Some(mut r) = r {
-                let mut buf = Vec::new();
                 let _ = r.by_ref().take(64 * 1024).read_to_end(&mut buf);
-                s = String::from_utf8_lossy(&buf).into_owned();
             }
-            let _ = tx.send(s);
+            let _ = tx.send(buf);
         });
         rx
     };
     let out_rx = pipe(child.stdout.take().map(|r| Box::new(r) as _));
     let err_rx = pipe(child.stderr.take().map(|r| Box::new(r) as _));
     let started = Instant::now();
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancelled() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("cancelled".into());
+            }
             Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -690,7 +717,7 @@ pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
             }
         }
     };
-    Ok(Output {
+    Ok(RawOutput {
         code: status.code(),
         stdout: out_rx.recv().unwrap_or_default(),
         stderr: err_rx.recv().unwrap_or_default(),
