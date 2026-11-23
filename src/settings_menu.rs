@@ -1779,6 +1779,95 @@ mod tests {
         }
     }
 
+    /// At the narrowest pane, every combination of the three agents' states
+    /// draws one agents line whose words and buttons are all inside the
+    /// pane: no word cut, no button clipped past the edge.
+    #[test]
+    fn every_agents_line_fits_at_minimum_width() {
+        use crate::remote::Prereq;
+        use crate::remote::RemoteShell;
+        use crate::remote_install::{AgentState, Gate, Piece, agents_line};
+        use crate::remotes_pane::LINE_H;
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let target = "agents-line-fit";
+        let mut s = Settings {
+            remotes: vec![remote(&"m".repeat(crate::remote::MAX_NAME), target)],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let each = |p: &'static str| {
+            let ready = |after_install| AgentState::Missing {
+                gate: Gate::Ready(crate::remote::install_for(p, RemoteShell::Posix).unwrap()),
+                after_install,
+            };
+            [
+                AgentState::Found,
+                AgentState::Installed,
+                AgentState::Installing,
+                AgentState::Checking,
+                ready(false),
+                ready(true),
+                AgentState::Missing {
+                    gate: Gate::Needs(vec![Prereq::Curl, Prereq::Bash]),
+                    after_install: false,
+                },
+                AgentState::Missing {
+                    gate: Gate::ByHand,
+                    after_install: false,
+                },
+            ]
+        };
+        let mut misfits = Vec::new();
+        let mut combos = 0;
+        for a in each("claude") {
+            for b in each("codex") {
+                for c in each("grok") {
+                    combos += 1;
+                    let states = vec![("claude", a.clone()), ("codex", b.clone()), ("grok", c)];
+                    let words: Vec<String> = agents_line("desk", RemoteShell::Posix, &states)
+                        .iter()
+                        .map(|p| match p {
+                            Piece::Text { text, .. } => text.clone(),
+                            Piece::Install { label, .. } => format!("[{label}]"),
+                        })
+                        .collect();
+                    menu.remotes.force_agent_states(target, states);
+                    frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+                    let laid = menu.remotes.laid();
+                    let line = laid.agents[0];
+                    let inside = laid.pane.contains_rect(line)
+                        && line.height() <= LINE_H + 0.5
+                        && laid
+                            .installs
+                            .iter()
+                            .all(|b| laid.pane.contains_rect(*b) && laid.list.contains_rect(*b));
+                    if !(inside && laid.agents_fit) {
+                        misfits.push((line.right() - laid.pane.right(), words.join(" · ")));
+                    }
+                }
+            }
+        }
+        assert_eq!(combos, 8 * 8 * 8);
+        misfits.sort_by(|x, y| y.0.total_cmp(&x.0));
+        assert!(
+            misfits.is_empty(),
+            "{} lines overflow the pane, widest first:
+{}",
+            misfits.len(),
+            misfits
+                .iter()
+                .map(|(over, w)| format!("{over:+.0}px  {w}"))
+                .collect::<Vec<_>>()
+                .join(
+                    "
+"
+                )
+        );
+    }
+
     /// At the narrowest pane, every install command in the table shows
     /// whole in the confirm's two lines (none is cut), on every shell kind,
     /// and the question never loses the Remote's name, even a longest one.
@@ -1831,9 +1920,13 @@ mod tests {
                     assert!(!laid.confirm_elided, "{name} {shell:?}: a command is cut");
                     let (q, fits) = laid.question.clone().expect("a question");
                     assert!(q.contains(name), "{shell:?}: {q:?} lost the name");
-                    if name.len() < crate::remote::MAX_NAME {
-                        assert!(fits, "{shell:?}: {q:?} is cut");
-                    }
+                    assert!(fits, "{shell:?}: {q:?} is cut");
+                    let (text, controls) = laid.rows[0];
+                    assert!(laid.pane.contains_rect(controls), "{name}: {controls:?}");
+                    assert!(
+                        text.max.x <= controls.min.x,
+                        "{name}: the row's text {text:?} runs under {controls:?}"
+                    );
                     seen.push(q);
                 }
                 assert_eq!(seen.len(), 3);

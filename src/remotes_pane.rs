@@ -425,6 +425,10 @@ pub struct RemotesView {
     /// Per target: its agents line, built once per Test answer and marks
     /// change instead of every frame.
     agents: HashMap<String, std::sync::Arc<AgentsCache>>,
+    /// Test hook: per target, agent states that stand in for the Test
+    /// answer and the install marks (both shared with parallel tests).
+    #[cfg(test)]
+    forced: HashMap<String, Vec<(&'static str, AgentState)>>,
 }
 
 /// One row's agents states and line, valid while its key holds.
@@ -468,7 +472,7 @@ pub struct Laid {
     pub confirm_elided: bool,
     /// The confirm's question as drawn, and whether it fit uncut.
     pub question: Option<(String, bool)>,
-    /// Every agents line's words fit without a "…" cut.
+    /// Every agents line fits: no words cut, no button past its edge.
     pub agents_fit: bool,
 }
 
@@ -507,6 +511,8 @@ impl RemotesView {
             },
             install_project: None,
             agents: HashMap::new(),
+            #[cfg(test)]
+            forced: HashMap::new(),
         }
     }
 
@@ -534,6 +540,13 @@ impl RemotesView {
         );
     }
 
+    /// Test hook: draw `target`'s agents line from `states`, whatever its
+    /// Test said.
+    #[cfg(test)]
+    pub fn force_agent_states(&mut self, target: &str, states: Vec<(&'static str, AgentState)>) {
+        self.forced.insert(target.to_string(), states);
+    }
+
     /// The footer line, set from outside: how an install request went.
     pub fn note(&mut self, text: String) {
         self.message = Some(text);
@@ -550,6 +563,17 @@ impl RemotesView {
     /// install marks, or the Remote's name or shell changed. `None` before
     /// any Test.
     fn agents_for(&mut self, r: &Remote) -> Option<std::sync::Arc<AgentsCache>> {
+        #[cfg(test)]
+        if let Some(states) = self.forced.get(&r.target) {
+            return Some(std::sync::Arc::new(AgentsCache {
+                generation: 0,
+                marks: 0,
+                shell: r.shell,
+                name: r.name.clone(),
+                pieces: crate::remote_install::agents_line(&r.name, r.shell, states),
+                states: Some(states.clone()),
+            }));
+        }
         let entry = self.tests.get(&r.target)?;
         let marks = crate::remote_install::marks_generation();
         if let Some(c) = self.agents.get(&r.target)
@@ -1151,8 +1175,15 @@ impl RemotesView {
                         <= room
                 };
                 let q = crate::remote_install::question(provider, &r.name, fits);
-                self.laid.question = Some((q.clone(), fits(&q)));
-                row.add(egui::Label::new(egui::RichText::new(q).color(th.text)).truncate());
+                // No candidate fits one line (a longest name of wide
+                // glyphs): wrap onto the row's second line, over the row's
+                // own text, rather than cut the name.
+                let mut job = egui::text::LayoutJob::simple(q.clone(), font.clone(), th.text, room);
+                job.wrap.max_rows = 2;
+                job.wrap.break_anywhere = true;
+                let galley = row.painter().layout_job(job);
+                self.laid.question = Some((q, !galley.elided));
+                row.add(egui::Label::new(galley));
             } else {
                 if row.small_button("delete").clicked() {
                     acts.push(Act::AskDelete(i));
@@ -1187,11 +1218,17 @@ impl RemotesView {
             let sub = one_line(ui, &sub_text, egui::FontId::monospace(11.0), room);
             let name_at = egui::pos2(left, rect.min.y + 14.0 - name.size().y / 2.0);
             let sub_at = egui::pos2(left, rect.min.y + 30.0 - sub.size().y / 2.0);
-            let text = egui::Rect::from_min_size(name_at, name.size())
-                .union(egui::Rect::from_min_size(sub_at, sub.size()));
+            // Elided to nothing when the controls take the row (a wrapped
+            // question): even a lone "…" would run under them.
+            let mut text =
+                egui::Rect::from_min_size(egui::pos2(left, rect.min.y), egui::Vec2::ZERO);
             let elided = name.elided || sub.elided;
-            ui.painter().galley(name_at, name, name_color);
-            ui.painter().galley(sub_at, sub, th.dim);
+            for (at, g, color) in [(name_at, name, name_color), (sub_at, sub, th.dim)] {
+                if g.size().x <= room {
+                    text = text.union(egui::Rect::from_min_size(at, g.size()));
+                    ui.painter().galley(at, g, color);
+                }
+            }
             self.laid.rows.push((text, controls));
             if elided
                 && ui
@@ -1657,7 +1694,7 @@ fn status_line(ui: &mut egui::Ui, status: Option<(String, egui::Color32)>) -> eg
 struct AgentsLine {
     rect: egui::Rect,
     installs: Vec<egui::Rect>,
-    /// Every piece's words fit uncut.
+    /// Every piece's words fit uncut and every button is inside the line.
     fits: bool,
 }
 
@@ -1673,11 +1710,13 @@ fn agents_line_ui(
     let mut fits = true;
     let rect = ui
         .horizontal(|ui| {
+            // Buttons never shrink: one past this edge is clipped away.
+            let right = ui.max_rect().right();
             ui.set_height(LINE_H);
             ui.add_space(ROW_PAD);
-            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
             for (k, piece) in pieces.iter().enumerate() {
-                if k > 0 {
+                if k > 0 && !matches!(piece, Piece::Install { retry: true, .. }) {
                     ui.label(egui::RichText::new("·").color(th.dim).size(11.0));
                 }
                 match piece {
@@ -1700,6 +1739,7 @@ fn agents_line_ui(
                         provider,
                         label,
                         hover,
+                        ..
                     } => {
                         let b = ui.small_button(label);
                         installs.push(b.rect);
@@ -1709,6 +1749,7 @@ fn agents_line_ui(
                     }
                 }
             }
+            fits &= ui.min_rect().right() <= right + 0.5;
         })
         .response
         .rect;

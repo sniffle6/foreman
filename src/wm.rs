@@ -3591,7 +3591,7 @@ impl WindowManager {
         let mut s = Session::spawn_remote(built, remote, dir, &env, ctx.clone())
             .map_err(|e| format!("spawn failed: {e}"))?;
         // An agent opening here has been logged in to (or is about to be):
-        // the row stops saying "installed, needs login".
+        // the row stops saying "needs login".
         if let Some(p) = crate::remote::agent_of(argv) {
             crate::remote_install::clear_ended(&remote.target, p);
         }

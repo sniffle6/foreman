@@ -46,7 +46,7 @@ pub fn set_mark(target: &str, provider: &str, mark: Mark) {
 }
 
 /// An agent Session for `provider` opened on `target`: an ended install's
-/// "installed, needs login" is over (the user is logging in, or has). A
+/// "needs login" is over (the user is logging in, or has). A
 /// running install keeps its mark.
 pub fn clear_ended(target: &str, provider: &str) {
     let mut m = marks().lock().unwrap_or_else(|e| e.into_inner());
@@ -257,7 +257,8 @@ pub fn confirm_footer(project: &str, provider: &str, shell: RemoteShell) -> Stri
 
 /// The pane confirm's question, in the row's text room. Shortened, never
 /// cut, so the Remote's name always shows (the command block and footer
-/// name the agent too): the first candidate that `fits`, else the shortest.
+/// name the agent too): the first candidate that `fits` one line, else the
+/// shortest, which the pane wraps onto the row's second line.
 pub fn question(provider: &str, name: &str, fits: impl Fn(&str) -> bool) -> String {
     let candidates = [
         format!("Install {provider} on {name}?"),
@@ -337,16 +338,19 @@ pub enum Piece {
     /// An install row button for `provider`; its hover shows the command.
     Install {
         provider: &'static str,
-        /// "install grok"; after an install that did not finish, "retry"
-        /// (or "retry grok" when several did not), beside the words saying
-        /// so: the line must fit the narrowest pane.
+        /// "install grok"; after installs that did not finish, one "retry"
+        /// right after the words saying so: the line must fit the narrowest
+        /// pane.
         label: String,
         hover: String,
+        /// A retry: it answers the words just before it, so it sits against
+        /// them with no "·" between.
+        retry: bool,
     },
 }
 
 /// The agents line under a tested Remote's row: found agents together, then
-/// agents in the same state grouped ("claude, codex installed, need login")
+/// agents in the same state grouped ("claude, codex need login")
 /// so the line fits the narrowest pane, then an install button for each
 /// installable one. An install that ended without the agent says so before
 /// its button, so a failed or cancelled install never looks untried. Every
@@ -394,8 +398,8 @@ pub fn agents_line(
     }
     out.extend(group(
         &of(|s| *s == AgentState::Installed),
-        "installed, needs login",
-        "installed, need login",
+        "needs login",
+        "need login",
     ));
     out.extend(group(
         &of(|s| *s == AgentState::Installing),
@@ -416,36 +420,44 @@ pub fn agents_line(
             }
         )
     });
-    if !failed.is_empty() {
-        let words = if failed.len() == 1 {
-            "install did not finish"
-        } else {
-            "installs did not finish"
-        };
+    if let Some(first) = failed.first() {
         out.push(Piece::Text {
-            text: format!("{} {words}", failed.join(", ")),
+            text: format!("{} did not install", failed.join(", ")),
             hover: Some(format!(
-                "The last install from here ended, but Test does not find {} on {name}'s \
-                 PATH. Read that Session's output, then install again.",
-                failed.join(", ")
+                "The last install from here ended, but Test does not find {} on {name}'s                  PATH. Read that Session's output, then install again.",
+                and_list(&failed)
             )),
+        });
+        // One retry, right after the words it answers: it opens the confirm
+        // on the first, and left/right there reaches the rest.
+        let hover = states
+            .iter()
+            .filter(|(p, _)| failed.contains(p))
+            .map(|(p, s)| hover_of(p, s))
+            .collect::<Vec<_>>()
+            .join(
+                "
+
+",
+            );
+        out.push(Piece::Install {
+            provider: first,
+            label: "retry".to_string(),
+            hover,
+            retry: true,
         });
     }
     for (p, s) in states {
         if let AgentState::Missing {
             gate: Gate::Ready(_),
-            after_install,
+            after_install: false,
         } = s
         {
-            let label = match (after_install, failed.len()) {
-                (false, _) => format!("install {p}"),
-                (true, 1) => "retry".to_string(),
-                (true, _) => format!("retry {p}"),
-            };
             out.push(Piece::Install {
                 provider: p,
-                label,
+                label: format!("install {p}"),
                 hover: hover_of(p, s),
+                retry: false,
             });
         }
     }
@@ -468,7 +480,7 @@ pub fn agents_line(
     if !needs.is_empty() {
         let verb = if needs.len() == 1 { "needs" } else { "need" };
         out.push(Piece::Text {
-            text: format!("{} {verb} {}", needs.join(", "), and_list(&needed)),
+            text: format!("{} {verb} {}", needs.join(", "), needed.join(", ")),
             hover: Some(format!(
                 "Not on {name}, and the installer needs {} there first. Install it with \
                  {name}'s package manager, then Test again.",
@@ -487,7 +499,7 @@ pub fn agents_line(
     });
     if !by_hand.is_empty() {
         out.push(Piece::Text {
-            text: format!("{}: install by hand", by_hand.join(", ")),
+            text: format!("{}: by hand", by_hand.join(", ")),
             hover: Some(format!(
                 "No install command for {} on a {} Remote. Install by hand on {name}, then \
                  Test again.",
@@ -557,11 +569,16 @@ pub enum Key {
 /// and command as the Remotes pane's inline confirm.
 pub struct Prompt {
     pub ask: Ask,
+    /// The first button has had its opening focus.
+    focused: bool,
 }
 
 impl Prompt {
     pub fn new(ask: Ask) -> Self {
-        Self { ask }
+        Self {
+            ask,
+            focused: false,
+        }
     }
 
     pub fn key(&self, k: Key) -> Outcome {
@@ -610,26 +627,21 @@ impl Prompt {
     }
 
     /// Draw the prompt as a desktop modal; it owns the keyboard while open.
+    /// It opens with focus on the first button (what Enter does), so Tab
+    /// walks the buttons and Enter presses the focused one, never the
+    /// install behind it.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Outcome {
         let ctx = ui.ctx().clone();
         let th = crate::theme::live(&ctx);
-        let keys = ui.input(|i| {
-            let mut keys = Vec::new();
-            if i.key_pressed(egui::Key::Escape) {
-                keys.push(Key::Esc);
-            }
-            if i.key_pressed(egui::Key::Enter) {
-                keys.push(Key::Enter);
-            }
-            keys
+        let (esc, enter) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+            )
         });
-        for k in keys {
-            match self.key(k) {
-                Outcome::Pending => {}
-                done => return done,
-            }
-        }
-
+        let mut button_focused = false;
+        let buttons = self.buttons();
+        let take_focus = !std::mem::replace(&mut self.focused, true);
         let screen = ctx.content_rect();
         ui.painter().rect_filled(screen, 0.0, th.scrim);
         let width = (screen.width() - 32.0).clamp(200.0, 440.0);
@@ -689,8 +701,15 @@ impl Prompt {
                                 ui.add_space(4.0);
                             }
                             ui.horizontal(|ui| {
-                                for (label, k) in self.buttons() {
-                                    if ui.small_button(label).clicked() {
+                                for (n, (label, k)) in buttons.iter().copied().enumerate() {
+                                    let b = ui.small_button(label);
+                                    // Focused before this frame: egui turns
+                                    // Enter on it into its click.
+                                    button_focused |= b.has_focus();
+                                    if n == 0 && take_focus {
+                                        b.request_focus();
+                                    }
+                                    if b.clicked() {
                                         acts.push(k);
                                     }
                                 }
@@ -700,14 +719,18 @@ impl Prompt {
                     ui.label(egui::RichText::new(self.hint()).color(th.dim).size(11.5));
                 });
             });
-        let mut outcome = Outcome::Pending;
+        if esc {
+            acts.insert(0, Key::Esc);
+        } else if enter && !button_focused {
+            acts.push(Key::Enter);
+        }
         for k in acts {
             match self.key(k) {
                 Outcome::Pending => {}
-                done => outcome = done,
+                done => return done,
             }
         }
-        outcome
+        Outcome::Pending
     }
 }
 
@@ -841,7 +864,7 @@ mod tests {
         assert_eq!(line.len(), 3, "{line:?}");
         assert!(matches!(&line[0], Piece::Text { text, .. } if text == "has claude"));
         assert!(
-            matches!(&line[1], Piece::Install { provider: "codex", label, hover } if label == "install codex" && hover.starts_with("curl -fsSL https://chatgpt.com/codex/install.sh | sh"))
+            matches!(&line[1], Piece::Install { provider: "codex", label, hover, .. } if label == "install codex" && hover.starts_with("curl -fsSL https://chatgpt.com/codex/install.sh | sh"))
         );
         assert!(matches!(&line[2], Piece::Text { text, .. } if text == "grok needs bash"));
         assert_eq!(installable(&states), ["codex"]);
@@ -854,7 +877,7 @@ mod tests {
             .collect();
         let line = agents_line("desk", RemoteShell::Posix, &states);
         assert!(
-            matches!(&line[..], [Piece::Text { text, .. }] if text == "claude, codex, grok need curl and bash"),
+            matches!(&line[..], [Piece::Text { text, .. }] if text == "claude, codex, grok need curl, bash"),
             "{line:?}"
         );
         assert!(installable(&states).is_empty());
@@ -866,13 +889,13 @@ mod tests {
         };
         assert_eq!(words(AgentState::Installing), "grok installing…");
         assert_eq!(words(AgentState::Checking), "grok checking…");
-        assert_eq!(words(AgentState::Installed), "grok installed, needs login");
+        assert_eq!(words(AgentState::Installed), "grok needs login");
         assert_eq!(
             words(AgentState::Missing {
                 gate: Gate::ByHand,
                 after_install: false
             }),
-            "grok: install by hand"
+            "grok: by hand"
         );
     }
 
@@ -1011,7 +1034,7 @@ mod tests {
                 ("codex", Installed),
                 ("grok", ready(false))
             ])),
-            ["claude, codex installed, need login", "[install grok]"]
+            ["claude, codex need login", "[install grok]"]
         );
         assert_eq!(
             words(&line_of(&[
@@ -1019,7 +1042,7 @@ mod tests {
                 ("codex", Installed),
                 ("grok", Installed)
             ])),
-            ["claude, codex, grok installed, need login"]
+            ["claude, codex, grok need login"]
         );
         assert_eq!(
             words(&line_of(&[
@@ -1041,7 +1064,7 @@ mod tests {
         let line = line_of(&[("claude", AgentState::Found), ("grok", ready(true))]);
         assert_eq!(
             words(&line),
-            ["has claude", "grok install did not finish", "[retry]"]
+            ["has claude", "grok did not install", "[retry]"]
         );
         let Piece::Text { hover: Some(h), .. } = &line[1] else {
             panic!("{line:?}")
@@ -1052,14 +1075,93 @@ mod tests {
             words(&line_of(&[("grok", ready(false))])),
             ["[install grok]"]
         );
+        // Several: grouped, with one retry (left/right in the confirm
+        // reaches the rest), right after its words and before any untried
+        // agent's button.
+        let line = line_of(&[
+            ("claude", ready(false)),
+            ("codex", ready(true)),
+            ("grok", ready(true)),
+        ]);
         assert_eq!(
-            words(&line_of(&[("codex", ready(true)), ("grok", ready(true))])),
-            [
-                "codex, grok installs did not finish",
-                "[retry codex]",
-                "[retry grok]"
-            ]
+            words(&line),
+            ["codex, grok did not install", "[retry]", "[install claude]"]
         );
+        assert!(matches!(
+            &line[1],
+            Piece::Install {
+                provider: "codex",
+                retry: true,
+                ..
+            }
+        ));
+    }
+
+    /// One frame of the launcher's prompt with `keys` pressed.
+    fn prompt_frame(ctx: &egui::Context, p: &mut Prompt, keys: &[egui::Key]) -> Outcome {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events: keys
+                .iter()
+                .map(|&key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut out = Outcome::Pending;
+        let _ = ctx.run_ui(input, |ui| out = p.show(ui));
+        out
+    }
+
+    fn install_prompt(anyway: bool) -> Prompt {
+        Prompt::new(Ask {
+            remote: "desk".into(),
+            provider: "grok",
+            project: "p1".into(),
+            offer: Offer::Install {
+                provider: "grok",
+                title: "Install grok on desk?".into(),
+                command: "curl x | bash",
+                note: String::new(),
+            },
+            anyway,
+        })
+    }
+
+    /// Enter presses the focused button: Tab off "install" and Enter never
+    /// runs the installer.
+    #[test]
+    fn enter_presses_the_focused_button_not_the_install() {
+        use egui::Key::{Enter, Tab};
+        let ctx = egui::Context::default();
+        let mut p = install_prompt(true);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[]), Outcome::Pending);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[Tab]), Outcome::Pending);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[Enter]), Outcome::Cancelled);
+
+        let ctx = egui::Context::default();
+        let mut p = install_prompt(true);
+        for keys in [&[][..], &[Tab], &[Tab]] {
+            assert_eq!(prompt_frame(&ctx, &mut p, keys), Outcome::Pending);
+        }
+        assert_eq!(prompt_frame(&ctx, &mut p, &[Enter]), Outcome::LaunchAnyway);
+
+        // Untouched, Enter is still the install, on the first frame too.
+        let ctx = egui::Context::default();
+        let mut p = install_prompt(false);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[Enter]), Outcome::Confirmed);
+        let ctx = egui::Context::default();
+        let mut p = install_prompt(false);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[]), Outcome::Pending);
+        assert_eq!(prompt_frame(&ctx, &mut p, &[Enter]), Outcome::Confirmed);
     }
 
     /// Opening an agent Session for that provider there ends "installed,
