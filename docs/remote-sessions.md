@@ -21,11 +21,16 @@ is for changing the feature.
   The PowerShell install commands in `remote::INSTALL` have never run on any
   Remote. Test on a real Windows Remote before you trust any of them.
 - **An install Session's argv names the agent.** The Claude and Codex
-  install URLs contain `claude` / `codex`, so `IconKind::from_argv` gives
-  those install tabs the agent's icon and `agent_of` calls them agents.
-  `relaunch` checks `install_of` first, so Enter on an ended install opens
-  a shell. Without that check it would start the agent fresh, and Grok's
-  installer, whose URL has no agent name in it, would run again.
+  install URLs contain `claude` / `codex`. `IconKind::from_argv` returns
+  `None` for an `install_of` argv, so the icon, `agent_of`, the badges and the
+  workspace snapshot all treat an install tab as a plain Remote shell. A new
+  "is this an agent" check must go through `agent_of`. A substring scan of
+  its own turns install tabs back into agents, except Grok's, whose URL has
+  no agent name in it. Install Sessions get no Tunnel
+  (`remote::carries_tunnel`).
+- **`start_test` does nothing while a Test runs.** When something changed
+  the Remote (an install ended), call `retest`: it owes one more run after
+  the one in flight, which probed too early.
 - **Test answers live in a process-wide cache** (`remote_probe::test_entry`),
   not in the Remotes pane. The launcher reads it, and the install watch
   re-runs Test into it. The pane copies a found shell into `Remote::shell`

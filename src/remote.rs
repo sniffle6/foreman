@@ -290,6 +290,15 @@ pub fn install_of(argv: &[String]) -> Option<&'static str> {
     })
 }
 
+/// Whether a Remote Session launched with `argv` gets a Tunnel (the reverse
+/// forward plus `FOREMAN_URL`/`FOREMAN_TOKEN`). An install Session does not:
+/// nothing in a vendor's curl-pipe script posts to chat, the token would be
+/// handed to third-party code, and `ExitOnForwardFailure` could fail the
+/// install over a port clash.
+pub fn carries_tunnel(argv: &[String]) -> bool {
+    install_of(argv).is_none()
+}
+
 /// The agent provider (`claude` / `codex` / `grok`, from `board::AGENTS`)
 /// an argv runs, by the same scan the tab icon uses
 /// ([`crate::icons::IconKind::from_argv`]). The one "is an agent" predicate
@@ -1306,5 +1315,30 @@ mod tests {
         assert_eq!(install_of(&argv(&["sh", "-c", "curl x | bash"])), None);
         assert_eq!(install_of(&argv(&["claude"])), None);
         assert_eq!(relaunch(&argv(&["claude"])).install, None);
+    }
+
+    /// An install Session is a shell running a vendor script, for every
+    /// provider on every shell kind: no agent icon, no agent predicate, and
+    /// no Tunnel, though the claude and codex URLs name the agent (grok's
+    /// does not, which is why the scan alone was inconsistent).
+    #[test]
+    fn an_install_session_is_never_an_agent_and_carries_no_tunnel() {
+        for provider in crate::remote_probe::AGENTS {
+            for shell in [
+                RemoteShell::Posix,
+                RemoteShell::Pwsh,
+                RemoteShell::WindowsPowerShell,
+            ] {
+                let i = install_for(provider, shell).unwrap();
+                let argv = install_argv(shell, i.command);
+                assert_eq!(crate::icons::IconKind::from_argv(&argv), None, "{argv:?}");
+                assert_eq!(agent_of(&argv), None, "{argv:?}");
+                assert!(!carries_tunnel(&argv), "{argv:?}");
+            }
+        }
+        // Everything else keeps its Tunnel.
+        assert!(carries_tunnel(&argv(&["claude"])));
+        assert!(carries_tunnel(&[]));
+        assert!(carries_tunnel(&argv(&["sh", "-c", "curl x | bash"])));
     }
 }

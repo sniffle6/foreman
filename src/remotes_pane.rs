@@ -418,6 +418,25 @@ pub struct RemotesView {
     show_error: u8,
     /// Last frame's widget rects, for the layout test.
     laid: Laid,
+    /// The Project an install from here opens in (the desktop says, each
+    /// frame); `None` = no Project is open, so an install is refused before
+    /// its confirm.
+    install_project: Option<String>,
+    /// Per target: its agents line, built once per Test answer and marks
+    /// change instead of every frame.
+    agents: HashMap<String, std::sync::Arc<AgentsCache>>,
+}
+
+/// One row's agents states and line, valid while its key holds.
+#[derive(Debug)]
+struct AgentsCache {
+    /// Test entry generation, marks generation, the Remote's shell and name.
+    generation: u64,
+    marks: u64,
+    shell: RemoteShell,
+    name: String,
+    states: Option<Vec<(&'static str, AgentState)>>,
+    pieces: Vec<Piece>,
 }
 
 /// Where the last frame put things, in screen points.
@@ -445,6 +464,12 @@ pub struct Laid {
     pub installs: Vec<egui::Rect>,
     /// The install confirm's command block, while one is open.
     pub confirm: Option<egui::Rect>,
+    /// The confirm's command was cut to fit its two lines.
+    pub confirm_elided: bool,
+    /// The confirm's question as drawn, and whether it fit uncut.
+    pub question: Option<(String, bool)>,
+    /// Every agents line's words fit without a "…" cut.
+    pub agents_fit: bool,
 }
 
 impl Default for RemotesView {
@@ -476,7 +501,12 @@ impl RemotesView {
                 agents: Vec::new(),
                 installs: Vec::new(),
                 confirm: None,
+                confirm_elided: false,
+                question: None,
+                agents_fit: true,
             },
+            install_project: None,
+            agents: HashMap::new(),
         }
     }
 
@@ -493,10 +523,11 @@ impl RemotesView {
     /// Test hook: a finished Test for `target`, as if its probe answered.
     #[cfg(test)]
     pub fn set_test_result(&mut self, target: &str, outcome: TestOutcome) {
+        let generation = self.tests.get(target).map_or(1, |e| e.generation + 1);
         self.tests.insert(
             target.to_string(),
             TestEntry {
-                generation: 0,
+                generation,
                 running: false,
                 last: Some(outcome),
             },
@@ -506,6 +537,71 @@ impl RemotesView {
     /// The footer line, set from outside: how an install request went.
     pub fn note(&mut self, text: String) {
         self.message = Some(text);
+    }
+
+    /// The Project an install from here would open in, by name.
+    pub fn set_install_project(&mut self, project: Option<&str>) {
+        if self.install_project.as_deref() != project {
+            self.install_project = project.map(str::to_string);
+        }
+    }
+
+    /// Row `r`'s cached agents line, rebuilt only when its Test answer, the
+    /// install marks, or the Remote's name or shell changed. `None` before
+    /// any Test.
+    fn agents_for(&mut self, r: &Remote) -> Option<std::sync::Arc<AgentsCache>> {
+        let entry = self.tests.get(&r.target)?;
+        let marks = crate::remote_install::marks_generation();
+        if let Some(c) = self.agents.get(&r.target)
+            && c.generation == entry.generation
+            && c.marks == marks
+            && c.shell == r.shell
+            && c.name == r.name
+        {
+            return Some(c.clone());
+        }
+        let states = crate::remote_install::states_from(entry, &r.target, r.shell);
+        let pieces = states
+            .as_ref()
+            .map(|s| crate::remote_install::agents_line(&r.name, r.shell, s))
+            .unwrap_or_default();
+        let c = std::sync::Arc::new(AgentsCache {
+            generation: entry.generation,
+            marks,
+            shell: r.shell,
+            name: r.name.clone(),
+            states,
+            pieces,
+        });
+        self.agents.insert(r.target.clone(), c.clone());
+        Some(c)
+    }
+
+    /// Open the install confirm for `provider` on row `row`, unless no
+    /// Project is open to run it in: then say so now, not after Enter.
+    fn ask_install(&mut self, row: usize, provider: &'static str, remotes: &[Remote]) {
+        if self.install_project.is_none() {
+            self.message = Some(format!(
+                "Open a Project first: the {provider} install on {} runs as a Session inside one",
+                remotes[row].name
+            ));
+            return;
+        }
+        self.mode = Mode::ConfirmInstall { row, provider };
+        self.message = None;
+    }
+
+    /// The footer while a confirm is open: the Project it opens in and the
+    /// login after, on screen rather than on hover.
+    fn confirm_footer(&self, remotes: &[Remote]) -> Option<String> {
+        let Mode::ConfirmInstall { row, provider } = self.mode else {
+            return None;
+        };
+        let r = remotes.get(row)?;
+        let project = self.install_project.as_deref()?;
+        Some(crate::remote_install::confirm_footer(
+            project, provider, r.shell,
+        ))
     }
 
     /// Each agent's state on `r` from this pane's last Test; `None` before
@@ -578,13 +674,7 @@ impl RemotesView {
                 Key::Test if self.selected < len => return Effect::Test(self.selected),
                 Key::Install if self.selected < len => {
                     match self.installable(self.selected, remotes).first() {
-                        Some(&provider) => {
-                            self.mode = Mode::ConfirmInstall {
-                                row: self.selected,
-                                provider,
-                            };
-                            self.message = None;
-                        }
+                        Some(&provider) => self.ask_install(self.selected, provider, remotes),
                         None => {
                             self.message = Some(self.nothing_to_install(&remotes[self.selected]))
                         }
@@ -733,12 +823,19 @@ impl RemotesView {
     /// pane started, or the re-run after an install Session ended).
     /// Returns whether settings changed.
     fn poll_tests(&mut self, remotes: &mut [Remote]) -> bool {
-        let targets: Vec<String> = remotes.iter().map(|r| r.target.clone()).collect();
+        // The generation alone first: most frames nothing is new, and then
+        // nothing is cloned.
+        let fresh: Vec<(String, TestEntry)> = remotes
+            .iter()
+            .filter(|r| {
+                remote_probe::test_generation(&r.target)
+                    .is_some_and(|g| self.tests.get(&r.target).is_none_or(|e| e.generation != g))
+            })
+            .filter_map(|r| Some((r.target.clone(), remote_probe::test_entry(&r.target)?)))
+            .collect();
         let mut changed = false;
-        for target in targets {
-            if let Some(entry) = remote_probe::test_entry(&target) {
-                changed |= self.absorb(&target, entry, remotes);
-            }
+        for (target, entry) in fresh {
+            changed |= self.absorb(&target, entry, remotes);
         }
         changed
     }
@@ -856,6 +953,9 @@ impl RemotesView {
         self.laid.agents.clear();
         self.laid.installs.clear();
         self.laid.confirm = None;
+        self.laid.confirm_elided = false;
+        self.laid.question = None;
+        self.laid.agents_fit = true;
         self.laid.error = None;
 
         let th = crate::theme::live(ui.ctx());
@@ -898,7 +998,10 @@ impl RemotesView {
 
         ui.add_space(6.0);
         ui.separator();
-        if let Some(msg) = &self.message {
+        if let Some(msg) = self
+            .confirm_footer(remotes)
+            .or_else(|| self.message.clone())
+        {
             ui.label(egui::RichText::new(msg).color(th.dim).size(11.5));
         }
 
@@ -925,8 +1028,11 @@ impl RemotesView {
                 Act::Test(i) => effect(self, Effect::Test(i), remotes),
                 Act::AskInstall(i, provider) => {
                     self.selected = i;
-                    self.mode = Mode::ConfirmInstall { row: i, provider };
-                    self.message = None;
+                    // Never over an open form or delete confirm.
+                    if matches!(self.mode, Mode::Browse | Mode::ConfirmInstall { .. }) {
+                        self.mode = Mode::Browse;
+                        self.ask_install(i, provider, remotes);
+                    }
                 }
                 Act::Field(f) => {
                     if let Mode::Edit(d) = &mut self.mode {
@@ -1034,13 +1140,19 @@ impl RemotesView {
                 {
                     acts.push(Act::Key(Key::Enter));
                 }
-                row.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("Install {provider} on {}?", r.name))
-                            .color(th.text),
-                    )
-                    .truncate(),
-                );
+                // Shortened to fit, never cut: the Remote's name stays.
+                let font = egui::TextStyle::Body.resolve(row.style());
+                let room = row.available_width();
+                let fits = |q: &str| {
+                    row.painter()
+                        .layout_no_wrap(q.to_string(), font.clone(), th.text)
+                        .size()
+                        .x
+                        <= room
+                };
+                let q = crate::remote_install::question(provider, &r.name, fits);
+                self.laid.question = Some((q.clone(), fits(&q)));
+                row.add(egui::Label::new(egui::RichText::new(q).color(th.text)).truncate());
             } else {
                 if row.small_button("delete").clicked() {
                     acts.push(Act::AskDelete(i));
@@ -1090,17 +1202,20 @@ impl RemotesView {
                 resp.on_hover_text(format!("{}\n{sub_text}", r.name));
             }
 
-            let states = self.states(r);
+            let agents = self.agents_for(r);
             if let Mode::ConfirmInstall { row: c, provider } = self.mode
                 && c == i
             {
                 // The status and agents lines' room, given to the exact
                 // command, so opening the confirm moves nothing.
-                let offer = states
+                let offer = agents
                     .as_ref()
+                    .and_then(|a| a.states.as_ref())
                     .and_then(|s| s.iter().find(|(p, _)| *p == provider))
                     .map(|(p, st)| crate::remote_install::offer(&r.name, r.shell, p, st));
-                self.laid.confirm = Some(confirm_block(ui, offer.as_ref()));
+                let (rect, elided) = confirm_block(ui, offer.as_ref());
+                self.laid.confirm = Some(rect);
+                self.laid.confirm_elided = elided;
                 ui.add_space(2.0);
                 continue;
             }
@@ -1121,12 +1236,11 @@ impl RemotesView {
             self.laid.status.push(status_line(ui, status));
             // Reserved on every row, tested or not, so a Test landing never
             // moves the rows below. A re-run keeps the last answer here.
-            let pieces = states
-                .map(|s| crate::remote_install::agents_line(&r.name, r.shell, &s))
-                .unwrap_or_default();
-            let line = agents_line_ui(ui, &pieces, |p| acts.push(Act::AskInstall(i, p)));
+            let pieces = agents.as_ref().map_or(&[][..], |a| &a.pieces[..]);
+            let line = agents_line_ui(ui, pieces, |p| acts.push(Act::AskInstall(i, p)));
             self.laid.agents.push(line.rect);
             self.laid.installs.extend(line.installs);
+            self.laid.agents_fit &= line.fits;
             ui.add_space(2.0);
         }
 
@@ -1543,6 +1657,8 @@ fn status_line(ui: &mut egui::Ui, status: Option<(String, egui::Color32)>) -> eg
 struct AgentsLine {
     rect: egui::Rect,
     installs: Vec<egui::Rect>,
+    /// Every piece's words fit uncut.
+    fits: bool,
 }
 
 /// A row's agents line: words for each state, and an "install <agent>"
@@ -1554,6 +1670,7 @@ fn agents_line_ui(
 ) -> AgentsLine {
     let th = crate::theme::live(ui.ctx());
     let mut installs = Vec::new();
+    let mut fits = true;
     let rect = ui
         .horizontal(|ui| {
             ui.set_height(LINE_H);
@@ -1565,6 +1682,12 @@ fn agents_line_ui(
                 }
                 match piece {
                     Piece::Text { text, hover } => {
+                        fits &= ui
+                            .painter()
+                            .layout_no_wrap(text.clone(), egui::FontId::proportional(11.0), th.dim)
+                            .size()
+                            .x
+                            <= ui.available_width();
                         let l = ui.add(
                             egui::Label::new(egui::RichText::new(text).color(th.dim).size(11.0))
                                 .truncate(),
@@ -1573,8 +1696,12 @@ fn agents_line_ui(
                             l.on_hover_text(h);
                         }
                     }
-                    Piece::Install { provider, hover } => {
-                        let b = ui.small_button(format!("install {provider}"));
+                    Piece::Install {
+                        provider,
+                        label,
+                        hover,
+                    } => {
+                        let b = ui.small_button(label);
                         installs.push(b.rect);
                         if b.on_hover_text(hover).clicked() {
                             ask(provider);
@@ -1585,16 +1712,20 @@ fn agents_line_ui(
         })
         .response
         .rect;
-    AgentsLine { rect, installs }
+    AgentsLine {
+        rect,
+        installs,
+        fits,
+    }
 }
 
 /// The install confirm's body, in the room of a row's two lines: the exact
 /// command, wrapped (two lines hold every command in the table at the
 /// narrowest pane; anything longer is cut, whole on hover), and what will
 /// happen on hover.
-fn confirm_block(ui: &mut egui::Ui, offer: Option<&Offer>) -> egui::Rect {
+fn confirm_block(ui: &mut egui::Ui, offer: Option<&Offer>) -> (egui::Rect, bool) {
     let th = crate::theme::live(ui.ctx());
-    ui.horizontal_top(|ui| {
+    let shown = ui.horizontal_top(|ui| {
         ui.set_height(LINE_H * 2.0);
         ui.add_space(ROW_PAD);
         let (text, hover, mono) = match offer {
@@ -1620,11 +1751,12 @@ fn confirm_block(ui: &mut egui::Ui, offer: Option<&Offer>) -> egui::Rect {
         );
         job.wrap.max_rows = 2;
         let galley = ui.painter().layout_job(job);
+        let elided = galley.elided;
         ui.add(egui::Label::new(galley).selectable(false))
             .on_hover_text(hover);
-    })
-    .response
-    .rect
+        elided
+    });
+    (shown.response.rect, shown.inner)
 }
 
 /// A mouse action, applied after the rows are drawn so the draw never
@@ -2267,6 +2399,7 @@ mod tests {
     #[test]
     fn install_asks_first_with_the_agent_and_remote_named() {
         let mut v = RemotesView::new();
+        v.set_install_project(Some("proj"));
         let mut list = vec![r("desk", "pane-install-desk")];
         tested(&mut v, "pane-install-desk", true, true, &["claude"]);
         assert_eq!(v.installable(0, &list), ["codex", "grok"]);
@@ -2312,6 +2445,63 @@ mod tests {
         assert_eq!(list.len(), 1, "nothing else changed");
     }
 
+    /// No Project open: the install is refused at I, before a confirm that
+    /// could only fail after Enter. With one, the footer names it.
+    #[test]
+    fn install_with_no_project_open_refuses_before_the_confirm() {
+        let mut v = RemotesView::new();
+        let mut list = vec![r("desk", "pane-install-noproj")];
+        tested(&mut v, "pane-install-noproj", true, true, &[]);
+        assert_eq!(v.key(Key::Install, &mut list), Effect::None);
+        assert_eq!(v.mode, Mode::Browse, "no confirm to say no to later");
+        let m = v.message.clone().unwrap();
+        assert!(
+            m.contains("Open a Project first") && m.contains("desk"),
+            "{m}"
+        );
+        assert_eq!(v.confirm_footer(&list), None);
+
+        // With one open, the confirm's footer names it and the login after.
+        v.set_install_project(Some("proj"));
+        v.key(Key::Install, &mut list);
+        assert!(matches!(v.mode, Mode::ConfirmInstall { .. }));
+        assert_eq!(
+            v.confirm_footer(&list).as_deref(),
+            Some("Opens in proj; claude needs a login after.")
+        );
+    }
+
+    /// The row's agents line is built once per Test answer and marks
+    /// change, not every frame.
+    #[test]
+    fn the_agents_line_is_cached_until_its_inputs_change() {
+        let mut v = RemotesView::new();
+        let mut list = vec![r("desk", "pane-agents-cache")];
+        assert!(v.agents_for(&list[0]).is_none(), "untested");
+        tested(&mut v, "pane-agents-cache", true, true, &["claude"]);
+        let a = v.agents_for(&list[0]).unwrap();
+        let b = v.agents_for(&list[0]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "rebuilt with nothing new");
+        crate::remote_install::set_mark(
+            "pane-agents-cache",
+            "grok",
+            crate::remote_install::Mark::Installing,
+        );
+        let c = v.agents_for(&list[0]).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&b, &c), "a mark changed");
+        assert!(
+            c.pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Text { text, .. } if text == "grok installing…"))
+        );
+        list[0].name = "den".into();
+        let d = v.agents_for(&list[0]).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&c, &d), "renamed");
+        tested(&mut v, "pane-agents-cache", true, true, &[]);
+        let e = v.agents_for(&list[0]).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&d, &e), "a new Test answer");
+    }
+
     /// No install to confirm: I says why in words naming the Remote, and
     /// never opens a confirm.
     #[test]
@@ -2351,6 +2541,7 @@ mod tests {
     #[test]
     fn a_confirm_overtaken_by_a_test_installs_nothing() {
         let mut v = RemotesView::new();
+        v.set_install_project(Some("proj"));
         let mut list = vec![r("desk", "pane-install-late")];
         tested(&mut v, "pane-install-late", true, true, &[]);
         v.key(Key::Install, &mut list);

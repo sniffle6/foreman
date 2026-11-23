@@ -1141,6 +1141,13 @@ impl Session {
         session
     }
 
+    /// Test hook: the logical argv a Session was dispatched with, without
+    /// spawning it (an install argv must never reach a real `ssh` in tests).
+    #[cfg(test)]
+    pub fn set_dispatched_for_test(&mut self, argv: Vec<String>) {
+        self.dispatch_argv = Some(argv);
+    }
+
     /// True while a Remote Session's `ssh` is gone: the disconnect bar shows
     /// and nothing reaches the PTY; Enter (or a click on the bar) reconnects.
     pub fn disconnected(&self) -> bool {

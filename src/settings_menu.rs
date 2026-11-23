@@ -1675,6 +1675,7 @@ mod tests {
         };
         menu.select_pane(Pane::Remotes);
         menu.in_rail = false;
+        menu.remotes.set_install_project(Some("proj"));
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         let untested = menu.remotes.laid().rows.clone();
@@ -1707,6 +1708,7 @@ mod tests {
         }
         assert!(laid.hint_fits, "the hint with I is cut");
         assert!(laid.hint.height() < 16.0);
+        assert!(laid.agents_fit, "an agents line's words are cut");
 
         let none = egui::Modifiers::NONE;
         frame_at(
@@ -1722,12 +1724,120 @@ mod tests {
         assert!(laid.pane.contains_rect(block), "{block:?}");
         assert!(block.height() <= LINE_H * 2.0 + 0.5, "{block:?}");
         assert!(laid.hint_fits, "the confirm hint is cut");
+        assert!(!laid.confirm_elided, "the command is cut");
         assert_eq!(laid.rows[1], untested[1], "the confirm moved the next row");
         for (row, (_, controls)) in laid.rows.iter().enumerate() {
             assert!(
                 laid.pane.contains_rect(*controls),
                 "row {row}: {controls:?}"
             );
+        }
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::Escape, none)),
+        );
+
+        // The main sequence: two installed from here, the third still to
+        // go (and the same with its install failed), then all three. Like
+        // states group, so every piece and button stays inside the pane.
+        use crate::remote_install::{Mark, set_mark};
+        let desk = "layout-install-desk";
+        set_mark(desk, "claude", Mark::Ended);
+        set_mark(desk, "codex", Mark::Ended);
+        for (agents, grok_ended, buttons) in [
+            (&["claude", "codex"][..], false, 1),
+            (&["claude", "codex"][..], true, 1),
+            (&["claude", "codex", "grok"][..], true, 0),
+        ] {
+            if grok_ended {
+                set_mark(desk, "grok", Mark::Ended);
+            }
+            menu.remotes
+                .set_test_result(desk, report(true, true, agents));
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+            frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+            let laid = menu.remotes.laid();
+            // pi still has its one install button.
+            assert_eq!(laid.installs.len(), buttons + 1, "{agents:?}");
+            for b in &laid.installs {
+                assert!(
+                    laid.pane.contains_rect(*b),
+                    "{agents:?} {grok_ended}: {b:?} past {:?} {:?}",
+                    laid.pane,
+                    laid.agents
+                );
+            }
+            for a in &laid.agents {
+                assert!(laid.pane.contains_rect(*a), "{agents:?}: {a:?}");
+                assert!(a.height() <= LINE_H + 0.5, "{agents:?}: {a:?}");
+            }
+            assert!(laid.agents_fit, "{agents:?}: words cut");
+            assert_eq!(laid.rows, untested, "{agents:?} moved a row");
+        }
+    }
+
+    /// At the narrowest pane, every install command in the table shows
+    /// whole in the confirm's two lines (none is cut), on every shell kind,
+    /// and the question never loses the Remote's name, even a longest one.
+    #[test]
+    fn every_install_command_and_the_remote_name_fit_the_confirm() {
+        use crate::remote::RemoteShell;
+        use crate::remote_probe::{TestOutcome, TestReport};
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let ctx = egui::Context::default();
+        let long = "m".repeat(crate::remote::MAX_NAME);
+        let shells = [
+            RemoteShell::Posix,
+            RemoteShell::Pwsh,
+            RemoteShell::WindowsPowerShell,
+        ];
+        for name in ["desk", "build-server-in-the-garage-rack2", long.as_str()] {
+            for (k, shell) in shells.into_iter().enumerate() {
+                let target = format!("confirm-fit-{k}-{}", name.len());
+                let mut menu = SettingsMenu::new();
+                let mut s = Settings {
+                    remotes: vec![crate::remote::Remote {
+                        name: name.into(),
+                        target: target.clone(),
+                        shell,
+                        dirs: Default::default(),
+                    }],
+                    ..Default::default()
+                };
+                menu.select_pane(Pane::Remotes);
+                menu.in_rail = false;
+                menu.remotes.set_install_project(Some("proj"));
+                menu.remotes.set_test_result(
+                    &target,
+                    TestOutcome::Ok(TestReport {
+                        shell,
+                        login_shell: None,
+                        curl: true,
+                        bash: true,
+                        agents: vec![],
+                    }),
+                );
+                frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+                let none = egui::Modifiers::NONE;
+                let mut seen = Vec::new();
+                for key in [egui::Key::I, egui::Key::ArrowRight, egui::Key::ArrowRight] {
+                    frame_at(&ctx, &mut menu, &mut s, Some(size), Some((key, none)));
+                    frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+                    let laid = menu.remotes.laid();
+                    assert!(laid.confirm.is_some(), "{name} {shell:?}: no confirm");
+                    assert!(!laid.confirm_elided, "{name} {shell:?}: a command is cut");
+                    let (q, fits) = laid.question.clone().expect("a question");
+                    assert!(q.contains(name), "{shell:?}: {q:?} lost the name");
+                    if name.len() < crate::remote::MAX_NAME {
+                        assert!(fits, "{shell:?}: {q:?} is cut");
+                    }
+                    seen.push(q);
+                }
+                assert_eq!(seen.len(), 3);
+            }
         }
     }
 

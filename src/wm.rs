@@ -3371,12 +3371,19 @@ impl WindowManager {
 
     /// Run a confirmed install of `provider` on the Remote named `name`, in
     /// the Project tagged `project` (`None`: [`Self::install_project`]).
-    /// Returns the Project's name; errors are user-facing.
+    /// `shown` is the command the confirm showed, when it was a snapshot
+    /// (the launcher's prompt). Every confirm is a snapshot of some answer,
+    /// so this re-checks against the live Remote, Test and marks and refuses
+    /// when the agent is no longer missing with its installer ready, an
+    /// install of it there is already running, or the command would differ
+    /// from the one confirmed. Returns the Project's name; errors are
+    /// user-facing.
     fn run_install(
         &mut self,
         name: &str,
         provider: &'static str,
         project: Option<String>,
+        shown: Option<&str>,
         ctx: &egui::Context,
     ) -> Result<String, String> {
         let remote = crate::remote::find(&crate::config::live(ctx).remotes, name)?.clone();
@@ -3394,6 +3401,21 @@ impl WindowManager {
                 "Open a Project first: the {provider} install on {name} runs as a Session inside one"
             ));
         };
+        let states = crate::remote_install::states_on(&remote.target, remote.shell);
+        let install = crate::remote_install::ready_to_run(
+            &remote.name,
+            remote.shell,
+            provider,
+            states.as_deref(),
+        )?;
+        if shown.is_some_and(|c| c != install.command) {
+            return Err(format!(
+                "The {provider} install command for {} changed since you confirmed it (its \
+                 shell is now {}); choose it again",
+                remote.name,
+                crate::remotes_pane::shell_label(remote.shell)
+            ));
+        }
         let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) else {
             return Err("That Project closed".into());
         };
@@ -3423,6 +3445,67 @@ impl WindowManager {
         Ok(project_name)
     }
 
+    /// "launch anyway" in the launcher's install prompt: the last Test may
+    /// predate an install by hand, so start the agent on that Remote in the
+    /// Project that asked, as its launcher row does for a found agent.
+    fn launch_anyway(&mut self, a: crate::remote_install::Ask, ctx: &egui::Context) {
+        use crate::landing::SessionKind;
+        use crate::remote_dir_prompt::{Place, What};
+        let Some(kind) = [SessionKind::Claude, SessionKind::Codex, SessionKind::Grok]
+            .into_iter()
+            .find(|k| k.provider() == Some(a.provider))
+        else {
+            return;
+        };
+        let at = self.windows.iter().find_map(|w| {
+            w.tabs
+                .iter()
+                .position(|t| {
+                    matches!(&t.content, Content::Project(c) if c.tag.as_deref() == Some(a.project.as_str()))
+                })
+                .map(|pi| (w.id, pi))
+        });
+        let Some((wid, pi)) = at else {
+            crate::notify::queue(
+                ctx,
+                crate::notify::Level::Error,
+                format!("That Project closed: {} did not start", a.provider),
+            );
+            return;
+        };
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) else {
+            return;
+        };
+        let Content::Project(inner) = &mut w.tabs[pi].content else {
+            return;
+        };
+        let ask = inner.start_remote(&a.remote, What::Agent(kind), Place::Default, ctx);
+        self.surface_target(crate::panel::TargetPath {
+            project: wid,
+            ptab: None,
+            window: None,
+            tab: Some(pi),
+        });
+        self.ask_dir(ask);
+    }
+
+    /// Tell each Settings window which Project an install from it would open
+    /// in, so the Remotes pane can name it on its confirm and refuse before
+    /// the confirm when there is none.
+    fn tell_settings_install_project(&mut self) {
+        let name = self
+            .install_project()
+            .and_then(|(wid, pi)| self.windows.iter().find(|w| w.id == wid).map(|w| (w, pi)))
+            .map(|(w, pi)| display_name(&w.tabs[pi].title).to_string());
+        for w in &mut self.windows {
+            for t in &mut w.tabs {
+                if let Content::Settings(menu) = &mut t.content {
+                    menu.remotes.set_install_project(name.as_deref());
+                }
+            }
+        }
+    }
+
     /// The watched installs whose Session has ended: its `ssh` exited, or
     /// the Win or its Project closed (which ends the `ssh`). Removed from the
     /// watch list.
@@ -3446,7 +3529,9 @@ impl WindowManager {
     }
 
     /// Re-run Test on each Remote whose install Session just ended, so the
-    /// Remotes pane row and the launcher show what it left.
+    /// Remotes pane row and the launcher show what it left. A Test already
+    /// running probed before the install ended, so `retest` owes one more
+    /// run after it; a Remote deleted meanwhile is not tested.
     fn refresh_installs(&mut self, ctx: &egui::Context) {
         for i in self.take_ended_installs() {
             crate::remote_install::set_mark(
@@ -3454,7 +3539,7 @@ impl WindowManager {
                 i.provider,
                 crate::remote_install::Mark::Ended,
             );
-            crate::remote_probe::start_test(ctx, &i.target);
+            crate::remote_probe::retest(ctx, &i.target);
         }
     }
 
@@ -3487,27 +3572,7 @@ impl WindowManager {
         ctx: &egui::Context,
     ) -> Result<Session, String> {
         let terminal_id = term_tag(id);
-        // A token names a Project and a Member; outside a Project there is no
-        // room to post into, so no Tunnel.
-        let lease = match (crate::control::tunnel::hub(ctx), self.tag.as_deref()) {
-            (Some(hub), Some(project)) => Some(
-                hub.lease(project, &terminal_id)
-                    .map_err(|e| format!("could not start the Tunnel listener: {e}"))?,
-            ),
-            (Some(_), None) => {
-                crate::notify::queue(
-                    ctx,
-                    crate::notify::Level::Warning,
-                    format!(
-                        "{terminal_id} on {} has no way back: it is outside a Project, \
-                         so its agent cannot post to chat",
-                        remote.name
-                    ),
-                );
-                None
-            }
-            (None, _) => None,
-        };
+        let lease = self.remote_lease(argv, remote, &terminal_id, ctx)?;
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
             dir,
@@ -3525,12 +3590,54 @@ impl WindowManager {
         let env = self.term_env(id);
         let mut s = Session::spawn_remote(built, remote, dir, &env, ctx.clone())
             .map_err(|e| format!("spawn failed: {e}"))?;
+        // An agent opening here has been logged in to (or is about to be):
+        // the row stops saying "installed, needs login".
+        if let Some(p) = crate::remote::agent_of(argv) {
+            crate::remote_install::clear_ended(&remote.target, p);
+        }
         if let Some(l) = lease {
             let note =
                 crate::control::tunnel::reply_note(remote.shell, l.remote_port, l.token.value());
             s.attach_tunnel(l.token, note, note_at_launch);
         }
         Ok(s)
+    }
+
+    /// The Tunnel a Remote Session launched with `argv` gets. A token names a
+    /// Project and a Member; outside a Project there is no room to post
+    /// into, so none. An install Session never gets one
+    /// ([`crate::remote::carries_tunnel`]).
+    fn remote_lease(
+        &self,
+        argv: &[String],
+        remote: &crate::remote::Remote,
+        terminal_id: &str,
+        ctx: &egui::Context,
+    ) -> Result<Option<crate::control::tunnel::Lease>, String> {
+        if !crate::remote::carries_tunnel(argv) {
+            return Ok(None);
+        }
+        Ok(
+            match (crate::control::tunnel::hub(ctx), self.tag.as_deref()) {
+                (Some(hub), Some(project)) => Some(
+                    hub.lease(project, terminal_id)
+                        .map_err(|e| format!("could not start the Tunnel listener: {e}"))?,
+                ),
+                (Some(_), None) => {
+                    crate::notify::queue(
+                        ctx,
+                        crate::notify::Level::Warning,
+                        format!(
+                            "{terminal_id} on {} has no way back: it is outside a Project, \
+                             so its agent cannot post to chat",
+                            remote.name
+                        ),
+                    );
+                    None
+                }
+                (None, _) => None,
+            },
+        )
     }
 
     /// Enter on a disconnect bar: relaunch the same Remote and directory as
@@ -5016,7 +5123,7 @@ impl WindowManager {
                 false
             }
             MenuOutcome::Install { remote, provider } => {
-                let note = match self.run_install(&remote, provider, None, ctx) {
+                let note = match self.run_install(&remote, provider, None, None, ctx) {
                     Ok(project) => format!(
                         "Installing {provider} on {remote} in a new Session in {project}. \
                          Test runs again when it ends."
@@ -5773,9 +5880,12 @@ impl WindowManager {
             // fail with "command not found".
             Launch::InstallAgent(agent) => match (inner.chosen_remote(ctx), agent.provider()) {
                 (Some(r), Some(provider)) => {
-                    let offer = crate::remote_install::states_on(&r.target, r.shell)
+                    let state = crate::remote_install::states_on(&r.target, r.shell)
                         .and_then(|s| s.into_iter().find(|(p, _)| *p == provider))
-                        .map(|(p, st)| crate::remote_install::offer(&r.name, r.shell, p, &st))
+                        .map(|(_, st)| st);
+                    let offer = state
+                        .as_ref()
+                        .map(|st| crate::remote_install::offer(&r.name, r.shell, provider, st))
                         .unwrap_or_else(|| {
                             crate::remote_install::Offer::Blocked(format!(
                                 "Test {} again in Settings > Remotes: its last answer is gone",
@@ -5787,6 +5897,10 @@ impl WindowManager {
                         provider,
                         project: inner.tag.clone().unwrap_or_default(),
                         offer,
+                        anyway: matches!(
+                            state,
+                            Some(crate::remote_install::AgentState::Missing { .. })
+                        ),
                     });
                 }
                 _ => crate::notify::queue(
@@ -8145,6 +8259,7 @@ impl WindowManager {
             self.prune_launch_on(&crate::config::live(ui.ctx()).remotes);
             self.refresh_reconnects(ui.ctx());
             self.refresh_installs(ui.ctx());
+            self.tell_settings_install_project();
             self.refresh_exit_titles();
             self.refresh_auto_titles();
             if area.size() != prev_area && self.panel_id().is_some_and(|p| self.tree.contains(p)) {
@@ -9832,10 +9947,17 @@ impl WindowManager {
                 crate::remote_install::Outcome::Cancelled => {}
                 crate::remote_install::Outcome::Confirmed => {
                     let a = prompt.ask;
-                    if let Err(e) = self.run_install(&a.remote, a.provider, Some(a.project), ctx) {
+                    let shown = match &a.offer {
+                        crate::remote_install::Offer::Install { command, .. } => Some(*command),
+                        crate::remote_install::Offer::Blocked(_) => None,
+                    };
+                    if let Err(e) =
+                        self.run_install(&a.remote, a.provider, Some(a.project), shown, ctx)
+                    {
                         crate::notify::queue(ctx, crate::notify::Level::Error, e);
                     }
                 }
+                crate::remote_install::Outcome::LaunchAnyway => self.launch_anyway(prompt.ask, ctx),
             }
         }
 
@@ -16392,14 +16514,161 @@ mod tests {
         };
         crate::config::seed_live(&ctx, &settings);
         let mut empty = WindowManager::new();
-        let e = empty.run_install("desk", "grok", None, &ctx).unwrap_err();
+        let e = empty
+            .run_install("desk", "grok", None, None, &ctx)
+            .unwrap_err();
         assert!(
             e.contains("Open a Project first") && e.contains("desk"),
             "{e}"
         );
         assert!(empty.installs.is_empty());
-        let e = empty.run_install("garage", "grok", None, &ctx).unwrap_err();
+        let e = empty
+            .run_install("garage", "grok", None, None, &ctx)
+            .unwrap_err();
         assert!(e.contains("garage"), "{e}");
+    }
+
+    /// A confirm is a snapshot; `run_install` re-checks the live Test and
+    /// marks and refuses, with a plain message and nothing opened, when the
+    /// agent is there now, an install of it is already running there, there
+    /// is no Test answer, or the command differs from the one confirmed.
+    /// Every case refuses before a spawn: no installer runs in a test.
+    #[test]
+    fn run_install_refuses_what_changed_since_the_confirm() {
+        use crate::remote_install::{Mark, set_mark};
+        use crate::remote_probe::{TestEntry, TestOutcome, TestReport, put_test_entry};
+        let target = "run-install-refuse@nowhere";
+        let ctx = egui::Context::default();
+        let settings = crate::config::Settings {
+            remotes: vec![crate::remote::Remote {
+                name: "desk".into(),
+                target: target.into(),
+                shell: crate::remote::RemoteShell::Posix,
+                dirs: Default::default(),
+            }],
+            ..Default::default()
+        };
+        crate::config::seed_live(&ctx, &settings);
+        let mut wm = WindowManager::new();
+        let p = push(&mut wm, "proj");
+        let tested = |agents: &[&str]| {
+            put_test_entry(
+                target,
+                TestEntry {
+                    generation: 1,
+                    running: false,
+                    last: Some(TestOutcome::Ok(TestReport {
+                        shell: crate::remote::RemoteShell::Posix,
+                        login_shell: None,
+                        curl: true,
+                        bash: true,
+                        agents: agents.iter().map(|a| a.to_string()).collect(),
+                    })),
+                },
+            )
+        };
+        let refuse = |wm: &mut WindowManager, shown: Option<&str>| {
+            let e = wm
+                .run_install("desk", "grok", Some(format!("p{p}")), shown, &ctx)
+                .unwrap_err();
+            assert!(wm.installs.is_empty(), "{e}");
+            e
+        };
+
+        let e = refuse(&mut wm, None);
+        assert!(e.contains("Test desk again"), "never tested: {e}");
+
+        tested(&["grok"]);
+        let e = refuse(&mut wm, None);
+        assert_eq!(e, "grok is already on desk.");
+
+        tested(&[]);
+        set_mark(target, "grok", Mark::Installing);
+        let e = refuse(&mut wm, None);
+        assert!(e.contains("already installing on desk"), "{e}");
+
+        // Missing and ready again (the install ended), but the launcher
+        // showed another command than the live Remote's shell runs.
+        set_mark(target, "grok", Mark::Ended);
+        let e = refuse(&mut wm, Some("irm https://x.ai/cli/install.ps1 | iex"));
+        assert!(e.contains("changed since you confirmed"), "{e}");
+    }
+
+    /// An install Session's launch leases no Tunnel, even in a Project with
+    /// the Tunnel up: no `FOREMAN_URL`/`FOREMAN_TOKEN` for a third-party
+    /// script, no forward to fail the install. Other launches still get one.
+    #[test]
+    fn an_install_launch_carries_no_tunnel() {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx);
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".into());
+        for provider in crate::remote_probe::AGENTS {
+            for shell in [
+                crate::remote::RemoteShell::Posix,
+                crate::remote::RemoteShell::Pwsh,
+                crate::remote::RemoteShell::WindowsPowerShell,
+            ] {
+                let desk = crate::remote::Remote {
+                    name: "desk".into(),
+                    target: "andy@desk".into(),
+                    shell,
+                    dirs: Default::default(),
+                };
+                let argv = crate::remote_install::session_argv(&desk, provider).unwrap();
+                let lease = wm.remote_lease(&argv, &desk, "t5", &ctx).unwrap();
+                assert!(lease.is_none(), "{argv:?}");
+            }
+        }
+        let desk = crate::remote::Remote {
+            name: "desk".into(),
+            target: "andy@desk".into(),
+            shell: crate::remote::RemoteShell::Posix,
+            dirs: Default::default(),
+        };
+        let agent = vec!["claude".to_string()];
+        assert!(
+            wm.remote_lease(&agent, &desk, "t6", &ctx)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// An install tab is a plain Remote shell everywhere: the shell icon,
+    /// no agent in the workspace file, so after a restart Enter opens a
+    /// shell, for all three providers (grok's URL never named it; claude's
+    /// and codex's did).
+    #[test]
+    fn an_install_tab_saves_and_shows_as_a_plain_remote_shell() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let desk = crate::remote::Remote {
+            name: "desk".into(),
+            target: "foreman-test@127.0.0.1".into(),
+            shell: crate::remote::RemoteShell::Posix,
+            dirs: Default::default(),
+        };
+        for provider in crate::remote_probe::AGENTS {
+            let mut wm = WindowManager::new();
+            wm.tag = Some("p1".into());
+            wm.apply_manager(&remote_terminal_snap("desk"), &ctx);
+            let Content::Terminal(s) = &mut wm.windows[0].tabs[0].content else {
+                panic!("expected a terminal");
+            };
+            s.set_dispatched_for_test(
+                crate::remote_install::session_argv(&desk, provider).unwrap(),
+            );
+            assert_eq!(s.icon_kind(), crate::icons::IconKind::Cmd, "{provider}");
+            assert_eq!(crate::remote::agent_of(s.dispatched()), None);
+            match &wm.capture_manager().windows[0].tabs[0].content {
+                crate::workspace::ContentSnap::Terminal { remote, agent, .. } => {
+                    assert_eq!(remote.as_deref(), Some("desk"));
+                    assert_eq!(agent.as_deref(), None, "{provider} saved as an agent");
+                }
+                _ => panic!("expected Terminal"),
+            }
+        }
     }
 
     /// An install whose Session or Project is gone has ended: it leaves the

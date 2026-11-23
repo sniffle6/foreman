@@ -398,6 +398,9 @@ pub struct TestEntry {
 pub struct TestCache {
     entries: HashMap<String, TestEntry>,
     generation: u64,
+    /// Targets owed one more run when their running Test finishes: that run
+    /// probed before whatever asked (an install ending) changed the Remote.
+    again: std::collections::HashSet<String>,
 }
 
 impl TestCache {
@@ -414,16 +417,43 @@ impl TestCache {
         true
     }
 
-    pub fn finish(&mut self, target: &str, outcome: TestOutcome) {
+    /// [`Self::begin`], or, while a Test is running, owe `target` one more
+    /// run after it (asking twice still owes one). True = start one now.
+    pub fn begin_or_queue(&mut self, target: &str) -> bool {
+        if self.begin(target) {
+            return true;
+        }
+        self.again.insert(target.to_string());
+        false
+    }
+
+    /// Store a finished answer. When a re-run is owed and `target` is still
+    /// a Remote, the entry stays running and this returns true: probe again.
+    /// The answer is stored either way, but readers see `running` and keep
+    /// showing "checking" until the re-run lands.
+    pub fn finish(&mut self, target: &str, outcome: TestOutcome, still_listed: bool) -> bool {
         self.generation += 1;
+        let again = self.again.remove(target) && still_listed;
         let e = self.entries.entry(target.to_string()).or_default();
-        e.running = false;
+        e.running = again;
         e.last = Some(outcome);
         e.generation = self.generation;
+        again
     }
 
     pub fn get(&self, target: &str) -> Option<TestEntry> {
         self.entries.get(target).cloned()
+    }
+
+    /// The entry's generation alone: a per-frame "anything new?" check that
+    /// clones nothing.
+    pub fn generation_of(&self, target: &str) -> Option<u64> {
+        self.entries.get(target).map(|e| e.generation)
+    }
+
+    #[cfg(test)]
+    pub fn put(&mut self, target: &str, entry: TestEntry) {
+        self.entries.insert(target.to_string(), entry);
     }
 }
 
@@ -432,35 +462,88 @@ fn tests() -> &'static Mutex<TestCache> {
     TESTS.get_or_init(Mutex::default)
 }
 
+/// Whether `target` is still a Remote in the live settings.
+fn listed(ctx: &egui::Context, target: &str) -> bool {
+    crate::config::live(ctx)
+        .remotes
+        .iter()
+        .any(|r| r.target == target)
+}
+
 /// Run Test for `target` on its own thread, unless one is already running.
 /// The answer lands in the shared cache ([`test_entry`]) and wakes the UI.
 pub fn start_test(ctx: &egui::Context, target: &str) {
-    if !tests()
+    let began = tests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .begin(target)
-    {
+        .begin(target);
+    if began {
+        spawn_test(ctx, target);
+    }
+}
+
+/// Test `target` again because something changed it (an install Session
+/// ended): now, or once more right after a Test already in flight, whose
+/// answer predates the change. Nothing for a target that is no longer a
+/// Remote.
+pub fn retest(ctx: &egui::Context, target: &str) {
+    if !listed(ctx, target) {
         return;
     }
+    let began = tests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin_or_queue(target);
+    if began {
+        spawn_test(ctx, target);
+    }
+}
+
+/// The worker for a `target` already marked running: probe, store, and
+/// probe again while a re-run is owed.
+fn spawn_test(ctx: &egui::Context, target: &str) {
     let ctx = ctx.clone();
     let target = target.to_string();
     std::thread::spawn(move || {
-        let outcome = run_test(&target);
-        tests()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish(&target, outcome);
-        ctx.request_repaint();
+        loop {
+            let outcome = run_test(&target);
+            let still = listed(&ctx, &target);
+            let again = tests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish(&target, outcome, still);
+            ctx.request_repaint();
+            if !again {
+                break;
+            }
+        }
     });
 }
 
-/// The last Test of `target` this app run; `None` = never tested. A lock and
-/// a map lookup, cheap enough per frame.
+/// The last Test of `target` this app run; `None` = never tested. Clones
+/// the report: per frame, check [`test_generation`] first.
 pub fn test_entry(target: &str) -> Option<TestEntry> {
     tests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(target)
+}
+
+/// [`TestEntry::generation`] for `target`, without cloning the entry.
+pub fn test_generation(target: &str) -> Option<u64> {
+    tests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .generation_of(target)
+}
+
+/// Test hook: a shared entry, as if a Test had run.
+#[cfg(test)]
+pub fn put_test_entry(target: &str, entry: TestEntry) {
+    tests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(target, entry);
 }
 
 fn run_test(target: &str) -> TestOutcome {
@@ -760,7 +843,10 @@ mod tests {
         assert!(!c.begin("desk"), "already running");
         let g = c.get("desk").unwrap();
         assert!(g.running && g.last.is_none());
-        c.finish("desk", TestOutcome::NeedsLogin);
+        assert!(
+            !c.finish("desk", TestOutcome::NeedsLogin, true),
+            "nothing owed"
+        );
         let done = c.get("desk").unwrap();
         assert!(!done.running && done.generation > g.generation);
         assert!(c.begin("desk"));
@@ -768,6 +854,47 @@ mod tests {
         assert!(again.running && again.generation > done.generation);
         assert_eq!(again.last, Some(TestOutcome::NeedsLogin));
         assert_eq!(c.get("other"), None);
+    }
+
+    /// An install ending while a Test is in flight: that Test probed before
+    /// the install, so one more run is owed. The stale answer lands but the
+    /// entry stays running (the row keeps saying "checking"), the owed run
+    /// happens once however often it was asked for, and never for a Remote
+    /// deleted meanwhile.
+    #[test]
+    fn a_retest_during_a_running_test_runs_once_more_after_it() {
+        let stale = TestOutcome::Failed("probed before the install".into());
+        let fresh = TestOutcome::NeedsLogin;
+        let mut c = TestCache::default();
+        assert!(c.begin_or_queue("desk"), "idle: starts now");
+        assert!(!c.begin_or_queue("desk"), "running: owed");
+        assert!(!c.begin_or_queue("desk"), "still one owed");
+        assert!(c.finish("desk", stale.clone(), true), "probe again");
+        let e = c.get("desk").unwrap();
+        assert!(e.running, "readers keep showing checking");
+        assert_eq!(e.last, Some(stale.clone()));
+        assert!(!c.finish("desk", fresh.clone(), true), "owed once");
+        let e = c.get("desk").unwrap();
+        assert!(!e.running);
+        assert_eq!(e.last, Some(fresh));
+
+        // Owed, but the Remote was deleted before the in-flight run ended.
+        assert!(c.begin("desk"));
+        assert!(!c.begin_or_queue("desk"));
+        assert!(!c.finish("desk", stale, false));
+        assert!(!c.get("desk").unwrap().running);
+        // Nothing left owed for a later run either.
+        assert!(c.begin("desk"));
+        assert!(!c.finish("desk", TestOutcome::NeedsLogin, true));
+    }
+
+    /// A retest for a target that is no longer a Remote starts nothing.
+    #[test]
+    fn a_retest_of_a_deleted_remote_does_nothing() {
+        let ctx = egui::Context::default();
+        retest(&ctx, "retest-gone@nowhere");
+        assert_eq!(test_entry("retest-gone@nowhere"), None);
+        assert_eq!(test_generation("retest-gone@nowhere"), None);
     }
 
     #[test]

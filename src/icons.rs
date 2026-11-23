@@ -158,8 +158,14 @@ impl IconKind {
     /// is the one that launches, not the one a prompt mentions: a program
     /// whose file stem IS a provider wins (`C:\claude code\bin\codex.exe` is
     /// Codex), then the earliest mention in argv order (`wsl codex "compare
-    /// with claude"` is Codex).
+    /// with claude"` is Codex). An install Session's argv
+    /// ([`crate::remote::install_of`]) is never an agent, though two of the
+    /// vendor URLs name one: it is a shell running a third-party script, and
+    /// the icon, badges, status and the workspace snapshot all key off this.
     pub fn from_argv(argv: &[String]) -> Option<Self> {
+        if crate::remote::install_of(argv).is_some() {
+            return None;
+        }
         const AGENTS: [(&str, IconKind); 3] = [
             ("claude", IconKind::Claude),
             ("codex", IconKind::Codex),

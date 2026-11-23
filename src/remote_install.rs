@@ -7,6 +7,7 @@
 //! `docs/superpowers/specs/2026-11-20-remote-sessions-design.md`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eframe::egui;
@@ -28,11 +29,32 @@ fn marks() -> &'static Mutex<HashMap<(String, String), Mark>> {
     MARKS.get_or_init(Mutex::default)
 }
 
+/// Bumped by every mark change, so a cached agents line can tell it is
+/// stale without taking the marks lock.
+static MARKS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn marks_generation() -> u64 {
+    MARKS_GENERATION.load(Ordering::Relaxed)
+}
+
 pub fn set_mark(target: &str, provider: &str, mark: Mark) {
     marks()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((target.to_string(), provider.to_string()), mark);
+    MARKS_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// An agent Session for `provider` opened on `target`: an ended install's
+/// "installed, needs login" is over (the user is logging in, or has). A
+/// running install keeps its mark.
+pub fn clear_ended(target: &str, provider: &str) {
+    let mut m = marks().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (target.to_string(), provider.to_string());
+    if m.get(&key) == Some(&Mark::Ended) {
+        m.remove(&key);
+        MARKS_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn mark_of(target: &str, provider: &str) -> Option<Mark> {
@@ -162,6 +184,37 @@ pub fn session_argv(remote: &crate::remote::Remote, provider: &str) -> Result<Ve
     Ok(crate::remote::install_argv(remote.shell, i.command))
 }
 
+/// The last check before an install Session opens, against the live Test
+/// answer and marks for the live Remote: both confirms (the pane's row and
+/// the launcher's prompt) showed a snapshot, and a Test may have landed or
+/// another install started since. Only a missing agent whose installer is
+/// ready runs; anything else is the plain message why not. `states` is
+/// [`states_on`] for the Remote named `name`.
+pub fn ready_to_run(
+    name: &str,
+    shell: RemoteShell,
+    provider: &'static str,
+    states: Option<&[(&'static str, AgentState)]>,
+) -> Result<&'static Install, String> {
+    let Some(state) = states.and_then(|s| s.iter().find(|(p, _)| *p == provider)) else {
+        return Err(format!(
+            "Test {name} again in Settings > Remotes: foreman installs {provider} only \
+             where the last Test did not find it"
+        ));
+    };
+    match (&state.1, offer(name, shell, provider, &state.1)) {
+        (
+            AgentState::Missing {
+                gate: Gate::Ready(i),
+                ..
+            },
+            _,
+        ) => Ok(i),
+        (_, Offer::Blocked(why)) => Err(why),
+        (_, Offer::Install { title, .. }) => Err(title),
+    }
+}
+
 /// "curl", "curl and bash".
 fn and_list(items: &[&str]) -> String {
     match items {
@@ -185,6 +238,41 @@ pub enum Offer {
     Blocked(String),
 }
 
+/// Every PowerShell install command is untested: no Windows Remote has
+/// existed to run one against.
+fn untested(shell: RemoteShell) -> bool {
+    crate::remote::InstallShell::from(shell) == crate::remote::InstallShell::PowerShell
+}
+
+/// The pane confirm's footer: what hover used to hide. Where the Session
+/// opens, that a login follows, and, for PowerShell, that the command is
+/// untested.
+pub fn confirm_footer(project: &str, provider: &str, shell: RemoteShell) -> String {
+    let mut s = format!("Opens in {project}; {provider} needs a login after.");
+    if untested(shell) {
+        s.push_str(" Untested on Windows Remotes.");
+    }
+    s
+}
+
+/// The pane confirm's question, in the row's text room. Shortened, never
+/// cut, so the Remote's name always shows (the command block and footer
+/// name the agent too): the first candidate that `fits`, else the shortest.
+pub fn question(provider: &str, name: &str, fits: impl Fn(&str) -> bool) -> String {
+    let candidates = [
+        format!("Install {provider} on {name}?"),
+        format!("{provider} on {name}?"),
+        format!("On {name}?"),
+    ];
+    let last = candidates.len() - 1;
+    candidates
+        .into_iter()
+        .enumerate()
+        .find(|(k, q)| *k == last || fits(q))
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+}
+
 pub fn offer(name: &str, shell: RemoteShell, provider: &'static str, state: &AgentState) -> Offer {
     let p = provider;
     match state {
@@ -198,7 +286,12 @@ pub fn offer(name: &str, shell: RemoteShell, provider: &'static str, state: &Age
             note: format!(
                 "Runs {p}'s own installer in a new Session on {name}, in its home \
                  directory, so you can read the output, answer any prompt or press \
-                 Ctrl+C. Then {p} needs a login: run {p} in a Session on {name}."
+                 Ctrl+C. Then {p} needs a login: run {p} in a Session on {name}.{}",
+                if untested(shell) {
+                    " This PowerShell command is untested on Windows Remotes."
+                } else {
+                    ""
+                }
             ),
         },
         AgentState::Missing {
@@ -241,98 +334,167 @@ pub enum Piece {
         /// The whole story, on hover.
         hover: Option<String>,
     },
-    /// An "install <provider>" row button; its hover shows the command.
+    /// An install row button for `provider`; its hover shows the command.
     Install {
         provider: &'static str,
+        /// "install grok"; after an install that did not finish, "retry"
+        /// (or "retry grok" when several did not), beside the words saying
+        /// so: the line must fit the narrowest pane.
+        label: String,
         hover: String,
     },
 }
 
 /// The agents line under a tested Remote's row: found agents together, then
-/// each other agent's state in words (or its install button), with agents
-/// blocked for the same reason grouped so the line fits the narrowest pane.
-/// Every state is a word, never only a colour.
+/// agents in the same state grouped ("claude, codex installed, need login")
+/// so the line fits the narrowest pane, then an install button for each
+/// installable one. An install that ended without the agent says so before
+/// its button, so a failed or cancelled install never looks untried. Every
+/// state is a word, never only a colour.
 pub fn agents_line(
     name: &str,
     shell: RemoteShell,
     states: &[(&'static str, AgentState)],
 ) -> Vec<Piece> {
-    let text = |text: String, hover: Option<String>| Piece::Text { text, hover };
+    let hover_of = |p: &'static str, s: &AgentState| match offer(name, shell, p, s) {
+        Offer::Install { command, note, .. } => format!("{command}\n\n{note}"),
+        Offer::Blocked(why) => why,
+    };
+    let of = |want: fn(&AgentState) -> bool| -> Vec<&'static str> {
+        states
+            .iter()
+            .filter(|(_, s)| want(s))
+            .map(|(p, _)| *p)
+            .collect()
+    };
+    // One text piece for agents sharing a state: singular and plural words.
+    let group = |ps: &[&'static str], one: &str, many: &str| -> Option<Piece> {
+        if ps.is_empty() {
+            return None;
+        }
+        let hover = states
+            .iter()
+            .filter(|(p, _)| ps.contains(p))
+            .map(|(p, s)| hover_of(p, s))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let words = if ps.len() == 1 { one } else { many };
+        Some(Piece::Text {
+            text: format!("{} {words}", ps.join(", ")),
+            hover: Some(hover),
+        })
+    };
     let mut out = Vec::new();
-    let found: Vec<&str> = states
-        .iter()
-        .filter(|(_, s)| *s == AgentState::Found)
-        .map(|(p, _)| *p)
-        .collect();
+    let found = of(|s| *s == AgentState::Found);
     if !found.is_empty() {
-        out.push(text(format!("has {}", found.join(", ")), None));
+        out.push(Piece::Text {
+            text: format!("has {}", found.join(", ")),
+            hover: None,
+        });
+    }
+    out.extend(group(
+        &of(|s| *s == AgentState::Installed),
+        "installed, needs login",
+        "installed, need login",
+    ));
+    out.extend(group(
+        &of(|s| *s == AgentState::Installing),
+        "installing…",
+        "installing…",
+    ));
+    out.extend(group(
+        &of(|s| *s == AgentState::Checking),
+        "checking…",
+        "checking…",
+    ));
+    let failed = of(|s| {
+        matches!(
+            s,
+            AgentState::Missing {
+                gate: Gate::Ready(_),
+                after_install: true
+            }
+        )
+    });
+    if !failed.is_empty() {
+        let words = if failed.len() == 1 {
+            "install did not finish"
+        } else {
+            "installs did not finish"
+        };
+        out.push(Piece::Text {
+            text: format!("{} {words}", failed.join(", ")),
+            hover: Some(format!(
+                "The last install from here ended, but Test does not find {} on {name}'s \
+                 PATH. Read that Session's output, then install again.",
+                failed.join(", ")
+            )),
+        });
+    }
+    for (p, s) in states {
+        if let AgentState::Missing {
+            gate: Gate::Ready(_),
+            after_install,
+        } = s
+        {
+            let label = match (after_install, failed.len()) {
+                (false, _) => format!("install {p}"),
+                (true, 1) => "retry".to_string(),
+                (true, _) => format!("retry {p}"),
+            };
+            out.push(Piece::Install {
+                provider: p,
+                label,
+                hover: hover_of(p, s),
+            });
+        }
     }
     let mut needs: Vec<&str> = Vec::new();
     let mut needed: Vec<&str> = Vec::new();
-    let mut by_hand: Vec<&str> = Vec::new();
     for (p, s) in states {
-        let hover = match offer(name, shell, p, s) {
-            Offer::Install { command, note, .. } => format!("{command}\n\n{note}"),
-            Offer::Blocked(why) => why,
-        };
-        match s {
-            AgentState::Found => {}
-            AgentState::Installed => {
-                out.push(text(format!("{p} installed, needs login"), Some(hover)))
-            }
-            AgentState::Installing => out.push(text(format!("{p} installing…"), Some(hover))),
-            AgentState::Checking => out.push(text(format!("{p} checking…"), Some(hover))),
-            AgentState::Missing {
-                gate: Gate::Ready(_),
-                after_install,
-            } => {
-                let hover = if *after_install {
-                    format!(
-                        "The last {p} install ended, but Test does not find {p} on {name}'s \
-                         PATH. Read that Session's output.\n\n{hover}"
-                    )
-                } else {
-                    hover
-                };
-                out.push(Piece::Install { provider: p, hover });
-            }
-            AgentState::Missing {
-                gate: Gate::Needs(missing),
-                ..
-            } => {
-                needs.push(p);
-                for m in missing {
-                    if !needed.contains(&m.name()) {
-                        needed.push(m.name());
-                    }
+        if let AgentState::Missing {
+            gate: Gate::Needs(missing),
+            ..
+        } = s
+        {
+            needs.push(p);
+            for m in missing {
+                if !needed.contains(&m.name()) {
+                    needed.push(m.name());
                 }
             }
-            AgentState::Missing {
-                gate: Gate::ByHand, ..
-            } => by_hand.push(p),
         }
     }
     if !needs.is_empty() {
         let verb = if needs.len() == 1 { "needs" } else { "need" };
-        out.push(text(
-            format!("{} {verb} {}", needs.join(", "), and_list(&needed)),
-            Some(format!(
+        out.push(Piece::Text {
+            text: format!("{} {verb} {}", needs.join(", "), and_list(&needed)),
+            hover: Some(format!(
                 "Not on {name}, and the installer needs {} there first. Install it with \
                  {name}'s package manager, then Test again.",
                 and_list(&needed)
             )),
-        ));
+        });
     }
+    let by_hand = of(|s| {
+        matches!(
+            s,
+            AgentState::Missing {
+                gate: Gate::ByHand,
+                ..
+            }
+        )
+    });
     if !by_hand.is_empty() {
-        out.push(text(
-            format!("{}: install by hand", by_hand.join(", ")),
-            Some(format!(
+        out.push(Piece::Text {
+            text: format!("{}: install by hand", by_hand.join(", ")),
+            hover: Some(format!(
                 "No install command for {} on a {} Remote. Install by hand on {name}, then \
                  Test again.",
                 by_hand.join(", "),
                 crate::remotes_pane::shell_label(shell)
             )),
-        ));
+        });
     }
     out
 }
@@ -367,6 +529,9 @@ pub struct Ask {
     /// The Project's tag (`p7`) whose launcher asked: the install opens there.
     pub project: String,
     pub offer: Offer,
+    /// The last Test said missing. That answer can be stale (installed by
+    /// hand since), so the prompt also offers launching the agent anyway.
+    pub anyway: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,12 +540,17 @@ pub enum Outcome {
     Cancelled,
     /// Run the install. Only an [`Offer::Install`] confirms.
     Confirmed,
+    /// Launch the agent as if the last Test had found it.
+    LaunchAnyway,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     Enter,
     Esc,
+    /// The "launch anyway" button. No key reaches it: Enter stays on the
+    /// safe choice.
+    Anyway,
 }
 
 /// The desktop modal the launcher opens for a missing agent: the same words
@@ -397,9 +567,38 @@ impl Prompt {
     pub fn key(&self, k: Key) -> Outcome {
         match (k, &self.ask.offer) {
             (Key::Enter, Offer::Install { .. }) => Outcome::Confirmed,
+            (Key::Anyway, _) if self.ask.anyway => Outcome::LaunchAnyway,
+            (Key::Anyway, _) => Outcome::Pending,
             // A message has nothing to run: Enter only closes it.
             (Key::Enter, Offer::Blocked(_)) | (Key::Esc, _) => Outcome::Cancelled,
         }
+    }
+
+    /// The buttons, in order, and the key each one is. The first is what
+    /// Enter does.
+    pub fn buttons(&self) -> Vec<(&'static str, Key)> {
+        let mut b = match self.ask.offer {
+            Offer::Install { .. } => vec![("install", Key::Enter), ("cancel", Key::Esc)],
+            Offer::Blocked(_) => vec![("close", Key::Esc)],
+        };
+        if self.ask.anyway {
+            b.push(("launch anyway", Key::Anyway));
+        }
+        b
+    }
+
+    /// Why the agent is marked missing and where to check again: the answer
+    /// may be older than an install by hand.
+    pub fn stale_line(&self) -> Option<String> {
+        let Ask {
+            remote, provider, ..
+        } = &self.ask;
+        self.ask.anyway.then(|| {
+            format!(
+                "The last Test of {remote} did not find {provider}. Installed it since? \
+                 Launch anyway, or Test again in Settings > Remotes."
+            )
+        })
     }
 
     /// The key line, by what Enter does here.
@@ -462,6 +661,13 @@ impl Prompt {
                     ui.add(
                         egui::Label::new(egui::RichText::new(body).color(th.dim).size(11.5)).wrap(),
                     );
+                    if let Some(stale) = self.stale_line() {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(stale).color(th.dim).size(11.5))
+                                .wrap(),
+                        );
+                    }
                     ui.add_space(6.0);
                     egui::Frame::new()
                         .fill(th.sel_bg)
@@ -481,17 +687,14 @@ impl Prompt {
                                     .wrap(),
                                 );
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("install").clicked() {
-                                        acts.push(Key::Enter);
-                                    }
-                                    if ui.small_button("cancel").clicked() {
-                                        acts.push(Key::Esc);
-                                    }
-                                });
-                            } else if ui.small_button("close").clicked() {
-                                acts.push(Key::Esc);
                             }
+                            ui.horizontal(|ui| {
+                                for (label, k) in self.buttons() {
+                                    if ui.small_button(label).clicked() {
+                                        acts.push(k);
+                                    }
+                                }
+                            });
                         });
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(self.hint()).color(th.dim).size(11.5));
@@ -638,7 +841,7 @@ mod tests {
         assert_eq!(line.len(), 3, "{line:?}");
         assert!(matches!(&line[0], Piece::Text { text, .. } if text == "has claude"));
         assert!(
-            matches!(&line[1], Piece::Install { provider: "codex", hover } if hover.starts_with("curl -fsSL https://chatgpt.com/codex/install.sh | sh"))
+            matches!(&line[1], Piece::Install { provider: "codex", label, hover } if label == "install codex" && hover.starts_with("curl -fsSL https://chatgpt.com/codex/install.sh | sh"))
         );
         assert!(matches!(&line[2], Piece::Text { text, .. } if text == "grok needs bash"));
         assert_eq!(installable(&states), ["codex"]);
@@ -699,11 +902,45 @@ mod tests {
 
     #[test]
     fn the_prompt_confirms_only_an_install() {
+        let ask = |offer, anyway| Ask {
+            remote: "desk".into(),
+            provider: "grok",
+            project: "p1".into(),
+            offer,
+            anyway,
+        };
+        let install_offer = || Offer::Install {
+            provider: "grok",
+            title: "Install grok on desk?".into(),
+            command: "curl x | bash",
+            note: String::new(),
+        };
+        let install = Prompt::new(ask(install_offer(), false));
+        assert_eq!(install.key(Key::Enter), Outcome::Confirmed);
+        assert_eq!(install.key(Key::Esc), Outcome::Cancelled);
+        assert_eq!(install.hint(), "Enter install · Esc cancel");
+        assert_eq!(
+            install.buttons(),
+            [("install", Key::Enter), ("cancel", Key::Esc)]
+        );
+        assert_eq!(install.stale_line(), None);
+        assert_eq!(install.key(Key::Anyway), Outcome::Pending);
+        let blocked = Prompt::new(ask(Offer::Blocked("needs curl".into()), false));
+        assert_eq!(blocked.key(Key::Enter), Outcome::Cancelled);
+        assert_eq!(blocked.hint(), "Enter or Esc close");
+    }
+
+    /// A stale "missing" must not lock the agent out: the prompt offers
+    /// "launch anyway", last and never on Enter, and says the last Test did
+    /// not find it and where to Test again.
+    #[test]
+    fn the_prompt_offers_launch_anyway_but_never_on_enter() {
         let ask = |offer| Ask {
             remote: "desk".into(),
             provider: "grok",
             project: "p1".into(),
             offer,
+            anyway: true,
         };
         let install = Prompt::new(ask(Offer::Install {
             provider: "grok",
@@ -711,11 +948,203 @@ mod tests {
             command: "curl x | bash",
             note: String::new(),
         }));
-        assert_eq!(install.key(Key::Enter), Outcome::Confirmed);
-        assert_eq!(install.key(Key::Esc), Outcome::Cancelled);
+        assert_eq!(
+            install.key(Key::Enter),
+            Outcome::Confirmed,
+            "Enter installs"
+        );
+        assert_eq!(install.key(Key::Anyway), Outcome::LaunchAnyway);
+        assert_eq!(
+            install.buttons(),
+            [
+                ("install", Key::Enter),
+                ("cancel", Key::Esc),
+                ("launch anyway", Key::Anyway)
+            ]
+        );
         assert_eq!(install.hint(), "Enter install · Esc cancel");
+        let line = install.stale_line().unwrap();
+        assert!(
+            line.contains("last Test of desk did not find grok")
+                && line.contains("Settings > Remotes"),
+            "{line}"
+        );
+
+        // Nothing to install (needs curl): Enter still only closes.
         let blocked = Prompt::new(ask(Offer::Blocked("needs curl".into())));
         assert_eq!(blocked.key(Key::Enter), Outcome::Cancelled);
-        assert_eq!(blocked.hint(), "Enter or Esc close");
+        assert_eq!(blocked.key(Key::Anyway), Outcome::LaunchAnyway);
+        assert_eq!(
+            blocked.buttons(),
+            [("close", Key::Esc), ("launch anyway", Key::Anyway)]
+        );
+    }
+
+    fn line_of(states: &[(&'static str, AgentState)]) -> Vec<Piece> {
+        agents_line("desk", RemoteShell::Posix, states)
+    }
+
+    fn words(line: &[Piece]) -> Vec<String> {
+        line.iter()
+            .map(|p| match p {
+                Piece::Text { text, .. } => text.clone(),
+                Piece::Install { label, .. } => format!("[{label}]"),
+            })
+            .collect()
+    }
+
+    fn ready(after_install: bool) -> AgentState {
+        AgentState::Missing {
+            gate: Gate::Ready(posix("grok").unwrap()),
+            after_install,
+        }
+    }
+
+    /// Like states are one piece, as needs and by-hand already were, so the
+    /// main sequence (install two, a third still to go) fits one line.
+    #[test]
+    fn the_agents_line_groups_like_states() {
+        use AgentState::*;
+        assert_eq!(
+            words(&line_of(&[
+                ("claude", Installed),
+                ("codex", Installed),
+                ("grok", ready(false))
+            ])),
+            ["claude, codex installed, need login", "[install grok]"]
+        );
+        assert_eq!(
+            words(&line_of(&[
+                ("claude", Installed),
+                ("codex", Installed),
+                ("grok", Installed)
+            ])),
+            ["claude, codex, grok installed, need login"]
+        );
+        assert_eq!(
+            words(&line_of(&[
+                ("claude", Found),
+                ("codex", Installing),
+                ("grok", Installing)
+            ])),
+            ["has claude", "codex, grok installing…"]
+        );
+        assert_eq!(
+            words(&line_of(&[("codex", Checking), ("grok", Checking)])),
+            ["codex, grok checking…"]
+        );
+    }
+
+    /// A failed or cancelled install says so, and still offers the install.
+    #[test]
+    fn an_install_that_did_not_finish_says_so_and_offers_it_again() {
+        let line = line_of(&[("claude", AgentState::Found), ("grok", ready(true))]);
+        assert_eq!(
+            words(&line),
+            ["has claude", "grok install did not finish", "[retry]"]
+        );
+        let Piece::Text { hover: Some(h), .. } = &line[1] else {
+            panic!("{line:?}")
+        };
+        assert!(h.contains("Read that Session's output"), "{h}");
+        // Never tried: just the button.
+        assert_eq!(
+            words(&line_of(&[("grok", ready(false))])),
+            ["[install grok]"]
+        );
+        assert_eq!(
+            words(&line_of(&[("codex", ready(true)), ("grok", ready(true))])),
+            [
+                "codex, grok installs did not finish",
+                "[retry codex]",
+                "[retry grok]"
+            ]
+        );
+    }
+
+    /// Opening an agent Session for that provider there ends "installed,
+    /// needs login"; a running install keeps its mark; every change moves
+    /// the generation a cached line keys on.
+    #[test]
+    fn an_agent_session_clears_only_an_ended_install() {
+        let t = "clear-ended@desk";
+        set_mark(t, "claude", Mark::Ended);
+        let g = marks_generation();
+        clear_ended(t, "claude");
+        assert_eq!(mark_of(t, "claude"), None);
+        assert!(marks_generation() > g);
+        set_mark(t, "codex", Mark::Installing);
+        clear_ended(t, "codex");
+        assert_eq!(mark_of(t, "codex"), Some(Mark::Installing));
+        let g = marks_generation();
+        clear_ended(t, "grok");
+        assert_eq!(marks_generation(), g, "nothing to clear, nothing moved");
+    }
+
+    /// The last check before a spawn: only a missing agent whose installer
+    /// is ready runs; anything else is the offer's own words.
+    #[test]
+    fn ready_to_run_takes_only_a_ready_missing_agent() {
+        use AgentState::*;
+        let run = |s: AgentState| {
+            ready_to_run("desk", RemoteShell::Posix, "grok", Some(&[("grok", s)][..]))
+        };
+        assert_eq!(run(ready(false)), Ok(posix("grok").unwrap()));
+        assert_eq!(run(ready(true)), Ok(posix("grok").unwrap()), "retry");
+        assert_eq!(run(Found).unwrap_err(), "grok is already on desk.");
+        assert!(run(Installing).unwrap_err().contains("already installing"));
+        assert!(run(Checking).unwrap_err().contains("Test is checking"));
+        assert!(run(Installed).unwrap_err().contains("needs a login"));
+        let e = run(Missing {
+            gate: Gate::Needs(vec![Prereq::Bash]),
+            after_install: false,
+        })
+        .unwrap_err();
+        assert!(e.contains("needs bash"), "{e}");
+        let e = ready_to_run("desk", RemoteShell::Posix, "grok", None).unwrap_err();
+        assert!(e.contains("Test desk again"), "{e}");
+    }
+
+    /// The pane's question loses words before the Remote's name.
+    #[test]
+    fn the_question_keeps_the_remote_name() {
+        let all = |_: &str| true;
+        assert_eq!(question("grok", "desk", all), "Install grok on desk?");
+        let short = |q: &str| q.len() <= 16;
+        assert_eq!(question("grok", "desk", short), "grok on desk?");
+        let tiny = |q: &str| q.len() <= 9;
+        assert_eq!(question("grok", "desk", tiny), "On desk?");
+        assert_eq!(question("grok", "desk", |_| false), "On desk?");
+    }
+
+    /// Every PowerShell command says, in the confirm's own note and footer,
+    /// that it has never been run against a Windows Remote.
+    #[test]
+    fn powershell_installs_say_they_are_untested() {
+        let r = report(true, true, &[]);
+        for (shell, untested) in [
+            (RemoteShell::Posix, false),
+            (RemoteShell::Pwsh, true),
+            (RemoteShell::WindowsPowerShell, true),
+        ] {
+            let i = crate::remote::install_for("grok", shell);
+            let s = agent_state("grok", i, &r, false, None);
+            let Offer::Install { note, .. } = offer("desk", shell, "grok", &s) else {
+                panic!("ready")
+            };
+            assert_eq!(
+                note.contains("untested on Windows Remotes"),
+                untested,
+                "{note}"
+            );
+            assert_eq!(
+                confirm_footer("proj", "grok", shell).contains("Untested on Windows"),
+                untested
+            );
+        }
+        assert_eq!(
+            confirm_footer("proj", "grok", RemoteShell::Posix),
+            "Opens in proj; grok needs a login after."
+        );
     }
 }
