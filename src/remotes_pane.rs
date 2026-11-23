@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::remote::{self, Remote, RemoteShell};
+use crate::remote_browse_ui::{Browser, Nav};
 use crate::remote_install::{AgentState, Offer, Piece};
 use crate::remote_probe::{self, Reach, TestEntry, TestOutcome};
 
@@ -369,6 +370,8 @@ pub enum Key {
     /// Forget the focused Project directory row (Ctrl+Backspace, or Delete
     /// in an empty one).
     Clear,
+    /// Up a level, while the folder list has the keyboard.
+    Backspace,
 }
 
 /// What a key asks of the caller beyond the model's own state.
@@ -425,6 +428,9 @@ pub struct RemotesView {
     /// Per target: its agents line, built once per Test answer and marks
     /// change instead of every frame.
     agents: HashMap<String, std::sync::Arc<AgentsCache>>,
+    /// The folder list under the focused Directory row. Fresh per form,
+    /// so its listings live as long as the form.
+    browse: Browser,
     /// Test hook: per target, agent states that stand in for the Test
     /// answer and the install marks (both shared with parallel tests).
     #[cfg(test)]
@@ -511,6 +517,7 @@ impl RemotesView {
             },
             install_project: None,
             agents: HashMap::new(),
+            browse: Browser::new(),
             #[cfg(test)]
             forced: HashMap::new(),
         }
@@ -524,6 +531,12 @@ impl RemotesView {
     #[cfg(test)]
     pub fn laid(&self) -> &Laid {
         &self.laid
+    }
+
+    /// Test hook: the folder list, to seed listings and read its rects.
+    #[cfg(test)]
+    pub fn browse(&mut self) -> &mut Browser {
+        &mut self.browse
     }
 
     /// Test hook: a finished Test for `target`, as if its probe answered.
@@ -669,6 +682,7 @@ impl RemotesView {
     }
 
     fn begin_edit(&mut self, d: Draft) {
+        self.browse = Browser::new();
         self.mode = Mode::Edit(d);
         self.message = None;
         self.scroll_to = true;
@@ -746,6 +760,11 @@ impl RemotesView {
                 }
             }
             Mode::Edit(mut d) => {
+                if let Some(effect) = self.browse_key(k, &mut d) {
+                    self.mode = Mode::Edit(d);
+                    return effect;
+                }
+                let before = d.field;
                 let hosts = self.hosts.as_deref().unwrap_or_default();
                 let offered: Vec<String> = if d.field == Field::Target {
                     suggestions(hosts, remotes, &d)
@@ -816,15 +835,57 @@ impl RemotesView {
                     Key::Clear => {
                         if let Field::Dir(j) = d.field {
                             d.clear_dir(j);
+                            self.browse.focus_field();
                             self.scroll_to = true;
                         }
                     }
                     _ => {}
                 }
+                if d.field != before {
+                    self.browse.focus_field();
+                }
                 self.mode = Mode::Edit(d);
             }
         }
         Effect::None
+    }
+
+    /// A key for the folder list under the focused Directory row: all its
+    /// keys while it has the keyboard (Esc hands it back to the field, as
+    /// Esc first drops a Target suggestion), and Down from the field when
+    /// there is a list to enter. `None` = the form's own key.
+    fn browse_key(&mut self, k: Key, d: &mut Draft) -> Option<Effect> {
+        let Field::Dir(j) = d.field else {
+            return None;
+        };
+        let row = d.dirs.get_mut(j)?;
+        self.browse.set_source(d.target.trim(), d.shell);
+        let list = self.browse.list_focused();
+        let nav = match k {
+            Key::Esc if list => {
+                self.browse.focus_field();
+                return Some(Effect::None);
+            }
+            Key::Down => Nav::Down,
+            _ if !list => return None,
+            Key::Up => Nav::Up,
+            Key::Left => Nav::Left,
+            Key::Right => Nav::Right,
+            Key::Enter => Nav::Enter,
+            Key::Backspace => Nav::Backspace,
+            Key::Tab | Key::BackTab => Nav::Tab,
+            // Ctrl+Backspace still forgets the row.
+            _ => return None,
+        };
+        let old = row.remote.clone();
+        if !self.browse.key(nav, &mut row.remote) {
+            return None;
+        }
+        if row.remote != old {
+            d.error = None;
+        }
+        self.scroll_to = true;
+        Some(Effect::None)
     }
 
     fn delete(&mut self, i: usize, remotes: &mut Vec<Remote>) -> Effect {
@@ -907,6 +968,16 @@ impl RemotesView {
             }
             Mode::Browse if len == 0 => "Enter or A add · Esc back",
             Mode::Browse => "↑/↓ select · Enter add · Esc back",
+            Mode::Edit(_) if self.browse.list_focused() => {
+                "↑/↓ pick · Enter/→ go in · ← up · Tab/Esc back"
+            }
+            Mode::Edit(Draft {
+                field: Field::Dir(k),
+                ref dirs,
+                ..
+            }) if dirs.get(k).is_some_and(|r| self.browse.has_rows(&r.remote)) => {
+                "Tab next · ↓ folders · Ctrl+Backspace clear · Enter save · Esc cancel"
+            }
             Mode::Edit(Draft {
                 field: Field::Dir(_),
                 ..
@@ -959,7 +1030,7 @@ impl RemotesView {
         };
 
         if active {
-            for k in read_keys(ui, &self.mode) {
+            for k in read_keys(ui, &self.mode, self.browse.list_focused()) {
                 let e = self.key(k, remotes);
                 effect(self, e, remotes);
             }
@@ -1046,6 +1117,9 @@ impl RemotesView {
                     self.mode = Mode::ConfirmDelete(i);
                 }
                 Act::Key(k) => {
+                    // A button means what it says: save and cancel must not
+                    // go into a folder or only leave the list.
+                    self.browse.focus_field();
                     let e = self.key(k, remotes);
                     effect(self, e, remotes);
                 }
@@ -1062,6 +1136,7 @@ impl RemotesView {
                     if let Mode::Edit(d) = &mut self.mode {
                         d.field = f;
                         d.pick = None;
+                        self.browse.focus_field();
                     }
                 }
                 Act::Accept(host) => {
@@ -1072,6 +1147,7 @@ impl RemotesView {
                 Act::ClearDir(k) => {
                     if let Mode::Edit(d) = &mut self.mode {
                         d.clear_dir(k);
+                        self.browse.focus_field();
                     }
                 }
             }
@@ -1329,6 +1405,7 @@ impl RemotesView {
             return;
         };
         let laid = &mut self.laid.form;
+        let browse = &mut self.browse;
         let hosts = self.hosts.as_deref().unwrap_or_default();
         let name_id = egui::Id::new("remotes_edit_name");
         let target_id = egui::Id::new("remotes_edit_target");
@@ -1336,11 +1413,14 @@ impl RemotesView {
         // The model owns which field is active and egui focus follows it,
         // but only while this Win reads the keyboard: typing in a terminal
         // must never land in a field.
+        // The folder list holding the keyboard takes it from the field, so
+        // the two never both look focused.
         let dirs = d.dirs.len();
+        let list = browse.list_focused();
         ui.memory_mut(|m| match (active, d.field) {
             (true, Field::Name) => m.request_focus(name_id),
             (true, Field::Target) => m.request_focus(target_id),
-            (true, Field::Dir(k)) => m.request_focus(dir_id(k)),
+            (true, Field::Dir(k)) if !list => m.request_focus(dir_id(k)),
             _ => {
                 m.surrender_focus(name_id);
                 m.surrender_focus(target_id);
@@ -1498,6 +1578,9 @@ impl RemotesView {
                         label.on_hover_text(full);
                     }
                 });
+                if d.field == Field::Dir(k) {
+                    browse.pin_caret(&ctx, dir_id(k), &row.remote);
+                }
                 let r = form_row(ui, "Directory", th.dim, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let clear = ui.small_button("clear").on_hover_text(
@@ -1529,6 +1612,40 @@ impl RemotesView {
                 if edit.changed() {
                     d.error = None;
                 }
+            }
+            // One reserved area for whichever Directory is focused, after
+            // all of them: the same height focused or not, listed or not,
+            // so no row moves as focus or a listing comes and goes.
+            if !d.dirs.is_empty() {
+                ui.add_space(PAIR_GAP);
+                ui.horizontal(|ui| {
+                    ui.add_space(LABEL_W + FORM_GAP);
+                    let body_h = BROWSE_ROWS * ui.spacing().interact_size.y;
+                    let target = d.target.trim();
+                    match d.field {
+                        Field::Dir(k) if k < d.dirs.len() && remote::valid_target(target) => {
+                            browse.set_source(target, d.shell);
+                            if browse.show(ui, &mut d.dirs[k].remote, body_h, active) {
+                                d.error = None;
+                            }
+                            if browse.list_focused() {
+                                active_rect = Some(browse.laid.area);
+                            }
+                        }
+                        Field::Dir(_) => crate::remote_browse_ui::idle(
+                            ui,
+                            body_h,
+                            "Give a Target to list its folders",
+                            &mut browse.laid,
+                        ),
+                        _ => crate::remote_browse_ui::idle(
+                            ui,
+                            body_h,
+                            "Focus a Directory to list the Remote's folders here",
+                            &mut browse.laid,
+                        ),
+                    }
+                });
             }
             // A refused save, in the danger colour like a Keybindings
             // conflict, under the fields; focus is already on the bad one.
@@ -1607,10 +1724,18 @@ pub(crate) const OFFLINE_WHY: &str = "No TCP answer on its SSH port. This check 
 
 /// Space before each Project/Directory pair in the form.
 const PAIR_GAP: f32 = 6.0;
+/// Folder rows the form's list shows before it scrolls; the pane itself
+/// scrolls, so it need not fit a small window.
+const BROWSE_ROWS: f32 = 5.0;
 
 /// `text` on one line, its front cut with "…" so the rest fits `width`;
 /// and whether it was cut.
-fn elide_front(ui: &egui::Ui, text: &str, font: &egui::FontId, width: f32) -> (String, bool) {
+pub(crate) fn elide_front(
+    ui: &egui::Ui,
+    text: &str,
+    font: &egui::FontId,
+    width: f32,
+) -> (String, bool) {
     let w = |t: &str| {
         ui.painter()
             .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
@@ -1836,7 +1961,7 @@ fn browse_letter(key: egui::Key, mods: egui::Modifiers) -> Option<Key> {
 
 /// This frame's keys for the current mode. Letters only count while
 /// browsing: in the form they are typing.
-fn read_keys(ui: &egui::Ui, mode: &Mode) -> Vec<Key> {
+fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool) -> Vec<Key> {
     use egui::Key as K;
     // Consumed, not peeked: the row goes before the form draws, and the
     // TextEdit that takes its place (and its Id) would delete a word or a
@@ -1852,8 +1977,25 @@ fn read_keys(ui: &egui::Ui, mode: &Mode) -> Vec<Key> {
         },
         _ => false,
     });
-    ui.input(|i| {
+    // The folder list's own keys; the field is not focused meanwhile, so
+    // none of them edits it.
+    let browse: Vec<Key> = ui.input_mut(|i| {
         let mut out = Vec::new();
+        if list && matches!(mode, Mode::Edit(d) if matches!(d.field, Field::Dir(_))) {
+            for (k, key) in [
+                (K::ArrowLeft, Key::Left),
+                (K::ArrowRight, Key::Right),
+                (K::Backspace, Key::Backspace),
+            ] {
+                if i.consume_key(egui::Modifiers::NONE, k) {
+                    out.push(key);
+                }
+            }
+        }
+        out
+    });
+    ui.input(|i| {
+        let mut out = browse;
         let p = |k: K| i.key_pressed(k);
         let shift = i.modifiers.shift;
         if p(K::ArrowUp) {
@@ -2070,6 +2212,114 @@ mod tests {
         assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
         assert_eq!(list[0].dirs[r"H:\src\new"], "/srv/new");
         assert!(!list[0].dirs.contains_key(r"H:\src\app"));
+    }
+
+    fn listing(resolved: &str, names: &[&str]) -> crate::remote_browse::State {
+        crate::remote_browse::State::Listed(crate::remote_browse::Listed {
+            resolved: resolved.into(),
+            entries: names
+                .iter()
+                .map(|n| crate::remote_browse::Entry::dir(n))
+                .collect(),
+            truncated: false,
+        })
+    }
+
+    /// The form on Dir(0) ("/srv/app") with "/srv/" and "/srv/data/" listed.
+    fn on_first_dir() -> (RemotesView, Vec<Remote>) {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        for _ in 0..3 {
+            v.key(Key::Tab, &mut list);
+        }
+        assert_eq!(draft(&v).field, Field::Dir(0));
+        let b = v.browse();
+        // What a drawn frame does first.
+        b.set_source("andy@desk", RemoteShell::Posix);
+        b.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "/srv/",
+            listing("/srv", &["app", "apps", "data"]),
+        );
+        b.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "/srv/data/",
+            listing("/srv/data", &["x"]),
+        );
+        (v, list)
+    }
+
+    /// Down enters the list (not the next field), Enter there goes into a
+    /// folder and never saves, Backspace goes back up, Esc hands the
+    /// keyboard back without closing the form, and Enter then saves.
+    #[test]
+    fn the_folder_list_owns_its_keys_and_enter_saves_only_from_the_field() {
+        let (mut v, mut list) = on_first_dir();
+        assert!(v.hint(1).contains("↓ folders"), "{}", v.hint(1));
+        v.key(Key::Down, &mut list);
+        assert!(v.browse.list_focused());
+        assert_eq!(draft(&v).field, Field::Dir(0), "Down entered the list");
+        assert!(v.hint(1).contains("go in"), "{}", v.hint(1));
+        // "app" and "apps" match the filter; ".." is row 0.
+        v.key(Key::Down, &mut list); // apps
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
+        assert_eq!(draft(&v).dirs[0].remote, "/srv/apps/");
+        assert_eq!(list[0].dirs[r"H:\src\app"], "/srv/app", "nothing saved");
+        v.key(Key::Backspace, &mut list);
+        assert_eq!(draft(&v).dirs[0].remote, "/srv/");
+        v.key(Key::Down, &mut list); // apps -> data
+        v.key(Key::Right, &mut list);
+        assert_eq!(draft(&v).dirs[0].remote, "/srv/data/");
+        v.key(Key::Left, &mut list);
+        assert_eq!(draft(&v).dirs[0].remote, "/srv/");
+        assert_eq!(v.key(Key::Esc, &mut list), Effect::None);
+        assert!(v.is_editing(), "Esc left the list, not the form");
+        assert!(!v.browse.list_focused());
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert_eq!(list[0].dirs[r"H:\src\app"], "/srv/");
+    }
+
+    /// Tab from the list returns to the field (the next Tab moves on), and
+    /// Ctrl+Backspace still forgets the row from the list.
+    #[test]
+    fn tab_leaves_the_list_and_clear_still_forgets_from_it() {
+        let (mut v, mut list) = on_first_dir();
+        v.key(Key::Down, &mut list);
+        v.key(Key::Tab, &mut list);
+        assert!(!v.browse.list_focused());
+        assert_eq!(draft(&v).field, Field::Dir(0));
+        v.key(Key::Tab, &mut list);
+        assert_eq!(draft(&v).field, Field::Dir(1));
+        v.key(Key::BackTab, &mut list);
+        v.key(Key::Down, &mut list);
+        assert!(v.browse.list_focused());
+        v.key(Key::Clear, &mut list);
+        assert_eq!(draft(&v).dirs.len(), 1);
+        assert!(!v.browse.list_focused(), "the row it listed for is gone");
+    }
+
+    /// A Remote that cannot be listed: Down moves fields as before.
+    #[test]
+    fn with_nothing_listed_down_still_moves_to_the_next_field() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        for _ in 0..3 {
+            v.key(Key::Tab, &mut list);
+        }
+        v.browse().put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "/srv/",
+            crate::remote_browse::State::Failed(crate::remote_browse::NEEDS_LOGIN.into()),
+        );
+        v.key(Key::Down, &mut list);
+        assert_eq!(draft(&v).field, Field::Dir(1));
+        assert!(!v.browse.list_focused());
+        assert!(v.hint(1).starts_with("Tab next field"), "{}", v.hint(1));
     }
 
     #[test]

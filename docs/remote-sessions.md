@@ -19,7 +19,9 @@ is for changing the feature.
   `legacy_passable`) and resize through two ConPTYs. These were checked only by
   running encoded lines through local cmd → pwsh and cmd → 5.1, with no SSH.
   The PowerShell install commands in `remote::INSTALL` have never run on any
-  Remote. Test on a real Windows Remote before you trust any of them.
+  Remote, and neither has the folder list's PowerShell script
+  (`remote_browse::ps_script`, drive roots included). Test on a real Windows
+  Remote before you trust any of them.
 - **An install Session's argv names the agent.** The Claude and Codex
   install URLs contain `claude` / `codex`. `IconKind::from_argv` returns
   `None` for an `install_of` argv, so the icon, `agent_of`, the badges and the
@@ -40,6 +42,14 @@ is for changing the feature.
   beside each entry). Vendors move them; Codex's docs have already changed
   domain once. When an install fails, check the vendor page before
   changing foreman.
+- **A folder listing is cached for the life of its prompt or edit form.**
+  A folder made on the Remote while the prompt is open does not show until
+  the prompt is opened again. The cache belongs to the `Browser`, not to the
+  process, so a new prompt always lists afresh.
+- **Unit tests never run a listing.** Under `cfg(test)`
+  `remote_browse::spawn` does nothing, so an unseeded listing stays
+  "Listing folders…" forever. Seed one with `Browser::put`. The real script
+  is checked by hand (procedure below).
 - **Agent-state badges are not available on a Remote Session yet.** Nothing
   posts hook events, so posts to it are delivered Ready-only and `status`
   carries no `agent_state` for it.
@@ -93,6 +103,11 @@ is for changing the feature.
 
 ## Procedures
 
+- **Check the folder-list script against a real Remote** (read-only):
+  `FOREMAN_BROWSE_TARGET=user@pc cargo test --target-dir target/agent remote_browse::tests::live -- --ignored --nocapture`.
+  It lists home, `/`, and three dirs that must fail (no permission, missing,
+  a file), and prints each result. It runs Posix only.
+
 - **Check the Tunnel by hand.** In a Remote Session's shell (Posix):
   `curl -sS -H "Authorization: Bearer $FOREMAN_TOKEN" "$FOREMAN_URL/status"`.
   On Windows (untested) use `curl.exe` and `$env:FOREMAN_TOKEN`. A 401 means a
@@ -120,3 +135,5 @@ is for changing the feature.
   confirm's words; `wm.rs` `run_install`, `open_install`, `refresh_installs`.
 - `src/remotes_pane.rs`, `src/remote_dir_prompt.rs`, `src/launcher.rs`
   `entries_on`.
+- `src/remote_browse.rs` (path model, listing scripts, cache) and
+  `src/remote_browse_ui.rs` (the folder list widget).

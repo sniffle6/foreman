@@ -1576,6 +1576,128 @@ mod tests {
         }
     }
 
+    /// At the narrowest pane, the folder list under a Directory row: every
+    /// row and every Directory hint inside the pane and uncut, in the field
+    /// and in the list; and its reserved area the same height whichever
+    /// field is focused and whatever it shows, so no form row moves.
+    #[test]
+    fn remotes_folder_list_fits_at_minimum_width_and_moves_nothing() {
+        use crate::remote::RemoteShell::Posix;
+        use crate::remote_browse::{Entry, Listed, NEEDS_LOGIN, State};
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let none = egui::Modifiers::NONE;
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/".into());
+        desk.dirs.insert(r"H:\src\tool".into(), "/nope/".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::Enter, none)),
+        );
+        assert!(menu.remotes.is_editing());
+        let long = "a-folder-name-much-too-long-for-the-narrowest-pane-to-show-it-whole";
+        let names = ["app", long, "data", "x1", "x2", "x3", "x4", "x5"];
+        // Form rects relative to the Name field: the list scrolls the form,
+        // which must not count as a row moving.
+        let shape = |menu: &mut SettingsMenu| {
+            let laid = menu.remotes.laid();
+            let o = laid.form[0].min;
+            let form: Vec<egui::Rect> = laid
+                .form
+                .iter()
+                .map(|r| r.translate(-o.to_vec2()))
+                .collect();
+            let area = menu.remotes.browse().laid.area;
+            (form, area.height(), area.min - o)
+        };
+        let fits = |menu: &mut SettingsMenu, state: &str| {
+            let laid = menu.remotes.laid();
+            let pane = laid.pane;
+            assert!(laid.hint_fits, "{state}: hint cut at {pane:?}");
+            assert!(laid.hint.height() < 16.0, "{state}: {:?}", laid.hint);
+            let b = &menu.remotes.browse().laid;
+            assert!(
+                b.area.min.x >= pane.min.x && b.area.max.x <= pane.max.x,
+                "{state}: area {:?} outside {pane:?}",
+                b.area
+            );
+            for r in &b.rows {
+                assert!(
+                    r.min.x >= b.area.min.x && r.max.x <= b.area.max.x,
+                    "{state}: row {r:?} outside {:?}",
+                    b.area
+                );
+            }
+            b.rows.len()
+        };
+        let tab = |menu: &mut SettingsMenu, s: &mut Settings, key: egui::Key| {
+            frame_at(&ctx, menu, s, Some(size), Some((key, none)));
+            frame_at(&ctx, menu, s, Some(size), None);
+            frame_at(&ctx, menu, s, Some(size), None);
+        };
+        // Name: the area waits, idle.
+        let b = menu.remotes.browse();
+        b.put(
+            "andy@desk",
+            Posix,
+            "/srv/",
+            State::Listed(Listed {
+                resolved: "/srv".into(),
+                entries: names.iter().map(|n| Entry::dir(n)).collect(),
+                truncated: false,
+            }),
+        );
+        b.put(
+            "andy@desk",
+            Posix,
+            "/nope/",
+            State::Failed(NEEDS_LOGIN.into()),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let idle = shape(&mut menu);
+        fits(&mut menu, "Name");
+        for _ in 0..3 {
+            tab(&mut menu, &mut s, egui::Key::Tab);
+        }
+        // Directory 1, listed.
+        let n = fits(&mut menu, "Dir field");
+        assert_eq!(n, names.len() + 1, "every folder and ..");
+        assert_eq!(
+            shape(&mut menu),
+            idle,
+            "focusing a Directory moved the form"
+        );
+        tab(&mut menu, &mut s, egui::Key::ArrowDown);
+        assert!(menu.remotes.browse().list_focused());
+        fits(&mut menu, "list");
+        assert_eq!(shape(&mut menu), idle, "entering the list moved the form");
+        // Into "data": not listed yet, so Loading.
+        tab(&mut menu, &mut s, egui::Key::ArrowDown);
+        tab(&mut menu, &mut s, egui::Key::ArrowDown);
+        tab(&mut menu, &mut s, egui::Key::ArrowRight);
+        assert_eq!(fits(&mut menu, "loading"), 0);
+        assert_eq!(shape(&mut menu).1, idle.1, "Loading changed the height");
+        // Directory 2 cannot be listed.
+        tab(&mut menu, &mut s, egui::Key::Tab);
+        tab(&mut menu, &mut s, egui::Key::Tab);
+        assert!(!menu.remotes.browse().list_focused());
+        assert_eq!(fits(&mut menu, "failed"), 0);
+        assert!(menu.remotes.browse().laid.message.is_some());
+        assert_eq!(shape(&mut menu).1, idle.1, "Failed changed the height");
+    }
+
     /// At the narrowest pane the hint and every row's status line stay one
     /// line tall in each state, so nothing below them moves when the state
     /// changes or a long Test result lands.

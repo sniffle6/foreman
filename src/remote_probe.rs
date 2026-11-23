@@ -627,14 +627,14 @@ pub fn config_hosts() -> Vec<String> {
 // Running ssh
 // ---------------------------------------------------------------------------
 
-struct Output {
-    code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Output {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// The last non-blank line of `text`, or `fallback`.
-fn last_line(text: &str, fallback: &str) -> String {
+pub(crate) fn last_line(text: &str, fallback: &str) -> String {
     text.lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
@@ -644,7 +644,7 @@ fn last_line(text: &str, fallback: &str) -> String {
 
 /// Run the system `ssh` with `args`, no window, no stdin, killed at `timeout`.
 /// Blocks: call it from a worker thread only.
-fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
+pub(crate) fn run(args: &[&str], timeout: Duration) -> Result<Output, String> {
     let mut cmd = Command::new("ssh");
     cmd.args(args)
         .stdin(Stdio::null())

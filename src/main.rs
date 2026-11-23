@@ -53,6 +53,8 @@ mod ready;
 mod recents;
 mod release;
 mod remote;
+mod remote_browse;
+mod remote_browse_ui;
 mod remote_dir_prompt;
 mod remote_install;
 mod remote_probe;

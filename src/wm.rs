@@ -3263,6 +3263,7 @@ impl WindowManager {
                         });
                     Some(crate::remote_dir_prompt::Ask {
                         remote: remote.name.clone(),
+                        target: remote.target.clone(),
                         shell: remote.shell,
                         // The spelling the prompt shows and the mapping saves.
                         project_dir: crate::remote::plain_dir(&project_dir),
@@ -12352,6 +12353,7 @@ mod tests {
     fn desk_ask(project: &str, project_dir: &str) -> crate::remote_dir_prompt::Ask {
         crate::remote_dir_prompt::Ask {
             remote: "desk".into(),
+            target: "andy@desk".into(),
             shell: crate::remote::RemoteShell::Posix,
             project_dir: project_dir.into(),
             project: project.into(),

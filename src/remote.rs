@@ -25,7 +25,7 @@ pub const WINDOWS_LINE_CAP: usize = 8000;
 /// The login shell sshd runs on the Remote, which decides the script's
 /// language. Posix is the default so a half-filled entry still loads; Test
 /// fills in the real one.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RemoteShell {
     Pwsh,
     WindowsPowerShell,
@@ -551,13 +551,13 @@ pub fn build(l: &Launch) -> Result<Built, String> {
 }
 
 /// POSIX single-quote: `'` becomes `'\''`.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// PowerShell single-quote: `'` doubled. PowerShell also treats the curly
 /// quotes U+2018..U+201B as single quotes, so they are doubled too.
-fn ps_quote(s: &str) -> String {
+pub(crate) fn ps_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -571,7 +571,7 @@ fn ps_quote(s: &str) -> String {
 }
 
 /// `~` and `~/rest` mean the Remote's home; anything else is literal.
-fn home_relative(dir: &str) -> Option<&str> {
+pub(crate) fn home_relative(dir: &str) -> Option<&str> {
     if dir == "~" {
         return Some("");
     }
