@@ -2127,6 +2127,11 @@ mod tests {
         };
         menu.select_pane(Pane::Remotes);
         menu.in_rail = false;
+        // A real reach probe of these made-up hosts answers mid-test and
+        // changes each row's status word, and with it the row's width.
+        for t in ["layout-install-desk", "layout-install-pi"] {
+            crate::remote_probe::put_reach(t, crate::remote_probe::Reach::Reachable);
+        }
         menu.remotes.set_install_project(Some("proj"));
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);

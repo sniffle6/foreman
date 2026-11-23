@@ -177,6 +177,18 @@ pub fn reach(ctx: &egui::Context, target: &str) -> Reach {
     reach
 }
 
+/// Test hook: `target`'s reachability, as if a probe had just answered, so
+/// a layout test's status words do not change when a real probe returns.
+#[cfg(test)]
+pub fn put_reach(target: &str, reach: Reach) {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).finish(
+        target,
+        None,
+        reach,
+        Instant::now(),
+    );
+}
+
 /// The SSH port [`reach`] probes for `target`, once it has resolved it.
 pub fn ssh_port(target: &str) -> Option<u16> {
     cache()
