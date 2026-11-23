@@ -11,6 +11,9 @@ pub enum Entry<A> {
         label: &'static str,
         hint: Option<String>,
         mark: bool,
+        /// The label dimmed (an agent missing on the selected Remote). The
+        /// hint must say why in words; dim alone is colour only.
+        dim: bool,
         act: A,
     },
     /// Choices side by side (the launcher's where-strip). A click returns
@@ -442,6 +445,7 @@ pub fn show<A: Clone>(
                         label,
                         hint,
                         mark,
+                        dim,
                         act,
                     } => {
                         let response =
@@ -454,7 +458,7 @@ pub fn show<A: Clone>(
                             egui::Align2::LEFT_CENTER,
                             *label,
                             font.clone(),
-                            th.text,
+                            if *dim { th.dim } else { th.text },
                         );
                         if *mark {
                             mui.painter().text(
@@ -590,6 +594,7 @@ mod tests {
                                 label: "Claude",
                                 hint: None,
                                 mark: false,
+                                dim: false,
                                 act: 1,
                             },
                         ]

@@ -18,7 +18,23 @@ is for changing the feature.
   `WINDOWS_LINE_CAP`, the 5.1 argument escaping (`legacy_native`,
   `legacy_passable`) and resize through two ConPTYs. These were checked only by
   running encoded lines through local cmd → pwsh and cmd → 5.1, with no SSH.
-  Test on a real Windows Remote before you trust any of them.
+  The PowerShell install commands in `remote::INSTALL` have never run on any
+  Remote. Test on a real Windows Remote before you trust any of them.
+- **An install Session's argv names the agent.** The Claude and Codex
+  install URLs contain `claude` / `codex`, so `IconKind::from_argv` gives
+  those install tabs the agent's icon and `agent_of` calls them agents.
+  `relaunch` checks `install_of` first, so Enter on an ended install opens
+  a shell. Without that check it would start the agent fresh, and Grok's
+  installer, whose URL has no agent name in it, would run again.
+- **Test answers live in a process-wide cache** (`remote_probe::test_entry`),
+  not in the Remotes pane. The launcher reads it, and the install watch
+  re-runs Test into it. The pane copies a found shell into `Remote::shell`
+  only when it sees the answer, so a Test that finishes while Settings is
+  closed does not update the saved shell.
+- **The install commands are copied from vendor pages** (2026-11-22, URLs
+  beside each entry). Vendors move them; Codex's docs have already changed
+  domain once. When an install fails, check the vendor page before
+  changing foreman.
 - **Agent-state badges are not available on a Remote Session yet.** Nothing
   posts hook events, so posts to it are delivered Ready-only and `status`
   carries no `agent_state` for it.
@@ -94,6 +110,8 @@ is for changing the feature.
   `refresh_reconnects`, `inherited`.
 - `src/terminal.rs` — `Session::spawn_remote`, `Session::disconnected_remote`,
   `Session::attach_tunnel`, `disconnect_bar_text`.
-- `src/remote_probe.rs` — `reach`, `start_test`.
+- `src/remote_probe.rs` — `reach`, `start_test`, `test_entry`.
+- `src/remote_install.rs` — agent states, the prerequisite gate, the
+  confirm's words; `wm.rs` `run_install`, `open_install`, `refresh_installs`.
 - `src/remotes_pane.rs`, `src/remote_dir_prompt.rs`, `src/launcher.rs`
   `entries_on`.

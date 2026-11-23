@@ -643,6 +643,12 @@ pub enum MenuOutcome {
     /// "Check for updates now" was clicked — caller fires the fetch through
     /// `update_fx` (the menu has no path to that channel itself).
     CheckUpdatesNow,
+    /// Settings > Remotes confirmed an agent CLI install: the desktop opens
+    /// it as a Remote Session in the focused Project.
+    Install {
+        remote: String,
+        provider: &'static str,
+    },
     /// Close the menu.
     Close,
 }
@@ -657,7 +663,8 @@ fn bump(cur: &mut MenuOutcome, new: MenuOutcome) {
             MenuOutcome::Pending => 0,
             MenuOutcome::Changed => 1,
             MenuOutcome::CheckUpdatesNow => 2,
-            MenuOutcome::Close => 3,
+            MenuOutcome::Install { .. } => 3,
+            MenuOutcome::Close => 4,
         }
     }
     if rank(&new) > rank(cur) {
@@ -984,6 +991,9 @@ impl SettingsMenu {
             match self.remotes.show(ui, rect, reads_input, &mut s.remotes) {
                 crate::remotes_pane::Outcome::Changed => bump(outcome, MenuOutcome::Changed),
                 crate::remotes_pane::Outcome::Close => self.in_rail = true,
+                crate::remotes_pane::Outcome::Install { remote, provider } => {
+                    bump(outcome, MenuOutcome::Install { remote, provider })
+                }
                 crate::remotes_pane::Outcome::Pending => {}
             }
             return;
@@ -1532,6 +1542,16 @@ mod tests {
         let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
         let none = egui::Modifiers::NONE;
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        // The rows, before the add form scrolls the list to itself.
+        let laid = menu.remotes.laid();
+        assert_eq!(laid.rows.len(), 2);
+        for (text, controls) in &laid.rows {
+            assert!(laid.pane.contains_rect(*controls), "{controls:?}");
+            assert!(
+                text.max.x <= controls.min.x,
+                "text {text:?} runs under {controls:?}"
+            );
+        }
         frame_at(
             &ctx,
             &mut menu,
@@ -1553,14 +1573,6 @@ mod tests {
         assert_eq!(laid.form.len(), 5, "{:?}", laid.form);
         for r in &laid.form {
             assert!(laid.pane.contains_rect(*r), "{r:?} outside {:?}", laid.pane);
-        }
-        assert_eq!(laid.rows.len(), 2);
-        for (text, controls) in &laid.rows {
-            assert!(laid.pane.contains_rect(*controls), "{controls:?}");
-            assert!(
-                text.max.x <= controls.min.x,
-                "text {text:?} runs under {controls:?}"
-            );
         }
     }
 
@@ -1619,6 +1631,7 @@ mod tests {
                 shell: crate::remote::RemoteShell::Posix,
                 login_shell: Some("/usr/local/bin/a-rather-long-shell-path".into()),
                 curl: false,
+                bash: false,
                 agents: vec!["claude".into()],
             }),
         );
@@ -1639,6 +1652,83 @@ mod tests {
             }
         }
         assert!(menu.remotes.is_editing());
+    }
+
+    /// At the narrowest pane: the install buttons (three on one row, the
+    /// widest line there is) and the hint offering I sit inside the pane; a
+    /// Test landing and the confirm opening move no row; the confirm's
+    /// command block fits the two lines it replaces.
+    #[test]
+    fn remotes_install_actions_fit_at_minimum_width_and_move_nothing() {
+        use crate::remote::RemoteShell;
+        use crate::remote_probe::{TestOutcome, TestReport};
+        use crate::remotes_pane::LINE_H;
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![
+                remote("desk", "layout-install-desk"),
+                remote("pi", "layout-install-pi"),
+            ],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let untested = menu.remotes.laid().rows.clone();
+        let report = |curl, bash, agents: &[&str]| {
+            TestOutcome::Ok(TestReport {
+                shell: RemoteShell::Posix,
+                login_shell: None,
+                curl,
+                bash,
+                agents: agents.iter().map(|a| a.to_string()).collect(),
+            })
+        };
+        menu.remotes
+            .set_test_result("layout-install-desk", report(true, true, &[]));
+        menu.remotes
+            .set_test_result("layout-install-pi", report(true, false, &["claude"]));
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let laid = menu.remotes.laid();
+        assert_eq!(laid.rows, untested, "a Test result moved a row");
+        // desk: install claude, codex, grok. pi: install codex.
+        assert_eq!(laid.installs.len(), 4, "{:?}", laid.installs);
+        for b in &laid.installs {
+            assert!(laid.pane.contains_rect(*b), "{b:?} past {:?}", laid.pane);
+            assert!(laid.list.contains_rect(*b), "{b:?} past {:?}", laid.list);
+        }
+        for a in &laid.agents {
+            assert!(a.height() <= LINE_H + 0.5, "agents line {a:?}");
+            assert!(laid.pane.contains_rect(*a), "{a:?}");
+        }
+        assert!(laid.hint_fits, "the hint with I is cut");
+        assert!(laid.hint.height() < 16.0);
+
+        let none = egui::Modifiers::NONE;
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::I, none)),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let laid = menu.remotes.laid();
+        let block = laid.confirm.expect("the confirm shows its command");
+        assert!(laid.pane.contains_rect(block), "{block:?}");
+        assert!(block.height() <= LINE_H * 2.0 + 0.5, "{block:?}");
+        assert!(laid.hint_fits, "the confirm hint is cut");
+        assert_eq!(laid.rows[1], untested[1], "the confirm moved the next row");
+        for (row, (_, controls)) in laid.rows.iter().enumerate() {
+            assert!(
+                laid.pane.contains_rect(*controls),
+                "row {row}: {controls:?}"
+            );
+        }
     }
 
     /// A refused save at the smallest pane: the error shows and the save and

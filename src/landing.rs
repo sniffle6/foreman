@@ -395,6 +395,12 @@ impl SessionKind {
         }
     }
 
+    /// The agent provider (`claude` / `codex` / `grok`) as Test and the
+    /// install table name it; None for a plain shell.
+    pub fn provider(self) -> Option<&'static str> {
+        self.stem()
+    }
+
     /// PATH stem to probe and launch, or None for a plain shell.
     fn stem(self) -> Option<&'static str> {
         match self {

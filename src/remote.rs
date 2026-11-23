@@ -152,6 +152,144 @@ const RESUME: &[(&str, &[&str])] = &[
     ("codex", &["resume", "--last"]),
 ];
 
+/// A tool an install command needs on the Remote before it can work. Test
+/// reports each one; a missing one blocks the install action with a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prereq {
+    Curl,
+    Bash,
+}
+
+impl Prereq {
+    /// The program name, as Test looks it up and the UI names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Prereq::Curl => "curl",
+            Prereq::Bash => "bash",
+        }
+    }
+}
+
+/// Which install command a Remote's shell takes. Pwsh and Windows
+/// PowerShell run the same vendor command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallShell {
+    Posix,
+    PowerShell,
+}
+
+impl From<RemoteShell> for InstallShell {
+    fn from(s: RemoteShell) -> Self {
+        match s {
+            RemoteShell::Posix => InstallShell::Posix,
+            RemoteShell::Pwsh | RemoteShell::WindowsPowerShell => InstallShell::PowerShell,
+        }
+    }
+}
+
+/// One vendor install command for an agent CLI.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Install {
+    pub provider: &'static str,
+    pub shell: InstallShell,
+    /// The vendor's own command, verbatim from its install page.
+    pub command: &'static str,
+    pub needs: &'static [Prereq],
+}
+
+/// (provider, shell kind) → the vendor's official install command. Each
+/// command is copied from the vendor page in the comment beside it (looked
+/// up 2026-11-22); re-check the page before changing one. A provider or
+/// shell missing here has no install action: the UI says to install it by
+/// hand. Foreman installs nothing of its own: this is only the vendor's
+/// installer, run visibly in a Remote Session. Every PowerShell entry is
+/// untested (no Windows Remote has existed).
+const INSTALL: &[Install] = &[
+    // https://code.claude.com/docs/en/setup (native install, macOS/Linux/WSL)
+    Install {
+        provider: "claude",
+        shell: InstallShell::Posix,
+        command: "curl -fsSL https://claude.ai/install.sh | bash",
+        needs: &[Prereq::Curl, Prereq::Bash],
+    },
+    // https://code.claude.com/docs/en/setup (native install, Windows PowerShell)
+    Install {
+        provider: "claude",
+        shell: InstallShell::PowerShell,
+        command: "irm https://claude.ai/install.ps1 | iex",
+        needs: &[],
+    },
+    // https://github.com/openai/codex (README, standalone installer, macOS/Linux)
+    Install {
+        provider: "codex",
+        shell: InstallShell::Posix,
+        command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        needs: &[Prereq::Curl],
+    },
+    // https://github.com/openai/codex (README, standalone installer, Windows)
+    Install {
+        provider: "codex",
+        shell: InstallShell::PowerShell,
+        command: r#"powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex""#,
+        needs: &[],
+    },
+    // https://docs.x.ai/build/overview (Grok Build, macOS/Linux)
+    Install {
+        provider: "grok",
+        shell: InstallShell::Posix,
+        command: "curl -fsSL https://x.ai/cli/install.sh | bash",
+        needs: &[Prereq::Curl, Prereq::Bash],
+    },
+    // https://docs.x.ai/build/overview (Grok Build, Windows PowerShell)
+    Install {
+        provider: "grok",
+        shell: InstallShell::PowerShell,
+        command: "irm https://x.ai/cli/install.ps1 | iex",
+        needs: &[],
+    },
+];
+
+/// The install command for `provider` on a Remote whose shell is `shell`.
+pub fn install_for(provider: &str, shell: RemoteShell) -> Option<&'static Install> {
+    let family = InstallShell::from(shell);
+    INSTALL
+        .iter()
+        .find(|i| i.provider == provider && i.shell == family)
+}
+
+/// The logical argv an install Session runs: the vendor command handed to
+/// the Remote's own shell, since every command is a pipeline. It goes
+/// through [`build`] like any other launch, in the Remote's home.
+pub fn install_argv(shell: RemoteShell, command: &str) -> Vec<String> {
+    let argv: &[&str] = match shell {
+        RemoteShell::Posix => &["sh", "-c"],
+        RemoteShell::Pwsh => &["pwsh", "-NoLogo", "-NoProfile", "-Command"],
+        RemoteShell::WindowsPowerShell => &["powershell", "-NoLogo", "-NoProfile", "-Command"],
+    };
+    argv.iter()
+        .map(|a| a.to_string())
+        .chain(std::iter::once(command.to_string()))
+        .collect()
+}
+
+/// The provider an install Session's argv installs, when `argv` is exactly
+/// one [`install_argv`] from the table. Reconnect reads it so Enter on an
+/// ended install opens a shell there and never runs the installer again.
+pub fn install_of(argv: &[String]) -> Option<&'static str> {
+    const SHELLS: [RemoteShell; 3] = [
+        RemoteShell::Posix,
+        RemoteShell::Pwsh,
+        RemoteShell::WindowsPowerShell,
+    ];
+    INSTALL.iter().find_map(|i| {
+        SHELLS
+            .iter()
+            .filter(|s| InstallShell::from(**s) == i.shell)
+            .any(|s| install_argv(*s, i.command) == argv)
+            .then_some(i.provider)
+    })
+}
+
 /// The agent provider (`claude` / `codex` / `grok`, from `board::AGENTS`)
 /// an argv runs, by the same scan the tab icon uses
 /// ([`crate::icons::IconKind::from_argv`]). The one "is an agent" predicate
@@ -169,6 +307,9 @@ pub struct Relaunch {
     pub agent: Option<&'static str>,
     /// The argv reopens the agent's latest conversation (a resume entry).
     pub resumes: bool,
+    /// The original argv was an install of this provider; the relaunch is a
+    /// shell, so the installer only ever runs from its named action.
+    pub install: Option<&'static str>,
 }
 
 /// What a reconnect runs for a Session launched with `original`. An agent
@@ -178,13 +319,23 @@ pub struct Relaunch {
 /// `wsl claude …`, a wrapper script) fails safe: the bare provider, fresh,
 /// with no argument from the original argv, since any of them may be the
 /// Dispatch prompt. A shell stays a shell, and any other command runs again
-/// as it was.
+/// as it was. An install Session (see [`install_of`]) comes back as a shell,
+/// checked first because the claude and codex install URLs name the agent.
 pub fn relaunch(original: &[String]) -> Relaunch {
+    if let Some(provider) = install_of(original) {
+        return Relaunch {
+            argv: Vec::new(),
+            agent: None,
+            resumes: false,
+            install: Some(provider),
+        };
+    }
     let Some(agent) = agent_of(original) else {
         return Relaunch {
             argv: original.to_vec(),
             agent: None,
             resumes: false,
+            install: None,
         };
     };
     let program = &original[0];
@@ -198,6 +349,7 @@ pub fn relaunch(original: &[String]) -> Relaunch {
             argv: vec![agent.to_string()],
             agent: Some(agent),
             resumes: false,
+            install: None,
         };
     }
     let resume = RESUME
@@ -210,6 +362,7 @@ pub fn relaunch(original: &[String]) -> Relaunch {
             .collect(),
         agent: Some(agent),
         resumes: !resume.is_empty(),
+        install: None,
     }
 }
 
@@ -1048,5 +1201,110 @@ mod tests {
             Ok("/srv/proj")
         );
         assert!(launch_dir(&r, None, Some(r"\\?\H:\claude code")).is_err());
+    }
+
+    /// Every agent Test looks for has a command for every shell kind, and the
+    /// command is the one its own shell kind runs.
+    #[test]
+    fn every_agent_has_an_install_for_every_shell_kind() {
+        for provider in crate::remote_probe::AGENTS {
+            for shell in [
+                RemoteShell::Posix,
+                RemoteShell::Pwsh,
+                RemoteShell::WindowsPowerShell,
+            ] {
+                let i = install_for(provider, shell)
+                    .unwrap_or_else(|| panic!("{provider} on {shell:?} has no install"));
+                assert_eq!(i.provider, provider);
+                assert_eq!(i.shell, InstallShell::from(shell));
+                assert!(!i.command.trim().is_empty());
+                // A POSIX command fetches with curl and a PowerShell one
+                // with irm, so the curl gate matches the command.
+                match i.shell {
+                    InstallShell::Posix => {
+                        assert!(i.command.starts_with("curl "), "{}", i.command);
+                        assert!(i.needs.contains(&Prereq::Curl));
+                        assert_eq!(
+                            i.needs.contains(&Prereq::Bash),
+                            i.command.ends_with("| bash"),
+                            "{}",
+                            i.command
+                        );
+                    }
+                    InstallShell::PowerShell => {
+                        assert!(i.command.contains("irm "), "{}", i.command);
+                        assert!(i.needs.is_empty());
+                    }
+                }
+            }
+        }
+        // No entry, no action.
+        assert_eq!(install_for("aider", RemoteShell::Posix), None);
+        assert_eq!(install_for("", RemoteShell::Pwsh), None);
+        // One entry per (provider, shell kind).
+        for (a, x) in INSTALL.iter().enumerate() {
+            for y in &INSTALL[a + 1..] {
+                assert!(
+                    !(x.provider == y.provider && x.shell == y.shell),
+                    "{} twice",
+                    x.provider
+                );
+            }
+        }
+    }
+
+    /// The install Session goes through `build` with the install as its
+    /// logical argv: the tab and reconnect see that argv, and the script
+    /// carries the vendor command as one quoted literal, run in the home.
+    #[test]
+    fn an_install_is_built_like_any_launch_with_the_command_as_its_argv() {
+        for shell in [
+            RemoteShell::Posix,
+            RemoteShell::Pwsh,
+            RemoteShell::WindowsPowerShell,
+        ] {
+            let r = remote(shell);
+            let i = install_for("claude", shell).unwrap();
+            let argv = install_argv(shell, i.command);
+            assert_eq!(argv.last().map(String::as_str), Some(i.command));
+            let b = build(&launch(&r, "", &argv)).expect("an install fits");
+            assert_eq!(b.dispatched, argv);
+            let s = script(&b, shell);
+            assert!(!s.contains("cd --") && !s.contains("Set-Location"), "{s}");
+            match shell {
+                RemoteShell::Posix => assert!(
+                    s.contains(&format!("foreman-launch 'sh' '-c' '{}'", i.command)),
+                    "{s}"
+                ),
+                _ => assert!(s.contains(&format!("'-Command' '{}'", i.command)), "{s}"),
+            }
+        }
+        // Codex's Windows command carries quotes; 5.1 can still pass it.
+        let r = remote(RemoteShell::WindowsPowerShell);
+        let i = install_for("codex", RemoteShell::WindowsPowerShell).unwrap();
+        let argv = install_argv(RemoteShell::WindowsPowerShell, i.command);
+        assert!(build(&launch(&r, "", &argv)).is_ok());
+    }
+
+    /// Enter on an ended install opens a shell there: the installer never
+    /// runs again from the disconnect bar, even though two of the URLs name
+    /// the agent and would otherwise read as one.
+    #[test]
+    fn an_install_session_reconnects_as_a_shell() {
+        for i in INSTALL {
+            let shell = match i.shell {
+                InstallShell::Posix => RemoteShell::Posix,
+                InstallShell::PowerShell => RemoteShell::Pwsh,
+            };
+            let argv = install_argv(shell, i.command);
+            assert_eq!(install_of(&argv), Some(i.provider));
+            let re = relaunch(&argv);
+            assert_eq!(re.argv, Vec::<String>::new(), "{argv:?}");
+            assert_eq!((re.agent, re.install), (None, Some(i.provider)));
+        }
+        // Only the exact argv: the same words typed by hand are a command.
+        assert_eq!(install_of(&argv(&["sh", "-c", "curl x | bash"])), None);
+        assert_eq!(install_of(&argv(&["claude"])), None);
+        assert_eq!(relaunch(&argv(&["claude"])).install, None);
     }
 }

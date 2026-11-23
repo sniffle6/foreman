@@ -651,6 +651,22 @@ pub fn disconnect_bar_text(
     code: u32,
     next: &crate::remote::Relaunch,
 ) -> String {
+    // An install Session's end is the install's result, and Enter opens a
+    // shell there: the installer runs again only from its named action.
+    if let Some(p) = next.install {
+        return match (ran, code) {
+            (false, _) => format!("Not connected to {remote} — Enter for a shell there"),
+            (true, 0) => {
+                format!("{p} install finished on {remote} — Enter for a shell there to log in")
+            }
+            (true, 255) => format!(
+                "Disconnected from {remote} during the {p} install — Enter for a shell there"
+            ),
+            (true, c) => {
+                format!("{p} install on {remote} exited {c} — Enter for a shell there")
+            }
+        };
+    }
     let lead = match (ran, code) {
         (false, _) => format!("Not connected to {remote}"),
         (true, 0 | 255) => format!("Disconnected from {remote}"),
@@ -6954,6 +6970,31 @@ mod tests {
         assert_eq!(
             text(true, 255, &v(&["npx", "@anthropic-ai/claude-code", "do X"])),
             "Disconnected from desk — Enter to start claude fresh"
+        );
+        // An install Session: its result, and never "resume claude" or a
+        // second run of the installer, though the URL names the agent.
+        let desk = crate::remote::Remote {
+            name: "desk".into(),
+            target: "desk".into(),
+            shell: crate::remote::RemoteShell::Posix,
+            dirs: Default::default(),
+        };
+        let install = crate::remote_install::session_argv(&desk, "claude").unwrap();
+        assert_eq!(
+            text(true, 0, &install),
+            "claude install finished on desk — Enter for a shell there to log in"
+        );
+        assert_eq!(
+            text(true, 1, &install),
+            "claude install on desk exited 1 — Enter for a shell there"
+        );
+        assert_eq!(
+            text(true, 255, &install),
+            "Disconnected from desk during the claude install — Enter for a shell there"
+        );
+        assert_eq!(
+            text(false, 0, &install),
+            "Not connected to desk — Enter for a shell there"
         );
     }
 }

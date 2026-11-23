@@ -279,7 +279,14 @@ impl Content {
                         crate::theme::seed_live(ui.ctx(), &th);
                     }
                     MenuOutcome::Pending => {}
-                    other => menu.pending = Some(other),
+                    other => {
+                        // A Test's shell may have landed in the same frame
+                        // as the install click; keep it.
+                        if matches!(other, MenuOutcome::Install { .. }) {
+                            crate::config::seed_live(ui.ctx(), &live);
+                        }
+                        menu.pending = Some(other)
+                    }
                 }
                 // A control (toggle/stepper/rail) consumes its click before the
                 // window-level content Response sees it, so clicking a control in
@@ -467,6 +474,17 @@ impl Tab {
             layout_id: next_layout_id(),
         }
     }
+}
+
+/// An install Session ([`WindowManager::open_install`]) the desktop watches
+/// until its `ssh` ends, to re-run Test on that Remote.
+#[derive(Clone, Debug, PartialEq)]
+struct InstallWatch {
+    /// The Project's tag (`p7`) and the Session's Member id in it.
+    project: String,
+    term: WinId,
+    target: String,
+    provider: &'static str,
 }
 
 pub struct Win {
@@ -853,6 +871,12 @@ pub struct WindowManager {
     /// The one-time Remote directory prompt (desktop only); it holds the
     /// launch that asked until it is answered. Modal like `picker`.
     dir_prompt: Option<crate::remote_dir_prompt::DirPrompt>,
+    /// The launcher's confirm for installing a missing agent CLI on a Remote
+    /// (desktop only). Modal like `dir_prompt`.
+    install_prompt: Option<crate::remote_install::Prompt>,
+    /// Install Sessions opened from here, until each one's `ssh` ends
+    /// (desktop only).
+    installs: Vec<InstallWatch>,
     /// The launcher's where-strip for this Project: the Remote name it
     /// points at, `None` for this PC. Runtime only, so every app run starts
     /// at Local; a name that is no longer a Remote reads as Local.
@@ -973,6 +997,8 @@ impl WindowManager {
             integration: IntegrationDriver::new(),
             picker: None,
             dir_prompt: None,
+            install_prompt: None,
+            installs: Vec::new(),
             launch_on: None,
             renaming: None,
             rename_buf: String::new(),
@@ -3262,7 +3288,7 @@ impl WindowManager {
         place: crate::remote_dir_prompt::Place,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
-        use crate::remote_dir_prompt::{Place, What};
+        use crate::remote_dir_prompt::What;
         let argv: Vec<String> = match what {
             What::Agent(kind) => kind
                 .launch_command()
@@ -3274,13 +3300,45 @@ impl WindowManager {
         let id = self.next;
         // A bare agent or shell carries no brief: the reply note waits for
         // the first chat post, as for `open --on` without arguments.
-        let mut s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
+        let s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
+        self.place_remote_win(s, format!("{}  ·  #{}", remote.name, id), place, ctx);
+        Ok(id)
+    }
+
+    /// Open `provider`'s vendor install on `remote` as an ordinary Remote
+    /// Session in this Project: in the Remote's home, focused, the command as
+    /// its logical argv, so the user reads it, answers prompts and can
+    /// Ctrl+C. The desktop watches it and re-runs Test when its `ssh` ends.
+    fn open_install(
+        &mut self,
+        remote: &crate::remote::Remote,
+        provider: &'static str,
+        ctx: &egui::Context,
+    ) -> Result<WinId, String> {
+        let argv = crate::remote_install::session_argv(remote, provider)?;
+        let id = self.next;
+        let s = self.spawn_remote_session(&argv, remote, "", id, false, ctx)?;
+        let title = format!("{} · install {provider}  ·  #{id}", remote.name);
+        self.place_remote_win(s, title, crate::remote_dir_prompt::Place::Default, ctx);
+        Ok(id)
+    }
+
+    /// Give a just-spawned Remote Session Member id `self.next` and place
+    /// its Win like the local one it stands in for, focused.
+    fn place_remote_win(
+        &mut self,
+        mut s: Session,
+        title: String,
+        place: crate::remote_dir_prompt::Place,
+        ctx: &egui::Context,
+    ) {
+        use crate::remote_dir_prompt::Place;
+        let id = self.next;
         self.next += 1;
         s.set_term_id(id);
         let src = self.focused;
         self.z += 1;
         let rect = self.cascade_rect(egui::vec2(580.0, 380.0));
-        let title = format!("{}  ·  #{}", remote.name, id);
         self.push_win(id, Tab::shell_default(title, Content::Terminal(s)), rect);
         match place {
             Place::Default => {
@@ -3292,7 +3350,112 @@ impl WindowManager {
             Place::Split(d) => self.place_split(src, id, d),
         }
         self.mark_workspace_dirty();
-        Ok(id)
+    }
+
+    /// The Project window an install from Settings opens in: the focused
+    /// window when it is a Project, else the visible Project focused last.
+    /// Returns its window id and project-tab index.
+    fn install_project(&self) -> Option<(WinId, usize)> {
+        let project = |w: &Win| !w.minimized && w.is_project();
+        self.windows
+            .iter()
+            .find(|w| Some(w.id) == self.focused && project(w))
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(|w| project(w))
+                    .max_by_key(|w| w.z)
+            })
+            .map(|w| (w.id, w.active))
+    }
+
+    /// Run a confirmed install of `provider` on the Remote named `name`, in
+    /// the Project tagged `project` (`None`: [`Self::install_project`]).
+    /// Returns the Project's name; errors are user-facing.
+    fn run_install(
+        &mut self,
+        name: &str,
+        provider: &'static str,
+        project: Option<String>,
+        ctx: &egui::Context,
+    ) -> Result<String, String> {
+        let remote = crate::remote::find(&crate::config::live(ctx).remotes, name)?.clone();
+        let at = match project {
+            Some(tag) => self.windows.iter().find_map(|w| {
+                w.tabs.iter().position(|t| {
+                    matches!(&t.content, Content::Project(c) if c.tag.as_deref() == Some(tag.as_str()))
+                })
+                .map(|pi| (w.id, pi))
+            }),
+            None => self.install_project(),
+        };
+        let Some((wid, pi)) = at else {
+            return Err(format!(
+                "Open a Project first: the {provider} install on {name} runs as a Session inside one"
+            ));
+        };
+        let Some(w) = self.windows.iter_mut().find(|w| w.id == wid) else {
+            return Err("That Project closed".into());
+        };
+        let project_name = display_name(&w.tabs[pi].title).to_string();
+        let Content::Project(child) = &mut w.tabs[pi].content else {
+            return Err("That Project closed".into());
+        };
+        let tag = child.tag.clone().unwrap_or_default();
+        let term = child.open_install(&remote, provider, ctx)?;
+        crate::remote_install::set_mark(
+            &remote.target,
+            provider,
+            crate::remote_install::Mark::Installing,
+        );
+        self.installs.push(InstallWatch {
+            project: tag,
+            term,
+            target: remote.target.clone(),
+            provider,
+        });
+        self.surface_target(crate::panel::TargetPath {
+            project: wid,
+            ptab: Some(pi),
+            window: Some(term),
+            tab: None,
+        });
+        Ok(project_name)
+    }
+
+    /// The watched installs whose Session has ended: its `ssh` exited, or
+    /// the Win or its Project closed (which ends the `ssh`). Removed from the
+    /// watch list.
+    fn take_ended_installs(&mut self) -> Vec<InstallWatch> {
+        let watched = std::mem::take(&mut self.installs);
+        let (ended, live): (Vec<_>, Vec<_>) = watched.into_iter().partition(|i| {
+            self.windows
+                .iter()
+                .flat_map(|w| w.tabs.iter())
+                .find_map(|t| match &t.content {
+                    Content::Project(c) if c.tag.as_deref() == Some(i.project.as_str()) => {
+                        Some(c.as_ref())
+                    }
+                    _ => None,
+                })
+                .and_then(|c| c.terminal_session(i.term))
+                .is_none_or(Session::disconnected)
+        });
+        self.installs = live;
+        ended
+    }
+
+    /// Re-run Test on each Remote whose install Session just ended, so the
+    /// Remotes pane row and the launcher show what it left.
+    fn refresh_installs(&mut self, ctx: &egui::Context) {
+        for i in self.take_ended_installs() {
+            crate::remote_install::set_mark(
+                &i.target,
+                i.provider,
+                crate::remote_install::Mark::Ended,
+            );
+            crate::remote_probe::start_test(ctx, &i.target);
+        }
     }
 
     /// Leader N: a new terminal on the focused Session's Remote, else the
@@ -4829,7 +4992,7 @@ impl WindowManager {
     /// `drain_chat_clicks`). Close removes only the settings tab (per-tab, like
     /// Chat, so a co-tabbed project survives); CheckUpdatesNow latches the
     /// update fetch.
-    fn drain_settings(&mut self) -> bool {
+    fn drain_settings(&mut self, ctx: &egui::Context) -> bool {
         let mut found = None;
         for w in &mut self.windows {
             for t in &mut w.tabs {
@@ -4850,6 +5013,26 @@ impl WindowManager {
             }
             MenuOutcome::CheckUpdatesNow => {
                 self.check_updates_requested = true;
+                false
+            }
+            MenuOutcome::Install { remote, provider } => {
+                let note = match self.run_install(&remote, provider, None, ctx) {
+                    Ok(project) => format!(
+                        "Installing {provider} on {remote} in a new Session in {project}. \
+                         Test runs again when it ends."
+                    ),
+                    Err(e) => {
+                        crate::notify::queue(ctx, crate::notify::Level::Error, e.clone());
+                        e
+                    }
+                };
+                for w in &mut self.windows {
+                    for t in &mut w.tabs {
+                        if let Content::Settings(menu) = &mut t.content {
+                            menu.remotes.note(note.clone());
+                        }
+                    }
+                }
                 false
             }
             _ => false,
@@ -5552,6 +5735,7 @@ impl WindowManager {
         };
         use crate::remote_dir_prompt::{Place, What};
         let mut ask = None;
+        let mut install_ask = None;
         match launch {
             // A strip click only moves the selection: no spawn, no surfacing.
             // A Remote deleted since the click reads as Local.
@@ -5584,6 +5768,33 @@ impl WindowManager {
                     ),
                 }
             }
+            // A missing agent on the selected Remote: confirm the install
+            // (or say why there is none) instead of a launch that would
+            // fail with "command not found".
+            Launch::InstallAgent(agent) => match (inner.chosen_remote(ctx), agent.provider()) {
+                (Some(r), Some(provider)) => {
+                    let offer = crate::remote_install::states_on(&r.target, r.shell)
+                        .and_then(|s| s.into_iter().find(|(p, _)| *p == provider))
+                        .map(|(p, st)| crate::remote_install::offer(&r.name, r.shell, p, &st))
+                        .unwrap_or_else(|| {
+                            crate::remote_install::Offer::Blocked(format!(
+                                "Test {} again in Settings > Remotes: its last answer is gone",
+                                r.name
+                            ))
+                        });
+                    install_ask = Some(crate::remote_install::Ask {
+                        remote: r.name.clone(),
+                        provider,
+                        project: inner.tag.clone().unwrap_or_default(),
+                        offer,
+                    });
+                }
+                _ => crate::notify::queue(
+                    ctx,
+                    crate::notify::Level::Error,
+                    "That Remote is no longer set up".to_string(),
+                ),
+            },
             Launch::Shell(shell) => {
                 inner.add_terminal(shell, ctx);
             }
@@ -5618,6 +5829,9 @@ impl WindowManager {
             tab: Some(pi),
         });
         self.ask_dir(ask);
+        if let Some(a) = install_ask {
+            self.install_prompt = Some(crate::remote_install::Prompt::new(a));
+        }
     }
 
     /// Open the directory prompt for a launch that needs one (desktop only;
@@ -6895,6 +7109,7 @@ impl WindowManager {
             || self.pending_close.is_some()
             || self.picker.is_some()
             || self.dir_prompt.is_some()
+            || self.install_prompt.is_some()
             || self.renaming.is_some()
             || self.any_layout_capture()
     }
@@ -7929,6 +8144,7 @@ impl WindowManager {
         if self.desktop {
             self.prune_launch_on(&crate::config::live(ui.ctx()).remotes);
             self.refresh_reconnects(ui.ctx());
+            self.refresh_installs(ui.ctx());
             self.refresh_exit_titles();
             self.refresh_auto_titles();
             if area.size() != prev_area && self.panel_id().is_some_and(|p| self.tree.contains(p)) {
@@ -8020,8 +8236,11 @@ impl WindowManager {
         // this stops the focused terminal from consuming keystrokes meant for
         // the overlay, and (below) stops a hover under the overlay from
         // stealing focus either.
-        let no_modal =
-            live && self.picker.is_none() && self.dir_prompt.is_none() && self.renaming.is_none();
+        let no_modal = live
+            && self.picker.is_none()
+            && self.dir_prompt.is_none()
+            && self.install_prompt.is_none()
+            && self.renaming.is_none();
         // An open tab-overflow list owns Escape and the pointer: no terminal
         // here reads keys, but window chrome keeps its focus look (unlike
         // the overlays above, which dim it).
@@ -8991,18 +9210,21 @@ impl WindowManager {
                                     label: float_label,
                                     hint: None,
                                     mark: false,
+                                    dim: false,
                                     act: Act::Float(id),
                                 },
                                 crate::hover_menu::Entry::Item {
                                     label: "Minimize",
                                     hint: None,
                                     mark: false,
+                                    dim: false,
                                     act: Act::Min(id),
                                 },
                                 crate::hover_menu::Entry::Item {
                                     label: "Maximize",
                                     hint: None,
                                     mark: false,
+                                    dim: false,
                                     act: Act::Max(id),
                                 },
                             ]
@@ -9299,7 +9521,7 @@ impl WindowManager {
         self.drain_history_acts();
         self.drain_worktree_msgs(&ctx);
         self.drain_release(&ctx);
-        if self.drain_settings() {
+        if self.drain_settings(&ctx) {
             self.swallow_input(ui);
         }
         self.show_modals(ui, area, &ctx);
@@ -9389,6 +9611,7 @@ impl WindowManager {
     fn terminal_owns_keyboard(&self) -> bool {
         if self.picker.is_some()
             || self.dir_prompt.is_some()
+            || self.install_prompt.is_some()
             || self.renaming.is_some()
             || self.pending_close.is_some()
             || self.layout_ui.captures_keyboard()
@@ -9436,6 +9659,7 @@ impl WindowManager {
             && active
             && self.picker.is_none()
             && self.dir_prompt.is_none()
+            && self.install_prompt.is_none()
             && self.renaming.is_none()
             && !self.settings_capturing()
             // A layout menu or dialog owns the keys (the Delete dialog has
@@ -9508,7 +9732,11 @@ impl WindowManager {
         // hide the dialog (minimize → app-wide keyboard freeze with no visible
         // modal), or stack a second overlay on top. These fields still hold the
         // pre-open state the frame a modal OPENS, so that opening act applies.
-        if self.app_modal || self.picker.is_some() || self.dir_prompt.is_some() {
+        if self.app_modal
+            || self.picker.is_some()
+            || self.dir_prompt.is_some()
+            || self.install_prompt.is_some()
+        {
             return;
         }
         if acts.is_empty() {
@@ -9595,6 +9823,18 @@ impl WindowManager {
                 crate::remote_dir_prompt::Outcome::Cancelled => {}
                 crate::remote_dir_prompt::Outcome::Accepted(dir) => {
                     self.answer_dir(prompt.ask, dir, ctx)
+                }
+            }
+        }
+        if let Some(mut prompt) = self.install_prompt.take() {
+            match prompt.show(ui) {
+                crate::remote_install::Outcome::Pending => self.install_prompt = Some(prompt),
+                crate::remote_install::Outcome::Cancelled => {}
+                crate::remote_install::Outcome::Confirmed => {
+                    let a = prompt.ask;
+                    if let Err(e) = self.run_install(&a.remote, a.provider, Some(a.project), ctx) {
+                        crate::notify::queue(ctx, crate::notify::Level::Error, e);
+                    }
                 }
             }
         }
@@ -16124,6 +16364,63 @@ mod tests {
         assert_eq!(wm.focused, Some(first));
     }
 
+    /// Settings is a Win of its own, so an install from it opens in the
+    /// focused Project, or the visible Project focused last; never in a
+    /// minimized one, and with none it says plainly a Project must be open.
+    #[test]
+    fn an_install_from_settings_picks_the_project_focused_last() {
+        let mut wm = WindowManager::new();
+        assert_eq!(wm.install_project(), None);
+        let a = push(&mut wm, "a");
+        let b = push(&mut wm, "b");
+        assert_eq!(wm.install_project(), Some((b, 0)));
+        wm.focus(a);
+        wm.focused = None; // the Settings Win, say
+        assert_eq!(wm.install_project(), Some((a, 0)));
+        wm.windows.iter_mut().find(|w| w.id == a).unwrap().minimized = true;
+        assert_eq!(wm.install_project(), Some((b, 0)));
+
+        let ctx = egui::Context::default();
+        let settings = crate::config::Settings {
+            remotes: vec![crate::remote::Remote {
+                name: "desk".into(),
+                target: "andy@desk".into(),
+                shell: crate::remote::RemoteShell::Posix,
+                dirs: Default::default(),
+            }],
+            ..Default::default()
+        };
+        crate::config::seed_live(&ctx, &settings);
+        let mut empty = WindowManager::new();
+        let e = empty.run_install("desk", "grok", None, &ctx).unwrap_err();
+        assert!(
+            e.contains("Open a Project first") && e.contains("desk"),
+            "{e}"
+        );
+        assert!(empty.installs.is_empty());
+        let e = empty.run_install("garage", "grok", None, &ctx).unwrap_err();
+        assert!(e.contains("garage"), "{e}");
+    }
+
+    /// An install whose Session or Project is gone has ended: it leaves the
+    /// watch once, so Test re-runs once.
+    #[test]
+    fn an_install_whose_session_is_gone_has_ended() {
+        let mut wm = WindowManager::new();
+        let p = push(&mut wm, "proj");
+        let watch = |project: String| InstallWatch {
+            project,
+            term: 7,
+            target: "andy@desk".into(),
+            provider: "grok",
+        };
+        wm.installs = vec![watch(format!("p{p}")), watch("p999".into())];
+        let ended = wm.take_ended_installs();
+        assert_eq!(ended.len(), 2, "no such Session, and no such Project");
+        assert!(wm.installs.is_empty());
+        assert!(wm.take_ended_installs().is_empty());
+    }
+
     #[test]
     fn settings_esc_close_spares_co_tabbed_project() {
         let mut wm = WindowManager::new();
@@ -16133,7 +16430,7 @@ mod tests {
         let w = wm.windows.iter_mut().find(|w| w.id == id).unwrap();
         w.tabs.push(Tab::fixed("Settings", Content::Settings(menu)));
         w.active = w.tabs.len() - 1; // Settings tab is active/focused
-        wm.drain_settings();
+        wm.drain_settings(&egui::Context::default());
         let w = wm
             .windows
             .iter()

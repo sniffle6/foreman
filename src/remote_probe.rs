@@ -231,6 +231,9 @@ pub struct TestReport {
     /// `$SHELL` on a Posix Remote.
     pub login_shell: Option<String>,
     pub curl: bool,
+    /// `bash` on a Posix Remote's login PATH; some vendor installers pipe
+    /// into it. Not looked for on Windows, whose installers need nothing.
+    pub bash: bool,
     /// Agent CLIs from `AGENTS` found on the Remote's PATH.
     pub agents: Vec<String>,
 }
@@ -245,7 +248,8 @@ pub enum TestOutcome {
 }
 
 impl TestOutcome {
-    /// One plain line for the pane.
+    /// One plain line for the pane: login, shell and `curl`. The agent CLIs
+    /// have their own line ([`crate::remote_install`]).
     pub fn summary(&self) -> String {
         match self {
             TestOutcome::NeedsLogin => "Needs an interactive login (a password, passphrase or new host key): open a Remote Session on it once and log in there".into(),
@@ -260,21 +264,7 @@ impl TestOutcome {
                 } else {
                     "no curl (chat and badges need it)"
                 };
-                let missing: Vec<&str> = AGENTS
-                    .iter()
-                    .copied()
-                    .filter(|a| !r.agents.iter().any(|f| f == a))
-                    .collect();
-                let agents = match (r.agents.is_empty(), missing.is_empty()) {
-                    (true, _) => "no agent CLIs on PATH".to_string(),
-                    (false, true) => format!("agents: {}", r.agents.join(", ")),
-                    (false, false) => format!(
-                        "agents: {} ({} not found)",
-                        r.agents.join(", "),
-                        missing.join(", ")
-                    ),
-                };
-                format!("Login works · {shell} · {curl} · {agents}")
+                format!("Login works · {shell} · {curl}")
             }
         }
     }
@@ -326,7 +316,7 @@ pub fn stage2_line(family: Family) -> String {
         }
         Family::Posix => {
             let script = format!(
-                "echo \"{MARK} shell ${{SHELL:-sh}}\"\nexec \"${{SHELL:-sh}}\" -lic 'for c in curl {}; do if command -v \"$c\" >/dev/null 2>&1; then echo \"{MARK} have $c\"; else echo \"{MARK} miss $c\"; fi; done'\n",
+                "echo \"{MARK} shell ${{SHELL:-sh}}\"\nexec \"${{SHELL:-sh}}\" -lic 'for c in curl bash {}; do if command -v \"$c\" >/dev/null 2>&1; then echo \"{MARK} have $c\"; else echo \"{MARK} miss $c\"; fi; done'\n",
                 AGENTS.join(" ")
             );
             crate::remote::posix_line(&script)
@@ -366,6 +356,7 @@ pub fn parse_tools(family: Family, stdout: &str) -> Option<TestReport> {
         shell,
         login_shell: login_shell.filter(|_| family == Family::Posix),
         curl: has("curl") || has("curl.exe"),
+        bash: family == Family::Posix && has("bash"),
         agents: AGENTS
             .iter()
             .filter(|a| has(a))
@@ -390,17 +381,86 @@ pub fn classify_failure(stderr: &str) -> TestOutcome {
     }
 }
 
-/// Run Test for `target` on its own thread; the answer arrives on the
-/// returned channel and wakes the UI.
-pub fn start_test(ctx: &egui::Context, target: &str) -> mpsc::Receiver<TestOutcome> {
-    let (tx, rx) = mpsc::channel();
+/// The last Test of one target, as everyone reads it: the Remotes pane,
+/// the launcher, and the install watch that re-runs it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TestEntry {
+    /// Bumped by every start and every finish, so a reader can tell a new
+    /// answer from one it has already applied.
+    pub generation: u64,
+    pub running: bool,
+    /// The last finished answer. It stays while a re-run is in flight.
+    pub last: Option<TestOutcome>,
+}
+
+/// Per-target Test answers. Pure: the worker side is [`start_test`].
+#[derive(Debug, Default)]
+pub struct TestCache {
+    entries: HashMap<String, TestEntry>,
+    generation: u64,
+}
+
+impl TestCache {
+    /// Mark `target` running. False when it already is: one Test at a time.
+    pub fn begin(&mut self, target: &str) -> bool {
+        self.generation += 1;
+        let g = self.generation;
+        let e = self.entries.entry(target.to_string()).or_default();
+        if e.running {
+            return false;
+        }
+        e.running = true;
+        e.generation = g;
+        true
+    }
+
+    pub fn finish(&mut self, target: &str, outcome: TestOutcome) {
+        self.generation += 1;
+        let e = self.entries.entry(target.to_string()).or_default();
+        e.running = false;
+        e.last = Some(outcome);
+        e.generation = self.generation;
+    }
+
+    pub fn get(&self, target: &str) -> Option<TestEntry> {
+        self.entries.get(target).cloned()
+    }
+}
+
+fn tests() -> &'static Mutex<TestCache> {
+    static TESTS: OnceLock<Mutex<TestCache>> = OnceLock::new();
+    TESTS.get_or_init(Mutex::default)
+}
+
+/// Run Test for `target` on its own thread, unless one is already running.
+/// The answer lands in the shared cache ([`test_entry`]) and wakes the UI.
+pub fn start_test(ctx: &egui::Context, target: &str) {
+    if !tests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin(target)
+    {
+        return;
+    }
     let ctx = ctx.clone();
     let target = target.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(run_test(&target));
+        let outcome = run_test(&target);
+        tests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(&target, outcome);
         ctx.request_repaint();
     });
-    rx
+}
+
+/// The last Test of `target` this app run; `None` = never tested. A lock and
+/// a map lookup, cheap enough per frame.
+pub fn test_entry(target: &str) -> Option<TestEntry> {
+    tests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
 }
 
 fn run_test(target: &str) -> TestOutcome {
@@ -669,6 +729,7 @@ mod tests {
         assert!(r.curl);
         assert_eq!(r.agents, vec!["claude".to_string()]);
         assert_eq!(r.login_shell, None);
+        assert!(!r.bash, "bash is a Posix prerequisite only");
 
         let out = "foreman-probe miss pwsh\r\nforeman-probe miss curl.exe\r\n";
         let r = parse_tools(Family::Windows, out).unwrap();
@@ -678,12 +739,35 @@ mod tests {
 
     #[test]
     fn posix_tools_ignore_startup_noise_and_read_the_login_shell() {
-        let out = "foreman-probe shell /bin/bash\nbash: no job control in this shell\nLast login: Tue\nforeman-probe have curl\nforeman-probe miss claude\nforeman-probe have codex\nforeman-probe miss grok\n";
+        let out = "foreman-probe shell /bin/bash\nbash: no job control in this shell\nLast login: Tue\nforeman-probe have curl\nforeman-probe have bash\nforeman-probe miss claude\nforeman-probe have codex\nforeman-probe miss grok\n";
         let r = parse_tools(Family::Posix, out).unwrap();
         assert_eq!(r.shell, RemoteShell::Posix);
         assert_eq!(r.login_shell.as_deref(), Some("/bin/bash"));
         assert!(r.curl);
+        assert!(r.bash);
         assert_eq!(r.agents, vec!["codex".to_string()]);
+        let r = parse_tools(Family::Posix, "foreman-probe miss bash\n").unwrap();
+        assert!(!r.bash && !r.curl);
+    }
+
+    /// The shared cache: one run at a time, a re-run keeps the last answer
+    /// on show, and every change moves the generation.
+    #[test]
+    fn test_cache_runs_once_and_keeps_the_last_answer_while_rerunning() {
+        let mut c = TestCache::default();
+        assert_eq!(c.get("desk"), None);
+        assert!(c.begin("desk"));
+        assert!(!c.begin("desk"), "already running");
+        let g = c.get("desk").unwrap();
+        assert!(g.running && g.last.is_none());
+        c.finish("desk", TestOutcome::NeedsLogin);
+        let done = c.get("desk").unwrap();
+        assert!(!done.running && done.generation > g.generation);
+        assert!(c.begin("desk"));
+        let again = c.get("desk").unwrap();
+        assert!(again.running && again.generation > done.generation);
+        assert_eq!(again.last, Some(TestOutcome::NeedsLogin));
+        assert_eq!(c.get("other"), None);
     }
 
     #[test]
@@ -729,27 +813,26 @@ mod tests {
     }
 
     #[test]
-    fn summary_names_shell_curl_and_agents() {
+    fn summary_names_shell_and_curl() {
         let r = TestOutcome::Ok(TestReport {
             shell: RemoteShell::Posix,
             login_shell: Some("/bin/zsh".into()),
             curl: false,
+            bash: true,
             agents: vec!["claude".into()],
         });
         assert_eq!(
             r.summary(),
-            "Login works · SH (/bin/zsh) · no curl (chat and badges need it) · agents: claude (codex, grok not found)"
+            "Login works · SH (/bin/zsh) · no curl (chat and badges need it)"
         );
         let r = TestOutcome::Ok(TestReport {
             shell: RemoteShell::Pwsh,
             login_shell: None,
             curl: true,
+            bash: false,
             agents: vec![],
         });
-        assert_eq!(
-            r.summary(),
-            "Login works · PowerShell · curl found · no agent CLIs on PATH"
-        );
+        assert_eq!(r.summary(), "Login works · PowerShell · curl found");
         assert!(
             TestOutcome::NeedsLogin
                 .summary()

@@ -16,6 +16,9 @@ pub enum Launch {
     RemoteAgent(SessionKind),
     /// The Remote's login shell, on the Remote the where-strip names.
     RemoteShell,
+    /// An agent the selected Remote's last Test did not find: confirm its
+    /// install (or say why there is none) instead of launching it.
+    InstallAgent(SessionKind),
     /// The "+" itself: the default shell wherever the where-strip points.
     Default,
     /// Point the Project's where-strip at this PC (`None`) or at the Remote
@@ -34,6 +37,9 @@ pub struct Spot<'a> {
     pub reach: Reach,
     /// The SSH port the probe resolved, for the state line.
     pub port: Option<u16>,
+    /// Each agent's state from this run's last successful Test; `None` when
+    /// the Remote has none, and then its agent rows are as they always were.
+    pub agents: Option<Vec<(&'static str, crate::remote_install::AgentState)>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -82,6 +88,7 @@ pub fn menu(
             shell: r.shell,
             reach: crate::remote_probe::reach(ctx, &r.target),
             port: crate::remote_probe::ssh_port(&r.target),
+            agents: crate::remote_install::states_on(&r.target, r.shell),
         })
         .collect();
     let on = launch_on.and_then(|n| {
@@ -133,14 +140,16 @@ pub fn entries_on(
     };
     rows.push(header("AGENTS"));
     for agent in [SessionKind::Claude, SessionKind::Codex, SessionKind::Grok] {
+        let (hint, dim, act) = match on {
+            None => (None, false, Launch::Agent(agent)),
+            Some(i) => remote_agent_row(agent, spots[i].agents.as_deref()),
+        };
         rows.push(Entry::Item {
             label: agent.label(),
-            hint: None,
+            hint,
             mark: false,
-            act: match on {
-                None => Launch::Agent(agent),
-                Some(_) => Launch::RemoteAgent(agent),
-            },
+            dim,
+            act,
         });
     }
     rows.push(header("SHELLS"));
@@ -152,6 +161,7 @@ pub fn entries_on(
                 crate::remotes_pane::shell_label(spots[i].shell)
             )),
             mark: false,
+            dim: false,
             act: Launch::RemoteShell,
         });
     } else {
@@ -164,6 +174,7 @@ pub fn entries_on(
                 label,
                 hint: (shell == default_shell).then(|| "(default)".into()),
                 mark: false,
+                dim: false,
                 act: Launch::Shell(shell),
             });
         }
@@ -176,6 +187,7 @@ pub fn entries_on(
                 .chord_for(tool.command())
                 .map(|chord| format!("{} {}", keymap.leader.pretty(), chord.pretty())),
             mark: open_tools.contains(&tool),
+            dim: false,
             act: Launch::Tool(tool),
         });
     }
@@ -184,9 +196,37 @@ pub fn entries_on(
         label: "New project…",
         hint: None,
         mark: false,
+        dim: false,
         act: Launch::NewProject,
     });
     rows
+}
+
+/// An agent row under a Remote: its hint, whether it is dimmed, and what
+/// choosing it does, from that Remote's last Test. A missing agent is dim
+/// AND says so in words, and choosing it offers the install instead of a
+/// launch that would fail with "command not found". Untested: as always.
+fn remote_agent_row(
+    agent: SessionKind,
+    states: Option<&[(&'static str, crate::remote_install::AgentState)]>,
+) -> (Option<String>, bool, Launch) {
+    use crate::remote_install::AgentState;
+    let state = states
+        .and_then(|s| s.iter().find(|(p, _)| Some(*p) == agent.provider()))
+        .map(|(_, st)| st);
+    let (hint, dim, install) = match state {
+        Some(AgentState::Missing { .. }) => (Some("not installed"), true, true),
+        Some(AgentState::Installing) => (Some("installing…"), true, true),
+        Some(AgentState::Checking) => (Some("checking…"), true, false),
+        Some(AgentState::Installed) => (Some("needs login"), false, false),
+        Some(AgentState::Found) | None => (None, false, false),
+    };
+    let act = if install {
+        Launch::InstallAgent(agent)
+    } else {
+        Launch::RemoteAgent(agent)
+    };
+    (hint.map(str::to_string), dim, act)
 }
 
 /// The dim line under the strip: the selected Remote and its state in words,
@@ -301,6 +341,7 @@ mod tests {
                 shell: RemoteShell::Posix,
                 reach: Reach::Reachable,
                 port: Some(22),
+                agents: None,
             },
             Spot {
                 name: "garage",
@@ -308,6 +349,7 @@ mod tests {
                 shell: RemoteShell::Pwsh,
                 reach: Reach::Offline,
                 port: Some(2222),
+                agents: None,
             },
             Spot {
                 name: "laptop",
@@ -315,6 +357,7 @@ mod tests {
                 shell: RemoteShell::Posix,
                 reach: Reach::Checking,
                 port: None,
+                agents: None,
             },
         ]
     }
@@ -399,6 +442,7 @@ mod tests {
                         shell: RemoteShell::Posix,
                         reach: reach.clone(),
                         port,
+                        agents: None,
                     }];
                     let notes = crate::hover_menu::notes_fit(|| {
                         entries_on(&Keymap::default(), Shell::Cmd, &HashSet::new(), &spot, on)
@@ -478,5 +522,85 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Under a Remote whose last Test misses an agent, that row is dim and
+    /// says so, and choosing it offers the install. An untested Remote, and
+    /// Local, are exactly as before.
+    #[test]
+    fn a_missing_agent_on_the_selected_remote_is_marked_and_offers_install() {
+        use crate::remote_install::{AgentState, Gate};
+        let keymap = Keymap::default();
+        let agent_rows = |rows: &[Entry<Launch>]| -> Vec<(Option<String>, bool, Launch)> {
+            rows.iter()
+                .filter_map(|e| match e {
+                    Entry::Item { hint, dim, act, .. }
+                        if matches!(
+                            act,
+                            Launch::Agent(_) | Launch::RemoteAgent(_) | Launch::InstallAgent(_)
+                        ) =>
+                    {
+                        Some((hint.clone(), *dim, act.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut spots = spots();
+        spots[0].agents = Some(vec![
+            ("claude", AgentState::Found),
+            (
+                "codex",
+                AgentState::Missing {
+                    gate: Gate::ByHand,
+                    after_install: false,
+                },
+            ),
+            ("grok", AgentState::Installing),
+        ]);
+        let rows = entries_on(&keymap, Shell::Cmd, &HashSet::new(), &spots, Some(0));
+        assert_eq!(
+            agent_rows(&rows),
+            vec![
+                (None, false, Launch::RemoteAgent(SessionKind::Claude)),
+                (
+                    Some("not installed".into()),
+                    true,
+                    Launch::InstallAgent(SessionKind::Codex)
+                ),
+                (
+                    Some("installing…".into()),
+                    true,
+                    Launch::InstallAgent(SessionKind::Grok)
+                ),
+            ]
+        );
+        // Never tested: launches as today.
+        let rows = entries_on(&keymap, Shell::Cmd, &HashSet::new(), &spots, Some(2));
+        assert!(
+            agent_rows(&rows)
+                .iter()
+                .all(|(h, dim, act)| h.is_none() && !dim && matches!(act, Launch::RemoteAgent(_)))
+        );
+        // Local ignores any Remote's Test.
+        let rows = entries_on(&keymap, Shell::Cmd, &HashSet::new(), &spots, None);
+        assert!(
+            agent_rows(&rows)
+                .iter()
+                .all(|(h, dim, act)| h.is_none() && !dim && matches!(act, Launch::Agent(_)))
+        );
+        // No Remotes: no row dimmed, every act as before.
+        let rows = entries(&keymap, Shell::Cmd, &HashSet::new());
+        assert!(
+            rows.iter()
+                .all(|e| !matches!(e, Entry::Item { dim: true, .. }))
+        );
+        assert!(!rows.iter().any(|e| matches!(
+            e,
+            Entry::Item {
+                act: Launch::InstallAgent(_),
+                ..
+            }
+        )));
     }
 }

@@ -317,6 +317,36 @@ shell it found, whether `curl` is there, which agent CLIs are on PATH.
 Deleting a Remote does not touch live Sessions; each carries its own copy
 of the name.
 
+**Installing an agent CLI.** Each row has a second fixed line for the agent
+CLIs, there before the first Test so a result never moves a row: "has
+claude, codex", then each missing agent as an "install grok" row button or
+in words. "grok needs bash" means the installer needs a tool Test did not
+find; foreman installs no OS packages. The other words are "grok: install
+by hand" (no command for that shell), "grok installing…", "grok checking…"
+and "grok installed, needs login". `I` or the button opens a confirm in the
+row, shaped like delete's: "Install grok on desk?" with install and cancel,
+and the exact command in the room of the two lines under it. ←/→ picks
+another missing agent. Enter opens the vendor command as an ordinary Remote
+Session in the Remote's home, in the focused Project. Settings is a Win of
+its own, so that is the visible Project focused last; with none open it
+says one must be. When the Session's `ssh` ends, or its Win or Project
+closes, Test runs again. The disconnect bar says how the install ended, and
+Enter there opens a shell on the Remote to log in, never the installer
+again. Nothing installs on Test, launch or connect.
+
+The commands are one table, `remote::INSTALL`: one per (provider, Posix or
+PowerShell), the vendor's own native installer, with its page beside it.
+The Posix ones fetch with `curl`, and Claude's and Grok's pipe to `bash`, so
+Test also reports `bash`. None uses npm, so nothing needs Node. Every
+PowerShell entry is untested.
+
+In the launcher, under a Remote whose last Test this run misses an agent,
+that agent's row is dimmed and says "not installed" (or "installing…").
+Choosing it opens a desktop prompt with the same question, note and
+command, or the same plain message when there is nothing to run. A Remote
+not tested this run keeps its rows as they were. Test answers and installs
+are not saved across runs.
+
 **Disconnect.** When a Remote Session's `ssh` exits, the Win stays, shows a
 one-line "Disconnected from desk — Enter to reconnect" bar, and writes
 nothing to the PTY. A danger dot on the top corner of the tab and row icon
