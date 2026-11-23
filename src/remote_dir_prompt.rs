@@ -59,9 +59,11 @@ pub enum Outcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
-    /// Opens from the field; goes into the selected folder from the list.
+    /// Opens from the field; goes into the selected folder from the list;
+    /// creates the folder from the new-folder name field.
     Enter,
-    /// Cancels from the field; from the list, returns to the field.
+    /// Cancels from the field; from the list, returns to the field; from
+    /// the name field, returns to the list.
     Esc,
     /// A folder-list key ([`Browser::key`]).
     Nav(Nav),
@@ -166,14 +168,14 @@ impl DirPrompt {
 
     pub fn key(&mut self, k: Key) -> Outcome {
         match k {
-            // The first Esc leaves the list, the second cancels.
-            Key::Esc if self.browse.list_focused() => {
-                self.browse.focus_field();
-                Outcome::Pending
-            }
+            // Each Esc steps back one: name field, list, field; the last
+            // cancels.
+            Key::Esc if self.browse.back() => Outcome::Pending,
             Key::Esc => Outcome::Cancelled,
-            // One thing per state: the list's Enter never opens.
+            // One thing per state: the list's Enter never opens, and nor
+            // does the held Enter that just created a folder.
             Key::Enter if self.browse.list_focused() => self.nav(Nav::Enter),
+            Key::Enter if self.browse.held_enter() => Outcome::Pending,
             Key::Enter => match validate(&self.text) {
                 Ok(dir) => Outcome::Accepted(dir),
                 Err(e) => {
@@ -213,6 +215,7 @@ impl DirPrompt {
         let th = crate::theme::live(&ctx);
         let mut outcome = Outcome::Pending;
         let list = self.browse.list_focused();
+        let naming = self.browse.naming();
         let rows = !list && self.browse.enters(&self.text) != Enters::None;
         for k in ui.input_mut(|i| {
             let mut keys = Vec::new();
@@ -225,14 +228,17 @@ impl DirPrompt {
             // Consumed before the field draws, so none moves its caret.
             let none = egui::Modifiers::NONE;
             if list {
-                for (key, nav) in [
+                let all = [
                     (egui::Key::ArrowUp, Nav::Up),
                     (egui::Key::ArrowDown, Nav::Down),
+                    (egui::Key::Tab, Nav::Tab),
                     (egui::Key::ArrowLeft, Nav::Left),
                     (egui::Key::ArrowRight, Nav::Right),
                     (egui::Key::Backspace, Nav::Backspace),
-                    (egui::Key::Tab, Nav::Tab),
-                ] {
+                ];
+                // The name field edits with the rest.
+                let ours = if naming { &all[..3] } else { &all[..] };
+                for &(key, nav) in ours {
                     if i.consume_key(none, key) {
                         keys.push(Key::Nav(nav));
                     }
@@ -405,9 +411,11 @@ impl DirPrompt {
 fn hint(browse: &Browser, text: &str) -> &'static str {
     if browse.list_focused() {
         match browse.shows(text) {
-            Shows::Rows => "↑/↓ pick · Enter/→ go in · ← up · Esc, then Enter open",
+            Shows::Rows => "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open",
             Shows::Waiting => "Listing folders · Esc, then Enter open",
             Shows::Retry => "Enter retry · Esc, then Enter open",
+            Shows::Naming => "Enter create the folder · Esc back to the list",
+            Shows::Creating => "Creating the folder… · Esc back to the list",
         }
     } else {
         match browse.enters(text) {
@@ -700,7 +708,7 @@ mod tests {
         assert!(p.browse.list_focused());
         assert_eq!(
             p.hint(),
-            "↑/↓ pick · Enter/→ go in · ← up · Esc, then Enter open"
+            "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open"
         );
         assert!(p.laid.hint_fits);
         assert_eq!(
@@ -986,6 +994,265 @@ mod tests {
             frame(&ctx, &mut p, size, vec![]);
             assert!(p.browse.list_focused());
             check(&p, "list");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Making a folder
+    // -----------------------------------------------------------------------
+
+    fn up(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Enter held down: the press, and then its repeats (egui itself marks
+    /// a press of a key already down as a repeat).
+    fn hold_enter() -> Vec<egui::Event> {
+        key(egui::Key::Enter)
+    }
+
+    /// Enter pressed afresh: released first, as a keyboard does.
+    fn tap_enter() -> Vec<egui::Event> {
+        let mut e = vec![up(egui::Key::Enter)];
+        e.extend(key(egui::Key::Enter));
+        e
+    }
+
+    /// N as a keyboard sends it: the key, the text it types, the release.
+    fn n_key() -> Vec<egui::Event> {
+        let mut e = key(egui::Key::N);
+        e.push(egui::Event::Text("n".into()));
+        e.push(up(egui::Key::N));
+        e
+    }
+
+    /// A prompt on `~/` listing `apps` and `src`, the list focused.
+    fn in_the_list(ctx: &egui::Context, size: (f32, f32)) -> DirPrompt {
+        let mut p = DirPrompt::new(ask(Some("~/")));
+        p.browse.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "src"]),
+        );
+        frame(ctx, &mut p, size, vec![]);
+        frame(ctx, &mut p, size, key(egui::Key::ArrowDown));
+        frame(ctx, &mut p, size, vec![]);
+        assert!(p.browse.list_focused());
+        p
+    }
+
+    const NAMING: &str = "Enter create the folder · Esc back to the list";
+
+    /// N types an "n" in the field; only while the list has the keyboard
+    /// does it open the name field, which then takes the typing. The
+    /// Directory field never looks focused meanwhile, and each Esc steps
+    /// back one: to the list, to the field, then out.
+    #[test]
+    fn n_names_a_new_folder_only_from_the_list_and_esc_steps_back() {
+        let ctx = egui::Context::default();
+        let mut p = DirPrompt::new(ask(Some("~/")));
+        p.browse.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "src"]),
+        );
+        frame(&ctx, &mut p, WIDE, vec![]);
+        frame(&ctx, &mut p, WIDE, vec![]);
+        frame(&ctx, &mut p, WIDE, n_key());
+        assert_eq!(p.text, "~/n", "in the field N is typing");
+        assert!(!p.browse.naming());
+
+        let mut p = in_the_list(&ctx, WIDE);
+        assert_eq!(
+            p.hint(),
+            "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open"
+        );
+        assert!(p.laid.hint_fits);
+        frame(&ctx, &mut p, WIDE, n_key());
+        assert!(p.browse.naming());
+        assert_eq!(p.text, "~/", "N wrote nothing into the field");
+        assert_eq!(p.browse.name_text(), Some(""));
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert!(!field_focused(&ctx), "one focus at a time");
+        assert!(p.browse.laid.name.is_some());
+        assert_eq!(p.hint(), NAMING);
+        assert!(p.laid.hint_fits);
+        assert_eq!(
+            p.browse.laid.crumb_text, "New folder in ~ on desk",
+            "names the parent and the Remote"
+        );
+        frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("pro j".into())]);
+        assert_eq!(p.browse.name_text(), Some("pro j"));
+        assert_eq!(p.text, "~/", "typing went to the name");
+        // Left and Backspace edit the name, never the list or the field.
+        frame(&ctx, &mut p, WIDE, key(egui::Key::Backspace));
+        frame(&ctx, &mut p, WIDE, key(egui::Key::ArrowLeft));
+        assert_eq!(p.browse.name_text(), Some("pro "));
+        assert!(p.browse.naming());
+
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, key(egui::Key::Escape)),
+            Outcome::Pending
+        );
+        assert!(
+            !p.browse.naming() && p.browse.list_focused(),
+            "back in the list"
+        );
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert!(p.browse.laid.name.is_none());
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, key(egui::Key::Escape)),
+            Outcome::Pending
+        );
+        assert!(!p.browse.list_focused());
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert!(field_focused(&ctx));
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, key(egui::Key::Escape)),
+            Outcome::Cancelled
+        );
+    }
+
+    /// Enter creates once: its key repeats neither create again (while
+    /// it runs, nor after a failure lands) nor, once the folder is made,
+    /// open it. A fresh Enter tries again after a failure, with the name
+    /// kept, and opens the new folder after success.
+    #[test]
+    fn enter_creates_once_and_a_held_enter_never_opens() {
+        let ctx = egui::Context::default();
+        let mut p = in_the_list(&ctx, WIDE);
+        frame(&ctx, &mut p, WIDE, n_key());
+        frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("proj".into())]);
+        assert_eq!(frame(&ctx, &mut p, WIDE, tap_enter()), Outcome::Pending);
+        assert_eq!(p.browse.started, [(String::new(), "proj".to_string())]);
+        assert_eq!(p.hint(), "Creating the folder… · Esc back to the list");
+        assert_eq!(
+            p.browse.laid.crumb_text,
+            "Creating the folder in ~ on desk…"
+        );
+        for _ in 0..3 {
+            assert_eq!(frame(&ctx, &mut p, WIDE, hold_enter()), Outcome::Pending);
+        }
+        assert_eq!(p.browse.started.len(), 1, "repeats never create");
+
+        p.browse.land(Err(crate::remote_browse::Failure::new(
+            "That name is already taken here. Type another name.",
+        )));
+        frame(&ctx, &mut p, WIDE, hold_enter());
+        frame(&ctx, &mut p, WIDE, hold_enter());
+        assert_eq!(p.browse.started.len(), 1, "nor after a failure lands");
+        assert!(p.browse.laid.crumb_alert);
+        assert!(p.browse.laid.crumb_text.contains("already taken"));
+        assert_eq!(p.browse.name_text(), Some("proj"), "kept for another try");
+        assert_eq!(p.hint(), NAMING);
+        assert!(!field_focused(&ctx));
+
+        frame(&ctx, &mut p, WIDE, tap_enter());
+        assert_eq!(p.browse.started.len(), 2, "a fresh Enter tries again");
+        p.browse.land(Ok(()));
+        assert_eq!(frame(&ctx, &mut p, WIDE, hold_enter()), Outcome::Pending);
+        assert_eq!(p.text, "~/proj/", "the field holds the new folder");
+        assert!(!p.browse.list_focused());
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, hold_enter()),
+            Outcome::Pending,
+            "the held Enter does not open it"
+        );
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert!(field_focused(&ctx));
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, tap_enter()),
+            Outcome::Accepted("~/proj/".into())
+        );
+    }
+
+    /// After a create the parent is listed again, so the new folder is in
+    /// it: going up from the new (empty) folder lands on it.
+    #[test]
+    fn a_made_folder_is_in_the_refreshed_listing() {
+        let ctx = egui::Context::default();
+        let mut p = in_the_list(&ctx, WIDE);
+        frame(&ctx, &mut p, WIDE, n_key());
+        frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("proj".into())]);
+        frame(&ctx, &mut p, WIDE, tap_enter());
+        p.browse.land(Ok(()));
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert_eq!(p.text, "~/proj/");
+        assert_eq!(
+            p.browse.peek("andy@desk", RemoteShell::Posix, ""),
+            None,
+            "the parent's old listing is gone"
+        );
+        // What the Remote now says: the new folder, empty, in its parent.
+        p.browse.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "~/proj/",
+            listing("/home/andy/proj", &[]),
+        );
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert_eq!(
+            p.browse.laid.message_text.as_deref(),
+            Some("No folders here")
+        );
+        p.browse.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "proj", "src"]),
+        );
+        frame(&ctx, &mut p, WIDE, key(egui::Key::ArrowDown));
+        frame(&ctx, &mut p, WIDE, key(egui::Key::ArrowLeft));
+        assert_eq!(p.text, "~/");
+        // The folder left is selected: Enter goes back into it.
+        frame(&ctx, &mut p, WIDE, key(egui::Key::Enter));
+        assert_eq!(p.text, "~/proj/");
+    }
+
+    /// The list area, its rows and the buttons stay put across the list,
+    /// naming, creating and a failure, at full width and in a small
+    /// window; the name field sits in the new-folder row's slot, and every
+    /// hint fits its line.
+    #[test]
+    fn naming_creating_and_failing_move_nothing() {
+        for size in [WIDE, (472.0, 330.0)] {
+            let ctx = egui::Context::default();
+            let mut p = in_the_list(&ctx, size);
+            let shape = |p: &DirPrompt| {
+                (
+                    p.browse.laid.area,
+                    p.browse.laid.rows.clone(),
+                    p.laid.buttons.clone(),
+                )
+            };
+            let list = shape(&p);
+            let mut check = |p: &DirPrompt, state: &str| {
+                assert_eq!(shape(p), list, "{state} {size:?} moved something");
+                assert!(p.laid.hint_fits, "{state} {size:?}: hint cut");
+                assert!(!field_focused(&ctx), "{state}: two focused");
+                let name = p.browse.laid.name.expect(state);
+                assert!(list.1[1].contains_rect(name), "{state}: {name:?}");
+            };
+            frame(&ctx, &mut p, size, n_key());
+            frame(&ctx, &mut p, size, vec![egui::Event::Text("proj".into())]);
+            check(&p, "naming");
+            frame(&ctx, &mut p, size, tap_enter());
+            frame(&ctx, &mut p, size, vec![]);
+            check(&p, "creating");
+            p.browse.land(Err(crate::remote_browse::mkdir_unreached(
+                "ssh: connect to host desk port 22: Connection refused",
+            )));
+            frame(&ctx, &mut p, size, vec![]);
+            assert!(p.browse.laid.crumb_alert);
+            check(&p, "failed");
         }
     }
 }

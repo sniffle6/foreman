@@ -218,6 +218,33 @@ beside home, where a bare drive is typed; that script is untested (no
 Windows Remote exists), and a line past the Windows command-line cap says so
 instead of running. Nothing is copied to or installed on the Remote.
 
+**New folder.** The one thing the folder list changes on the Remote, and only
+by an explicit action: the first row after `..` is "+ new folder" (a `+`, and
+its key N while the list has the keyboard, so it reads as an action, not a
+folder), offered only over a listing. Enter or a click on it, or N while the
+list has the keyboard (in the field N is typing), turns that row into a name
+field in the same slot, prefilled with the filter typed so far; the list's
+height never changes. The breadcrumb then says where: "New folder in ~/Projects
+on falador". Enter creates (only a fresh press: a held Enter's repeats never
+create twice, and never then open or save); Esc goes back to the list, the
+next Esc to the field. The name is one path component: not empty, `.` or `..`,
+no `/` (nor `\` or `:` on a Windows Remote, nor `<>"|?*` or a trailing space
+or dot), no control character, at most 255 bytes; a leading `-` is fine. A bad
+name is refused at once, in words, and nothing runs. The create is one `ssh
+-T -o BatchMode=yes` run off the UI thread with a 15 s deadline, the parent
+and name only inside the base64 script: Posix `cd -- parent` then `mkdir --
+name`, one level, never over anything already there; PowerShell finds the
+parent with `-LiteralPath` and runs `New-Item -ItemType Directory` (untested,
+like the rest of the Windows path). While it runs the breadcrumb says so; a
+failure (already taken, permission denied, the folder gone, a login that needs
+a password, the Remote unreachable) shows in the danger colour on the
+breadcrumb line, saying what to do, with the name kept for another try. On
+success the parent's and the new folder's listings are dropped from the
+cache, the field holds the new folder (`~/Projects/name/`) and gets the
+keyboard back, and the list shows the new, empty folder, so Enter opens or
+saves there. Nothing is created by typing a path that does not exist, opening
+a Session, or saving the form.
+
 ## The way back
 
 One loopback listener per foreman instance, bound to `127.0.0.1` on an

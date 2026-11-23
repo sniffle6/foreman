@@ -19,9 +19,10 @@ is for changing the feature.
   `legacy_passable`) and resize through two ConPTYs. These were checked only by
   running encoded lines through local cmd → pwsh and cmd → 5.1, with no SSH.
   The PowerShell install commands in `remote::INSTALL` have never run on any
-  Remote, and neither has the folder list's PowerShell script
-  (`remote_browse::ps_script`, drive roots included). Test on a real Windows
-  Remote before you trust any of them.
+  Remote, and neither have the folder list's PowerShell scripts
+  (`remote_browse::ps_script`, drive roots included, and the new-folder
+  `ps_mkdir_script`). Test on a real Windows Remote before you trust any of
+  them.
 - **An install Session's argv names the agent.** The Claude and Codex
   install URLs contain `claude` / `codex`. `IconKind::from_argv` returns
   `None` for an `install_of` argv, so the icon, `agent_of`, the badges and the
@@ -43,8 +44,9 @@ is for changing the feature.
   domain once. When an install fails, check the vendor page before
   changing foreman.
 - **A folder listing is cached for the life of its prompt or edit form,
-  except a failure to reach the Remote.** A folder made on the Remote while
-  the prompt is open does not show until the prompt is opened again. The
+  except a failure to reach the Remote.** A folder made on the Remote by
+  anything but the picker's "+ new folder" does not show until the prompt is
+  opened again. The
   script's own answers (missing, a file, denied) are kept too. An
   `Unreachable` answer (ssh error, timeout, needs a password) is dropped by
   `Cache::forget` whenever the directory or the Remote changes, or Down or
@@ -53,9 +55,26 @@ is for changing the feature.
   landing. The cache belongs to the `Browser`, and dropping the `Browser`
   kills its running ssh (the Remotes pane drops it the frame after the form
   closes).
-- **Unit tests never run a listing over ssh.** Under `cfg(test)`
+- **"+ new folder" refreshes only on success.** A success drops the parent's
+  and the new folder's listings (`Cache::refresh`; one still running is
+  thrown away when it lands). A failure keeps the parent's listing on
+  purpose: relisting would blank the rows, name field included, while it
+  ran. So a create that timed out but did make the folder answers "already
+  taken" on retry while the list still lacks it. An Esc'd create still
+  lands its refresh but leaves the field alone. Closing the prompt or form
+  kills the create's ssh with the listings', so the folder may or may not
+  exist.
+- **A held Enter must never create twice, nor create and then open.** The
+  name field creates only on a press egui has not marked `repeat`, and the
+  field ignores Enter repeats right after a create (`Browser::held_enter`).
+  egui marks a press of a key it still holds down as a repeat, so a test
+  that presses Enter twice without a release (`pressed: false`) in between
+  sees the second as a repeat and creates nothing.
+- **Unit tests never run a listing or a create over ssh.** Under `cfg(test)`
   `remote_browse::spawn` does nothing, so an unseeded listing stays
-  "Listing folders…" forever. Seed one with `Browser::put`.
+  "Listing folders…" forever. Seed one with `Browser::put`. A create only
+  records itself in `Browser::started`; hand back its answer with
+  `Browser::land`.
   `the_posix_script_runs_against_hostile_names` does run the real Posix
   script through a local `sh` (Git Bash on Windows) and skips when there is
   none. Its denied branch runs only on Unix, because Windows ignores the
@@ -121,6 +140,11 @@ is for changing the feature.
   `FOREMAN_BROWSE_TARGET=user@pc cargo test --target-dir target/agent remote_browse::tests::live -- --ignored --nocapture`.
   It lists home, `/`, and three dirs that must fail (no permission, missing,
   a file), and prints each result. It runs Posix only.
+- **Check the new-folder create against a real Remote** (writes, Posix only):
+  `FOREMAN_BROWSE_TARGET=user@pc cargo test --target-dir target/agent remote_browse::tests::live_posix_mkdir -- --ignored --nocapture`.
+  It makes `/tmp/foreman-mkdir-test` and hostile names inside it, so that
+  directory must not exist first. Remove it after:
+  `ssh user@pc 'rm -rf -- /tmp/foreman-mkdir-test'`.
 
 - **Check the Tunnel by hand.** In a Remote Session's shell (Posix):
   `curl -sS -H "Authorization: Bearer $FOREMAN_TOKEN" "$FOREMAN_URL/status"`.

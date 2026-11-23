@@ -1748,6 +1748,182 @@ mod tests {
         assert_eq!(shape(&mut menu).1, idle.1, "Failed changed the height");
     }
 
+    /// The Remotes form at its narrowest, making a folder: N types in the
+    /// Directory field and opens the name field only from the list; the
+    /// hint stays one line and the form and list area never move across
+    /// naming, creating and a failure; Esc in the name field goes back to
+    /// the list, not out of the form; Enter creates once and never saves,
+    /// nor does its held repeat after the folder lands in the Directory.
+    #[test]
+    fn remotes_folder_list_makes_a_folder() {
+        use crate::remote::RemoteShell::Posix;
+        use crate::remote_browse::{Entry, Failure, Listed, State};
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        let ev = |key: egui::Key, pressed: bool| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let run = |menu: &mut SettingsMenu, s: &mut Settings, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            let mut km = Keymap::default();
+            let mut theme = crate::theme::Theme::default();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| {
+                        let r = ui.max_rect();
+                        if matches!(
+                            menu.show(ui, r, true, s, &mut km, &mut theme),
+                            MenuOutcome::Changed
+                        ) {
+                            s.sanitize();
+                        }
+                    });
+            });
+        };
+        let tap = |k: egui::Key| vec![ev(k, false), ev(k, true), ev(k, false)];
+        let n_key = || {
+            vec![
+                ev(egui::Key::N, true),
+                egui::Event::Text("n".into()),
+                ev(egui::Key::N, false),
+            ]
+        };
+        let shape = |menu: &mut SettingsMenu| {
+            let laid = menu.remotes.laid();
+            let o = laid.form[0].min;
+            let form: Vec<egui::Rect> = laid
+                .form
+                .iter()
+                .map(|r| r.translate(-o.to_vec2()))
+                .collect();
+            let b = &menu.remotes.browse().laid;
+            let rows: Vec<egui::Rect> = b.rows.iter().map(|r| r.translate(-o.to_vec2())).collect();
+            (form, b.area.translate(-o.to_vec2()), rows)
+        };
+        let fits = |menu: &mut SettingsMenu, state: &str| {
+            let laid = menu.remotes.laid();
+            assert!(laid.hint_fits, "{state}: hint cut at {:?}", laid.pane);
+            assert!(laid.hint.height() < 16.0, "{state}: {:?}", laid.hint);
+        };
+        let saved = |s: &Settings| s.remotes[0].dirs[r"H:\src\app"].clone();
+
+        run(&mut menu, &mut s, vec![]);
+        run(&mut menu, &mut s, tap(egui::Key::Enter));
+        assert!(menu.remotes.is_editing());
+        menu.remotes.browse().put(
+            "andy@desk",
+            Posix,
+            "/srv/",
+            State::Listed(Listed {
+                resolved: "/srv".into(),
+                entries: ["app", "data"].iter().map(|n| Entry::dir(n)).collect(),
+                truncated: false,
+            }),
+        );
+        for _ in 0..3 {
+            run(&mut menu, &mut s, tap(egui::Key::Tab));
+        }
+        // In the Directory field, N is typing.
+        run(&mut menu, &mut s, n_key());
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/n"));
+        assert!(!menu.remotes.browse().naming());
+        run(&mut menu, &mut s, tap(egui::Key::Backspace));
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/"));
+        run(&mut menu, &mut s, tap(egui::Key::ArrowDown));
+        run(&mut menu, &mut s, vec![]);
+        assert!(menu.remotes.browse().list_focused());
+        fits(&mut menu, "list");
+        // The scroll animates: let it land before measuring.
+        for _ in 0..40 {
+            run(&mut menu, &mut s, vec![]);
+        }
+        let list = shape(&mut menu);
+
+        run(&mut menu, &mut s, n_key());
+        assert!(menu.remotes.browse().naming());
+        run(&mut menu, &mut s, vec![egui::Event::Text("made".into())]);
+        assert_eq!(menu.remotes.browse().name_text(), Some("made"));
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/"));
+        fits(&mut menu, "naming");
+        assert_eq!(shape(&mut menu), list, "naming moved the form");
+        assert_eq!(
+            menu.remotes.browse().laid.crumb_text,
+            "New folder in /srv/ on desk"
+        );
+        // Ctrl+Backspace edits the name; it never forgets the row.
+        run(
+            &mut menu,
+            &mut s,
+            vec![egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+        );
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/"), "the row is kept");
+        assert!(menu.remotes.browse().naming());
+        run(&mut menu, &mut s, vec![egui::Event::Text("made".into())]);
+        assert_eq!(menu.remotes.browse().name_text(), Some("made"));
+
+        run(&mut menu, &mut s, tap(egui::Key::Enter));
+        assert_eq!(menu.remotes.browse().started.len(), 1);
+        assert!(menu.remotes.is_editing(), "Enter in the name never saves");
+        assert_eq!(saved(&s), "/srv/");
+        run(&mut menu, &mut s, vec![]);
+        fits(&mut menu, "creating");
+        assert_eq!(shape(&mut menu), list, "creating moved the form");
+        menu.remotes.browse().land(Err(Failure::new(
+            "Permission denied: you can't make folders here.",
+        )));
+        run(&mut menu, &mut s, vec![]);
+        fits(&mut menu, "failed");
+        assert!(menu.remotes.browse().laid.crumb_alert);
+        assert_eq!(shape(&mut menu), list, "a failure moved the form");
+
+        run(&mut menu, &mut s, tap(egui::Key::Escape));
+        assert!(menu.remotes.is_editing(), "Esc left only the name field");
+        assert!(menu.remotes.browse().list_focused() && !menu.remotes.browse().naming());
+
+        run(&mut menu, &mut s, n_key());
+        run(&mut menu, &mut s, vec![egui::Event::Text("made".into())]);
+        run(
+            &mut menu,
+            &mut s,
+            vec![ev(egui::Key::Enter, false), ev(egui::Key::Enter, true)],
+        );
+        assert_eq!(menu.remotes.browse().started.len(), 2);
+        menu.remotes.browse().land(Ok(()));
+        // Enter still held: its repeat lands nothing and saves nothing.
+        run(&mut menu, &mut s, vec![ev(egui::Key::Enter, true)]);
+        assert_eq!(menu.remotes.draft_dir(0), Some("/srv/made/"));
+        run(&mut menu, &mut s, vec![ev(egui::Key::Enter, true)]);
+        assert!(menu.remotes.is_editing(), "the held Enter did not save");
+        assert_eq!(saved(&s), "/srv/");
+        run(&mut menu, &mut s, tap(egui::Key::Enter));
+        assert!(!menu.remotes.is_editing());
+        assert_eq!(saved(&s), "/srv/made/");
+    }
+
     /// In the Remotes form, the first Esc in the folder list goes back to
     /// the Directory field and the second cancels the form; typing while
     /// the list has the keyboard lands in the field.

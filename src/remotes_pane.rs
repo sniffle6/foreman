@@ -860,9 +860,10 @@ impl RemotesView {
     }
 
     /// A key for the folder list under the focused Directory row: all its
-    /// keys while it has the keyboard (Esc hands it back to the field, as
-    /// Esc first drops a Target suggestion), and Down from the field when
-    /// there is a list to enter. `None` = the form's own key.
+    /// keys while it has the keyboard (Esc steps back one, name field to
+    /// list to field, as Esc first drops a Target suggestion), and Down
+    /// from the field when there is a list to enter. `None` = the form's
+    /// own key.
     fn browse_key(&mut self, k: Key, d: &mut Draft) -> Option<Effect> {
         let Field::Dir(j) = d.field else {
             return None;
@@ -876,9 +877,11 @@ impl RemotesView {
         let list = self.browse.list_focused();
         let nav = match k {
             Key::Esc if list => {
-                self.browse.focus_field();
+                self.browse.back();
                 return Some(Effect::None);
             }
+            // Never saves while the Enter that made a folder is held.
+            Key::Enter if !list && self.browse.held_enter() => return Some(Effect::None),
             Key::Down => Nav::Down,
             _ if !list => return None,
             Key::Up => Nav::Up,
@@ -887,6 +890,8 @@ impl RemotesView {
             Key::Enter => Nav::Enter,
             Key::Backspace => Nav::Backspace,
             Key::Tab | Key::BackTab => Nav::Tab,
+            // The name field's: nothing of the form's.
+            _ if self.browse.naming() => return Some(Effect::None),
             // Ctrl+Backspace still forgets the row.
             _ => return None,
         };
@@ -989,7 +994,9 @@ impl RemotesView {
                 match dirs.get(k).map(|r| self.browse.shows(&r.remote)) {
                     Some(Shows::Waiting) => "Listing folders · Tab/Esc back",
                     Some(Shows::Retry) => "Enter retry · Tab/Esc back",
-                    _ => "↑/↓ pick · Enter/→ go in · ← up · Tab/Esc back",
+                    Some(Shows::Naming) => "Enter create the folder · Esc back to the list",
+                    Some(Shows::Creating) => "Creating the folder… · Esc back to the list",
+                    _ => "↑/↓ pick · Enter/→ in · ← up · N new folder · Tab/Esc back",
                 }
             }
             Mode::Edit(Draft {
@@ -1064,7 +1071,8 @@ impl RemotesView {
         };
 
         if active {
-            for k in read_keys(ui, &self.mode, self.browse.list_focused()) {
+            let (list, naming) = (self.browse.list_focused(), self.browse.naming());
+            for k in read_keys(ui, &self.mode, list, naming) {
                 let e = self.key(k, remotes);
                 effect(self, e, remotes);
             }
@@ -2041,13 +2049,15 @@ fn browse_letter(key: egui::Key, mods: egui::Modifiers) -> Option<Key> {
 }
 
 /// This frame's keys for the current mode. Letters only count while
-/// browsing: in the form they are typing.
-fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool) -> Vec<Key> {
+/// browsing: in the form they are typing. While the folder list's name
+/// field is open, the editing keys are its own.
+fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool, naming: bool) -> Vec<Key> {
     use egui::Key as K;
     // Consumed, not peeked: the row goes before the form draws, and the
     // TextEdit that takes its place (and its Id) would delete a word or a
     // character of the next directory.
     let clear = ui.input_mut(|i| match mode {
+        _ if naming => false,
         Mode::Edit(d) => match d.field {
             Field::Dir(k) => {
                 i.consume_key(egui::Modifiers::CTRL, K::Backspace)
@@ -2062,7 +2072,7 @@ fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool) -> Vec<Key> {
     // none of them edits it.
     let browse: Vec<Key> = ui.input_mut(|i| {
         let mut out = Vec::new();
-        if list && matches!(mode, Mode::Edit(d) if matches!(d.field, Field::Dir(_))) {
+        if list && !naming && matches!(mode, Mode::Edit(d) if matches!(d.field, Field::Dir(_))) {
             for (k, key) in [
                 (K::ArrowLeft, Key::Left),
                 (K::ArrowRight, Key::Right),
@@ -2343,7 +2353,7 @@ mod tests {
         v.key(Key::Down, &mut list);
         assert!(v.browse.list_focused());
         assert_eq!(draft(&v).field, Field::Dir(0), "Down entered the list");
-        assert!(v.hint(1).contains("go in"), "{}", v.hint(1));
+        assert!(v.hint(1).contains("→ in"), "{}", v.hint(1));
         // "app" and "apps" match the filter; ".." is row 0.
         v.key(Key::Down, &mut list); // apps
         assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
