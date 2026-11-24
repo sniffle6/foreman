@@ -1234,17 +1234,16 @@ impl Session {
     }
 
     /// Give a Remote Session its way back: the token that names it to the
-    /// Tunnel listener, and the note teaching its agent to use it. With
-    /// `at_launch` the note is injected now (Ready-gated like any chat post)
-    /// instead of riding on the first chat delivery.
+    /// Tunnel listener, and the note teaching its agent to use it, going
+    /// `how`. `AtLaunch` injects it now (Ready-gated like any chat post).
     pub fn attach_tunnel(
         &mut self,
         token: crate::control::tunnel::Token,
         note: String,
-        at_launch: bool,
+        how: crate::control::tunnel::NoteGoes,
     ) {
         self.tunnel_token = Some(token);
-        if let Some(note) = self.reply_note.arm(note, at_launch) {
+        if let Some(note) = self.reply_note.arm(note, how) {
             self.inject_input(&note);
         }
     }

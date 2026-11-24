@@ -3156,10 +3156,16 @@ impl WindowManager {
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
         // An agent with arguments may be working a brief and never get a
-        // chat post, so it needs the note now. A bare agent waits for a post
-        // anyway, and a shell would run the note as commands.
-        let at_launch = argv.len() > 1 && crate::remote::agent_of(argv).is_some();
-        let s = self.spawn_remote_session(argv, remote, dir, self.next, at_launch, ctx)?;
+        // chat post, so it needs the note now: in its prompt when that is
+        // certain, typed otherwise. A bare agent waits for a post anyway, and
+        // a shell would run the note as commands.
+        use crate::control::tunnel::NoteGoes;
+        let how = if argv.len() > 1 && crate::remote::agent_of(argv).is_some() {
+            NoteGoes::InPrompt
+        } else {
+            NoteGoes::WithFirstPost
+        };
+        let s = self.spawn_remote_session(argv, remote, dir, self.next, how, ctx)?;
         Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
     }
 
@@ -3301,7 +3307,14 @@ impl WindowManager {
         let id = self.next;
         // A bare agent or shell carries no brief: the reply note waits for
         // the first chat post, as for `open --on` without arguments.
-        let s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
+        let s = self.spawn_remote_session(
+            &argv,
+            remote,
+            dir,
+            id,
+            crate::control::tunnel::NoteGoes::WithFirstPost,
+            ctx,
+        )?;
         self.place_remote_win(s, format!("{}  ·  #{}", remote.name, id), place, ctx);
         Ok(id)
     }
@@ -3318,7 +3331,14 @@ impl WindowManager {
     ) -> Result<WinId, String> {
         let argv = crate::remote_install::session_argv(remote, provider)?;
         let id = self.next;
-        let s = self.spawn_remote_session(&argv, remote, "", id, false, ctx)?;
+        let s = self.spawn_remote_session(
+            &argv,
+            remote,
+            "",
+            id,
+            crate::control::tunnel::NoteGoes::WithFirstPost,
+            ctx,
+        )?;
         let title = format!("{} · install {provider}  ·  #{id}", remote.name);
         self.place_remote_win(s, title, crate::remote_dir_prompt::Place::Default, ctx);
         Ok(id)
@@ -3562,18 +3582,29 @@ impl WindowManager {
 
     /// One connection to `remote` for Member `t{id}`: a fresh Tunnel lease
     /// (so a reconnect renews the token), the `ssh` launch, and the reply
-    /// note armed for this connection. Launch and reconnect both come here.
+    /// note armed for this connection to go `how`. Launch and reconnect both
+    /// come here. `InPrompt` that does not fit the launch
+    /// ([`crate::remote::Built::note_carried`]) is typed `AtLaunch` instead.
     fn spawn_remote_session(
         &self,
         argv: &[String],
         remote: &crate::remote::Remote,
         dir: &str,
         id: WinId,
-        note_at_launch: bool,
+        how: crate::control::tunnel::NoteGoes,
         ctx: &egui::Context,
     ) -> Result<Session, String> {
+        use crate::control::tunnel::NoteGoes;
         let terminal_id = term_tag(id);
         let lease = self.remote_lease(argv, remote, &terminal_id, ctx)?;
+        let carry = match (&lease, how) {
+            (Some(l), NoteGoes::InPrompt) => Some(crate::control::tunnel::prompt_note(
+                remote.shell,
+                l.remote_port,
+                l.token.value(),
+            )),
+            _ => None,
+        };
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
             dir,
@@ -3585,7 +3616,12 @@ impl WindowManager {
                 token: l.token.value(),
             }),
             argv,
+            prompt_note: carry.as_deref(),
         })?;
+        let how = match how {
+            NoteGoes::InPrompt if !built.note_carried => NoteGoes::AtLaunch,
+            how => how,
+        };
         // The local env reaches only ssh.exe; ssh sends TERM with the pty
         // request, and the builder exports the rest on the Remote.
         let env = self.term_env(id);
@@ -3599,7 +3635,7 @@ impl WindowManager {
         if let Some(l) = lease {
             let note =
                 crate::control::tunnel::reply_note(remote.shell, l.remote_port, l.token.value());
-            s.attach_tunnel(l.token, note, note_at_launch);
+            s.attach_tunnel(l.token, note, how);
         }
         Ok(s)
     }
@@ -3694,11 +3730,17 @@ impl WindowManager {
         // A restored Session that never connected says "connecting", as its
         // bar said "Enter to connect".
         let ran = s.ever_connected();
-        // An agent gets the note at launch: a resumed one still has the dead
-        // token's curl command in its conversation and would use it, 401,
-        // until a post came. A shell would run the note as commands.
-        let at_launch = re.agent.is_some();
-        let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, at_launch, ctx)?;
+        // An agent gets the note typed at launch: a resumed one still has the
+        // dead token's curl command in its conversation and would use it,
+        // 401, until a post came. There is no prompt to carry it (resume
+        // drops it), so it is typed. A shell would run it as commands.
+        use crate::control::tunnel::NoteGoes;
+        let how = if re.agent.is_some() {
+            NoteGoes::AtLaunch
+        } else {
+            NoteGoes::WithFirstPost
+        };
+        let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, how, ctx)?;
         fresh.set_term_id(id);
         fresh.inject_note(&reconnect_banner(&remote.name, &argv, ran));
         let Some((win, tab)) = self.terminal_location(id) else {
@@ -12898,19 +12940,91 @@ mod tests {
 
     #[test]
     fn an_agent_reconnect_gets_the_reply_note_at_launch_once() {
-        // Launched with a brief, so the dead connection queued its own note
-        // too: that one is not carried over.
-        let (queued, waits) = reconnected(|wm, remote, ctx| {
-            let argv = ["codex".to_string(), "do the card".into()];
-            wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
+        // The first launch carried the note in its prompt, or (a wrapper, a
+        // one-word brief) typed it, so the dead connection queued its own
+        // copy too: that one is not carried over. Either way the reconnect,
+        // which has no prompt, types the fresh note.
+        for words in [
+            &["codex", "do the card"][..],
+            &["npx", "@openai/codex", "do the card"],
+            &["claude", "hi"],
+        ] {
+            let (queued, waits) = reconnected(|wm, remote, ctx| {
+                let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+                wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
+                    .expect("ssh spawns")
+            });
+            let notes = queued
+                .iter()
+                .filter(|q| q.contains("[foreman] You run on"))
+                .count();
+            assert_eq!(notes, 1, "{words:?}: {queued:?}");
+            assert!(!waits, "no chat delivery repeats it");
+        }
+    }
+
+    /// A first launch on a Remote: what is typed into the pane before
+    /// anything else, and whether a chat delivery still carries the note.
+    fn first_launch(words: &[&str]) -> (Vec<String>, bool) {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
+        let remote = crate::config::live(&ctx).remotes[0].clone();
+        let child = wm.project_child_mut(pid).unwrap();
+        let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        let tid = if argv.is_empty() {
+            use crate::remote_dir_prompt::{Place, What};
+            child
+                .open_remote_win(&remote, "/tmp", What::Shell, Place::Default, &ctx)
                 .expect("ssh spawns")
-        });
-        let notes = queued
-            .iter()
-            .filter(|q| q.contains("[foreman] You run on"))
-            .count();
-        assert_eq!(notes, 1, "{queued:?}");
-        assert!(!waits, "no chat delivery repeats it");
+        } else {
+            child
+                .add_remote_terminal(&argv, &remote, "/tmp", None, &ctx)
+                .expect("ssh spawns")
+        };
+        let s = child.terminal_session_mut(tid).unwrap();
+        let out = (s.pending_injects().to_vec(), s.reply_note_waits());
+        s.kill_for_test();
+        out
+    }
+
+    #[test]
+    fn a_first_launch_with_a_certain_prompt_types_nothing() {
+        for words in [
+            &["claude", "do the card"][..],
+            &["codex", "do the card"],
+            &["grok", "do the card"],
+            &["claude", "do the card", "--model", "x"],
+        ] {
+            let (queued, waits) = first_launch(words);
+            assert!(queued.is_empty(), "{words:?}: {queued:?}");
+            assert!(!waits, "{words:?}: the prompt delivered it");
+        }
+    }
+
+    #[test]
+    fn a_first_launch_without_a_certain_prompt_types_the_note_as_before() {
+        // An agent with arguments foreman cannot place: typed at launch.
+        for words in [
+            &["claude", "-p", "do the card"][..],
+            &["codex", "exec", "do the card"],
+            &["npx", "@anthropic-ai/claude-code", "do the card"],
+            &["claude", "hi"],
+        ] {
+            let (queued, waits) = first_launch(words);
+            assert_eq!(queued.len(), 1, "{words:?}: {queued:?}");
+            assert!(queued[0].starts_with("[foreman] You run on"), "{queued:?}");
+            assert!(!waits, "{words:?}");
+        }
+        // A bare agent, a shell, and a non-agent command: the first post.
+        for words in [&["claude"][..], &[], &["htop", "-d", "5"]] {
+            let (queued, waits) = first_launch(words);
+            assert!(queued.is_empty(), "{words:?}: {queued:?}");
+            assert!(waits, "{words:?}: the first chat delivery carries it");
+        }
     }
 
     #[test]

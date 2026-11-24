@@ -814,28 +814,61 @@ fn response(status: u16, body: &str) -> Vec<u8> {
 }
 
 /// What a Remote Session's agent is told, once per connection (see
-/// [`ReplyNote`]): the exact command to post back. URL and token are written
-/// out rather than named as `$FOREMAN_URL`, because a Windows agent's tool
-/// shell may be PowerShell or Git Bash and each spells variables differently.
-/// Windows says `curl.exe`: in Windows PowerShell 5.1 `curl` is an alias for
-/// `Invoke-WebRequest`.
+/// [`ReplyNote`]), typed into its pane: the exact command to post back.
 pub fn reply_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
+    format!(
+        "[foreman] You run on another PC, so the foreman CLI is not here. Post to this chat with:\n{}",
+        reply_commands(shell, remote_port, token)
+    )
+}
+
+/// [`reply_note`] as it rides at the end of a first launch's prompt
+/// ([`crate::remote::prompt_index`]): set apart from the brief above it, so
+/// the agent reads it as how to report, not as more of the task.
+pub fn prompt_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
+    format!(
+        "[foreman] The rest of this prompt is not part of your task: it tells you how to reach this project's chat. \
+         You run on another PC, so the foreman CLI is not here. Post to this chat with:\n{}",
+        reply_commands(shell, remote_port, token)
+    )
+}
+
+/// The commands both notes teach. URL and token are written out rather than
+/// named as `$FOREMAN_URL`, because a Windows agent's tool shell may be
+/// PowerShell or Git Bash and each spells variables differently. Windows
+/// says `curl.exe`: in Windows PowerShell 5.1 `curl` is an alias for
+/// `Invoke-WebRequest`.
+fn reply_commands(shell: RemoteShell, remote_port: u16, token: &str) -> String {
     let curl = match shell {
         RemoteShell::Posix => "curl",
         RemoteShell::Pwsh | RemoteShell::WindowsPowerShell => "curl.exe",
     };
     let url = format!("http://127.0.0.1:{remote_port}");
     format!(
-        "[foreman] You run on another PC, so the foreman CLI is not here. Post to this chat with:\n\
-         {curl} -sS -H \"Authorization: Bearer {token}\" --data-binary 'your message' \"{url}/chat?to=tN\"\n\
+        "{curl} -sS -H \"Authorization: Bearer {token}\" --data-binary 'your message' \"{url}/chat?to=tN\"\n\
          Query: to=tN names the member (repeat or comma-separate; leave it out to post to everyone), re=N answers post #N, now=1 is urgent. \
          Same header, GET {url}/chat?history=20 reads the room and GET {url}/status lists its Sessions."
     )
 }
 
+/// How a connection's reply note reaches its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteGoes {
+    /// Inside the launch prompt (asked for by a first launch with a brief;
+    /// [`crate::remote::Built::note_carried`] says whether it fitted). Nothing
+    /// is typed: a keystroke at launch can answer a dialog the agent shows
+    /// first, such as Claude's folder trust.
+    InPrompt,
+    /// Typed into the pane once it is Ready.
+    AtLaunch,
+    /// Appended to the first chat delivery.
+    WithFirstPost,
+}
+
 /// The reply note's once-per-connection state. An agent Dispatched with its
-/// brief gets the note at launch, since no chat post may ever come to carry
-/// it; anything else gets it with its first chat delivery.
+/// brief gets the note at launch (in its prompt, or typed), since no chat
+/// post may ever come to carry it; anything else gets it with its first
+/// chat delivery.
 #[derive(Debug, Default)]
 pub struct ReplyNote {
     /// Waiting for the first chat delivery.
@@ -845,16 +878,19 @@ pub struct ReplyNote {
 }
 
 impl ReplyNote {
-    /// Arm `note` for a new connection. With `at_launch` it comes straight
-    /// back for the caller to inject, and no chat delivery carries it.
-    pub fn arm(&mut self, note: String, at_launch: bool) -> Option<String> {
+    /// Arm `note` for a new connection. `AtLaunch` hands it straight back
+    /// for the caller to type; `InPrompt` counts it as delivered already.
+    /// Either way no chat delivery carries it.
+    pub fn arm(&mut self, note: String, how: NoteGoes) -> Option<String> {
         self.armed = Some(note.clone());
-        if at_launch {
-            self.pending = None;
-            Some(note)
-        } else {
-            self.pending = Some(note);
-            None
+        self.pending = None;
+        match how {
+            NoteGoes::AtLaunch => Some(note),
+            NoteGoes::InPrompt => None,
+            NoteGoes::WithFirstPost => {
+                self.pending = Some(note);
+                None
+            }
         }
     }
 
@@ -1119,13 +1155,28 @@ mod tests {
         for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
             assert!(reply_note(shell, 21000, "tok").contains("\ncurl.exe -sS"));
         }
+        // The prompt's copy teaches the same commands, set apart as not task.
+        for shell in [
+            RemoteShell::Posix,
+            RemoteShell::Pwsh,
+            RemoteShell::WindowsPowerShell,
+        ] {
+            let commands = reply_commands(shell, 21000, "tok");
+            let typed = reply_note(shell, 21000, "tok");
+            let carried = prompt_note(shell, 21000, "tok");
+            assert!(typed.ends_with(&format!(":\n{commands}")), "{typed}");
+            assert!(carried.ends_with(&format!(":\n{commands}")), "{carried}");
+            assert!(
+                carried.starts_with("[foreman] The rest of this prompt is not part of your task")
+            );
+        }
     }
 
     #[test]
     fn the_reply_note_goes_once_per_connection_at_launch_or_on_first_delivery() {
         // Not at launch: the first chat delivery carries it, the next is bare.
         let mut note = ReplyNote::default();
-        assert_eq!(note.arm("NOTE".into(), false), None);
+        assert_eq!(note.arm("NOTE".into(), NoteGoes::WithFirstPost), None);
         assert_eq!(
             note.on_delivery("[chat p1 #1] t1→t2: hi"),
             "[chat p1 #1] t1→t2: hi\n\nNOTE"
@@ -1136,13 +1187,24 @@ mod tests {
         );
         // At launch: handed back to inject now, and no delivery repeats it.
         let mut note = ReplyNote::default();
-        assert_eq!(note.arm("NOTE".into(), true).as_deref(), Some("NOTE"));
+        assert_eq!(
+            note.arm("NOTE".into(), NoteGoes::AtLaunch).as_deref(),
+            Some("NOTE")
+        );
         assert_eq!(
             note.on_delivery("[chat p1 #1] t1→t2: hi"),
             "[chat p1 #1] t1→t2: hi"
         );
+        // In the prompt: nothing to type, and no delivery repeats it.
+        let mut carried = ReplyNote::default();
+        assert_eq!(carried.arm("NOTE".into(), NoteGoes::InPrompt), None);
+        assert!(!carried.waits());
+        assert_eq!(
+            carried.on_delivery("[chat p1 #1] t1→t2: hi"),
+            "[chat p1 #1] t1→t2: hi"
+        );
         // A new connection re-arms it, whichever way the last one went.
-        assert_eq!(note.arm("NOTE2".into(), false), None);
+        assert_eq!(note.arm("NOTE2".into(), NoteGoes::WithFirstPost), None);
         assert!(note.on_delivery("x").ends_with("\n\nNOTE2"));
     }
 
@@ -1150,7 +1212,7 @@ mod tests {
     fn a_queue_handed_to_a_reconnect_loses_the_dead_connection_s_note() {
         assert_eq!(ReplyNote::default().strip(vec!["a".into()]), ["a"]);
         let mut note = ReplyNote::default();
-        note.arm("NOTE".into(), true);
+        note.arm("NOTE".into(), NoteGoes::AtLaunch);
         let queued = vec![
             "NOTE".to_string(),
             "[chat p1 #1] t1→t2: hi\n\nNOTE".into(),
@@ -1702,7 +1764,7 @@ mod tests {
         let value = lease.token.value().to_string();
         let argv: Vec<String> = ["cmd.exe", "/c", "exit 0"].map(String::from).to_vec();
         let mut s = crate::terminal::Session::spawn_argv(&argv, None, &[], ctx).unwrap();
-        s.attach_tunnel(lease.token, "note".into(), false);
+        s.attach_tunnel(lease.token, "note".into(), NoteGoes::WithFirstPost);
         assert!(hub.owner(&value).is_some());
         let t0 = Instant::now();
         while s.exited().is_none() {

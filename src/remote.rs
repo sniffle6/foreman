@@ -308,6 +308,44 @@ pub fn agent_of(argv: &[String]) -> Option<&'static str> {
     crate::icons::IconKind::from_argv(argv).and_then(crate::icons::IconKind::provider)
 }
 
+/// Which argument of `argv` is its Dispatch prompt, when that is certain;
+/// `None` for anything else, which then gets the reply note typed instead of
+/// appended to an argument that may not be the prompt.
+///
+/// Accepted: exactly the shapes foreman dispatches and its skills document,
+/// the bare program then the brief (`card_argv`; "prompt immediately after
+/// the program"): `<agent> <brief>`, and for Claude and Codex
+/// `<agent> <brief> --model <id>`. The brief must hold whitespace and not
+/// start with `-`. No subcommand of any of the three CLIs holds whitespace,
+/// so this tells a brief from `exec` / `resume` / `mcp` without a list that
+/// drifts with CLI versions; a one-word brief falls back.
+///
+/// Refused: a program path or wrapper (`/usr/bin/claude`, `npx …`,
+/// `my-claude`), a flag first (`-p`, `--continue`, `--model x brief`), any
+/// subcommand, and any other trailing argument, which could change what the
+/// first one means.
+pub fn prompt_index(argv: &[String]) -> Option<usize> {
+    let (program, rest) = argv.split_first()?;
+    let program = program.as_str();
+    if !crate::board::AGENTS.contains(&program) {
+        return None;
+    }
+    let (brief, tail) = rest.split_first()?;
+    let is_brief = !brief.starts_with('-') && brief.chars().any(char::is_whitespace);
+    let tail_ok = match tail {
+        [] => true,
+        [flag, id] => {
+            matches!(program, "claude" | "codex")
+                && flag == "--model"
+                && !id.is_empty()
+                && !id.starts_with('-')
+                && !id.chars().any(char::is_whitespace)
+        }
+        _ => false,
+    };
+    (is_brief && tail_ok).then_some(1)
+}
+
 /// What a reconnect relaunches. See [`relaunch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relaunch {
@@ -456,6 +494,9 @@ pub struct Launch<'a> {
     pub tunnel: Option<Tunnel<'a>>,
     /// What the user asked to run (`claude …`). Empty = an interactive shell.
     pub argv: &'a [String],
+    /// The reply note to append to the prompt argument ([`prompt_index`]),
+    /// for a first launch with a Tunnel. Reconnect passes `None`.
+    pub prompt_note: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -463,15 +504,43 @@ pub struct Built {
     /// The local process: `ssh … -- <target> <remote line>`.
     pub ssh: Vec<String>,
     /// The logical argv, unchanged, for `IconKind::from_argv`. The wrapped
-    /// line never contains the agent's name in readable form.
+    /// line never contains the agent's name in readable form. It never holds
+    /// the carried note either: reconnect and the snapshot read it, and the
+    /// note's token dies with this connection.
     pub dispatched: Vec<String>,
+    /// [`Launch::prompt_note`] rides in the prompt. `false` when there was
+    /// none, the argv has no certain prompt, or the longer line would be
+    /// refused (a Windows Remote's cap or 5.1's quoting): that launch is
+    /// built as it was and the caller types the note instead.
+    pub note_carried: bool,
 }
 
 /// Build the local `ssh` argv for a launch. Refuses (never truncates) a
 /// Windows launch whose remote line would not fit cmd.
 pub fn build(l: &Launch) -> Result<Built, String> {
+    let dispatched = l.argv.to_vec();
+    if let (Some(note), Some(_), Some(i)) = (l.prompt_note, l.tunnel, prompt_index(l.argv)) {
+        let mut carried = dispatched.clone();
+        carried[i] = format!("{}\n\n{note}", carried[i]);
+        if let Ok(ssh) = ssh_argv(l, &carried) {
+            return Ok(Built {
+                ssh,
+                dispatched,
+                note_carried: true,
+            });
+        }
+    }
+    Ok(Built {
+        ssh: ssh_argv(l, l.argv)?,
+        dispatched,
+        note_carried: false,
+    })
+}
+
+/// [`build`]'s `ssh` argv running `argv` for launch `l`.
+fn ssh_argv(l: &Launch, argv: &[String]) -> Result<Vec<String>, String> {
     // Same rule as a local spawn, applied before the argv is buried in base64.
-    let run = crate::agent_command::codex_in_process(l.argv).unwrap_or_else(|| l.argv.to_vec());
+    let run = crate::agent_command::codex_in_process(argv).unwrap_or_else(|| argv.to_vec());
     // Nothing is installed on a Remote, so Claude's state hooks ride the
     // launch. Without a Tunnel there is nowhere for them to go.
     let run = match l.tunnel {
@@ -550,10 +619,7 @@ pub fn build(l: &Launch) -> Result<Built, String> {
     ssh.push("--".into());
     ssh.push(l.remote.target.clone());
     ssh.push(line);
-    Ok(Built {
-        ssh,
-        dispatched: l.argv.to_vec(),
-    })
+    Ok(ssh)
 }
 
 /// Events whose hook sends its stdin payload, so the `/hook` route can drop a
@@ -908,6 +974,7 @@ mod tests {
                 token: "tok",
             }),
             argv,
+            prompt_note: None,
         }
     }
 
@@ -1527,5 +1594,185 @@ mod tests {
         assert!(carries_tunnel(&argv(&["claude"])));
         assert!(carries_tunnel(&[]));
         assert!(carries_tunnel(&argv(&["sh", "-c", "curl x | bash"])));
+    }
+
+    /// The prompt argument is named only for the shapes foreman dispatches
+    /// and documents; everything else gets the note typed.
+    #[test]
+    fn the_prompt_argument_is_named_only_when_certain() {
+        let brief = "do the card";
+        let accepted: &[&[&str]] = &[
+            &["claude", brief],
+            &["codex", brief],
+            &["grok", brief],
+            // `card_argv` with a model.
+            &["claude", brief, "--model", "claude-opus-5-5"],
+            &["codex", brief, "--model", "gpt-6.1-sol"],
+            &["claude", "line one\nline two"],
+        ];
+        for a in accepted {
+            assert_eq!(prompt_index(&argv(a)), Some(1), "{a:?}");
+        }
+        let refused: &[&[&str]] = &[
+            // No prompt: a shell, a bare agent, an empty brief.
+            &[],
+            &["claude"],
+            &["claude", ""],
+            // One word could be a subcommand (or is one).
+            &["claude", "hi"],
+            &["claude", "mcp"],
+            &["codex", "exec", brief],
+            &["codex", "resume", "--last"],
+            &["codex", "e", brief],
+            // A flag first: print mode, resume forms, a flag's value.
+            &["claude", "-p", brief],
+            &["claude", "--print", brief],
+            &["claude", "--continue"],
+            &["claude", "--resume", "abc"],
+            &["claude", "--model", "x", brief],
+            &["codex", "--no-daemon", brief],
+            &["claude", "- do the card"],
+            // Anything after the brief but `--model <id>`.
+            &["claude", brief, "-p"],
+            &["claude", brief, "--allowedTools", "Bash"],
+            &["claude", brief, "--model"],
+            &["claude", brief, "--model", "-x"],
+            &["claude", brief, "--model", "two words"],
+            &["claude", brief, "--model", "x", "more"],
+            &["claude", brief, "another prompt"],
+            &["grok", brief, "--model", "x"],
+            // Not the bare program: paths, extensions, case, wrappers.
+            &["/usr/local/bin/claude", brief],
+            &["./claude", brief],
+            &[r"C:\bin\claude.exe", brief],
+            &["claude.exe", brief],
+            &["Claude", brief],
+            &["my-claude", brief],
+            &["claude-wrapper", brief],
+            &["npx", "@anthropic-ai/claude-code", brief],
+            &["wsl", "claude", brief],
+            &["bash", "-lc", "claude 'do the card'"],
+            &["htop", "-d", "5"],
+        ];
+        for a in refused {
+            assert_eq!(prompt_index(&argv(a)), None, "{a:?}");
+        }
+        // Every reconnect argv and every install Session is refused.
+        for a in accepted {
+            assert_eq!(prompt_index(&relaunch(&argv(a)).argv), None, "{a:?}");
+        }
+        for i in INSTALL {
+            for shell in [
+                RemoteShell::Posix,
+                RemoteShell::Pwsh,
+                RemoteShell::WindowsPowerShell,
+            ] {
+                assert_eq!(prompt_index(&install_argv(shell, i.command)), None);
+            }
+        }
+    }
+
+    fn carrying<'a>(r: &'a Remote, argv: &'a [String]) -> Launch<'a> {
+        Launch {
+            prompt_note: Some("NOTE \"q\" 'x' tok"),
+            ..launch(r, "", argv)
+        }
+    }
+
+    #[test]
+    fn a_first_launch_carries_the_note_inside_its_prompt() {
+        let r = remote(RemoteShell::Posix);
+        let carried = "do the card\n\nNOTE \"q\" 'x' tok";
+        for (words, tail) in [
+            (vec!["codex", "do the card"], "'codex' '--no-daemon' "),
+            (vec!["grok", "do the card"], "'grok' "),
+        ] {
+            let a = argv(&words);
+            let b = build(&carrying(&r, &a)).unwrap();
+            assert!(b.note_carried);
+            assert_eq!(b.dispatched, a, "the logical argv never holds the note");
+            let s = script(&b, r.shell);
+            assert!(
+                s.ends_with(&format!("{tail}{}\n", sh_quote(carried))),
+                "{s}"
+            );
+        }
+        // Claude: after its hooks, and before `--model`.
+        let a = argv(&["claude", "do the card", "--model", "x"]);
+        let b = build(&carrying(&r, &a)).unwrap();
+        assert!(b.note_carried);
+        let s = script(&b, r.shell);
+        let settings = &claude_with_hooks(&a, r.shell).unwrap()[2];
+        assert!(
+            s.ends_with(&format!(
+                "'claude' '--settings' {} {} '--model' 'x'\n",
+                sh_quote(settings),
+                sh_quote(carried)
+            )),
+            "{s}"
+        );
+        // pwsh carries it the same way.
+        let w = remote(RemoteShell::Pwsh);
+        let a = argv(&["claude", "do the card"]);
+        let b = build(&carrying(&w, &a)).unwrap();
+        assert!(b.note_carried);
+        assert!(script(&b, w.shell).contains(&ps_quote(carried)));
+    }
+
+    #[test]
+    fn a_launch_without_a_certain_prompt_is_built_as_it_was() {
+        let r = remote(RemoteShell::Posix);
+        for words in [
+            vec!["claude", "-p", "do the card"],
+            vec!["codex", "exec", "do the card"],
+            vec!["npx", "@anthropic-ai/claude-code", "do the card"],
+            vec!["claude"],
+            vec![],
+        ] {
+            let a = argv(&words);
+            let b = build(&carrying(&r, &a)).unwrap();
+            assert!(!b.note_carried, "{words:?}");
+            assert_eq!(b, build(&launch(&r, "", &a)).unwrap(), "{words:?}");
+        }
+        // No Tunnel: nowhere for the note's command to go.
+        let a = argv(&["claude", "do the card"]);
+        let mut l = carrying(&r, &a);
+        l.tunnel = None;
+        assert!(!build(&l).unwrap().note_carried);
+    }
+
+    /// A brief that fits a Windows Remote's line alone but not with the
+    /// note launches as today (the note is then typed), never refused.
+    #[test]
+    fn a_note_that_would_overflow_a_windows_line_is_left_out_of_the_prompt() {
+        for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
+            let r = remote(shell);
+            let fits = |n: usize| {
+                let a = argv(&["codex", &"do it ".repeat(n)]);
+                build(&launch(&r, "", &a)).is_ok()
+            };
+            let mut n = 1;
+            while fits(n + 1) {
+                n += 1;
+            }
+            let a = argv(&["codex", &"do it ".repeat(n)]);
+            let long_note = "N ".repeat(200);
+            let l = Launch {
+                prompt_note: Some(&long_note),
+                ..launch(&r, "", &a)
+            };
+            let b = build(&l).expect("never refused for the note");
+            assert!(!b.note_carried, "{shell:?}");
+            assert_eq!(b, build(&launch(&r, "", &a)).unwrap());
+            // Over the cap without the note: refused as before.
+            let a = argv(&["codex", &"do it ".repeat(n + 1)]);
+            assert!(
+                build(&Launch {
+                    prompt_note: Some(&long_note),
+                    ..launch(&r, "", &a)
+                })
+                .is_err()
+            );
+        }
     }
 }

@@ -98,10 +98,16 @@ process is there, and it is an ordinary member of THIS project's chat.
   refused: pass `--cwd` or ask the human. Never guess a directory.
 - Remotes are added by the human in Settings > Remotes. Do not edit
   settings.json for them.
-- **The agent on R has no foreman CLI and no skills.** Opened with a prompt,
-  it gets a reply note at launch with the exact `curl` command that posts to
-  this room; a bare agent gets the note with its first chat post. Ask it to
-  report by chat and leave the foreman commands out of its brief.
+- **The agent on R has no foreman CLI and no skills.** Opened as
+  `claude "<brief>"` (or `codex` / `grok`, `--model <id>` allowed after the
+  brief), it gets a reply note at the end of its prompt with the exact
+  `curl` command that posts to this room. Any other shape with arguments
+  gets the note typed at launch; a bare agent gets it with its first chat
+  post. Ask it to report by chat and leave the foreman commands out of its
+  brief.
+- Codex on R in a directory it has not trusted could not post: its tool
+  sandbox refused the `curl` to the room ("Failed to connect"), though the
+  Tunnel answered a plain shell there. Use a directory Codex already trusts.
 - A Remote agent can post chat (with `to`, `re`, `now`), read chat history
   and read `status`. It cannot open, send to, close or snapshot panes, or
   use the kanban board. You drive; it reports.
@@ -110,7 +116,9 @@ process is there, and it is an ordinary member of THIS project's chat.
   Grok and Windows Remotes have none, so posts to them are not held for
   Idle and `status` never says idle: snapshot to see where they are. A
   first launch in a directory Claude has not trusted shows no state while
-  the trust dialog waits.
+  the trust dialog waits, and anything typed before the human answers it
+  (earlier room posts arriving as catch-up, a typed note) picks "No, exit".
+  Use a directory it already trusts, or ask the human to answer the dialog.
 - In `status --json` its line carries `remote` (the Remote's name). Its ssh
   dropping shows as `state: exited` with `disconnected: true`: the pane
   waits for the human's Enter to reconnect, and foreman never reconnects by

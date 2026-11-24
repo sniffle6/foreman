@@ -303,11 +303,22 @@ a short note with the exact reply command for that Remote's shell. A
 Dispatch brief built for `--on` carries the same note. It is sent once per
 connection, not on every message.
 
+A first launch whose prompt argument foreman can name for certain
+(`remote::prompt_index`: the bare `claude`/`codex`/`grok`, then the brief)
+carries the note at the end of that argument and types nothing. Keystrokes
+at launch can answer a dialog the agent shows first. Claude's folder-trust
+dialog defaults to "No, exit". Any other agent shape with arguments gets the
+note typed at launch, as does a reconnect: its resume argv has no prompt,
+and its token is new.
+
 Accepted risk: the token sits on a command line (base64, not secret) on
 both PCs, so another process running as the same user can read it, and on
 Linux any user can read a process's arguments. It buys posting chat as that
 one Session, and feeding its badge, until the Session exits. The local pipe
-already trusts same-user processes with more than that.
+already trusts same-user processes with more than that. A note carried in
+the prompt keeps the token in the agent's own argv on the Remote for the
+agent's life, where the launch line lasts only while it runs. Same grant,
+longer window.
 
 ## Agent state
 
@@ -580,6 +591,45 @@ directory. State read from `status --json` and the screen from `snapshot`.
   Enter picks "No, exit". Bare `claude` gets no note at launch and was used
   instead. Not fixed here; see `docs/remote-sessions.md`.
 - **Codex, Grok, Windows Remotes: not run.** No hooks are built for them.
+
+## Results, 2026-11-23, the reply note inside the prompt
+
+A release build ran as its own instance (own `APPDATA` holding only the
+Remotes settings plus one empty Project, agent environment stripped), driven
+through its control pipe against the same Debian Remote. It used Claude Code
+2.1.331 and codex-cli 0.163.0, each in a new `/tmp` directory neither had
+seen, removed after.
+
+- **(a) Nothing typed at the trust dialog: passed.** `claude "<brief>"`
+  opened at 22:23:23.6. At 22:23:36.9 and again at 22:24:08.0 (44 s) it sat
+  at "Accessing workspace" with "❯ No, exit" selected, `state: running`.
+  The brief and the note sat in its argv (`/proc/<pid>/cmdline`), the note
+  after a blank line.
+- **(b) Answered by hand, it ran the brief: passed.** `send --keys Down`,
+  then `Enter`, chose "Yes, I trust this folder". Claude ran one `curl` from
+  its prompt, and the room showed `#2 t2: s2hp4s-ok`. `agent_state` went
+  idle.
+- **(c) No second note: passed.** A post to it arrived as the bare
+  `[chat p1 #4] t1→t2: …` line. The only `[foreman]` text on screen was the
+  prompt's. It answered with `#5 t2 (re #4): s2hp4s-second`.
+- **Found: room catch-up still answers the dialog.** A second Claude,
+  opened the same way into a room that by then held broadcasts #2 and #5,
+  got them typed on its first Ready frame (a new Member's cursor starts at
+  0). It exited within 6 s: "Claude Code didn't start because this folder
+  isn't trusted." Not fixed here. The note no longer causes it, but any
+  earlier post does.
+- **Codex: the note arrived, the post did not.** No trust dialog showed. The
+  carried note was in its prompt, and nothing but the room catch-up was
+  typed. Its `curl` failed ("Failed to connect"), while a plain ssh shell on
+  the same port got 401. With no `sandbox_mode` in its config, its tool
+  sandbox blocked the call. So (b) is not shown for Codex.
+- **Token exposure measured.** The carried note's token is in the agent's
+  world-readable cmdline for its life. A Claude on the same Remote launched
+  without a carried note showed only `$FOREMAN_TOKEN` there.
+- **Not run: reconnect** (it still types the note; unit tests pin it),
+  **Grok** (not installed on the Remote) and **Windows Remotes** (none
+  exist). Their prompt carrying and the line-cap fallback are unit-tested
+  only.
 
 ## Order of work
 
