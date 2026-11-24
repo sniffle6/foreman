@@ -162,7 +162,8 @@ pub fn reach(ctx: &egui::Context, target: &str) -> Reach {
         .get(target, Instant::now());
     if let Some(job) = job {
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        // Refused under test: the probe stays in flight, the answer Checking.
+        spawn_network(move || {
             let (endpoint, reach) = run_reach(&job);
             cache().lock().unwrap_or_else(|e| e.into_inner()).finish(
                 &job.target,
@@ -175,18 +176,6 @@ pub fn reach(ctx: &egui::Context, target: &str) -> Reach {
     }
     ctx.request_repaint_after(REACH_TTL);
     reach
-}
-
-/// Test hook: `target`'s reachability, as if a probe had just answered, so
-/// a layout test's status words do not change when a real probe returns.
-#[cfg(test)]
-pub fn put_reach(target: &str, reach: Reach) {
-    cache().lock().unwrap_or_else(|e| e.into_inner()).finish(
-        target,
-        None,
-        reach,
-        Instant::now(),
-    );
 }
 
 /// The SSH port [`reach`] probes for `target`, once it has resolved it.
@@ -222,6 +211,9 @@ fn run_reach(job: &Job) -> (Option<Endpoint>, Reach) {
 }
 
 fn tcp_reach(host: &str, port: u16) -> Reach {
+    if !network_allowed() {
+        return Reach::Unknown(UNDER_TEST.into());
+    }
     let Ok(addrs) = (host, port).to_socket_addrs() else {
         return Reach::Offline; // the name does not resolve from here
     };
@@ -516,7 +508,8 @@ pub fn retest(ctx: &egui::Context, target: &str) {
 fn spawn_test(ctx: &egui::Context, target: &str) {
     let ctx = ctx.clone();
     let target = target.to_string();
-    std::thread::spawn(move || {
+    // Refused under test: the entry stays running.
+    spawn_network(move || {
         loop {
             let outcome = run_test(&target);
             let still = listed(&ctx, &target);
@@ -636,6 +629,76 @@ pub fn config_hosts() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// The network seam
+// ---------------------------------------------------------------------------
+
+/// What a refused run says. Never shown outside tests.
+pub(crate) const UNDER_TEST: &str = "no network under test";
+
+#[cfg(test)]
+thread_local! {
+    static NETWORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread may run ssh or open a socket. Always, outside tests.
+/// Under `cfg(test)` only after [`allow_network`] on this thread; each
+/// refusal is counted ([`refused`]).
+pub(crate) fn network_allowed() -> bool {
+    #[cfg(test)]
+    {
+        let ok = NETWORK.get();
+        if !ok {
+            REFUSED.set(REFUSED.get() + 1);
+        }
+        ok
+    }
+    #[cfg(not(test))]
+    true
+}
+
+/// Run `work`, which reaches the network, on its own thread: the one way a
+/// probe, a Test, a folder listing or a folder create leaves the UI thread.
+/// Under test, without [`allow_network`], nothing starts and this returns
+/// false; with it, the opt-in follows `work` onto its thread.
+pub(crate) fn spawn_network(work: impl FnOnce() + Send + 'static) -> bool {
+    if !network_allowed() {
+        return false;
+    }
+    #[cfg(test)]
+    std::thread::spawn(move || {
+        let _net = allow_network();
+        work()
+    });
+    #[cfg(not(test))]
+    std::thread::spawn(work);
+    true
+}
+
+/// A test's opt-in to the network, for this thread until dropped. Only the
+/// `#[ignore]`d live tests take one.
+#[cfg(test)]
+pub struct NetworkAllowed(bool);
+
+#[cfg(test)]
+pub fn allow_network() -> NetworkAllowed {
+    NetworkAllowed(NETWORK.replace(true))
+}
+
+#[cfg(test)]
+impl Drop for NetworkAllowed {
+    fn drop(&mut self) {
+        NETWORK.set(self.0);
+    }
+}
+
+/// How many network starts this thread has had refused.
+#[cfg(test)]
+pub fn refused() -> usize {
+    REFUSED.get()
+}
+
+// ---------------------------------------------------------------------------
 // Running ssh
 // ---------------------------------------------------------------------------
 
@@ -680,6 +743,9 @@ pub(crate) fn run_raw(
     timeout: Duration,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<RawOutput, String> {
+    if !network_allowed() {
+        return Err(UNDER_TEST.into());
+    }
     let mut cmd = Command::new("ssh");
     cmd.args(args)
         .stdin(Stdio::null())
@@ -739,6 +805,39 @@ pub(crate) fn run_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under test nothing reaches a network unless the test opted in: the
+    /// reach probe, Test, ssh and the connect are each refused on the
+    /// calling thread, before any thread, process or socket starts. A start
+    /// that skips the seam leaves `refused` where it was and fails here.
+    #[test]
+    fn nothing_reaches_a_network_under_test_without_opting_in() {
+        let ctx = egui::Context::default();
+        let target = "guard.foreman.invalid";
+        let before = refused();
+        assert_eq!(reach(&ctx, target), Reach::Checking);
+        assert_eq!(refused(), before + 1, "the reach probe went past the seam");
+        assert_eq!(reach(&ctx, target), Reach::Checking, "in flight, never run");
+        assert_eq!(refused(), before + 1, "and never asked again");
+        start_test(&ctx, target);
+        assert_eq!(refused(), before + 2, "Test went past the seam");
+        assert!(test_entry(target).is_some_and(|e| e.running && e.last.is_none()));
+        assert_eq!(
+            run(&["-V"], Duration::from_secs(1)).err().as_deref(),
+            Some(UNDER_TEST)
+        );
+        assert_eq!(
+            tcp_reach("127.0.0.1", 22),
+            Reach::Unknown(UNDER_TEST.into())
+        );
+        assert!(!spawn_network(|| panic!("ran without the opt-in")));
+        assert_eq!(refused(), before + 5);
+        {
+            let _net = allow_network();
+            assert!(network_allowed());
+        }
+        assert!(!network_allowed(), "the opt-in ends with its scope");
+    }
 
     #[test]
     fn ssh_g_direct_reads_host_and_port() {

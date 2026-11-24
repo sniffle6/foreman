@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::remote::RemoteShell;
-use crate::remote_browse::{self as model, Entry, Failure, Key, Listed, Shared, State, Style};
+use crate::remote_browse::{
+    self as model, Entry, Failure, Key, Listed, Mkdir, Shared, State, Style,
+};
 
 /// How long the directory part of the field must stay put while typing
 /// before a listing starts. Navigation lists at once.
@@ -77,6 +79,9 @@ pub enum Shows {
     Naming,
     /// A folder is being created.
     Creating,
+    /// Rows, while a create whose name field was closed still runs: the
+    /// new-folder row is busy.
+    Busy,
 }
 
 /// One row of the list.
@@ -199,6 +204,11 @@ struct Naming {
     parent: String,
     name: String,
     phase: Phase,
+    /// The field has been drawn: Enter before the user could see it
+    /// creates nothing.
+    shown: bool,
+    /// The user typed in it: an untouched field never creates.
+    typed: bool,
 }
 
 #[derive(Debug)]
@@ -212,12 +222,46 @@ enum Phase {
 
 /// A create's answer, handed back by its worker thread.
 #[derive(Debug)]
-struct Made {
+struct Landed {
     job: u64,
     /// The parent's listing and the new folder's: both out of date now.
     parent: Key,
     child: Key,
-    result: Result<(), Failure>,
+    outcome: Mkdir,
+}
+
+/// The create running.
+#[derive(Debug)]
+struct Running {
+    job: u64,
+    name: String,
+    parent: Key,
+    child: Key,
+}
+
+/// Runs one create in place of ssh: the parent's key and the name in, how
+/// it ended out. Tests inject one ([`Browser::with_runner`]).
+#[derive(Clone)]
+pub struct Runner(Arc<dyn Fn(&Key, &str) -> Mkdir + Send + Sync>);
+
+impl std::fmt::Debug for Runner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Runner")
+    }
+}
+
+/// Hand a create's outcome back. When the folder was or may have been
+/// made, the parent's listing and the new folder's are asked again first,
+/// here on the create's thread: a name field closed meanwhile, or a widget
+/// dropped, never loses the refresh. A refusal (the script's, or nothing
+/// sent) changed nothing, and keeps the rows under the name field.
+fn deliver(cache: &Shared, slot: &Mutex<Option<Landed>>, landed: Landed) {
+    if matches!(landed.outcome, Mkdir::Made | Mkdir::Unsure(_)) {
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.refresh(&landed.parent);
+        c.refresh(&landed.child);
+    }
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(landed);
 }
 
 /// Tells each Browser's name field from another's.
@@ -250,9 +294,18 @@ pub struct Browser {
     /// The new-folder name field, while open (`focus` is `Name`).
     naming: Option<Naming>,
     /// The last create's answer, until a frame takes it.
-    made: Arc<Mutex<Option<Made>>>,
+    made: Arc<Mutex<Option<Landed>>>,
     /// Creates started; each one's number.
     jobs: u64,
+    /// The create running, and its name: one at a time per widget, whether
+    /// or not its name field is still open.
+    creating: Option<Running>,
+    /// Runs creates in place of ssh; `None` is ssh.
+    runner: Option<Runner>,
+    /// What a create's answer said when no name field was left to say it:
+    /// shown on the breadcrumb until the directory changes or the name
+    /// field opens again.
+    notice: Option<Failure>,
     /// The Enter that created a folder may still be held: its repeats must
     /// not then open or save in the field. Cleared by a fresh Enter, or a
     /// frame that sees Enter up.
@@ -298,6 +351,9 @@ impl Browser {
             naming: None,
             made: Arc::default(),
             jobs: 0,
+            creating: None,
+            runner: None,
+            notice: None,
             enter_held: false,
             name_id: egui::Id::new((
                 "remote_browse_name",
@@ -333,6 +389,7 @@ impl Browser {
                 });
                 self.focus = Focus::Field;
                 self.naming = None;
+                self.notice = None;
                 self.immediate = true;
                 self.reseat = false;
                 self.want = None;
@@ -437,6 +494,7 @@ impl Browser {
         }
         match self.view(text).as_deref().map(|v| &*v.state) {
             Some(State::Unreachable(_)) => Shows::Retry,
+            Some(State::Listed(_)) if self.creating.is_some() => Shows::Busy,
             Some(State::Listed(_)) => Shows::Rows,
             _ => Shows::Waiting,
         }
@@ -542,9 +600,16 @@ impl Browser {
             self.sel = view.first();
         }
         // The name field lives in the new-folder row: no row, no field.
+        // Except while its create runs: the create's own refresh relists
+        // the parent, and only its answer may close the field.
         if self.focus == Focus::Name {
+            let running = self
+                .naming
+                .as_ref()
+                .is_some_and(|n| matches!(n.phase, Phase::Creating(_)));
             match view.rows.iter().position(|r| *r == Row::NewFolder) {
                 Some(i) => self.sel = i,
+                None if running => {}
                 None => {
                     self.naming = None;
                     self.focus = Focus::List;
@@ -553,17 +618,24 @@ impl Browser {
         }
     }
 
-    /// Open the name field in the new-folder row, the filter typed so far
-    /// as the name.
+    /// Open the name field in the new-folder row, empty: the name is only
+    /// ever what the user types there, never the filter or a typed path.
+    /// Nothing while a create runs: one at a time.
     fn start_naming(&mut self, text: &str, view: &View) {
+        if self.creating.is_some() {
+            return;
+        }
         let Some(i) = view.rows.iter().position(|r| *r == Row::NewFolder) else {
             return;
         };
         let at = model::split(text, self.style());
+        self.notice = None;
         self.naming = Some(Naming {
             parent: at.dir.to_string(),
-            name: at.filter.to_string(),
+            name: String::new(),
             phase: Phase::Typing,
+            shown: false,
+            typed: false,
         });
         self.focus = Focus::Name;
         self.sel = i;
@@ -571,13 +643,17 @@ impl Browser {
     }
 
     /// Enter in the name field: check the name, then make the folder off
-    /// the UI thread. Never while one is already being made.
+    /// the UI thread. Nothing until the field has been drawn and holds a
+    /// name the user typed, and never while a create runs.
     fn create(&mut self) {
         let style = self.style();
+        if self.creating.is_some() {
+            return;
+        }
         let (Some(s), Some(n)) = (&self.source, &mut self.naming) else {
             return;
         };
-        if matches!(n.phase, Phase::Creating(_)) {
+        if !n.shown || !n.typed {
             return;
         }
         if let Err(why) = model::check_name(&n.name, style) {
@@ -593,57 +669,80 @@ impl Browser {
             s.shell,
             &model::descend(&n.parent, style, &Entry::dir(&n.name)),
         );
+        self.creating = Some(Running {
+            job,
+            name: n.name.clone(),
+            parent: parent.clone(),
+            child: child.clone(),
+        });
         #[cfg(test)]
-        {
-            let _ = child;
-            self.started.push((parent.dir.clone(), n.name.clone()));
-        }
-        #[cfg(not(test))]
-        {
-            let (slot, cancel, ctx) = (self.made.clone(), self.cancel.clone(), self.ctx.clone());
-            let name = n.name.clone();
-            std::thread::spawn(move || {
-                let result =
-                    model::run_mkdir(&parent.target, parent.shell, &parent.dir, &name, &cancel);
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Made {
-                    job,
-                    parent,
-                    child,
-                    result,
-                });
-                if !cancel.load(Ordering::Relaxed)
-                    && let Some(ctx) = ctx
-                {
-                    ctx.request_repaint();
-                }
-            });
+        self.started.push((parent.dir.clone(), n.name.clone()));
+        let name = n.name.clone();
+        let (cache, slot, cancel, ctx) = (
+            self.cache.clone(),
+            self.made.clone(),
+            self.cancel.clone(),
+            self.ctx.clone(),
+        );
+        let runner = self.runner.clone();
+        let work = move || {
+            let outcome = match &runner {
+                Some(Runner(run)) => run(&parent, &name),
+                // Never killed with the widget's listings: a kill can land
+                // after mkdir ran, and then nobody knows.
+                None => model::run_mkdir(
+                    &parent.target,
+                    parent.shell,
+                    &parent.dir,
+                    &name,
+                    &AtomicBool::new(false),
+                ),
+            };
+            let landed = Landed {
+                job,
+                parent,
+                child,
+                outcome,
+            };
+            deliver(&cache, &slot, landed);
+            // A dropped widget has nothing to repaint.
+            if !cancel.load(Ordering::Relaxed)
+                && let Some(ctx) = ctx
+            {
+                ctx.request_repaint();
+            }
+        };
+        if self.runner.is_some() {
+            std::thread::spawn(work);
+        } else {
+            // Refused under test: it stays Creating until `land`.
+            crate::remote_probe::spawn_network(work);
         }
     }
 
-    /// Take a create's answer. On success the listings it touched are asked
-    /// again. If the name field that asked is still open: on success the
-    /// field holds the new folder (and lists it) and gets the keyboard
-    /// back; on failure the name stays for another try. Returns whether
-    /// `text` changed.
+    /// Take a create's answer (its listings were already asked again, see
+    /// [`deliver`]); the next create may start. If the name field that
+    /// asked is still open: on success the field holds the new folder (and
+    /// lists it) and gets the keyboard back; on a refusal why shows, with
+    /// the name kept for another try. An unsure answer closes the name
+    /// field (the parent is listing again, so its row is gone) and, like
+    /// any failure whose name field was closed meanwhile, says why on the
+    /// breadcrumb. Returns whether `text` changed.
     fn take_made(&mut self, text: &mut String) -> bool {
         let Some(m) = self.made.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return false;
         };
-        if m.result.is_ok() {
-            let mut cache = self.lock();
-            cache.refresh(&m.parent);
-            cache.refresh(&m.child);
+        if self.creating.as_ref().is_some_and(|r| r.job == m.job) {
+            self.creating = None;
         }
         let style = self.style();
-        let Some(n) = self
+        let open = self
             .naming
-            .as_mut()
-            .filter(|n| matches!(n.phase, Phase::Creating(j) if j == m.job))
-        else {
-            return false;
-        };
-        match m.result {
-            Ok(()) => {
+            .as_ref()
+            .is_some_and(|n| matches!(n.phase, Phase::Creating(j) if j == m.job));
+        match m.outcome {
+            Mkdir::Made if open => {
+                let n = self.naming.as_ref().expect("open");
                 let next = model::descend(&n.parent, style, &Entry::dir(&n.name));
                 self.focus_field();
                 self.reseat = false;
@@ -652,8 +751,29 @@ impl Browser {
                 *text = next;
                 true
             }
-            Err(f) => {
-                n.phase = Phase::Failed(f);
+            // The refreshed listing shows it.
+            Mkdir::Made => false,
+            Mkdir::Refused(f) | Mkdir::NotSent(f) if open => {
+                if let Some(n) = &mut self.naming {
+                    n.phase = Phase::Failed(f);
+                }
+                false
+            }
+            Mkdir::Unsure(f) if open => {
+                self.naming = None;
+                self.focus = Focus::List;
+                self.notice = Some(f);
+                false
+            }
+            // Only on the Remote it was for: the picker may list another now.
+            Mkdir::Refused(f) | Mkdir::NotSent(f) | Mkdir::Unsure(f) => {
+                if self
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| s.target == m.parent.target && s.shell == m.parent.shell)
+                {
+                    self.notice = Some(f);
+                }
                 false
             }
         }
@@ -783,9 +903,11 @@ impl Browser {
         }
     }
 
-    /// Typing while the list has the keyboard: N opens the new-folder name
-    /// field (when there is a listing to make it in); any other text goes
-    /// to the field, which takes the keyboard back. Call before the field
+    /// Typing while the list has the keyboard: Ctrl+N opens the new-folder
+    /// name field (when there is a listing to make it in); text, every
+    /// letter included, goes to the field, which takes the keyboard back
+    /// and filters by it. A bare letter never opens the name field: what
+    /// was typed after it would become a folder name. Call before the field
     /// draws. Returns whether `text` changed.
     pub fn route_typing(&mut self, ctx: &egui::Context, text: &mut String) -> bool {
         if self.focus != Focus::List {
@@ -796,7 +918,6 @@ impl Browser {
             && ctx.input_mut(take_new_folder_key)
         {
             self.start_naming(text, &view);
-            // Anything typed after the N goes to the name field.
             return false;
         }
         let typed = ctx.input_mut(|i| {
@@ -860,28 +981,53 @@ impl Browser {
         self.cancel.clone()
     }
 
-    /// Test hook: the running create's answer, as if it had come back.
+    /// Test hook: the running create's answer, as if its thread had
+    /// handed it back (when no runner ran one: under test ssh never does).
     #[cfg(test)]
-    pub fn land(&self, result: Result<(), Failure>) {
-        let s = self.source.as_ref().expect("a Remote");
-        let n = self.naming.as_ref().expect("a name field");
-        let style = self.style();
-        *self.made.lock().unwrap() = Some(Made {
-            job: self.jobs,
-            parent: Key::new(&s.target, s.shell, &n.parent),
-            child: Key::new(
-                &s.target,
-                s.shell,
-                &model::descend(&n.parent, style, &Entry::dir(&n.name)),
-            ),
-            result,
-        });
+    pub fn land(&self, outcome: Mkdir) {
+        let r = self.creating.as_ref().expect("a create running");
+        let landed = Landed {
+            job: r.job,
+            parent: r.parent.clone(),
+            child: r.child.clone(),
+            outcome,
+        };
+        deliver(&self.cache, &self.made, landed);
+    }
+
+    /// Test hook: the listings cache and the answer slot, which outlive the
+    /// widget while a create runs.
+    #[cfg(test)]
+    fn handles(&self) -> (Shared, Arc<Mutex<Option<Landed>>>) {
+        (self.cache.clone(), self.made.clone())
+    }
+
+    /// Test hook: run creates with `run` on their own thread, in place of
+    /// ssh.
+    #[cfg(test)]
+    pub fn with_runner(&mut self, run: impl Fn(&Key, &str) -> Mkdir + Send + Sync + 'static) {
+        self.runner = Some(Runner(Arc::new(run)));
+    }
+
+    /// Test hook: whether a create's answer is waiting for a frame.
+    #[cfg(test)]
+    pub fn has_landed(&self) -> bool {
+        self.made.lock().unwrap().is_some()
     }
 
     /// Test hook: the open name field's text.
     #[cfg(test)]
     pub fn name_text(&self) -> Option<&str> {
         self.naming.as_ref().map(|n| n.name.as_str())
+    }
+
+    /// Test hook: `name` typed into the open name field, already drawn.
+    #[cfg(test)]
+    pub fn type_name(&mut self, name: &str) {
+        let n = self.naming.as_mut().expect("a name field");
+        n.name = name.to_string();
+        n.shown = true;
+        n.typed = true;
     }
 
     /// Draw the list for `text` in a reserved area `body_h` tall (plus the
@@ -911,6 +1057,7 @@ impl Browser {
             // Another directory: what could not be reached is asked again.
             if self.last_dir.is_some() {
                 self.lock().forget();
+                self.notice = None;
             }
             self.last_dir = Some(key.dir.clone());
             self.changed_at = now;
@@ -970,7 +1117,13 @@ impl Browser {
                 None,
             ),
             Some(Phase::Failed(f)) => (lead, tail, Some((f.why.clone(), f.detail.clone()))),
-            None => (lead, tail, None),
+            None => {
+                let alert = self
+                    .notice
+                    .as_ref()
+                    .map(|f| (f.why.clone(), f.detail.clone()));
+                (lead, tail, alert)
+            }
         };
         let filter = model::split(text, style).filter;
         let message: Option<(String, egui::Color32, Option<String>)> = match &*view.state {
@@ -1017,6 +1170,13 @@ impl Browser {
             ctx.memory_mut(|m| m.surrender_focus(name_id));
         }
         let new_folder_tip = format!("New folder in {here} on {name}");
+        // A create whose name field was closed still runs: its row says so
+        // and starts nothing.
+        let busy = self
+            .creating
+            .as_ref()
+            .filter(|_| self.naming.is_none())
+            .map(|r| format!("making “{}”…", r.name));
         let naming = &mut self.naming;
         let laid = &mut self.laid;
         laid.rows.clear();
@@ -1091,12 +1251,17 @@ impl Browser {
                                 .interactive(!busy),
                         );
                         laid.name = Some(r.rect);
-                        if r.changed() && matches!(n.phase, Phase::Failed(_)) {
-                            n.phase = Phase::Typing;
+                        n.shown = true;
+                        if r.changed() {
+                            n.typed = true;
+                            if matches!(n.phase, Phase::Failed(_)) {
+                                n.phase = Phase::Typing;
+                            }
                         }
                         continue;
                     }
-                    let ok = view.selectable(row);
+                    let busy_row = row == Row::NewFolder && busy.is_some();
+                    let ok = view.selectable(row) && !busy_row;
                     let (rect, resp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), ROW_H),
                         if ok {
@@ -1122,11 +1287,14 @@ impl Browser {
                     }
                     let (name, note, color, why) = match row {
                         Row::Up => ("..".into(), Some("up one level"), th.text, None),
-                        // An action: a "+" (and its key, where N works),
-                        // not a folder name.
+                        // An action: a "+" (and its key, where Ctrl+N
+                        // works), not a folder name.
+                        Row::NewFolder if busy_row => {
+                            ("+ new folder".into(), busy.as_deref(), th.dim, None)
+                        }
                         Row::NewFolder => (
                             "+ new folder".into(),
-                            focused.then_some("N"),
+                            focused.then_some("Ctrl+N"),
                             th.border_focus,
                             None,
                         ),
@@ -1171,6 +1339,7 @@ impl Browser {
                         p.galley(at, ng, th.dim);
                     }
                     let resp = match (why, elided) {
+                        _ if busy_row => resp.on_hover_text("A folder is being made here"),
                         _ if row == Row::NewFolder => resp.on_hover_text(&new_folder_tip),
                         (Some(why), true) => resp.on_hover_text(format!("{name}\n{why}")),
                         (Some(why), false) => resp.on_hover_text(why),
@@ -1227,7 +1396,7 @@ impl Browser {
     }
 }
 
-/// Take this frame's N press (no Ctrl, Alt or Cmd) and the "n" it typed.
+/// Take this frame's Ctrl+N press (Cmd+N on a Mac; no Alt or Shift).
 /// Returns whether there was one.
 fn take_new_folder_key(i: &mut egui::InputState) -> bool {
     let Some(at) = i.events.iter().position(|e| {
@@ -1237,18 +1406,12 @@ fn take_new_folder_key(i: &mut egui::InputState) -> bool {
             repeat: false,
             modifiers,
             ..
-        } if !(modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd))
+        } if (modifiers.ctrl || modifiers.command || modifiers.mac_cmd)
+            && !(modifiers.alt || modifiers.shift))
     }) else {
         return false;
     };
     i.events.remove(at);
-    if let Some(t) = i
-        .events
-        .iter()
-        .position(|e| matches!(e, egui::Event::Text(t) if t.eq_ignore_ascii_case("n")))
-    {
-        i.events.remove(t);
-    }
     true
 }
 
@@ -1697,9 +1860,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The list's text after `b` lands its create's answer, as a frame would.
-    fn landed(b: &mut Browser, text: &mut String, result: Result<(), Failure>) -> bool {
-        b.land(result);
+    fn landed(b: &mut Browser, text: &mut String, outcome: Mkdir) -> bool {
+        b.land(outcome);
         b.take_made(text)
+    }
+
+    /// The list on `~/`, focused, with the name field open (row 1).
+    fn naming_in_home() -> (Browser, String) {
+        let mut b = browser();
+        let mut text = "~/".to_string();
+        b.key(Nav::Down, &mut text);
+        b.sel = 1;
+        b.key(Nav::Enter, &mut text);
+        assert!(b.naming());
+        (b, text)
     }
 
     /// "+ new folder" is the first row after "..", only over a listing: a
@@ -1734,8 +1908,9 @@ mod tests {
         assert_eq!(b.view("/y/").unwrap().rows, [Row::Retry]);
     }
 
-    /// Enter on the row opens the name field with what was typed after the
-    /// last separator; Enter there creates exactly once while it runs; a
+    /// Enter on the row opens an EMPTY name field, whatever was typed
+    /// after the last separator: a typed path that does not exist never
+    /// becomes a folder. Enter there creates exactly once while it runs; a
     /// failure keeps the name for another try; success writes the new
     /// folder into the field, hands the field the keyboard and lists the
     /// parent and the new folder again.
@@ -1754,7 +1929,10 @@ mod tests {
         assert_eq!(b.view(&text).unwrap().rows[b.sel], Row::NewFolder);
         assert!(b.key(Nav::Enter, &mut text));
         assert!(b.naming() && b.list_focused());
-        assert_eq!(b.name_text(), Some("proj"), "the filter is the first guess");
+        assert_eq!(b.name_text(), Some(""), "never the filter");
+        b.key(Nav::Enter, &mut text);
+        assert!(b.started.is_empty(), "an untouched field never creates");
+        b.type_name("proj");
         assert_eq!(b.shows(&text), Shows::Naming);
         assert_eq!(text, "~/src/proj", "naming writes nothing");
         // The name field edits itself: the list's keys do nothing.
@@ -1779,19 +1957,19 @@ mod tests {
         assert!(!landed(
             &mut b,
             &mut text,
-            Err(Failure::new("That name is already taken here."))
+            Mkdir::Refused(Failure::new("That name is already taken here."))
         ));
         assert!(b.naming(), "a failure keeps the name field");
         assert_eq!(b.name_text(), Some("proj"));
         assert_eq!(b.shows(&text), Shows::Naming);
         assert!(
             b.peek("desk", RemoteShell::Posix, "~/src/").is_some(),
-            "kept on failure"
+            "the script made nothing: the listing is kept"
         );
         b.key(Nav::Enter, &mut text);
         assert_eq!(b.started.len(), 2, "Enter tries again");
 
-        assert!(landed(&mut b, &mut text, Ok(())));
+        assert!(landed(&mut b, &mut text, Mkdir::Made));
         assert_eq!(text, "~/src/proj/");
         assert!(
             !b.list_focused() && !b.naming(),
@@ -1804,25 +1982,51 @@ mod tests {
         );
     }
 
+    /// Enter creates nothing until the name field has been drawn and holds
+    /// a name the user typed: not in the frame it opened, not untouched.
+    #[test]
+    fn enter_needs_a_shown_field_and_a_typed_name() {
+        let (mut b, mut text) = naming_in_home();
+        // Typed (as a test can, before any frame) but never drawn.
+        b.naming.as_mut().unwrap().name = "x".into();
+        b.naming.as_mut().unwrap().typed = true;
+        b.key(Nav::Enter, &mut text);
+        assert!(b.started.is_empty(), "not before it was shown");
+        // Drawn, holding a name nobody typed.
+        b.naming.as_mut().unwrap().shown = true;
+        b.naming.as_mut().unwrap().typed = false;
+        b.key(Nav::Enter, &mut text);
+        assert!(b.started.is_empty(), "not a name the user didn't type");
+        assert!(matches!(
+            b.naming.as_ref().map(|n| &n.phase),
+            Some(Phase::Typing)
+        ));
+        b.type_name("x");
+        b.key(Nav::Enter, &mut text);
+        assert_eq!(b.started.len(), 1);
+    }
+
     /// A name that can't be one folder is refused at once, in words, and
     /// nothing runs; editing goes back to naming.
     #[test]
     fn a_bad_name_is_refused_without_running() {
-        let mut b = browser();
-        let mut text = "~/".to_string();
-        b.key(Nav::Down, &mut text);
-        b.sel = 1;
-        b.key(Nav::Enter, &mut text);
-        assert_eq!(b.name_text(), Some(""));
+        let (mut b, mut text) = naming_in_home();
+        b.type_name("");
         b.key(Nav::Enter, &mut text);
         assert!(b.started.is_empty());
         assert!(matches!(
             b.naming.as_ref().map(|n| &n.phase),
             Some(Phase::Failed(f)) if f.why.contains("Type a name")
         ));
-        b.naming.as_mut().unwrap().name = "a/b".into();
-        b.key(Nav::Enter, &mut text);
-        assert!(b.started.is_empty(), "never runs a bad name");
+        for bad in ["a/b", "   ", " lead", "trail "] {
+            b.type_name(bad);
+            b.key(Nav::Enter, &mut text);
+            assert!(b.started.is_empty(), "ran {bad:?}");
+        }
+        assert!(matches!(
+            b.naming.as_ref().map(|n| &n.phase),
+            Some(Phase::Failed(f)) if f.why.contains("start or end with a space")
+        ));
     }
 
     /// Esc closes the name field back to the list, the next to the field.
@@ -1830,17 +2034,13 @@ mod tests {
     /// but the field is left as it is.
     #[test]
     fn esc_steps_back_one_and_a_landing_after_it_only_refreshes() {
-        let mut b = browser();
-        let mut text = "~/".to_string();
-        b.key(Nav::Down, &mut text);
-        b.sel = 1;
+        let (mut b, mut text) = naming_in_home();
+        b.type_name("new");
         b.key(Nav::Enter, &mut text);
-        b.naming.as_mut().unwrap().name = "new".into();
-        b.key(Nav::Enter, &mut text);
-        b.land(Ok(()));
         assert!(b.back());
         assert!(b.list_focused() && !b.naming(), "back in the list");
         assert_eq!(b.view(&text).unwrap().rows[b.sel], Row::NewFolder);
+        b.land(Mkdir::Made);
         assert!(!b.take_made(&mut text), "the field is not moved");
         assert_eq!(text, "~/");
         assert_eq!(
@@ -1853,16 +2053,73 @@ mod tests {
         assert!(!b.back(), "the field's Esc is the caller's");
     }
 
+    /// One create at a time per widget: closing its name field and opening
+    /// the row again starts nothing while it runs, and the row says it is
+    /// busy until the answer is taken.
+    #[test]
+    fn a_second_create_cannot_start_while_one_runs() {
+        let (mut b, mut text) = naming_in_home();
+        b.type_name("one");
+        b.key(Nav::Enter, &mut text);
+        assert!(b.back(), "Esc: the create runs on");
+        assert_eq!(b.shows(&text), Shows::Busy);
+        b.sel = 1;
+        b.key(Nav::Enter, &mut text);
+        assert!(!b.naming(), "the busy row opens nothing");
+        let v = b.view(&text).unwrap();
+        b.start_naming(&text, &v);
+        assert!(!b.naming());
+        assert_eq!(b.started.len(), 1);
+        b.land(Mkdir::Unsure(model::mkdir_unsure(
+            "ssh did not finish in 15s",
+        )));
+        assert!(!b.take_made(&mut text));
+        assert_eq!(
+            b.peek("desk", RemoteShell::Posix, "~/"),
+            None,
+            "an unsure answer lists the parent again"
+        );
+        assert!(
+            b.notice
+                .as_ref()
+                .is_some_and(|f| f.why.contains("may have been made")),
+            "said, though its name field was closed"
+        );
+        b.put(
+            "desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "made", "src"]),
+        );
+        assert_eq!(b.shows(&text), Shows::Rows, "free again");
+        b.sel = 1;
+        b.key(Nav::Enter, &mut text);
+        assert!(b.naming());
+        assert_eq!(b.name_text(), Some(""));
+        assert!(b.notice.is_none(), "a new name field clears it");
+    }
+
+    /// A create's failure that lands after the picker moved to another
+    /// Remote is not said on that Remote's breadcrumb.
+    #[test]
+    fn a_late_failure_is_not_said_on_another_remote() {
+        let (mut b, mut text) = naming_in_home();
+        b.type_name("one");
+        b.key(Nav::Enter, &mut text);
+        b.set_source("pi", RemoteShell::Posix, "pi");
+        b.land(Mkdir::Unsure(model::mkdir_unsure(
+            "ssh did not finish in 15s",
+        )));
+        assert!(!b.take_made(&mut text));
+        assert!(b.notice.is_none());
+        assert!(b.creating.is_none(), "free for the new Remote");
+    }
+
     /// Clicking the field, or anything else that hands it the keyboard,
     /// closes the name field; a new Remote does too.
     #[test]
     fn the_name_field_closes_when_the_field_takes_the_keyboard() {
-        let mut b = browser();
-        let mut text = "~/".to_string();
-        b.key(Nav::Down, &mut text);
-        b.sel = 1;
-        b.key(Nav::Enter, &mut text);
-        assert!(b.naming());
+        let (mut b, mut text) = naming_in_home();
         b.focus_field();
         assert!(!b.naming() && !b.list_focused());
         b.key(Nav::Down, &mut text);
@@ -1870,5 +2127,180 @@ mod tests {
         b.key(Nav::Enter, &mut text);
         b.set_source("pi", RemoteShell::Posix, "pi");
         assert!(!b.naming() && !b.list_focused());
+    }
+
+    // -----------------------------------------------------------------------
+    // The create's own thread, with a fake command in place of ssh
+    // -----------------------------------------------------------------------
+
+    /// A runner that blocks until the test sends its outcome, and how often
+    /// it ran.
+    fn held_runner(b: &mut Browser) -> (std::sync::mpsc::Sender<Mkdir>, Arc<AtomicU64>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Mkdir>();
+        let rx = Mutex::new(rx);
+        let runs = Arc::new(AtomicU64::new(0));
+        let counted = runs.clone();
+        b.with_runner(move |parent, name| {
+            assert_eq!((parent.dir.as_str(), name), ("", "made"));
+            counted.fetch_add(1, Ordering::SeqCst);
+            rx.lock().unwrap().recv().expect("an outcome")
+        });
+        (tx, runs)
+    }
+
+    /// One frame of `b` on `text`, so it holds the context it repaints.
+    fn draw(ctx: &egui::Context, b: &mut Browser, text: &mut String) {
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            b.show(ui, text, 5.0 * ROW_H, true, None);
+        });
+    }
+
+    /// Empty frames until nothing asks for another: a repaint asked for
+    /// after this is someone's wake-up.
+    fn settle_repaints(ctx: &egui::Context) {
+        for _ in 0..10 {
+            if !ctx.has_requested_repaint() {
+                return;
+            }
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        }
+        panic!("egui keeps repainting");
+    }
+
+    /// Wait for the create's thread to hand its answer back.
+    fn wait_landed(slot: &Mutex<Option<Landed>>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the create never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The name field open on `~/`, "made" typed, drawn once.
+    fn ready_to_create(ctx: &egui::Context) -> (Browser, String) {
+        let (mut b, mut text) = naming_in_home();
+        draw(ctx, &mut b, &mut text);
+        b.type_name("made");
+        (b, text)
+    }
+
+    /// The real path: Enter starts the create on its own thread, which
+    /// runs the command, lists the parent again, hands the answer back and
+    /// wakes the UI; the next frame puts the new folder in the field.
+    #[test]
+    fn a_create_runs_on_its_thread_and_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (mut b, mut text) = ready_to_create(&ctx);
+        let (tx, runs) = held_runner(&mut b);
+        let (cache, slot) = b.handles();
+        b.key(Nav::Enter, &mut text);
+        assert_eq!(b.shows(&text), Shows::Creating);
+        settle_repaints(&ctx);
+        tx.send(Mkdir::Made).unwrap();
+        wait_landed(&slot);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(ctx.has_requested_repaint(), "the UI was woken");
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .peek(&Key::new("desk", RemoteShell::Posix, ""))
+                .is_none(),
+            "the parent lists again"
+        );
+        draw(&ctx, &mut b, &mut text);
+        assert_eq!(text, "~/made/");
+        assert!(!b.list_focused());
+    }
+
+    /// ssh killed at its deadline (maybe after mkdir ran): never a plain
+    /// failure. The parent lists again, and the words say the folder may
+    /// have been made.
+    #[test]
+    fn a_timed_out_create_lists_the_parent_again_and_says_it_may_be_made() {
+        let ctx = egui::Context::default();
+        let (mut b, mut text) = ready_to_create(&ctx);
+        let (tx, _) = held_runner(&mut b);
+        let (_, slot) = b.handles();
+        b.key(Nav::Enter, &mut text);
+        tx.send(Mkdir::Unsure(model::mkdir_unsure(
+            "ssh did not finish in 15s",
+        )))
+        .unwrap();
+        wait_landed(&slot);
+        assert_eq!(b.peek("desk", RemoteShell::Posix, ""), None);
+        draw(&ctx, &mut b, &mut text);
+        // The parent is listing again, so its rows (the name field's
+        // included) are gone; the words stay on the breadcrumb.
+        assert!(!b.naming() && b.list_focused());
+        assert!(b.laid.crumb_alert);
+        assert!(
+            b.laid.crumb_text.contains("may have been made"),
+            "{}",
+            b.laid.crumb_text
+        );
+        assert_eq!(b.shows(&text), Shows::Waiting, "free, and listing");
+    }
+
+    /// Esc while the create runs: its answer still lists the parent again
+    /// when it lands, and the field is left alone.
+    #[test]
+    fn a_create_left_by_esc_still_refreshes_when_it_ends() {
+        let ctx = egui::Context::default();
+        let (mut b, mut text) = ready_to_create(&ctx);
+        let (tx, _) = held_runner(&mut b);
+        let (_, slot) = b.handles();
+        b.key(Nav::Enter, &mut text);
+        assert!(b.back());
+        tx.send(Mkdir::Unsure(model::mkdir_unsure("cancelled")))
+            .unwrap();
+        wait_landed(&slot);
+        assert_eq!(b.peek("desk", RemoteShell::Posix, ""), None);
+        draw(&ctx, &mut b, &mut text);
+        assert_eq!(text, "~/");
+        assert_eq!(b.shows(&text), Shows::Waiting, "listing the parent again");
+        assert!(b.laid.crumb_alert, "and the answer is not lost");
+    }
+
+    /// The widget dropped while the create runs: the create is not killed
+    /// with the listings (a kill could land after mkdir ran); it runs to
+    /// its end, lists the parent again, and wakes nobody.
+    #[test]
+    fn a_dropped_widget_lets_its_create_finish() {
+        let ctx = egui::Context::default();
+        let (mut b, mut text) = ready_to_create(&ctx);
+        let (tx, runs) = held_runner(&mut b);
+        let (cache, slot) = b.handles();
+        b.key(Nav::Enter, &mut text);
+        drop(b);
+        settle_repaints(&ctx);
+        tx.send(Mkdir::Made).unwrap();
+        wait_landed(&slot);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .peek(&Key::new("desk", RemoteShell::Posix, ""))
+                .is_none(),
+            "the parent lists again"
+        );
+        assert!(
+            !ctx.has_requested_repaint(),
+            "a dropped widget is not woken"
+        );
+    }
+
+    /// Without a runner, ssh: under test it is refused at the seam, and
+    /// the create waits as Creating for the test to land it.
+    #[test]
+    fn an_ssh_create_never_starts_under_test() {
+        let ctx = egui::Context::default();
+        let (mut b, mut text) = ready_to_create(&ctx);
+        let before = crate::remote_probe::refused();
+        b.key(Nav::Enter, &mut text);
+        assert_eq!(crate::remote_probe::refused(), before + 1);
+        assert_eq!(b.shows(&text), Shows::Creating);
+        assert!(!b.has_landed());
     }
 }

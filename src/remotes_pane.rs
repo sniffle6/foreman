@@ -996,7 +996,10 @@ impl RemotesView {
                     Some(Shows::Retry) => "Enter retry · Tab/Esc back",
                     Some(Shows::Naming) => "Enter create the folder · Esc back to the list",
                     Some(Shows::Creating) => "Creating the folder… · Esc back to the list",
-                    _ => "↑/↓ pick · Enter/→ in · ← up · N new folder · Tab/Esc back",
+                    Some(Shows::Busy) => {
+                        "↑/↓ pick · Enter/→ in · ← up · making a folder… · Tab/Esc back"
+                    }
+                    _ => "↑/↓ pick · Enter/→ in · ← up · Ctrl+N new folder · Tab/Esc back",
                 }
             }
             Mode::Edit(Draft {

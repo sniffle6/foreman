@@ -1749,7 +1749,7 @@ mod tests {
     }
 
     /// The Remotes form at its narrowest, making a folder: N types in the
-    /// Directory field and opens the name field only from the list; the
+    /// Directory field, and Ctrl+N opens the name field from the list; the
     /// hint stays one line and the form and list area never move across
     /// naming, creating and a failure; Esc in the name field goes back to
     /// the list, not out of the form; Enter creates once and never saves,
@@ -1757,7 +1757,7 @@ mod tests {
     #[test]
     fn remotes_folder_list_makes_a_folder() {
         use crate::remote::RemoteShell::Posix;
-        use crate::remote_browse::{Entry, Failure, Listed, State};
+        use crate::remote_browse::{Entry, Failure, Listed, Mkdir, State};
         let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
         let ctx = egui::Context::default();
         let mut menu = SettingsMenu::new();
@@ -1805,6 +1805,16 @@ mod tests {
                 egui::Event::Text("n".into()),
                 ev(egui::Key::N, false),
             ]
+        };
+        let ctrl_n = || {
+            let ev = |pressed| egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            };
+            vec![ev(true), ev(false)]
         };
         let shape = |menu: &mut SettingsMenu| {
             let laid = menu.remotes.laid();
@@ -1857,7 +1867,7 @@ mod tests {
         }
         let list = shape(&mut menu);
 
-        run(&mut menu, &mut s, n_key());
+        run(&mut menu, &mut s, ctrl_n());
         assert!(menu.remotes.browse().naming());
         run(&mut menu, &mut s, vec![egui::Event::Text("made".into())]);
         assert_eq!(menu.remotes.browse().name_text(), Some("made"));
@@ -1892,7 +1902,7 @@ mod tests {
         run(&mut menu, &mut s, vec![]);
         fits(&mut menu, "creating");
         assert_eq!(shape(&mut menu), list, "creating moved the form");
-        menu.remotes.browse().land(Err(Failure::new(
+        menu.remotes.browse().land(Mkdir::Refused(Failure::new(
             "Permission denied: you can't make folders here.",
         )));
         run(&mut menu, &mut s, vec![]);
@@ -1904,7 +1914,8 @@ mod tests {
         assert!(menu.remotes.is_editing(), "Esc left only the name field");
         assert!(menu.remotes.browse().list_focused() && !menu.remotes.browse().naming());
 
-        run(&mut menu, &mut s, n_key());
+        run(&mut menu, &mut s, ctrl_n());
+        assert_eq!(menu.remotes.browse().name_text(), Some(""), "opens empty");
         run(&mut menu, &mut s, vec![egui::Event::Text("made".into())]);
         run(
             &mut menu,
@@ -1912,7 +1923,7 @@ mod tests {
             vec![ev(egui::Key::Enter, false), ev(egui::Key::Enter, true)],
         );
         assert_eq!(menu.remotes.browse().started.len(), 2);
-        menu.remotes.browse().land(Ok(()));
+        menu.remotes.browse().land(Mkdir::Made);
         // Enter still held: its repeat lands nothing and saves nothing.
         run(&mut menu, &mut s, vec![ev(egui::Key::Enter, true)]);
         assert_eq!(menu.remotes.draft_dir(0), Some("/srv/made/"));
@@ -2127,11 +2138,6 @@ mod tests {
         };
         menu.select_pane(Pane::Remotes);
         menu.in_rail = false;
-        // A real reach probe of these made-up hosts answers mid-test and
-        // changes each row's status word, and with it the row's width.
-        for t in ["layout-install-desk", "layout-install-pi"] {
-            crate::remote_probe::put_reach(t, crate::remote_probe::Reach::Reachable);
-        }
         menu.remotes.set_install_project(Some("proj"));
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);

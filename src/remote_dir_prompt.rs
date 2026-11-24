@@ -411,7 +411,12 @@ impl DirPrompt {
 fn hint(browse: &Browser, text: &str) -> &'static str {
     if browse.list_focused() {
         match browse.shows(text) {
-            Shows::Rows => "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open",
+            Shows::Rows => {
+                "↑/↓ pick · Enter/→ go in · ← up · Ctrl+N new folder · Esc, then Enter open"
+            }
+            Shows::Busy => {
+                "↑/↓ pick · Enter/→ go in · ← up · making a folder… · Esc, then Enter open"
+            }
             Shows::Waiting => "Listing folders · Esc, then Enter open",
             Shows::Retry => "Enter retry · Esc, then Enter open",
             Shows::Naming => "Enter create the folder · Esc back to the list",
@@ -513,7 +518,7 @@ mod tests {
         assert_eq!(p.text, "/srv/app");
     }
 
-    use crate::remote_browse::{Entry, Failure, Listed, State};
+    use crate::remote_browse::{Entry, Failure, Listed, Mkdir, State};
 
     fn listing(resolved: &str, names: &[&str]) -> State {
         State::Listed(Listed {
@@ -708,7 +713,7 @@ mod tests {
         assert!(p.browse.list_focused());
         assert_eq!(
             p.hint(),
-            "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open"
+            "↑/↓ pick · Enter/→ go in · ← up · Ctrl+N new folder · Esc, then Enter open"
         );
         assert!(p.laid.hint_fits);
         assert_eq!(
@@ -1024,12 +1029,30 @@ mod tests {
         e
     }
 
-    /// N as a keyboard sends it: the key, the text it types, the release.
-    fn n_key() -> Vec<egui::Event> {
-        let mut e = key(egui::Key::N);
-        e.push(egui::Event::Text("n".into()));
-        e.push(up(egui::Key::N));
+    /// A letter as a keyboard sends it: the key, the text it types, the
+    /// release.
+    fn letter(k: egui::Key, c: &str) -> Vec<egui::Event> {
+        let mut e = key(k);
+        e.push(egui::Event::Text(c.into()));
+        e.push(up(k));
         e
+    }
+
+    /// N as a keyboard sends it.
+    fn n_key() -> Vec<egui::Event> {
+        letter(egui::Key::N, "n")
+    }
+
+    /// Ctrl+N: no text typed.
+    fn ctrl_n() -> Vec<egui::Event> {
+        let ev = |pressed| egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        vec![ev(true), ev(false)]
     }
 
     /// A prompt on `~/` listing `apps` and `src`, the list focused.
@@ -1050,12 +1073,12 @@ mod tests {
 
     const NAMING: &str = "Enter create the folder · Esc back to the list";
 
-    /// N types an "n" in the field; only while the list has the keyboard
-    /// does it open the name field, which then takes the typing. The
-    /// Directory field never looks focused meanwhile, and each Esc steps
-    /// back one: to the list, to the field, then out.
+    /// N types an "n" in the field; Ctrl+N, only while the list has the
+    /// keyboard, opens an empty name field, which then takes the typing.
+    /// The Directory field never looks focused meanwhile, and each Esc
+    /// steps back one: to the list, to the field, then out.
     #[test]
-    fn n_names_a_new_folder_only_from_the_list_and_esc_steps_back() {
+    fn ctrl_n_names_a_new_folder_only_from_the_list_and_esc_steps_back() {
         let ctx = egui::Context::default();
         let mut p = DirPrompt::new(ask(Some("~/")));
         p.browse.put(
@@ -1073,12 +1096,12 @@ mod tests {
         let mut p = in_the_list(&ctx, WIDE);
         assert_eq!(
             p.hint(),
-            "↑/↓ pick · Enter/→ go in · ← up · N new folder · Esc, then Enter open"
+            "↑/↓ pick · Enter/→ go in · ← up · Ctrl+N new folder · Esc, then Enter open"
         );
         assert!(p.laid.hint_fits);
-        frame(&ctx, &mut p, WIDE, n_key());
+        frame(&ctx, &mut p, WIDE, ctrl_n());
         assert!(p.browse.naming());
-        assert_eq!(p.text, "~/", "N wrote nothing into the field");
+        assert_eq!(p.text, "~/", "Ctrl+N wrote nothing into the field");
         assert_eq!(p.browse.name_text(), Some(""));
         frame(&ctx, &mut p, WIDE, vec![]);
         assert!(!field_focused(&ctx), "one focus at a time");
@@ -1129,7 +1152,7 @@ mod tests {
     fn enter_creates_once_and_a_held_enter_never_opens() {
         let ctx = egui::Context::default();
         let mut p = in_the_list(&ctx, WIDE);
-        frame(&ctx, &mut p, WIDE, n_key());
+        frame(&ctx, &mut p, WIDE, ctrl_n());
         frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("proj".into())]);
         assert_eq!(frame(&ctx, &mut p, WIDE, tap_enter()), Outcome::Pending);
         assert_eq!(p.browse.started, [(String::new(), "proj".to_string())]);
@@ -1143,7 +1166,7 @@ mod tests {
         }
         assert_eq!(p.browse.started.len(), 1, "repeats never create");
 
-        p.browse.land(Err(crate::remote_browse::Failure::new(
+        p.browse.land(Mkdir::Refused(Failure::new(
             "That name is already taken here. Type another name.",
         )));
         frame(&ctx, &mut p, WIDE, hold_enter());
@@ -1157,7 +1180,7 @@ mod tests {
 
         frame(&ctx, &mut p, WIDE, tap_enter());
         assert_eq!(p.browse.started.len(), 2, "a fresh Enter tries again");
-        p.browse.land(Ok(()));
+        p.browse.land(Mkdir::Made);
         assert_eq!(frame(&ctx, &mut p, WIDE, hold_enter()), Outcome::Pending);
         assert_eq!(p.text, "~/proj/", "the field holds the new folder");
         assert!(!p.browse.list_focused());
@@ -1180,10 +1203,10 @@ mod tests {
     fn a_made_folder_is_in_the_refreshed_listing() {
         let ctx = egui::Context::default();
         let mut p = in_the_list(&ctx, WIDE);
-        frame(&ctx, &mut p, WIDE, n_key());
+        frame(&ctx, &mut p, WIDE, ctrl_n());
         frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("proj".into())]);
         frame(&ctx, &mut p, WIDE, tap_enter());
-        p.browse.land(Ok(()));
+        p.browse.land(Mkdir::Made);
         frame(&ctx, &mut p, WIDE, vec![]);
         assert_eq!(p.text, "~/proj/");
         assert_eq!(
@@ -1234,25 +1257,124 @@ mod tests {
                 )
             };
             let list = shape(&p);
-            let mut check = |p: &DirPrompt, state: &str| {
+            let check = |p: &DirPrompt, state: &str| {
                 assert_eq!(shape(p), list, "{state} {size:?} moved something");
                 assert!(p.laid.hint_fits, "{state} {size:?}: hint cut");
                 assert!(!field_focused(&ctx), "{state}: two focused");
                 let name = p.browse.laid.name.expect(state);
                 assert!(list.1[1].contains_rect(name), "{state}: {name:?}");
             };
-            frame(&ctx, &mut p, size, n_key());
+            frame(&ctx, &mut p, size, ctrl_n());
             frame(&ctx, &mut p, size, vec![egui::Event::Text("proj".into())]);
             check(&p, "naming");
             frame(&ctx, &mut p, size, tap_enter());
             frame(&ctx, &mut p, size, vec![]);
             check(&p, "creating");
-            p.browse.land(Err(crate::remote_browse::mkdir_unreached(
-                "ssh: connect to host desk port 22: Connection refused",
-            )));
+            p.browse
+                .land(Mkdir::NotSent(crate::remote_browse::mkdir_unreached(
+                    "ssh: connect to host desk port 22: Connection refused",
+                )));
             frame(&ctx, &mut p, size, vec![]);
             assert!(p.browse.laid.crumb_alert);
             check(&p, "failed");
         }
+    }
+
+    /// Typing a filter in the list never names a folder: "node" goes to the
+    /// field, letter by letter, the first "n" included, and nothing is
+    /// created, even by the Enter that follows.
+    #[test]
+    fn typing_node_in_the_list_filters_and_creates_nothing() {
+        let ctx = egui::Context::default();
+        let mut p = in_the_list(&ctx, WIDE);
+        for (k, c) in [
+            (egui::Key::N, "n"),
+            (egui::Key::O, "o"),
+            (egui::Key::D, "d"),
+            (egui::Key::E, "e"),
+        ] {
+            frame(&ctx, &mut p, WIDE, letter(k, c));
+            assert!(!p.browse.naming(), "{c} opened the name field");
+        }
+        assert_eq!(p.text, "~/node");
+        assert!(!p.browse.list_focused(), "the field has the keyboard");
+        assert_eq!(p.browse.name_text(), None);
+        assert_eq!(
+            frame(&ctx, &mut p, WIDE, tap_enter()),
+            Outcome::Accepted("~/node".into()),
+            "Enter opens the typed path"
+        );
+        assert!(p.browse.started.is_empty(), "nothing was created");
+    }
+
+    /// Ctrl+N opens the name field EMPTY, even over a typed filter. Enter
+    /// in the frame it opens does nothing, nor does Enter on the untouched
+    /// empty field: no create, no complaint.
+    #[test]
+    fn ctrl_n_opens_an_empty_field_that_enter_alone_never_creates_from() {
+        let ctx = egui::Context::default();
+        let mut p = in_the_list(&ctx, WIDE);
+        // A filter matching nothing, then back in the list on the row
+        // (row 0 is "..").
+        frame(&ctx, &mut p, WIDE, letter(egui::Key::P, "p"));
+        assert_eq!(p.text, "~/p");
+        frame(&ctx, &mut p, WIDE, key(egui::Key::ArrowDown));
+        frame(&ctx, &mut p, WIDE, key(egui::Key::ArrowDown));
+        assert!(p.browse.list_focused());
+        // Ctrl+N and Enter in the same frame: the field opens, and that is
+        // all.
+        let mut both = ctrl_n();
+        both.extend(tap_enter());
+        assert_eq!(frame(&ctx, &mut p, WIDE, both), Outcome::Pending);
+        assert!(p.browse.started.is_empty(), "the opening frame's Enter");
+        assert!(p.browse.naming());
+        assert_eq!(p.browse.name_text(), Some(""), "never the filter");
+        assert_eq!(p.text, "~/p");
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert_eq!(frame(&ctx, &mut p, WIDE, tap_enter()), Outcome::Pending);
+        assert!(p.browse.started.is_empty(), "the untouched field's Enter");
+        assert!(!p.browse.laid.crumb_alert, "and no complaint");
+        assert!(p.browse.naming());
+        frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("x".into())]);
+        frame(&ctx, &mut p, WIDE, tap_enter());
+        assert_eq!(p.browse.started, [(String::new(), "x".to_string())]);
+    }
+
+    /// One create at a time: Esc out of a running create's name field,
+    /// Ctrl+N or Enter on the row opens nothing; the row and the hint say
+    /// it is busy until the answer lands.
+    #[test]
+    fn a_second_create_cannot_start_while_one_runs() {
+        let ctx = egui::Context::default();
+        let mut p = in_the_list(&ctx, WIDE);
+        frame(&ctx, &mut p, WIDE, ctrl_n());
+        frame(&ctx, &mut p, WIDE, vec![egui::Event::Text("one".into())]);
+        frame(&ctx, &mut p, WIDE, tap_enter());
+        assert_eq!(p.browse.started.len(), 1);
+        frame(&ctx, &mut p, WIDE, key(egui::Key::Escape));
+        assert!(p.browse.list_focused() && !p.browse.naming());
+        frame(&ctx, &mut p, WIDE, vec![]);
+        assert_eq!(
+            p.hint(),
+            "↑/↓ pick · Enter/→ go in · ← up · making a folder… · Esc, then Enter open"
+        );
+        assert!(p.laid.hint_fits);
+        frame(&ctx, &mut p, WIDE, ctrl_n());
+        assert!(!p.browse.naming(), "Ctrl+N while busy");
+        // Still on the row itself: Enter.
+        frame(&ctx, &mut p, WIDE, tap_enter());
+        assert!(!p.browse.naming(), "Enter on the busy row");
+        assert_eq!(p.text, "~/");
+        assert_eq!(p.browse.started.len(), 1, "never a second");
+        p.browse.land(Mkdir::Made);
+        frame(&ctx, &mut p, WIDE, vec![]);
+        p.browse.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "one", "src"]),
+        );
+        frame(&ctx, &mut p, WIDE, ctrl_n());
+        assert!(p.browse.naming(), "free once it landed");
     }
 }

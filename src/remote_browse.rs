@@ -585,6 +585,8 @@ fn unreached(raw: &str) -> (&'static str, Fix) {
     let l = raw.to_lowercase();
     if l.contains("could not run ssh") {
         ("ssh could not be started on this PC", Fix::None)
+    } else if l == "cancelled" {
+        ("ssh was stopped before the Remote answered", Fix::Retry)
     } else if l.contains("did not finish") || l.contains("timed out") {
         ("the Remote did not answer in time", Fix::Retry)
     } else if l.contains("connection refused") {
@@ -607,19 +609,41 @@ pub const MAX_NAME: usize = 255;
 /// The whole create: a login plus one `mkdir`.
 const MKDIR_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Names Windows keeps for devices, with or without an extension.
+const WINDOWS_DEVICES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Why `name` cannot be a new folder's name, in words that say what to do;
 /// `Ok` when it can. One path component, never `.` or `..`, nothing the
 /// Remote would read as a separator. A leading `-` is fine: the commands
-/// end their options with `--`.
+/// end their options with `--`. Nothing is trimmed: a name with a space at
+/// either end is refused, so the folder made is the one typed.
 pub fn check_name(name: &str, style: Style) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("Type a name for the new folder.");
+    }
+    if name.trim().is_empty() {
+        return Err("A folder name can't be only spaces. Type a name.");
+    }
+    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
+        return Err(
+            "A folder name can't start or end with a space: it would be easy to miss. Remove the space.",
+        );
     }
     if name == "." || name == ".." {
         return Err("“.” and “..” are not folder names. Type another name.");
     }
     if name.chars().any(char::is_control) {
         return Err("A folder name can't hold a tab, a line break or a control character.");
+    }
+    // "con.txt" and "con .txt" open the device too.
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    if style == Style::Windows && WINDOWS_DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d)) {
+        return Err(
+            "Windows keeps this name for a device (CON, PRN, AUX, NUL, COM1–9, LPT1–9). Type another name.",
+        );
     }
     match style {
         Style::Posix if name.contains('/') => {
@@ -665,9 +689,12 @@ else printf '%s fail other %s\\n' '{MARK}' \"$(printf '%s' \"$e\" | head -n 1)\"
 }
 
 /// The PowerShell create (pwsh and 5.1): the parent found with
-/// `-LiteralPath`, the folder made by `New-Item -ItemType Directory` at
-/// the full path (its `-Path` takes no wildcards). Untested: no Windows
-/// Remote has existed.
+/// `-LiteralPath`, then pinned as the process's current directory, which
+/// Windows will not let anyone delete or rename while it is. The folder is
+/// made by .NET `CreateDirectory` at the full path: literal (`[` and `]` are
+/// name characters), and one level, since the pinned parent is there.
+/// `New-Item -ItemType Directory` is not used: it would make a vanished
+/// parent again. Untested on a Remote: no Windows Remote has existed.
 pub fn ps_mkdir_script(parent: &str, name: &str) -> String {
     format!(
         "$ErrorActionPreference = 'Stop'
@@ -679,9 +706,12 @@ try {{
   if (-not (Test-Path -LiteralPath $t)) {{ '{MARK} fail missing'; exit 0 }}
   if (-not (Test-Path -LiteralPath $t -PathType Container)) {{ '{MARK} fail notdir'; exit 0 }}
   $p = (Get-Item -LiteralPath $t -Force).FullName
+  try {{ [System.IO.Directory]::SetCurrentDirectory($p) }}
+  catch [System.IO.DirectoryNotFoundException] {{ '{MARK} fail missing'; exit 0 }}
+  catch [System.IO.FileNotFoundException] {{ '{MARK} fail missing'; exit 0 }}
   $f = [System.IO.Path]::Combine($p, $n)
   if (Test-Path -LiteralPath $f) {{ '{MARK} fail exists'; exit 0 }}
-  $null = New-Item -ItemType Directory -Path $f
+  $null = [System.IO.Directory]::CreateDirectory($f)
 }} catch [System.UnauthorizedAccessException] {{ '{MARK} fail denied'; exit 0 }}
 catch {{
   if ($f -and (Test-Path -LiteralPath $f)) {{ '{MARK} fail exists' }}
@@ -750,19 +780,59 @@ pub fn parse_mkdir(stdout: &[u8], style: Style) -> Option<Result<(), Failure>> {
     }))
 }
 
-/// A finished create's `ssh`: the script's answer, or why the login failed
-/// in plain words that say what to do.
-pub fn mkdir_outcome(stdout: &[u8], stderr: &str, style: Style) -> Result<(), Failure> {
-    if let Some(r) = parse_mkdir(stdout, style) {
-        return r;
+/// How a create ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mkdir {
+    Made,
+    /// The script on the Remote answered that it made nothing, and why.
+    Refused(Failure),
+    /// Nothing ran on the Remote: refused before sending, ssh never started
+    /// or never connected, or the login was refused.
+    NotSent(Failure),
+    /// ssh ran but its answer never came back (timed out, cut off): the
+    /// folder may have been made.
+    Unsure(Failure),
+}
+
+/// A finished create's `ssh`: the script's answer, or, when none came back,
+/// whether the command can have run, in plain words that say what to do.
+pub fn mkdir_outcome(stdout: &[u8], stderr: &str, style: Style) -> Mkdir {
+    match parse_mkdir(stdout, style) {
+        Some(Ok(())) => return Mkdir::Made,
+        Some(Err(f)) => return Mkdir::Refused(f),
+        None => {}
     }
     match crate::remote_probe::classify_failure(stderr) {
-        crate::remote_probe::TestOutcome::NeedsLogin => Err(Failure {
+        // BatchMode refused the login: no command ran.
+        crate::remote_probe::TestOutcome::NeedsLogin => Mkdir::NotSent(Failure {
             why: "Can't make the folder: logging in to this Remote needs a password or passphrase. Load a key, then press Enter again.".into(),
             detail: Some(crate::remote_probe::last_line(stderr, "")).filter(|d| !d.is_empty()),
         }),
-        crate::remote_probe::TestOutcome::Failed(e) => Err(mkdir_unreached(&e)),
-        crate::remote_probe::TestOutcome::Ok(_) => Err(mkdir_unreached("")),
+        crate::remote_probe::TestOutcome::Failed(e) if never_connected(&e) => {
+            Mkdir::NotSent(mkdir_unreached(&e))
+        }
+        crate::remote_probe::TestOutcome::Failed(e) => Mkdir::Unsure(mkdir_unsure(&e)),
+        crate::remote_probe::TestOutcome::Ok(_) => Mkdir::Unsure(mkdir_unsure("")),
+    }
+}
+
+/// Whether ssh's own words say it never reached a login: no command ran.
+fn never_connected(raw: &str) -> bool {
+    let l = raw.to_lowercase();
+    l.contains("could not run ssh")
+        || l.contains("could not resolve hostname")
+        || l.contains("ssh: connect to host")
+}
+
+/// A create whose answer never came back: say what happened, that the
+/// folder may be there, and that the list was asked again.
+pub fn mkdir_unsure(raw: &str) -> Failure {
+    let (what, _) = unreached(raw);
+    Failure {
+        why: format!(
+            "The folder may have been made: {what}. Look for it in the list before you try again."
+        ),
+        detail: Some(raw.trim().to_string()).filter(|d| !d.is_empty()),
     }
 }
 
@@ -781,15 +851,19 @@ pub fn mkdir_unreached(raw: &str) -> Failure {
 }
 
 /// Make `name` in `parent` now. Blocks up to [`MKDIR_TIMEOUT`], or until
-/// `cancel` is set: worker threads only.
+/// `cancel` is set: worker threads only. A kill at the deadline or on
+/// `cancel` can land after `mkdir` ran, so it is [`Mkdir::Unsure`].
 pub fn run_mkdir(
     target: &str,
     shell: RemoteShell,
     parent: &str,
     name: &str,
     cancel: &AtomicBool,
-) -> Result<(), Failure> {
-    let args = mkdir_args(target, shell, parent, name)?;
+) -> Mkdir {
+    let args = match mkdir_args(target, shell, parent, name) {
+        Ok(a) => a,
+        Err(f) => return Mkdir::NotSent(f),
+    };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match crate::remote_probe::run_raw(&args, MKDIR_TIMEOUT, Some(cancel)) {
         Ok(out) => mkdir_outcome(
@@ -797,7 +871,10 @@ pub fn run_mkdir(
             &String::from_utf8_lossy(&out.stderr),
             Style::of(shell),
         ),
-        Err(e) => Err(mkdir_unreached(&e)),
+        Err(e) if never_connected(&e) || e == crate::remote_probe::UNDER_TEST => {
+            Mkdir::NotSent(mkdir_unreached(&e))
+        }
+        Err(e) => Mkdir::Unsure(mkdir_unsure(&e)),
     }
 }
 
@@ -950,14 +1027,11 @@ pub fn list(
     state
 }
 
-/// Unit tests never reach a network: the entry stays `Loading`.
-#[cfg(test)]
-fn spawn(_ctx: &egui::Context, _cache: &Shared, _key: &Key, _cancel: &Arc<AtomicBool>) {}
-
-#[cfg(not(test))]
+/// Run `key`'s listing on a worker thread. Refused under test (no opt-in):
+/// the entry stays `Loading`.
 fn spawn(ctx: &egui::Context, cache: &Shared, key: &Key, cancel: &Arc<AtomicBool>) {
     let (ctx, cache, key, cancel) = (ctx.clone(), cache.clone(), key.clone(), cancel.clone());
-    std::thread::spawn(move || {
+    crate::remote_probe::spawn_network(move || {
         let state = run_listing(&key, &cancel);
         cache
             .lock()
@@ -1403,16 +1477,49 @@ mod tests {
             ("what?", Windows, false),
             ("trailing.", Windows, false),
             ("trailing ", Windows, false),
+            // Nothing is trimmed: spaces at either end are refused.
+            (" ", Posix, false),
+            ("   ", Posix, false),
+            ("\u{3000}", Posix, false),
+            (" lead", Posix, false),
+            ("trail ", Posix, false),
+            (" lead", Windows, false),
+            ("in side", Windows, true),
+            // Windows device names, with or without an extension.
+            ("CON", Windows, false),
+            ("con", Windows, false),
+            ("nul.txt", Windows, false),
+            ("Aux.tar.gz", Windows, false),
+            ("COM1", Windows, false),
+            ("lpt9.x", Windows, false),
+            ("con .txt", Windows, false),
+            ("PRN", Windows, false),
+            ("COM0", Windows, true),
+            ("COM10", Windows, true),
+            ("console", Windows, true),
+            ("CON", Posix, true),
+            ("[a]b", Windows, true),
         ] {
             assert_eq!(check_name(name, style).is_ok(), ok, "{name:?} {style:?}");
         }
         assert!(check_name(&"x".repeat(MAX_NAME), Posix).is_ok());
         assert!(check_name(&"x".repeat(MAX_NAME + 1), Posix).is_err());
-        // Each refusal says what to do.
-        for bad in ["", "..", "a/b", "a\tb"] {
+        // Each refusal says what to do, and why for the spaces.
+        for bad in ["", "..", "a/b", "a\tb", " ", " x", "x "] {
             let why = check_name(bad, Posix).unwrap_err();
             assert!(why.ends_with('.') && why.len() > 20, "{bad:?}: {why}");
         }
+        assert!(check_name("  ", Posix).unwrap_err().contains("only spaces"));
+        assert!(
+            check_name("x ", Posix)
+                .unwrap_err()
+                .contains("start or end with a space")
+        );
+        assert!(
+            check_name("nul.txt", Windows)
+                .unwrap_err()
+                .contains("device")
+        );
     }
 
     #[test]
@@ -1473,8 +1580,13 @@ mod tests {
         let ps = ps_mkdir_script(r"C:\it's\", "new 'one'");
         assert!(ps.contains("$t = 'C:\\it''s\\'\n"), "{ps}");
         assert!(ps.contains("$n = 'new ''one'''\n"), "{ps}");
+        assert!(ps.contains("Test-Path -LiteralPath $t"), "{ps}");
+        // Literal and one level: never New-Item, which makes parents.
         assert!(
-            ps.contains("Test-Path -LiteralPath $t") && ps.contains("New-Item -ItemType Directory")
+            ps.contains("[System.IO.Directory]::SetCurrentDirectory($p)")
+                && ps.contains("[System.IO.Directory]::CreateDirectory($f)")
+                && !ps.contains("New-Item"),
+            "{ps}"
         );
         // A Windows line past the cap is refused plainly, never cut.
         let long = "x".repeat(crate::remote::WINDOWS_LINE_CAP);
@@ -1516,27 +1628,96 @@ mod tests {
         };
         assert_eq!(f.detail.as_deref(), Some("Boom."));
         assert!(!f.why.contains("Boom"));
-        // The login, not the script.
-        let f =
-            mkdir_outcome(b"", "andy@desk: Permission denied (publickey).\n", Posix).unwrap_err();
+        assert_eq!(
+            mkdir_outcome(b"foreman-browse made\n", "", Posix),
+            Mkdir::Made
+        );
+        assert!(matches!(
+            mkdir_outcome(b"foreman-browse fail exists\n", "", Posix),
+            Mkdir::Refused(_)
+        ));
+    }
+
+    /// No answer from the script: when ssh says it never got as far as a
+    /// login, nothing ran; anything else may have run mkdir, and says so.
+    #[test]
+    fn a_create_without_an_answer_is_unsure_unless_ssh_never_connected() {
+        let Mkdir::NotSent(f) =
+            mkdir_outcome(b"", "andy@desk: Permission denied (publickey).\n", Posix)
+        else {
+            panic!()
+        };
         assert!(f.why.contains("password or passphrase"), "{}", f.why);
-        let f = mkdir_outcome(
-            b"",
+        for stderr in [
             "ssh: connect to host desk port 22: Connection refused\n",
-            Posix,
-        )
-        .unwrap_err();
+            "ssh: connect to host desk port 22: Connection timed out\n",
+            "ssh: Could not resolve hostname desk: No such host is known.\n",
+        ] {
+            let Mkdir::NotSent(f) = mkdir_outcome(b"", stderr, Posix) else {
+                panic!("{stderr}")
+            };
+            assert!(!f.why.contains("may have"), "{}", f.why);
+            assert!(!f.why.contains("ssh: "), "raw stderr in {}", f.why);
+        }
+        for stderr in [
+            "client_loop: send disconnect: Broken pipe\n",
+            "Connection to desk closed by remote host.\n",
+            "",
+        ] {
+            let Mkdir::Unsure(f) = mkdir_outcome(b"motd\n", stderr, Posix) else {
+                panic!("{stderr:?}")
+            };
+            assert!(f.why.contains("may have been made"), "{}", f.why);
+            assert!(f.why.contains("Look for it in the list"), "{}", f.why);
+        }
+        // run_raw's own errors: its deadline or a cancel killed ssh, maybe
+        // after mkdir ran.
+        let f = mkdir_unsure("ssh did not finish in 15s");
         assert!(
-            f.why.contains("refused") && f.why.ends_with("try again."),
+            f.why
+                .starts_with("The folder may have been made: the Remote did not answer in time."),
             "{}",
             f.why
         );
-        assert!(!f.why.contains("ssh: "), "raw stderr in {}", f.why);
-        assert!(
-            mkdir_unreached("ssh did not finish in 15s")
-                .why
-                .contains("in time")
+        assert_eq!(f.detail.as_deref(), Some("ssh did not finish in 15s"));
+        assert!(never_connected("could not run ssh: not found"));
+        assert!(!never_connected("ssh did not finish in 15s"));
+        assert!(!never_connected("cancelled"));
+    }
+
+    /// Under test ssh never runs: a create is refused before sending, a
+    /// listing never starts, each at the one seam.
+    #[test]
+    fn creates_and_listings_never_reach_a_network_under_test() {
+        let before = crate::remote_probe::refused();
+        let r = run_mkdir(
+            "desk",
+            RemoteShell::Posix,
+            "~/",
+            "x",
+            &AtomicBool::new(false),
         );
+        assert!(matches!(r, Mkdir::NotSent(_)), "{r:?}");
+        assert_eq!(crate::remote_probe::refused(), before + 1);
+        let before = crate::remote_probe::refused();
+        let r = run_listing(
+            &Key::new("desk", RemoteShell::Posix, "~/"),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(r, State::Unreachable(_)), "{r:?}");
+        assert_eq!(crate::remote_probe::refused(), before + 1);
+        // A listing asked for is never started: it stays Loading.
+        let ctx = egui::Context::default();
+        let cache = Shared::default();
+        let key = Key::new("desk", RemoteShell::Posix, "/srv/");
+        let before = crate::remote_probe::refused();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(*list(&ctx, &cache, &key, true, &cancel), State::Loading);
+        assert_eq!(crate::remote_probe::refused(), before + 1);
+        assert!(matches!(
+            *cache.lock().unwrap().peek(&key).unwrap(),
+            State::Loading
+        ));
     }
 
     /// A refresh drops a kept answer; one still running is thrown away when
@@ -1832,6 +2013,61 @@ mod tests {
         }
     }
 
+    /// The generated PowerShell create, run by a local PowerShell (pwsh or
+    /// 5.1) on a temp folder: `[` and `]` are name characters, not
+    /// wildcards; a taken name (folder or file) and a missing parent or a
+    /// file say so and make nothing, never a parent. No Remote: skips when
+    /// no PowerShell runs here.
+    #[test]
+    fn the_powershell_mkdir_script_runs_locally() {
+        use std::process::Command;
+        let flags = ["-NoLogo", "-NoProfile", "-NonInteractive"];
+        let Some(exe) = ["pwsh", "powershell"].into_iter().find(|exe| {
+            Command::new(exe)
+                .args(flags)
+                .args(["-Command", "exit 0"])
+                .status()
+                .is_ok_and(|s| s.success())
+        }) else {
+            eprintln!("skipped: no PowerShell on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let sep = std::path::MAIN_SEPARATOR;
+        let root = format!("{}{sep}", home.display());
+        let run = |parent: &str, name: &str| {
+            let script = crate::remote::utf16le_b64(&ps_mkdir_script(parent, name));
+            let out = Command::new(exe)
+                .args(flags)
+                .args(["-EncodedCommand", &script])
+                .output()
+                .expect("PowerShell ran");
+            parse_mkdir(&out.stdout, Windows).unwrap_or_else(|| panic!("no marker: {out:?}"))
+        };
+        let names = ["a[1]", "[x]", "it's", "-x", "$(x)", "a name with spaces"];
+        for name in names {
+            assert_eq!(run(&root, name), Ok(()), "{name}");
+            assert!(home.join(name).is_dir(), "{name} was not made");
+        }
+        assert_eq!(std::fs::read_dir(home).unwrap().count(), names.len());
+        let failed = |parent: &str, name: &str, want: &str| match run(parent, name) {
+            Err(f) => assert!(f.why.contains(want), "{parent}{name}: {}", f.why),
+            Ok(()) => panic!("{parent}{name}: made"),
+        };
+        failed(&root, "a[1]", "already taken");
+        std::fs::write(home.join("plain.txt"), "x").unwrap();
+        failed(&root, "plain.txt", "already taken");
+        assert!(home.join("plain.txt").is_file());
+        failed(&format!("{root}nope{sep}"), "x", "no longer on the Remote");
+        assert!(!home.join("nope").exists(), "a parent was made");
+        failed(
+            &format!("{root}plain.txt{sep}"),
+            "x",
+            "no longer on the Remote",
+        );
+    }
+
     /// The Posix create against a real Remote. Makes folders ONLY under
     /// /tmp/foreman-mkdir-test, which must not exist yet; remove it after.
     /// Run by hand:
@@ -1843,6 +2079,7 @@ mod tests {
         let Ok(target) = std::env::var("FOREMAN_BROWSE_TARGET") else {
             return;
         };
+        let _net = crate::remote_probe::allow_network();
         let never = AtomicBool::new(false);
         let root = "/tmp/foreman-mkdir-test/";
         let run = |parent: &str, name: &str| {
@@ -1850,14 +2087,20 @@ mod tests {
             println!("{parent}{name} -> {r:?}");
             r
         };
-        assert_eq!(run("/tmp/", "foreman-mkdir-test"), Ok(()));
+        assert_eq!(run("/tmp/", "foreman-mkdir-test"), Mkdir::Made);
         for name in ["it's", "$(touch pwned)", "-x", "a name with spaces"] {
-            assert_eq!(run(root, name), Ok(()), "{name}");
+            assert_eq!(run(root, name), Mkdir::Made, "{name}");
         }
-        assert!(run(root, "it's").is_err_and(|f| f.why.contains("already taken")));
-        assert!(
-            run("/tmp/foreman-mkdir-test/nope/", "x").is_err_and(|f| f.why.contains("no longer"))
-        );
+        assert!(matches!(run(root, "it's"), Mkdir::Refused(f) if f.why.contains("already taken")));
+        assert!(matches!(
+            run("/tmp/foreman-mkdir-test/nope/", "x"),
+            Mkdir::Refused(f) if f.why.contains("no longer")
+        ));
+        // Killed at once, as at the deadline: unsure, never a plain failure.
+        let now = AtomicBool::new(true);
+        let r = run_mkdir(&target, RemoteShell::Posix, root, "killed", &now);
+        println!("killed -> {r:?}");
+        assert!(matches!(r, Mkdir::Unsure(f) if f.why.contains("may have been made")));
         let State::Listed(l) = run_listing(&Key::new(&target, RemoteShell::Posix, root), &never)
         else {
             panic!("no listing")
@@ -1878,6 +2121,7 @@ mod tests {
         let Ok(target) = std::env::var("FOREMAN_BROWSE_TARGET") else {
             return;
         };
+        let _net = crate::remote_probe::allow_network();
         let never = AtomicBool::new(false);
         for dir in ["", "/", "~/", "/root/", "/nope-foreman/", "/etc/hostname/"] {
             let state = run_listing(&Key::new(&target, RemoteShell::Posix, dir), &never);

@@ -22,7 +22,8 @@ is for changing the feature.
   Remote, and neither have the folder list's PowerShell scripts
   (`remote_browse::ps_script`, drive roots included, and the new-folder
   `ps_mkdir_script`). Test on a real Windows Remote before you trust any of
-  them.
+  them. `ps_mkdir_script` alone also runs in the unit tests through a local
+  PowerShell, with no SSH.
 - **An install Session's argv names the agent.** The Claude and Codex
   install URLs contain `claude` / `codex`. `IconKind::from_argv` returns
   `None` for an `install_of` argv, so the icon, `agent_of`, the badges and the
@@ -55,26 +56,45 @@ is for changing the feature.
   landing. The cache belongs to the `Browser`, and dropping the `Browser`
   kills its running ssh (the Remotes pane drops it the frame after the form
   closes).
-- **"+ new folder" refreshes only on success.** A success drops the parent's
-  and the new folder's listings (`Cache::refresh`; one still running is
-  thrown away when it lands). A failure keeps the parent's listing on
-  purpose: relisting would blank the rows, name field included, while it
-  ran. So a create that timed out but did make the folder answers "already
-  taken" on retry while the list still lacks it. An Esc'd create still
-  lands its refresh but leaves the field alone. Closing the prompt or form
-  kills the create's ssh with the listings', so the folder may or may not
-  exist.
+- **"+ new folder" refreshes when the folder was or may have been made**
+  (`Mkdir::Made`, `Mkdir::Unsure`). A timeout or a cut-off ssh can land
+  after `mkdir` ran, so it is never a plain failure. The create's own
+  thread does the refresh (`deliver`), so an Esc'd name field or a dropped
+  widget can't skip it. A refusal (`Refused` from the script, `NotSent`
+  when ssh never got to a login) changed nothing and keeps the rows. That
+  matters because relisting blanks the rows, name field included. An
+  unsure answer therefore closes the name field and puts its words on the
+  breadcrumb (`Browser::notice`). `settle` keeps a name field without a
+  row only while its create runs, since only the answer may close it.
+- **A create is never killed with its widget.** Dropping the `Browser`
+  kills its listings' ssh, but the create runs to its 15 s deadline: a kill
+  mid-create leaves nobody knowing whether the folder exists. One create
+  at a time per widget (`Browser::creating`). While it runs, the row reads
+  "making …" and opens nothing.
+- **The keyboard trigger is Ctrl+N, never a bare letter.** With the list
+  focused, a bare N used to open the name field, and what was typed next
+  became the name: typing "node" to filter made a folder "ode". Letters
+  always go to the field as a filter. The name field also starts empty
+  (never the filter: "~/src/proj" + new folder + Enter made "proj"), and
+  Enter creates only once the field was drawn and the user typed in it.
 - **A held Enter must never create twice, nor create and then open.** The
   name field creates only on a press egui has not marked `repeat`, and the
   field ignores Enter repeats right after a create (`Browser::held_enter`).
   egui marks a press of a key it still holds down as a repeat, so a test
   that presses Enter twice without a release (`pressed: false`) in between
   sees the second as a repeat and creates nothing.
-- **Unit tests never run a listing or a create over ssh.** Under `cfg(test)`
-  `remote_browse::spawn` does nothing, so an unseeded listing stays
-  "Listing folders…" forever. Seed one with `Browser::put`. A create only
-  records itself in `Browser::started`; hand back its answer with
-  `Browser::land`.
+- **Under `cfg(test)` nothing reaches a network unless the test opts in.**
+  Every reach probe, Test, listing and create leaves the UI thread through
+  `remote_probe::spawn_network`, and every ssh run or connect checks
+  `network_allowed`. Both refuse on a test thread without
+  `remote_probe::allow_network()` (only the `#[ignore]`d live tests take
+  it). So an unseeded listing stays "Listing folders…" and a reach stays
+  Checking forever. Seed with `Browser::put` / `put_test_entry`. An ssh
+  create stays Creating (`Browser::started` records it). Hand back its
+  answer with `Browser::land`, or drive the real create thread with
+  `Browser::with_runner`. A new network call must go through the seam, or
+  `nothing_reaches_a_network_under_test_without_opting_in` should grow a
+  line for it.
   `the_posix_script_runs_against_hostile_names` does run the real Posix
   script through a local `sh` (Git Bash on Windows) and skips when there is
   none. Its denied branch runs only on Unix, because Windows ignores the
