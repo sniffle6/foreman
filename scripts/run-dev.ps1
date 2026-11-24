@@ -250,6 +250,20 @@ foreach ($name in @('FOREMAN', 'FOREMAN_EXE', 'FOREMAN_PIPE',
                    'FOREMAN_PROJECT_ID', 'FOREMAN_TERMINAL_ID', 'FOREMAN_TITLE_PIPE')) {
     Remove-Item "Env:$name" -ErrorAction SilentlyContinue
 }
+# An agent that runs this script hands its own session markers to the dev
+# instance, and every `claude` opened there then thinks it is that agent's
+# child: white mascot, "Transcript saving is off - inherited
+# CLAUDE_CODE_CHILD_SESSION marker" (2026-11-23). CLAUDE_CONFIG_DIR is the
+# user's own setting and stays.
+# The agent's tool shell also sets NO_COLOR (every program in the dev instance
+# goes monochrome: that was the white mascot), GIT_EDITOR=true and
+# GIT_TERMINAL_PROMPT=0 (git commit/credential prompts silently do nothing),
+# and a fake KITTY_WINDOW_ID. None of these are in the user's own environment.
+# If a dev instance looks or behaves unlike the installed one, diff
+# `Get-ChildItem Env:` in a pane of each before suspecting the code.
+Get-ChildItem Env: |
+    Where-Object { $_.Name -match '^(CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PID$|CODEX_THREAD_ID$|NO_COLOR$|GIT_EDITOR$|GIT_ASKPASS$|GIT_TERMINAL_PROMPT$|KITTY_WINDOW_ID$|NoDefaultCurrentDirectoryInExePath$|TERM$|COLORTERM$)' } |
+    ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
 
 $p = Start-Process -FilePath $Exe -WorkingDirectory $SrcDir -WindowStyle Normal -PassThru
 Start-Sleep -Seconds 2
