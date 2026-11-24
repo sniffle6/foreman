@@ -105,8 +105,12 @@ process is there, and it is an ordinary member of THIS project's chat.
 - A Remote agent can post chat (with `to`, `re`, `now`), read chat history
   and read `status`. It cannot open, send to, close or snapshot panes, or
   use the kanban board. You drive; it reports.
-- No `agent_state` on a Remote Session yet, so posts to it are not held for
-  Idle and `status` never says idle. Snapshot to see where it is.
+- `agent_state` on a Remote Session: only for Claude on a POSIX Remote,
+  started as plain `claude` (no wrapper, no `--settings` of yours). Codex,
+  Grok and Windows Remotes have none, so posts to them are not held for
+  Idle and `status` never says idle: snapshot to see where they are. A
+  first launch in a directory Claude has not trusted shows no state while
+  the trust dialog waits.
 - In `status --json` its line carries `remote` (the Remote's name). Its ssh
   dropping shows as `state: exited` with `disconnected: true`: the pane
   waits for the human's Enter to reconnect, and foreman never reconnects by

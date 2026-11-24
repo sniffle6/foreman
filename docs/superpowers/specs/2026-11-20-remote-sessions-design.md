@@ -547,6 +547,40 @@ available; every Windows half of the experiments above is still open.
 - **4 and 6: not run.** Resize needs a human at the window; sleep needs the
   seat PC to sleep.
 
+## Results, 2026-11-23, Claude hooks through the Tunnel
+
+A release build of the `/hook` work ran as its own instance (own `APPDATA`,
+agent environment stripped), driven through its control pipe against the
+same Debian Remote, Claude Code 2.1.331 (logged in), in a throwaway
+directory. State read from `status --json` and the screen from `snapshot`.
+
+- **3, Claude: passed.** Prompt submitted → `working` (20:18:11.7), held
+  across a `Bash` call, → `idle` 2.4 s later on `Stop`. A `Write` in
+  default permission mode → `needs_you` on `PermissionRequest`
+  (20:19:57.7); approving → `working` (20:20:26.05), which only
+  `PostToolUse` can cause there, → `idle` 0.7 s later on `Stop`.
+- **No state where none belongs.** A plain Remote `bash` and a `claude
+  --settings <own file>` never carried `agent_state`. The folder-trust
+  dialog fires no hook, so it shows no state, not Needs you.
+- **Experiment 3's subagent question: answered.** Captured raw payloads (a
+  second Claude with its own capture `--settings`): a subagent's
+  `PermissionRequest` and `PostToolUse` carry `agent_id` and `agent_type`;
+  its end is `SubagentStop`, never `Stop`. Main-thread `UserPromptSubmit`
+  and `Stop` carry no agent fields. So a subagent cannot mark its parent
+  idle. A backgrounded subagent finishing makes Claude start a main turn
+  with a `<task-notification>` prompt (`UserPromptSubmit`, then `Stop`), so
+  the row goes working → idle again on its own.
+- **Nothing installed on the Remote.** `~/.claude/settings.json` kept its
+  mtime and sha256; no foreman file appeared.
+- **Not shown live: reconnect.** `send` cannot press Enter on a disconnect
+  bar, and driving the GUI was out of bounds. Unit tests cover the hooks
+  and the new token on a reconnect.
+- **Found: the at-launch reply note answers the trust dialog.** A Claude
+  dispatched with a prompt into an untrusted directory exits: the note's
+  Enter picks "No, exit". Bare `claude` gets no note at launch and was used
+  instead. Not fixed here; see `docs/remote-sessions.md`.
+- **Codex, Grok, Windows Remotes: not run.** No hooks are built for them.
+
 ## Order of work
 
 One run, in this order, each step usable when it lands:

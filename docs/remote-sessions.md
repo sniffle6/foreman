@@ -103,9 +103,16 @@ is for changing the feature.
   resets the field's focus-lock filter, so egui then treats ArrowUp/Down as
   focus moves and parks the keyboard on a button for a frame. The directory
   prompt requests focus only when the field lacks it.
-- **Agent-state badges are not available on a Remote Session yet.** Nothing
-  posts hook events, so posts to it are delivered Ready-only and `status`
-  carries no `agent_state` for it.
+- **Agent-state badges: Claude on a POSIX Remote only.** Its hooks ride the
+  launch as `--settings` and post to the Tunnel's `/hook`; gotchas are in
+  `docs/agent-state.md`. Codex, Grok and Windows Remotes post no events, so
+  posts to them are delivered Ready-only and `status` carries no
+  `agent_state` for them.
+- **The at-launch reply note can answer Claude's folder-trust dialog.** A
+  Claude dispatched with a prompt into a directory it has never trusted gets
+  the note pasted and submitted on Ready, and that Enter picks the dialog's
+  default "No, exit" (seen 2026-11-23). Trust the directory once first, or
+  open bare `claude` and send the brief by chat.
 - **The token is per connection.** `spawn_remote_session` leases a new one on
   every launch and every reconnect, and the old one dies with its `ssh`. A
   reconnect that relaunches an agent injects the fresh reply note at launch,

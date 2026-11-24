@@ -114,16 +114,31 @@ as `--settings` JSON, one `curl` per event to the Tunnel's `/hook`. Events
 take the local hook lane from there.
 
 - **Only a bare `claude` on a POSIX Remote gets hooks.** A wrapper (`npx …`),
-  a user's own `--settings`, Codex, Grok and every Windows Remote get none,
-  so no badge. Windows is unproved, and the encoded hooks would take about
-  3 KB of the 8000-character line a dispatched brief has to fit in.
-- **Subagent filtering is partial and unproved.** Only `UserPromptSubmit`,
-  `Stop` and `StopFailure` forward their stdin, which is all the filter
-  needs. The other two events count for a subagent anyway, and their payload
-  is tool input or output of any size. Observed 2026-11-20 (Claude 2.1.105,
-  logged out): main-agent payloads of 246 and 289 bytes with no agent
-  fields. No subagent payload was seen, because no turn could run. A payload
-  over the Tunnel's 64 KB cap counts as the main agent's.
+  a user's own `--settings`, an install Session, a shell, Codex, Grok and
+  every Windows Remote get none, so no badge. A wrapper's reconnect
+  relaunches bare `claude` and does get them; every reconnect leases a new
+  token, which the hooks read from `$FOREMAN_TOKEN`. Windows is unproved, and
+  the encoded hooks would take about 3 KB of the 8000-character line a
+  dispatched brief has to fit in.
+- **Verified 2026-11-23** against a Debian Remote, Claude Code 2.1.331:
+  `UserPromptSubmit` → working, tool calls stay working, `Stop` → idle,
+  `PermissionRequest` → needs you, approving → working (`PostToolUse`) →
+  idle. The remote `~/.claude/settings.json` was unchanged. Reconnect was
+  checked by unit test only: `send` cannot press Enter on a disconnect bar.
+- **Folder trust is not Needs you.** Claude runs no hook until the folder is
+  trusted, so a first launch in a new Remote directory shows no badge while
+  the trust dialog waits.
+- **Subagents never send `Stop`.** In 2.1.331 a subagent's end is
+  `SubagentStop`, which Foreman does not hook. Its `PermissionRequest` and
+  `PostToolUse` carry `agent_id`/`agent_type` and count, as locally. Main
+  `UserPromptSubmit`/`Stop` carry no agent fields, so the filter on them is
+  a guard, not a live path. A backgrounded subagent can ask permission after
+  the main `Stop`: the row goes idle → needs you → working, and the main
+  turn Claude starts to report its result (a `<task-notification>` prompt)
+  ends in idle.
+- **A payload over the Tunnel's 64 KB cap counts as the main agent's.** Only
+  `UserPromptSubmit`, `Stop` and `StopFailure` forward their stdin; the other
+  two would send tool input or output of any size.
 - **No naming on a Remote.** The prompt is not forwarded, and the transcript
   naming reads lives on the Remote.
 

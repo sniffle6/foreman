@@ -1607,6 +1607,45 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_hook_caller_is_let_go_at_its_stage_deadline() {
+        let (hub, seen) = live_hub();
+        let lease = hub.lease("p2", "t7").unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A caller that sends its request, reads the refusal, and then keeps
+        // the connection open.
+        let by = |raw: String| {
+            let mut c = connect(port);
+            c.write_all(raw.as_bytes()).unwrap();
+            let (conn, _) = listener.accept().unwrap();
+            let t0 = Instant::now();
+            let h = hub.clone();
+            let server = std::thread::spawn(move || {
+                h.handle(conn);
+                t0.elapsed()
+            });
+            let mut out = String::new();
+            c.read_to_string(&mut out).unwrap();
+            (out, server.join().unwrap(), c)
+        };
+        let slack = Duration::from_millis(150);
+        // No token: the head deadline, as on every other route.
+        let (out, took, _c) =
+            by("POST /hook?agent=claude&event=Stop HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".into());
+        assert!(out.starts_with("HTTP/1.1 401 "), "{out}");
+        assert!(took < FAST.head + slack, "401 held its thread {took:?}");
+        // A token but no such event: refused through the same drain, bounded
+        // by the request deadline.
+        let (out, took, _c) = by(format!(
+            "POST /hook?agent=claude&event=Nope HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            lease.token.value()
+        ));
+        assert!(out.starts_with("HTTP/1.1 400 "), "{out}");
+        assert!(took < FAST.request + slack, "400 held its thread {took:?}");
+        assert!(seen.try_recv().is_err(), "a refusal queues nothing");
+    }
+
+    #[test]
     fn a_slow_reader_of_a_large_history_is_cut_off_at_the_response_deadline() {
         let deadlines = Deadlines {
             head: Duration::from_secs(2),

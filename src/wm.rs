@@ -16654,7 +16654,7 @@ mod tests {
     fn an_install_launch_carries_no_tunnel() {
         let ctx = egui::Context::default();
         let (tx, _rx) = std::sync::mpsc::channel();
-        crate::control::tunnel::install(&ctx, tx);
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let mut wm = WindowManager::new();
         wm.tag = Some("p1".into());
         for provider in crate::remote_probe::AGENTS {

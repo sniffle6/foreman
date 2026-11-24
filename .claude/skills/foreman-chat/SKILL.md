@@ -71,8 +71,9 @@ section) whenever the worker should be part of this room.
   reply note foreman gave it at launch or with its first post. It can post
   (`to`, `re`, `now`), read history and read status. It cannot open, send
   to, close or snapshot panes, or use the kanban board.
-- No agent state on a Remote Session yet: posts to it are delivered once
-  the pane takes input, even mid-turn. Keep them few and targeted.
+- Agent state on a Remote Session: only for Claude on a POSIX Remote.
+  Posts to Codex, Grok or a Windows Remote are delivered once the pane
+  takes input, even mid-turn. Keep those few and targeted.
 - While its connection is down (`disconnected: true` in `status --json`)
   `--to` it fails as exited. Broadcasts sent meanwhile reach it after the
   human reconnects. A reconnect gets a fresh reply note, and the old

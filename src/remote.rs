@@ -1220,6 +1220,58 @@ mod tests {
         let mut l = launch(&r, "", &a);
         l.tunnel = None;
         assert!(!script(&build(&l).unwrap(), r.shell).contains("--settings"));
+        // A plain shell and every install Session, even handed a Tunnel
+        // (the window manager never gives one), stay as they were.
+        let r = remote(RemoteShell::Posix);
+        let shell: Vec<String> = Vec::new();
+        assert!(!script(&build(&launch(&r, "", &shell)).unwrap(), r.shell).contains("--settings"));
+        for i in INSTALL.iter().filter(|i| i.shell == InstallShell::Posix) {
+            let a = install_argv(RemoteShell::Posix, i.command);
+            assert_eq!(install_of(&a), Some(i.provider));
+            let s = script(&build(&launch(&r, "", &a)).unwrap(), r.shell);
+            assert!(!s.contains("--settings"), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_reconnected_claude_gets_the_hooks_again_with_the_new_token() {
+        let r = remote(RemoteShell::Posix);
+        // The bare program resumes; a wrapper relaunches as bare `claude`.
+        for original in [
+            argv(&["claude", "do the card"]),
+            argv(&["npx", "@anthropic-ai/claude-code", "do the card"]),
+        ] {
+            let re = relaunch(&original);
+            assert_eq!(re.agent, Some("claude"), "{original:?}");
+            let mut l = launch(&r, "", &re.argv);
+            l.tunnel = Some(Tunnel {
+                remote_port: 41999,
+                local_port: 50002,
+                token: "fresh-token",
+            });
+            let s = script(&build(&l).unwrap(), r.shell);
+            let hooked = claude_with_hooks(&re.argv, r.shell).expect("bare claude");
+            assert!(
+                s.contains(&format!("'claude' '--settings' {}", sh_quote(&hooked[2]))),
+                "{s}"
+            );
+            // The hooks read the token from the launch environment, which
+            // carries the new one.
+            assert!(s.contains("export FOREMAN_TOKEN='fresh-token'\n"), "{s}");
+            assert!(!hooked[2].contains("fresh-token") && !hooked[2].contains("tok"));
+        }
+        // A non-agent command relaunches as it was, and an install as a shell.
+        for original in [
+            argv(&["htop"]),
+            install_argv(
+                RemoteShell::Posix,
+                "curl -fsSL https://claude.ai/install.sh | bash",
+            ),
+        ] {
+            let re = relaunch(&original);
+            let s = script(&build(&launch(&r, "", &re.argv)).unwrap(), r.shell);
+            assert!(!s.contains("--settings"), "{s}");
+        }
     }
 
     #[test]
