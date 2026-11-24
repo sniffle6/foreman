@@ -128,6 +128,11 @@ take the local hook lane from there.
 - **Folder trust is not Needs you.** Claude runs no hook until the folder is
   trusted, so a first launch in a new Remote directory shows no badge while
   the trust dialog waits.
+- **`SessionStart` maps to no state.** Only the Remote launch hooks send it,
+  and it leaves the badge as it was. Its one use is to open the Session's
+  chat hold, which keeps typed input out of the trust dialog
+  (`docs/remote-sessions.md`). The local helper refuses
+  `--event SessionStart`, because no local handler sends it.
 - **Subagents never send `Stop`.** In 2.1.331 a subagent's end is
   `SubagentStop`, which Foreman does not hook. Its `PermissionRequest` and
   `PostToolUse` carry `agent_id`/`agent_type` and count, as locally. Main

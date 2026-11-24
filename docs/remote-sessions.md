@@ -110,27 +110,41 @@ is for changing the feature.
   `agent_state` for them.
 - **Anything typed before Claude's folder-trust dialog is answered quits
   Claude.** The dialog's default is "No, exit", and the Enter that ends any
-  injected text picks it. A first launch whose prompt `remote::prompt_index`
-  can name carries the reply note inside the prompt and types nothing. Two
-  things still type at launch: the fallback note (any other agent shape with
-  arguments), and the room's catch-up. A new Member's cursor starts at 0, so
-  its first Ready frame delivers every earlier broadcast. Seen 2026-11-23: a
-  Claude with a carried note, opened into a room that held two posts, exited
-  6 s after launch. Trust the directory first, or have the human answer the
-  dialog.
-- **Codex in an untrusted Remote directory could not post.** Seen
-  2026-11-23, Codex 0.163 with no `sandbox_mode` set: it ran the carried
-  `curl` and got "Failed to connect", while a plain ssh shell got a 401 from
-  the same port. So its tool sandbox blocked the call, not the Tunnel.
-  foreman would have to loosen Codex's sandbox to change that, so it leaves
-  it alone.
+  injected text picks it. Three things keep input out of it. A first launch
+  whose note rides in its prompt types nothing. A Remote Session's first
+  launch joins the room at its end (`ChatRoom::join_at_end`), so it gets no
+  catch-up. A Claude launched with hooks holds every post and typed note
+  (`remote::ChatHold`, `ReadyGate::hold`) until a hook event opens it: Claude
+  runs no hook at the dialog (seen 2026-11-23: 40 s at the dialog, nothing,
+  then `SessionStart` 0.3 s after the answer). There is no timer. A timer
+  would type into the dialog it waited out.
+- **`SessionStart` is too early for a launch with a brief.** Claude's REPL is
+  still mounting when it fires. A post pasted then was lost once in three
+  tries: no `[chat …]` turn in the transcript. In the other two the tty
+  echoed it and the REPL read it later. So a launch whose brief rides in
+  argv waits for that brief's `UserPromptSubmit`, which only a mounted REPL
+  sends. A bare launch and `--continue` have nothing later, so `SessionStart`
+  opens theirs. A bare one kept its held post once; that is not proof it
+  cannot lose one.
+- **A held Claude whose hooks never run holds forever.** Examples are
+  `disableAllHooks` in the Remote's settings, a missing `curl`, a subcommand
+  (`claude mcp …`), or `--version`. Its posts stay in the room, its typed
+  note stays queued, and `snapshot` shows nothing typed. Codex, Grok, a
+  shell, a wrapper and a Windows Remote carry no hooks and get no hold.
+- **Codex in an untrusted Remote directory could not post.** Seen twice on
+  2026-11-23, Codex 0.163 with no `sandbox_mode` set. Its tool shell has
+  `FOREMAN_URL` and `FOREMAN_TOKEN` (`env | grep -c ^FOREMAN_TOKEN=` printed
+  1), but its `curl` got "Failed to connect" while a plain ssh shell got a
+  401 from the same port. So its tool sandbox blocks the call, not the
+  Tunnel. foreman would have to loosen Codex's sandbox to change that, so it
+  leaves it alone.
 - **The prompt rule refuses rather than guesses.** `prompt_index` accepts only
   the bare program and then the brief, with `--model <id>` the one tail it
   allows. The brief must hold whitespace. No subcommand of the three CLIs
   does, so this needs no subcommand list that drifts between CLI versions. A
-  one-word brief therefore gets the typed note. If the note would push a
-  Windows launch over `WINDOWS_LINE_CAP`, `build` drops it and the note is
-  typed instead. The launch is never refused because of the note.
+  one-word brief therefore gets the typed note. On top of that,
+  `remote::note_route` carries the note only for `claude` and `codex` on a
+  Posix Remote. Those are the only tool shells seen to have the variables.
 - **The token is per connection.** `spawn_remote_session` leases a new one on
   every launch and every reconnect, and the old one dies with its `ssh`. A
   reconnect that relaunches an agent types the fresh reply note at launch.
@@ -146,14 +160,17 @@ is for changing the feature.
   can read it with `ps`, and can then post as that Session until it exits.
   This risk was accepted in the spec. Do not add a route that does more than
   post, read or report state.
-- **A carried reply note puts the token in the agent's argv for its whole
-  life.** On the Remote the base64 launch line lives only while the launch
-  shells run: each one `exec`s the next. The hooks' `--settings` read
-  `$FOREMAN_TOKEN` from the environment, which only the same user can read.
-  The note inside the prompt names the token outright, so
-  `/proc/<pid>/cmdline` (mode 444) shows it to every user there until the
-  agent exits (measured 2026-11-23). It grants nothing beyond the accepted
-  risk above, but it lasts the agent's life instead of the launch.
+- **The token must never be in a Remote agent's argv.** `/proc/<pid>/cmdline`
+  is mode 444, so every user on the Remote can read an agent's arguments for
+  its whole life. The base64 launch line holds the token only in its own
+  `export`, and lives only while the launch shells run, since each one
+  `exec`s the next. The hooks' `--settings` and the in-prompt note name
+  `$FOREMAN_TOKEN`, which sits in the environment, readable only by the same
+  user. Measured 2026-11-23: zero copies in a Remote Claude's or Codex's
+  cmdline and in `ps -eo args`, one in each one's environment.
+  `no_remote_launch_carries_the_token_outside_its_export` decodes every
+  built line to keep it that way. The typed note still writes the token out,
+  on screen and in the agent's conversation, never in argv.
 - **Listener slots are shared by every Remote.** There is one listener per
   foreman instance, so `MAX_INFLIGHT` counts callers from all Remotes
   together. A flood from one Remote (any user on it, see above) answers
@@ -170,11 +187,11 @@ is for changing the feature.
   Session's if two share the directory on that Remote.
 - **A typed launch note can land in an ssh password prompt.** Ready latches
   on the first output, and a password or host-key prompt is output. A
-  reconnected agent, or a first launch whose note falls back to typing, then
-  gets the note typed into `ssh`'s prompt instead of into the agent. A
-  carried note cannot land there. Key login avoids it: Settings > Remotes > Test
-  says whether login works without a prompt, and one interactive login
-  accepts the host key.
+  reconnected agent, or a first launch whose note is typed, then gets the
+  note typed into `ssh`'s prompt instead of into the agent. A carried note
+  cannot land there, and neither can anything held for a hooked Claude. Key
+  login avoids it: Settings > Remotes > Test says whether login works
+  without a prompt, and one interactive login accepts the host key.
 - **File-path links and file drops do not exist yet, so nothing gates them
   on a Remote Session.** Whoever adds either must make it inert when
   `Session::remote()` is `Some`. See `docs/terminal-links.md`.
@@ -185,9 +202,15 @@ is for changing the feature.
   and an uncertain input must never be resent by itself. Reconnect is the
   human's Enter on the disconnect bar, and the Dispatch prompt is never sent
   again.
-- **The note is written out, not `$FOREMAN_URL`.** A Windows agent's tool shell
-  may be PowerShell or Git Bash, and they spell variables differently. The
-  variables are exported too, which the procedure below uses.
+- **The typed note writes URL and token out; the in-prompt one names
+  `$FOREMAN_URL` and `$FOREMAN_TOKEN`.** The prompt is argv, which every user
+  on the Remote can read. A typed note is not, and it also serves Grok and
+  Windows Remotes, whose tool shells were never seen with the variables. A
+  Windows tool shell may be PowerShell or Git Bash, and each spells
+  variables differently.
+- **Only a Remote Session skips catch-up.** A local agent has the foreman
+  skills to read the room, and its catch-up has never raced a dialog
+  foreman cannot see through ssh.
 
 ## Procedures
 

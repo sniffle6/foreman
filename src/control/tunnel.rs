@@ -815,35 +815,39 @@ fn response(status: u16, body: &str) -> Vec<u8> {
 
 /// What a Remote Session's agent is told, once per connection (see
 /// [`ReplyNote`]), typed into its pane: the exact command to post back.
+/// URL and token are written out: this note is typed, so it never sits in
+/// argv, and a Windows agent's tool shell may be PowerShell or Git Bash,
+/// which spell variables differently.
 pub fn reply_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
     format!(
         "[foreman] You run on another PC, so the foreman CLI is not here. Post to this chat with:\n{}",
-        reply_commands(shell, remote_port, token)
+        reply_commands(shell, &format!("http://127.0.0.1:{remote_port}"), token)
     )
 }
 
 /// [`reply_note`] as it rides at the end of a first launch's prompt
-/// ([`crate::remote::prompt_index`]): set apart from the brief above it, so
-/// the agent reads it as how to report, not as more of the task.
-pub fn prompt_note(shell: RemoteShell, remote_port: u16, token: &str) -> String {
+/// ([`crate::remote::note_route`]): set apart from the brief above it, so
+/// the agent reads it as how to report, not as more of the task. It names
+/// the launch's exported `$FOREMAN_URL` and `$FOREMAN_TOKEN` instead of the
+/// values: the prompt is the agent's argv, which every user on the Remote
+/// can read for the agent's whole life. Posix spelling only, since only a
+/// Posix tool shell was seen to have them.
+pub fn prompt_note() -> String {
     format!(
         "[foreman] The rest of this prompt is not part of your task: it tells you how to reach this project's chat. \
          You run on another PC, so the foreman CLI is not here. Post to this chat with:\n{}",
-        reply_commands(shell, remote_port, token)
+        reply_commands(RemoteShell::Posix, "$FOREMAN_URL", "$FOREMAN_TOKEN")
     )
 }
 
-/// The commands both notes teach. URL and token are written out rather than
-/// named as `$FOREMAN_URL`, because a Windows agent's tool shell may be
-/// PowerShell or Git Bash and each spells variables differently. Windows
-/// says `curl.exe`: in Windows PowerShell 5.1 `curl` is an alias for
-/// `Invoke-WebRequest`.
-fn reply_commands(shell: RemoteShell, remote_port: u16, token: &str) -> String {
+/// The commands both notes teach, with `url` and `token` spelled as the
+/// note needs. Windows says `curl.exe`: in Windows PowerShell 5.1 `curl` is
+/// an alias for `Invoke-WebRequest`.
+fn reply_commands(shell: RemoteShell, url: &str, token: &str) -> String {
     let curl = match shell {
         RemoteShell::Posix => "curl",
         RemoteShell::Pwsh | RemoteShell::WindowsPowerShell => "curl.exe",
     };
-    let url = format!("http://127.0.0.1:{remote_port}");
     format!(
         "{curl} -sS -H \"Authorization: Bearer {token}\" --data-binary 'your message' \"{url}/chat?to=tN\"\n\
          Query: to=tN names the member (repeat or comma-separate; leave it out to post to everyone), re=N answers post #N, now=1 is urgent. \
@@ -854,10 +858,9 @@ fn reply_commands(shell: RemoteShell, remote_port: u16, token: &str) -> String {
 /// How a connection's reply note reaches its agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteGoes {
-    /// Inside the launch prompt (asked for by a first launch with a brief;
-    /// [`crate::remote::Built::note_carried`] says whether it fitted). Nothing
-    /// is typed: a keystroke at launch can answer a dialog the agent shows
-    /// first, such as Claude's folder trust.
+    /// Inside the launch prompt ([`crate::remote::note_route`]), naming the
+    /// exported variables. Nothing is typed: a keystroke at launch can
+    /// answer a dialog the agent shows first, such as Claude's folder trust.
     InPrompt,
     /// Typed into the pane once it is Ready.
     AtLaunch,
@@ -1155,21 +1158,26 @@ mod tests {
         for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
             assert!(reply_note(shell, 21000, "tok").contains("\ncurl.exe -sS"));
         }
-        // The prompt's copy teaches the same commands, set apart as not task.
-        for shell in [
-            RemoteShell::Posix,
-            RemoteShell::Pwsh,
-            RemoteShell::WindowsPowerShell,
-        ] {
-            let commands = reply_commands(shell, 21000, "tok");
-            let typed = reply_note(shell, 21000, "tok");
-            let carried = prompt_note(shell, 21000, "tok");
-            assert!(typed.ends_with(&format!(":\n{commands}")), "{typed}");
-            assert!(carried.ends_with(&format!(":\n{commands}")), "{carried}");
-            assert!(
-                carried.starts_with("[foreman] The rest of this prompt is not part of your task")
-            );
-        }
+        // The prompt's copy teaches the same commands, set apart as not
+        // task, with the variables where the typed note has the values.
+        let url = "http://127.0.0.1:21000";
+        let typed = reply_note(RemoteShell::Posix, 21000, "tok");
+        let carried = prompt_note();
+        assert_eq!(
+            carried
+                .rsplit_once(":\n")
+                .unwrap()
+                .1
+                .replace("$FOREMAN_URL", url)
+                .replace("$FOREMAN_TOKEN", "tok"),
+            typed.rsplit_once(":\n").unwrap().1,
+        );
+        assert!(carried.starts_with("[foreman] The rest of this prompt is not part of your task"));
+        assert!(
+            carried.contains("-H \"Authorization: Bearer $FOREMAN_TOKEN\""),
+            "double quotes, so the tool shell expands it: {carried}"
+        );
+        assert!(!carried.contains("127.0.0.1"), "{carried}");
     }
 
     #[test]

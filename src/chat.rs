@@ -719,6 +719,22 @@ impl ChatRoom {
         self.log.sys(ChatKind::Joined, id, name);
     }
 
+    /// [`Self::join_receiving`] for a Member handed no catch-up: its cursor
+    /// starts at the room's end, so only posts made after it joined reach it.
+    /// A Remote Session's first launch joins this way: its agent may sit at a
+    /// dialog foreman cannot see through ssh, and the backlog typed there
+    /// answers it. A present id is untouched, cursor and all.
+    pub fn join_at_end(&mut self, id: &str, name: &str, reception: Reception) {
+        if self.member(id).is_some() {
+            return;
+        }
+        self.join_receiving(id, name, reception);
+        let end = self.last_seq();
+        if let Some(m) = self.member_mut(id) {
+            m.cursor = end;
+        }
+    }
+
     /// A reconnected Remote Session comes back as the same Member: present
     /// again, with a Joined line, its cursor where it stopped so posts sent
     /// while it was down still reach it. Unknown ids stay out (a restored
@@ -1328,6 +1344,58 @@ mod tests {
         // exactly one Joined line; the second call is a no-op (no rename either)
         assert_eq!(room.last_seq(), 1);
         assert_eq!(room.member("t1").unwrap().name, "alpha");
+    }
+
+    #[test]
+    fn a_member_joined_at_the_end_gets_no_catch_up_and_a_rejoin_keeps_its_cursor() {
+        let mut room = ChatRoom::new();
+        room.join("t1", "orchestrator");
+        room.post("t1", "earlier one", &[], None).expect("ok");
+        room.post("t1", "earlier two", &[], None).expect("ok");
+        // t2 joins with catch-up (a local Member); t3 at the end (a Remote's
+        // first launch).
+        room.join("t2", "local");
+        room.join_at_end("t3", "remote", Reception::Everything);
+        let all = [
+            live("t1", true, false),
+            live("t2", true, false),
+            live("t3", true, false),
+        ];
+        let d = room.tick("p1", &all);
+        let lines = |d: &[Delivery], id: &str| {
+            d.iter()
+                .find(|x| x.id == id)
+                .map(|x| x.lines.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(lines(&d, "t2").len(), 2, "the local Member catches up");
+        assert!(
+            lines(&d, "t3").is_empty(),
+            "no backlog: {:?}",
+            lines(&d, "t3")
+        );
+        // A present Member is untouched by a second join_at_end.
+        room.join_at_end("t2", "local", Reception::Everything);
+        assert_eq!(room.member("t2").unwrap().cursor, room.last_seq());
+        // What comes after the join reaches it.
+        room.post("t1", "later", &[], None).expect("ok");
+        let d = room.tick("p1", &all);
+        assert_eq!(
+            lines(&d, "t3"),
+            [format!("[chat p1 #{}] t1: later", room.last_seq())]
+        );
+        // Disconnected (exited), posted to, reconnected: the cursor stayed,
+        // so the post made while it was down still arrives.
+        room.tick("p1", &[live("t1", true, false), live("t2", true, false)]);
+        room.post("t1", "while you were down", &[], None)
+            .expect("ok");
+        let down = room.last_seq();
+        room.rejoin("t3", "remote");
+        let d = room.tick("p1", &all);
+        assert_eq!(
+            lines(&d, "t3"),
+            [format!("[chat p1 #{down}] t1: while you were down")]
+        );
     }
 
     #[test]

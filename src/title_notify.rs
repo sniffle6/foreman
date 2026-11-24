@@ -65,7 +65,9 @@ fn parse_args(args: &[String]) -> Option<(SourceAgent, HookEvent)> {
     // A missing `--event` is a handler written by an older Foreman; it keeps
     // naming until the installer rewrites it.
     let event = match value_of("--event") {
-        Some(name) => HookEvent::parse(name)?,
+        // `SessionStart` only comes over a Remote's Tunnel (its chat hold);
+        // no local handler sends it, so one that does is misconfigured.
+        Some(name) => HookEvent::parse(name).filter(|e| *e != HookEvent::SessionStart)?,
         None => HookEvent::UserPromptSubmit,
     };
     Some((source, event))

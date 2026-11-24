@@ -3140,7 +3140,7 @@ impl WindowManager {
         let env = self.term_env(self.next);
         let cwd = cwd.or(self.cwd.as_deref());
         let s = Session::spawn_argv(argv, cwd, &env, ctx.clone())?;
-        Ok(self.place_dispatched(s, argv, title, reception))
+        Ok(self.place_dispatched(s, argv, title, reception, CatchUp::Yes))
     }
 
     /// `open --on`: [`Self::add_terminal_cmd`] for a Remote Session. `argv`
@@ -3155,18 +3155,14 @@ impl WindowManager {
         title: Option<&str>,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
-        // An agent with arguments may be working a brief and never get a
-        // chat post, so it needs the note now: in its prompt when that is
-        // certain, typed otherwise. A bare agent waits for a post anyway, and
-        // a shell would run the note as commands.
-        use crate::control::tunnel::NoteGoes;
-        let how = if argv.len() > 1 && crate::remote::agent_of(argv).is_some() {
-            NoteGoes::InPrompt
-        } else {
-            NoteGoes::WithFirstPost
-        };
-        let s = self.spawn_remote_session(argv, remote, dir, self.next, how, ctx)?;
-        Ok(self.place_dispatched(s, argv, title, crate::chat::Reception::Everything))
+        let s = self.spawn_remote_session(argv, remote, dir, self.next, false, ctx)?;
+        Ok(self.place_dispatched(
+            s,
+            argv,
+            title,
+            crate::chat::Reception::Everything,
+            CatchUp::No,
+        ))
     }
 
     /// What a split or new terminal from the focused Session opens on: its
@@ -3305,16 +3301,7 @@ impl WindowManager {
             What::Shell => Vec::new(),
         };
         let id = self.next;
-        // A bare agent or shell carries no brief: the reply note waits for
-        // the first chat post, as for `open --on` without arguments.
-        let s = self.spawn_remote_session(
-            &argv,
-            remote,
-            dir,
-            id,
-            crate::control::tunnel::NoteGoes::WithFirstPost,
-            ctx,
-        )?;
+        let s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
         self.place_remote_win(s, format!("{}  ·  #{}", remote.name, id), place, ctx);
         Ok(id)
     }
@@ -3331,14 +3318,7 @@ impl WindowManager {
     ) -> Result<WinId, String> {
         let argv = crate::remote_install::session_argv(remote, provider)?;
         let id = self.next;
-        let s = self.spawn_remote_session(
-            &argv,
-            remote,
-            "",
-            id,
-            crate::control::tunnel::NoteGoes::WithFirstPost,
-            ctx,
-        )?;
+        let s = self.spawn_remote_session(&argv, remote, "", id, false, ctx)?;
         let title = format!("{} · install {provider}  ·  #{id}", remote.name);
         self.place_remote_win(s, title, crate::remote_dir_prompt::Place::Default, ctx);
         Ok(id)
@@ -3582,29 +3562,23 @@ impl WindowManager {
 
     /// One connection to `remote` for Member `t{id}`: a fresh Tunnel lease
     /// (so a reconnect renews the token), the `ssh` launch, and the reply
-    /// note armed for this connection to go `how`. Launch and reconnect both
-    /// come here. `InPrompt` that does not fit the launch
-    /// ([`crate::remote::Built::note_carried`]) is typed `AtLaunch` instead.
+    /// note armed for this connection the way the build placed it
+    /// ([`crate::remote::Built::note`]), or typed at launch for a
+    /// `resumed_agent`. Launch and reconnect both come here.
+    /// A launch carrying Claude's hooks holds all chat input until the hook
+    /// event its [`crate::remote::ChatHold`] names
+    /// ([`Session::hold_chat_until_hook`]).
     fn spawn_remote_session(
         &self,
         argv: &[String],
         remote: &crate::remote::Remote,
         dir: &str,
         id: WinId,
-        how: crate::control::tunnel::NoteGoes,
+        resumed_agent: bool,
         ctx: &egui::Context,
     ) -> Result<Session, String> {
-        use crate::control::tunnel::NoteGoes;
         let terminal_id = term_tag(id);
         let lease = self.remote_lease(argv, remote, &terminal_id, ctx)?;
-        let carry = match (&lease, how) {
-            (Some(l), NoteGoes::InPrompt) => Some(crate::control::tunnel::prompt_note(
-                remote.shell,
-                l.remote_port,
-                l.token.value(),
-            )),
-            _ => None,
-        };
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
             dir,
@@ -3616,12 +3590,13 @@ impl WindowManager {
                 token: l.token.value(),
             }),
             argv,
-            prompt_note: carry.as_deref(),
         })?;
-        let how = match how {
-            NoteGoes::InPrompt if !built.note_carried => NoteGoes::AtLaunch,
-            how => how,
+        let how = if resumed_agent {
+            crate::control::tunnel::NoteGoes::AtLaunch
+        } else {
+            built.note
         };
+        let hold = built.hold;
         // The local env reaches only ssh.exe; ssh sends TERM with the pty
         // request, and the builder exports the rest on the Remote.
         let env = self.term_env(id);
@@ -3631,6 +3606,10 @@ impl WindowManager {
         // the row stops saying "needs login".
         if let Some(p) = crate::remote::agent_of(argv) {
             crate::remote_install::clear_ended(&remote.target, p);
+        }
+        // Before the note is armed: a typed note waits too.
+        if let Some(until) = hold {
+            s.hold_chat_until_hook(until);
         }
         if let Some(l) = lease {
             let note =
@@ -3733,14 +3712,9 @@ impl WindowManager {
         // An agent gets the note typed at launch: a resumed one still has the
         // dead token's curl command in its conversation and would use it,
         // 401, until a post came. There is no prompt to carry it (resume
-        // drops it), so it is typed. A shell would run it as commands.
-        use crate::control::tunnel::NoteGoes;
-        let how = if re.agent.is_some() {
-            NoteGoes::AtLaunch
-        } else {
-            NoteGoes::WithFirstPost
-        };
-        let mut fresh = self.spawn_remote_session(&argv, &remote, &dir, id, how, ctx)?;
+        // drops it). A shell would run it as commands, so it waits for a post.
+        let mut fresh =
+            self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), ctx)?;
         fresh.set_term_id(id);
         fresh.inject_note(&reconnect_banner(&remote.name, &argv, ran));
         let Some((win, tab)) = self.terminal_location(id) else {
@@ -3773,6 +3747,7 @@ impl WindowManager {
         argv: &[String],
         title: Option<&str>,
         reception: crate::chat::Reception,
+        catch_up: CatchUp,
     ) -> WinId {
         s.inject_note(&dispatch_banner(argv));
         let (id, rect) = self.next_slot(egui::vec2(580.0, 380.0));
@@ -3783,9 +3758,11 @@ impl WindowManager {
         // Dispatched agents auto-join the project chat room (spec §2) — the
         // room appends the Joined line; the transcript records it. Joined
         // from the title, not the window: a stacked window is gone by then.
-        self.chat
-            .borrow_mut()
-            .join_receiving(&term_tag(id), display_name(&title), reception);
+        let (tag, name) = (term_tag(id), display_name(&title));
+        match catch_up {
+            CatchUp::Yes => self.chat.borrow_mut().join_receiving(&tag, name, reception),
+            CatchUp::No => self.chat.borrow_mut().join_at_end(&tag, name, reception),
+        }
         // push_win focuses the new window; a dispatched agent must never yank
         // the keyboard out from under the user mid-keystroke (fire-and-watch:
         // the new terminal is to LOOK at, not type into). Keep focus where it
@@ -8174,6 +8151,9 @@ impl WindowManager {
                     if term_tag(session.term_id()) != event.terminal_id {
                         continue;
                     }
+                    // Its hooks ran, so its agent is past any startup dialog:
+                    // this may open its chat hold, whatever the icon says.
+                    session.hook_arrived(event.hook_event);
                     if !source_matches_icon(event.source_agent, session.icon_kind()) {
                         return false;
                     }
@@ -10961,6 +10941,17 @@ fn dispatch_stack_target(cands: &[StackCandidate]) -> Option<WinId> {
     best.map(|c| c.id)
 }
 
+/// Whether a dispatched Session's new Member is handed the room's earlier
+/// posts. A Remote Session's first launch is not: its agent may be at a
+/// dialog foreman cannot see through ssh (Claude's folder trust quits on the
+/// Enter that ends each post). A local agent has the foreman skills to read
+/// the room, and its catch-up has never raced such a dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatchUp {
+    Yes,
+    No,
+}
+
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
@@ -12996,13 +12987,192 @@ mod tests {
         for words in [
             &["claude", "do the card"][..],
             &["codex", "do the card"],
-            &["grok", "do the card"],
             &["claude", "do the card", "--model", "x"],
         ] {
             let (queued, waits) = first_launch(words);
             assert!(queued.is_empty(), "{words:?}: {queued:?}");
             assert!(!waits, "{words:?}: the prompt delivered it");
         }
+    }
+
+    /// A Project with the desk Remote, a Tunnel, and two posts already in
+    /// its room.
+    fn room_with_backlog() -> (WindowManager, u64, egui::Context, crate::remote::Remote) {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
+        let remote = crate::config::live(&ctx).remotes[0].clone();
+        let child = wm.project_child_mut(pid).unwrap();
+        child.chat.borrow_mut().post_human("earlier one").unwrap();
+        child.chat.borrow_mut().post_human("earlier two").unwrap();
+        (wm, pid, ctx, remote)
+    }
+
+    fn ready_member(id: WinId) -> crate::chat::LiveMember {
+        crate::chat::LiveMember {
+            id: term_tag(id),
+            name: "m".into(),
+            ready: true,
+            agent_state: None,
+            exited: false,
+        }
+    }
+
+    #[test]
+    fn a_remote_first_launch_joins_at_the_room_end_and_a_local_one_catches_up() {
+        let (mut wm, pid, ctx, remote) = room_with_backlog();
+        let child = wm.project_child_mut(pid).unwrap();
+        let argv: Vec<String> = ["codex", "do the card"].map(String::from).to_vec();
+        let remote_t = child
+            .add_remote_terminal(&argv, &remote, "/tmp", None, &ctx)
+            .expect("ssh spawns");
+        let local: Vec<String> = ["cmd.exe", "/c", "exit 0"].map(String::from).to_vec();
+        let local_t = child
+            .add_terminal_cmd(&local, None, None, &ctx)
+            .expect("spawns");
+        let live = [ready_member(remote_t), ready_member(local_t)];
+        let d = child.chat.borrow_mut().tick("p1", &live);
+        let to = |id| {
+            d.iter()
+                .find(|x| x.id == term_tag(id))
+                .map(|x| x.lines.len())
+        };
+        assert_eq!(
+            to(remote_t),
+            None,
+            "no catch-up for the Remote first launch"
+        );
+        assert_eq!(to(local_t), Some(2), "a local Member catches up as before");
+        child.chat.borrow_mut().post_human("after").unwrap();
+        let d = child.chat.borrow_mut().tick("p1", &live);
+        let to = |id| {
+            d.iter()
+                .find(|x| x.id == term_tag(id))
+                .map(|x| x.lines.len())
+        };
+        assert_eq!(to(remote_t), Some(1), "later posts reach it");
+        for id in [remote_t, local_t] {
+            child.terminal_session_mut(id).unwrap().kill_for_test();
+        }
+    }
+
+    fn hook_event(
+        project: &str,
+        id: WinId,
+        hook_event: crate::agent_state::HookEvent,
+    ) -> crate::title_notify::TitlePromptEvent {
+        crate::title_notify::TitlePromptEvent {
+            source_agent: crate::terminal_titles::SourceAgent::Claude,
+            hook_event,
+            vendor_session_id: String::new(),
+            transcript_path: None,
+            project_id: Some(project.into()),
+            terminal_id: term_tag(id),
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn a_hooked_remote_claude_holds_chat_until_the_hook_event_that_opens_it() {
+        use crate::agent_state::HookEvent::{SessionStart, UserPromptSubmit};
+        let (mut wm, pid, ctx, remote) = room_with_backlog();
+        let child = wm.project_child_mut(pid).unwrap();
+        let tag = child.tag.clone().unwrap();
+        let mut ids = Vec::new();
+        for (words, held) in [
+            (&["claude", "do the card"][..], true),
+            (&["claude", "hi"], true),
+            (&["claude"], true),
+            (&["codex", "do the card"], false),
+            (&["grok", "do the card"], false),
+            (&["htop", "-d", "5"], false),
+        ] {
+            let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            let id = child
+                .add_remote_terminal(&argv, &remote, "/tmp", None, &ctx)
+                .expect("ssh spawns");
+            let s = child.terminal_session(id).unwrap();
+            assert_eq!(s.chat_held(), held, "{words:?}");
+            ids.push(id);
+        }
+        let held = |wm: &mut WindowManager, id| {
+            let child = wm.project_child_mut(pid).unwrap();
+            child.terminal_session(id).unwrap().chat_held()
+        };
+        let (briefed, typed, bare) = (ids[0], ids[1], ids[2]);
+        // This Session's id in another Project opens nothing.
+        wm.apply_hook_event(&hook_event("p99", briefed, UserPromptSubmit));
+        assert!(held(&mut wm, briefed));
+        // A briefed Claude is past the dialog at SessionStart, but its REPL
+        // may not read input yet: only its prompt's submit opens it.
+        wm.apply_hook_event(&hook_event(&tag, briefed, SessionStart));
+        assert!(
+            held(&mut wm, briefed),
+            "SessionStart does not open a brief's hold"
+        );
+        wm.apply_hook_event(&hook_event(&tag, briefed, UserPromptSubmit));
+        assert!(!held(&mut wm, briefed));
+        // A bare Claude has nothing later: SessionStart opens it, and only it.
+        wm.apply_hook_event(&hook_event(&tag, bare, SessionStart));
+        assert!(!held(&mut wm, bare));
+        assert!(held(&mut wm, typed));
+        // A typed note queued behind the hold keeps its place.
+        let child = wm.project_child_mut(pid).unwrap();
+        let queued = child
+            .terminal_session(typed)
+            .unwrap()
+            .pending_injects()
+            .to_vec();
+        assert!(queued[0].starts_with("[foreman] You run on"), "{queued:?}");
+        for id in ids {
+            child.terminal_session_mut(id).unwrap().kill_for_test();
+        }
+    }
+
+    #[test]
+    fn a_reconnected_claude_is_held_again_until_its_own_session_start() {
+        use crate::agent_state::HookEvent::{SessionStart, UserPromptSubmit};
+        let (mut wm, pid, ctx, remote) = room_with_backlog();
+        let child = wm.project_child_mut(pid).unwrap();
+        let tag = child.tag.clone().unwrap();
+        let argv: Vec<String> = ["claude", "do the card"].map(String::from).to_vec();
+        let id = child
+            .add_remote_terminal(&argv, &remote, "/tmp", None, &ctx)
+            .expect("ssh spawns");
+        wm.apply_hook_event(&hook_event(&tag, id, UserPromptSubmit));
+        let s = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session_mut(id)
+            .unwrap();
+        assert!(!s.chat_held(), "the first connection opened on its prompt");
+        s.kill_for_test();
+        s.request_reconnect_for_test();
+        wm.refresh_reconnects(&ctx);
+        let s = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session(id)
+            .unwrap();
+        assert!(!s.disconnected(), "reconnected");
+        assert!(
+            s.chat_held(),
+            "the fresh connection waits for its own event"
+        );
+        let queued = s.pending_injects().to_vec();
+        assert_eq!(queued.len(), 1, "the fresh typed note, held: {queued:?}");
+        // `claude --continue` has no prompt: its SessionStart opens it.
+        wm.apply_hook_event(&hook_event(&tag, id, SessionStart));
+        let s = wm
+            .project_child_mut(pid)
+            .unwrap()
+            .terminal_session_mut(id)
+            .unwrap();
+        assert!(!s.chat_held());
+        s.kill_for_test();
     }
 
     #[test]
@@ -13013,6 +13183,8 @@ mod tests {
             &["codex", "exec", "do the card"],
             &["npx", "@anthropic-ai/claude-code", "do the card"],
             &["claude", "hi"],
+            // Never run on a Remote: typed, so the token stays out of argv.
+            &["grok", "do the card"],
         ] {
             let (queued, waits) = first_launch(words);
             assert_eq!(queued.len(), 1, "{words:?}: {queued:?}");

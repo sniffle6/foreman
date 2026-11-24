@@ -303,22 +303,31 @@ a short note with the exact reply command for that Remote's shell. A
 Dispatch brief built for `--on` carries the same note. It is sent once per
 connection, not on every message.
 
-A first launch whose prompt argument foreman can name for certain
-(`remote::prompt_index`: the bare `claude`/`codex`/`grok`, then the brief)
-carries the note at the end of that argument and types nothing. Keystrokes
-at launch can answer a dialog the agent shows first. Claude's folder-trust
-dialog defaults to "No, exit". Any other agent shape with arguments gets the
-note typed at launch, as does a reconnect: its resume argv has no prompt,
-and its token is new.
+A first launch of `claude` or `codex` on a Posix Remote whose prompt
+argument foreman can name for certain (`remote::note_route`, over
+`remote::prompt_index`: the bare program, then the brief) carries the note
+at the end of that argument and types nothing. Keystrokes at launch can
+answer a dialog the agent shows first, and Claude's folder-trust dialog
+defaults to "No, exit". That note names `$FOREMAN_URL` and `$FOREMAN_TOKEN`,
+which the launch exports. Both agents' tool shells were seen to have them.
+Grok, every Windows Remote, any other agent shape with arguments, and a
+reconnect (its resume argv has no prompt, and its token is new) get the
+note typed at launch, with the values written out.
+
+A Remote Session's first launch joins the room at its end, so it gets no
+catch-up of earlier posts. A reconnect keeps its Member and cursor. A
+Claude launched with hooks also holds every post and typed note until a
+hook event says it is past the dialog: its brief's `UserPromptSubmit`, or
+`SessionStart` for a bare launch or `--continue`. Nothing opens the hold
+on a timer.
 
 Accepted risk: the token sits on a command line (base64, not secret) on
 both PCs, so another process running as the same user can read it, and on
-Linux any user can read a process's arguments. It buys posting chat as that
-one Session, and feeding its badge, until the Session exits. The local pipe
-already trusts same-user processes with more than that. A note carried in
-the prompt keeps the token in the agent's own argv on the Remote for the
-agent's life, where the launch line lasts only while it runs. Same grant,
-longer window.
+Linux any user can read a process's arguments while the launch shells run.
+It buys posting chat as that one Session, and feeding its badge, until the
+Session exits. The local pipe already trusts same-user processes with more
+than that. The agent's own argv never holds the token: an argv lasts the
+agent's life, where the launch line lasts only while it runs.
 
 ## Agent state
 
@@ -333,7 +342,8 @@ supplies the icon.
 Per provider (see Results):
 
 - **Claude** takes hook settings as JSON on `--settings`. Confirmed to fire
-  through the Tunnel.
+  through the Tunnel. The launch adds `SessionStart`, which maps to no
+  state and only opens the chat hold.
 - **Codex** reads hooks from a file and only runs ones the user has trusted.
   The one launch-time route is its trust-bypass flag. Foreman does not pass
   that flag on its own; Codex gets no badge on a bare Remote in v1.
@@ -631,7 +641,58 @@ seen, removed after.
   exist). Their prompt carrying and the line-cap fallback are unit-tested
   only.
 
-## Order of work
+## Results, 2026-11-23, no catch-up, the chat hold, no token in argv
+
+A release build ran as its own instance (own `APPDATA`, agent environment
+stripped), driven through its control pipe against the same Debian Remote:
+Claude Code 2.1.331, codex-cli 0.163.0. Every agent ran in a new `/tmp`
+directory, removed after along with its trust entry. Posts came from the
+instance's local probe pane.
+
+- **Before building: no hook fires at the trust dialog.** This used a
+  hand-made `--settings` that logged every event to a file. With a prompt
+  and bare, the log stayed empty for 40 s at the dialog. `SessionStart`
+  came 0.3 s after the answer, then the prompt's `UserPromptSubmit` 0.4 s
+  later. `claude --continue` in a trusted directory sent `SessionStart`
+  0.7 s after launch with no prompt.
+- **Found, and fixed before (a)–(c): `SessionStart` is too early for a
+  brief.** With the hold opening on `SessionStart`, a post held through the
+  dialog was pasted while the REPL mounted and lost: no `[chat …]` turn in
+  the transcript, and Claude only answered it from `GET /chat?history`. Two
+  more runs (one briefed, one bare) kept theirs, after the tty had echoed
+  it. A launch with a brief now waits for that brief's `UserPromptSubmit`.
+- **(a) No catch-up, nothing typed: passed.** Broadcasts #4 and #5 were in
+  the room. `claude "<brief>"` opened at 23:19:55.7. At 23:20:25.9 (30 s) it
+  sat at the dialog with "❯ No, exit" selected, `state: running`,
+  `ready: true`, nothing typed.
+- **(b) A post during the dialog is held: passed.** #7 was posted at
+  23:20:32.3. At 23:21:03.4 Claude was still at the dialog, alive, nothing
+  typed.
+- **(c) Held, then delivered in order: passed.** `send --keys Down`, then
+  `Enter` at 23:21:09.6. The transcript shows the brief submitted at
+  :10.7, its `curl` with `$FOREMAN_TOKEN` and `$FOREMAN_URL` at :13.2
+  (room `#8 t4: a3q-done`), then `[chat p1 #7] t2: …` typed at :15.6 and
+  answered `#9 t4→t2 (re #7): a3q-heard`. #4 and #5 never reached it. A
+  bare `claude` held a post through 30 s of dialog. After the answer, the
+  post arrived with the reply note, and it replied `#12 t5→t2 (re #11)`.
+- **(d) No token in argv: passed.** The token came from decoding the
+  instance's own `ssh.exe` launch line, where it is held once, in its
+  `export`. On the Remote the agent's `/proc/<pid>/cmdline` (mode 444) held
+  0 copies, and `ps -eo args` held 0. Its environment held 1. The prompt's
+  note read `-H "Authorization: Bearer $FOREMAN_TOKEN" … "$FOREMAN_URL/chat?to=tN"`.
+- **(e) Codex: the note rides in its prompt, as variables.** Before
+  choosing, a Codex in a Remote shell printed both variables from its tool
+  shell. Opened as `codex "<brief>"`, nothing was typed: no note and no
+  catch-up. Its `env | grep -c ^FOREMAN_TOKEN=` printed 1, and its
+  cmdline and every process in its directory held 0 copies of the token.
+  Its `curl` still failed ("Failed to connect"): its own sandbox, as
+  before. Codex's post is not shown.
+- **Not run: reconnect live** (`send` cannot press Enter on a disconnect
+  bar; unit tests pin the fresh hold and its `SessionStart`), **Grok** (not
+  installed; typed note, unverified) and **Windows Remotes** (none exist;
+  typed note, unverified).
+
+## Order of work## Order of work
 
 One run, in this order, each step usable when it lands:
 

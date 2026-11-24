@@ -126,13 +126,16 @@ process is there, and it is an ordinary member of THIS project's chat.
   refused: pass `--cwd` or ask the human. Never guess a directory.
 - Remotes are added by the human in Settings > Remotes. Do not edit
   settings.json for them.
-- **The agent on R has no Foreman CLI and no skills.** Opened as
-  `codex "<brief>"` (or `claude` / `grok`, `--model <id>` allowed after the
-  brief), it gets a reply note at the end of its prompt with the exact
-  `curl` command that posts to this room. Any other shape with arguments
-  gets the note typed at launch; a bare agent gets it with its first chat
-  post. Ask it to report by chat and leave the Foreman commands out of its
-  brief.
+- **The agent on R has no Foreman CLI and no skills.** Opened on a POSIX
+  Remote as `codex "<brief>"` or `claude "<brief>"` (`--model <id>` allowed
+  after the brief), it gets a reply note at the end of its prompt: the
+  `curl` command that posts to this room, naming `$FOREMAN_URL` and
+  `$FOREMAN_TOKEN`, which its tool shell has. Grok, a Windows Remote and any
+  other shape with arguments get the note typed at launch instead, with the
+  token written out on screen. A bare agent gets it with its first chat
+  post. It joins the room at its end: posts made before it opened never
+  reach it. Ask it to report by chat and leave the Foreman commands out of
+  its brief.
 - Codex on R in a directory it has not trusted could not post: its tool
   sandbox refused the `curl` to the room ("Failed to connect"), though the
   Tunnel answered a plain shell there. Use a directory Codex already trusts.
@@ -144,9 +147,10 @@ process is there, and it is an ordinary member of THIS project's chat.
   Grok and Windows Remotes have none, so posts to them are not held for
   Idle and `status` never says idle: snapshot to see where they are. A
   first launch in a directory Claude has not trusted shows no state while
-  the trust dialog waits, and anything typed before the human answers it
-  (earlier room posts arriving as catch-up, a typed note) picks "No, exit".
-  Use a directory it already trusts, or ask the human to answer the dialog.
+  the trust dialog waits. Nothing is typed into a Remote Claude until its
+  hooks report it past the dialog (its brief submitted, or a bare one
+  started), so posts to it wait and arrive in order once the human answers
+  the dialog. Ask the human to answer it, or use a directory it trusts.
 - In `status --json` its line carries `remote` (the Remote's name). Its ssh
   dropping shows as `state: exited` with `disconnected: true`: the pane
   waits for the human's Enter to reconnect, and Foreman never reconnects by

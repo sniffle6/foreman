@@ -780,6 +780,8 @@ pub struct Session {
     /// The reply command for this connection's agent, sent once: at launch
     /// or with its first chat delivery (`inject_chat`).
     reply_note: crate::control::tunnel::ReplyNote,
+    /// What opens this connection's chat hold, while one is on.
+    chat_hold: Option<crate::remote::ChatHold>,
     /// Hook-driven agent state for the Sessions panel badge. Pure; fed by
     /// `WindowManager::apply_hook_event`, never by the PTY.
     agent_state: crate::agent_state::AgentStateSlot,
@@ -1450,6 +1452,7 @@ impl Session {
             reconnect_requested: false,
             tunnel_token: None,
             reply_note: Default::default(),
+            chat_hold: None,
             agent_state: Default::default(),
             root_pid,
             term_id: 0,
@@ -1512,6 +1515,29 @@ impl Session {
     /// latched during [`Session::pump`].
     pub fn ready(&self) -> bool {
         self.ready_gate.ready()
+    }
+
+    /// Hold every chat input and typed note for this connection until a
+    /// hook event `until` names ([`Self::hook_arrived`]). For a Remote
+    /// Claude launched with hooks: it reports nothing while its folder-trust
+    /// dialog waits, and any Enter typed there quits it.
+    pub fn hold_chat_until_hook(&mut self, until: crate::remote::ChatHold) {
+        self.chat_hold = Some(until);
+        self.ready_gate.hold();
+    }
+
+    /// A hook event named this Session. If it opens the hold, held input
+    /// goes out in order.
+    pub fn hook_arrived(&mut self, event: crate::agent_state::HookEvent) {
+        if self.chat_hold.is_some_and(|h| h.opened_by(event)) {
+            self.chat_hold = None;
+            self.ready_gate.release();
+        }
+    }
+
+    /// Is chat waiting for this connection's first hook event?
+    pub fn chat_held(&self) -> bool {
+        self.ready_gate.held()
     }
 
     /// The chat outbox retains held posts until the previous paste is submitted.

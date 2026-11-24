@@ -16,6 +16,10 @@ pub enum HookEvent {
     Stop,
     StopFailure,
     Interrupt,
+    /// Only a Remote Claude's launch hooks send it: its first event once it
+    /// is past the folder-trust dialog, which opens that Session's chat
+    /// hold. It changes no state.
+    SessionStart,
 }
 
 impl HookEvent {
@@ -27,6 +31,7 @@ impl HookEvent {
             "Stop" => Self::Stop,
             "StopFailure" => Self::StopFailure,
             "Interrupt" => Self::Interrupt,
+            "SessionStart" => Self::SessionStart,
             _ => return None,
         })
     }
@@ -39,6 +44,7 @@ impl HookEvent {
             Self::Stop => "Stop",
             Self::StopFailure => "StopFailure",
             Self::Interrupt => "Interrupt",
+            Self::SessionStart => "SessionStart",
         }
     }
 }
@@ -78,6 +84,9 @@ impl AgentStateSlot {
     /// its provider against the pane's icon; the mapping is idempotent, so a
     /// duplicated event (Grok replays Claude's hooks) is harmless.
     pub fn apply(&mut self, source: SourceAgent, event: HookEvent) {
+        if event == HookEvent::SessionStart {
+            return;
+        }
         self.source = Some(source);
         match event {
             HookEvent::UserPromptSubmit => {
@@ -97,6 +106,7 @@ impl AgentStateSlot {
                 self.finished = true;
             }
             HookEvent::Interrupt => self.state = Some(AgentState::Idle),
+            HookEvent::SessionStart => {}
         }
     }
 
@@ -163,12 +173,31 @@ mod tests {
             Stop,
             StopFailure,
             Interrupt,
+            SessionStart,
         ] {
             assert_eq!(HookEvent::parse(event.name()), Some(event));
         }
-        assert_eq!(HookEvent::parse("SessionStart"), None);
         assert_eq!(HookEvent::parse("PreToolUse"), None);
         assert_eq!(HookEvent::parse(""), None);
+    }
+
+    #[test]
+    fn session_start_changes_no_state() {
+        let mut slot = AgentStateSlot::default();
+        run(&mut slot, Claude, &[SessionStart]);
+        assert_eq!(
+            badge(&slot, IconKind::Claude),
+            None,
+            "no badge from it alone"
+        );
+        for (before, want) in [
+            (UserPromptSubmit, WORKING),
+            (PermissionRequest, NEEDS),
+            (Stop, DONE),
+        ] {
+            run(&mut slot, Claude, &[before, SessionStart]);
+            assert_eq!(badge(&slot, IconKind::Claude), want, "{before:?}");
+        }
     }
 
     #[test]

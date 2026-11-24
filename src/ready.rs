@@ -106,6 +106,12 @@ pub struct ReadyGate {
     ink: InkScan,
     /// Latched true once `dsr_replied && painted`.
     ready: bool,
+    /// Nothing is pasted while set, Ready or not: a Remote Claude may still
+    /// be at its folder-trust dialog, which reports no state and quits on
+    /// any Enter. Set at spawn ([`Self::hold`]), cleared by the hook event
+    /// its [`crate::remote::ChatHold`] names ([`Self::release`]); never on a
+    /// timer, which would type into the dialog it waits out.
+    held: bool,
 }
 
 impl ReadyGate {
@@ -117,7 +123,23 @@ impl ReadyGate {
             painted: false,
             ink: InkScan::Ground,
             ready: false,
+            held: false,
         }
+    }
+
+    /// Paste nothing until [`Self::release`]. Queued input keeps its order.
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Let held input go, oldest first, one paste per submit as always.
+    pub fn release(&mut self) {
+        self.held = false;
+    }
+
+    /// Is input waiting for [`Self::release`]?
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// Test/setup helper: clear both Ready halves and the ink scanner (does not
@@ -136,7 +158,7 @@ impl ReadyGate {
 
     /// Can the outbox hand off a post without leaving it in a second queue?
     pub fn chat_input_available(&self) -> bool {
-        self.ready && self.pending_submit.is_none() && self.pending_inject.is_empty()
+        self.ready && !self.held && self.pending_submit.is_none() && self.pending_inject.is_empty()
     }
 
     /// Feed a raw PTY rx chunk for the paint half of Ready (InkScan).
@@ -189,7 +211,11 @@ impl ReadyGate {
     /// Emit the oldest queued post as a paste and arm its submit — only when
     /// Ready and the previous post has been submitted.
     fn next_paste(&mut self, now: Instant) -> Option<Action> {
-        if !self.ready || self.pending_submit.is_some() || self.pending_inject.is_empty() {
+        if !self.ready
+            || self.held
+            || self.pending_submit.is_some()
+            || self.pending_inject.is_empty()
+        {
             return None;
         }
         let text = self.pending_inject.remove(0);
@@ -217,6 +243,43 @@ impl Default for ReadyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_gate_pastes_nothing_until_released_then_everything_in_order() {
+        let now = Instant::now();
+        let later = |ms| now + Duration::from_millis(ms);
+        let mut gate = ReadyGate::new();
+        gate.hold();
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        assert!(gate.ready(), "Ready latches as usual");
+        assert!(
+            !gate.chat_input_available(),
+            "the outbox keeps posts in the room"
+        );
+        assert!(gate.try_inject("note", now).is_none());
+        assert!(gate.try_inject("post", now).is_none());
+        for ms in [0, 1_000, 60_000, 3_600_000] {
+            assert!(
+                gate.poll(later(ms)).is_empty(),
+                "no timer opens it ({ms} ms)"
+            );
+        }
+        assert_eq!(gate.pending_inject, ["note", "post"]);
+        gate.release();
+        let t = later(3_600_000);
+        assert_eq!(gate.poll(t), [Action::Write(paste_wrap("note"))]);
+        let t = t + SUBMIT_DELAY;
+        assert_eq!(
+            gate.poll(t),
+            [
+                Action::Write(b"\r".to_vec()),
+                Action::Write(paste_wrap("post"))
+            ]
+        );
+        assert_eq!(gate.poll(t + SUBMIT_DELAY), [Action::Write(b"\r".to_vec())]);
+        assert!(gate.chat_input_available());
+    }
 
     #[test]
     fn chat_submit_waits_through_busy_receiver_paste_processing() {

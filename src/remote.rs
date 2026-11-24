@@ -308,6 +308,32 @@ pub fn agent_of(argv: &[String]) -> Option<&'static str> {
     crate::icons::IconKind::from_argv(argv).and_then(crate::icons::IconKind::provider)
 }
 
+/// How a launch of `argv` on a `shell` Remote teaches its agent the reply
+/// command. Reconnect argvs come here too: [`relaunch`] leaves no prompt, so
+/// they are never `InPrompt`.
+///
+/// `InPrompt` only where the note can name `$FOREMAN_URL` and
+/// `$FOREMAN_TOKEN` rather than the token itself (which would sit in the
+/// agent's world-readable argv for its life), the agent's tool shell was
+/// seen to have both (2026-11-23, Debian: Claude 2.1.331's Bash tool,
+/// codex-cli 0.163.0's shell), and [`prompt_index`] names the prompt.
+/// Grok (never run on a Remote), every Windows Remote (none tried; a tool
+/// shell there may be PowerShell or Git Bash) and any other agent with
+/// arguments get it typed `AtLaunch`. A bare agent, a shell or a non-agent
+/// command waits for the first post: a shell would run the note.
+pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
+    use crate::control::tunnel::NoteGoes;
+    if argv.len() < 2 || agent_of(argv).is_none() {
+        return NoteGoes::WithFirstPost;
+    }
+    let sees_env = shell == RemoteShell::Posix && matches!(argv[0].as_str(), "claude" | "codex");
+    if sees_env && prompt_index(argv).is_some() {
+        NoteGoes::InPrompt
+    } else {
+        NoteGoes::AtLaunch
+    }
+}
+
 /// Which argument of `argv` is its Dispatch prompt, when that is certain;
 /// `None` for anything else, which then gets the reply note typed instead of
 /// appended to an argument that may not be the prompt.
@@ -494,9 +520,6 @@ pub struct Launch<'a> {
     pub tunnel: Option<Tunnel<'a>>,
     /// What the user asked to run (`claude …`). Empty = an interactive shell.
     pub argv: &'a [String],
-    /// The reply note to append to the prompt argument ([`prompt_index`]),
-    /// for a first launch with a Tunnel. Reconnect passes `None`.
-    pub prompt_note: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -508,32 +531,83 @@ pub struct Built {
     /// the carried note either: reconnect and the snapshot read it, and the
     /// note's token dies with this connection.
     pub dispatched: Vec<String>,
-    /// [`Launch::prompt_note`] rides in the prompt. `false` when there was
-    /// none, the argv has no certain prompt, or the longer line would be
-    /// refused (a Windows Remote's cap or 5.1's quoting): that launch is
-    /// built as it was and the caller types the note instead.
-    pub note_carried: bool,
+    /// How this connection's reply note reaches the agent ([`note_route`]).
+    /// `InPrompt` only when the note was appended to the prompt; a launch
+    /// that would not take it is `AtLaunch`, typed by the caller.
+    pub note: crate::control::tunnel::NoteGoes,
+    /// Claude's hooks ride this launch, so the caller holds all chat input
+    /// until the hook event [`ChatHold`] names. `None`: no hooks, no hold.
+    pub hold: Option<ChatHold>,
+}
+
+/// Which hook event opens a hooked Remote Claude's chat hold. Claude runs no
+/// hook while its folder-trust dialog waits, and any Enter typed there quits
+/// it, so no input goes before an event. `SessionStart` is the first one
+/// past the dialog, but its REPL is still mounting then: a post pasted at it
+/// was lost once in three tries (2026-11-23, Claude Code 2.1.331; the other
+/// two were echoed by the tty and then read). A launch whose brief rides in
+/// argv also fires `UserPromptSubmit` for it, and only a mounted REPL does,
+/// so it waits for that. A bare launch or `--continue` has nothing later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatHold {
+    /// Any event opens it, `SessionStart` included.
+    UntilStart,
+    /// Any event but `SessionStart` opens it.
+    UntilPrompt,
+}
+
+impl ChatHold {
+    /// Whether `event` opens this hold.
+    pub fn opened_by(self, event: crate::agent_state::HookEvent) -> bool {
+        self == Self::UntilStart || event != crate::agent_state::HookEvent::SessionStart
+    }
+}
+
+/// [`Built::hold`] for `argv`: only Claude's launch hooks report anything on
+/// a Remote ([`claude_with_hooks`]).
+fn chat_hold(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
+    claude_with_hooks(argv, shell)?;
+    Some(if prompt_index(argv).is_some() {
+        ChatHold::UntilPrompt
+    } else {
+        ChatHold::UntilStart
+    })
 }
 
 /// Build the local `ssh` argv for a launch. Refuses (never truncates) a
 /// Windows launch whose remote line would not fit cmd.
 pub fn build(l: &Launch) -> Result<Built, String> {
+    use crate::control::tunnel::NoteGoes;
     let dispatched = l.argv.to_vec();
-    if let (Some(note), Some(_), Some(i)) = (l.prompt_note, l.tunnel, prompt_index(l.argv)) {
+    let hold = l.tunnel.and_then(|_| chat_hold(l.argv, l.remote.shell));
+    let note = note_route(l.argv, l.remote.shell);
+    if note == NoteGoes::InPrompt
+        && l.tunnel.is_some()
+        && let Some(i) = prompt_index(l.argv)
+    {
         let mut carried = dispatched.clone();
-        carried[i] = format!("{}\n\n{note}", carried[i]);
+        carried[i] = format!(
+            "{}\n\n{}",
+            carried[i],
+            crate::control::tunnel::prompt_note()
+        );
         if let Ok(ssh) = ssh_argv(l, &carried) {
             return Ok(Built {
                 ssh,
                 dispatched,
-                note_carried: true,
+                note,
+                hold,
             });
         }
     }
     Ok(Built {
         ssh: ssh_argv(l, l.argv)?,
         dispatched,
-        note_carried: false,
+        note: match note {
+            NoteGoes::InPrompt => NoteGoes::AtLaunch,
+            other => other,
+        },
+        hold,
     })
 }
 
@@ -622,6 +696,13 @@ fn ssh_argv(l: &Launch, argv: &[String]) -> Result<Vec<String>, String> {
     Ok(ssh)
 }
 
+/// The event a Remote Claude fires first once it is past its folder-trust
+/// dialog: launched with a prompt, bare, and on `--continue` (seen
+/// 2026-11-23, Claude Code 2.1.331: nothing in 40 s at the dialog, then this
+/// within 0.3 s of the answer). It only opens the chat hold
+/// ([`ChatHold`]) and maps to no state.
+const REMOTE_GATE_EVENT: &str = "SessionStart";
+
 /// Events whose hook sends its stdin payload, so the `/hook` route can drop a
 /// subagent's the way the local helper does. The others count for a subagent
 /// anyway, and their payload carries tool input or output of any size.
@@ -646,7 +727,10 @@ fn claude_with_hooks(argv: &[String], shell: RemoteShell) -> Option<Vec<String>>
         return None;
     }
     let mut hooks = serde_json::Map::new();
-    for &event in crate::agent_hooks::state_events("claude") {
+    for &event in crate::agent_hooks::state_events("claude")
+        .iter()
+        .chain(&[REMOTE_GATE_EVENT])
+    {
         hooks.insert(
             event.into(),
             serde_json::json!([{ "hooks": [posix_hook(event)] }]),
@@ -974,7 +1058,6 @@ mod tests {
                 token: "tok",
             }),
             argv,
-            prompt_note: None,
         }
     }
 
@@ -1087,7 +1170,12 @@ mod tests {
                 (RemoteShell::WindowsPowerShell, legacy, pwsh),
             ] {
                 let r = remote(shell);
-                let s = script(&build(&launch(&r, &dir, &a)).unwrap(), shell);
+                // No Tunnel: a carried reply note would end the argument.
+                let l = Launch {
+                    tunnel: None,
+                    ..launch(&r, &dir, &a)
+                };
+                let s = script(&build(&l).unwrap(), shell);
                 assert!(
                     s.contains(&format!(" {want_arg}\n")),
                     "{shell:?} argv {input:?}:\n{s}"
@@ -1210,7 +1298,12 @@ mod tests {
     fn remote_keeps_the_logical_argv_and_applies_the_codex_rule_inside() {
         let a = argv(&["codex", "do the thing"]);
         let r = remote(RemoteShell::Posix);
-        let b = build(&launch(&r, "", &a)).unwrap();
+        // No Tunnel, so no reply note rides in the prompt.
+        let b = build(&Launch {
+            tunnel: None,
+            ..launch(&r, "", &a)
+        })
+        .unwrap();
         assert_eq!(b.dispatched, a);
         assert!(b.ssh.iter().all(|w| !w.contains("codex")));
         assert!(
@@ -1228,10 +1321,11 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(&run[2]).unwrap();
         let hooks = settings["hooks"].as_object().unwrap();
         let mut want = crate::agent_hooks::state_events("claude").to_vec();
+        want.push(REMOTE_GATE_EVENT);
         let mut got: Vec<&str> = hooks.keys().map(String::as_str).collect();
         want.sort_unstable();
         got.sort_unstable();
-        assert_eq!(got, want, "the same events the local installer manages");
+        assert_eq!(got, want, "the local installer's events, and the gate's");
         for (event, groups) in hooks {
             let h = &groups[0]["hooks"][0];
             let cmd = h["command"].as_str().unwrap();
@@ -1672,107 +1766,244 @@ mod tests {
         }
     }
 
-    fn carrying<'a>(r: &'a Remote, argv: &'a [String]) -> Launch<'a> {
-        Launch {
-            prompt_note: Some("NOTE \"q\" 'x' tok"),
-            ..launch(r, "", argv)
+    /// Who gets the reply note in the prompt (naming the variables), who
+    /// gets it typed, and who waits for a post. One row per agent and shell.
+    #[test]
+    fn the_reply_note_s_route_per_agent_and_shell() {
+        use crate::control::tunnel::NoteGoes::{AtLaunch, InPrompt, WithFirstPost};
+        use RemoteShell::{Posix, Pwsh, WindowsPowerShell};
+        let brief = "do the card";
+        let table: &[(&[&str], RemoteShell, crate::control::tunnel::NoteGoes)] = &[
+            // Seen on a Posix Remote with both variables in the tool shell.
+            (&["claude", brief], Posix, InPrompt),
+            (&["claude", brief, "--model", "x"], Posix, InPrompt),
+            (&["codex", brief], Posix, InPrompt),
+            (&["codex", brief, "--model", "x"], Posix, InPrompt),
+            // Never run on a Remote: typed.
+            (&["grok", brief], Posix, AtLaunch),
+            // Windows: no tool shell seen, and it may not be Posix.
+            (&["claude", brief], Pwsh, AtLaunch),
+            (&["codex", brief], WindowsPowerShell, AtLaunch),
+            (&["grok", brief], Pwsh, AtLaunch),
+            // An agent with arguments foreman cannot place: typed.
+            (&["claude", "hi"], Posix, AtLaunch),
+            (&["claude", "-p", brief], Posix, AtLaunch),
+            (&["codex", "exec", brief], Posix, AtLaunch),
+            (
+                &["npx", "@anthropic-ai/claude-code", brief],
+                Posix,
+                AtLaunch,
+            ),
+            (&["/usr/bin/claude", brief], Posix, AtLaunch),
+            // A reconnect's resume argv: typed (it has no prompt).
+            (&["claude", "--continue"], Posix, AtLaunch),
+            (&["codex", "resume", "--last"], Posix, AtLaunch),
+            (&["grok", "--continue"], Pwsh, AtLaunch),
+            // Bare agent, shell, non-agent command: the first post.
+            (&["claude"], Posix, WithFirstPost),
+            (&["codex"], Pwsh, WithFirstPost),
+            (&[], Posix, WithFirstPost),
+            (&["htop", "-d", "5"], Posix, WithFirstPost),
+        ];
+        for (words, shell, want) in table {
+            assert_eq!(
+                note_route(&argv(words), *shell),
+                *want,
+                "{words:?} on {shell:?}"
+            );
+        }
+        // No reconnect argv carries it (the caller types it for an agent).
+        for (words, shell, _) in table {
+            let re = relaunch(&argv(words));
+            assert_ne!(note_route(&re.argv, *shell), InPrompt, "{words:?}");
         }
     }
 
     #[test]
-    fn a_first_launch_carries_the_note_inside_its_prompt() {
+    fn a_first_launch_carries_the_variable_note_inside_its_prompt() {
+        use crate::control::tunnel::NoteGoes;
         let r = remote(RemoteShell::Posix);
-        let carried = "do the card\n\nNOTE \"q\" 'x' tok";
-        for (words, tail) in [
-            (vec!["codex", "do the card"], "'codex' '--no-daemon' "),
-            (vec!["grok", "do the card"], "'grok' "),
-        ] {
-            let a = argv(&words);
-            let b = build(&carrying(&r, &a)).unwrap();
-            assert!(b.note_carried);
-            assert_eq!(b.dispatched, a, "the logical argv never holds the note");
-            let s = script(&b, r.shell);
-            assert!(
-                s.ends_with(&format!("{tail}{}\n", sh_quote(carried))),
-                "{s}"
-            );
-        }
+        let carried = format!("do the card\n\n{}", crate::control::tunnel::prompt_note());
+        let a = argv(&["codex", "do the card"]);
+        let b = build(&launch(&r, "", &a)).unwrap();
+        assert_eq!(b.note, NoteGoes::InPrompt);
+        assert_eq!(b.dispatched, a, "the logical argv never holds the note");
+        let s = script(&b, r.shell);
+        assert!(
+            s.ends_with(&format!("'codex' '--no-daemon' {}\n", sh_quote(&carried))),
+            "{s}"
+        );
         // Claude: after its hooks, and before `--model`.
         let a = argv(&["claude", "do the card", "--model", "x"]);
-        let b = build(&carrying(&r, &a)).unwrap();
-        assert!(b.note_carried);
+        let b = build(&launch(&r, "", &a)).unwrap();
+        assert_eq!(b.note, NoteGoes::InPrompt);
         let s = script(&b, r.shell);
         let settings = &claude_with_hooks(&a, r.shell).unwrap()[2];
         assert!(
             s.ends_with(&format!(
                 "'claude' '--settings' {} {} '--model' 'x'\n",
                 sh_quote(settings),
-                sh_quote(carried)
+                sh_quote(&carried)
             )),
             "{s}"
         );
-        // pwsh carries it the same way.
-        let w = remote(RemoteShell::Pwsh);
-        let a = argv(&["claude", "do the card"]);
-        let b = build(&carrying(&w, &a)).unwrap();
-        assert!(b.note_carried);
-        assert!(script(&b, w.shell).contains(&ps_quote(carried)));
     }
 
     #[test]
-    fn a_launch_without_a_certain_prompt_is_built_as_it_was() {
-        let r = remote(RemoteShell::Posix);
-        for words in [
-            vec!["claude", "-p", "do the card"],
-            vec!["codex", "exec", "do the card"],
-            vec!["npx", "@anthropic-ai/claude-code", "do the card"],
-            vec!["claude"],
-            vec![],
+    fn a_launch_whose_note_is_not_carried_is_built_as_it_was() {
+        use crate::control::tunnel::NoteGoes;
+        for (shell, words) in [
+            (RemoteShell::Posix, vec!["claude", "-p", "do the card"]),
+            (RemoteShell::Posix, vec!["codex", "exec", "do the card"]),
+            (RemoteShell::Posix, vec!["grok", "do the card"]),
+            (RemoteShell::Posix, vec!["claude"]),
+            (RemoteShell::Posix, vec![]),
+            (RemoteShell::Pwsh, vec!["claude", "do the card"]),
+            (RemoteShell::WindowsPowerShell, vec!["codex", "do the card"]),
         ] {
+            let r = remote(shell);
             let a = argv(&words);
-            let b = build(&carrying(&r, &a)).unwrap();
-            assert!(!b.note_carried, "{words:?}");
-            assert_eq!(b, build(&launch(&r, "", &a)).unwrap(), "{words:?}");
+            let l = launch(&r, "", &a);
+            let b = build(&l).unwrap();
+            assert_ne!(b.note, NoteGoes::InPrompt, "{words:?}");
+            assert_eq!(b.ssh, ssh_argv(&l, &a).unwrap(), "{words:?}");
         }
         // No Tunnel: nowhere for the note's command to go.
+        let r = remote(RemoteShell::Posix);
         let a = argv(&["claude", "do the card"]);
-        let mut l = carrying(&r, &a);
+        let mut l = launch(&r, "", &a);
         l.tunnel = None;
-        assert!(!build(&l).unwrap().note_carried);
+        let b = build(&l).unwrap();
+        assert_eq!(b.ssh, ssh_argv(&l, &a).unwrap());
+        assert_eq!(b.hold, None);
     }
 
-    /// A brief that fits a Windows Remote's line alone but not with the
-    /// note launches as today (the note is then typed), never refused.
+    /// The token may appear once in a built launch: the script's own export,
+    /// which lives only while the launch shells run (each `exec`s the next).
+    /// Anywhere else (the agent's argv, the hooks, the carried note, the ssh
+    /// options) every user on the Remote reads it in `ps` for the agent's
+    /// life.
     #[test]
-    fn a_note_that_would_overflow_a_windows_line_is_left_out_of_the_prompt() {
-        for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
+    fn no_remote_launch_carries_the_token_outside_its_export() {
+        const TOKEN: &str = "a3qTOKENliteral9f8e7d";
+        let brief = "do the card";
+        let firsts: &[&[&str]] = &[
+            &["claude", brief],
+            &["claude", brief, "--model", "claude-opus-5-5"],
+            &["codex", brief],
+            &["codex", brief, "--model", "x"],
+            &["grok", brief],
+            &["claude", "hi"],
+            &["claude", "-p", brief],
+            &["codex", "exec", brief],
+            &["npx", "@anthropic-ai/claude-code", brief],
+            &["/usr/bin/claude", brief],
+            &["claude"],
+            &["codex"],
+            &["grok"],
+            &[],
+            &["htop", "-d", "5"],
+        ];
+        let mut built = 0;
+        for shell in [
+            RemoteShell::Posix,
+            RemoteShell::Pwsh,
+            RemoteShell::WindowsPowerShell,
+        ] {
             let r = remote(shell);
-            let fits = |n: usize| {
-                let a = argv(&["codex", &"do it ".repeat(n)]);
-                build(&launch(&r, "", &a)).is_ok()
-            };
-            let mut n = 1;
-            while fits(n + 1) {
-                n += 1;
+            for words in firsts {
+                let first = argv(words);
+                for a in [first.clone(), relaunch(&first).argv] {
+                    let l = Launch {
+                        tunnel: Some(Tunnel {
+                            remote_port: 41234,
+                            local_port: 50001,
+                            token: TOKEN,
+                        }),
+                        ..launch(&r, "~/src/proj", &a)
+                    };
+                    let Ok(b) = build(&l) else { continue };
+                    built += 1;
+                    let (line, opts) = b.ssh.split_last().unwrap();
+                    for o in opts {
+                        assert!(!o.contains(TOKEN), "{a:?} {shell:?}: ssh option {o}");
+                    }
+                    assert!(!line.contains(TOKEN), "{a:?} {shell:?}: the line in clear");
+                    assert!(!b.dispatched.iter().any(|d| d.contains(TOKEN)));
+                    let export = match shell {
+                        RemoteShell::Posix => format!("export FOREMAN_TOKEN='{TOKEN}'"),
+                        _ => format!("$env:FOREMAN_TOKEN = '{TOKEN}'"),
+                    };
+                    let s = script(&b, shell);
+                    let holding: Vec<&str> = s.lines().filter(|l| l.contains(TOKEN)).collect();
+                    assert_eq!(holding, [export.as_str()], "{a:?} on {shell:?}:\n{s}");
+                    assert_eq!(s.matches(TOKEN).count(), 1, "{a:?} on {shell:?}:\n{s}");
+                }
             }
-            let a = argv(&["codex", &"do it ".repeat(n)]);
-            let long_note = "N ".repeat(200);
-            let l = Launch {
-                prompt_note: Some(&long_note),
-                ..launch(&r, "", &a)
-            };
-            let b = build(&l).expect("never refused for the note");
-            assert!(!b.note_carried, "{shell:?}");
-            assert_eq!(b, build(&launch(&r, "", &a)).unwrap());
-            // Over the cap without the note: refused as before.
-            let a = argv(&["codex", &"do it ".repeat(n + 1)]);
-            assert!(
-                build(&Launch {
-                    prompt_note: Some(&long_note),
-                    ..launch(&r, "", &a)
-                })
-                .is_err()
+        }
+        assert!(built > 60, "the table must build: {built}");
+    }
+
+    /// Only a launch carrying Claude's hooks holds chat, a launch with its
+    /// brief in argv until the brief is submitted, and its hooks include the
+    /// one that fires first past the trust dialog.
+    #[test]
+    fn only_a_hooked_claude_launch_holds_chat_and_a_briefed_one_waits_for_its_prompt() {
+        use crate::agent_state::HookEvent;
+        use ChatHold::{UntilPrompt, UntilStart};
+        let posix = remote(RemoteShell::Posix);
+        for (words, hold) in [
+            (&["claude", "do the card"][..], Some(UntilPrompt)),
+            (
+                &["claude", "do the card", "--model", "x"],
+                Some(UntilPrompt),
+            ),
+            (&["claude"], Some(UntilStart)),
+            (&["claude", "--continue"], Some(UntilStart)),
+            // A prompt foreman cannot place: the first event, as for bare.
+            (&["claude", "hi"], Some(UntilStart)),
+            (&["claude", "--settings", "mine.json"], None),
+            (&["npx", "@anthropic-ai/claude-code"], None),
+            (&["codex", "do the card"], None),
+            (&["grok", "do the card"], None),
+            (&[], None),
+        ] {
+            let a = argv(words);
+            assert_eq!(
+                build(&launch(&posix, "", &a)).unwrap().hold,
+                hold,
+                "{words:?}"
             );
         }
+        for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
+            let a = argv(&["claude"]);
+            assert_eq!(build(&launch(&remote(shell), "", &a)).unwrap().hold, None);
+        }
+        let every = [
+            HookEvent::SessionStart,
+            HookEvent::UserPromptSubmit,
+            HookEvent::PermissionRequest,
+            HookEvent::PostToolUse,
+            HookEvent::Stop,
+            HookEvent::StopFailure,
+        ];
+        for e in every {
+            assert!(UntilStart.opened_by(e), "{e:?}");
+            assert_eq!(
+                UntilPrompt.opened_by(e),
+                e != HookEvent::SessionStart,
+                "{e:?}"
+            );
+        }
+        let with = claude_with_hooks(&argv(&["claude"]), RemoteShell::Posix).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&with[2]).unwrap();
+        let start = settings["hooks"][REMOTE_GATE_EVENT][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            start.contains(&format!("/hook?agent=claude&event={REMOTE_GATE_EVENT}")),
+            "{start}"
+        );
+        assert!(crate::agent_state::HookEvent::parse(REMOTE_GATE_EVENT).is_some());
     }
 }
