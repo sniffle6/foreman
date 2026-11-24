@@ -271,7 +271,8 @@ pub fn show<A: Clone>(
         (label_w + if hint_w > 0.0 { hint_w + 40.0 } else { 0.0 } + pad * 2.0 + 16.0).max(100.0);
     let w = menu_width(rows_w, strip_w + (pad - SEG_PAD) * 2.0, area.width());
     #[cfg(test)]
-    ui.ctx().data_mut(|d| d.insert_temp(menu_id.with("width"), w));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(menu_id.with("width"), w));
     let height = |entry: &Entry<A>| match entry {
         Entry::Header(_) | Entry::HeaderText(_) => 19.0,
         Entry::Note(_) => NOTE_H,
