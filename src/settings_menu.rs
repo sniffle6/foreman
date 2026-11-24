@@ -493,6 +493,9 @@ pub struct SettingsMenu {
     /// Test seam: the layout store to use instead of the user's.
     #[cfg(test)]
     pub layout_store: Option<crate::layout_library::LayoutStore>,
+    /// Test seam: last frame's footer line, and whether it fit uncut.
+    #[cfg(test)]
+    pub footer_laid: (String, bool),
 }
 
 impl SettingsMenu {
@@ -512,6 +515,8 @@ impl SettingsMenu {
             was_active: false,
             #[cfg(test)]
             layout_store: None,
+            #[cfg(test)]
+            footer_laid: (String::new(), true),
         }
     }
 
@@ -754,15 +759,38 @@ impl SettingsMenu {
             [footer.left_top(), footer.right_top()],
             egui::Stroke::new(1.0, th.border),
         );
-        ui.painter().text(
-            egui::pos2(footer.min.x + 18.0, footer.center().y),
-            egui::Align2::LEFT_CENTER,
-            "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close",
-            egui::FontId::proportional(11.5),
+        let text = self.footer(s);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), egui::FontId::proportional(11.5), th.dim);
+        #[cfg(test)]
+        {
+            self.footer_laid = (text.to_string(), galley.size().x <= w - 2.0 * 18.0);
+        }
+        ui.painter().galley(
+            egui::pos2(
+                footer.min.x + 18.0,
+                footer.center().y - galley.size().y / 2.0,
+            ),
+            galley,
             th.dim,
         );
 
         outcome
+    }
+
+    /// The footer's key line. The one hook a custom-body pane has to say
+    /// its own keys while it reads the keyboard, so the footer never
+    /// contradicts it; the rail and the row panes share the menu's line.
+    fn footer(&self, s: &Settings) -> &'static str {
+        if !self.in_rail {
+            match self.pane {
+                Pane::Keybindings => return self.keybindings.footer(),
+                Pane::Remotes => return self.remotes.footer(&s.remotes),
+                _ => {}
+            }
+        }
+        "↑↓ navigate · Tab rail⇄pane · Enter edit · ←→ adjust · Esc close"
     }
 
     /// True while the embedded keybindings editor is mid chord-capture. The WM
@@ -813,10 +841,10 @@ impl SettingsMenu {
             return MenuOutcome::Pending;
         }
 
-        // Same for Remotes, except Tab moves between the edit form's fields
-        // while the form is open.
+        // Same for Remotes, except Tab is the pane's own while it moves
+        // between the edit form's fields or the install confirm's agents.
         if self.pane == Pane::Remotes && !self.in_rail {
-            if tab && !self.remotes.is_editing() {
+            if tab && !self.remotes.owns_tab() {
                 self.in_rail = true;
             }
             return MenuOutcome::Pending;
@@ -1576,10 +1604,11 @@ mod tests {
         }
     }
 
-    /// At the narrowest pane, the folder list under a Directory row: every
-    /// row and every Directory hint inside the pane and uncut, in the field
-    /// and in the list; and its reserved area the same height whichever
-    /// field is focused and whatever it shows, so no form row moves.
+    /// At the narrowest pane, the folder list directly under the focused
+    /// Directory row: every row inside the pane and the footer uncut, in the
+    /// field and in the list; and its area the same height whatever it
+    /// shows and whoever has the keyboard, so no form row moves when a
+    /// listing lands.
     #[test]
     fn remotes_folder_list_fits_at_minimum_width_and_moves_nothing() {
         use crate::remote::RemoteShell::Posix;
@@ -1622,10 +1651,9 @@ mod tests {
             (form, area.height(), area.min - o)
         };
         let fits = |menu: &mut SettingsMenu, state: &str| {
-            let laid = menu.remotes.laid();
-            let pane = laid.pane;
-            assert!(laid.hint_fits, "{state}: hint cut at {pane:?}");
-            assert!(laid.hint.height() < 16.0, "{state}: {:?}", laid.hint);
+            let (footer, fits) = menu.footer_laid.clone();
+            assert!(fits, "{state}: footer cut: {footer}");
+            let pane = menu.remotes.laid().pane;
             let b = &menu.remotes.browse().laid;
             assert!(
                 b.area.min.x >= pane.min.x && b.area.max.x <= pane.max.x,
@@ -1668,7 +1696,6 @@ mod tests {
         );
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
-        let idle = shape(&mut menu);
         fits(&mut menu, "Name");
         for _ in 0..3 {
             tab(&mut menu, &mut s, egui::Key::Tab);
@@ -1691,12 +1718,13 @@ mod tests {
             let area = menu.remotes.browse().laid.area;
             assert!(seen.contains_rect(field), "field {field:?} out of {seen:?}");
             assert!(seen.contains_rect(area), "list {area:?} out of {seen:?}");
+            // Directly under its Directory row, across the row's width.
+            assert!(area.min.y > field.max.y && area.min.y - field.max.y < 20.0);
+            assert!(area.max.x >= field.max.x && area.min.x < field.min.x);
         }
-        assert_eq!(
-            shape(&mut menu),
-            idle,
-            "focusing a Directory moved the form"
-        );
+        // From here on the list stays under Directory 1: what it shows,
+        // and who has the keyboard, moves nothing.
+        let idle = shape(&mut menu);
         tab(&mut menu, &mut s, egui::Key::ArrowDown);
         assert!(menu.remotes.browse().list_focused());
         fits(&mut menu, "list");
@@ -1829,9 +1857,8 @@ mod tests {
             (form, b.area.translate(-o.to_vec2()), rows)
         };
         let fits = |menu: &mut SettingsMenu, state: &str| {
-            let laid = menu.remotes.laid();
-            assert!(laid.hint_fits, "{state}: hint cut at {:?}", laid.pane);
-            assert!(laid.hint.height() < 16.0, "{state}: {:?}", laid.hint);
+            let (footer, fits) = &menu.footer_laid;
+            assert!(fits, "{state}: footer cut: {footer}");
         };
         let saved = |s: &Settings| s.remotes[0].dirs[r"H:\src\app"].clone();
 
@@ -2043,22 +2070,14 @@ mod tests {
     /// line tall in each state, so nothing below them moves when the state
     /// changes or a long Test result lands.
     #[test]
-    fn remotes_pane_hint_and_status_are_one_line_at_minimum_width() {
+    fn remotes_pane_footer_and_status_are_one_line_at_minimum_width() {
         use crate::remotes_pane::LINE_H;
         let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
         let none = egui::Modifiers::NONE;
         let one_line = |menu: &SettingsMenu, state: &str| {
             let laid = menu.remotes.laid();
-            assert!(
-                laid.hint.height() > 0.0 && laid.hint.height() < 16.0,
-                "{state}: hint {:?}",
-                laid.hint
-            );
-            assert!(
-                laid.hint_fits,
-                "{state}: the hint is cut at {:?}",
-                laid.pane
-            );
+            let (footer, fits) = &menu.footer_laid;
+            assert!(fits, "{state}: the footer is cut: {footer}");
             for r in &laid.status {
                 assert!(r.height() <= LINE_H + 0.5, "{state}: status {r:?}");
             }
@@ -2169,8 +2188,8 @@ mod tests {
             assert!(a.height() <= LINE_H + 0.5, "agents line {a:?}");
             assert!(laid.pane.contains_rect(*a), "{a:?}");
         }
-        assert!(laid.hint_fits, "the hint with I is cut");
-        assert!(laid.hint.height() < 16.0);
+        assert!(menu.footer_laid.1, "the footer with I is cut");
+        assert!(menu.footer_laid.0.contains("I install"));
         assert!(laid.agents_fit, "an agents line's words are cut");
 
         let none = egui::Modifiers::NONE;
@@ -2186,7 +2205,7 @@ mod tests {
         let block = laid.confirm.expect("the confirm shows its command");
         assert!(laid.pane.contains_rect(block), "{block:?}");
         assert!(block.height() <= LINE_H * 2.0 + 0.5, "{block:?}");
-        assert!(laid.hint_fits, "the confirm hint is cut");
+        assert!(menu.footer_laid.1, "the confirm footer is cut");
         assert!(!laid.confirm_elided, "the command is cut");
         assert_eq!(laid.rows[1], untested[1], "the confirm moved the next row");
         for (row, (_, controls)) in laid.rows.iter().enumerate() {
@@ -2243,13 +2262,16 @@ mod tests {
     }
 
     /// At the narrowest pane, every combination of the three agents' states
-    /// draws one agents line whose words and buttons are all inside the
-    /// pane: no word cut, no button clipped past the edge.
+    /// that one Test can report draws one agents line whose words and
+    /// buttons are all inside the pane: no word cut, no button clipped past
+    /// the edge. A missing agent's gate comes from the Remote's one `curl` /
+    /// `bash` answer, as in the app, so "codex did not install" (its
+    /// installer ran, so curl was there) never meets "claude needs curl".
     #[test]
     fn every_agents_line_fits_at_minimum_width() {
-        use crate::remote::Prereq;
         use crate::remote::RemoteShell;
-        use crate::remote_install::{AgentState, Gate, Piece, agents_line};
+        use crate::remote_install::{AgentState, Gate, Piece, agents_line, gate};
+        use crate::remote_probe::TestReport;
         use crate::remotes_pane::LINE_H;
         let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
         let ctx = egui::Context::default();
@@ -2261,9 +2283,9 @@ mod tests {
         };
         menu.select_pane(Pane::Remotes);
         menu.in_rail = false;
-        let each = |p: &'static str| {
-            let ready = |after_install| AgentState::Missing {
-                gate: Gate::Ready(crate::remote::install_for(p, RemoteShell::Posix).unwrap()),
+        let each = |p: &'static str, report: &TestReport| {
+            let missing = |after_install| AgentState::Missing {
+                gate: gate(crate::remote::install_for(p, RemoteShell::Posix), report),
                 after_install,
             };
             [
@@ -2271,12 +2293,9 @@ mod tests {
                 AgentState::Installed,
                 AgentState::Installing,
                 AgentState::Checking,
-                ready(false),
-                ready(true),
-                AgentState::Missing {
-                    gate: Gate::Needs(vec![Prereq::Curl, Prereq::Bash]),
-                    after_install: false,
-                },
+                missing(false),
+                missing(true),
+                // No command for this shell.
                 AgentState::Missing {
                     gate: Gate::ByHand,
                     after_install: false,
@@ -2285,49 +2304,51 @@ mod tests {
         };
         let mut misfits = Vec::new();
         let mut combos = 0;
-        for a in each("claude") {
-            for b in each("codex") {
-                for c in each("grok") {
-                    combos += 1;
-                    let states = vec![("claude", a.clone()), ("codex", b.clone()), ("grok", c)];
-                    let words: Vec<String> = agents_line("desk", RemoteShell::Posix, &states)
-                        .iter()
-                        .map(|p| match p {
-                            Piece::Text { text, .. } => text.clone(),
-                            Piece::Install { label, .. } => format!("[{label}]"),
-                        })
-                        .collect();
-                    menu.remotes.force_agent_states(target, states);
-                    frame_at(&ctx, &mut menu, &mut s, Some(size), None);
-                    let laid = menu.remotes.laid();
-                    let line = laid.agents[0];
-                    let inside = laid.pane.contains_rect(line)
-                        && line.height() <= LINE_H + 0.5
-                        && laid
-                            .installs
+        for (curl, bash) in [(true, true), (true, false), (false, true), (false, false)] {
+            let report = TestReport {
+                shell: RemoteShell::Posix,
+                login_shell: None,
+                curl,
+                bash,
+                agents: vec![],
+            };
+            for a in each("claude", &report) {
+                for b in each("codex", &report) {
+                    for c in each("grok", &report) {
+                        combos += 1;
+                        let states = vec![("claude", a.clone()), ("codex", b.clone()), ("grok", c)];
+                        let words: Vec<String> = agents_line("desk", RemoteShell::Posix, &states)
                             .iter()
-                            .all(|b| laid.pane.contains_rect(*b) && laid.list.contains_rect(*b));
-                    if !(inside && laid.agents_fit) {
-                        misfits.push((line.right() - laid.pane.right(), words.join(" · ")));
+                            .map(|p| match p {
+                                Piece::Text { text, .. } => text.clone(),
+                                Piece::Install { label, .. } => format!("[{label}]"),
+                            })
+                            .collect();
+                        menu.remotes.force_agent_states(target, states);
+                        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+                        let laid = menu.remotes.laid();
+                        let line = laid.agents[0];
+                        let inside = laid.pane.contains_rect(line)
+                            && line.height() <= LINE_H + 0.5
+                            && laid
+                                .installs
+                                .iter()
+                                .all(|b| line.contains_rect(*b) && laid.list.contains_rect(*b));
+                        if !(inside && laid.agents_fit) {
+                            misfits.push(words.join(" · "));
+                        }
                     }
                 }
             }
         }
-        assert_eq!(combos, 8 * 8 * 8);
-        misfits.sort_by(|x, y| y.0.total_cmp(&x.0));
+        assert_eq!(combos, 4 * 7 * 7 * 7);
+        misfits.sort();
+        misfits.dedup();
         assert!(
             misfits.is_empty(),
-            "{} lines overflow the pane, widest first:
-{}",
+            "{} lines overflow the pane:\n{}",
             misfits.len(),
-            misfits
-                .iter()
-                .map(|(over, w)| format!("{over:+.0}px  {w}"))
-                .collect::<Vec<_>>()
-                .join(
-                    "
-"
-                )
+            misfits.join("\n")
         );
     }
 
@@ -2395,6 +2416,308 @@ mod tests {
                 assert_eq!(seen.len(), 3);
             }
         }
+    }
+
+    /// One frame at the narrowest pane under a theme whose `sel_bg` is a
+    /// strong colour (as a user theme may make it), with `events`; returns
+    /// every rect painted filled with `sel_bg`.
+    fn sel_bg_fills(
+        ctx: &egui::Context,
+        menu: &mut SettingsMenu,
+        s: &mut Settings,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, sel: egui::Color32, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, sel, out)),
+                egui::Shape::Rect(r) if r.fill == sel => out.push(r.rect),
+                _ => {}
+            }
+        }
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let mut theme = crate::theme::Theme::default();
+        theme.sel_bg = egui::Color32::from_rgb(230, 110, 20);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let mut km = Keymap::default();
+        let sel = theme.sel_bg;
+        let out = ctx.run_ui(input, |ui| {
+            crate::theme::seed_live(ui.ctx(), &theme);
+            let r = ui.max_rect();
+            if matches!(
+                menu.show(ui, r, true, s, &mut km, &mut theme),
+                MenuOutcome::Changed
+            ) {
+                s.sanitize();
+            }
+        });
+        let mut fills = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, sel, &mut fills);
+        }
+        // The pane's own: the rail marks its active pane with the wash too.
+        let pane = menu.remotes.laid().pane;
+        fills.retain(|r| r.min.x >= pane.min.x);
+        fills
+    }
+
+    fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        [true, false]
+            .map(|pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            })
+            .to_vec()
+    }
+
+    /// The selected Remote's wash covers the whole item: its name and
+    /// target, its buttons, its status line and its agents line. One wash.
+    #[test]
+    fn the_selected_remotes_wash_covers_all_its_lines() {
+        use crate::remote_probe::{TestOutcome, TestReport};
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![remote("desk", "wash-desk"), remote("pi", "wash-pi")],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        for t in ["wash-desk", "wash-pi"] {
+            menu.remotes.set_test_result(
+                t,
+                TestOutcome::Ok(TestReport {
+                    shell: crate::remote::RemoteShell::Posix,
+                    login_shell: None,
+                    curl: true,
+                    bash: true,
+                    agents: vec!["claude".into()],
+                }),
+            );
+        }
+        for row in [0, 1] {
+            sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+            let fills = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+            assert_eq!(fills.len(), 1, "row {row}: {fills:?}");
+            let laid = menu.remotes.laid();
+            let (text, controls) = laid.rows[row];
+            for (what, r) in [
+                ("text", text),
+                ("buttons", controls),
+                ("status", laid.status[row]),
+                ("agents", laid.agents[row]),
+            ] {
+                assert!(
+                    fills[0].contains_rect(r),
+                    "row {row}: {what} {r:?} outside {:?}",
+                    fills[0]
+                );
+            }
+            for b in &laid.installs {
+                if laid.agents[row].contains_rect(*b) {
+                    assert!(fills[0].contains_rect(*b), "row {row}: install {b:?}");
+                }
+            }
+            sel_bg_fills(
+                &ctx,
+                &mut menu,
+                &mut s,
+                press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            );
+        }
+    }
+
+    /// Editing has no container fill: nothing in the form is filled with
+    /// `sel_bg`, whatever has the keyboard, except the folder list's
+    /// selected row while the list has it.
+    #[test]
+    fn the_edit_state_fills_nothing_with_sel_bg_but_a_selected_folder_row() {
+        use crate::remote::RemoteShell::Posix;
+        use crate::remote_browse::{Entry, Listed, State};
+        let none = egui::Modifiers::NONE;
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/".into());
+        desk.dirs.insert(r"H:\src\tool".into(), "".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+        sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Enter, none));
+        assert!(menu.remotes.is_editing());
+        menu.remotes.browse().put(
+            "andy@desk",
+            Posix,
+            "/srv/",
+            State::Listed(Listed {
+                resolved: "/srv".into(),
+                entries: ["app", "data"].iter().map(|n| Entry::dir(n)).collect(),
+                truncated: false,
+            }),
+        );
+        let none_filled = |fills: Vec<egui::Rect>, state: &str| {
+            assert!(fills.is_empty(), "{state}: filled with sel_bg: {fills:?}");
+        };
+        let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+        none_filled(f, "Name");
+        for state in ["Target", "Shell", "Directory"] {
+            let f = sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Tab, none));
+            none_filled(f, state);
+            let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+            none_filled(f, state);
+        }
+        sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::ArrowDown, none));
+        assert!(menu.remotes.browse().list_focused());
+        let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+        let rows = menu.remotes.browse().laid.rows.clone();
+        assert_eq!(f.len(), 1, "the list's selection: {f:?}");
+        assert!(
+            rows.contains(&f[0]),
+            "{:?} is not a folder row {rows:?}",
+            f[0]
+        );
+        // The name field in the new-folder row: no row is selected-looking.
+        sel_bg_fills(
+            &ctx,
+            &mut menu,
+            &mut s,
+            press(egui::Key::N, egui::Modifiers::CTRL),
+        );
+        assert!(menu.remotes.browse().naming());
+        let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+        none_filled(f, "naming");
+        // A refused save: the error line, still no fill.
+        sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Escape, none));
+        sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Escape, none));
+        if let Some(d) = menu.remotes.draft_mut() {
+            d.name.clear();
+        }
+        sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Enter, none));
+        let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
+        assert!(menu.remotes.laid().error.is_some(), "the save was refused");
+        none_filled(f, "error");
+    }
+
+    /// The footer says the keys that work where the keyboard is, and
+    /// pressing them does what it says; each line fits at the narrowest
+    /// window.
+    #[test]
+    fn the_footer_follows_the_focus_and_its_keys_work() {
+        use crate::remote::RemoteShell::Posix;
+        use crate::remote_browse::{Entry, Listed, State};
+        let none = egui::Modifiers::NONE;
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut desk = remote("desk", "andy@desk");
+        desk.dirs.insert(r"H:\src\app".into(), "/srv/".into());
+        let mut s = Settings {
+            remotes: vec![desk],
+            ..Default::default()
+        };
+        let size = Some(egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y));
+        let key = |menu: &mut SettingsMenu, s: &mut Settings, k: egui::Key, m| {
+            frame_at(&ctx, menu, s, size, Some((k, m)));
+            frame_at(&ctx, menu, s, size, None);
+            let (footer, fits) = menu.footer_laid.clone();
+            assert!(fits, "cut: {footer}");
+            footer
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = true;
+        let f = key(&mut menu, &mut s, egui::Key::F13, none);
+        assert!(f.contains("Tab rail⇄pane"), "{f}");
+        let f = key(&mut menu, &mut s, egui::Key::Enter, none);
+        assert!(!menu.in_rail);
+        assert!(
+            f.contains("Enter edit") && f.contains("Tab/Esc rail"),
+            "{f}"
+        );
+        key(&mut menu, &mut s, egui::Key::Tab, none);
+        assert!(menu.in_rail, "Tab: rail");
+        // Back in by hand: after a Tab, egui's own focus walk has put a rail
+        // row under Enter (a known settings-menu wrinkle, not this pane's).
+        menu.in_rail = false;
+        key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert!(menu.in_rail, "Esc: rail");
+        menu.in_rail = false;
+        key(&mut menu, &mut s, egui::Key::F13, none);
+
+        let f = key(&mut menu, &mut s, egui::Key::Delete, none);
+        assert_eq!(f, "Enter delete · Esc keep");
+        let f = key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert_eq!(s.remotes.len(), 1, "Esc kept it");
+        assert!(f.contains("Enter edit"), "{f}");
+
+        let f = key(&mut menu, &mut s, egui::Key::Enter, none);
+        assert!(menu.remotes.is_editing());
+        assert_eq!(f, "Tab next field · Enter save · Esc cancel", "Name");
+        key(&mut menu, &mut s, egui::Key::Tab, none);
+        assert!(!menu.in_rail, "Tab moved fields, not to the rail");
+        let f = key(&mut menu, &mut s, egui::Key::Tab, none);
+        assert!(f.starts_with("←/→ change shell"), "{f}");
+        key(&mut menu, &mut s, egui::Key::ArrowRight, none);
+        assert_ne!(
+            menu.remotes.draft_mut().map(|d| d.shell),
+            Some(Posix),
+            "→ changed it"
+        );
+        let shell = menu.remotes.draft_mut().map(|d| d.shell).unwrap();
+        menu.remotes.browse().put(
+            "andy@desk",
+            shell,
+            "/srv/",
+            State::Listed(Listed {
+                resolved: "/srv".into(),
+                entries: ["app"].iter().map(|n| Entry::dir(n)).collect(),
+                truncated: false,
+            }),
+        );
+        let f = key(&mut menu, &mut s, egui::Key::Tab, none);
+        assert!(f.contains("↓ folders") && f.contains("Esc cancel"), "{f}");
+        let f = key(&mut menu, &mut s, egui::Key::ArrowDown, none);
+        assert!(menu.remotes.browse().list_focused(), "↓: the list");
+        assert!(
+            f.contains("Ctrl+N new folder") && f.ends_with("Tab/Esc back"),
+            "{f}"
+        );
+        let f = key(&mut menu, &mut s, egui::Key::N, egui::Modifiers::CTRL);
+        assert!(menu.remotes.browse().naming(), "Ctrl+N: the name field");
+        assert_eq!(f, "Enter create the folder · Esc back to the list");
+        let f = key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert!(menu.remotes.browse().list_focused() && !menu.remotes.browse().naming());
+        assert!(f.ends_with("Tab/Esc back"), "{f}");
+        let f = key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert!(!menu.remotes.browse().list_focused() && menu.remotes.is_editing());
+        assert!(f.contains("Esc cancel"), "{f}");
+        let f = key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert!(
+            !menu.remotes.is_editing() && !menu.in_rail,
+            "Esc cancelled the edit"
+        );
+        assert!(f.contains("Tab/Esc rail"), "{f}");
+
+        // The Keybindings pane says its own keys too.
+        menu.select_pane(Pane::Keybindings);
+        menu.in_rail = false;
+        let f = key(&mut menu, &mut s, egui::Key::F13, none);
+        assert!(
+            f.contains("Enter rebind") && f.contains("Tab/Esc rail"),
+            "{f}"
+        );
+        let f = key(&mut menu, &mut s, egui::Key::Enter, none);
+        assert_eq!(f, "Press the new chord · Esc cancel");
+        let f = key(&mut menu, &mut s, egui::Key::Escape, none);
+        assert!(f.contains("Enter rebind") && !menu.in_rail, "{f}");
     }
 
     /// A refused save at the smallest pane: the error shows and the save and
@@ -2472,9 +2795,8 @@ mod tests {
             frame_at(&ctx, &mut menu, &mut s, size, Some((egui::Key::Tab, none)));
         }
         frame_at(&ctx, &mut menu, &mut s, size, None);
-        let laid = menu.remotes.laid();
-        assert!(laid.hint_fits, "the hint is cut at {:?}", laid.pane);
-        assert!(laid.dirs_note_fits);
+        assert!(menu.footer_laid.1, "the footer is cut");
+        assert!(menu.footer_laid.0.contains("Ctrl+Backspace clear"));
         let ctrl = egui::Modifiers::CTRL;
         frame_at(
             &ctx,

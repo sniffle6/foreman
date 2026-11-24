@@ -457,16 +457,13 @@ pub struct Laid {
     pub form: Vec<egui::Rect>,
     /// Per row: its painted text, and its status and buttons.
     pub rows: Vec<(egui::Rect, egui::Rect)>,
-    /// The key hint line, and whether it fit without its "…" cut.
-    pub hint: egui::Rect,
-    pub hint_fits: bool,
     /// The scrolling list's viewport: what is on screen of the rows.
     pub list: egui::Rect,
     /// Per row: its status line.
     pub status: Vec<egui::Rect>,
     /// The form's error line, while it shows one.
     pub error: Option<egui::Rect>,
-    /// The form's Project directories heading fit without its "…" cut.
+    /// The form's "no Project directories yet" line fit without its cut.
     pub dirs_note_fits: bool,
     /// Per row: its agents line.
     pub agents: Vec<egui::Rect>,
@@ -502,8 +499,6 @@ impl RemotesView {
                 pane: egui::Rect::NOTHING,
                 form: Vec::new(),
                 rows: Vec::new(),
-                hint: egui::Rect::NOTHING,
-                hint_fits: true,
                 list: egui::Rect::NOTHING,
                 status: Vec::new(),
                 error: None,
@@ -523,7 +518,7 @@ impl RemotesView {
         }
     }
 
-    /// True while the edit form is open, so the menu leaves Tab to it.
+    /// True while the edit form is open.
     pub fn is_editing(&self) -> bool {
         matches!(self.mode, Mode::Edit(_))
     }
@@ -537,6 +532,15 @@ impl RemotesView {
     #[cfg(test)]
     pub fn browse(&mut self) -> &mut Browser {
         &mut self.browse
+    }
+
+    /// Test hook: the open form's draft.
+    #[cfg(test)]
+    pub fn draft_mut(&mut self) -> Option<&mut Draft> {
+        match &mut self.mode {
+            Mode::Edit(d) => Some(d),
+            _ => None,
+        }
     }
 
     /// Test hook: the form's Directory `k` as typed.
@@ -976,24 +980,40 @@ impl RemotesView {
         }
     }
 
-    /// This frame's key hint, one line at the pane's minimum width. Browsing
+    /// The settings footer's line for this frame: the keys that work where
+    /// the keyboard is, one line at the window's minimum width. Browsing
     /// offers only what the selection can do: the Add row cannot be edited,
     /// tested or deleted.
-    fn hint(&self, len: usize) -> &'static str {
-        match self.mode {
+    pub fn footer(&self, remotes: &[Remote]) -> &'static str {
+        let len = remotes.len();
+        match &self.mode {
             Mode::Browse if self.selected < len => {
-                "↑/↓ select · Enter edit · A add · T test · Del delete · Esc back"
+                if self.installable(self.selected, remotes).is_empty() {
+                    "↑/↓ select · Enter edit · A add · T test · Del delete · Tab/Esc rail"
+                } else {
+                    "↑/↓ select · Enter edit · A add · T test · I install · Del delete · Tab/Esc rail"
+                }
             }
-            Mode::Browse if len == 0 => "Enter or A add · Esc back",
-            Mode::Browse => "↑/↓ select · Enter add · Esc back",
-            Mode::Edit(Draft {
-                field: Field::Dir(k),
-                ref dirs,
-                ..
-            }) if self.browse.list_focused() => {
-                match dirs.get(k).map(|r| self.browse.shows(&r.remote)) {
-                    Some(Shows::Waiting) => "Listing folders · Tab/Esc back",
-                    Some(Shows::Retry) => "Enter retry · Tab/Esc back",
+            Mode::Browse if len == 0 => "Enter or A add · Tab/Esc rail",
+            Mode::Browse => "↑/↓ select · Enter add · Tab/Esc rail",
+            Mode::Edit(d) => self.edit_footer(d, remotes),
+            Mode::ConfirmDelete(_) => "Enter delete · Esc keep",
+            Mode::ConfirmInstall { row, .. } if self.installable(*row, remotes).len() > 1 => {
+                "Enter install · ←/→ other agent · Esc cancel"
+            }
+            Mode::ConfirmInstall { .. } => "Enter install · Esc cancel",
+        }
+    }
+
+    /// [`Self::footer`] while a form is open: the focused field's keys, the
+    /// folder list's, or the new-folder name field's.
+    fn edit_footer(&self, d: &Draft, remotes: &[Remote]) -> &'static str {
+        let listable = remote::valid_target(d.target.trim());
+        match d.field {
+            Field::Dir(k) if listable && self.browse.list_focused() => {
+                match d.dirs.get(k).map(|r| self.browse.shows(&r.remote)) {
+                    Some(Shows::Waiting) => "Listing folders · Tab/Esc back to the field",
+                    Some(Shows::Retry) => "Enter retry · Tab/Esc back to the field",
                     Some(Shows::Naming) => "Enter create the folder · Esc back to the list",
                     Some(Shows::Creating) => "Creating the folder… · Esc back to the list",
                     Some(Shows::Busy) => {
@@ -1002,44 +1022,35 @@ impl RemotesView {
                     _ => "↑/↓ pick · Enter/→ in · ← up · Ctrl+N new folder · Tab/Esc back",
                 }
             }
-            Mode::Edit(Draft {
-                field: Field::Dir(k),
-                ref dirs,
-                ref target,
-                ..
-            }) if remote::valid_target(target.trim()) => {
-                match dirs.get(k).map(|r| self.browse.enters(&r.remote)) {
-                    Some(Enters::Folders) => {
-                        "Tab next · ↓ folders · Ctrl+Backspace clear · Enter save · Esc cancel"
-                    }
-                    Some(Enters::Retry) => {
-                        "Tab next · ↓ retry · Ctrl+Backspace clear · Enter save · Esc cancel"
-                    }
-                    _ => "Tab next field · Ctrl+Backspace clear · Enter save · Esc cancel",
+            Field::Dir(k) if listable => match d.dirs.get(k).map(|r| self.browse.enters(&r.remote))
+            {
+                Some(Enters::Folders) => {
+                    "Tab next field · ↓ folders · Ctrl+Backspace clear · Enter save · Esc cancel"
                 }
+                Some(Enters::Retry) => {
+                    "Tab next field · ↓ retry · Ctrl+Backspace clear · Enter save · Esc cancel"
+                }
+                _ => "Tab next field · Ctrl+Backspace clear · Enter save · Esc cancel",
+            },
+            Field::Dir(_) => "Tab next field · Ctrl+Backspace clear · Enter save · Esc cancel",
+            Field::Target if d.pick.is_some() => {
+                "↑/↓ pick a Host · Enter use it · Esc back to the field"
             }
-            Mode::Edit(Draft {
-                field: Field::Dir(_),
-                ..
-            }) => "Tab next field · Ctrl+Backspace clear · Enter save · Esc cancel",
-            Mode::Edit(_) => "Tab next field · ←/→ shell · Enter save · Esc cancel",
-            Mode::ConfirmDelete(_) => "Enter delete · Esc keep",
-            Mode::ConfirmInstall { .. } => "Enter install · Esc cancel",
+            Field::Target
+                if !suggestions(self.hosts.as_deref().unwrap_or_default(), remotes, d)
+                    .is_empty() =>
+            {
+                "Tab next field · ↓ ssh-config Hosts · Enter save · Esc cancel"
+            }
+            Field::Shell => "←/→ change shell · Tab next field · Enter save · Esc cancel",
+            Field::Name | Field::Target => "Tab next field · Enter save · Esc cancel",
         }
     }
 
-    /// [`Self::hint`], offering `I` when the selected row has something to
-    /// install, and ←/→ in a confirm with more than one choice.
-    fn hint_for(&self, remotes: &[Remote]) -> &'static str {
-        match self.mode {
-            Mode::Browse if !self.installable(self.selected, remotes).is_empty() => {
-                "↑/↓ · Enter edit · A add · T test · I install · Del delete · Esc back"
-            }
-            Mode::ConfirmInstall { row, .. } if self.installable(row, remotes).len() > 1 => {
-                "Enter install · ←/→ other agent · Esc cancel"
-            }
-            _ => self.hint(remotes.len()),
-        }
+    /// True while Tab is the pane's own key (moving fields, or choosing the
+    /// agent in an install confirm), so the menu leaves it alone.
+    pub fn owns_tab(&self) -> bool {
+        matches!(self.mode, Mode::Edit(_) | Mode::ConfirmInstall { .. })
     }
 
     /// Render one frame. `remotes` is the live list, mutated in place.
@@ -1100,49 +1111,47 @@ impl RemotesView {
 
         let th = crate::theme::live(ui.ctx());
         ui.painter_at(rect).rect_filled(rect, 0.0, th.win_bg);
-        // The Keybindings pane's left edge: the child spans the pane, rows
-        // inset their text by ROW_PAD.
+        // No title and no hint here: the settings title band names the
+        // pane and the footer carries the keys (`footer`).
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
         let ui = &mut child;
         ui.set_clip_rect(rect);
         ui.visuals_mut().override_text_color = Some(th.text);
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("Remotes")
-                .color(th.border_focus)
-                .size(16.0)
-                .strong(),
-        );
-        // Truncated, never wrapped: a second line would push the list down
-        // whenever the hint changes. The copy is short enough not to need
-        // the cut at the pane's minimum width; `hint_fits` proves it.
-        let hint = self.hint_for(remotes);
-        self.laid.hint_fits = ui
-            .painter()
-            .layout_no_wrap(hint.into(), egui::FontId::proportional(11.5), th.dim)
-            .size()
-            .x
-            <= ui.available_width();
-        self.laid.hint = ui
-            .add(egui::Label::new(egui::RichText::new(hint).color(th.dim).size(11.5)).truncate())
-            .rect;
-        ui.add_space(8.0);
+        // Rows are allocated edge to edge, as in the other panes; clusters
+        // set their own spacing.
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
 
         let mut acts: Vec<Act> = Vec::new();
         self.laid.list = egui::ScrollArea::vertical()
             .id_salt("remotes_pane")
             .auto_shrink([false, false])
-            .max_height((rect.height() - 110.0).max(60.0))
+            .max_height((rect.height() - FOOT_H).max(60.0))
             .show(ui, |ui| self.render_rows(ui, remotes, active, &mut acts))
             .inner_rect;
 
-        ui.add_space(6.0);
-        ui.separator();
+        // The separator and the message line, pinned under the list. One
+        // line, cut with "…" and whole on hover, so nothing moves.
+        let sep_y = self.laid.list.max.y + 6.0;
+        let (l, r) = (rect.min.x + PAD, rect.max.x - PAD);
+        ui.painter().hline(
+            egui::Rangef::new(l, r),
+            sep_y,
+            egui::Stroke::new(1.0, th.border),
+        );
         if let Some(msg) = self
             .confirm_footer(remotes)
             .or_else(|| self.message.clone())
         {
-            ui.label(egui::RichText::new(msg).color(th.dim).size(11.5));
+            let line = egui::Rect::from_min_max(
+                egui::pos2(l, sep_y + 4.0),
+                egui::pos2(r, sep_y + 4.0 + LINE_H),
+            );
+            let mut c = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(line)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            c.add(egui::Label::new(egui::RichText::new(msg).color(th.dim).size(11.5)).truncate());
         }
 
         for a in acts {
@@ -1224,26 +1233,33 @@ impl RemotesView {
             Mode::Edit(d) => Some(d.index),
             _ => None,
         };
+        let w = ui.available_width();
         for (i, r) in remotes.iter().enumerate() {
             if editing == Some(Some(i)) {
                 self.render_form(ui, remotes, active, scroll_to, acts);
+                ui.add_space(ITEM_GAP);
                 continue;
             }
             let selected = i == self.selected && editing.is_none();
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), ROW_H),
-                egui::Sense::click(),
-            );
+            // The whole item at once, its height fixed in every state, so
+            // the wash covers all three lines and nothing below ever moves.
+            let (item, resp) = ui.allocate_exact_size(egui::vec2(w, ITEM_H), egui::Sense::click());
             if resp.clicked() {
                 acts.push(Act::Select(i));
             }
             if selected {
                 ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(4), th.sel_bg);
+                    .rect_filled(wash(item), egui::CornerRadius::same(4), th.sel_bg);
                 if scroll_to {
-                    ui.scroll_to_rect(rect, None);
+                    ui.scroll_to_rect(item, None);
                 }
             }
+            let row = egui::Rect::from_min_size(item.min, egui::vec2(w, ROW_H));
+            let status_rect = egui::Rect::from_min_max(
+                egui::pos2(item.min.x + PAD, row.max.y),
+                egui::pos2(item.max.x - PAD, row.max.y + LINE_H),
+            );
+            let agents_rect = status_rect.translate(egui::vec2(0.0, LINE_H));
             let reach = remote_probe::reach(ui.ctx(), &r.target);
             let (dot, reach_text, why) = match &reach {
                 Reach::Checking => (th.dim, "checking…", None),
@@ -1253,43 +1269,41 @@ impl RemotesView {
             };
 
             // Status and buttons first, right to left; the text gets the rest.
-            let mut row = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rect.shrink2(egui::vec2(ROW_PAD, 0.0)))
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
-            );
+            let mut row_ui = cluster(ui, row);
+            let row_ui = &mut row_ui;
             if let Mode::ConfirmDelete(d) = self.mode
                 && d == i
             {
-                if row.small_button("keep").clicked() {
+                if row_ui.small_button("keep").clicked() {
                     acts.push(Act::Key(Key::Esc));
                 }
-                if row
+                if row_ui
                     .small_button(egui::RichText::new("delete").color(th.danger))
                     .clicked()
                 {
                     acts.push(Act::Key(Key::Enter));
                 }
-                row.label(egui::RichText::new(format!("Delete {}?", r.name)).color(th.danger));
+                row_ui.label(egui::RichText::new(format!("Delete {}?", r.name)).color(th.danger));
             } else if let Mode::ConfirmInstall { row: c, provider } = self.mode
                 && c == i
             {
                 // The delete confirm's shape: answer buttons, then the
                 // question naming the agent and the Remote.
-                if row.small_button("cancel").clicked() {
+                if row_ui.small_button("cancel").clicked() {
                     acts.push(Act::Key(Key::Esc));
                 }
-                if row
+                if row_ui
                     .small_button(egui::RichText::new("install").color(th.border_focus))
                     .clicked()
                 {
                     acts.push(Act::Key(Key::Enter));
                 }
                 // Shortened to fit, never cut: the Remote's name stays.
-                let font = egui::TextStyle::Body.resolve(row.style());
-                let room = row.available_width();
+                let font = egui::TextStyle::Body.resolve(row_ui.style());
+                let room = row_ui.available_width();
                 let fits = |q: &str| {
-                    row.painter()
+                    row_ui
+                        .painter()
                         .layout_no_wrap(q.to_string(), font.clone(), th.text)
                         .size()
                         .x
@@ -1302,30 +1316,30 @@ impl RemotesView {
                 let mut job = egui::text::LayoutJob::simple(q.clone(), font.clone(), th.text, room);
                 job.wrap.max_rows = 2;
                 job.wrap.break_anywhere = true;
-                let galley = row.painter().layout_job(job);
+                let galley = row_ui.painter().layout_job(job);
                 self.laid.question = Some((q, !galley.elided));
-                row.add(egui::Label::new(galley));
+                row_ui.add(egui::Label::new(galley));
             } else {
-                if row.small_button("delete").clicked() {
+                if row_ui.small_button("delete").clicked() {
                     acts.push(Act::AskDelete(i));
                 }
-                if row.small_button("edit").clicked() {
+                if row_ui.small_button("edit").clicked() {
                     acts.push(Act::Edit(i));
                 }
                 let running = self.tests.get(&r.target).is_some_and(|e| e.running);
-                if row
+                if row_ui
                     .add_enabled(!running, egui::Button::new("test").small())
                     .clicked()
                 {
                     acts.push(Act::Test(i));
                 }
-                row.add_space(8.0);
-                let label = row.label(egui::RichText::new(reach_text).color(dot).size(11.5));
+                row_ui.add_space(4.0);
+                let label = row_ui.label(egui::RichText::new(reach_text).color(dot).size(11.5));
                 if let Some(why) = &why {
                     label.on_hover_text(why);
                 }
             }
-            let controls = row.min_rect();
+            let controls = row_ui.min_rect();
 
             let name_color = if reach == Reach::Offline {
                 th.dim
@@ -1333,16 +1347,15 @@ impl RemotesView {
                 th.text
             };
             let sub_text = format!("{} · {}", r.target, shell_label(r.shell));
-            let left = rect.min.x + ROW_PAD;
+            let left = row.min.x + PAD;
             let room = (controls.min.x - 8.0 - left).max(0.0);
-            let name = one_line(ui, &r.name, egui::FontId::proportional(13.0), room);
-            let sub = one_line(ui, &sub_text, egui::FontId::monospace(11.0), room);
-            let name_at = egui::pos2(left, rect.min.y + 14.0 - name.size().y / 2.0);
-            let sub_at = egui::pos2(left, rect.min.y + 30.0 - sub.size().y / 2.0);
+            let name = one_line(ui, &r.name, egui::FontId::proportional(LABEL_PT), room);
+            let sub = one_line(ui, &sub_text, egui::FontId::monospace(DESC_PT), room);
+            let name_at = egui::pos2(left, row.min.y + LABEL_Y - name.size().y / 2.0);
+            let sub_at = egui::pos2(left, row.min.y + DESC_Y - sub.size().y / 2.0);
             // Elided to nothing when the controls take the row (a wrapped
             // question): even a lone "…" would run under them.
-            let mut text =
-                egui::Rect::from_min_size(egui::pos2(left, rect.min.y), egui::Vec2::ZERO);
+            let mut text = egui::Rect::from_min_size(egui::pos2(left, row.min.y), egui::Vec2::ZERO);
             let elided = name.elided || sub.elided;
             for (at, g, color) in [(name_at, name, name_color), (sub_at, sub, th.dim)] {
                 if g.size().x <= room {
@@ -1371,10 +1384,11 @@ impl RemotesView {
                     .and_then(|a| a.states.as_ref())
                     .and_then(|s| s.iter().find(|(p, _)| *p == provider))
                     .map(|(p, st)| crate::remote_install::offer(&r.name, r.shell, p, st));
-                let (rect, elided) = confirm_block(ui, offer.as_ref());
+                let (rect, elided) =
+                    confirm_block(ui, status_rect.union(agents_rect), offer.as_ref());
                 self.laid.confirm = Some(rect);
                 self.laid.confirm_elided = elided;
-                ui.add_space(2.0);
+                ui.add_space(ITEM_GAP);
                 continue;
             }
             let status = match self.tests.get(&r.target) {
@@ -1391,26 +1405,27 @@ impl RemotesView {
                 _ if selected => why.map(|w| (w, th.dim)),
                 _ => None,
             };
-            self.laid.status.push(status_line(ui, status));
+            self.laid.status.push(status_line(ui, status_rect, status));
             // Reserved on every row, tested or not, so a Test landing never
             // moves the rows below. A re-run keeps the last answer here.
             let pieces = agents.as_ref().map_or(&[][..], |a| &a.pieces[..]);
-            let line = agents_line_ui(ui, pieces, |p| acts.push(Act::AskInstall(i, p)));
+            let line = agents_line_ui(ui, agents_rect, pieces, |p| {
+                acts.push(Act::AskInstall(i, p))
+            });
             self.laid.agents.push(line.rect);
             self.laid.installs.extend(line.installs);
             self.laid.agents_fit &= line.fits;
-            ui.add_space(2.0);
+            ui.add_space(ITEM_GAP);
         }
 
         if editing == Some(None) {
             self.render_form(ui, remotes, active, scroll_to, acts);
         } else {
             let selected = self.selected >= remotes.len() && self.mode == Mode::Browse;
-            let (rect, resp) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
             if selected {
                 ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(4), th.sel_bg);
+                    .rect_filled(wash(rect), egui::CornerRadius::same(4), th.sel_bg);
                 if scroll_to {
                     ui.scroll_to_rect(rect, None);
                 }
@@ -1421,10 +1436,10 @@ impl RemotesView {
                 th.dim
             };
             ui.painter().text(
-                egui::pos2(rect.min.x + ROW_PAD, rect.center().y),
+                egui::pos2(rect.min.x + PAD, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 "+ Add Remote",
-                egui::FontId::proportional(12.5),
+                egui::FontId::proportional(LABEL_PT),
                 color,
             );
             if resp.clicked() {
@@ -1433,8 +1448,9 @@ impl RemotesView {
         }
     }
 
-    /// The inline add/edit form, in place of its row (or after the list):
-    /// one label/field row each, as wide as the pane allows.
+    /// The add/edit form, in place of its row (or after the list): the
+    /// Remote expanded into ordinary settings rows on the pane background,
+    /// marked by a focus bar down its left edge.
     fn render_form(
         &mut self,
         ui: &mut egui::Ui,
@@ -1486,284 +1502,306 @@ impl RemotesView {
         // Where this frame's scroll request goes: the active field, or the
         // error and buttons after a refused save.
         let mut active_rect = None;
-        // The focused Directory field, to scroll it into view with the
-        // list area it shares.
-        let mut dir_rect: Option<egui::Rect> = None;
         let mut error_rect = None;
         let mut note_fits = true;
-        let frame = egui::Frame::new()
-            .fill(th.sel_bg)
-            .corner_radius(egui::CornerRadius::same(4))
-            .inner_margin(egui::Margin::same(8));
-        let shown = frame.show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = egui::vec2(FORM_GAP, 6.0);
-            let r = form_row(ui, "Name", th.dim, |ui| {
-                ui.add(
+        let w = ui.available_width();
+        let fw = field_w(w);
+        let top = ui.cursor().min;
+
+        // The header: the Remote's name, and save and cancel where its
+        // delete and keep sit when collapsed.
+        let (title, sub) = match d.index.and_then(|i| remotes.get(i)) {
+            Some(r) => (
+                r.name.clone(),
+                Some(format!("{} · {}", r.target, shell_label(r.shell))),
+            ),
+            None => ("New Remote".to_string(), None),
+        };
+        let (_, (save, cancel)) = settings_row(ui, &title, sub.as_deref().map(Desc::Mono), |ui| {
+            let cancel = ui.small_button("cancel");
+            if cancel.clicked() {
+                acts.push(Act::Key(Key::Esc));
+            }
+            let save = ui.small_button("save");
+            if save.clicked() {
+                acts.push(Act::Key(Key::Enter));
+            }
+            (save.rect, cancel.rect)
+        });
+        let buttons = save.union(cancel);
+        // A refused save, in the danger colour like a Keybindings conflict,
+        // right under the buttons; focus is already on the bad field. The
+        // line is reserved, so an error appearing moves nothing. Cut from
+        // the front: the reason is at the end.
+        let (err_line, _) = ui.allocate_exact_size(egui::vec2(w, LINE_H), egui::Sense::hover());
+        if let Some(e) = &d.error {
+            let r = err_line.shrink2(egui::vec2(PAD, 0.0));
+            let font = egui::FontId::proportional(11.5);
+            let (shown, cut) = elide_front(ui, e, &font, r.width());
+            let g = ui.painter().layout_no_wrap(shown, font, th.danger);
+            let at = egui::pos2(r.min.x, r.center().y - g.size().y / 2.0);
+            error_rect = Some(buttons.union(egui::Rect::from_min_size(at, g.size())));
+            ui.painter().galley(at, g, th.danger);
+            if cut {
+                ui.interact(r, egui::Id::new("remotes_edit_error"), egui::Sense::hover())
+                    .on_hover_text(e);
+            }
+        }
+
+        let (_, name) = settings_row(
+            ui,
+            "Name",
+            Some(Desc::Words("What the launcher calls it")),
+            |ui| {
+                ui.add_sized(
+                    egui::vec2(fw, FIELD_H),
                     egui::TextEdit::singleline(&mut d.name)
                         .id(name_id)
                         .lock_focus(true) // Tab is ours: it moves fields
-                        .hint_text("desk")
-                        .desired_width(f32::INFINITY),
+                        .hint_text("desk"),
                 )
-            });
-            laid.push(r.rect);
-            if d.field == Field::Name {
-                active_rect = Some(r.rect);
-            }
-            if r.clicked() {
-                acts.push(Act::Field(Field::Name));
-            }
-            if r.changed() {
-                d.error = None;
-            }
-            let r = form_row(ui, "Target", th.dim, |ui| {
-                ui.add(
+            },
+        );
+        laid.push(name.rect);
+        if d.field == Field::Name {
+            active_rect = Some(name.rect);
+        }
+        if name.clicked() {
+            acts.push(Act::Field(Field::Name));
+        }
+        if name.changed() {
+            d.error = None;
+        }
+
+        let (_, target) = settings_row(
+            ui,
+            "Target",
+            Some(Desc::Words("user@pc or an ssh-config Host")),
+            |ui| {
+                ui.add_sized(
+                    egui::vec2(fw, FIELD_H),
                     egui::TextEdit::singleline(&mut d.target)
                         .id(target_id)
                         .lock_focus(true)
-                        .hint_text("user@pc or ssh-config Host")
-                        .desired_width(f32::INFINITY),
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("user@pc"),
                 )
+            },
+        );
+        laid.push(target.rect);
+        if d.field == Field::Target {
+            active_rect = Some(target.rect);
+        }
+        if target.clicked() {
+            acts.push(Act::Field(Field::Target));
+        }
+        if target.changed() {
+            d.pick = None;
+            d.error = None;
+        }
+        if !hosts.is_empty() {
+            // One fixed line whether or not Target is active, so the form
+            // does not grow when focus moves.
+            let offered = if d.field == Field::Target {
+                suggestions(hosts, remotes, d)
+            } else {
+                Vec::new()
+            };
+            let (line, _) = ui.allocate_exact_size(egui::vec2(w, LINE_H), egui::Sense::hover());
+            let mut c = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(line.shrink2(egui::vec2(PAD, 0.0)))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            egui::ScrollArea::horizontal()
+                .id_salt("remotes_hosts")
+                .show(&mut c, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let small = |t: &str| egui::RichText::new(t).color(th.dim).size(DESC_PT);
+                        if offered.is_empty() {
+                            ui.label(small(if d.field == Field::Target {
+                                "No ~/.ssh/config Host starts with that"
+                            } else {
+                                "~/.ssh/config Hosts are offered in Target"
+                            }));
+                        } else {
+                            ui.label(small("~/.ssh/config:"));
+                        }
+                        for (i, host) in offered.iter().enumerate() {
+                            let picked = d.pick == Some(i);
+                            let (r, resp) =
+                                chip(ui, host, egui::FontId::monospace(DESC_PT), 14.0, picked);
+                            if picked && scroll {
+                                ui.scroll_to_rect(r, None);
+                            }
+                            if resp.clicked() {
+                                acts.push(Act::Accept(host.to_string()));
+                            }
+                        }
+                    });
+                });
+        }
+
+        let shell_on = active && d.field == Field::Shell;
+        let (_, (shell_rect, shell_clicked)) =
+            settings_row(ui, "Shell", Some(Desc::Words("Test fills this in")), |ui| {
+                let (r, resp) = chip(
+                    ui,
+                    shell_label(d.shell),
+                    egui::FontId::proportional(CHIP_PT),
+                    22.0,
+                    shell_on,
+                );
+                (r, resp.clicked())
             });
-            laid.push(r.rect);
-            if d.field == Field::Target {
-                active_rect = Some(r.rect);
+        laid.push(shell_rect);
+        if d.field == Field::Shell {
+            active_rect = Some(shell_rect);
+        }
+        if shell_clicked {
+            acts.push(Act::Field(Field::Shell));
+            acts.push(Act::Key(Key::Right));
+        }
+
+        // The Project directories this Remote has answered for: the one
+        // place a wrong directory-prompt answer can be fixed.
+        if d.index.is_some() {
+            section_header(ui, w, "Project directories");
+            if d.dirs.is_empty() {
+                let text = "None yet: a Project's first launch on it asks";
+                let (line, _) =
+                    ui.allocate_exact_size(egui::vec2(w, LINE_H + 6.0), egui::Sense::hover());
+                let font = egui::FontId::proportional(DESC_PT);
+                let room = line.width() - 2.0 * PAD;
+                note_fits = ui
+                    .painter()
+                    .layout_no_wrap(text.into(), font.clone(), th.dim)
+                    .size()
+                    .x
+                    <= room;
+                let g = one_line(ui, text, font, room);
+                ui.painter().galley(
+                    egui::pos2(line.min.x + PAD, line.center().y - g.size().y / 2.0),
+                    g,
+                    th.dim,
+                );
             }
-            if r.clicked() {
-                acts.push(Act::Field(Field::Target));
+        }
+        for k in 0..d.dirs.len() {
+            if d.field == Field::Dir(k) {
+                browse.pin_caret(&ctx, dir_id(k), &d.dirs[k].remote);
             }
-            if r.changed() {
-                d.pick = None;
+            let full = remote::plain_dir(&d.dirs[k].project);
+            let label = project_name(&d.dirs[k].project);
+            let row = &mut d.dirs[k];
+            let (_, (edit, clear)) = settings_row(ui, &label, Some(Desc::Path(&full)), |ui| {
+                let clear = ui
+                    .small_button("clear")
+                    .on_hover_text("Forget it: the next launch from this Project asks again");
+                if clear.clicked() {
+                    acts.push(Act::ClearDir(k));
+                }
+                // The field column's left edge, shared with Name and Target.
+                let width = (fw - clear.rect.width() - CLUSTER_GAP).max(60.0);
+                let edit = ui.add_sized(
+                    egui::vec2(width, FIELD_H),
+                    egui::TextEdit::singleline(&mut row.remote)
+                        .id(dir_id(k))
+                        .lock_focus(true)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("(home)"),
+                );
+                (edit, clear.rect)
+            });
+            laid.push(edit.rect);
+            laid.push(clear);
+            if edit.clicked() {
+                acts.push(Act::Field(Field::Dir(k)));
+            }
+            if edit.changed() {
                 d.error = None;
             }
-            if !hosts.is_empty() {
-                // One fixed line whether or not Target is active, so the
-                // form does not grow when focus moves.
-                let offered = if d.field == Field::Target {
-                    suggestions(hosts, remotes, d)
+            if d.field != Field::Dir(k) {
+                continue;
+            }
+            active_rect = Some(edit.rect);
+            // The folder list, directly under the focused Directory row:
+            // the same height whatever it shows, so a listing landing moves
+            // nothing.
+            let body_h = BROWSE_ROWS * crate::remote_browse_ui::ROW_H;
+            let h = Browser::height(ui, body_h);
+            let (outer, _) =
+                ui.allocate_exact_size(egui::vec2(w, h + PICK_GAP), egui::Sense::hover());
+            let area = egui::Rect::from_min_size(
+                egui::pos2(outer.min.x + PAD, outer.min.y),
+                egui::vec2(w - 2.0 * PAD, h),
+            );
+            let mut c = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(area)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            let target = d.target.trim();
+            if remote::valid_target(target) {
+                let name = if d.name.trim().is_empty() {
+                    target
                 } else {
-                    Vec::new()
+                    d.name.trim()
                 };
-                ui.horizontal(|ui| {
-                    ui.set_min_height(LINE_H);
-                    ui.add_space(LABEL_W + FORM_GAP);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("remotes_hosts")
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let small =
-                                    |t: &str| egui::RichText::new(t).color(th.dim).size(11.0);
-                                if offered.is_empty() {
-                                    ui.label(small(if d.field == Field::Target {
-                                        "No ~/.ssh/config Host starts with that"
-                                    } else {
-                                        "~/.ssh/config Hosts are offered in Target"
-                                    }));
-                                }
-                                if !offered.is_empty() {
-                                    ui.label(small("~/.ssh/config:"));
-                                }
-                                for (i, host) in offered.iter().enumerate() {
-                                    let picked = d.pick == Some(i);
-                                    let text = egui::RichText::new(*host).monospace().size(11.0);
-                                    let r = ui.selectable_label(picked, text);
-                                    if picked && scroll {
-                                        ui.scroll_to_rect(r.rect, None);
-                                    }
-                                    if r.clicked() {
-                                        acts.push(Act::Accept(host.to_string()));
-                                    }
-                                }
-                            });
-                        });
-                });
-            }
-            let r = form_row(ui, "Shell", th.dim, |ui| {
-                let mut chip = egui::Button::new(shell_label(d.shell)).small();
-                if d.field == Field::Shell {
-                    chip = chip.stroke(egui::Stroke::new(1.0, th.border_focus));
-                }
-                ui.add(chip).on_hover_text("Test fills this in")
-            });
-            laid.push(r.rect);
-            if d.field == Field::Shell {
-                active_rect = Some(r.rect);
-            }
-            if r.clicked() {
-                acts.push(Act::Field(Field::Shell));
-                acts.push(Act::Key(Key::Right));
-            }
-            // The Project directories this Remote has answered for: the one
-            // place a wrong directory-prompt answer can be fixed.
-            if d.index.is_some() {
-                let text = if d.dirs.is_empty() {
-                    "No Project directories yet: a Project's first launch asks"
-                } else {
-                    "Project directories (blank is the home directory)"
-                };
-                ui.horizontal(|ui| {
-                    ui.add_space(LABEL_W + FORM_GAP);
-                    note_fits = ui
-                        .painter()
-                        .layout_no_wrap(text.into(), egui::FontId::proportional(11.0), th.dim)
-                        .size()
-                        .x
-                        <= ui.available_width();
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).color(th.dim).size(11.0))
-                            .truncate(),
-                    );
-                });
-            }
-            for k in 0..d.dirs.len() {
-                let row = &mut d.dirs[k];
-                // Each Project starts a pair; the gap ties a Directory to
-                // the Project above it, not the one below.
-                ui.add_space(PAIR_GAP);
-                form_row(ui, "Project", th.dim, |ui| {
-                    // Cut from the front: Projects under one long parent
-                    // differ at the end.
-                    let full = remote::plain_dir(&row.project);
-                    let font = egui::FontId::monospace(11.0);
-                    let (shown, cut) = elide_front(ui, &full, &font, ui.available_width());
-                    let label = ui.add(
-                        egui::Label::new(egui::RichText::new(shown).font(font).color(th.text))
-                            .extend(),
-                    );
-                    if cut {
-                        label.on_hover_text(full);
-                    }
-                });
-                if d.field == Field::Dir(k) {
-                    browse.pin_caret(&ctx, dir_id(k), &row.remote);
-                }
-                let r = form_row(ui, "Directory", th.dim, |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let clear = ui.small_button("clear").on_hover_text(
-                            "Forget it: the next launch from this Project asks again",
-                        );
-                        if clear.clicked() {
-                            acts.push(Act::ClearDir(k));
-                        }
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut row.remote)
-                                .id(dir_id(k))
-                                .lock_focus(true)
-                                .hint_text("home directory")
-                                .desired_width(f32::INFINITY),
-                        );
-                        (edit, clear.rect)
-                    })
-                    .inner
-                });
-                let (edit, clear) = r;
-                laid.push(edit.rect);
-                laid.push(clear);
-                if d.field == Field::Dir(k) {
-                    active_rect = Some(edit.rect);
-                    dir_rect = Some(edit.rect);
-                }
-                if edit.clicked() {
-                    acts.push(Act::Field(Field::Dir(k)));
-                }
-                if edit.changed() {
+                browse.set_source(target, d.shell, name);
+                let project = project_name(&d.dirs[k].project);
+                if browse.show(
+                    &mut c,
+                    &mut d.dirs[k].remote,
+                    body_h,
+                    active,
+                    Some(&project),
+                ) {
                     d.error = None;
                 }
+                // The field and its list together when they fit the view;
+                // else whichever has the keyboard.
+                let area = browse.laid.area;
+                let fits = |r: egui::Rect| r.height() <= ui.clip_rect().height();
+                // A margin, so neither sits flush on the edge.
+                let both = edit.rect.union(area).expand2(egui::vec2(0.0, 4.0));
+                active_rect = if fits(both) {
+                    Some(both)
+                } else if browse.list_focused() {
+                    Some(area)
+                } else {
+                    Some(edit.rect)
+                };
+            } else {
+                crate::remote_browse_ui::idle(
+                    &mut c,
+                    body_h,
+                    "Give a Target to list its folders",
+                    &mut browse.laid,
+                );
             }
-            // One reserved area for whichever Directory is focused, after
-            // all of them: the same height focused or not, listed or not,
-            // so no row moves as focus or a listing comes and goes.
-            if !d.dirs.is_empty() {
-                ui.add_space(PAIR_GAP);
-                ui.horizontal(|ui| {
-                    ui.add_space(LABEL_W + FORM_GAP);
-                    let body_h = BROWSE_ROWS * crate::remote_browse_ui::ROW_H;
-                    let target = d.target.trim();
-                    let name = if d.name.trim().is_empty() {
-                        target
-                    } else {
-                        d.name.trim()
-                    };
-                    match d.field {
-                        Field::Dir(k) if k < d.dirs.len() && remote::valid_target(target) => {
-                            browse.set_source(target, d.shell, name);
-                            // One area serves every Directory: say whose.
-                            let project = project_name(&d.dirs[k].project);
-                            let row = &mut d.dirs[k].remote;
-                            if browse.show(ui, row, body_h, active, Some(&project)) {
-                                d.error = None;
-                            }
-                            // The field and its list together when they fit
-                            // the view; else whichever has the keyboard.
-                            let area = browse.laid.area;
-                            let fits = |r: egui::Rect| r.height() <= ui.clip_rect().height();
-                            // A margin, so neither sits flush on the edge.
-                            let both =
-                                dir_rect.map(|f| f.union(area).expand2(egui::vec2(0.0, 4.0)));
-                            active_rect = match both {
-                                Some(both) if fits(both) => Some(both),
-                                _ if browse.list_focused() => Some(area),
-                                other => dir_rect.or(other),
-                            };
-                        }
-                        Field::Dir(_) => crate::remote_browse_ui::idle(
-                            ui,
-                            body_h,
-                            "Give a Target to list its folders",
-                            &mut browse.laid,
-                        ),
-                        _ if remote::valid_target(target) => crate::remote_browse_ui::idle(
-                            ui,
-                            body_h,
-                            &format!("Click a Directory field to browse folders on {name}"),
-                            &mut browse.laid,
-                        ),
-                        _ => crate::remote_browse_ui::idle(
-                            ui,
-                            body_h,
-                            "Click a Directory field to browse its folders",
-                            &mut browse.laid,
-                        ),
-                    }
-                });
-            }
-            // A refused save, in the danger colour like a Keybindings
-            // conflict, under the fields; focus is already on the bad one.
-            // The line is reserved, so an error appearing does not push the
-            // buttons down.
-            ui.horizontal_top(|ui| {
-                ui.set_min_height(LINE_H);
-                ui.add_space(LABEL_W + FORM_GAP);
-                if let Some(e) = &d.error {
-                    let r = ui.add(
-                        egui::Label::new(egui::RichText::new(e).color(th.danger).size(11.5)).wrap(),
-                    );
-                    error_rect = Some(r.rect);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(LABEL_W + FORM_GAP);
-                let save = if d.index.is_some() { "save" } else { "add" };
-                let r = ui.small_button(save);
-                laid.push(r.rect);
-                let buttons = r.rect;
-                if r.clicked() {
-                    acts.push(Act::Key(Key::Enter));
-                }
-                let r = ui.small_button("cancel");
-                laid.push(r.rect);
-                if r.clicked() {
-                    acts.push(Act::Key(Key::Esc));
-                }
-                error_rect = error_rect.map(|e| e.union(buttons.union(r.rect)));
-            });
-        });
+        }
+        ui.add_space(4.0);
+        laid.push(save);
+        laid.push(cancel);
+
+        // The rail's idiom: a focus bar down the left edge marks the item
+        // being edited; no fill.
+        let form = egui::Rect::from_min_max(top, egui::pos2(top.x + w, ui.cursor().min.y));
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(form.min.x + WASH_INSET, form.min.y),
+                egui::vec2(2.0, form.height()),
+            ),
+            0.0,
+            th.border_focus,
+        );
         self.laid.error = error_rect;
         self.laid.dirs_note_fits = note_fits;
         // After the hosts strip's own scroll, so this one wins the list's.
         // A refused save shows its error with the buttons; otherwise the
-        // active field, which on opening is Name at the top of the form.
+        // active field, which on opening is Name near the top of the form.
         let error_to = error_rect.filter(|_| show_error > 0);
         if let Some(to) = error_to {
             // At once, not animated: the buttons must be there for the next
@@ -1775,8 +1813,7 @@ impl RemotesView {
             }
         } else if scroll {
             // On Name (where the form opens) the whole form when it fits, so
-            // its buttons show too, below rows that carry two lines each.
-            let form = shown.response.rect;
+            // its buttons and fields show together.
             let on_name = matches!(&self.mode, Mode::Edit(d) if d.field == Field::Name);
             match active_rect {
                 Some(r) if !on_name || form.height() > ui.clip_rect().height() => {
@@ -1785,28 +1822,46 @@ impl RemotesView {
                 _ => ui.scroll_to_rect_animation(form, None, egui::style::ScrollAnimation::none()),
             }
         }
-        ui.add_space(4.0);
     }
 }
 
-/// A row's height: name over target · shell.
-const ROW_H: f32 = 42.0;
-/// Row text inset, the Keybindings pane's.
-const ROW_PAD: f32 = 6.0;
+// The settings rows' grammar (settings_menu `draw_pane`, appearance.rs).
+/// A row's height.
+const ROW_H: f32 = 46.0;
+/// Left and right pad of every row's content.
+const PAD: f32 = 18.0;
+/// Label and description: size and centre line from the row's top.
+const LABEL_PT: f32 = 13.0;
+const LABEL_Y: f32 = 16.0;
+const DESC_PT: f32 = 11.0;
+const DESC_Y: f32 = 32.0;
+/// A chip control's text size (Kind::Choice).
+const CHIP_PT: f32 = 12.5;
+/// A text field's height.
+const FIELD_H: f32 = 24.0;
+/// The selection wash's inset from the pane's sides (draw_pane's).
+const WASH_INSET: f32 = 6.0;
+/// Space between a cluster's controls.
+const CLUSTER_GAP: f32 = 6.0;
 /// The line reserved under each row, and for the hosts strip.
 pub(crate) const LINE_H: f32 = 18.0;
-/// The form's label column.
-pub(crate) const LABEL_W: f32 = 52.0;
-pub(crate) const FORM_GAP: f32 = 8.0;
+/// A collapsed Remote: its row, its status line and its agents line.
+const ITEM_H: f32 = ROW_H + 2.0 * LINE_H;
+/// Between one item and the next, so a wash never touches its neighbour.
+const ITEM_GAP: f32 = 4.0;
+/// A section header (appearance.rs `section_header`).
+const HEADER_H: f32 = 30.0;
+/// Under the folder list, before the next row.
+const PICK_GAP: f32 = 6.0;
+/// The separator and message line under the list.
+const FOOT_H: f32 = 6.0 + 4.0 + LINE_H + 4.0;
 
 /// The offline tooltip, and the selected row's reason line.
 pub(crate) const OFFLINE_WHY: &str = "No TCP answer on its SSH port. This check cannot see past a \
      ProxyJump, so Test it or open a Remote Session to be sure.";
 
-/// Space before each Project/Directory pair in the form.
-const PAIR_GAP: f32 = 6.0;
-
-/// A Project directory's last component, the name the folder list gives it.
+/// A Project directory's last component, the name its row and the folder
+/// list give it.
 fn project_name(project: &str) -> String {
     let full = remote::plain_dir(project);
     let trimmed = full.trim_end_matches(['\\', '/']);
@@ -1817,8 +1872,138 @@ fn project_name(project: &str) -> String {
 }
 
 /// Folder rows the form's list shows before it scrolls: few enough that a
-/// Directory field and the list fit the pane's view at its minimum height.
+/// Directory row and the list fit the pane's view at its minimum height.
 const BROWSE_ROWS: f32 = 4.0;
+
+/// A text field's width in a row `w` wide: the settings menu's.
+fn field_w(w: f32) -> f32 {
+    (w - 220.0).clamp(160.0, 300.0)
+}
+
+/// The selection wash for an item or row: its whole height, inset from the
+/// pane's sides.
+fn wash(r: egui::Rect) -> egui::Rect {
+    r.shrink2(egui::vec2(WASH_INSET, 0.0))
+}
+
+/// A right-to-left child over `row`'s padded width, for its controls.
+fn cluster(ui: &mut egui::Ui, row: egui::Rect) -> egui::Ui {
+    let mut c = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row.shrink2(egui::vec2(PAD, 0.0)))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    c.spacing_mut().item_spacing = egui::vec2(CLUSTER_GAP, 0.0);
+    c
+}
+
+/// A row's dim description: words cut at the end, or a path in monospace
+/// cut at the front (whole on hover), or another machine string in
+/// monospace cut at the end.
+#[derive(Clone, Copy)]
+enum Desc<'a> {
+    Words(&'a str),
+    Path(&'a str),
+    Mono(&'a str),
+}
+
+/// One settings row: `label` over its description on the left, cut to stop
+/// short of the controls `control` draws right to left. Returns the row and
+/// what `control` returned.
+fn settings_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    desc: Option<Desc>,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Rect, R) {
+    let th = crate::theme::live(ui.ctx());
+    let w = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    let mut c = cluster(ui, row);
+    let out = control(&mut c);
+    let left = row.min.x + PAD;
+    let room = (c.min_rect().min.x - 8.0 - left).max(0.0);
+    let g = one_line(ui, label, egui::FontId::proportional(LABEL_PT), room);
+    let at = egui::pos2(left, row.min.y + LABEL_Y - g.size().y / 2.0);
+    ui.painter().galley(at, g, th.text);
+    if let Some(desc) = desc {
+        let (g, whole) = match desc {
+            Desc::Words(t) => (
+                one_line(ui, t, egui::FontId::proportional(DESC_PT), room),
+                None,
+            ),
+            Desc::Mono(t) => (
+                one_line(ui, t, egui::FontId::monospace(DESC_PT), room),
+                None,
+            ),
+            Desc::Path(t) => {
+                let font = egui::FontId::monospace(DESC_PT);
+                let (shown, cut) = elide_front(ui, t, &font, room);
+                let g = ui.painter().layout_no_wrap(shown, font, th.dim);
+                (g, cut.then_some(t))
+            }
+        };
+        let at = egui::pos2(left, row.min.y + DESC_Y - g.size().y / 2.0);
+        let r = egui::Rect::from_min_size(at, g.size());
+        ui.painter().galley(at, g, th.dim);
+        if let Some(whole) = whole {
+            ui.interact(
+                r,
+                ui.id().with(("remotes_desc", whole)),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(whole);
+        }
+    }
+    (row, out)
+}
+
+/// An outline chip, the settings choice control's look: 1 px border, no
+/// fill, `border_focus` when `on` or hovered.
+fn chip(
+    ui: &mut egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    h: f32,
+    on: bool,
+) -> (egui::Rect, egui::Response) {
+    let th = crate::theme::live(ui.ctx());
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font, th.text);
+    let pad = if h >= 20.0 { 12.0 } else { 5.0 };
+    let (r, resp) =
+        ui.allocate_exact_size(egui::vec2(g.size().x + 2.0 * pad, h), egui::Sense::click());
+    let border = if on || resp.hovered() {
+        th.border_focus
+    } else {
+        th.border
+    };
+    ui.painter().rect_stroke(
+        r,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(r.center() - g.size() / 2.0, g, th.text);
+    (r, resp)
+}
+
+/// A section header: small dim caps over a hairline.
+fn section_header(ui: &mut egui::Ui, w: f32, label: &str) {
+    let th = crate::theme::live(ui.ctx());
+    let (r, _) = ui.allocate_exact_size(egui::vec2(w, HEADER_H), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(r.left() + PAD, r.bottom() - 10.0),
+        egui::Align2::LEFT_CENTER,
+        label.to_uppercase(),
+        egui::FontId::proportional(DESC_PT),
+        th.dim,
+    );
+    ui.painter().hline(
+        egui::Rangef::new(r.left() + PAD, r.right() - PAD),
+        r.bottom() - 1.0,
+        egui::Stroke::new(1.0, th.border),
+    );
+}
 
 /// `text` on one line, its front cut with "…" so the rest fits `width`;
 /// and whether it was cut.
@@ -1865,46 +2050,23 @@ fn one_line(
     ui.painter().layout_job(job)
 }
 
-/// The form's label font: every label must fit [`LABEL_W`] in it.
-pub(crate) fn label_font() -> egui::FontId {
-    egui::FontId::proportional(11.5)
-}
-
-/// A form row: a dim label in a fixed column, then the field.
-pub(crate) fn form_row<R>(
-    ui: &mut egui::Ui,
-    label: &str,
-    color: egui::Color32,
-    field: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        let (r, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, h), egui::Sense::hover());
-        ui.painter().text(
-            r.left_center(),
-            egui::Align2::LEFT_CENTER,
-            label,
-            label_font(),
-            color,
-        );
-        field(ui)
-    })
-    .inner
-}
-
 /// The line under a row for its Test or reach reason. Always there and
 /// always one line, so a result arriving or the selection passing never
 /// moves the rows below; a long one is cut with "…", whole on hover.
-fn status_line(ui: &mut egui::Ui, status: Option<(String, egui::Color32)>) -> egui::Rect {
-    ui.horizontal(|ui| {
-        ui.set_height(LINE_H);
-        ui.add_space(ROW_PAD);
-        if let Some((text, color)) = status {
-            ui.add(egui::Label::new(egui::RichText::new(text).color(color).size(11.0)).truncate());
-        }
-    })
-    .response
-    .rect
+fn status_line(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    status: Option<(String, egui::Color32)>,
+) -> egui::Rect {
+    if let Some((text, color)) = status {
+        let mut c = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        c.add(egui::Label::new(egui::RichText::new(text).color(color).size(DESC_PT)).truncate());
+    }
+    rect
 }
 
 /// What [`agents_line_ui`] drew.
@@ -1915,61 +2077,80 @@ struct AgentsLine {
     fits: bool,
 }
 
-/// A row's agents line: words for each state, and an "install <agent>"
-/// row button beside each agent that can be installed. One line, always.
+/// A row's agents line: words for each state on the left, and an
+/// "install <agent>" (or "retry") button for each agent that can be
+/// installed in the line's right-hand cluster. One line, always.
 fn agents_line_ui(
     ui: &mut egui::Ui,
+    rect: egui::Rect,
     pieces: &[Piece],
     mut ask: impl FnMut(&'static str),
 ) -> AgentsLine {
     let th = crate::theme::live(ui.ctx());
     let mut installs = Vec::new();
     let mut fits = true;
-    let rect = ui
-        .horizontal(|ui| {
-            // Buttons never shrink: one past this edge is clipped away.
-            let right = ui.max_rect().right();
-            ui.set_height(LINE_H);
-            ui.add_space(ROW_PAD);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (k, piece) in pieces.iter().enumerate() {
-                if k > 0 && !matches!(piece, Piece::Install { retry: true, .. }) {
-                    ui.label(egui::RichText::new("·").color(th.dim).size(11.0));
-                }
-                match piece {
-                    Piece::Text { text, hover } => {
-                        fits &= ui
-                            .painter()
-                            .layout_no_wrap(text.clone(), egui::FontId::proportional(11.0), th.dim)
-                            .size()
-                            .x
-                            <= ui.available_width();
-                        let l = ui.add(
-                            egui::Label::new(egui::RichText::new(text).color(th.dim).size(11.0))
-                                .truncate(),
-                        );
-                        if let Some(h) = hover {
-                            l.on_hover_text(h);
-                        }
-                    }
-                    Piece::Install {
-                        provider,
-                        label,
-                        hover,
-                        ..
-                    } => {
-                        let b = ui.small_button(label);
-                        installs.push(b.rect);
-                        if b.on_hover_text(hover).clicked() {
-                            ask(provider);
-                        }
-                    }
-                }
+    // The buttons first, right to left, so the words know their room.
+    let mut buttons = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    buttons.spacing_mut().item_spacing.x = 4.0;
+    for piece in pieces.iter().rev() {
+        if let Piece::Install {
+            provider,
+            label,
+            hover,
+        } = piece
+        {
+            let b = buttons.small_button(label);
+            installs.push(b.rect);
+            if b.on_hover_text(hover).clicked() {
+                ask(provider);
             }
-            fits &= ui.min_rect().right() <= right + 0.5;
+        }
+    }
+    installs.reverse();
+    // Buttons never shrink: one past the line's start is clipped away.
+    fits &= installs.first().is_none_or(|b| b.min.x >= rect.min.x - 0.5);
+    let words_end = installs
+        .first()
+        .map_or(rect.max.x, |b| b.min.x - CLUSTER_GAP);
+    // One label, groups split by "; " (commas already list the agents in a
+    // group): the narrowest such line is what lets a three-state mix fit
+    // beside its button at the pane's minimum width.
+    let (texts, hovers): (Vec<&str>, Vec<&str>) = pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Text { text, hover } => Some((text.as_str(), hover.as_deref().unwrap_or(text))),
+            Piece::Install { .. } => None,
         })
-        .response
-        .rect;
+        .unzip();
+    if !texts.is_empty() {
+        let text = texts.join("; ");
+        let font = egui::FontId::proportional(DESC_PT);
+        let room = (words_end - rect.min.x).max(0.0);
+        let need = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), th.dim)
+            .size()
+            .x;
+        fits &= need <= room;
+        let g = one_line(ui, &text, font, room);
+        let at = egui::pos2(rect.min.x, rect.center().y - g.size().y / 2.0);
+        let r = egui::Rect::from_min_size(at, g.size());
+        ui.painter().galley(at, g, th.dim);
+        ui.interact(
+            r,
+            ui.id().with(("remotes_agents", rect.min.y as i32)),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(hovers.join(
+            "
+
+",
+        ));
+    }
     AgentsLine {
         rect,
         installs,
@@ -1981,40 +2162,35 @@ fn agents_line_ui(
 /// command, wrapped (two lines hold every command in the table at the
 /// narrowest pane; anything longer is cut, whole on hover), and what will
 /// happen on hover.
-fn confirm_block(ui: &mut egui::Ui, offer: Option<&Offer>) -> (egui::Rect, bool) {
+fn confirm_block(ui: &mut egui::Ui, rect: egui::Rect, offer: Option<&Offer>) -> (egui::Rect, bool) {
     let th = crate::theme::live(ui.ctx());
-    let shown = ui.horizontal_top(|ui| {
-        ui.set_height(LINE_H * 2.0);
-        ui.add_space(ROW_PAD);
-        let (text, hover, mono) = match offer {
-            Some(Offer::Install { command, note, .. }) => {
-                ((*command).to_string(), format!("{command}\n\n{note}"), true)
-            }
-            Some(Offer::Blocked(why)) => (why.clone(), why.clone(), false),
-            None => {
-                let t = "Test this Remote again: its last answer is gone".to_string();
-                (t.clone(), t, false)
-            }
-        };
-        let font = if mono {
-            egui::FontId::monospace(11.0)
-        } else {
-            egui::FontId::proportional(11.0)
-        };
-        let mut job = egui::text::LayoutJob::simple(
-            text,
-            font,
-            th.text,
-            (ui.available_width() - ROW_PAD).max(40.0),
-        );
-        job.wrap.max_rows = 2;
-        let galley = ui.painter().layout_job(job);
-        let elided = galley.elided;
-        ui.add(egui::Label::new(galley).selectable(false))
-            .on_hover_text(hover);
-        elided
-    });
-    (shown.response.rect, shown.inner)
+    let (text, hover, mono) = match offer {
+        Some(Offer::Install { command, note, .. }) => {
+            ((*command).to_string(), format!("{command}\n\n{note}"), true)
+        }
+        Some(Offer::Blocked(why)) => (why.clone(), why.clone(), false),
+        None => {
+            let t = "Test this Remote again: its last answer is gone".to_string();
+            (t.clone(), t, false)
+        }
+    };
+    let font = if mono {
+        egui::FontId::monospace(DESC_PT)
+    } else {
+        egui::FontId::proportional(DESC_PT)
+    };
+    let mut job = egui::text::LayoutJob::simple(text, font, th.text, rect.width().max(40.0));
+    job.wrap.max_rows = 2;
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    let mut c = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    c.add(egui::Label::new(galley).selectable(false))
+        .on_hover_text(hover);
+    (rect, elided)
 }
 
 /// A mouse action, applied after the rows are drawn so the draw never
@@ -2352,11 +2528,11 @@ mod tests {
     #[test]
     fn the_folder_list_owns_its_keys_and_enter_saves_only_from_the_field() {
         let (mut v, mut list) = on_first_dir();
-        assert!(v.hint(1).contains("↓ folders"), "{}", v.hint(1));
+        assert!(v.footer(&list).contains("↓ folders"), "{}", v.footer(&list));
         v.key(Key::Down, &mut list);
         assert!(v.browse.list_focused());
         assert_eq!(draft(&v).field, Field::Dir(0), "Down entered the list");
-        assert!(v.hint(1).contains("→ in"), "{}", v.hint(1));
+        assert!(v.footer(&list).contains("→ in"), "{}", v.footer(&list));
         // "app" and "apps" match the filter; ".." is row 0.
         v.key(Key::Down, &mut list); // apps
         assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
@@ -2409,11 +2585,14 @@ mod tests {
         // What a drawn frame does first.
         v.browse()
             .set_source("andy@desk", RemoteShell::Posix, "desk");
-        assert!(v.hint(1).contains("↓ folders"), "{}", v.hint(1));
+        assert!(v.footer(&list).contains("↓ folders"), "{}", v.footer(&list));
         v.key(Key::Down, &mut list);
         assert_eq!(draft(&v).field, Field::Dir(0), "did not move on");
         assert!(v.browse.list_focused());
-        assert_eq!(v.hint(1), "Listing folders · Tab/Esc back");
+        assert_eq!(
+            v.footer(&list),
+            "Listing folders · Tab/Esc back to the field"
+        );
         v.browse().put(
             "andy@desk",
             RemoteShell::Posix,
@@ -2433,7 +2612,7 @@ mod tests {
         let gone = || crate::remote_browse::unreachable("ssh did not finish in 15s");
         v.browse()
             .put("andy@desk", RemoteShell::Posix, "/srv/", gone());
-        assert!(v.hint(1).contains("↓ retry"), "{}", v.hint(1));
+        assert!(v.footer(&list).contains("↓ retry"), "{}", v.footer(&list));
         v.key(Key::Down, &mut list);
         assert!(v.browse.list_focused());
         assert_eq!(
@@ -2488,7 +2667,11 @@ mod tests {
         v.key(Key::Down, &mut list);
         assert_eq!(draft(&v).field, Field::Dir(1));
         assert!(!v.browse.list_focused());
-        assert!(v.hint(1).starts_with("Tab next field"), "{}", v.hint(1));
+        assert!(
+            v.footer(&list).starts_with("Tab next field"),
+            "{}",
+            v.footer(&list)
+        );
     }
 
     #[test]
@@ -2503,7 +2686,11 @@ mod tests {
             v.key(Key::Tab, &mut list);
         }
         assert_eq!(draft(&v).field, Field::Dir(1));
-        assert!(v.hint(1).contains("Ctrl+Backspace clear"), "{}", v.hint(1));
+        assert!(
+            v.footer(&list).contains("Ctrl+Backspace clear"),
+            "{}",
+            v.footer(&list)
+        );
         v.key(Key::Clear, &mut list);
         let d = draft(&v);
         assert_eq!(d.dirs.len(), 1);
@@ -2628,12 +2815,13 @@ mod tests {
     }
 
     #[test]
-    fn the_browse_hint_offers_only_what_the_selection_can_do() {
+    fn the_browse_footer_offers_only_what_the_selection_can_do() {
         let mut v = RemotesView::new();
-        assert!(!v.hint(0).contains("Del"), "{}", v.hint(0));
-        assert!(v.hint(1).contains("T test"));
+        let list = vec![r("desk", "desk")];
+        assert!(!v.footer(&[]).contains("Del"), "{}", v.footer(&[]));
+        assert!(v.footer(&list).contains("T test"));
         v.selected = 1; // the Add row
-        for h in [v.hint(1), v.hint(0)] {
+        for h in [v.footer(&list), v.footer(&[])] {
             assert!(
                 !h.contains("edit") && !h.contains("test") && !h.contains("Del"),
                 "{h}"
@@ -2863,11 +3051,7 @@ mod tests {
         let mut list = vec![r("desk", "pane-install-desk")];
         tested(&mut v, "pane-install-desk", true, true, &["claude"]);
         assert_eq!(v.installable(0, &list), ["codex", "grok"]);
-        assert!(
-            v.hint_for(&list).contains("I install"),
-            "{}",
-            v.hint_for(&list)
-        );
+        assert!(v.footer(&list).contains("I install"), "{}", v.footer(&list));
 
         assert_eq!(v.key(Key::Install, &mut list), Effect::None);
         assert_eq!(
@@ -2877,7 +3061,7 @@ mod tests {
                 provider: "codex"
             }
         );
-        assert!(v.hint_for(&list).contains("←/→ other agent"));
+        assert!(v.footer(&list).contains("←/→ other agent"));
         v.key(Key::Right, &mut list);
         assert_eq!(
             v.mode,
@@ -2971,7 +3155,7 @@ mod tests {
         v.key(Key::Install, &mut list);
         assert_eq!(v.mode, Mode::Browse);
         assert!(v.message.as_deref().unwrap().contains("Test desk first"));
-        assert!(!v.hint_for(&list).contains("install"));
+        assert!(!v.footer(&list).contains("install"));
 
         tested(&mut v, "pane-install-why", false, false, &[]);
         v.key(Key::Install, &mut list);

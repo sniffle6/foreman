@@ -2,7 +2,7 @@
 //! prompt and the Remotes pane edit form. The field text stays the source
 //! of truth ([`crate::remote_browse`] reads and writes it); this draws the
 //! list, moves its selection, starts listings off the frame path, and runs
-//! its "+ new folder" row's name field and create.
+//! its "+ New folder" row's name field and create.
 //!
 //! The area has a fixed height whatever it shows, so a listing arriving
 //! never moves what is below it. The field and the list never both look
@@ -31,7 +31,7 @@ const STILL_TRYING: Duration = Duration::from_secs(3);
 pub const ROW_H: f32 = 22.0;
 /// The list frame's inner margin.
 const PAD: f32 = 4.0;
-/// Room left of each row's name for the selected-row marker.
+/// Room left of each row's name: the gutter the new-folder row's "+" sits in.
 const MARK_W: f32 = 12.0;
 const SMALL: f32 = 11.5;
 
@@ -1273,27 +1273,21 @@ impl Browser {
                     laid.rows.push(rect);
                     let p = ui.painter();
                     let selected = focused && i == sel;
+                    // The wash alone says selected (one encoding); hover
+                    // washes too, as the launcher's rows do.
                     if selected || (ok && resp.hovered()) {
                         p.rect_filled(rect, egui::CornerRadius::same(3), th.sel_bg);
                     }
-                    if selected {
-                        p.text(
-                            egui::pos2(rect.min.x + 2.0, rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            "›",
-                            font.clone(),
-                            th.border_focus,
-                        );
-                    }
                     let (name, note, color, why) = match row {
                         Row::Up => ("..".into(), Some("up one level"), th.text, None),
-                        // An action: a "+" (and its key, where Ctrl+N
-                        // works), not a folder name.
+                        // An action, not a folder: its "+" sits in the
+                        // gutter no folder uses, and its key shows where
+                        // Ctrl+N works.
                         Row::NewFolder if busy_row => {
-                            ("+ new folder".into(), busy.as_deref(), th.dim, None)
+                            ("New folder".into(), busy.as_deref(), th.dim, None)
                         }
                         Row::NewFolder => (
-                            "+ new folder".into(),
+                            "New folder".into(),
                             focused.then_some("Ctrl+N"),
                             th.border_focus,
                             None,
@@ -1315,6 +1309,15 @@ impl Browser {
                             (e.shown().into_owned(), note, color, e.blocked)
                         }
                     };
+                    if row == Row::NewFolder {
+                        p.text(
+                            egui::pos2(rect.min.x + 2.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "+",
+                            font.clone(),
+                            color,
+                        );
+                    }
                     let left = rect.min.x + MARK_W;
                     let room = (rect.max.x - left - PAD).max(0.0);
                     let note_g = note.map(|n| {
@@ -1432,7 +1435,13 @@ pub fn idle(ui: &mut egui::Ui, body_h: f32, words: &str, laid: &mut Laid) {
     });
 }
 
+/// Folder names: UI text, so the proportional font.
 fn name_font(ui: &egui::Ui) -> egui::FontId {
+    egui::TextStyle::Body.resolve(ui.style())
+}
+
+/// The breadcrumb's path: a machine string, so monospace.
+fn path_font(ui: &egui::Ui) -> egui::FontId {
     egui::TextStyle::Monospace.resolve(ui.style())
 }
 
@@ -1469,9 +1478,8 @@ fn area(
         egui::Sense::hover(),
     );
     laid.area = rect;
+    // No fill: a container is its border on whatever surface it sits on.
     let stroke = if focused { th.border_focus } else { th.border };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(4), th.win_bg);
     ui.painter().rect_stroke(
         rect,
         egui::CornerRadius::same(4),
@@ -1528,7 +1536,7 @@ fn area(
         let lead_w = lead_g.size().x;
         let y = |h: f32| crumb_rect.center().y - h / 2.0;
         p.galley(egui::pos2(x, y(lead_g.size().y)), lead_g, th.dim);
-        let font = name_font(ui);
+        let font = path_font(ui);
         let path_room = (room - lead_w - tail_w).max(0.0);
         let (shown, cut) = crate::remotes_pane::elide_front(ui, c.path, &font, path_room);
         let g = ui.painter().layout_no_wrap(shown, font, th.text);

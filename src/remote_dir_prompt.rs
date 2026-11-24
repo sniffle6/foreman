@@ -302,64 +302,51 @@ impl DirPrompt {
                         )
                         .wrap(),
                     );
+                    ui.add_space(8.0);
+                    // On the popup's own surface: no slab, no label column.
+                    // The field, the folder list directly under it, any
+                    // error, then the buttons.
+                    let r = ui.add(
+                        egui::TextEdit::singleline(text)
+                            .id(field_id)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text(placeholder)
+                            .desired_width(f32::INFINITY),
+                    );
+                    laid.field = r.rect;
+                    if r.changed() {
+                        *error = None;
+                    }
+                    if r.clicked() {
+                        browse.focus_field();
+                    }
+                    ui.add_space(4.0);
+                    if browse.show(ui, text, body_h, true, None) {
+                        *error = None;
+                    }
+                    if let Some(e) = &*error {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(e).color(th.danger).size(11.5))
+                                .wrap(),
+                        );
+                    }
                     ui.add_space(6.0);
-                    // The Remotes pane's form: same frame, label column and
-                    // error placement.
-                    egui::Frame::new()
-                        .fill(th.sel_bg)
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.spacing_mut().item_spacing =
-                                egui::vec2(crate::remotes_pane::FORM_GAP, 6.0);
-                            let r = crate::remotes_pane::form_row(ui, "Directory", th.dim, |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(text)
-                                        .id(field_id)
-                                        .hint_text(placeholder)
-                                        .desired_width(f32::INFINITY),
-                                )
-                            });
-                            laid.field = r.rect;
-                            if r.changed() {
-                                *error = None;
-                            }
-                            if r.clicked() {
-                                browse.focus_field();
-                            }
-                            let indent =
-                                crate::remotes_pane::LABEL_W + crate::remotes_pane::FORM_GAP;
-                            ui.horizontal(|ui| {
-                                ui.add_space(indent);
-                                if browse.show(ui, text, body_h, true, None) {
-                                    *error = None;
-                                }
-                            });
-                            if let Some(e) = &*error {
-                                ui.horizontal_top(|ui| {
-                                    ui.add_space(indent);
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(e).color(th.danger).size(11.5),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                ui.add_space(indent);
-                                let open = ui.small_button("open");
-                                if open.clicked() {
-                                    acts.push(Key::Enter);
-                                }
-                                let cancel = ui.small_button("cancel");
-                                if cancel.clicked() {
-                                    acts.push(Key::Esc);
-                                }
-                                laid.buttons.extend([open.rect, cancel.rect]);
-                            });
-                        });
+                    // A fixed-height row: a layout left to fill the Area
+                    // would grow it a little every frame.
+                    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    let right = egui::Layout::right_to_left(egui::Align::Center);
+                    ui.allocate_ui_with_layout(row, right, |ui| {
+                        let cancel = ui.small_button("cancel");
+                        if cancel.clicked() {
+                            acts.push(Key::Esc);
+                        }
+                        let open = ui.small_button("open");
+                        if open.clicked() {
+                            acts.push(Key::Enter);
+                        }
+                        laid.buttons.extend([open.rect, cancel.rect]);
+                    });
                     ui.add_space(4.0);
                     // Truncated, never wrapped, so a focus change moves
                     // nothing; `hint_fits` proves the copy needs no cut.
@@ -491,25 +478,6 @@ mod tests {
         let e = explain(&a);
         assert!(e.contains(r"H:\src\app") && e.contains("desk"), "{e}");
         assert!(e.contains("Settings > Remotes"), "{e}");
-    }
-
-    #[test]
-    fn the_directory_label_fits_the_form_label_column() {
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            for label in ["Directory", "Project", "Name", "Target", "Shell"] {
-                let w = ui
-                    .painter()
-                    .layout_no_wrap(
-                        label.into(),
-                        crate::remotes_pane::label_font(),
-                        egui::Color32::WHITE,
-                    )
-                    .size()
-                    .x;
-                assert!(w <= crate::remotes_pane::LABEL_W, "{label}: {w}");
-            }
-        });
     }
 
     #[test]

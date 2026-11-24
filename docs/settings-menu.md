@@ -94,6 +94,11 @@ on purpose — a user slider on those creates support tickets, not value).
   rail (it never closes the window while the editor is focused). Clicking a
   window away *mid-capture* **freezes** the capture — it resumes when the
   settings window is refocused — rather than cancelling it.
+- **The footer is the only key hint.** A custom-body pane (Keybindings,
+  Remotes) returns its own line from `SettingsMenu::footer` while it has the
+  keyboard, and draws no title or hint in the pane: two hint lines drifted
+  apart (the Remotes pane said "Esc close" while Esc cancelled its edit).
+  Every footer line must fit one line at the window's minimum width.
 - **The keybindings editor only reads input when the settings window is
   focused** (like every other pane). An unfocused Keybindings pane is inert, so
   typing in a terminal beside it can't drive the hidden editor.

@@ -167,6 +167,15 @@ impl SettingsView {
         }
     }
 
+    /// The settings footer's key line while this pane reads the keyboard.
+    pub fn footer(&self) -> &'static str {
+        match self.mode {
+            Mode::Idle => "↑/↓ or j/k select · Enter rebind · Tab/Esc rail",
+            Mode::Capturing { .. } => "Press the new chord · Esc cancel",
+            Mode::Conflict { .. } => "Enter replace the binding · Esc keep the old one",
+        }
+    }
+
     /// Render one frame and report what the caller should do. `km` is the live
     /// keymap, mutated in place; a `Changed` outcome means the caller persists.
     /// Draws into `rect` (the caller lays out the pane / modal panel). `active`
@@ -251,19 +260,9 @@ impl SettingsView {
         let ui = &mut child;
         ui.set_clip_rect(rect);
         ui.visuals_mut().override_text_color = Some(th.text);
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("Keyboard bindings")
-                .color(th.border_focus)
-                .size(16.0)
-                .strong(),
-        );
-        ui.label(
-            egui::RichText::new("j/k or ↑/↓ select · Enter rebind · Esc back / cancel capture")
-                .color(th.dim)
-                .size(11.5),
-        );
-        ui.add_space(8.0);
+        // No title and no hint: the settings title band names the pane and
+        // the footer carries the keys (`footer`).
+        ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .id_salt("keybindings_pane")
             .auto_shrink([false, false])

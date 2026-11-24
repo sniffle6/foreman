@@ -181,9 +181,9 @@ edit form lists each Project directory with its Remote directory to edit or
 clear. Splits always use the mapping, not wherever the Remote shell has
 `cd`'d to (there is no OSC 7 tracking).
 
-**Folder list.** Under the prompt's Directory field, and under the edit
-form's Directory rows (one reserved area for whichever row is focused), a
-list of the Remote's folders saves typing a path blind. Folders only, never
+**Folder list.** Directly under the prompt's Directory field, and directly
+under the edit form's focused Directory row, a list of the Remote's folders
+saves typing a path blind. Folders only, never
 files. The field stays the source of truth: the list shows the folders in
 the directory the text names up to its last separator, filtered by the
 case-insensitive prefix after it. Choosing one writes `dir/name/` into the
@@ -191,7 +191,11 @@ field and lists the next level; `..` goes up (above home it uses where the
 listing found home); home is written `~/…`. The area is a fixed height in
 every state (listing, listed, empty, cut, failed, retry), the prompt's list
 gives up rows rather than push its buttons off a small window, and the field
-and the list never both look focused. Its breadcrumb names the directory
+and the list never both look focused. It has no fill: a 1 px border that
+turns the focus colour while the list has the keyboard. Rows are 22 px,
+folder names in the UI font, the breadcrumb's path in monospace; the
+selected row is shown by the selection wash alone, and hover washes as the
+launcher's rows do. Its breadcrumb names the directory
 (in the edit form also whose: "Folders for app on desk in /srv/") and says
 "first 500" when cut. Keys: Down from the field enters the list, and while
 the directory is still listing it waits there and selects the first folder
@@ -219,9 +223,10 @@ Windows Remote exists), and a line past the Windows command-line cap says so
 instead of running. Nothing is copied to or installed on the Remote.
 
 **New folder.** The one thing the folder list changes on the Remote, and only
-by an explicit action: the first row after `..` is "+ new folder" (a `+`, and
-its key Ctrl+N while the list has the keyboard, so it reads as an action, not a
-folder), offered only over a listing. Enter or a click on it, or Ctrl+N while
+by an explicit action: the first row after `..` is "+ New folder" (its `+`
+in the gutter no folder uses, and its key Ctrl+N shown while the list has the
+keyboard, so it reads as an action, not a folder, by more than colour),
+offered only over a listing. Enter or a click on it, or Ctrl+N while
 the list has the keyboard, turns that row into an empty name field in the same
 slot; the list's height never changes. A bare letter never opens it: letters
 typed in the list go to the field as a filter. The breadcrumb then says where:
@@ -381,9 +386,24 @@ follows the where-strip instead, not the focused Session: the strip is on
 screen under the pointer when it is clicked, so that is what the user sees
 choosing.
 
-**Settings → Remotes.** A custom-body pane like Keybindings: one row per
-Remote (name, target, shell, reachability, Test, delete), inline add and
-edit, ssh-config `Host` names offered as suggestions. **Test** runs one
+**Settings → Remotes.** A custom-body pane like Keybindings, in the
+settings rows' grammar (row height 46, left pad 18, label over a dim
+description, controls right-aligned). One item per Remote: name over
+`target · shell`, its reachability and Test / edit / delete on the right,
+then its status line and agents line, each a fixed line; the selection wash
+covers all three. Editing expands the item in place into ordinary rows on
+the pane background, marked only by a 2 px focus bar down its left edge (the
+rail's idiom), never a filled block: a header (the name, or "New Remote",
+with save and cancel where delete and keep sit), the reserved error line,
+Name, Target (monospace) with the reserved ssh-config suggestion line under
+it (outline chips), Shell as an outline choice chip, then under a "PROJECT
+DIRECTORIES" section header one row per mapping: the Project folder's name
+over its seat-PC path (cut from the front, whole on hover), the Directory
+field ("(home)" when blank) and clear. Enter saves and Esc cancels from any
+field. The pane has no title or hint of its own: the settings title band
+names it, and the settings footer carries the keys for whatever has the
+keyboard (browsing, a field, the folder list, the new-folder name, a
+confirm), supplied by the pane. **Test** runs one
 `ssh -o BatchMode=yes` probe off-thread and reports: login works without a
 prompt (or "needs an interactive login: open a Remote Session on it once
 and log in there"), which
@@ -392,9 +412,10 @@ Deleting a Remote does not touch live Sessions; each carries its own copy
 of the name.
 
 **Installing an agent CLI.** Each row has a second fixed line for the agent
-CLIs, there before the first Test so a result never moves a row: "has
-claude, codex", then each missing agent as an "install grok" row button or
-in words. "grok needs bash" means the installer needs a tool Test did not
+CLIs, there before the first Test so a result never moves a row: the words
+on the left, groups split by "; " ("has claude, codex; grok needs bash"),
+and each installable agent's "install grok" button (or one "retry" after
+"did not install") in the line's right-hand cluster. "grok needs bash" means the installer needs a tool Test did not
 find; foreman installs no OS packages. The other words are "grok: install
 by hand" (no command for that shell), "grok installing…", "grok checking…"
 and "grok installed, needs login". `I` or the button opens a confirm in the

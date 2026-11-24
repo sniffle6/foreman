@@ -335,17 +335,15 @@ pub enum Piece {
         /// The whole story, on hover.
         hover: Option<String>,
     },
-    /// An install row button for `provider`; its hover shows the command.
+    /// An install row button for `provider`, drawn in the line's
+    /// right-hand cluster; its hover shows the command.
     Install {
         provider: &'static str,
         /// "install grok"; after installs that did not finish, one "retry"
-        /// right after the words saying so: the line must fit the narrowest
-        /// pane.
+        /// (the words "did not install" say what it answers): the line must
+        /// fit the narrowest pane.
         label: String,
         hover: String,
-        /// A retry: it answers the words just before it, so it sits against
-        /// them with no "·" between.
-        retry: bool,
     },
 }
 
@@ -424,12 +422,12 @@ pub fn agents_line(
         out.push(Piece::Text {
             text: format!("{} did not install", failed.join(", ")),
             hover: Some(format!(
-                "The last install from here ended, but Test does not find {} on {name}'s                  PATH. Read that Session's output, then install again.",
+                "The last install from here ended, but Test does not find {} on {name}'s PATH. Read that Session's output, then install again.",
                 and_list(&failed)
             )),
         });
-        // One retry, right after the words it answers: it opens the confirm
-        // on the first, and left/right there reaches the rest.
+        // One retry, the first button: it opens the confirm on the first,
+        // and left/right there reaches the rest.
         let hover = states
             .iter()
             .filter(|(p, _)| failed.contains(p))
@@ -444,7 +442,6 @@ pub fn agents_line(
             provider: first,
             label: "retry".to_string(),
             hover,
-            retry: true,
         });
     }
     for (p, s) in states {
@@ -457,7 +454,6 @@ pub fn agents_line(
                 provider: p,
                 label: format!("install {p}"),
                 hover: hover_of(p, s),
-                retry: false,
             });
         }
     }
@@ -1091,7 +1087,6 @@ mod tests {
             &line[1],
             Piece::Install {
                 provider: "codex",
-                retry: true,
                 ..
             }
         ));
