@@ -3,11 +3,11 @@
   "id": "e2pzhg",
   "title": "Open a Remote Session from the CLI with --on",
   "body": "Make `foreman open --on <name> -- <command>` open a Session on a Remote through the launch builder. The Session remembers which Remote it is on. Add `foreman remotes` and mark Remote Sessions in status.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: Launch, Control plane)\nBlocked by: Remote settings model and the SSH launch builder\nDone when:\n- open --on with a mapped directory, or with --cwd, spawns the ssh argv from the builder; no mapping and no --cwd is an error naming both fixes\n- an unknown Remote name is an error; a request without `on` is byte-identical on the wire to today (compat test beside the existing ones)\n- the tab icon for `open --on X -- codex` is the Codex icon\n- status text and --json carry the Remote name for Remote Sessions only\n- `foreman remotes` lists name and target\n- this card passes no Tunnel flags yet; the builder's Tunnel input is optional\nGate: cargo test --target-dir target/agent remote; cargo test --target-dir target/agent control",
-  "state": "backlog",
+  "state": "done",
   "planned": {
     "name": "remote-sessions",
     "wave": 2
   },
   "created": "2026-11-21T00:06:52Z",
-  "updated": "2026-11-21T00:06:52Z"
+  "updated": "2026-11-21T01:37:48Z"
 }

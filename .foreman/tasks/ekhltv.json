@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "id": "ekhltv",
+  "title": "Fix the flaky Tunnel busy-slot test and the lost 503",
+  "body": "The Tunnel test control::tunnel::tests::stalled_callers_without_a_token_free_their_slots_at_the_head_deadline (src/control/tunnel.rs, added by commit 03761b2) is flaky: it failed 4 of 13 runs on this PC, panicking at the assert that a non-200 reply starts with \"HTTP/1.1 503 \" with an EMPTY reply string. Reproduce with: cargo test --target-dir target/agent stalled_callers_without_a_token (run it ten times).\nLikely cause, to confirm before fixing: on the busy path the listener writes 503 and closes the socket while the request bytes the client already sent are still unread in the receive buffer. On Windows closing a socket with unread data sends a reset, so the client can lose the 503 and see a reset instead. That is a product bug as well as a test bug: a real curl caller would get \"connection reset\" instead of 503. The other refusal paths already linger; check every early-refusal path (busy, 401, 413, 501, 400) for the same thing.\nFix the cause in the listener (for example shut down the write half and drain or linger briefly, bounded by a deadline, before closing), not by loosening the test. Do not add a crate. Do not change routes or the pipe protocol.\nBlocked by: Harden the Tunnel listener and send the reply note at launch\nDone when:\n- the root cause is stated in the commit body with what was observed\n- the test passes 30 runs in a row (run it in a loop and report the count)\n- a caller refused as busy after it has already sent its request reliably reads the 503 (test)\n- the drain or linger is bounded so a refused caller cannot hold a thread past the head deadline\nGate: cargo test --target-dir target/agent control; cargo test --target-dir target/agent chat\n",
+  "state": "done",
+  "planned": {
+    "name": "remote-sessions",
+    "wave": 3
+  },
+  "created": "2026-11-21T01:39:54Z",
+  "updated": "2026-11-21T01:52:22Z"
+}

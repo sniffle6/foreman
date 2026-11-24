@@ -3,11 +3,11 @@
   "id": "3atypp",
   "title": "Globe badge and inert local-path features on Remote Sessions",
   "body": "Mark Remote Sessions with a small globe over the tab icon and the Sessions-panel row icon, with a tooltip naming the Remote. Make the features that assume a seat-PC path inert on them: file-path links, file drops and image paste. The close confirm names the Remote instead of a process tree.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: UI > Globe, UI > Inert on a Remote Session)\nBlocked by: Open a Remote Session from the CLI with --on\nDone when:\n- the globe overlays the icon and the agent logo stays visible; local Sessions are unchanged\n- URL links still open on a Remote Session; file-path links do nothing; a drop or image paste is refused with a toast\n- closing a Remote Session with a running program shows a confirm that names the Remote\n- the globe asset is a white silhouette tinted like the other icons\nGate: cargo test --target-dir target/agent; then ask the human to run build-screenshot",
-  "state": "backlog",
+  "state": "done",
   "planned": {
     "name": "remote-sessions",
     "wave": 3
   },
   "created": "2026-11-21T00:06:52Z",
-  "updated": "2026-11-21T00:06:52Z"
+  "updated": "2026-11-21T03:48:46Z"
 }

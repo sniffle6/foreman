@@ -2,12 +2,19 @@
   "v": 1,
   "id": "sfyaz0",
   "title": "Launch-time hooks and the hook route for Remote Session badges",
-  "body": "Make the agent-state badge work for Claude on a Remote Session with nothing installed there: add hook settings to the Claude launch argv, each hook one curl to the Tunnel, and add the hook route that feeds the existing state mapping. Codex and Grok get no hooks in this card.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: Agent state, Results)\nBlocked by: Tunnel listener: token, chat and status routes, reply note\nDone when:\n- a Claude launch on a Remote carries hook settings for the same events the local installer manages; other providers' argv is unchanged\n- the hook route answers with an empty body and maps events through the existing state slot for the token's Session\n- the subagent filtering question in the spec is answered in the commit body with what was observed, and any gap is written as a gotcha in the agent-state doc\n- Stop and PostToolUse are confirmed against a real Remote where Claude is logged in, or the card is blocked with that reason\nGate: cargo test --target-dir target/agent agent_state; cargo test --target-dir target/agent remote",
-  "state": "backlog",
+  "body": "Make the agent-state badge work for Claude on a Remote Session with nothing installed there: add hook settings to the Claude launch argv, each hook one curl to the Tunnel, and add the hook route that feeds the existing state mapping. Codex and Grok get no hooks in this card.\nSpec: docs/superpowers/specs/2026-11-20-remote-sessions-design.md (sections: Agent state, Results)\nBlocked by: Tunnel listener: token, chat and status routes, reply note\nDone when:\n- a Claude launch on a Remote carries hook settings for the same events the local installer manages; other providers' argv is unchanged\n- the hook route answers with an empty body and maps events through the existing state slot for the token's Session\n- the subagent filtering question in the spec is answered in the commit body with what was observed, and any gap is written as a gotcha in the agent-state doc\n- Stop and PostToolUse are confirmed against a real Remote where Claude is logged in, or the card is blocked with that reason\nNotes from landed cards:\n- The route goes in route() and build_call() in src/control/tunnel.rs. A caller with no token must get the same short head deadline as the other routes, and every refusal must go through the existing bounded-drain path (see foreman-debugging-playbook on the Windows reset trap).\n- The skills and feature doc card (35v1vs) ran before this one and says badges are not available on a Remote Session yet. If this card lands, update that line in the feature doc and both providers' skill copies (follow the embedded-skill rebuild rule in foreman-docs-and-writing). If this card ends blocked, leave them alone.\n- Before blocking for the login reason, check it: ssh andy@100.102.251.37 with key login (no password; never ask for one), then `claude auth status`. If it reports loggedIn false, finish and commit everything that does not need the login, state plainly in the final report which criteria are unverified, and block the card with that reason instead of guessing.\nGate: cargo test --target-dir target/agent agent_state; cargo test --target-dir target/agent remote",
+  "state": "blocked",
+  "blocked_reason": "Stop/PostToolUse unverified: Claude on andy@100.102.251.37 reports loggedIn false (2.1.105). Code committed as 0d34db3; log Claude in there, run one turn, then integrate.",
+  "worktree": {
+    "path": "H:/claude code/foreman",
+    "branch": "card/sfyaz0",
+    "base": "main",
+    "in_place": true
+  },
   "planned": {
     "name": "remote-sessions",
     "wave": 4
   },
   "created": "2026-11-21T00:06:53Z",
-  "updated": "2026-11-21T00:06:53Z"
+  "updated": "2026-11-21T04:51:20Z"
 }
