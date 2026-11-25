@@ -681,6 +681,90 @@ pub fn disconnect_bar_text(
     format!("{lead} — Enter to {verb}")
 }
 
+/// The held cue's line: what is held, then its one action. The action is a
+/// click target and never a key: every key in a held pane goes to the agent,
+/// whose first keys answer its folder-trust dialog.
+pub fn held_cue_text(agent: Option<&str>) -> (String, &'static str) {
+    (
+        format!(
+            "Chat held until {} has started — ",
+            agent.unwrap_or("the agent")
+        ),
+        "deliver now",
+    )
+}
+
+/// The held cue laid out in its strip: the line's two galleys and where the
+/// action sits, so the click can be read before the frame decides the grid.
+struct HeldCue {
+    bar: egui::Rect,
+    lead: std::sync::Arc<egui::Galley>,
+    action: std::sync::Arc<egui::Galley>,
+    action_rect: egui::Rect,
+}
+
+impl HeldCue {
+    /// The cue in `bar`, the lead truncated first when the Win is narrow.
+    fn layout(
+        ui: &egui::Ui,
+        bar: egui::Rect,
+        agent: Option<&str>,
+        th: &crate::theme::Theme,
+    ) -> Self {
+        let (lead, action) = held_cue_text(agent);
+        let galley = |text: String, color, width: f32| {
+            let mut job = egui::text::LayoutJob::single_section(
+                text,
+                egui::TextFormat {
+                    font_id: egui::TextStyle::Body.resolve(ui.style()),
+                    color,
+                    ..Default::default()
+                },
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+        let action = galley(action.to_string(), th.text, bar.width() - 12.0);
+        let lead = galley(lead, th.dim, bar.width() - 12.0 - action.size().x);
+        let pos = egui::pos2(
+            bar.min.x + 6.0 + lead.size().x,
+            bar.center().y - action.size().y / 2.0,
+        );
+        Self {
+            bar,
+            lead,
+            action_rect: egui::Rect::from_min_size(pos, action.size()),
+            action,
+        }
+    }
+
+    /// Same strip as the disconnect bar (search-bar tokens, top rule). The
+    /// lead is dim; the action is plain text, underlined while hovered.
+    fn paint(&self, ui: &egui::Ui, hovered: bool, th: &crate::theme::Theme) {
+        let painter = ui.painter_at(self.bar);
+        painter.rect_filled(self.bar, egui::CornerRadius::ZERO, th.search_bar_bg);
+        painter.hline(
+            self.bar.x_range(),
+            self.bar.min.y,
+            egui::Stroke::new(1.0, th.search_bar_border),
+        );
+        let y = self.bar.center().y - self.lead.size().y / 2.0;
+        painter.galley(
+            egui::pos2(self.bar.min.x + 6.0, y),
+            self.lead.clone(),
+            th.dim,
+        );
+        painter.galley(self.action_rect.min, self.action.clone(), th.text);
+        if hovered {
+            painter.hline(
+                self.action_rect.x_range(),
+                self.action_rect.max.y - 1.0,
+                egui::Stroke::new(1.0, th.text),
+            );
+        }
+    }
+}
+
 /// A bare Enter press this frame that is not key repeat: the disconnect
 /// bar's reconnect key.
 fn bare_enter_pressed(events: &[egui::Event]) -> bool {
@@ -1569,9 +1653,25 @@ impl Session {
         }
     }
 
-    /// Is chat waiting for this connection's first hook event?
+    /// Is chat waiting for this connection's first hook event? A settle that
+    /// has run out counts as open, even before the next pump lets it go. A
+    /// dead connection holds nothing: a reconnect carries its input to a
+    /// fresh connection with its own hold.
     pub fn chat_held(&self) -> bool {
-        self.ready_gate.held()
+        !self.disconnected() && self.ready_gate.held_at(std::time::Instant::now())
+    }
+
+    /// Open the hold now, by the human's hand (the held cue's action, or
+    /// `foreman deliver`): held input goes out in order once Ready, exactly
+    /// as if its hook event had come. Only these call it. A keystroke in the
+    /// pane never does: the first keys a human presses at a held Claude
+    /// answer its folder-trust dialog, and releasing then would type into
+    /// it. Returns whether anything was held.
+    pub fn release_chat_hold(&mut self) -> bool {
+        let held = self.chat_held();
+        self.chat_hold = None;
+        self.ready_gate.release();
+        held
     }
 
     /// The chat outbox retains held posts until the previous paste is submitted.
@@ -2548,6 +2648,33 @@ impl Session {
                 ui.ctx().request_repaint();
             }
         }
+        // A held Remote Session gives its bottom strip to the held cue the
+        // same way. Its action is read before the grid is sized, so the frame
+        // the hold opens (hook event, settle, click) shows no cue and the
+        // full grid. A Win too short for both shows only the agent.
+        let mut cue = None;
+        if !disconnected && self.chat_held() && rect.height() >= bar_h + rh {
+            let strip = rect.with_min_y(rect.max.y - bar_h);
+            let c = HeldCue::layout(ui, strip, crate::remote::agent_of(self.dispatched()), &th);
+            let r = ui.interact(
+                c.action_rect,
+                resp.id.with(("foreman_held_cue", self.term_id)),
+                egui::Sense::click(),
+            );
+            if r.clicked() {
+                self.release_chat_hold();
+                ui.ctx().request_repaint();
+            } else {
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                cue = Some((c, r.hovered()));
+            }
+        }
+        let rect = match &cue {
+            Some((c, _)) => rect.with_max_y(c.bar.min.y),
+            None => rect,
+        };
         let cols = ((rect.width() / cw).floor() as usize).clamp(2, 600);
         let rows = ((rect.height() / rh).floor() as usize).clamp(1, 300);
         self.resize(cols, rows);
@@ -3245,6 +3372,9 @@ impl Session {
         if let Some(bar) = bar {
             let hovered = bar_resp.as_ref().is_some_and(|r| r.hovered());
             paint_disconnect_bar(ui, bar, self.disconnect_text(), active, hovered, &th);
+        }
+        if let Some((c, hovered)) = &cue {
+            c.paint(ui, *hovered, &th);
         }
 
         // Multi-line-paste confirm, last so it draws on top of everything else
@@ -6983,6 +7113,129 @@ mod tests {
         d.frame(&mut s, vec![pointer(in_grid, false)]);
         assert!(!s.take_reconnect());
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// A connected Remote Claude, Ready, holding its chat, with its writes
+    /// captured. No process behind it.
+    fn watched_held(ctx: &egui::Context) -> (Session, Arc<Mutex<Vec<u8>>>) {
+        let (mut s, sent) = watched_disconnected(ctx);
+        s.dispatch_argv = Some(vec!["claude".into()]);
+        s.reshape_for_test(true, true);
+        s.ready_gate.on_dsr_reply_flushed(true);
+        s.ready_gate.on_rx_chunk(b"X");
+        s.hold_chat_until_hook(crate::remote::ChatHold::UntilStart);
+        (s, sent)
+    }
+
+    /// Where the held cue's action sits in a [`PaneDriver`] pane.
+    fn held_cue_action(d: &mut PaneDriver) -> egui::Pos2 {
+        let rect = d.rect;
+        let mut at = None;
+        let input = egui::RawInput {
+            screen_rect: Some(rect),
+            time: Some(d.t),
+            ..Default::default()
+        };
+        let _ = d.ctx.run_ui(input, |ui| {
+            let th = crate::theme::live(ui.ctx());
+            let strip = rect.with_min_y(rect.max.y - disconnect_bar_height(ui));
+            at = Some(
+                HeldCue::layout(ui, strip, Some("claude"), &th)
+                    .action_rect
+                    .center(),
+            );
+        });
+        at.unwrap()
+    }
+
+    /// Keys typed into a held pane go to the agent (they answer its trust
+    /// dialog) and never open the hold. The cue's action opens it, and the
+    /// frame it does shows the full grid. Held input then goes once each, in
+    /// order.
+    #[test]
+    fn only_the_held_cue_s_action_opens_a_hold_by_hand() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, sent) = watched_held(&d.ctx);
+        for text in ["note", "post 1", "post 2"] {
+            s.inject_input(text);
+        }
+        d.frame(&mut s, vec![]);
+        let held_rows = s.term.screen_lines();
+        d.frame(
+            &mut s,
+            [tap(egui::Key::ArrowDown), tap(egui::Key::Enter)].concat(),
+        );
+        assert!(s.chat_held(), "keys never open a hold");
+        let typed = std::mem::take(&mut *sent.lock().unwrap());
+        assert!(!typed.is_empty(), "the keys reached the agent");
+        assert!(
+            !typed.windows(6).any(|w| w == b"\x1b[200~"),
+            "nothing held was pasted: {typed:?}"
+        );
+        // A click elsewhere on the strip is not the action.
+        let off = egui::pos2(4.0, 296.0);
+        d.frame(
+            &mut s,
+            vec![egui::Event::PointerMoved(off), pointer(off, true)],
+        );
+        d.frame(&mut s, vec![pointer(off, false)]);
+        assert!(s.chat_held());
+        let action = held_cue_action(&mut d);
+        // egui hit-tests against the last frame's widgets: draw the pane once
+        // after the probe frame.
+        d.frame(&mut s, vec![egui::Event::PointerMoved(action)]);
+        d.frame(&mut s, vec![pointer(action, true)]);
+        assert_eq!(s.term.screen_lines(), held_rows, "pressed, not clicked");
+        d.frame(&mut s, vec![pointer(action, false)]);
+        assert!(!s.chat_held(), "the action opened it");
+        assert!(
+            s.term.screen_lines() > held_rows,
+            "the frame it opened has no cue: {} rows",
+            s.term.screen_lines()
+        );
+        let mut t = std::time::Instant::now();
+        for _ in 0..8 {
+            t += crate::ready::SUBMIT_DELAY;
+            s.pump_at(t);
+        }
+        let mut want = Vec::new();
+        for text in ["note", "post 1", "post 2"] {
+            want.extend(crate::ready::paste_wrap(text));
+            want.push(b'\r');
+        }
+        assert_eq!(*sent.lock().unwrap(), want, "each once, in order");
+    }
+
+    /// A settle that has run out opens the hold in the frame laid out before
+    /// the pump that lets it go: no frame shows a cue for a hold that is over.
+    #[test]
+    fn the_held_cue_is_gone_the_frame_a_settle_runs_out() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        let (mut s, _) = watched_held(&d.ctx);
+        d.frame(&mut s, vec![]);
+        let held_rows = s.term.screen_lines();
+        let past = std::time::Instant::now()
+            - crate::remote::START_SETTLE
+            - std::time::Duration::from_millis(1);
+        s.hook_arrived_at(crate::agent_state::HookEvent::SessionStart, past);
+        assert!(!s.chat_held());
+        d.frame(&mut s, vec![]);
+        assert!(s.term.screen_lines() > held_rows);
+    }
+
+    #[test]
+    fn the_held_cue_names_the_agent_and_its_one_action() {
+        assert_eq!(
+            held_cue_text(Some("claude")),
+            (
+                "Chat held until claude has started — ".to_string(),
+                "deliver now"
+            )
+        );
+        assert_eq!(
+            held_cue_text(None).0,
+            "Chat held until the agent has started — "
+        );
     }
 
     #[test]

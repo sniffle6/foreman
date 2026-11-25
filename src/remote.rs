@@ -316,21 +316,45 @@ pub fn agent_of(argv: &[String]) -> Option<&'static str> {
 /// `$FOREMAN_TOKEN` rather than the token itself (which would sit in the
 /// agent's world-readable argv for its life), the agent's tool shell was
 /// seen to have both (2026-11-23, Debian: Claude 2.1.331's Bash tool,
-/// codex-cli 0.163.0's shell), and [`prompt_index`] names the prompt.
-/// Grok (never run on a Remote), every Windows Remote (none tried; a tool
-/// shell there may be PowerShell or Git Bash) and any other agent with
-/// arguments get it typed `AtLaunch`. A bare agent, a shell or a non-agent
-/// command waits for the first post: a shell would run the note.
+/// codex-cli 0.163.0's shell), and [`prompt_index`] names the prompt. A
+/// brief that starts with `/` is a slash command, whose arguments the note
+/// would become, so it is never carried.
+///
+/// Typed `AtLaunch` only behind a chat hold ([`hooked_claude`]): keys typed
+/// before a hook event can answer a startup dialog (Claude's folder trust
+/// defaults to "No, exit"). Every other agent with arguments (Grok, Codex
+/// with a shape [`prompt_index`] refuses, Claude with its own `--settings`,
+/// anything on a Windows Remote) gets it with its first post, as a bare
+/// agent, a shell or a non-agent command does: a shell would run the note.
 pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
     use crate::control::tunnel::NoteGoes;
     if argv.len() < 2 || agent_of(argv).is_none() {
         return NoteGoes::WithFirstPost;
     }
     let sees_env = shell == RemoteShell::Posix && matches!(argv[0].as_str(), "claude" | "codex");
-    if sees_env && prompt_index(argv).is_some() {
+    let slash = argv[1].trim_start().starts_with('/');
+    if sees_env && !slash && prompt_index(argv).is_some() {
         NoteGoes::InPrompt
-    } else {
+    } else if hooked_claude(argv, shell).is_some() {
         NoteGoes::AtLaunch
+    } else {
+        NoteGoes::WithFirstPost
+    }
+}
+
+/// How one connection's note goes, from its build's choice: a reconnect that
+/// resumes an agent behind a hold types it once the hold opens (the resumed
+/// conversation still has the dead token's `curl`, and there is no prompt
+/// to carry it). A hookless one waits for its first post like any launch,
+/// since nothing proves it is past a startup dialog.
+pub fn connection_note(
+    built: crate::control::tunnel::NoteGoes,
+    hold: Option<ChatHold>,
+    resumed_agent: bool,
+) -> crate::control::tunnel::NoteGoes {
+    match (resumed_agent, hold) {
+        (true, Some(_)) => crate::control::tunnel::NoteGoes::AtLaunch,
+        _ => built,
     }
 }
 
@@ -601,8 +625,10 @@ impl ChatHold {
 ///
 /// Hooks ride only Claude itself, by its file stem (`claude`,
 /// `/home/u/.npm-global/bin/claude`), on a Posix Remote, without the user's
-/// own `--settings`. A wrapper gets none, as with
-/// [`crate::agent_command::codex_in_process`]. Windows is unproved, and the
+/// own `--settings`: Claude keeps only the last `--settings` it is given, so
+/// foreman's would replace the user's or be replaced (2026-11-24, Claude
+/// Code 2.1.331: of two, only the last one's hooks ran). A wrapper gets
+/// none, as with [`crate::agent_command::codex_in_process`]. Windows is unproved, and the
 /// encoded hooks would take ~3 KB of the brief's room under
 /// [`WINDOWS_LINE_CAP`].
 ///
@@ -669,9 +695,12 @@ pub fn build(l: &Launch) -> Result<Built, String> {
     Ok(Built {
         ssh: ssh_argv(l, l.argv)?,
         dispatched,
-        note: match note {
-            NoteGoes::InPrompt => NoteGoes::AtLaunch,
-            other => other,
+        // A note that would not fit the prompt is typed only behind a hold.
+        // Without a Tunnel there is no hold, so never `AtLaunch` either.
+        note: match (note, hold) {
+            (NoteGoes::InPrompt | NoteGoes::AtLaunch, Some(_)) => NoteGoes::AtLaunch,
+            (NoteGoes::InPrompt | NoteGoes::AtLaunch, None) => NoteGoes::WithFirstPost,
+            (other, _) => other,
         },
         hold,
     })
@@ -1820,57 +1849,134 @@ mod tests {
         }
     }
 
-    /// Who gets the reply note in the prompt (naming the variables), who
-    /// gets it typed, and who waits for a post. One row per agent and shell.
+    /// Per agent and shell: where the reply note goes and which hold the
+    /// launch gets. Nothing is typed at launch without a hold, since only a
+    /// hook event proves the agent is past a startup dialog.
     #[test]
     fn the_reply_note_s_route_per_agent_and_shell() {
         use crate::control::tunnel::NoteGoes::{AtLaunch, InPrompt, WithFirstPost};
+        use ChatHold::{UntilPrompt, UntilStart};
         use RemoteShell::{Posix, Pwsh, WindowsPowerShell};
         let brief = "do the card";
-        let table: &[(&[&str], RemoteShell, crate::control::tunnel::NoteGoes)] = &[
+        type Row<'a> = (
+            &'a [&'a str],
+            RemoteShell,
+            crate::control::tunnel::NoteGoes,
+            Option<ChatHold>,
+        );
+        let table: &[Row] = &[
             // Seen on a Posix Remote with both variables in the tool shell.
-            (&["claude", brief], Posix, InPrompt),
-            (&["claude", brief, "--model", "x"], Posix, InPrompt),
-            (&["codex", brief], Posix, InPrompt),
-            (&["codex", brief, "--model", "x"], Posix, InPrompt),
-            // Never run on a Remote: typed.
-            (&["grok", brief], Posix, AtLaunch),
-            // Windows: no tool shell seen, and it may not be Posix.
-            (&["claude", brief], Pwsh, AtLaunch),
-            (&["codex", brief], WindowsPowerShell, AtLaunch),
-            (&["grok", brief], Pwsh, AtLaunch),
-            // An agent with arguments foreman cannot place: typed.
-            (&["claude", "hi"], Posix, AtLaunch),
-            (&["claude", "-p", brief], Posix, AtLaunch),
-            (&["codex", "exec", brief], Posix, AtLaunch),
+            (&["claude", brief], Posix, InPrompt, Some(UntilPrompt)),
+            (
+                &["claude", brief, "--model", "x"],
+                Posix,
+                InPrompt,
+                Some(UntilPrompt),
+            ),
+            (&["codex", brief], Posix, InPrompt, None),
+            (&["codex", brief, "--model", "x"], Posix, InPrompt, None),
+            // A slash command would take the note as its arguments: typed,
+            // behind the hold.
+            (
+                &["claude", "/review this"],
+                Posix,
+                AtLaunch,
+                Some(UntilStart),
+            ),
+            (
+                &["claude", "  /context now"],
+                Posix,
+                AtLaunch,
+                Some(UntilStart),
+            ),
+            (&["claude", "/cost"], Posix, AtLaunch, Some(UntilStart)),
+            (&["codex", "/status now"], Posix, WithFirstPost, None),
+            // A hooked Claude foreman cannot place the note for: typed,
+            // behind the hold.
+            (&["claude", "hi"], Posix, AtLaunch, Some(UntilPrompt)),
+            (&["claude", "-p", brief], Posix, AtLaunch, Some(UntilStart)),
+            (
+                &["/usr/bin/claude", brief],
+                Posix,
+                AtLaunch,
+                Some(UntilPrompt),
+            ),
+            (&["claude", "agents"], Posix, AtLaunch, Some(UntilPrompt)),
+            // Hookless: no hold, so nothing typed; the first post carries it.
+            (&["grok", brief], Posix, WithFirstPost, None),
+            (
+                &["claude", "--settings", "{}", brief],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (
+                &["claude", brief, "--settings=x.json"],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (&["codex", "exec", brief], Posix, WithFirstPost, None),
+            (&["codex", "hi"], Posix, WithFirstPost, None),
             (
                 &["npx", "@anthropic-ai/claude-code", brief],
                 Posix,
-                AtLaunch,
+                WithFirstPost,
+                None,
             ),
-            (&["/usr/bin/claude", brief], Posix, AtLaunch),
-            // A reconnect's resume argv: typed (it has no prompt).
-            (&["claude", "--continue"], Posix, AtLaunch),
-            (&["codex", "resume", "--last"], Posix, AtLaunch),
-            (&["grok", "--continue"], Pwsh, AtLaunch),
+            // Windows: no hooks, no tool shell seen.
+            (&["claude", brief], Pwsh, WithFirstPost, None),
+            (&["codex", brief], WindowsPowerShell, WithFirstPost, None),
+            (&["grok", brief], Pwsh, WithFirstPost, None),
+            // A reconnect's resume argv: typed only behind a hold.
+            (&["claude", "--continue"], Posix, AtLaunch, Some(UntilStart)),
+            (&["codex", "resume", "--last"], Posix, WithFirstPost, None),
+            (&["claude", "--continue"], Pwsh, WithFirstPost, None),
             // Bare agent, shell, non-agent command: the first post.
-            (&["claude"], Posix, WithFirstPost),
-            (&["codex"], Pwsh, WithFirstPost),
-            (&[], Posix, WithFirstPost),
-            (&["htop", "-d", "5"], Posix, WithFirstPost),
+            (&["claude"], Posix, WithFirstPost, Some(UntilStart)),
+            (&["codex"], Pwsh, WithFirstPost, None),
+            (&[], Posix, WithFirstPost, None),
+            (&["htop", "-d", "5"], Posix, WithFirstPost, None),
         ];
-        for (words, shell, want) in table {
-            assert_eq!(
-                note_route(&argv(words), *shell),
-                *want,
-                "{words:?} on {shell:?}"
-            );
+        for (words, shell, note, hold) in table {
+            let a = argv(words);
+            assert_eq!(note_route(&a, *shell), *note, "{words:?} on {shell:?}");
+            assert_eq!(hooked_claude(&a, *shell), *hold, "{words:?} on {shell:?}");
+            if *note == AtLaunch {
+                assert!(hold.is_some(), "typed only behind a hold: {words:?}");
+            }
+            if a.is_empty() {
+                continue;
+            }
+            // What a launch with a Tunnel actually does agrees.
+            let b = build(&launch(&remote(*shell), "", &a)).unwrap();
+            assert_eq!((b.note, b.hold), (*note, *hold), "{words:?} on {shell:?}");
         }
-        // No reconnect argv carries it (the caller types it for an agent).
-        for (words, shell, _) in table {
+        // No reconnect argv carries it, and none is typed without a hold.
+        for (words, shell, ..) in table {
             let re = relaunch(&argv(words));
-            assert_ne!(note_route(&re.argv, *shell), InPrompt, "{words:?}");
+            let hold = hooked_claude(&re.argv, *shell);
+            let note = connection_note(note_route(&re.argv, *shell), hold, true);
+            assert_ne!(note, InPrompt, "{words:?}");
+            if note == AtLaunch {
+                assert!(hold.is_some(), "{words:?} on {shell:?}");
+            }
         }
+        // A resumed agent behind a hold types the fresh note; a first launch
+        // keeps its build's choice.
+        assert_eq!(
+            connection_note(WithFirstPost, Some(UntilStart), true),
+            AtLaunch
+        );
+        assert_eq!(connection_note(WithFirstPost, None, true), WithFirstPost);
+        assert_eq!(
+            connection_note(WithFirstPost, Some(UntilStart), false),
+            WithFirstPost
+        );
+        assert_eq!(
+            connection_note(InPrompt, Some(UntilPrompt), false),
+            InPrompt
+        );
     }
 
     #[test]
@@ -1930,6 +2036,14 @@ mod tests {
         let b = build(&l).unwrap();
         assert_eq!(b.ssh, ssh_argv(&l, &a).unwrap());
         assert_eq!(b.hold, None);
+        // Nothing is typed without a hold, even where no note will be armed.
+        for words in [&["claude", "hi"][..], &["claude", "/cost"], &["claude", "do the card"]] {
+            let a = argv(words);
+            let mut l = launch(&r, "", &a);
+            l.tunnel = None;
+            let b = build(&l).unwrap();
+            assert_eq!((b.note, b.hold), (NoteGoes::WithFirstPost, None), "{words:?}");
+        }
     }
 
     /// The token may appear once in a built launch: the script's own export,

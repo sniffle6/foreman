@@ -212,6 +212,10 @@ pub struct StatusTerminalLine {
     /// Absent when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub disconnected: bool,
+    /// A Remote Session holding its chat until its agent has started (a
+    /// hook event, or `foreman deliver`). Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chat_held: bool,
 }
 
 /// Close terminal panes in one project. Self-close is resolved CLIENT-side:
@@ -310,6 +314,18 @@ pub struct FocusRequest {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ReconnectRequest {
     pub cmd: String, // always "reconnect"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>, // "p2"; None = focused project
+    pub terminal: String, // "t4"
+}
+
+/// Deliver the chat a Remote Session is holding now: what the held cue's
+/// "deliver now" does. Local pipe only, like [`ReconnectRequest`]: a peer may
+/// not send it ([`REMOTE_VERBS`]) and the Tunnel has no route that builds it,
+/// so a Remote agent cannot open its own hold.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeliverRequest {
+    pub cmd: String, // always "deliver"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>, // "p2"; None = focused project
     pub terminal: String, // "t4"
@@ -455,6 +471,7 @@ pub enum CtrlMsg {
         mpsc::Sender<OpenReply>,
         std::time::Instant,
     ),
+    Deliver(DeliverRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Kanban(KanbanRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     /// Settings are App-owned, so `App::service_background` answers this one
@@ -608,6 +625,9 @@ fn dispatch_line(
                 .map_err(|e| format!("bad request: {e}")),
             "reconnect" => serde_json::from_str::<ReconnectRequest>(line)
                 .map(|r| CtrlMsg::Reconnect(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "deliver" => serde_json::from_str::<DeliverRequest>(line)
+                .map(|r| CtrlMsg::Deliver(r, rtx, now))
                 .map_err(|e| format!("bad request: {e}")),
             "view" => serde_json::from_str::<ViewRequest>(line)
                 .map(|r| CtrlMsg::View(r, rtx, now))
@@ -1539,6 +1559,21 @@ pub fn parse_reconnect_args(
     })
 }
 
+/// Parse `foreman deliver` args: `<terminal> [--project P]`, as
+/// [`parse_reconnect_args`].
+pub fn parse_deliver_args(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<DeliverRequest, String> {
+    let r = parse_reconnect_args(args, default_project)
+        .map_err(|e| e.replace("reconnect", "deliver"))?;
+    Ok(DeliverRequest {
+        cmd: "deliver".into(),
+        project: r.project,
+        terminal: r.terminal,
+    })
+}
+
 /// Parse `foreman view` args: `[--project P] <path.png>`. Resolves the path to
 /// an absolute, canonicalized form CLIENT-side (the GUI may run with a
 /// different cwd) and strips Windows' `\\?\` verbatim prefix so the stored/
@@ -2285,6 +2320,7 @@ USAGE
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman focus [--project P] [--terminal T]  bring a project or terminal tab to the front
   foreman reconnect <tN> [--project P]      reconnect a disconnected Remote Session
+  foreman deliver <tN> [--project P]        deliver the chat a Remote Session holds now
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman kanban <action> ...                add/list/start/dispatch/edit/done/block/rm/wait a card
@@ -2296,7 +2332,8 @@ USAGE
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
                                             snapshot --help, focus --help,
-                                            reconnect --help, view --help, kanban --help)
+                                            reconnect --help, deliver --help,
+                                            view --help, kanban --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -2403,8 +2440,10 @@ exit_code, chat (bool), placement, ready (bool: takes input yet),
 agent_state (working|needs_you|idle, from the agent's hooks), remote
 (the Remote's name, Remote Sessions only), and disconnected (true while a
 Remote Session's connection is down and waits for Enter or foreman
-reconnect; its state still reads exited). A missing field means unknown,
-not a default: no agent_state is not idle.
+reconnect; its state still reads exited), and chat_held (true while a
+Remote Session holds its chat until its agent has started; foreman deliver
+opens it). A missing field means unknown, not a default: no agent_state is
+not idle.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_CLOSE: &str = "\
@@ -2474,6 +2513,22 @@ resumed (claude --continue, codex resume --last) and the reply note typed
 for it. Refused for a local Session and for a Remote Session that is still
 connected. Only this PC's pipe takes it: a peer (--host) or a Remote agent
 cannot reconnect a pane.
+Reply: {\"ok\":true,\"project\":\"pN\",\"terminal\":\"tN\"}.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_DELIVER: &str = "\
+foreman deliver <tN> [--project P]
+
+Deliver the chat Remote Session tN in project P (default: your
+FOREMAN_PROJECT_ID, else the focused project) is holding, now, as
+\"deliver now\" on its held cue does. A Remote Claude holds its chat and
+reply note until a hook event shows it is past its folder-trust dialog,
+since keys typed there answer it. Use this when no event will come (hooks
+disabled or unreachable on the Remote, or a first argument that is a
+subcommand such as claude agents). Held input goes in order, each once,
+before anything newer. status --json shows chat_held while it holds.
+Refused for a Session that holds nothing. Only this PC's pipe takes it: a
+peer (--host) or a Remote agent cannot open a hold.
 Reply: {\"ok\":true,\"project\":\"pN\",\"terminal\":\"tN\"}.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
@@ -2644,6 +2699,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("snapshot") => snapshot_main(&args[1..]),
         Some("focus") => focus_main(&args[1..]),
         Some("reconnect") => reconnect_main(&args[1..]),
+        Some("deliver") => deliver_main(&args[1..]),
         Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("view") => view_main(&args[1..]),
         Some("kanban") => kanban_main(&args[1..]),
@@ -2669,6 +2725,7 @@ pub fn client_main(args: &[String]) -> i32 {
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman focus [--project P] [--terminal T]");
             eprintln!("       foreman reconnect <tN> [--project P]");
+            eprintln!("       foreman deliver <tN> [--project P]");
             eprintln!("       foreman icat <file.png> [--cols N]");
             eprintln!("       foreman view <file.png> [--project P]");
             eprintln!("       foreman kanban <action> ...");
@@ -2873,6 +2930,21 @@ fn reconnect_main(args: &[String]) -> i32 {
         }
     };
     report("foreman reconnect", request(&client_pipe(), &req))
+}
+
+fn deliver_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_DELIVER}");
+        return 0;
+    }
+    let req = match parse_deliver_args(args, std::env::var("FOREMAN_PROJECT_ID").ok()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman deliver: {e}");
+            return 2;
+        }
+    };
+    report("foreman deliver", request(&client_pipe(), &req))
 }
 
 fn view_main(args: &[String]) -> i32 {
@@ -3849,7 +3921,18 @@ mod tests {
         assert_eq!(client_main(&s(&["kanban", "-h"])), 0);
         assert_eq!(client_main(&s(&["reconnect", "--help"])), 0);
         assert_eq!(client_main(&s(&["reconnect", "-h"])), 0);
-        assert_eq!(client_main(&s(&["reconnect"])), 2, "no terminal: bad arguments");
+        assert_eq!(
+            client_main(&s(&["reconnect"])),
+            2,
+            "no terminal: bad arguments"
+        );
+        assert_eq!(client_main(&s(&["deliver", "--help"])), 0);
+        assert_eq!(client_main(&s(&["deliver", "-h"])), 0);
+        assert_eq!(
+            client_main(&s(&["deliver"])),
+            2,
+            "no terminal: bad arguments"
+        );
     }
 
     #[test]
@@ -4149,6 +4232,7 @@ mod tests {
             agent_state: None,
             remote: None,
             disconnected: false,
+            chat_held: false,
         };
         let json = serde_json::to_string(&line).unwrap();
         for absent in [
@@ -4157,6 +4241,7 @@ mod tests {
             "agent_state",
             "remote",
             "disconnected",
+            "chat_held",
         ] {
             assert!(!json.contains(&format!("\"{absent}\"")), "{json}");
         }
@@ -4184,6 +4269,24 @@ mod tests {
             old.trim_end_matches('}').to_string() + r#","disconnected":true}"#
         );
         assert_eq!(serde_json::to_string(&line).unwrap(), old);
+    }
+
+    #[test]
+    fn status_terminal_line_chat_held_is_wire_compatible() {
+        // A line from a build before the field parses as not held, and a
+        // Session that holds nothing serializes byte for byte as before.
+        let old = r#"{"project":"p1","terminal":"t3","title":"w","agent":"claude","state":"running","chat":true,"placement":"front","ready":true,"remote":"desk"}"#;
+        let line: StatusTerminalLine = serde_json::from_str(old).unwrap();
+        assert!(!line.chat_held);
+        assert_eq!(serde_json::to_string(&line).unwrap(), old);
+        let held = StatusTerminalLine {
+            chat_held: true,
+            ..line
+        };
+        assert_eq!(
+            serde_json::to_string(&held).unwrap(),
+            old.trim_end_matches('}').to_string() + r#","chat_held":true}"#
+        );
     }
 
     #[test]
@@ -4682,6 +4785,67 @@ mod tests {
                 .contains("not available to remote peers")
         );
         assert!(msg.is_none(), "nothing reached the GUI channel");
+    }
+
+    #[test]
+    fn deliver_is_local_only() {
+        // A peer's line is refused before the GUI channel; no socket needed.
+        let (tx, rx) = mpsc::channel();
+        let reply = dispatch_line(
+            r#"{"cmd":"deliver","project":"p1","terminal":"t2"}"#,
+            Origin::Peer("100.64.0.2"),
+            &tx,
+            &eframe::egui::Context::default(),
+        );
+        assert!(
+            reply
+                .error
+                .unwrap()
+                .contains("not available to remote peers")
+        );
+        assert!(rx.try_recv().is_err(), "nothing reached the GUI channel");
+    }
+
+    /// The new verb's wire shape and arguments; no existing request gained
+    /// a field (`reconnect_request_wire_shape` pins theirs).
+    #[test]
+    fn deliver_request_wire_shape() {
+        let req = parse_deliver_args(&s(&["t4"]), Some("p2".into())).unwrap();
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"deliver","project":"p2","terminal":"t4"}"#
+        );
+        let req = parse_deliver_args(&s(&["t4"]), None).unwrap();
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"deliver","terminal":"t4"}"#
+        );
+        let req = parse_deliver_args(&s(&["--project", "p3", "t4"]), Some("p2".into())).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p3"), "--project wins");
+        for bad in [&[][..], &["t4", "t5"], &["--now", "t4"], &["--project"]] {
+            let e = parse_deliver_args(&s(bad), None).unwrap_err();
+            assert!(!e.contains("reconnect"), "{bad:?}: {e}");
+        }
+        // The line the local pipe reads becomes the GUI message.
+        let (tx, rx) = mpsc::channel();
+        let gui = std::thread::spawn(move || match rx.recv().unwrap() {
+            CtrlMsg::Deliver(r, reply, _) => {
+                let _ = reply.send(OpenReply {
+                    ok: true,
+                    ..Default::default()
+                });
+                r.terminal
+            }
+            _ => String::new(),
+        });
+        let reply = dispatch_line(
+            r#"{"cmd":"deliver","project":"p2","terminal":"t4"}"#,
+            Origin::Local,
+            &tx,
+            &eframe::egui::Context::default(),
+        );
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(gui.join().unwrap(), "t4");
     }
 
     /// The new verb's wire shape; no existing request gained a field.

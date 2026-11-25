@@ -310,9 +310,15 @@ at the end of that argument and types nothing. Keystrokes at launch can
 answer a dialog the agent shows first, and Claude's folder-trust dialog
 defaults to "No, exit". That note names `$FOREMAN_URL` and `$FOREMAN_TOKEN`,
 which the launch exports. Both agents' tool shells were seen to have them.
-Grok, every Windows Remote, any other agent shape with arguments, and a
-reconnect (its resume argv has no prompt, and its token is new) get the
-note typed at launch, with the values written out.
+A brief that starts with `/` never carries it: it would become the slash
+command's arguments. A Claude launched with hooks that foreman cannot
+carry the note for (a slash brief, a one-word brief, `-p`, a path) and a
+reconnect of one (its resume argv has no prompt, and its token is new) get
+it typed behind the chat hold below, with the values written out. Every
+other agent (Grok, Codex in another shape, Claude with the user's own
+`--settings`, every Windows Remote, a bare agent, a resumed hookless one)
+gets it with its first chat delivery. Nothing is typed into them at
+launch: no signal says a startup dialog is gone.
 
 A Remote Session's first launch joins the room at its end, so it gets no
 catch-up of earlier posts. A reconnect keeps its Member and cursor. A
@@ -320,7 +326,14 @@ Claude launched with hooks also holds every post and typed note until a
 hook event says it is past the dialog: its brief's `UserPromptSubmit` (one
 word or many, bare or by path), or for a bare launch, `--continue` and a
 slash command, a fixed settle after `SessionStart` so the REPL has mounted
-(Results, 2026-11-24). Nothing opens the hold before an event.
+(Results, 2026-11-24). Nothing opens the hold before an event, and no
+keystroke opens it: the human's first keys answer the dialog. While it
+holds, `status --json` carries `chat_held: true` and the pane shows a cue
+on its bottom line with one action, "deliver now", which opens it, as does
+the local-only `foreman deliver tN`, for an agent whose events never come.
+A hookless agent has no hold: its posts go at Ready, so a post sent while
+its own startup dialog shows can answer it. Holding it with no signal would
+stall unattended dispatch into trusted directories.
 
 Accepted risk: the token sits on a command line (base64, not secret) on
 both PCs, so another process running as the same user can read it, and on
@@ -344,7 +357,9 @@ Per provider (see Results):
 
 - **Claude** takes hook settings as JSON on `--settings`. Confirmed to fire
   through the Tunnel. The launch adds `SessionStart`, which maps to no
-  state and only opens the chat hold.
+  state and only opens the chat hold. Claude keeps only the last
+  `--settings` it is given, so a launch with the user's own gets no hooks
+  and no hold (Results, 2026-11-24, the hold for every hookable Claude).
 - **Codex** reads hooks from a file and only runs ones the user has trusted.
   The one launch-time route is its trust-bypass flag. Foreman does not pass
   that flag on its own; Codex gets no badge on a bare Remote in v1.
@@ -751,6 +766,66 @@ the settle and `remote::hooked_claude`.
 - **Not run**: Grok (not installed), Windows Remotes (none exist). The
   leading-space slash brief (`"  /cost"`) was classified after the AFTER
   build and is unit-tested only.
+
+## Results, 2026-11-24, the hold for every hookable Claude, shown and released
+
+Release builds ran as their own instances (own `APPDATA`, agent environment
+stripped), driven through their pipes against the Debian Remote, Claude
+Code 2.1.331. Every run used a new `/tmp` directory, its trust dialog
+answered with `send --keys "Down Enter"`. Posts came from the instance's
+local probe pane. A post counts as delivered when the transcript holds it
+as a typed prompt or a `queued_command` attachment. BEFORE is main at
+afc3660; AFTER adds this change.
+
+- **P1** `claude --settings '{}' "<multi-word brief>"`, a Claude with its own
+  settings and so no hooks. **P2a** a bare Claude by path through a wrapper
+  that points `$FOREMAN_URL` (which the hooks read) at a closed port, so no
+  hook reaches the Tunnel; the typed note writes the real URL out, so the
+  agent can still reply. **P2n** the same with a `PATH` holding no `curl`,
+  for that launch only. **P2b** `claude agents`, which keeps a live input
+  box, sent `SessionStart` and never `UserPromptSubmit` in a probe, and so
+  holds as a brief forever. Each P2 run posted after the answer and waited
+  60 s; AFTER then ran `foreman deliver`. **S** `claude "/context  now"`, a
+  slash brief with whitespace.
+
+| Run | BEFORE runs | failed | AFTER runs | failed |
+|---|---|---|---|---|
+| P1 | 5 | 5 | 5 | 0 |
+| P2a | 2 | 2 | 3 | 0 |
+| P2n | 1 | 1 | 1 | 0 |
+| P2b | 1 | 1 | 1 | 0 |
+| S | 1 | 1 | 1 | 0 |
+
+- **BEFORE P1**: the typed note's Enter chose "No, exit" within 12 s in
+  every run: `state: exited`, "Claude Code didn't start because this
+  folder isn't trusted."
+- **BEFORE P2a, P2n, P2b**: 60 s after the post the input box was empty,
+  no transcript existed (nothing was ever submitted), and `status --json`
+  showed nothing but `ready: true`. Nothing said chat was waiting.
+- **BEFORE S**: the decoded launch argument was `/context  now`, a blank
+  line, then the note: the note rode inside the slash command, whose
+  `<command-args>` held it. Claude still read it there and answered a
+  later post, so the harm is shown for the argument, not for `/context`.
+- **AFTER P1**: at 30 s each sat at the dialog, alive, nothing typed. After
+  the answer a post carried the note and each replied.
+- **AFTER P2**: `chat_held: true` from the dialog through 60 s, with no
+  transcript. `foreman deliver` answered ok and the field was gone. P2a and
+  P2n: both posts arrived once each, in order, the first typed with the
+  note and the second queued, and Claude answered both. P2b: the note and
+  the post each became one background task, once each; their order is not
+  observable there, since each runs in its own process. A second `deliver`
+  was refused, "holds no chat", every time.
+- **AFTER S**: the argument was `/context  now` alone. `/context` ran with
+  `now`, the note came 3 s later as its own prompt (after `SessionStart`
+  and the settle), then the post, and Claude replied.
+- **Found before building: Claude keeps only the last `--settings`.** In
+  `claude -p` runs with hooks logging to a file, two `--settings` ran only
+  the last one's hooks, and hooks followed by `{}` ran none. So foreman's
+  hooks cannot ride beside the user's own, and that launch is hookless.
+- **Not shown**: the held cue in the GUI (a click and its layout are
+  unit-tested; how it looks needs a human), Grok (not installed), Windows
+  Remotes (none exist), a dropped hook event followed by a later one
+  (unit-tested: every event but `SessionStart` opens either hold).
 
 ## Order of work
 

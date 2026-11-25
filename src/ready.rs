@@ -152,9 +152,17 @@ impl ReadyGate {
         }
     }
 
-    /// Is input waiting for [`Self::release`]?
+    /// Is input waiting for [`Self::release`]? Callers read [`Self::held_at`].
+    #[cfg(test)]
     pub fn held(&self) -> bool {
         self.held
+    }
+
+    /// [`Self::held`] as of `now`: a deadline from [`Self::release_at`] that
+    /// has passed counts as released even before [`Self::poll`] runs, so a
+    /// frame laid out before the poll does not show a hold that is over.
+    pub fn held_at(&self, now: Instant) -> bool {
+        self.held && !self.release_at.is_some_and(|t| now >= t)
     }
 
     /// Test/setup helper: clear both Ready halves and the ink scanner (does not
@@ -321,9 +329,12 @@ mod tests {
         gate.release_at(at(9_000)); // a second SessionStart: no later
         assert!(gate.try_inject("post 2", at(2_000)).is_none());
         for ms in [1_000, 2_000, 2_499] {
+            assert!(gate.held_at(at(ms)), "held at {ms} ms");
             assert!(gate.poll(at(ms)).is_empty(), "held at {ms} ms");
             assert!(!gate.chat_input_available());
         }
+        // Released as of the deadline, before the poll that lets it go.
+        assert!(gate.held() && !gate.held_at(at(2_500)));
         let mut written = Vec::new();
         let mut t = at(2_500);
         for _ in 0..8 {

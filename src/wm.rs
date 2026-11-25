@@ -2023,6 +2023,21 @@ impl WindowManager {
                 });
                 ctx.request_repaint();
             }
+            CtrlMsg::Deliver(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(match self.deliver_dispatch(&req) {
+                    Ok((pid, tid)) => OpenReply {
+                        ok: true,
+                        project: Some(format!("p{pid}")),
+                        terminal: Some(term_tag(tid)),
+                        ..Default::default()
+                    },
+                    Err(e) => OpenReply::err(e),
+                });
+                ctx.request_repaint();
+            }
             CtrlMsg::View(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return;
@@ -2763,6 +2778,7 @@ impl WindowManager {
                             agent_state: agent_state.map(str::to_string),
                             remote: s.remote().map(str::to_string),
                             disconnected: s.disconnected(),
+                            chat_held: s.chat_held(),
                         }));
                     }
                 }
@@ -3022,6 +3038,20 @@ impl WindowManager {
             ));
         }
         self.project_child_mut(pid)?.reconnect(tid, ctx)?;
+        Ok((pid, tid))
+    }
+
+    /// `foreman deliver`: open a held Session's chat now, as its held cue's
+    /// action does ([`Session::release_chat_hold`]).
+    fn deliver_dispatch(
+        &mut self,
+        req: &crate::control::DeliverRequest,
+    ) -> Result<(WinId, WinId), String> {
+        let terminal = req.terminal.as_str();
+        let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
+        if !self.session_mut(pid, tid)?.release_chat_hold() {
+            return Err(format!("{terminal} holds no chat"));
+        }
         Ok((pid, tid))
     }
 
@@ -3601,8 +3631,9 @@ impl WindowManager {
     /// One connection to `remote` for Member `t{id}`: a fresh Tunnel lease
     /// (so a reconnect renews the token), the `ssh` launch, and the reply
     /// note armed for this connection the way the build placed it
-    /// ([`crate::remote::Built::note`]), or typed at launch for a
-    /// `resumed_agent`. Launch and reconnect both come here.
+    /// ([`crate::remote::Built::note`]), or typed once its hold opens for a
+    /// `resumed_agent` ([`crate::remote::connection_note`]). Launch and
+    /// reconnect both come here.
     /// A launch carrying Claude's hooks holds all chat input until the hook
     /// event its [`crate::remote::ChatHold`] names
     /// ([`Session::hold_chat_until_hook`]).
@@ -3629,12 +3660,8 @@ impl WindowManager {
             }),
             argv,
         })?;
-        let how = if resumed_agent {
-            crate::control::tunnel::NoteGoes::AtLaunch
-        } else {
-            built.note
-        };
         let hold = built.hold;
+        let how = crate::remote::connection_note(built.note, hold, resumed_agent);
         // The local env reaches only ssh.exe; ssh sends TERM with the pty
         // request, and the builder exports the rest on the Remote.
         let env = self.term_env(id);
@@ -3747,10 +3774,11 @@ impl WindowManager {
         // A restored Session that never connected says "connecting", as its
         // bar said "Enter to connect".
         let ran = s.ever_connected();
-        // An agent gets the note typed at launch: a resumed one still has the
-        // dead token's curl command in its conversation and would use it,
-        // 401, until a post came. There is no prompt to carry it (resume
-        // drops it). A shell would run it as commands, so it waits for a post.
+        // A held agent gets the note typed once its hold opens: a resumed one
+        // still has the dead token's curl command in its conversation and
+        // would use it, 401, until a post came. There is no prompt to carry
+        // it (resume drops it). A hookless agent and a shell wait for a post:
+        // nothing proves the agent is past a dialog, and a shell would run it.
         let mut fresh =
             self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), ctx)?;
         fresh.set_term_id(id);
@@ -12960,10 +12988,106 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.error.as_deref(), Some("t7 is not a Remote Session"));
         let stale = std::time::Instant::now() - crate::control::REPLY_TIMEOUT;
-        assert!(via(&mut wm, "t9", stale).is_err(), "a stale request is dropped");
+        assert!(
+            via(&mut wm, "t9", stale).is_err(),
+            "a stale request is dropped"
+        );
         let child = wm.project_child_mut(pid).unwrap();
         assert!(child.terminal_session(9).unwrap().disconnected());
         assert!(!child.terminal_session(8).unwrap().disconnected());
+    }
+
+    /// A held Remote Session says so in `status --json`, and only then. Keys
+    /// sent to it and a `SessionStart` for a brief's hold never open it;
+    /// `foreman deliver` does, once, and refuses a Session holding nothing.
+    /// No process: restored Sessions made to look connected.
+    #[test]
+    fn deliver_opens_a_held_session_and_status_shows_the_hold_only_while_held() {
+        use crate::agent_state::HookEvent::SessionStart;
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let child = wm.project_child_mut(pid).unwrap();
+        let tag = child.tag.clone().unwrap();
+        for (id, remote) in [(7, true), (8, true), (9, false)] {
+            let mut s = crate::terminal::Session::disconnected_remote(
+                "desk",
+                Some("claude"),
+                Some("/tmp"),
+                ctx.clone(),
+            );
+            s.set_term_id(id);
+            s.reshape_for_test(remote, true);
+            if id == 7 {
+                s.hold_chat_until_hook(crate::remote::ChatHold::UntilPrompt);
+            }
+            child.push_win(id, Tab::fixed("t", Content::Terminal(s)), r);
+        }
+        let held = |wm: &mut WindowManager, id: WinId| {
+            let rows = status_json(wm, &ctx);
+            let row = rows
+                .iter()
+                .find(|r| r["terminal"] == format!("t{id}"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no line for t{id}: {rows:?}"));
+            row.get("chat_held").cloned()
+        };
+        assert_eq!(held(&mut wm, 7), Some(serde_json::json!(true)));
+        assert_eq!(held(&mut wm, 8), None, "absent when not held");
+        assert_eq!(held(&mut wm, 9), None);
+        // The keys that answer the trust dialog go through and open nothing.
+        let send = crate::control::SendRequest {
+            cmd: "send".into(),
+            project: Some(tag.clone()),
+            terminal: Some("t7".into()),
+            text: Some("y".into()),
+            keys: vec!["Down".into(), "Enter".into()],
+            settle_ms: None,
+        };
+        wm.send_dispatch(&send).unwrap();
+        wm.apply_hook_event(&hook_event(&tag, 7, SessionStart));
+        assert_eq!(held(&mut wm, 7), Some(serde_json::json!(true)));
+        let ask = |terminal: &str| crate::control::DeliverRequest {
+            cmd: "deliver".into(),
+            project: Some(tag.clone()),
+            terminal: terminal.into(),
+        };
+        let via = |wm: &mut WindowManager, t: &str, sent: std::time::Instant| {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            wm.handle_ctrl(crate::control::CtrlMsg::Deliver(ask(t), rtx, sent), &ctx);
+            rrx.try_recv()
+        };
+        for (t, err) in [
+            ("t8", "t8 holds no chat"),
+            ("t9", "t9 holds no chat"),
+            ("t99", "no such terminal"),
+        ] {
+            let r = via(&mut wm, t, std::time::Instant::now()).expect("a reply");
+            assert!(!r.ok);
+            assert!(r.error.as_deref().unwrap().contains(err), "{t}: {r:?}");
+        }
+        let stale = std::time::Instant::now() - crate::control::REPLY_TIMEOUT;
+        assert!(
+            via(&mut wm, "t7", stale).is_err(),
+            "a stale request is dropped"
+        );
+        assert_eq!(held(&mut wm, 7), Some(serde_json::json!(true)));
+        let r = via(&mut wm, "t7", std::time::Instant::now()).expect("a reply");
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.terminal.as_deref(), Some("t7"));
+        assert_eq!(held(&mut wm, 7), None, "the field is gone with the hold");
+        let r = via(&mut wm, "t7", std::time::Instant::now()).expect("a reply");
+        assert_eq!(r.error.as_deref(), Some("t7 holds no chat"), "once");
+        // A dead connection holds nothing: its input goes to the reconnect.
+        let child = wm.project_child_mut(pid).unwrap();
+        let s = child.terminal_session_mut(8).unwrap();
+        s.hold_chat_until_hook(crate::remote::ChatHold::UntilStart);
+        s.reshape_for_test(true, false);
+        assert_eq!(held(&mut wm, 8), None, "not while disconnected");
+        let r = via(&mut wm, "t8", std::time::Instant::now()).expect("a reply");
+        assert_eq!(r.error.as_deref(), Some("t8 holds no chat"));
     }
 
     #[test]
@@ -13025,15 +13149,16 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_reconnect_gets_the_reply_note_at_launch_once() {
-        // The first launch carried the note in its prompt, or (a wrapper, a
-        // one-word brief) typed it, so the dead connection queued its own
-        // copy too: that one is not carried over. Either way the reconnect,
-        // which has no prompt, types the fresh note.
-        for words in [
-            &["codex", "do the card"][..],
-            &["npx", "@openai/codex", "do the card"],
-            &["claude", "hi"],
+    fn an_agent_reconnect_types_the_reply_note_once_only_behind_a_hold() {
+        // The first launch carried the note in its prompt, or typed it, so
+        // the dead connection may have queued its own copy: that one is not
+        // carried over. A held Claude (`claude --continue`) gets the fresh
+        // note typed once its hold opens; a hookless agent has nothing that
+        // proves it is past a dialog, so its first post carries it.
+        for (words, typed) in [
+            (&["claude", "hi"][..], true),
+            (&["codex", "do the card"], false),
+            (&["npx", "@openai/codex", "do the card"], false),
         ] {
             let (queued, waits) = reconnected(|wm, remote, ctx| {
                 let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
@@ -13044,8 +13169,8 @@ mod tests {
                 .iter()
                 .filter(|q| q.contains("[foreman] You run on"))
                 .count();
-            assert_eq!(notes, 1, "{words:?}: {queued:?}");
-            assert!(!waits, "no chat delivery repeats it");
+            assert_eq!(notes, usize::from(typed), "{words:?}: {queued:?}");
+            assert_eq!(waits, !typed, "{words:?}: exactly one route");
         }
     }
 
@@ -13288,23 +13413,26 @@ mod tests {
     }
 
     #[test]
-    fn a_first_launch_without_a_certain_prompt_types_the_note_as_before() {
-        // An agent with arguments foreman cannot place: typed at launch.
-        for words in [
-            &["claude", "-p", "do the card"][..],
-            &["codex", "exec", "do the card"],
-            &["npx", "@anthropic-ai/claude-code", "do the card"],
-            &["claude", "hi"],
-            // Never run on a Remote: typed, so the token stays out of argv.
-            &["grok", "do the card"],
-        ] {
+    fn a_first_launch_types_the_note_only_behind_a_hold() {
+        // A hooked Claude foreman cannot place the note for: typed, and held
+        // with everything else until a hook event.
+        for words in [&["claude", "-p", "do the card"][..], &["claude", "hi"]] {
             let (queued, waits) = first_launch(words);
             assert_eq!(queued.len(), 1, "{words:?}: {queued:?}");
             assert!(queued[0].starts_with("[foreman] You run on"), "{queued:?}");
             assert!(!waits, "{words:?}");
         }
-        // A bare agent, a shell, and a non-agent command: the first post.
-        for words in [&["claude"][..], &[], &["htop", "-d", "5"]] {
+        // Hookless (no hold): nothing typed, since keys at launch can answer
+        // a dialog. The first post carries it. A bare agent, a shell and a
+        // non-agent command likewise.
+        for words in [
+            &["codex", "exec", "do the card"][..],
+            &["npx", "@anthropic-ai/claude-code", "do the card"],
+            &["grok", "do the card"],
+            &["claude"],
+            &[],
+            &["htop", "-d", "5"],
+        ] {
             let (queued, waits) = first_launch(words);
             assert!(queued.is_empty(), "{words:?}: {queued:?}");
             assert!(waits, "{words:?}: the first chat delivery carries it");

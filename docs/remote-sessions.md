@@ -110,14 +110,20 @@ is for changing the feature.
   `agent_state` for them.
 - **Anything typed before Claude's folder-trust dialog is answered quits
   Claude.** The dialog's default is "No, exit", and the Enter that ends any
-  injected text picks it. Three things keep input out of it. A first launch
-  whose note rides in its prompt types nothing. A Remote Session's first
-  launch joins the room at its end (`ChatRoom::join_at_end`), so it gets no
-  catch-up. A Claude launched with hooks holds every post and typed note
-  (`remote::ChatHold`, `ReadyGate::hold`) until a hook event opens it: Claude
-  runs no hook at the dialog (seen 2026-11-23: 40 s at the dialog, nothing,
-  then `SessionStart` 0.3 s after the answer). Nothing opens the hold before
-  an event: a timer alone would type into the dialog it waited out.
+  injected text picks it. Four things keep input out of it. A first launch
+  whose note rides in its prompt types nothing. A note is typed at launch
+  only behind a hold (`remote::note_route`); every other agent gets it with
+  its first post. A Remote Session's first launch joins the room at its end
+  (`ChatRoom::join_at_end`), so it gets no catch-up. A Claude launched with
+  hooks holds every post and typed note (`remote::ChatHold`,
+  `ReadyGate::hold`) until a hook event opens it: Claude runs no hook at the
+  dialog (seen 2026-11-23: 40 s at the dialog, nothing, then `SessionStart`
+  0.3 s after the answer). Nothing opens the hold before an event: a timer
+  alone would type into the dialog it waited out.
+- **A keystroke never opens a hold.** The first keys a human presses in a
+  held pane are the ones that answer the trust dialog, so releasing then
+  would type into it. Only the cue's "deliver now" click and
+  `foreman deliver tN` open it by hand (`Session::release_chat_hold`).
 - **`SessionStart` comes before the REPL can read a long line.** After the
   dialog the tty is in cooked mode until the REPL mounts, and Linux drops a
   line over 4095 bytes there. Seen 2026-11-24 (Claude Code 2.1.331): a held
@@ -132,12 +138,32 @@ is for changing the feature.
   by path, waits for that brief's `UserPromptSubmit` instead
   (`remote::hooked_claude`). A slash command may never send one (`/cost`
   and `/context` did not, `/init` did), so it settles like a bare launch.
-- **A held Claude whose hooks never run holds forever.** Examples are
-  `disableAllHooks` in the Remote's settings, a missing `curl`, a subcommand
-  (`claude mcp …`: a first argument counts as a brief, so it waits for a
-  `UserPromptSubmit` that never comes), or `--version`. Its posts stay in the room, its typed
-  note stays queued, and `snapshot` shows nothing typed. Codex, Grok, a
-  shell, a wrapper and a Windows Remote carry no hooks and get no hold.
+- **A held Claude whose hooks never run holds until a human opens it.**
+  Examples are `disableAllHooks` in the Remote's settings, a missing `curl`
+  or a hook that cannot reach the Tunnel (seen 2026-11-24), a dropped hook
+  event (the lane is a bounded `try_send`) with nothing after it, and a
+  subcommand that stays open (`claude agents`: a first argument counts as a
+  brief, and it fired `SessionStart` but never `UserPromptSubmit`). Its posts
+  stay in the room and its typed note stays queued. The pane shows a cue on
+  its bottom line ("Chat held until claude has started — deliver now"),
+  `status --json` carries `chat_held: true`, and the cue's click or
+  `foreman deliver tN` sends it all in order. Any later hook event still
+  opens it: every event but `SessionStart` comes from a mounted REPL.
+- **Known limit: a hookless Remote agent's chat goes at Ready.** Codex,
+  Grok, Claude with the user's own `--settings`, a wrapper and anything on a
+  Windows Remote report no event, so there is no hold. Their posts are
+  pasted once the pane is Ready, which a trust dialog already is. A post
+  sent while one shows answers it ("No, exit" for Claude). Holding them
+  with no signal would stall unattended dispatch into trusted directories
+  forever, and a hold only a human can open is worse than the dialog. What
+  they do get: no note typed at launch, so a Dispatch alone cannot quit
+  them.
+- **Claude keeps only the last `--settings`.** With two, only the last
+  one's hooks ran, and hooks then `{}` ran none (2026-11-24, Claude Code
+  2.1.331, `claude -p`). So foreman cannot add its hooks beside the user's
+  own `--settings`, and `remote::hooked_claude` treats that launch as
+  hookless. `--plugin-dir` can carry hooks too, but needs files on the
+  Remote.
 - **Codex in an untrusted Remote directory could not post.** Seen twice on
   2026-11-23, Codex 0.163 with no `sandbox_mode` set. Its tool shell has
   `FOREMAN_URL` and `FOREMAN_TOKEN` (`env | grep -c ^FOREMAN_TOKEN=` printed
@@ -151,14 +177,19 @@ is for changing the feature.
   does, so this needs no subcommand list that drifts between CLI versions. A
   one-word brief therefore gets the typed note. On top of that,
   `remote::note_route` carries the note only for `claude` and `codex` on a
-  Posix Remote. Those are the only tool shells seen to have the variables.
+  Posix Remote, never in a brief that starts with `/`: the note became
+  `/context`'s arguments (2026-11-24). Those are the only tool shells seen
+  to have the variables.
 - **The token is per connection.** `spawn_remote_session` leases a new one on
   every launch and every reconnect, and the old one dies with its `ssh`. A
-  reconnect that relaunches an agent types the fresh reply note at launch.
-  The resume argv has no prompt to carry the note (`relaunch` drops the
-  original prompt), and a resumed agent still has the old `curl` command in
-  its conversation, so it would get 401 until a post came. A shell reconnect
-  waits for the first post: a shell would run the note as commands. Input
+  reconnect that relaunches a held Claude types the fresh reply note once
+  the hold opens (`remote::connection_note`). The resume argv has no prompt
+  to carry the note (`relaunch` drops the original prompt), and a resumed
+  agent still has the old `curl` command in its conversation, so it would
+  get 401 until a post came. A resumed hookless agent (`codex resume
+  --last`) does get 401 until then: nothing proves it is past a dialog, so
+  its first post carries the note. A shell reconnect waits for the first
+  post too: a shell would run the note as commands. Input
   queued on the dead connection is carried over without its note
   (`ReplyNote::strip`), or the agent would be taught the dead token too.
 - **The forwarded port is open to everyone on the Remote.** Any user or
@@ -192,13 +223,13 @@ is for changing the feature.
   on permission prompts the original skipped. `--continue` / `resume --last`
   also take the latest conversation in that directory, which is another
   Session's if two share the directory on that Remote.
-- **A typed launch note can land in an ssh password prompt.** Ready latches
-  on the first output, and a password or host-key prompt is output. A
-  reconnected agent, or a first launch whose note is typed, then gets the
-  note typed into `ssh`'s prompt instead of into the agent. A carried note
-  cannot land there, and neither can anything held for a hooked Claude. Key
-  login avoids it: Settings > Remotes > Test says whether login works
-  without a prompt, and one interactive login accepts the host key.
+- **A post to a hookless Remote agent can land in an ssh password prompt.**
+  Ready latches on the first output, and a password or host-key prompt is
+  output, so the first post to it is typed into `ssh`'s prompt instead of
+  into the agent. A carried note cannot land there, and neither can
+  anything held for a hooked Claude. Key login avoids it: Settings > Remotes
+  > Test says whether login works without a prompt, and one interactive
+  login accepts the host key.
 - **File-path links and file drops do not exist yet, so nothing gates them
   on a Remote Session.** Whoever adds either must make it inert when
   `Session::remote()` is `Some`. See `docs/terminal-links.md`.
@@ -232,6 +263,11 @@ is for changing the feature.
   It makes `/tmp/foreman-mkdir-test` and hostile names inside it, so that
   directory must not exist first. Remove it after:
   `ssh user@pc 'rm -rf -- /tmp/foreman-mkdir-test'`.
+
+- **Open a stuck hold by hand.** `foreman status --json` shows
+  `chat_held: true` on the Session; after the dialog is answered (check with
+  `foreman snapshot`), `foreman deliver tN --project pN`. It refuses a
+  Session that holds nothing. Like `reconnect`, only this PC's pipe takes it.
 
 - **Drive a reconnect** (tests, or Enter without the GUI). Find the
   Session's `ssh.exe` by its parent, the foreman PID

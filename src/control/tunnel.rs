@@ -1011,6 +1011,7 @@ mod tests {
             "/snapshot",
             "/kanban",
             "/reconnect",
+            "/deliver",
             "/",
         ] {
             assert_eq!(route("POST", path).unwrap_err().status, 404, "{path}");
@@ -1466,6 +1467,25 @@ mod tests {
         assert!(
             seen.recv().unwrap().starts_with("chat "),
             "a reconnect line posted to /chat is chat text, never a verb"
+        );
+        // Nor can it open its own chat hold.
+        refused(
+            format!(
+                "POST /deliver HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: 0\r\n\r\n"
+            ),
+            "404",
+        );
+        let verb = r#"{"cmd":"deliver","project":"p1","terminal":"t1"}"#;
+        refused(
+            format!(
+                "POST /chat?cmd=deliver HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: {}\r\n\r\n{verb}",
+                verb.len()
+            ),
+            "200",
+        );
+        assert!(
+            seen.recv().unwrap().starts_with("chat "),
+            "a deliver line posted to /chat is chat text, never a verb"
         );
         refused(
             format!(
