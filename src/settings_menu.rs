@@ -1545,6 +1545,7 @@ mod tests {
             name: name.into(),
             target: target.into(),
             shell: Default::default(),
+            base: String::new(),
             dirs: Default::default(),
         }
     }
@@ -1597,8 +1598,8 @@ mod tests {
             "{:?}",
             laid.pane
         );
-        // Name, Target, Shell, add, cancel.
-        assert_eq!(laid.form.len(), 5, "{:?}", laid.form);
+        // Name, Target, Shell, Projects folder, add, cancel.
+        assert_eq!(laid.form.len(), 6, "{:?}", laid.form);
         for r in &laid.form {
             assert!(laid.pane.contains_rect(*r), "{r:?} outside {:?}", laid.pane);
         }
@@ -1697,7 +1698,7 @@ mod tests {
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         frame_at(&ctx, &mut menu, &mut s, Some(size), None);
         fits(&mut menu, "Name");
-        for _ in 0..3 {
+        for _ in 0..4 {
             tab(&mut menu, &mut s, egui::Key::Tab);
         }
         // Directory 1, listed: the rows in view, the area naming whose
@@ -1714,7 +1715,8 @@ mod tests {
         }
         {
             let laid = menu.remotes.laid();
-            let (seen, field) = (laid.list, laid.form[3]);
+            // Name, Target, Shell, Projects folder, then Directory 1.
+            let (seen, field) = (laid.list, laid.form[4]);
             let area = menu.remotes.browse().laid.area;
             assert!(seen.contains_rect(field), "field {field:?} out of {seen:?}");
             assert!(seen.contains_rect(area), "list {area:?} out of {seen:?}");
@@ -1875,7 +1877,7 @@ mod tests {
                 truncated: false,
             }),
         );
-        for _ in 0..3 {
+        for _ in 0..4 {
             run(&mut menu, &mut s, tap(egui::Key::Tab));
         }
         // In the Directory field, N is typing.
@@ -1995,7 +1997,7 @@ mod tests {
                     truncated: false,
                 }),
             );
-            for _ in 0..3 {
+            for _ in 0..4 {
                 frame_at(&ctx, menu, s, Some(size), Some((egui::Key::Tab, none)));
             }
             frame_at(
@@ -2376,6 +2378,7 @@ mod tests {
                         name: name.into(),
                         target: target.clone(),
                         shell,
+                        base: String::new(),
                         dirs: Default::default(),
                     }],
                     ..Default::default()
@@ -2570,7 +2573,7 @@ mod tests {
         };
         let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
         none_filled(f, "Name");
-        for state in ["Target", "Shell", "Directory"] {
+        for state in ["Target", "Shell", "Projects folder", "Directory"] {
             let f = sel_bg_fills(&ctx, &mut menu, &mut s, press(egui::Key::Tab, none));
             none_filled(f, state);
             let f = sel_bg_fills(&ctx, &mut menu, &mut s, vec![]);
@@ -2683,6 +2686,11 @@ mod tests {
             }),
         );
         let f = key(&mut menu, &mut s, egui::Key::Tab, none);
+        assert_eq!(
+            f, "Tab next field · ↓ folders · Enter save · Esc cancel",
+            "Projects folder"
+        );
+        let f = key(&mut menu, &mut s, egui::Key::Tab, none);
         assert!(f.contains("↓ folders") && f.contains("Esc cancel"), "{f}");
         let f = key(&mut menu, &mut s, egui::Key::ArrowDown, none);
         assert!(menu.remotes.browse().list_focused(), "↓: the list");
@@ -2791,7 +2799,7 @@ mod tests {
             size,
             Some((egui::Key::Enter, none)),
         );
-        for _ in 0..3 {
+        for _ in 0..4 {
             frame_at(&ctx, &mut menu, &mut s, size, Some((egui::Key::Tab, none)));
         }
         frame_at(&ctx, &mut menu, &mut s, size, None);

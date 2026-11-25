@@ -121,9 +121,11 @@ process is there, and it is an ordinary member of THIS project's chat.
   `--host` talks to a separate Foreman already running on that PC, with its
   own room and panes (`foreman-chat`, "Another PC"). A PC that `remotes`
   lists takes `--on`.
-- It starts in the Project's directory mapped on R. `--cwd D` names a
-  directory on R instead, for this launch only. With neither, open is
-  refused: pass `--cwd` or ask the human. Never guess a directory.
+- It starts in the Project's directory on R: the one set for it in
+  Settings > Remotes, else a folder of the Project's own name inside R's
+  Projects folder (R's home unless the human set one), made if missing.
+  `--cwd D` names a directory on R instead, for this launch only; D must
+  already exist.
 - Remotes are added by the human in Settings > Remotes. Do not edit
   settings.json for them.
 - **The agent on R has no Foreman CLI and no skills.** Opened on a POSIX

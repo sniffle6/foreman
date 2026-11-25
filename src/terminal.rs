@@ -7734,6 +7734,7 @@ mod tests {
             name: "desk".into(),
             target: "desk".into(),
             shell: crate::remote::RemoteShell::Posix,
+            base: String::new(),
             dirs: Default::default(),
         };
         let install = crate::remote_install::session_argv(&desk, "claude").unwrap();

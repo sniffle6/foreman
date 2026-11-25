@@ -45,10 +45,10 @@ is for changing the feature.
   beside each entry). Vendors move them; Codex's docs have already changed
   domain once. When an install fails, check the vendor page before
   changing foreman.
-- **A folder listing is cached for the life of its prompt or edit form,
-  except a failure to reach the Remote.** A folder made on the Remote by
-  anything but the picker's "+ new folder" does not show until the prompt is
-  opened again. The
+- **A folder listing is cached for the life of its edit form, except a
+  failure to reach the Remote.** A folder made on the Remote by anything
+  but the picker's "+ new folder" does not show until the form is opened
+  again. The
   script's own answers (missing, a file, denied) are kept too. An
   `Unreachable` answer (ssh error, timeout, needs a password) is dropped by
   `Cache::forget` whenever the directory or the Remote changes, or Down or
@@ -102,8 +102,27 @@ is for changing the feature.
   mode bits.
 - **Don't `request_focus` a TextEdit that already has focus.** The request
   resets the field's focus-lock filter, so egui then treats ArrowUp/Down as
-  focus moves and parks the keyboard on a button for a frame. The directory
-  prompt requests focus only when the field lacks it.
+  focus moves and parks the keyboard on a button for a frame.
+- **Only a directory equal to the derived one is created, and only its
+  last folder.** The launch script makes the directory when it equals
+  `<Projects folder>/<Project folder name>` for the Project it launches
+  from (`spawn_remote_session`), whoever chose it. It never makes the
+  parent, so a mistyped Projects folder ends the Session with `mkdir`'s
+  error. Any other directory (a Project's own row in Settings, `--cwd`)
+  must exist, or the `cd` fails and the Session ends.
+- **The derived directory is never saved.** `Remote::dirs` holds only the
+  Projects given a directory of their own. Changing the Projects folder
+  moves every other Project's next launch, and leaves the folders already
+  made under the old one behind.
+- **A blank Project row is no mapping; the home is `~`.** Before the
+  Projects folder a blank value was the directory prompt's answer for
+  home, so `sanitize` loads a blank as `~`. Saving a blank row removes it.
+- **The edit form lists a row per open Project**, mapped or not
+  (`RemotesView::set_projects`), since nothing else creates a row. A
+  closed Project with no mapping has none: open it to give it one.
+- **The Windows-Remote folder create has never run.** The PowerShell line
+  that checks the parent and creates the folder is only matched as text in
+  the unit tests.
 - **Agent-state badges: Claude on a POSIX Remote only.** Its hooks ride the
   launch as `--settings` and post to the Tunnel's `/hook`; gotchas are in
   `docs/agent-state.md`. Codex, Grok and Windows Remotes post no events, so
@@ -330,6 +349,14 @@ is for changing the feature.
 
 ## Why
 
+- **No directory prompt.** A first launch used to ask which directory on
+  the Remote to use. It now takes `<Projects folder>/<Project folder
+  name>` without asking (2026-11-25): a Remote Session should follow its
+  Project like a local one does. The spec's Launch > Directory section
+  describes the removed prompt.
+- **The Projects folder is never created, only the Project's folder in
+  it.** Creating the whole path would turn a typo (`~/scr`) into a tree of
+  empty folders with agents running in them.
 - **No auto-reconnect.** A dropped connection may have eaten a shell input,
   and an uncertain input must never be resent by itself. Reconnect is the
   human's Enter on the disconnect bar, or `foreman reconnect tN`, which does
@@ -385,17 +412,17 @@ is for changing the feature.
 
 ## Key files
 
-- `src/remote.rs` — `Remote`, `build`, `relaunch` and `RESUME`, `launch_dir`.
+- `src/remote.rs` — `Remote`, `build`, `relaunch` and `RESUME`, `launch_dir`,
+  `derived_dir`.
 - `src/control/tunnel.rs` — `Hub::lease`, `Hub::handle`, `build_call`,
   `reply_note`, `ReplyNote`.
-- `src/wm.rs` — `spawn_remote_session`, `add_remote_terminal`,
+- `src/wm.rs` — `spawn_remote_session`, `add_remote_terminal`, `remote_dir`,
   `refresh_reconnects`, `inherited`.
 - `src/terminal.rs` — `Session::spawn_remote`, `Session::disconnected_remote`,
   `Session::attach_tunnel`, `disconnect_bar_text`.
 - `src/remote_probe.rs` — `reach`, `start_test`, `test_entry`.
 - `src/remote_install.rs` — agent states, the prerequisite gate, the
   confirm's words; `wm.rs` `run_install`, `open_install`, `refresh_installs`.
-- `src/remotes_pane.rs`, `src/remote_dir_prompt.rs`, `src/launcher.rs`
-  `entries_on`.
+- `src/remotes_pane.rs`, `src/launcher.rs` `entries_on`.
 - `src/remote_browse.rs` (path model, listing scripts, cache) and
   `src/remote_browse_ui.rs` (the folder list widget).

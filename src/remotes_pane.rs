@@ -60,6 +60,8 @@ pub enum Field {
     Name,
     Target,
     Shell,
+    /// The Remote's Projects folder (`Remote::base`).
+    Base,
     /// The Remote directory of the draft's `dirs[i]`.
     Dir(usize),
 }
@@ -67,12 +69,13 @@ pub enum Field {
 impl Field {
     /// The next field in Tab order, over a form with `dirs` directory rows.
     fn step(self, forward: bool, dirs: usize) -> Field {
-        let n = 3 + dirs;
+        let n = 4 + dirs;
         let i = match self {
             Field::Name => 0,
             Field::Target => 1,
             Field::Shell => 2,
-            Field::Dir(k) => 3 + k.min(dirs.saturating_sub(1)),
+            Field::Base => 3,
+            Field::Dir(k) => 4 + k.min(dirs.saturating_sub(1)),
         };
         match if forward {
             (i + 1) % n
@@ -82,7 +85,8 @@ impl Field {
             0 => Field::Name,
             1 => Field::Target,
             2 => Field::Shell,
-            k => Field::Dir(k - 3),
+            3 => Field::Base,
+            k => Field::Dir(k - 4),
         }
     }
 }
@@ -92,7 +96,8 @@ impl Field {
 pub struct DirRow {
     /// The `Remote::dirs` key as stored: the seat-PC Project directory.
     pub project: String,
-    /// The directory on the Remote; blank is its home.
+    /// The directory on the Remote. Blank is no mapping: the Project opens
+    /// in its folder under the Projects folder.
     pub remote: String,
 }
 
@@ -104,6 +109,8 @@ pub struct Draft {
     pub name: String,
     pub target: String,
     pub shell: RemoteShell,
+    /// The Projects folder (`Remote::base`); blank is the home.
+    pub base: String,
     pub field: Field,
     /// The highlighted ssh-config suggestion, while the Target field is active.
     pub pick: Option<usize>,
@@ -113,7 +120,7 @@ pub struct Draft {
     /// The entry's Project directory mappings, editable.
     pub dirs: Vec<DirRow>,
     /// Project keys cleared in this draft; removed on save. Kept apart from
-    /// `dirs` so a mapping the directory prompt adds while the form is open
+    /// `dirs` so a mapping a first launch adds while the form is open
     /// survives the save.
     pub cleared: Vec<String>,
 }
@@ -139,6 +146,7 @@ impl Draft {
             name: String::new(),
             target: String::new(),
             shell: RemoteShell::default(),
+            base: String::new(),
             field: Field::Name,
             pick: None,
             error: None,
@@ -147,29 +155,52 @@ impl Draft {
         }
     }
 
-    pub fn edit(index: usize, r: &Remote) -> Self {
+    /// `open` is the directories of the Projects open now: each gets a row,
+    /// blank unless it has a mapping, so one can be given a directory of its
+    /// own without having been launched first.
+    pub fn edit(index: usize, r: &Remote, open: &[String]) -> Self {
+        let mut dirs: Vec<DirRow> = r
+            .dirs
+            .iter()
+            .map(|(project, remote)| DirRow {
+                project: project.clone(),
+                remote: remote.clone(),
+            })
+            .collect();
+        for project in open {
+            if !dirs.iter().any(|d| remote::same_dir(&d.project, project)) {
+                dirs.push(DirRow {
+                    project: remote::plain_dir(project),
+                    remote: String::new(),
+                });
+            }
+        }
         Self {
             index: Some(index),
             name: r.name.clone(),
             target: r.target.clone(),
             shell: r.shell,
+            base: r.base.clone(),
             field: Field::Name,
             pick: None,
             error: None,
-            dirs: r
-                .dirs
-                .iter()
-                .map(|(project, remote)| DirRow {
-                    project: project.clone(),
-                    remote: remote.clone(),
-                })
-                .collect(),
+            dirs,
             cleared: Vec::new(),
         }
     }
 
-    /// Drop the mapping at `k`: the next launch from that Project asks
-    /// again. The active field stays on a row that still exists.
+    /// The directory the folder list is listing for: the focused Projects
+    /// folder or Project row.
+    fn browsed(&self) -> Option<&str> {
+        match self.field {
+            Field::Base => Some(&self.base),
+            Field::Dir(k) => self.dirs.get(k).map(|r| r.remote.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Drop the mapping at `k`: that Project goes back to its folder under
+    /// the Projects folder. The active field stays on a row that still exists.
     pub fn clear_dir(&mut self, k: usize) {
         if k >= self.dirs.len() {
             return;
@@ -252,6 +283,7 @@ impl Draft {
             name: name.to_string(),
             target: target.to_string(),
             shell: self.shell,
+            base: remote::checked_dir(&self.base).map_err(|e| invalid(Field::Base, e))?,
             dirs,
         })
     }
@@ -268,14 +300,17 @@ impl Draft {
             out.retain(|seat, _| !remote::same_dir(seat, key));
         }
         for (k, row) in self.dirs.iter().enumerate() {
-            let dir = crate::remote_dir_prompt::validate(&row.remote).map_err(|e| {
+            let dir = remote::checked_dir(&row.remote).map_err(|e| {
                 invalid(
                     Field::Dir(k),
                     format!("{}: {e}", remote::plain_dir(&row.project)),
                 )
             })?;
             out.retain(|seat, _| !remote::same_dir(seat, &row.project));
-            out.insert(remote::plain_dir(&row.project), dir);
+            // Blank is no mapping; the home is spelled `~`.
+            if !dir.is_empty() {
+                out.insert(remote::plain_dir(&row.project), dir);
+            }
         }
         Ok(out)
     }
@@ -425,6 +460,9 @@ pub struct RemotesView {
     /// frame); `None` = no Project is open, so an install is refused before
     /// its confirm.
     install_project: Option<String>,
+    /// The directories of the Projects open now; each gets a row in the
+    /// edit form.
+    projects: Vec<String>,
     /// Per target: its agents line, built once per Test answer and marks
     /// change instead of every frame.
     agents: HashMap<String, std::sync::Arc<AgentsCache>>,
@@ -511,6 +549,7 @@ impl RemotesView {
                 agents_fit: true,
             },
             install_project: None,
+            projects: Vec::new(),
             agents: HashMap::new(),
             browse: Browser::new(),
             #[cfg(test)]
@@ -582,6 +621,13 @@ impl RemotesView {
     pub fn set_install_project(&mut self, project: Option<&str>) {
         if self.install_project.as_deref() != project {
             self.install_project = project.map(str::to_string);
+        }
+    }
+
+    /// The directories of the Projects open now.
+    pub fn set_projects(&mut self, projects: &[String]) {
+        if self.projects != projects {
+            self.projects = projects.to_vec();
         }
     }
 
@@ -716,7 +762,11 @@ impl RemotesView {
                     self.scroll_to = true;
                 }
                 Key::Enter if self.selected < len => {
-                    self.begin_edit(Draft::edit(self.selected, &remotes[self.selected]));
+                    self.begin_edit(Draft::edit(
+                        self.selected,
+                        &remotes[self.selected],
+                        &self.projects,
+                    ));
                 }
                 Key::Enter | Key::Add => self.begin_add(len),
                 Key::Delete if self.selected < len => {
@@ -863,16 +913,18 @@ impl RemotesView {
         Effect::None
     }
 
-    /// A key for the folder list under the focused Directory row: all its
+    /// A key for the folder list under the focused directory field (the
+    /// Projects folder or a Project's row): all its
     /// keys while it has the keyboard (Esc steps back one, name field to
     /// list to field, as Esc first drops a Target suggestion), and Down
     /// from the field when there is a list to enter. `None` = the form's
     /// own key.
     fn browse_key(&mut self, k: Key, d: &mut Draft) -> Option<Effect> {
-        let Field::Dir(j) = d.field else {
-            return None;
+        let text = match d.field {
+            Field::Base => &mut d.base,
+            Field::Dir(j) => &mut d.dirs.get_mut(j)?.remote,
+            _ => return None,
         };
-        let row = d.dirs.get_mut(j)?;
         let target = d.target.trim();
         if !remote::valid_target(target) {
             return None; // nothing to list: the area says why
@@ -899,11 +951,11 @@ impl RemotesView {
             // Ctrl+Backspace still forgets the row.
             _ => return None,
         };
-        let old = row.remote.clone();
-        if !self.browse.key(nav, &mut row.remote) {
+        let old = text.clone();
+        if !self.browse.key(nav, text) {
             return None;
         }
-        if row.remote != old {
+        if *text != old {
             d.error = None;
         }
         self.scroll_to = true;
@@ -1010,8 +1062,8 @@ impl RemotesView {
     fn edit_footer(&self, d: &Draft, remotes: &[Remote]) -> &'static str {
         let listable = remote::valid_target(d.target.trim());
         match d.field {
-            Field::Dir(k) if listable && self.browse.list_focused() => {
-                match d.dirs.get(k).map(|r| self.browse.shows(&r.remote)) {
+            Field::Base | Field::Dir(_) if listable && self.browse.list_focused() => {
+                match d.browsed().map(|t| self.browse.shows(t)) {
                     Some(Shows::Waiting) => "Listing folders · Tab/Esc back to the field",
                     Some(Shows::Retry) => "Enter retry · Tab/Esc back to the field",
                     Some(Shows::Naming) => "Enter create the folder · Esc back to the list",
@@ -1043,7 +1095,12 @@ impl RemotesView {
                 "Tab next field · ↓ ssh-config Hosts · Enter save · Esc cancel"
             }
             Field::Shell => "←/→ change shell · Tab next field · Enter save · Esc cancel",
-            Field::Name | Field::Target => "Tab next field · Enter save · Esc cancel",
+            Field::Base if listable => match self.browse.enters(&d.base) {
+                Enters::Folders => "Tab next field · ↓ folders · Enter save · Esc cancel",
+                Enters::Retry => "Tab next field · ↓ retry · Enter save · Esc cancel",
+                Enters::None => "Tab next field · Enter save · Esc cancel",
+            },
+            Field::Name | Field::Target | Field::Base => "Tab next field · Enter save · Esc cancel",
         }
     }
 
@@ -1163,7 +1220,7 @@ impl RemotesView {
                 }
                 Act::Edit(i) => {
                     self.selected = i;
-                    self.begin_edit(Draft::edit(i, &remotes[i]));
+                    self.begin_edit(Draft::edit(i, &remotes[i], &self.projects));
                 }
                 Act::Add => self.begin_add(remotes.len()),
                 Act::AskDelete(i) => {
@@ -1470,6 +1527,7 @@ impl RemotesView {
         let hosts = self.hosts.as_deref().unwrap_or_default();
         let name_id = egui::Id::new("remotes_edit_name");
         let target_id = egui::Id::new("remotes_edit_target");
+        let base_id = egui::Id::new("remotes_edit_base");
         let dir_id = |k: usize| egui::Id::new(("remotes_edit_dir", k));
         // The model owns which field is active and egui focus follows it,
         // but only while this Win reads the keyboard: typing in a terminal
@@ -1479,10 +1537,14 @@ impl RemotesView {
         let dirs = d.dirs.len();
         // Typing while the list has the keyboard lands in the field, which
         // takes the keyboard back before it draws.
+        let typed_into = match d.field {
+            Field::Base => Some(&mut d.base),
+            Field::Dir(k) => d.dirs.get_mut(k).map(|r| &mut r.remote),
+            _ => None,
+        };
         if active
-            && let Field::Dir(k) = d.field
-            && let Some(row) = d.dirs.get_mut(k)
-            && browse.route_typing(&ctx, &mut row.remote)
+            && let Some(text) = typed_into
+            && browse.route_typing(&ctx, text)
         {
             d.error = None;
         }
@@ -1490,10 +1552,12 @@ impl RemotesView {
         ui.memory_mut(|m| match (active, d.field) {
             (true, Field::Name) => m.request_focus(name_id),
             (true, Field::Target) => m.request_focus(target_id),
+            (true, Field::Base) if !list => m.request_focus(base_id),
             (true, Field::Dir(k)) if !list => m.request_focus(dir_id(k)),
             _ => {
                 m.surrender_focus(name_id);
                 m.surrender_focus(target_id);
+                m.surrender_focus(base_id);
                 for k in 0..dirs {
                     m.surrender_focus(dir_id(k));
                 }
@@ -1664,12 +1728,56 @@ impl RemotesView {
             acts.push(Act::Key(Key::Right));
         }
 
-        // The Project directories this Remote has answered for: the one
-        // place a wrong directory-prompt answer can be fixed.
+        // Where Projects live on this Remote: one opens in a folder of its
+        // own name here, made on the first launch if it is missing.
+        if d.field == Field::Base {
+            browse.pin_caret(&ctx, base_id, &d.base);
+        }
+        let (_, base) = settings_row(
+            ui,
+            "Projects folder",
+            Some(Desc::Words("A Project opens in its own folder here")),
+            |ui| {
+                ui.add_sized(
+                    egui::vec2(fw, FIELD_H),
+                    egui::TextEdit::singleline(&mut d.base)
+                        .id(base_id)
+                        .lock_focus(true)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("(home)"),
+                )
+            },
+        );
+        laid.push(base.rect);
+        if d.field == Field::Base {
+            let (rect, changed) = folder_list(
+                ui,
+                browse,
+                w,
+                (d.target.trim(), d.shell, d.name.trim()),
+                &mut d.base,
+                None,
+                active,
+                base.rect,
+            );
+            active_rect = Some(rect);
+            if changed {
+                d.error = None;
+            }
+        }
+        if base.clicked() {
+            acts.push(Act::Field(Field::Base));
+        }
+        if base.changed() {
+            d.error = None;
+        }
+
+        // A Project that lives somewhere else on this Remote gets its own
+        // directory here; a blank row follows the Projects folder.
         if d.index.is_some() {
             section_header(ui, w, "Project directories");
             if d.dirs.is_empty() {
-                let text = "None yet: a Project's first launch on it asks";
+                let text = "None: open a Project to give it its own";
                 let (line, _) =
                     ui.allocate_exact_size(egui::vec2(w, LINE_H + 6.0), egui::Sense::hover());
                 let font = egui::FontId::proportional(DESC_PT);
@@ -1694,11 +1802,13 @@ impl RemotesView {
             }
             let full = remote::plain_dir(&d.dirs[k].project);
             let label = project_name(&d.dirs[k].project);
+            // What a blank row means, spelled out.
+            let follows = remote::derived_dir(&d.base, &d.dirs[k].project);
             let row = &mut d.dirs[k];
             let (_, (edit, clear)) = settings_row(ui, &label, Some(Desc::Path(&full)), |ui| {
-                let clear = ui
-                    .small_button("clear")
-                    .on_hover_text("Forget it: the next launch from this Project asks again");
+                let clear = ui.small_button("clear").on_hover_text(
+                    "Forget it: this Project goes back to its folder in the Projects folder",
+                );
                 if clear.clicked() {
                     acts.push(Act::ClearDir(k));
                 }
@@ -1710,7 +1820,7 @@ impl RemotesView {
                         .id(dir_id(k))
                         .lock_focus(true)
                         .font(egui::TextStyle::Monospace)
-                        .hint_text("(home)"),
+                        .hint_text(follows.as_str()),
                 );
                 (edit, clear.rect)
             });
@@ -1725,61 +1835,20 @@ impl RemotesView {
             if d.field != Field::Dir(k) {
                 continue;
             }
-            active_rect = Some(edit.rect);
-            // The folder list, directly under the focused Directory row:
-            // the same height whatever it shows, so a listing landing moves
-            // nothing.
-            let body_h = BROWSE_ROWS * crate::remote_browse_ui::ROW_H;
-            let h = Browser::height(ui, body_h);
-            let (outer, _) =
-                ui.allocate_exact_size(egui::vec2(w, h + PICK_GAP), egui::Sense::hover());
-            let area = egui::Rect::from_min_size(
-                egui::pos2(outer.min.x + PAD, outer.min.y),
-                egui::vec2(w - 2.0 * PAD, h),
+            let project = project_name(&d.dirs[k].project);
+            let (rect, changed) = folder_list(
+                ui,
+                browse,
+                w,
+                (d.target.trim(), d.shell, d.name.trim()),
+                &mut d.dirs[k].remote,
+                Some(&project),
+                active,
+                edit.rect,
             );
-            let mut c = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(area)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            let target = d.target.trim();
-            if remote::valid_target(target) {
-                let name = if d.name.trim().is_empty() {
-                    target
-                } else {
-                    d.name.trim()
-                };
-                browse.set_source(target, d.shell, name);
-                let project = project_name(&d.dirs[k].project);
-                if browse.show(
-                    &mut c,
-                    &mut d.dirs[k].remote,
-                    body_h,
-                    active,
-                    Some(&project),
-                ) {
-                    d.error = None;
-                }
-                // The field and its list together when they fit the view;
-                // else whichever has the keyboard.
-                let area = browse.laid.area;
-                let fits = |r: egui::Rect| r.height() <= ui.clip_rect().height();
-                // A margin, so neither sits flush on the edge.
-                let both = edit.rect.union(area).expand2(egui::vec2(0.0, 4.0));
-                active_rect = if fits(both) {
-                    Some(both)
-                } else if browse.list_focused() {
-                    Some(area)
-                } else {
-                    Some(edit.rect)
-                };
-            } else {
-                crate::remote_browse_ui::idle(
-                    &mut c,
-                    body_h,
-                    "Give a Target to list its folders",
-                    &mut browse.laid,
-                );
+            active_rect = Some(rect);
+            if changed {
+                d.error = None;
             }
         }
         ui.add_space(4.0);
@@ -2227,6 +2296,60 @@ fn browse_letter(key: egui::Key, mods: egui::Modifiers) -> Option<Key> {
     })
 }
 
+/// The folder list directly under the focused directory field `edit`: the
+/// same height whatever it shows, so a listing landing moves nothing.
+/// `source` is the draft's (target, shell, name); `whose` names the Project
+/// a row is for. Returns what to keep in view (the field and its list
+/// together when they fit, else whichever has the keyboard) and whether the
+/// list changed `text`.
+#[allow(clippy::too_many_arguments)]
+fn folder_list(
+    ui: &mut egui::Ui,
+    browse: &mut Browser,
+    w: f32,
+    source: (&str, RemoteShell, &str),
+    text: &mut String,
+    whose: Option<&str>,
+    active: bool,
+    edit: egui::Rect,
+) -> (egui::Rect, bool) {
+    let (target, shell, name) = source;
+    let body_h = BROWSE_ROWS * crate::remote_browse_ui::ROW_H;
+    let h = Browser::height(ui, body_h);
+    let (outer, _) = ui.allocate_exact_size(egui::vec2(w, h + PICK_GAP), egui::Sense::hover());
+    let area = egui::Rect::from_min_size(
+        egui::pos2(outer.min.x + PAD, outer.min.y),
+        egui::vec2(w - 2.0 * PAD, h),
+    );
+    let mut c = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(area)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    if !remote::valid_target(target) {
+        crate::remote_browse_ui::idle(
+            &mut c,
+            body_h,
+            "Give a Target to list its folders",
+            &mut browse.laid,
+        );
+        return (edit, false);
+    }
+    browse.set_source(target, shell, if name.is_empty() { target } else { name });
+    let changed = browse.show(&mut c, text, body_h, active, whose);
+    let area = browse.laid.area;
+    // A margin, so neither sits flush on the edge.
+    let both = edit.union(area).expand2(egui::vec2(0.0, 4.0));
+    let rect = if both.height() <= ui.clip_rect().height() {
+        both
+    } else if browse.list_focused() {
+        area
+    } else {
+        edit
+    };
+    (rect, changed)
+}
+
 /// This frame's keys for the current mode. Letters only count while
 /// browsing: in the form they are typing. While the folder list's name
 /// field is open, the editing keys are its own.
@@ -2251,7 +2374,10 @@ fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool, naming: bool) -> Vec<Key> {
     // none of them edits it.
     let browse: Vec<Key> = ui.input_mut(|i| {
         let mut out = Vec::new();
-        if list && !naming && matches!(mode, Mode::Edit(d) if matches!(d.field, Field::Dir(_))) {
+        if list
+            && !naming
+            && matches!(mode, Mode::Edit(d) if matches!(d.field, Field::Base | Field::Dir(_)))
+        {
             for (k, key) in [
                 (K::ArrowLeft, Key::Left),
                 (K::ArrowRight, Key::Right),
@@ -2342,6 +2468,7 @@ mod tests {
             name: name.into(),
             target: target.into(),
             shell: RemoteShell::Posix,
+            base: String::new(),
             dirs: Default::default(),
         }
     }
@@ -2351,6 +2478,7 @@ mod tests {
             match field {
                 Field::Name => d.name = text.into(),
                 Field::Target => d.target = text.into(),
+                Field::Base => d.base = text.into(),
                 Field::Dir(k) => d.dirs[k].remote = text.into(),
                 Field::Shell => {}
             }
@@ -2415,8 +2543,8 @@ mod tests {
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
         assert_eq!(draft(&v).dirs.len(), 2);
-        // Tab walks Name, Target, Shell, then each directory.
-        for _ in 0..3 {
+        // Tab walks Name, Target, Shell, Projects folder, then each directory.
+        for _ in 0..4 {
             v.key(Key::Tab, &mut list);
         }
         assert_eq!(draft(&v).field, Field::Dir(0));
@@ -2430,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cleared_project_directory_is_forgotten_so_the_prompt_asks_again() {
+    fn a_cleared_project_directory_is_forgotten_so_the_next_launch_derives_it() {
         let mut v = RemotesView::new();
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
@@ -2442,8 +2570,40 @@ mod tests {
         assert_eq!(d.field, Field::Shell);
         assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
         assert!(list[0].dirs.is_empty(), "{:?}", list[0].dirs);
-        let e = crate::remote::launch_dir(&list[0], None, Some(r"H:\src\app")).unwrap_err();
-        assert!(e.contains("prompt"), "{e}");
+        assert_eq!(
+            crate::remote::launch_dir(&list[0], None, Some(r"H:\src\app")).as_deref(),
+            Ok("~/app")
+        );
+    }
+
+    /// The Projects folder is saved with the Remote. Every open Project has
+    /// a row, blank unless mapped; a blank row saves no mapping and a typed
+    /// one saves under the plain key.
+    #[test]
+    fn the_projects_folder_is_saved_and_open_projects_get_rows() {
+        let list = vec![mapped()];
+        let open = [r"\\?\H:\src\app".to_string(), r"H:\src\new".to_string()];
+        let mut d = Draft::edit(0, &list[0], &open);
+        assert_eq!(d.dirs.len(), 3, "the two mapped, and the open unmapped one");
+        assert_eq!(d.dirs[2].project, r"H:\src\new");
+        assert_eq!(d.dirs[2].remote, "");
+        d.base = " ~/src ".into();
+        let saved = d.validate(&list).unwrap();
+        assert_eq!(saved.base, "~/src");
+        assert_eq!(saved.dirs.len(), 2, "a blank row maps nothing");
+        assert!(!saved.dirs.contains_key(r"H:\src\new"));
+        assert_eq!(
+            crate::remote::launch_dir(&saved, None, Some(r"H:\src\new")).as_deref(),
+            Ok("~/src/new")
+        );
+        // Typed: that Project's own directory. Blanked: back to the base.
+        d.dirs[2].remote = "/srv/new".into();
+        d.dirs[0].remote = " ".into();
+        let saved = d.validate(&list).unwrap();
+        assert_eq!(saved.dirs[r"H:\src\new"], "/srv/new");
+        assert_eq!(saved.dirs.len(), 2, "{:?}", saved.dirs);
+        d.base = "a\tb".into();
+        assert_eq!(d.validate(&list).unwrap_err().field, Field::Base);
     }
 
     #[test]
@@ -2475,7 +2635,7 @@ mod tests {
         let mut v = RemotesView::new();
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
-        // The directory prompt answers for another Project meanwhile.
+        // Another Project's first launch saves its directory meanwhile.
         list[0].dirs.insert(r"H:\src\new".into(), "/srv/new".into());
         let Mode::Edit(d) = &mut v.mode else { panic!() };
         d.clear_dir(0);
@@ -2500,7 +2660,7 @@ mod tests {
         let mut v = RemotesView::new();
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
-        for _ in 0..3 {
+        for _ in 0..4 {
             v.key(Key::Tab, &mut list);
         }
         assert_eq!(draft(&v).field, Field::Dir(0));
@@ -2520,6 +2680,47 @@ mod tests {
             listing("/srv/data", &["x"]),
         );
         (v, list)
+    }
+
+    /// The Projects folder has the same folder list as a Project row: Down
+    /// enters it, Enter goes into a folder and writes it to the field, and
+    /// Enter from the field saves it as the Remote's base.
+    #[test]
+    fn the_projects_folder_is_picked_from_the_folder_list() {
+        let mut v = RemotesView::new();
+        let mut list = vec![mapped()];
+        v.key(Key::Enter, &mut list);
+        for _ in 0..3 {
+            v.key(Key::Tab, &mut list);
+        }
+        assert_eq!(draft(&v).field, Field::Base);
+        let b = v.browse();
+        b.set_source("andy@desk", RemoteShell::Posix, "desk");
+        b.put(
+            "andy@desk",
+            RemoteShell::Posix,
+            "",
+            listing("/home/andy", &["apps", "src"]),
+        );
+        assert!(v.footer(&list).contains("↓ folders"), "{}", v.footer(&list));
+        v.key(Key::Down, &mut list);
+        assert!(v.browse.list_focused());
+        assert_eq!(draft(&v).field, Field::Base, "Down entered the list");
+        assert!(v.footer(&list).contains("→ in"), "{}", v.footer(&list));
+        v.key(Key::Down, &mut list); // apps -> src
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
+        assert_eq!(draft(&v).base, "~/src/");
+        assert_eq!(list[0].base, "", "nothing saved");
+        // Tab hands the keyboard back to the field; Enter there saves.
+        v.key(Key::Tab, &mut list);
+        assert!(!v.browse.list_focused());
+        assert_eq!(draft(&v).field, Field::Base);
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::Changed);
+        assert_eq!(list[0].base, "~/src/");
+        assert_eq!(
+            crate::remote::launch_dir(&list[0], None, Some(r"H:\src\new")).as_deref(),
+            Ok("~/src/new")
+        );
     }
 
     /// Down enters the list (not the next field), Enter there goes into a
@@ -2579,7 +2780,7 @@ mod tests {
         let mut v = RemotesView::new();
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
-        for _ in 0..3 {
+        for _ in 0..4 {
             v.key(Key::Tab, &mut list);
         }
         // What a drawn frame does first.
@@ -2631,7 +2832,7 @@ mod tests {
         if let Mode::Edit(d) = &mut v.mode {
             d.target = "not a target".into();
         }
-        for _ in 0..3 {
+        for _ in 0..4 {
             v.key(Key::Tab, &mut list);
         }
         v.key(Key::Down, &mut list);
@@ -2653,7 +2854,7 @@ mod tests {
         let mut v = RemotesView::new();
         let mut list = vec![mapped()];
         v.key(Key::Enter, &mut list);
-        for _ in 0..3 {
+        for _ in 0..4 {
             v.key(Key::Tab, &mut list);
         }
         v.browse().put(
@@ -2682,7 +2883,7 @@ mod tests {
         // On a field that is not a directory, nothing to clear.
         v.key(Key::Clear, &mut list);
         assert_eq!(draft(&v).dirs.len(), 2);
-        for _ in 0..4 {
+        for _ in 0..5 {
             v.key(Key::Tab, &mut list);
         }
         assert_eq!(draft(&v).field, Field::Dir(1));
@@ -2730,11 +2931,14 @@ mod tests {
 
     #[test]
     fn tab_order_wraps_through_the_directory_fields() {
-        assert_eq!(Field::Shell.step(true, 0), Field::Name);
-        assert_eq!(Field::Shell.step(true, 2), Field::Dir(0));
+        assert_eq!(Field::Shell.step(true, 0), Field::Base);
+        assert_eq!(Field::Base.step(true, 0), Field::Name);
+        assert_eq!(Field::Name.step(false, 0), Field::Base);
+        assert_eq!(Field::Shell.step(true, 2), Field::Base);
+        assert_eq!(Field::Base.step(true, 2), Field::Dir(0));
         assert_eq!(Field::Dir(1).step(true, 2), Field::Name);
         assert_eq!(Field::Name.step(false, 2), Field::Dir(1));
-        assert_eq!(Field::Dir(0).step(false, 2), Field::Shell);
+        assert_eq!(Field::Dir(0).step(false, 2), Field::Base);
     }
 
     fn draft(v: &RemotesView) -> &Draft {
@@ -2855,7 +3059,7 @@ mod tests {
         // Whatever validate accepts, sanitize keeps.
         assert_eq!(remote::sanitize(vec![ok.clone()]), vec![ok]);
         // Editing an entry may keep its own name.
-        let mut same = Draft::edit(0, &list[0]);
+        let mut same = Draft::edit(0, &list[0], &[]);
         same.target = "andy@desk".into();
         assert!(same.validate(&list).is_ok());
     }
@@ -2926,7 +3130,7 @@ mod tests {
         d.target = "desk".into(); // exactly typed: nothing left to complete
         assert!(suggestions(&hosts, &list, &d).is_empty());
         // Editing the entry that uses garage offers it back.
-        let d = Draft::edit(0, &list[0]);
+        let d = Draft::edit(0, &list[0], &[]);
         let mut d2 = d.clone();
         d2.target = "gar".into();
         assert_eq!(suggestions(&hosts, &list, &d2), vec!["garage"]);
@@ -2976,7 +3180,8 @@ mod tests {
         v.key(Key::Right, &mut list); // Name field: the TextEdit's cursor key
         let Mode::Edit(d) = &v.mode else { panic!() };
         assert_eq!(d.shell, RemoteShell::Posix);
-        v.key(Key::BackTab, &mut list); // wraps to Shell
+        v.key(Key::BackTab, &mut list); // wraps to Projects folder
+        v.key(Key::BackTab, &mut list); // Shell
         v.key(Key::Left, &mut list);
         let Mode::Edit(d) = &v.mode else { panic!() };
         assert_eq!(d.shell, RemoteShell::WindowsPowerShell);

@@ -42,8 +42,12 @@ pub struct Remote {
     pub target: String,
     #[serde(default)]
     pub shell: RemoteShell,
-    /// Seat-PC Project directory -> directory on this Remote. A blank value
-    /// is a saved answer meaning the Remote's home.
+    /// The folder on this Remote that holds Projects: one opens in
+    /// `<base>/<its folder name>` ([`derived_dir`]). Blank = the home.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base: String,
+    /// Seat-PC Project directory -> directory on this Remote, for a Project
+    /// that does not live under `base`. `~` is the Remote's home.
     #[serde(default)]
     pub dirs: BTreeMap<String, String>,
 }
@@ -73,8 +77,13 @@ pub fn sanitize(remotes: Vec<Remote>) -> Vec<Remote> {
         .map(|mut r| {
             r.name = r.name.trim().to_string();
             r.target = r.target.trim().to_string();
+            r.base = checked_dir(&r.base).unwrap_or_default();
             for dir in r.dirs.values_mut() {
                 *dir = dir.trim().to_string();
+                // Blank was the old directory prompt's answer for home.
+                if dir.is_empty() {
+                    *dir = "~".into();
+                }
             }
             r.dirs.retain(|project, _| !project.trim().is_empty());
             r
@@ -830,34 +839,92 @@ pub fn plain_dir(dir: &str) -> String {
     }
 }
 
+/// Longest Remote directory kept. Far past any real path; it bounds what a
+/// stuck key or a paste can put into settings.json.
+pub const MAX_DIR: usize = 1024;
+
+/// A Remote directory as stored: one line, bounded. Blank is a real value
+/// (the Remote's home); anything else the launch script quotes as a literal,
+/// so no other rule is needed.
+pub fn checked_dir(text: &str) -> Result<String, String> {
+    let dir = text.trim();
+    if dir.chars().any(char::is_control) {
+        return Err("A directory is one line: no tabs or line breaks".into());
+    }
+    if dir.len() > MAX_DIR {
+        return Err(format!(
+            "Too long for a directory ({MAX_DIR} characters at most)"
+        ));
+    }
+    Ok(dir.to_string())
+}
+
+/// What a user-opened Remote launch opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum What {
+    Agent(crate::landing::SessionKind),
+    Shell,
+}
+
+/// Where that launch puts its Win.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// Beside the focused window, like any new terminal.
+    Default,
+    /// A directional split of the focused window.
+    Split(crate::wm::Dir),
+}
+
+/// The directory a Project at `project_dir` gets on a Remote that has no
+/// mapping for it: a folder of the Project's own name inside `base` (blank =
+/// the Remote's home). `base` itself for a Project with no folder name, a
+/// drive root. The separator is the one `base` already uses.
+pub fn derived_dir(base: &str, project_dir: &str) -> String {
+    let plain = plain_dir(&project_dir.replace('/', "\\"));
+    let name = plain
+        .trim_end_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or("");
+    let base = match base.trim() {
+        "" => "~",
+        b => b,
+    };
+    if name.is_empty() || name.ends_with(':') {
+        return base.to_string();
+    }
+    let sep = if base.contains('\\') && !base.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    format!("{}{sep}{name}", base.trim_end_matches(['/', '\\']))
+}
+
 /// The directory on `remote` a launch from a Project at `project_dir` runs
-/// in. An explicit `cwd` wins and is not saved; otherwise the Project's
-/// mapping (blank = the Remote's home). Neither is an error naming both fixes,
-/// because guessing would start an agent in the wrong place.
-pub fn launch_dir<'a>(
-    remote: &'a Remote,
-    cwd: Option<&'a str>,
+/// in. An explicit `cwd` wins; otherwise the Project's mapping; otherwise
+/// [`derived_dir`], which is never saved, so it follows `Remote::base`. Only
+/// a Project with no directory of its own is an error.
+pub fn launch_dir(
+    remote: &Remote,
+    cwd: Option<&str>,
     project_dir: Option<&str>,
-) -> Result<&'a str, String> {
+) -> Result<String, String> {
     if let Some(dir) = cwd {
-        return Ok(dir);
+        return Ok(dir.to_string());
     }
     let name = &remote.name;
     let Some(project_dir) = project_dir else {
         return Err(format!(
-            "this Project has no directory to map to one on {name}; pass --cwd <directory on {name}>"
+            "this Project has no directory to name one on {name} after; pass --cwd <directory on {name}>"
         ));
     };
-    remote
+    Ok(remote
         .dirs
         .iter()
         .find(|(seat, _)| same_dir(seat, project_dir))
-        .map(|(_, there)| there.as_str())
-        .ok_or_else(|| {
-            format!(
-                "{name} has no directory for this Project ({project_dir}); pass --cwd <directory on {name}>, or open a Session on {name} from this Project's launcher once and answer its directory prompt"
-            )
-        })
+        .map(|(_, there)| there.clone())
+        .unwrap_or_else(|| derived_dir(&remote.base, project_dir)))
 }
 
 /// The per-Session reverse forward back to the seat PC's listener.
@@ -876,6 +943,10 @@ pub struct Launch<'a> {
     pub remote: &'a Remote,
     /// Directory on the Remote. Blank = the Remote's home.
     pub dir: &'a str,
+    /// Create `dir` when it is missing, inside a parent that exists. Only
+    /// for a directory foreman chose ([`derived_dir`]); one the user named,
+    /// `Remote::base` included, must already exist.
+    pub make_dir: bool,
     /// `t{id}`, as `FOREMAN_TERMINAL_ID` is locally.
     pub terminal_id: &'a str,
     /// `p{id}`; `None` outside a Project, as locally.
@@ -1086,7 +1157,7 @@ fn ssh_argv(l: &Launch, argv: &[String]) -> Result<Vec<String>, String> {
     }
 
     let line = match l.remote.shell {
-        RemoteShell::Posix => posix_line(&posix_script(l.dir, &env, &run)),
+        RemoteShell::Posix => posix_line(&posix_script(l.dir, l.make_dir, &env, &run)),
         shell @ (RemoteShell::Pwsh | RemoteShell::WindowsPowerShell) => {
             let exe = if shell == RemoteShell::Pwsh {
                 "pwsh"
@@ -1107,6 +1178,7 @@ fn ssh_argv(l: &Launch, argv: &[String]) -> Result<Vec<String>, String> {
                 "{exe} -NoLogo{no_exit} -EncodedCommand {}",
                 utf16le_b64(&ps_script(
                     l.dir,
+                    l.make_dir,
                     &env,
                     &run,
                     shell == RemoteShell::WindowsPowerShell
@@ -1227,7 +1299,7 @@ pub(crate) fn home_relative(dir: &str) -> Option<&str> {
     dir.strip_prefix("~/").or_else(|| dir.strip_prefix("~\\"))
 }
 
-fn posix_script(dir: &str, env: &[(&str, String)], argv: &[String]) -> String {
+fn posix_script(dir: &str, make_dir: bool, env: &[(&str, String)], argv: &[String]) -> String {
     let mut s = String::new();
     if !dir.is_empty() {
         let target = match home_relative(dir) {
@@ -1235,6 +1307,10 @@ fn posix_script(dir: &str, env: &[(&str, String)], argv: &[String]) -> String {
             Some(rest) => format!("\"$HOME\"/{}", sh_quote(rest)),
             None => sh_quote(dir),
         };
+        if make_dir {
+            // No -p: a mistyped base fails here instead of growing a tree.
+            s.push_str(&format!("[ -d {target} ] || mkdir -- {target} || exit 1\n"));
+        }
         s.push_str(&format!("cd -- {target} || exit 1\n"));
     }
     for (k, v) in env {
@@ -1260,7 +1336,13 @@ pub(crate) fn posix_line(script: &str) -> String {
     format!("sh -c \"$(printf %s {b64} | base64 -d)\"")
 }
 
-fn ps_script(dir: &str, env: &[(&str, String)], argv: &[String], legacy: bool) -> String {
+fn ps_script(
+    dir: &str,
+    make_dir: bool,
+    env: &[(&str, String)],
+    argv: &[String],
+    legacy: bool,
+) -> String {
     let mut s = String::new();
     if !dir.is_empty() {
         let target = match home_relative(dir) {
@@ -1268,8 +1350,18 @@ fn ps_script(dir: &str, env: &[(&str, String)], argv: &[String], legacy: bool) -
             Some(rest) => format!("(Join-Path $HOME {})", ps_quote(rest)),
             None => ps_quote(dir),
         };
+        // .NET, not New-Item: no wildcard reading of the name, and an
+        // existing folder is not an error. CreateDirectory would make the
+        // parents too, so a missing parent (a mistyped base) is refused.
+        let make = if make_dir {
+            format!(
+                "$d = {target}; if (-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($d))) {{ throw \"$d: its parent folder does not exist\" }}; [void][IO.Directory]::CreateDirectory($d); "
+            )
+        } else {
+            String::new()
+        };
         s.push_str(&format!(
-            "try {{ Set-Location -LiteralPath {target} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n"
+            "try {{ {make}Set-Location -LiteralPath {target} -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}\n"
         ));
     }
     for (k, v) in env {
@@ -1356,6 +1448,7 @@ mod tests {
             name: "desk".into(),
             target: "me@desk.lan".into(),
             shell: super::RemoteShell::default(),
+            base: String::new(),
             dirs: Default::default(),
         };
         assert_eq!(
@@ -1898,6 +1991,7 @@ mod tests {
             name: "desk".into(),
             target: "andy@desk".into(),
             shell,
+            base: String::new(),
             dirs: BTreeMap::new(),
         }
     }
@@ -1910,6 +2004,7 @@ mod tests {
         Launch {
             remote: r,
             dir,
+            make_dir: false,
             terminal_id: "t7",
             project_id: Some("p3"),
             tunnel: Some(Tunnel {
@@ -2322,6 +2417,7 @@ mod tests {
             name: name.into(),
             target: target.into(),
             shell: RemoteShell::Posix,
+            base: String::new(),
             dirs: BTreeMap::new(),
         };
         let got = sanitize(vec![
@@ -2364,32 +2460,106 @@ mod tests {
     }
 
     #[test]
-    fn remote_launch_dir_prefers_cwd_then_mapping_and_names_both_fixes() {
+    fn remote_launch_dir_prefers_cwd_then_mapping_then_the_projects_own_name() {
         let mut r = remote(RemoteShell::Posix);
         r.dirs.insert(
             r"H:\claude code\foreman".into(),
             "/home/andy/foreman".into(),
         );
         r.dirs.insert(r"H:\scratch".into(), String::new());
+        let at = |cwd, project| launch_dir(&r, cwd, project);
         // --cwd wins over a mapping.
         assert_eq!(
-            launch_dir(&r, Some("/tmp"), Some(r"H:\claude code\foreman")),
+            at(Some("/tmp"), Some(r"H:\claude code\foreman")).as_deref(),
             Ok("/tmp")
         );
         // Case, slash direction and a trailing separator still match.
         assert_eq!(
-            launch_dir(&r, None, Some("h:/Claude Code/foreman/")),
+            at(None, Some("h:/Claude Code/foreman/")).as_deref(),
             Ok("/home/andy/foreman")
         );
-        // A blank mapping is a saved answer: the Remote's home.
-        assert_eq!(launch_dir(&r, None, Some(r"H:\scratch")), Ok(""));
-        let e = launch_dir(&r, None, Some(r"H:\other")).unwrap_err();
-        assert!(
-            e.contains("--cwd") && e.contains("directory prompt") && e.contains(r"H:\other"),
-            "{e}"
-        );
-        let e = launch_dir(&r, None, None).unwrap_err();
+        // No mapping: the Project's own folder name, in the Remote's home...
+        assert_eq!(at(None, Some(r"H:\src\other")).as_deref(), Ok("~/other"));
+        let e = at(None, None).unwrap_err();
         assert!(e.contains("--cwd"), "{e}");
+        // ...or in the Remote's base folder, which a mapping still beats.
+        r.base = "~/src".into();
+        assert_eq!(
+            launch_dir(&r, None, Some(r"H:\src\other")).as_deref(),
+            Ok("~/src/other")
+        );
+        assert_eq!(
+            launch_dir(&r, None, Some(r"H:\claude code\foreman")).as_deref(),
+            Ok("/home/andy/foreman")
+        );
+    }
+
+    #[test]
+    fn a_derived_directory_is_the_projects_folder_name_under_the_base() {
+        assert_eq!(derived_dir("", r"H:\claude code\foreman"), "~/foreman");
+        assert_eq!(derived_dir("", r"\\?\H:\src\my app\"), "~/my app");
+        assert_eq!(derived_dir(" ", "h:/src/app/"), "~/app");
+        assert_eq!(derived_dir("", r"\\nas\share\proj"), "~/proj");
+        assert_eq!(derived_dir("~/src", r"H:\src\app"), "~/src/app");
+        assert_eq!(derived_dir("/srv/code/", r"H:\src\app"), "/srv/code/app");
+        // A Windows base keeps its own separator.
+        assert_eq!(derived_dir(r"C:\src", r"H:\src\app"), r"C:\src\app");
+        assert_eq!(derived_dir(r"C:\src\", r"H:\src\app"), r"C:\src\app");
+        // A drive root has no name: the base itself.
+        assert_eq!(derived_dir("", r"H:\"), "~");
+        assert_eq!(derived_dir("~/src", r"\\?\H:\"), "~/src");
+    }
+
+    /// A settings.json from before the base folder: a blank mapping was the
+    /// directory prompt's answer for home, and blank now means no mapping.
+    #[test]
+    fn a_blank_saved_mapping_loads_as_home() {
+        let mut r = remote(RemoteShell::Posix);
+        r.base = "  ~/src  ".into();
+        r.dirs.insert(r"H:\scratch".into(), " ".into());
+        let r = sanitize(vec![r]).remove(0);
+        assert_eq!(r.base, "~/src");
+        assert_eq!(r.dirs[r"H:\scratch"], "~");
+        assert_eq!(
+            launch_dir(&r, None, Some(r"H:\scratch")).as_deref(),
+            Ok("~")
+        );
+    }
+
+    /// Only a directory foreman chose is created, before the `cd`, and only
+    /// its last folder: a missing parent fails. A name is quoted, never read
+    /// as an option or a pattern.
+    #[test]
+    fn make_dir_creates_only_the_last_folder_before_entering_it() {
+        let env: [(&str, String); 0] = [];
+        let s = posix_script("~/my app", true, &env, &[]);
+        assert!(
+            s.starts_with(
+                "[ -d \"$HOME\"/'my app' ] || mkdir -- \"$HOME\"/'my app' || exit 1\n\
+                 cd -- \"$HOME\"/'my app' || exit 1\n"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("mkdir -p"), "{s}");
+        assert!(!posix_script("~/my app", false, &env, &[]).contains("mkdir"));
+        // Home needs no making, asked or not.
+        assert!(!posix_script("", true, &env, &[]).contains("mkdir"));
+        let s = ps_script("~/it's [1]", true, &env, &[], false);
+        assert!(
+            s.starts_with(
+                "try { $d = (Join-Path $HOME 'it''s [1]'); \
+                 if (-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($d))) "
+            ),
+            "{s}"
+        );
+        assert!(
+            s.contains(
+                "[void][IO.Directory]::CreateDirectory($d); \
+                 Set-Location -LiteralPath (Join-Path $HOME 'it''s [1]') -ErrorAction Stop }"
+            ),
+            "{s}"
+        );
+        assert!(!ps_script("~/x", false, &env, &[], false).contains("CreateDirectory"));
     }
 
     #[test]
@@ -2409,15 +2579,19 @@ mod tests {
             .insert(r"\\?\UNC\nas\share\proj".into(), "/srv/proj".into());
         // A canonicalized Project directory still finds its mapping...
         assert_eq!(
-            launch_dir(&r, None, Some(r"\\?\H:\claude code\foreman\")),
+            launch_dir(&r, None, Some(r"\\?\H:\claude code\foreman\")).as_deref(),
             Ok("/srv/foreman")
         );
         // ...in both directions, and through the UNC form.
         assert_eq!(
-            launch_dir(&r, None, Some(r"\\nas\share\proj")),
+            launch_dir(&r, None, Some(r"\\nas\share\proj")).as_deref(),
             Ok("/srv/proj")
         );
-        assert!(launch_dir(&r, None, Some(r"\\?\H:\claude code")).is_err());
+        // The parent folder is another Project: its own name, not the mapping.
+        assert_eq!(
+            launch_dir(&r, None, Some(r"\\?\H:\claude code")).as_deref(),
+            Ok("~/claude code")
+        );
     }
 
     /// Every agent Test looks for has a command for every shell kind, and the

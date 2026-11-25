@@ -1,5 +1,5 @@
 //! Listing a Remote's folders for the directory picker under a Directory
-//! field (the directory prompt and the Remotes pane). The field text is the
+//! field (the Remotes pane). The field text is the
 //! source of truth: [`split`] reads which directory it names and the prefix
 //! that filters it, and [`descend`] / [`up`] write a choice back. Listings
 //! run over `ssh` with `BatchMode` on a worker thread, cached per (target,

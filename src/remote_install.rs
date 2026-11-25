@@ -923,6 +923,7 @@ mod tests {
                 name: "desk".into(),
                 target: "desk".into(),
                 shell,
+                base: String::new(),
                 dirs: Default::default(),
             };
             let argv = session_argv(&desk, "codex").unwrap();

@@ -2369,9 +2369,10 @@ addressed in chat. The reply is NOT the command's output or result.
 A target that is a .cmd/.bat shim (npm installs) cannot receive newlines
 or \" in arguments — foreman refuses such dispatches loudly.
 --on R runs <command...> on Remote R (see foreman remotes) over ssh: the
-pane is here, the process is there. It starts in the Project's mapped
-directory on R; --cwd D names a directory on R instead (not saved). With
-no mapping and no --cwd, open is refused rather than guessing.
+pane is here, the process is there. It starts in the Project's directory
+on R: the one set for it in Settings > Remotes, else a folder of the
+Project's own name inside R's Projects folder (R's home unless one is
+set), made if missing. --cwd D names an existing directory on R instead.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_REMOTES: &str = "foreman remotes
@@ -3283,6 +3284,7 @@ mod tests {
             name: name.into(),
             target: target.into(),
             shell: RemoteShell::Posix,
+            base: String::new(),
             dirs: Default::default(),
         };
         assert_eq!(
