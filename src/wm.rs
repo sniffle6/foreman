@@ -13223,11 +13223,12 @@ mod tests {
             (&["codex", "do the card"], Posix),
             (&["codex", "exec", "do the card"], Posix),
         ] {
-            let (queued, waits) = reconnected_with(shell, &["post 1", "post 2"], |wm, remote, ctx| {
-                let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
-                wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
-                    .expect("ssh spawns")
-            });
+            let (queued, waits) =
+                reconnected_with(shell, &["post 1", "post 2"], |wm, remote, ctx| {
+                    let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+                    wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
+                        .expect("ssh spawns")
+                });
             assert_eq!(queued.len(), 3, "{words:?}: {queued:?}");
             assert!(is_note(&queued[0]), "{words:?}: note first: {queued:?}");
             assert_eq!(queued[1..], ["post 1", "post 2"], "{words:?}");
@@ -13235,13 +13236,24 @@ mod tests {
         }
         // Hookless Claude and a shell: the first carried post carries it.
         let (queued, waits) = reconnected_with(Pwsh, &["post 1", "post 2"], |wm, remote, ctx| {
-            wm.add_remote_terminal(&["claude".into(), "do the card".into()], remote, "/tmp", None, ctx)
-                .expect("ssh spawns")
+            wm.add_remote_terminal(
+                &["claude".into(), "do the card".into()],
+                remote,
+                "/tmp",
+                None,
+                ctx,
+            )
+            .expect("ssh spawns")
         });
         assert_eq!(queued.len(), 2, "{queued:?}");
-        assert!(queued[0].starts_with("post 1
+        assert!(
+            queued[0].starts_with(
+                "post 1
 
-[foreman] You run on"), "{queued:?}");
+[foreman] You run on"
+            ),
+            "{queued:?}"
+        );
         assert_eq!(queued[1], "post 2");
         assert!(!waits, "one note");
         let (queued, waits) = reconnected_with(Posix, &["post 1", "post 2"], |wm, remote, ctx| {
@@ -13249,9 +13261,14 @@ mod tests {
             wm.open_remote_win(remote, "/tmp", What::Shell, Place::Default, ctx)
                 .expect("ssh spawns")
         });
-        assert!(queued[0].starts_with("post 1
+        assert!(
+            queued[0].starts_with(
+                "post 1
 
-[foreman] You run on"), "{queued:?}");
+[foreman] You run on"
+            ),
+            "{queued:?}"
+        );
         assert_eq!(queued[1..], ["post 2"]);
         assert!(!waits);
     }

@@ -1552,8 +1552,7 @@ fn parse_terminal_target(
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
-    let terminal =
-        terminal.ok_or_else(|| format!("{verb} needs a terminal: foreman {verb} tN"))?;
+    let terminal = terminal.ok_or_else(|| format!("{verb} needs a terminal: foreman {verb} tN"))?;
     Ok((project.or(default_project), terminal))
 }
 
