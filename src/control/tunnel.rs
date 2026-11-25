@@ -1821,11 +1821,9 @@ mod tests {
         let mut s = crate::terminal::Session::spawn_argv(&argv, None, &[], ctx).unwrap();
         s.attach_tunnel(lease.token, "note".into(), NoteGoes::WithFirstPost);
         assert!(hub.owner(&value).is_some());
-        let t0 = Instant::now();
-        while s.exited().is_none() {
-            assert!(t0.elapsed() < Duration::from_secs(10), "cmd never exited");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // End it ourselves: the in-box ConPTY host holds the child until its
+        // startup cursor query is answered, and nothing here pumps the pane.
+        s.kill_for_test();
         assert_eq!(
             hub.owner(&value),
             None,
