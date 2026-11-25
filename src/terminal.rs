@@ -672,13 +672,42 @@ pub fn disconnect_bar_text(
         (true, 0 | 255) => format!("Disconnected from {remote}"),
         (true, c) => format!("Disconnected from {remote} (ssh exit {c})"),
     };
+    // A command that names an agent foreman cannot vouch for comes back as a
+    // shell, and the bar says so before Enter: the human expected it rerun.
+    let to = if next.withheld { " to a shell" } else { "" };
     let verb = match (next.agent, next.resumes, ran) {
         (Some(a), true, _) => format!("resume {a}"),
         (Some(a), false, _) => format!("start {a} fresh"),
-        (None, _, true) => "reconnect".to_string(),
-        (None, _, false) => "connect".to_string(),
+        (None, _, true) => format!("reconnect{to}"),
+        (None, _, false) => format!("connect{to}"),
     };
     format!("{lead} — Enter to {verb}")
+}
+
+/// `text` as grid rows no wider than `cols` display columns, for
+/// [`Session::inject_note_full`]. A newline starts a row; any other control
+/// character becomes U+FFFD, so the text can never drive the emulator. No
+/// row soft-wraps, so a later resize cannot strand part of one.
+pub fn full_note_rows(text: &str, cols: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let cols = cols.max(2);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for c in line.chars() {
+            let c = if c.is_control() { '\u{FFFD}' } else { c };
+            let w = c.width().unwrap_or(0);
+            if used + w > cols {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += w;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// The held cue's line in its three pieces: what waits, a separator, and its
@@ -917,6 +946,9 @@ pub struct Session {
     // Dispatch banner queued by inject_note(); flushed (fitted to the real
     // width) by the first resize(). See inject_note for why it is deferred.
     pending_note: Option<String>,
+    // Text written right after the note, wrapped rather than elided
+    // (inject_note_full).
+    pending_full: Option<String>,
     // Ready latch + chat inject queue + deferred submit (pure gate; Session
     // applies Action::Write). See crate::ready and CONTEXT.md "Ready gate".
     ready_gate: crate::ready::ReadyGate,
@@ -1609,6 +1641,7 @@ impl Session {
             cols,
             rows,
             pending_note: None,
+            pending_full: None,
             ready_gate: crate::ready::ReadyGate::new(),
             output_gen: 0,
             content_gen: 0,
@@ -1793,6 +1826,15 @@ impl Session {
     /// real width.
     pub fn inject_note(&mut self, text: &str) {
         self.pending_note = Some(text.to_string());
+    }
+
+    /// Like [`Session::inject_note`], but every word of `text` stays on the
+    /// screen: it is written after the note, broken into rows that fit the
+    /// real width ([`full_note_rows`]) instead of elided to one. For text the
+    /// human must be able to read whole, such as a command a reconnect did
+    /// not rerun.
+    pub fn inject_note_full(&mut self, text: &str) {
+        self.pending_full = Some(text.to_string());
     }
 
     /// Deliver chat text into this session's stdin: bracketed paste, then a
@@ -2076,6 +2118,13 @@ impl Session {
             };
             let bytes = format!("\x1b[2m{fitted}\x1b[0m\r\n").into_bytes();
             self.parser.advance(&mut self.term, &bytes);
+            self.content_gen = self.content_gen.wrapping_add(1);
+        }
+        if let Some(full) = self.pending_full.take() {
+            for row in full_note_rows(&full, cols) {
+                let bytes = format!("\x1b[2m{row}\x1b[0m\r\n").into_bytes();
+                self.parser.advance(&mut self.term, &bytes);
+            }
             self.content_gen = self.content_gen.wrapping_add(1);
         }
     }
@@ -7577,6 +7626,20 @@ mod tests {
     }
 
     #[test]
+    fn a_full_note_keeps_every_character_within_the_width() {
+        assert_eq!(full_note_rows("abcdef", 4), ["abcd", "ef"]);
+        assert_eq!(full_note_rows("ab\ncd", 80), ["ab", "cd"]);
+        // A wide char never splits across the edge.
+        assert_eq!(full_note_rows("abc漢", 4), ["abc", "漢"]);
+        // Control characters cannot reach the emulator.
+        assert_eq!(full_note_rows("a\x1b[2Jb\r", 80), ["a\u{FFFD}[2Jb\u{FFFD}"]);
+        let long = "x".repeat(250);
+        let rows = full_note_rows(&long, 80);
+        assert_eq!(rows.concat(), long);
+        assert!(rows.iter().all(|r| r.len() <= 80));
+    }
+
+    #[test]
     fn the_disconnect_bar_says_what_enter_will_do() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let text = |ran, code, argv: &[String]| {
@@ -7613,6 +7676,17 @@ mod tests {
         assert_eq!(
             text(true, 255, &v(&["npx", "@anthropic-ai/claude-code", "do X"])),
             "Disconnected from desk — Enter to start claude fresh"
+        );
+        // A command naming an agent foreman cannot vouch for: a shell, said
+        // before Enter.
+        let brief = v(&["env", "FOO=1", "claude", "do X"]);
+        assert_eq!(
+            text(true, 255, &brief),
+            "Disconnected from desk — Enter to reconnect to a shell"
+        );
+        assert_eq!(
+            text(false, 0, &brief),
+            "Not connected to desk — Enter to connect to a shell"
         );
         // An install Session: its result, and never "resume claude" or a
         // second run of the installer, though the URL names the agent.

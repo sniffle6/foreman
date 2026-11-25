@@ -3674,9 +3674,7 @@ impl WindowManager {
             .map_err(|e| format!("spawn failed: {e}"))?;
         // An agent opening here has been logged in to (or is about to be):
         // the row stops saying "needs login".
-        if let Some(p) = crate::remote::program_agent(argv) {
-            crate::remote_install::clear_ended(&remote.target, p.agent);
-        }
+        crate::remote_install::agent_opened(&remote.target, argv);
         // Before the note is armed: a typed note waits too.
         if let Some(until) = hold {
             s.hold_chat_until_hook(until);
@@ -3788,7 +3786,12 @@ impl WindowManager {
         let mut fresh =
             self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), ctx)?;
         fresh.set_term_id(id);
-        fresh.inject_note(&reconnect_banner(&remote.name, &argv, ran));
+        let withheld = re.withheld.then_some(&original[..]);
+        let (banner, command) = reconnect_banner(&remote.name, remote.shell, &argv, withheld, ran);
+        fresh.inject_note(&banner);
+        if let Some(command) = command {
+            fresh.inject_note_full(&command);
+        }
         let Some((win, tab)) = self.terminal_location(id) else {
             return Ok(());
         };
@@ -3802,9 +3805,13 @@ impl WindowManager {
         };
         // Chat input the dead connection never wrote goes to the fresh one,
         // after the fresh note or carrying it, never ahead of it: the dead
-        // token would answer it with a 401.
+        // token would answer it with a 401. A shell opened in place of a
+        // command that was not rerun gets none: it would run chat as commands.
         if let Content::Terminal(old) = &mut t.content {
-            fresh.carry_injects(old.take_pending_injects());
+            let carried = old.take_pending_injects();
+            if withheld.is_none() {
+                fresh.carry_injects(carried);
+            }
         }
         // The dead Session drops here, and its job with it.
         t.content = Content::Terminal(fresh);
@@ -11033,12 +11040,29 @@ enum CatchUp {
 /// as in progress: it lands before ssh has connected, and with the PC off
 /// the next line is ssh's error. `ran` = this Session had a connection; a
 /// restored one that never connected is "connecting", not "reconnecting".
-fn reconnect_banner(remote: &str, argv: &[String], ran: bool) -> String {
+/// A `withheld` command ([`crate::remote::ReconnectClass::Shell`]) comes back
+/// as the second value, whole and quoted to retype
+/// ([`Session::inject_note_full`]): the human decides whether it runs.
+fn reconnect_banner(
+    remote: &str,
+    shell: crate::remote::RemoteShell,
+    argv: &[String],
+    withheld: Option<&[String]>,
+    ran: bool,
+) -> (String, Option<String>) {
     let verb = if ran { "reconnecting" } else { "connecting" };
-    if argv.is_empty() {
-        format!("── {verb} to {remote}… ──")
+    if let Some(original) = withheld {
+        (
+            format!("── {verb} to {remote}: a shell. Not rerun, as it may repeat a brief: ──"),
+            Some(crate::remote::display_command(original, shell)),
+        )
+    } else if argv.is_empty() {
+        (format!("── {verb} to {remote}… ──"), None)
     } else {
-        format!("── {verb} to {remote}: {}… ──", argv.join(" "))
+        (
+            format!("── {verb} to {remote}: {}… ──", argv.join(" ")),
+            None,
+        )
     }
 }
 
@@ -13769,18 +13793,46 @@ mod tests {
 
     #[test]
     fn a_reconnect_banner_says_in_progress_not_done() {
+        use crate::remote::RemoteShell::{Posix, Pwsh};
+        let line = |s: &str| (s.to_string(), None);
         assert_eq!(
-            reconnect_banner("desk", &[], true),
-            "── reconnecting to desk… ──"
+            reconnect_banner("desk", Posix, &[], None, true),
+            line("── reconnecting to desk… ──")
         );
         assert_eq!(
-            reconnect_banner("desk", &["claude".into(), "--continue".into()], true),
-            "── reconnecting to desk: claude --continue… ──"
+            reconnect_banner(
+                "desk",
+                Posix,
+                &["claude".into(), "--continue".into()],
+                None,
+                true
+            ),
+            line("── reconnecting to desk: claude --continue… ──")
         );
         // A restored Session that never connected.
         assert_eq!(
-            reconnect_banner("desk", &[], false),
-            "── connecting to desk… ──"
+            reconnect_banner("desk", Posix, &[], None, false),
+            line("── connecting to desk… ──")
+        );
+        // A command naming an agent foreman cannot vouch for: a shell, and
+        // the original whole, quoted to retype.
+        let original: Vec<String> = ["env", "FOO=1", "claude", "post it's done"]
+            .map(String::from)
+            .into();
+        let head = "── reconnecting to desk: a shell. Not rerun, as it may repeat a brief: ──";
+        assert_eq!(
+            reconnect_banner("desk", Posix, &[], Some(&original), true),
+            (
+                head.to_string(),
+                Some(r"env FOO=1 claude 'post it'\''s done'".to_string())
+            )
+        );
+        assert_eq!(
+            reconnect_banner("desk", Pwsh, &[], Some(&original), true),
+            (
+                head.to_string(),
+                Some("env FOO=1 claude 'post it''s done'".to_string())
+            )
         );
     }
 

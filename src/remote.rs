@@ -299,75 +299,185 @@ pub fn carries_tunnel(argv: &[String]) -> bool {
     install_of(argv).is_none()
 }
 
-/// Launchers whose next argument (after an optional `--`) is the program
-/// they run, as foreman's own tests and [`relaunch`] name them.
-const AGENT_WRAPPERS: &[&str] = &["npx", "wsl"];
-
-/// npm packages that are an agent, as `npx` names them.
+//// npm packages that are an agent, as `npx` names them, with the command
+/// (its `bin`) each provides (`npm view <pkg> bin`, 2026-11-24).
 const AGENT_PACKAGES: &[(&str, &str)] = &[
     ("@anthropic-ai/claude-code", "claude"),
     ("@openai/codex", "codex"),
 ];
+
+/// Extensions an agent's or wrapper's program file may carry besides none:
+/// the Windows launchers (`claude.exe` from Claude's installer, `claude.cmd`
+/// and `claude.ps1` from npm's shims, `wsl.exe`). Any other one (`codex.py`,
+/// `claude.sh`, `grok.md`) is a file named after the agent, not the agent,
+/// and may be a wrapper script that replays its brief.
+const PROGRAM_EXTENSIONS: &[&str] = &["exe", "cmd", "bat", "com", "ps1"];
 
 /// The agent a Remote launch's PROGRAM is, from [`program_agent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramAgent {
     /// The provider, from `board::AGENTS`.
     pub agent: &'static str,
-    /// Run through an [`AGENT_WRAPPERS`] launcher rather than by itself.
+    /// Run through `npx` or `wsl` ([`npx_agent`], [`wsl_agent`]) rather
+    /// than by itself.
     pub wrapped: bool,
 }
 
 /// Which agent `argv`'s program is, exactly: its file stem is the agent's
-/// name (case-insensitive: `claude`, `/usr/bin/codex`, `CLAUDE.exe`), or it
-/// is a known wrapper whose program argument is the bare name or the
-/// agent's npm package (`npx @openai/codex`, `wsl -- codex`). Anything that
-/// only mentions an agent (`vi codex.md`, `tail -f grok.log`,
-/// `env X=1 codex`, `bash -c "codex …"`, `npx -y @openai/codex`) is not one.
+/// name (case-insensitive: `claude`, `/usr/bin/codex`, `CLAUDE.exe`) with no
+/// extension or an executable's ([`PROGRAM_EXTENSIONS`]), or it is `npx` or
+/// `wsl` in a form whose grammar foreman knows and that runs the agent
+/// ([`npx_agent`], [`wsl_agent`]). Anything that only mentions an agent
+/// (`vi codex.md`, `tail -f grok.log`, `env X=1 codex`, `bash -c "codex …"`,
+/// `codex.py`, `npx codex`) is not one.
 /// The one predicate for every Remote decision that types into the pane or
 /// changes what runs: the reply note ([`note_route`], [`typed_route`]),
 /// Claude's hooks and its chat hold ([`hooked_claude`]), what a reconnect
-/// runs ([`relaunch`]) and the agent a saved workspace restores. The tab
-/// icon ([`crate::icons::IconKind::from_argv`]) also matches a mention and
-/// decides nothing.
+/// runs ([`reconnect_class`]) and the agent a saved workspace restores. The
+/// tab icon ([`crate::icons::IconKind::from_argv`]) also matches a mention
+/// and decides nothing.
 /// A wrong yes pastes the note and an Enter into whatever it is; a wrong no
 /// only waits for a post to carry the note.
 pub fn program_agent(argv: &[String]) -> Option<ProgramAgent> {
     if install_of(argv).is_some() {
         return None;
     }
-    let named = |word: &str| {
-        crate::board::AGENTS
-            .iter()
-            .copied()
-            .find(|a| a.eq_ignore_ascii_case(word))
-    };
     let (program, rest) = argv.split_first()?;
-    let stem = std::path::Path::new(program).file_stem()?.to_str()?;
-    if let Some(agent) = named(stem) {
+    let stem = program_stem(program)?;
+    if let Some(agent) = agent_named(stem) {
         return Some(ProgramAgent {
             agent,
             wrapped: false,
         });
     }
-    if !AGENT_WRAPPERS.iter().any(|w| w.eq_ignore_ascii_case(stem)) {
+    let agent = if stem.eq_ignore_ascii_case("npx") {
+        npx_agent(rest)?
+    } else if stem.eq_ignore_ascii_case("wsl") {
+        wsl_agent(rest)?
+    } else {
         return None;
-    }
-    let runs = match rest {
-        [dashes, runs, ..] if dashes == "--" => runs,
-        [runs, ..] => runs,
-        [] => return None,
     };
-    let agent = named(runs).or_else(|| {
-        AGENT_PACKAGES
-            .iter()
-            .find(|(package, _)| package == runs)
-            .map(|&(_, agent)| agent)
-    })?;
     Some(ProgramAgent {
         agent,
         wrapped: true,
     })
+}
+
+/// `board::AGENTS`' entry for `word`, ignoring case.
+fn agent_named(word: &str) -> Option<&'static str> {
+    crate::board::AGENTS
+        .iter()
+        .copied()
+        .find(|a| a.eq_ignore_ascii_case(word))
+}
+
+/// `program`'s file stem, when its extension is none or a program's
+/// ([`PROGRAM_EXTENSIONS`]).
+fn program_stem(program: &str) -> Option<&str> {
+    let path = std::path::Path::new(program);
+    if let Some(ext) = path.extension() {
+        if !PROGRAM_EXTENSIONS
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e))
+        {
+            return None;
+        }
+    }
+    path.file_stem()?.to_str()
+}
+
+/// The agent `npx <rest>` runs, when foreman can state that from npx's
+/// grammar. Source: npm 11.12.1 on this PC, `npx --help` and its docs
+/// (`docs/content/commands/npx.md` and `npm-exec.md`, read 2026-11-24):
+/// "When run via the `npx` binary, all flags and options *must* be set prior
+/// to any positional arguments"; `--` ends them; "`-p` is ... shorthand for
+/// `--package` in npx"; `-y` / `--yes` suppresses the install prompt.
+///
+/// Accepted: `npx [-y|--yes]... [one of -p <pkg>, --package <pkg>,
+/// --package=<pkg>] [--] <first> ...`. Without a package option `<first>` is
+/// the package spec, which must be an [`AGENT_PACKAGES`] name, optionally
+/// with `@<version>` or `@<tag>` ([`agent_package`]). With one, that package
+/// must be an agent's and `<first>` is the command, which must be its bin.
+/// Any other option (`-c`/`--call`, `--no`, `--registry`, a second
+/// `--package`...) refuses.
+///
+/// A bare `claude` or `codex` is refused: each is a different registry
+/// package from the real CLI (`npm view`, 2026-11-24: `claude` 0.1.2, "This
+/// is not the official Claude Code package"; `codex` 0.2.3, "Static site and
+/// code documentation generator"), so `npx codex` may download and run that.
+fn npx_agent(rest: &[String]) -> Option<&'static str> {
+    let mut package: Option<&str> = None;
+    let mut i = 0;
+    while let Some(a) = rest.get(i) {
+        match a.as_str() {
+            "-y" | "--yes" => i += 1,
+            "-p" | "--package" if package.is_none() => {
+                package = Some(rest.get(i + 1)?.as_str());
+                i += 2;
+            }
+            a if a.starts_with("--package=") && package.is_none() => {
+                package = Some(&a["--package=".len()..]);
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            a if a.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    let first = rest.get(i)?;
+    match package {
+        None => agent_package(first),
+        Some(p) => agent_package(p).filter(|agent| first == agent),
+    }
+}
+
+/// The agent an npm package spec names: an exact [`AGENT_PACKAGES`] name,
+/// bare or with an `@` suffix of version or tag characters (`@latest`,
+/// `@0.172.0`, `@1.0.0-beta.1`). Any other spec (`@openai/codex-sdk`, a
+/// range, an `npm:` alias, a git or file spec) is not one.
+fn agent_package(spec: &str) -> Option<&'static str> {
+    AGENT_PACKAGES.iter().find_map(|&(name, agent)| {
+        let tail = spec.strip_prefix(name)?;
+        let ok = tail.is_empty()
+            || tail.strip_prefix('@').is_some_and(|v| {
+                !v.is_empty()
+                    && v.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+            });
+        ok.then_some(agent)
+    })
+}
+
+/// The agent `wsl <rest>` runs, when foreman can state that from wsl's
+/// grammar. Source: `wsl.exe --help` on this PC (2026-11-24): "Usage:
+/// wsl.exe [Argument] [Options...] [CommandLine]", with `--exec, -e
+/// <CommandLine>` (no default shell), `--` ("Pass the remaining command line
+/// as-is"), `--distribution, -d <DistroName>` and `--user, -u <UserName>`.
+///
+/// Accepted: `wsl [-d|--distribution <distro>|-u|--user <user>]...
+/// [--|-e|--exec] <agent> ...`, where `<agent>` is the bare name. Any other
+/// argument (`--cd`, `--shell-type`, `--system`, `--distribution-id`, every
+/// management argument) refuses.
+fn wsl_agent(rest: &[String]) -> Option<&'static str> {
+    let mut i = 0;
+    loop {
+        match rest.get(i)?.as_str() {
+            "-d" | "--distribution" | "-u" | "--user" => {
+                rest.get(i + 1)?;
+                i += 2;
+            }
+            "--" | "-e" | "--exec" => {
+                i += 1;
+                break;
+            }
+            a if a.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    agent_named(rest.get(i)?)
 }
 
 /// How a launch of `argv` on a `shell` Remote teaches its agent the reply
@@ -476,6 +586,45 @@ pub fn prompt_index(argv: &[String]) -> Option<usize> {
     (is_brief && tail_ok).then_some(1)
 }
 
+/// What a reconnect does for a Session launched with an argv: the one
+/// decision behind [`relaunch`], the disconnect bar's words and the
+/// reconnect banner. A reconnect never replays an agent's original prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconnectClass {
+    /// An install Session ([`install_of`]): a shell, so the installer runs
+    /// only from its named action. Checked first: the claude and codex
+    /// install URLs name the agent.
+    Install(&'static str),
+    /// The program is an agent ([`program_agent`]): it resumes
+    /// (`claude --continue`, `codex resume --last`), or starts fresh with no
+    /// argument when it has no resume entry or ran through a wrapper.
+    Agent(ProgramAgent),
+    /// The command names no agent anywhere (a shell, `vi notes.md`, `htop`,
+    /// `tail -f app.log`): it runs again as it was.
+    Rerun,
+    /// The command names an agent but its program is none foreman knows
+    /// (`env X=1 codex "brief"`, `nice claude "brief"`, `bash -c 'claude …'`,
+    /// and also `vi codex.md`). foreman cannot tell a brief from a file name
+    /// there, so a login shell opens in the same directory and runs nothing.
+    Shell,
+}
+
+/// The [`ReconnectClass`] of a Session launched with `argv`. The mention
+/// test is the tab icon's scan ([`crate::icons::IconKind::from_argv`]),
+/// asked only "is an agent name anywhere in it": it never decides what runs
+/// or what is typed, only that a command naming one is not rerun.
+pub fn reconnect_class(argv: &[String]) -> ReconnectClass {
+    if let Some(provider) = install_of(argv) {
+        ReconnectClass::Install(provider)
+    } else if let Some(p) = program_agent(argv) {
+        ReconnectClass::Agent(p)
+    } else if crate::icons::IconKind::from_argv(argv).is_some() {
+        ReconnectClass::Shell
+    } else {
+        ReconnectClass::Rerun
+    }
+}
+
 /// What a reconnect relaunches. See [`relaunch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relaunch {
@@ -488,43 +637,45 @@ pub struct Relaunch {
     /// The original argv was an install of this provider; the relaunch is a
     /// shell, so the installer only ever runs from its named action.
     pub install: Option<&'static str>,
+    /// The original command names an agent foreman cannot vouch for
+    /// ([`ReconnectClass::Shell`]): the relaunch is a login shell and the
+    /// original is not run again.
+    pub withheld: bool,
 }
 
-/// What a reconnect runs for a Session launched with `original`. Decided by
-/// [`program_agent`], never by a mention: `vi codex.md` reruns as it was.
-/// An agent run by itself (`claude`, `C:\bin\claude.exe`) gets the
-/// provider's resume arguments from [`RESUME`], or none at all. One run
-/// through a wrapper [`program_agent`] accepts (`npx @anthropic-ai/claude-code
-/// "do X"`, `wsl claude …`) fails safe: the bare provider, fresh, with no
-/// argument from the original argv, since any of them may be the Dispatch
-/// prompt. A shell stays a shell, and any other command runs again as it
-/// was, arguments and all (`env X=1 codex "brief"` included: foreman cannot
-/// tell a prompt from a file name in a command it does not know). An install
-/// Session (see [`install_of`]) comes back as a shell, checked first because
-/// the claude and codex install URLs name the agent.
+/// What a reconnect runs for a Session launched with `original`, by its
+/// [`reconnect_class`]. An agent run by itself (`claude`,
+/// `C:\bin\claude.exe`) gets the provider's resume arguments from
+/// [`RESUME`], or none at all. One run through a wrapper [`program_agent`]
+/// accepts (`npx -y @anthropic-ai/claude-code "do X"`, `wsl -d U -- claude
+/// …`) fails safe: the bare provider, fresh, with no argument from the
+/// original argv, since any of them may be the Dispatch prompt. A command
+/// naming no agent runs again as it was; one naming an agent that is not
+/// its program, and an install, come back as a shell.
 pub fn relaunch(original: &[String]) -> Relaunch {
-    if let Some(provider) = install_of(original) {
-        return Relaunch {
-            argv: Vec::new(),
-            agent: None,
-            resumes: false,
-            install: Some(provider),
-        };
-    }
-    let Some(ProgramAgent { agent, wrapped }) = program_agent(original) else {
-        return Relaunch {
-            argv: original.to_vec(),
-            agent: None,
-            resumes: false,
-            install: None,
-        };
+    let shell = |install, withheld| Relaunch {
+        argv: Vec::new(),
+        agent: None,
+        resumes: false,
+        install,
+        withheld,
+    };
+    let ProgramAgent { agent, wrapped } = match reconnect_class(original) {
+        ReconnectClass::Install(provider) => return shell(Some(provider), false),
+        ReconnectClass::Shell => return shell(None, true),
+        ReconnectClass::Rerun => {
+            return Relaunch {
+                argv: original.to_vec(),
+                ..shell(None, false)
+            };
+        }
+        ReconnectClass::Agent(p) => p,
     };
     if wrapped {
         return Relaunch {
             argv: vec![agent.to_string()],
             agent: Some(agent),
-            resumes: false,
-            install: None,
+            ..shell(None, false)
         };
     }
     let resume = RESUME
@@ -537,8 +688,33 @@ pub fn relaunch(original: &[String]) -> Relaunch {
             .collect(),
         agent: Some(agent),
         resumes: !resume.is_empty(),
-        install: None,
+        ..shell(None, false)
     }
+}
+
+/// `argv` as one line the human can read and retype on a `shell` Remote:
+/// a word with nothing a shell treats specially stays bare, anything else is
+/// quoted for that shell. For the reconnect banner of a command that is not
+/// rerun.
+pub fn display_command(argv: &[String], shell: RemoteShell) -> String {
+    let plain = |a: &str| {
+        !a.is_empty()
+            && a.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+')
+            })
+    };
+    argv.iter()
+        .map(|a| {
+            if plain(a) {
+                a.clone()
+            } else if shell == RemoteShell::Posix {
+                sh_quote(a)
+            } else {
+                ps_quote(a)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// [`relaunch`]'s argv.
@@ -1164,7 +1340,15 @@ mod tests {
         for (original, want) in [
             (v(&["npx", "@anthropic-ai/claude-code", prompt]), "claude"),
             (v(&["npx", "@openai/codex", prompt]), "codex"),
-            (v(&["npx.cmd", "codex", prompt]), "codex"),
+            (v(&["npx.cmd", "@openai/codex", prompt]), "codex"),
+            (
+                v(&["npx", "-y", "@anthropic-ai/claude-code", prompt]),
+                "claude",
+            ),
+            (
+                v(&["wsl", "-d", "Ubuntu", "--", "claude", prompt]),
+                "claude",
+            ),
             (v(&["wsl", "claude", prompt]), "claude"),
             (v(&["wsl", "--", "codex", prompt]), "codex"),
             (v(&["wsl", "--", "grok", prompt]), "grok"),
@@ -1183,137 +1367,279 @@ mod tests {
         }
     }
 
-    /// Reconnect decides by the PROGRAM ([`program_agent`]), never by the
-    /// tab icon's scan: a command that only mentions an agent reruns as it
-    /// was, exactly like any other command, and starts no agent. The rows
-    /// are the note table's (`the_reply_note_s_route_per_agent_and_shell`).
+    /// Every command's [`ReconnectClass`], and what [`relaunch`] runs for it.
+    /// A reconnect never replays an agent's original prompt: an agent
+    /// program resumes or starts bare, a command naming no agent reruns, and
+    /// one that names an agent foreman cannot vouch for opens a shell. The
+    /// rows include the note table's (`the_reply_note_s_route_per_agent_and_shell`)
+    /// and the relaunch tables'.
     #[test]
-    fn reconnect_decides_by_the_program_not_a_mention() {
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    fn a_reconnect_never_replays_a_command_naming_an_agent_it_cannot_vouch_for() {
+        use ReconnectClass::{Agent, Rerun, Shell};
         let brief = "do the card now";
-        let bash_c = format!("codex \"{brief}\"");
-        // Rerun as it was: no agent, no resume.
-        let same = |a: &[&str]| (v(a), v(a), None, false);
-        // (original, what a reconnect runs, its agent, resumes)
-        let table: Vec<(Vec<String>, Vec<String>, Option<&str>, bool)> = vec![
-            // Mentions.
-            same(&["vi", "codex.md"]),
-            same(&["vim", "codex.md"]),
-            same(&["tail", "-f", "grok.log"]),
-            same(&["tail", "-f", "/var/log/grok.log"]),
-            same(&["cat", "claude.txt"]),
-            same(&["/opt/claude/bin/python", "script.py"]),
-            same(&["python", "claude_tool.py", brief]),
-            same(&["bash", "-c", &bash_c]),
-            // A wrapper program_agent does not accept is no agent either:
-            // its own command, prompt and all.
-            same(&["env", "VAR=1", "codex", brief]),
-            same(&["codex-wrapper", brief]),
-            same(&["my-claude-wrapper.cmd", brief]),
-            same(&["npx", "-y", "@openai/codex", brief]),
-            same(&["npx", "@openai/codex-sdk", brief]),
-            same(&["wsl", "-d", "codex", "bash"]),
-            same(&["npx"]),
-            // Accepted wrappers: the bare provider, fresh.
+        let own = |agent| {
+            Agent(ProgramAgent {
+                agent,
+                wrapped: false,
+            })
+        };
+        let via = |agent| {
+            Agent(ProgramAgent {
+                agent,
+                wrapped: true,
+            })
+        };
+        let bash_c = format!("claude \"{brief}\"");
+        let table: Vec<(Vec<&str>, ReconnectClass)> = vec![
+            // Agents by name, path, case and executable extension: resume.
+            (vec!["claude", brief], own("claude")),
+            (vec!["claude", brief, "--model", "x"], own("claude")),
+            (vec!["claude", "--model", "opus", brief], own("claude")),
+            (vec!["claude", "/review this"], own("claude")),
+            (vec!["claude", "-p", brief], own("claude")),
+            (vec!["claude", "agents"], own("claude")),
+            (vec!["claude", "--settings", "{}", brief], own("claude")),
+            (vec!["claude", "--continue"], own("claude")),
+            (vec!["claude"], own("claude")),
+            (vec!["codex", brief], own("codex")),
+            (vec!["codex", "exec", "compare with claude"], own("codex")),
+            (vec!["codex", "resume", "--last"], own("codex")),
+            (vec!["grok", brief], own("grok")),
+            (vec!["/usr/bin/claude", brief], own("claude")),
+            (vec!["/usr/bin/Claude", brief], own("claude")),
+            (vec!["/home/u/.npm-global/bin/codex", brief], own("codex")),
+            (vec!["Codex", "exec", brief], own("codex")),
+            (vec![r"C:\bin\Claude.exe", brief], own("claude")),
+            (vec!["claude.exe", brief], own("claude")),
+            (vec!["claude.cmd", brief], own("claude")),
+            (vec![r"C:\npm\claude.CMD", brief], own("claude")),
+            (vec![r"C:\npm\claude.ps1", brief], own("claude")),
+            (vec!["grok.exe", brief], own("grok")),
+            // A file named after an agent is not the agent.
+            (vec!["codex.py", brief], Shell),
+            (vec!["claude.sh", brief], Shell),
+            (vec!["grok.md"], Shell),
+            (vec!["./claude.js", brief], Shell),
+            // npx: `-y`/`--yes`, one `-p`/`--package`, `--`, and an exact
+            // agent package with an optional @version or @tag: the bare
+            // provider, fresh.
             (
-                v(&["npx", "@openai/codex", brief]),
-                v(&["codex"]),
-                Some("codex"),
-                false,
+                vec!["npx", "@anthropic-ai/claude-code", brief],
+                via("claude"),
             ),
             (
-                v(&["npx", "@anthropic-ai/claude-code", brief]),
-                v(&["claude"]),
-                Some("claude"),
-                false,
+                vec!["npx", "-y", "@anthropic-ai/claude-code", brief],
+                via("claude"),
             ),
             (
-                v(&["npx", "claude", brief]),
-                v(&["claude"]),
-                Some("claude"),
-                false,
+                vec!["npx", "--yes", "@anthropic-ai/claude-code", brief],
+                via("claude"),
+            ),
+            (vec!["npx", "@openai/codex", brief], via("codex")),
+            (vec!["npx", "@openai/codex@latest", brief], via("codex")),
+            (
+                vec!["npx", "-y", "@openai/codex@0.172.0", brief],
+                via("codex"),
             ),
             (
-                v(&["wsl", "codex", brief]),
-                v(&["codex"]),
-                Some("codex"),
-                false,
+                vec!["npx", "@openai/codex@1.0.0-beta.1", brief],
+                via("codex"),
+            ),
+            (vec!["npx.cmd", "@openai/codex", brief], via("codex")),
+            (vec!["npx", "--", "@openai/codex", brief], via("codex")),
+            (
+                vec!["npx", "-y", "--", "@anthropic-ai/claude-code", brief],
+                via("claude"),
             ),
             (
-                v(&["wsl", "--", "grok", brief]),
-                v(&["grok"]),
-                Some("grok"),
-                false,
-            ),
-            // Agents by name, path and case: resume, keeping the program.
-            (
-                v(&["claude", brief]),
-                v(&["claude", "--continue"]),
-                Some("claude"),
-                true,
+                vec!["npx", "-p", "@anthropic-ai/claude-code", "claude", brief],
+                via("claude"),
             ),
             (
-                v(&["codex", "exec", brief]),
-                v(&["codex", "resume", "--last"]),
-                Some("codex"),
-                true,
+                vec!["npx", "--package", "@openai/codex", "codex", brief],
+                via("codex"),
             ),
             (
-                v(&["/home/u/.npm-global/bin/codex", brief]),
-                v(&["/home/u/.npm-global/bin/codex", "resume", "--last"]),
-                Some("codex"),
-                true,
+                vec!["npx", "--package=@openai/codex@latest", "codex", brief],
+                via("codex"),
             ),
             (
-                v(&["/usr/bin/Claude", brief]),
-                v(&["/usr/bin/Claude", "--continue"]),
-                Some("claude"),
-                true,
+                vec!["npx", "-y", "-p", "@openai/codex", "--", "codex", brief],
+                via("codex"),
+            ),
+            // npx forms whose grammar foreman does not know, or that may run
+            // something else: a shell.
+            (vec!["npx", "claude", brief], Shell),
+            (vec!["npx", "codex", brief], Shell),
+            (vec!["npx.cmd", "codex", brief], Shell),
+            (vec!["npx", "-y", "codex", brief], Shell),
+            (vec!["npx", "@openai/codex-sdk", brief], Shell),
+            (vec!["npx", "codex-helper", brief], Shell),
+            (vec!["npx", "@openai/codex@^1", brief], Shell),
+            (vec!["npx", "@openai/codex@npm:other", brief], Shell),
+            (vec!["npx", "@openai/codex@", brief], Shell),
+            (
+                vec!["npx", "--registry", "r", "@openai/codex", brief],
+                Shell,
+            ),
+            (vec!["npx", "-c", &bash_c], Shell),
+            (vec!["npx", "--no", "@openai/codex", brief], Shell),
+            (vec!["npx", "-p", "@openai/codex", "claude", brief], Shell),
+            (
+                vec!["npx", "-p", "@openai/codex", "-p", "x", "codex"],
+                Shell,
+            ),
+            (vec!["npx", "-p", "@openai/codex"], Shell),
+            (vec!["npx", "-p", "left-pad", "claude", brief], Shell),
+            (vec!["npx"], Rerun),
+            (vec!["npx", "cowsay", "hi"], Rerun),
+            // wsl: `-d`/`--distribution`, `-u`/`--user`, then `--`,
+            // `-e`/`--exec` or the command: the bare provider, fresh.
+            (vec!["wsl", "claude", brief], via("claude")),
+            (vec!["wsl", "codex", "compare with claude"], via("codex")),
+            (vec!["wsl", "--", "grok", brief], via("grok")),
+            (
+                vec!["wsl", "-d", "Ubuntu", "--", "claude", brief],
+                via("claude"),
             ),
             (
-                v(&["Codex", "exec", brief]),
-                v(&["Codex", "resume", "--last"]),
-                Some("codex"),
-                true,
+                vec!["wsl", "--distribution", "Ubuntu", "codex", brief],
+                via("codex"),
             ),
             (
-                v(&[r"C:\npm\claude.CMD", brief]),
-                v(&[r"C:\npm\claude.CMD", "--continue"]),
-                Some("claude"),
-                true,
+                vec!["wsl", "-u", "andy", "-e", "codex", brief],
+                via("codex"),
             ),
             (
-                v(&["grok.exe", brief]),
-                v(&["grok.exe"]),
-                Some("grok"),
-                false,
+                vec!["wsl", "-d", "U", "--user", "a", "--exec", "claude"],
+                via("claude"),
             ),
-            // A shell and a plain command, as before.
-            same(&[]),
-            same(&["htop", "-d", "5"]),
+            (vec!["wsl.exe", "--", "claude", brief], via("claude")),
+            (vec!["wsl", "--cd", "~", "claude", brief], Shell),
+            (vec!["wsl", "--shell-type", "login", "claude", brief], Shell),
+            (vec!["wsl", "--system", "claude"], Shell),
+            (vec!["wsl", "-d", "codex", "bash"], Shell),
+            (vec!["wsl", "-e", "bash", "-c", &bash_c], Shell),
+            (vec!["wsl", "-d"], Rerun),
+            (vec!["wsl", "-d", "Ubuntu", "htop"], Rerun),
+            // Wrappers foreman does not know, and mentions: a shell, since a
+            // brief and a file name look the same.
+            (vec!["env", "X=1", "codex", brief], Shell),
+            (vec!["env", "FOO=1", "claude", brief], Shell),
+            (vec!["nice", "claude", brief], Shell),
+            (vec!["sudo", "-u", "x", "claude", brief], Shell),
+            (vec!["bash", "-c", &bash_c], Shell),
+            (vec!["bash", "-lc", "claude 'do the card'"], Shell),
+            (vec!["codex-wrapper", brief], Shell),
+            (vec!["my-claude-wrapper.cmd", brief], Shell),
+            (vec!["python", "claude_tool.py", brief], Shell),
+            (vec!["/opt/claude/bin/python", "script.py"], Shell),
+            (vec!["vi", "codex.md"], Shell),
+            (vec!["vim", "codex.md"], Shell),
+            (vec!["tail", "-f", "grok.log"], Shell),
+            (vec!["tail", "-f", "/var/log/grok.log"], Shell),
+            (vec!["cat", "claude.txt"], Shell),
+            // No agent named anywhere: rerun as it was.
+            (vec![], Rerun),
+            (vec!["vi", "notes.md"], Rerun),
+            (vec!["htop"], Rerun),
+            (vec!["htop", "-d", "5"], Rerun),
+            (vec!["tail", "-f", "app.log"], Rerun),
+            (vec!["bash"], Rerun),
+            (vec!["python", "tool.py", brief], Rerun),
         ];
-        for (original, argv, agent, resumes) in &table {
-            let r = relaunch(original);
-            assert_eq!(&r.argv, argv, "{original:?}");
-            assert_eq!(r.agent, *agent, "{original:?}");
-            assert_eq!(r.resumes, *resumes, "{original:?}");
+        for (words, class) in &table {
+            let original = argv(words);
+            assert_eq!(reconnect_class(&original), *class, "{words:?}");
+            let r = relaunch(&original);
+            assert_eq!(r.withheld, *class == Shell, "{words:?}");
+            assert_eq!(r.install, None, "{words:?}");
             assert_eq!(
                 r.agent,
-                program_agent(original).map(|p| p.agent),
-                "one predicate: {original:?}"
+                program_agent(&original).map(|p| p.agent),
+                "one predicate: {words:?}"
             );
-            if r.agent.is_none() {
-                assert_eq!(
-                    program_agent(&r.argv),
-                    None,
-                    "starts no agent: {original:?}"
+            let want: Vec<String> = match class {
+                Agent(ProgramAgent {
+                    agent,
+                    wrapped: true,
+                }) => argv(&[*agent]),
+                Agent(ProgramAgent { agent, .. }) => {
+                    let resume = RESUME.iter().find(|(p, _)| p == agent);
+                    std::iter::once(original[0].clone())
+                        .chain(
+                            resume
+                                .into_iter()
+                                .flat_map(|(_, a)| a.iter().map(|w| w.to_string())),
+                        )
+                        .collect()
+                }
+                Rerun => original.clone(),
+                Shell | ReconnectClass::Install(_) => Vec::new(),
+            };
+            assert_eq!(r.argv, want, "{words:?}");
+            assert_eq!(
+                r.resumes,
+                r.argv.len() > 1 && r.agent.is_some(),
+                "{words:?}"
+            );
+            if *class != Rerun {
+                // No argument of the original runs again, only its program.
+                assert!(
+                    r.argv.iter().skip(1).all(|a| !original[1..].contains(a)
+                        || RESUME.iter().any(|(_, args)| args.contains(&a.as_str()))),
+                    "{words:?} -> {:?}",
+                    r.argv
                 );
-            } else if program_agent(original).is_some_and(|p| p.wrapped) {
-                assert!(!r.argv.iter().any(|a| a.contains(brief)), "{original:?}");
+                assert!(!r.argv.iter().any(|a| a.contains(brief)), "{words:?}");
+            } else {
+                assert_eq!(
+                    crate::icons::IconKind::from_argv(&original),
+                    None,
+                    "a rerun names no agent: {words:?}"
+                );
             }
+            let bar = crate::terminal::disconnect_bar_text("desk", true, 255, &r);
+            assert_eq!(
+                bar.ends_with("Enter to reconnect to a shell"),
+                *class == Shell,
+                "{words:?}: {bar}"
+            );
         }
+        // An install is its own class, checked before any mention.
+        let install = install_argv(
+            RemoteShell::Posix,
+            "curl -fsSL https://claude.ai/install.sh | bash",
+        );
+        assert_eq!(reconnect_class(&install), ReconnectClass::Install("claude"));
         // The tab icon still calls a mention an agent; it decides nothing.
-        assert!(crate::icons::IconKind::from_argv(&v(&["vi", "codex.md"])).is_some());
+        assert!(crate::icons::IconKind::from_argv(&argv(&["vi", "codex.md"])).is_some());
+    }
+
+    /// The banner's copy of a command that is not rerun retypes as the same
+    /// words on its Remote's shell.
+    #[test]
+    fn a_withheld_command_is_shown_quoted_to_retype() {
+        let a = argv(&[
+            "env",
+            "FOO=1",
+            "claude",
+            "say \"hi\" it's $HOME",
+            "--model",
+            "x",
+        ]);
+        assert_eq!(
+            display_command(&a, RemoteShell::Posix),
+            r#"env FOO=1 claude 'say "hi" it'\''s $HOME' --model x"#
+        );
+        assert_eq!(
+            display_command(&a, RemoteShell::Pwsh),
+            r#"env FOO=1 claude 'say "hi" it''s $HOME' --model x"#
+        );
+        assert_eq!(
+            display_command(&argv(&["vi", ""]), RemoteShell::Posix),
+            "vi ''"
+        );
     }
 
     fn remote(shell: RemoteShell) -> Remote {
@@ -2162,7 +2488,30 @@ mod tests {
             (&["grok.exe", brief], Pwsh, AtLaunch, None),
             // A known wrapper whose program argument is the agent's name or
             // package.
-            (&["npx", "codex", brief], Posix, AtLaunch, None),
+            (
+                &["npx", "-y", "@openai/codex", brief],
+                Posix,
+                AtLaunch,
+                None,
+            ),
+            (
+                &["npx", "@openai/codex@latest", brief],
+                Posix,
+                AtLaunch,
+                None,
+            ),
+            (
+                &["npx", "--yes", "@anthropic-ai/claude-code", brief],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (
+                &["wsl", "-d", "Ubuntu", "--", "codex", brief],
+                Pwsh,
+                AtLaunch,
+                None,
+            ),
             (&["npx", "claude", brief], Posix, WithFirstPost, None),
             (&["npx.cmd", "@openai/codex", brief], Pwsh, AtLaunch, None),
             (&["wsl", "codex", brief], Pwsh, AtLaunch, None),
@@ -2200,12 +2549,10 @@ mod tests {
             ),
             (&["codex-wrapper", brief], Posix, WithFirstPost, None),
             (&["my-claude-wrapper.cmd", brief], Pwsh, WithFirstPost, None),
-            (
-                &["npx", "-y", "@openai/codex", brief],
-                Posix,
-                WithFirstPost,
-                None,
-            ),
+            // `npx codex` may be the registry's other `codex` package.
+            (&["npx", "codex", brief], Posix, WithFirstPost, None),
+            (&["codex.py", brief], Posix, WithFirstPost, None),
+            (&["claude.sh", brief], Posix, WithFirstPost, None),
             (
                 &["npx", "@openai/codex-sdk", brief],
                 Posix,

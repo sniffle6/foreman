@@ -491,9 +491,13 @@ Sessions-panel row read "disconnected" until then. An agent Session
 relaunches with that provider's resume argv from one small table; a
 provider with no entry, or an agent launched through `npx` or `wsl`,
 starts the bare provider fresh. "Is an agent" is the program itself
-(`remote::program_agent`), not the tab icon's scan, so a command that only
-names an agent (`vi codex.md`) runs again as it was, like any other
-command. An agent's Dispatch prompt is never sent again.
+(`remote::program_agent`), not the tab icon's scan. A reconnect never
+replays an agent's original prompt: a command that names no agent runs
+again as it was, and one that names an agent but is no agent program
+(`env X=1 codex "brief"`, `vi codex.md`) gets a login shell in its
+directory, since a brief and a file name look the same
+(`remote::reconnect_class`). The bar says "Enter to reconnect to a shell"
+and the banner prints the command.
 
 **Inert on a Remote Session:** file-path links (URLs still open), file
 drops and image paste (refused with a toast). The close confirm names the
@@ -942,6 +946,39 @@ reconnect: the pane's `ssh.exe` stopped by PID, then `foreman reconnect`.
   transcript removed. Instances stopped by PID, sandbox workspace restored.
   Claude's trust entry for the deleted directory stays in the Remote's
   `~/.claude.json`.
+
+## Results, 2026-11-24, a reconnect never replays a brief
+
+Same setup, one run each. BEFORE is 03e278f; AFTER is this change. Each
+reconnect: the pane's `ssh.exe` stopped by PID, then `foreman reconnect`.
+The brief told Claude to run `sh post.sh <WORD>` (a curl to the Tunnel),
+allowed by the directory's `.claude/settings.local.json`; the trust dialog
+was answered once by hand.
+
+| Run | BEFORE | AFTER |
+|---|---|---|
+| `env FOO=1 claude "<brief>"`, reconnected | the brief ran again: a second post, a second transcript | a login shell in its directory, nothing run, one post |
+| its disconnect bar | not captured | "Enter to reconnect to a shell" |
+| `vi codex.md`, reconnected | not run | a login shell, no vi, no Codex |
+| `vi notes.md`, reconnected | not run | vi on `notes.md` again |
+| `claude "<brief>"` after one turn, reconnected | not run | `claude --settings <hooks> --continue`, posted on the new token |
+
+- BEFORE: `#2 t3: KUMQUAT`, then after the reconnect `#5 t3: KUMQUAT`,
+  with the Remote running `claude Run this command…` and two transcripts in
+  the directory, each opening with the brief.
+- AFTER: the banner read `── reconnecting to falador: a shell. Not rerun,
+  as it may repeat a brief: ──` with the command whole on the next row, then
+  `andy@Falador:/tmp/3e0-A2-…$`. A first AFTER build printed the command in
+  the one-row note and elided it mid-brief; the command now has its own
+  rows.
+- Claude: one turn posted `LYCHEE`; the reconnect resumed it, and a post
+  asking for `MANGO` got `#22 t7 (re #21): MANGO`.
+- npx: not run live. On the Remote's npm 9.2.0 a `--no` probe printed npm's
+  own version, so whether a form would download stayed unproved. Unit
+  tests only.
+- Cleanup: vi quit with `:q!`, nothing saved. Directories and transcripts
+  removed. Instances stopped by PID, sandbox workspace restored, settings
+  unchanged. The trust entries stay in the Remote's `~/.claude.json`.
 
 ## Order of work
 

@@ -170,18 +170,39 @@ is for changing the feature.
   note typed at Ready, since a Dispatch may never get a post to carry it.
 - **Only an agent PROGRAM is typed into or resumed.** `remote::program_agent`
   decides every Remote choice of what runs or what is typed (typed note,
-  hooks, hold, what reconnect runs, the agent the workspace saves):
-  argv[0]'s stem is the agent, or `npx`/`wsl` runs the bare name or its npm
-  package. The tab icon's scan (`IconKind::from_argv`) also matches a
+  hooks, hold, what reconnect runs, the agent the workspace saves).
+  argv[0]'s stem is the agent with no extension or an executable's
+  (`claude.cmd` yes, `claude.sh` no), or `npx`/`wsl` runs it in a form whose
+  grammar the code states and cites (`npx_agent`, `wsl_agent`). An unknown
+  flag refuses. The tab icon's scan (`IconKind::from_argv`) also matches a
   mention and decides nothing. On it `vi codex.md` got the note and its
   Enter typed into vi, and its reconnect started `codex resume --last`
   (2026-11-24).
-- **A command that is no agent program reruns as it was on reconnect,
-  arguments and all.** `env X=1 codex "brief"`, `bash -c "codex …"` and a
-  wrapper script replay their brief, as `python tool.py "brief"` always
-  did: foreman cannot tell a prompt from a file name in a command it does
-  not know. Launch an agent by name, by path, or through `npx`/`wsl` for it
-  to resume without its prompt.
+- **`npx claude` and `npx codex` are not agents.** Both bare names are
+  other npm packages (2026-11-24: `claude` 0.1.2 says it is not the official
+  package, `codex` is a static site generator). Only the scoped packages
+  count, optionally `@<version>` or `@<tag>`.
+- **The npx grammar is npm 11's; the Debian Remote runs npm 9.2.0.** There
+  `npx --no @anthropic-ai/claude-code --version` printed `9.2.0`, npm's own
+  version, so an option after the package may still reach npm on that
+  version. `npx_agent` reads nothing after the package, so its verdict
+  holds; check this before it ever does. No npx form was run live: whether
+  one would download is unproved.
+- **A reconnect never replays an agent's original prompt.** `remote::reconnect_class`
+  has three classes. An agent program resumes (`claude --continue`,
+  `codex resume --last`), and through `npx`/`wsl` it starts the bare
+  provider fresh. A command that names no agent (`vi notes.md`, `htop`, a
+  shell) reruns as it was. A command that names one but is no agent program
+  (`env X=1 codex "brief"`, `nice claude "brief"`, `bash -c 'claude …'`, and
+  also `vi codex.md`) gets a login shell in the same directory and runs
+  nothing: foreman cannot tell a brief from a file name there. Before
+  009024d these relaunched bare; 009024d reran them, brief and all, so a
+  dropped Dispatch redid its work. The bar says "Enter to reconnect to a
+  shell". The banner's header is one row like every note, and the command
+  follows it whole, quoted to retype (`Session::inject_note_full`): a note
+  is elided to one row, and that cut the command mid-brief (2026-11-24).
+- **That shell gets none of the dead connection's queued chat.** A shell
+  would run it as commands, so `wm.rs` `reconnect` drops it.
 - **A workspace saved before `program` restores every Remote pane as a
   shell.** The old `agent` field came from the icon's scan, so a saved
   `vi codex.md` and a real Codex look the same; neither is trusted
@@ -284,8 +305,8 @@ is for changing the feature.
   and an uncertain input must never be resent by itself. Reconnect is the
   human's Enter on the disconnect bar, or `foreman reconnect tN`, which does
   the same through this PC's pipe only: a peer and the Tunnel cannot send
-  it, so a Remote agent cannot reconnect a pane. An agent program's Dispatch
-  prompt is never sent again.
+  it, so a Remote agent cannot reconnect a pane. A reconnect never replays
+  an agent's original prompt (the three classes are under Gotchas).
 - **The typed note writes URL and token out; the in-prompt one names
   `$FOREMAN_URL` and `$FOREMAN_TOKEN`.** The prompt is argv, which every user
   on the Remote can read. A typed note is not, and it also serves Grok and

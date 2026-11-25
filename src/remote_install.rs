@@ -57,6 +57,16 @@ pub fn clear_ended(target: &str, provider: &str) {
     }
 }
 
+/// A Remote Session launched with `argv` opened on `target`: when its
+/// program is an agent ([`crate::remote::program_agent`], an accepted
+/// `npx`/`wsl` form included), that provider's "needs login" is over. A
+/// command that only names one (`vi codex.md`) clears nothing.
+pub fn agent_opened(target: &str, argv: &[String]) {
+    if let Some(p) = crate::remote::program_agent(argv) {
+        clear_ended(target, p.agent);
+    }
+}
+
 pub fn mark_of(target: &str, provider: &str) -> Option<Mark> {
     marks()
         .lock()
@@ -1176,6 +1186,40 @@ mod tests {
         let g = marks_generation();
         clear_ended(t, "grok");
         assert_eq!(marks_generation(), g, "nothing to clear, nothing moved");
+    }
+
+    /// An agent opened through a wrapper foreman accepts ends "needs
+    /// login"; a command that only names the agent does not.
+    #[test]
+    fn an_agent_opened_through_an_accepted_wrapper_clears_needs_login() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let t = "agent-opened@desk";
+        for (argv, provider, clears) in [
+            (
+                v(&["npx", "-y", "@anthropic-ai/claude-code", "brief x"]),
+                "claude",
+                true,
+            ),
+            (
+                v(&["npx", "@openai/codex@latest", "brief x"]),
+                "codex",
+                true,
+            ),
+            (
+                v(&["wsl", "-d", "Ubuntu", "--", "claude", "brief x"]),
+                "claude",
+                true,
+            ),
+            (v(&["claude", "brief x"]), "claude", true),
+            (v(&["vi", "codex.md"]), "codex", false),
+            (v(&["env", "X=1", "claude", "brief x"]), "claude", false),
+            (v(&["npx", "claude", "brief x"]), "claude", false),
+        ] {
+            set_mark(t, provider, Mark::Ended);
+            agent_opened(t, &argv);
+            let want = if clears { None } else { Some(Mark::Ended) };
+            assert_eq!(mark_of(t, provider), want, "{argv:?}");
+        }
     }
 
     /// The last check before a spawn: only a missing agent whose installer

@@ -175,11 +175,13 @@ process is there, and it is an ordinary member of THIS project's chat.
   waits for the human's Enter to reconnect, and Foreman never reconnects by
   itself. `reconnect tN` does what that Enter does, from this PC only; use
   it when the human asks. Until then `chat --to` it fails as exited.
-- A reconnected agent resumes its last conversation (Claude, Codex) without
-  its original prompt or flags, or starts fresh. Re-brief it by chat. Only a
-  launch by name, by path, or through `npx`/`wsl` is an agent here: any other
-  command (`env X=1 codex "brief"`, a wrapper script) reruns as it was,
-  brief included.
+- A reconnect never replays a brief. An agent launched by name or path
+  resumes its last conversation (Claude, Codex) without its original prompt
+  or flags, or starts fresh; one launched through `npx` or `wsl` starts
+  fresh. Re-brief it by chat. A command that names no agent (`vi notes.md`)
+  reruns as it was. Any other command that names one (`env X=1 codex
+  "brief"`, `bash -c 'claude …'`, even `vi codex.md`) reconnects to a shell
+  in its directory and runs nothing; the human reruns it if they want.
 - A Windows Remote may refuse a long prompt for its command-line limit. Do
   what the error says: open without the prompt and send the brief by chat.
 - `kanban dispatch` has no `--on`; card work runs on this PC.
