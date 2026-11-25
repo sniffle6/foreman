@@ -892,6 +892,29 @@ Session's own queue, which is what a drop carries over.
 - Unverified: how the cue looks (needs a human), Grok (not installed),
   Windows Remotes (none exist).
 
+## Results, 2026-11-24, the reply note only into an agent program
+
+Same setup as above, one run each. BEFORE is 308401b, AFTER is this change.
+The Remote has no `vim`, only `vi` (vim.tiny). The argv `vi codex.md`
+matches the tab icon's substring scan just as `vim codex.md` does, so
+`foreman open --on falador --cwd /tmp/<new> -- vi codex.md` was run.
+
+| Run | BEFORE | AFTER |
+|---|---|---|
+| note typed into vi at launch (snapshot at 17 s) | yes | no |
+| first chat post to the pane carries the note | not run | yes |
+
+- BEFORE: rows 1-9 of the pane were the reply note, typed into vi's buffer
+  above its `"codex.md" [New File]` line.
+- AFTER: the pane showed only vi's status line until a post. The post
+  `[chat p1 #3] t1→t4` came first, then the note.
+- Both runs quit with `:q!`. Nothing was saved, and both directories were
+  removed.
+- Found, not fixed: the BEFORE instance's saved workspace held the vi pane
+  as a Remote `agent: "codex"` (persisted through `agent_of`), and
+  `relaunch` turns it into a bare `codex`. Reconnect and restore still use
+  the loose predicate.
+
 ## Order of work
 
 One run, in this order, each step usable when it lands:

@@ -137,7 +137,9 @@ process is there, and it is an ordinary member of THIS project's chat.
   a wrapper such as `npx`, anything on a Windows Remote) cannot reply until
   you post to it:** nothing is typed into it at launch, since keys then
   answer its trust dialog "No, exit", so its first chat post carries the
-  note. Post to it once (for example "report here when done"). A bare agent
+  note. Post to it once (for example "report here when done"). A bare agent,
+  and any command that is not the agent's own program (`env X=1 codex …`,
+  `bash -c "…"`, a script; `npx` or `wsl` naming the agent counts as it),
   also gets the note with its first post. It joins
   the room at its end: posts made before it opened never
   reach it. Ask it to report by chat and leave the Foreman commands out of

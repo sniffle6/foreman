@@ -688,7 +688,10 @@ pub fn disconnect_bar_text(
 /// first keys answer its folder-trust dialog.
 pub fn held_cue_text(agent: Option<&str>) -> (String, &'static str, &'static str) {
     (
-        format!("Chat waiting until {} is ready", agent.unwrap_or("the agent")),
+        format!(
+            "Chat waiting until {} is ready",
+            agent.unwrap_or("the agent")
+        ),
         " — ",
         "deliver now",
     )
@@ -935,6 +938,11 @@ pub struct Session {
     /// is also what tells `show` to leave the thumb painted while the pointer
     /// wanders off the pane mid-drag.
     thumb_drag: Option<f32>,
+    /// The primary press that is down, or came up this frame, began on the
+    /// search bar or the held cue. egui clears `press_origin` on the release
+    /// event itself, so the release frame of a drag that left the bar would
+    /// otherwise look like the grid's and copy-on-select a stale selection.
+    press_on_bar: bool,
     /// When the thumb was last "held" (band hover, drag, or the offset moving).
     /// `None` means never — an untouched pane starts already faded.
     thumb_seen: Option<std::time::Instant>,
@@ -1606,6 +1614,7 @@ impl Session {
             content_gen: 0,
             mono_paint: None,
             thumb_drag: None,
+            press_on_bar: false,
             thumb_seen: None,
             thumb_last_off: 0,
             link_hover: None,
@@ -2732,7 +2741,10 @@ impl Session {
                     resp.id.with(("foreman_held_cue", self.term_id)),
                     HELD_CUE_SENSE,
                 )
-                .on_hover_text(held_cue_tooltip(agent));
+                // Built only while its tooltip shows, not every cue frame.
+                .on_hover_ui(|ui| {
+                    ui.label(held_cue_tooltip(agent));
+                });
             if r.clicked() {
                 self.release_chat_hold();
                 ui.ctx().request_repaint();
@@ -2816,14 +2828,29 @@ impl Session {
 
             // Local selection allowed when not app-owned, including while search
             // is open — but never when the pointer is over the search bar.
-            let over_chrome =
-                |p: egui::Pos2| [search_bar, cue_bar].iter().flatten().any(|b| b.contains(p));
-            // A gesture that began on a bar stays off the grid after it moves:
-            // egui reports a drag start where the pointer is by then.
-            let pointer_over_bar = ui.input(|i| {
-                i.pointer.interact_pos().is_some_and(over_chrome)
-                    || i.pointer.press_origin().is_some_and(over_chrome)
+            let over_chrome = |p: egui::Pos2| {
+                [search_bar, cue_bar]
+                    .iter()
+                    .flatten()
+                    .any(|b| b.contains(p))
+            };
+            // A gesture that began on a bar stays off the grid after it moves
+            // (egui reports a drag start where the pointer is by then) and
+            // through the frame it is released on.
+            let (over, pressed, settled) = ui.input(|i| {
+                let p = &i.pointer;
+                (
+                    p.interact_pos().is_some_and(over_chrome),
+                    p.press_origin().is_some_and(over_chrome),
+                    !p.primary_down() && !p.primary_released(),
+                )
             });
+            if pressed {
+                self.press_on_bar = true;
+            } else if settled || ui.input(|i| i.pointer.primary_pressed()) {
+                self.press_on_bar = false;
+            }
+            let pointer_over_bar = over || self.press_on_bar;
             // Scrollback thumb drag. Claimed BEFORE local selection, which
             // otherwise swallows every primary drag on the pane. Gated on
             // `!suppress_local` so an app that owns the mouse still wins — the
@@ -2935,9 +2962,7 @@ impl Session {
                 }
                 // Secondary click over the search bar must not paste into the PTY.
                 if resp.secondary_clicked() && !disconnected {
-                    let paste_ok = resp
-                        .interact_pointer_pos()
-                        .is_none_or(|p| !over_chrome(p));
+                    let paste_ok = resp.interact_pointer_pos().is_none_or(|p| !over_chrome(p));
                     if paste_ok {
                         if let Some(txt) = read_clipboard().filter(|t| !t.is_empty()) {
                             self.request_paste(txt, ui);
@@ -7315,7 +7340,10 @@ mod tests {
                 "deliver now"
             )
         );
-        assert_eq!(held_cue_text(None).0, "Chat waiting until the agent is ready");
+        assert_eq!(
+            held_cue_text(None).0,
+            "Chat waiting until the agent is ready"
+        );
         assert_eq!(
             held_cue_tooltip(Some("claude")),
             "Types the waiting chat into this pane now. If claude is showing a prompt, answer it first."
@@ -7336,7 +7364,8 @@ mod tests {
             let mut got = None;
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let th = crate::theme::live(ui.ctx());
-                let bar = egui::Rect::from_min_size(egui::pos2(0.0, 280.0), egui::vec2(width, 20.0));
+                let bar =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 280.0), egui::vec2(width, 20.0));
                 let c = HeldCue::layout(ui, bar, Some("claude"), &th);
                 got = Some((
                     c.bar,
@@ -7356,7 +7385,11 @@ mod tests {
         }
         let (wide, narrow) = (widths[0], widths[1]);
         assert!(narrow.0 < wide.0, "the lead gave way: {widths:?}");
-        assert_eq!((narrow.1, narrow.2), (wide.1, wide.2), "separator and action kept");
+        assert_eq!(
+            (narrow.1, narrow.2),
+            (wide.1, wide.2),
+            "separator and action kept"
+        );
     }
 
     /// `chat_held` is true from the moment a hold begins; the cue, and the
@@ -7411,7 +7444,8 @@ mod tests {
     fn a_press_on_the_held_cue_sends_no_mouse_bytes() {
         let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
         let (mut s, sent) = watched_held(&d.ctx);
-        s.parser.advance(&mut s.term, b"\x1b[?1000h\x1b[?1006hClaude");
+        s.parser
+            .advance(&mut s.term, b"\x1b[?1000h\x1b[?1006hClaude");
         d.frame(&mut s, vec![]);
         let action = held_cue_action(&mut d);
         let lead = egui::pos2(4.0, 296.0);
@@ -7428,31 +7462,98 @@ mod tests {
         assert!(!s.chat_held(), "the action still works");
         // The same press on the grid does reach the agent.
         let grid = egui::pos2(100.0, 40.0);
-        d.frame(&mut s, vec![egui::Event::PointerMoved(grid), pointer(grid, true)]);
+        d.frame(
+            &mut s,
+            vec![egui::Event::PointerMoved(grid), pointer(grid, true)],
+        );
         d.frame(&mut s, vec![pointer(grid, false)]);
         assert!(sent.lock().unwrap().starts_with(b"\x1b[<0;"));
     }
 
-    /// A drag that starts on the cue's strip selects nothing; one that starts
-    /// on the grid still does.
+    /// Press at `from`, drag along row y=5 of the grid, release there. Returns
+    /// what the release frame copied, then what the frame after it copied.
+    fn drag_to_grid(
+        d: &mut PaneDriver,
+        s: &mut Session,
+        from: egui::Pos2,
+    ) -> (Vec<String>, Vec<String>) {
+        d.frame(
+            s,
+            vec![egui::Event::PointerMoved(from), pointer(from, true)],
+        );
+        for x in [40.0, 100.0, 160.0] {
+            d.frame(s, vec![egui::Event::PointerMoved(egui::pos2(x, 5.0))]);
+        }
+        let release = d.frame(s, vec![pointer(egui::pos2(160.0, 5.0), false)]);
+        (release, d.frame(s, vec![]))
+    }
+
+    fn copy_on_select(ctx: &egui::Context) {
+        let settings = crate::config::Settings {
+            copy_on_select: true,
+            ..Default::default()
+        };
+        crate::config::seed_live(ctx, &settings);
+    }
+
+    /// A drag that starts on the cue's strip selects nothing and, through its
+    /// release frame, copies nothing: not even a selection already there.
+    /// One that starts on the grid still selects and copies.
     #[test]
     fn a_drag_from_the_held_cue_starts_no_selection() {
         let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        copy_on_select(&d.ctx);
         let (mut s, sent) = watched_held(&d.ctx);
         s.parser.advance(&mut s.term, b"some text on the first row");
         d.frame(&mut s, vec![]);
-        let drag = |d: &mut PaneDriver, s: &mut Session, from: egui::Pos2| {
-            d.frame(s, vec![egui::Event::PointerMoved(from), pointer(from, true)]);
-            for x in [40.0, 100.0, 160.0] {
-                d.frame(s, vec![egui::Event::PointerMoved(egui::pos2(x, 5.0))]);
-            }
-            d.frame(s, vec![pointer(egui::pos2(160.0, 5.0), false)]);
-        };
-        drag(&mut d, &mut s, egui::pos2(4.0, 296.0));
-        assert!(s.term.selection.is_none(), "{:?}", s.term.selection_to_string());
+        let cue = egui::pos2(4.0, 296.0);
+        let copied = drag_to_grid(&mut d, &mut s, cue);
+        assert!(
+            s.term.selection.is_none(),
+            "{:?}",
+            s.term.selection_to_string()
+        );
+        assert_eq!(copied, (vec![], vec![]));
         assert!(s.chat_held());
-        drag(&mut d, &mut s, egui::pos2(2.0, 5.0));
-        assert!(s.term.selection.is_some(), "the grid still selects");
+        let (copied, _) = drag_to_grid(&mut d, &mut s, egui::pos2(2.0, 5.0));
+        let stale = s
+            .term
+            .selection_to_string()
+            .expect("the grid still selects");
+        assert_eq!(copied, [stale.clone()], "the grid's drag copies on select");
+        // The release frame of a drag from the cue leaves the old selection
+        // alone and off the clipboard.
+        let copied = drag_to_grid(&mut d, &mut s, cue);
+        assert_eq!(copied, (vec![], vec![]), "re-copied {stale:?}");
+        assert_eq!(s.term.selection_to_string(), Some(stale));
+        assert!(s.chat_held());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// The search bar's equivalent: a drag from the bar onto the grid
+    /// selects nothing and copies nothing through its release frame.
+    #[test]
+    fn a_drag_from_the_search_bar_starts_no_selection_and_copies_nothing() {
+        let mut d = PaneDriver::new(egui::vec2(600.0, 300.0));
+        copy_on_select(&d.ctx);
+        let (mut s, sent) = watched_disconnected(&d.ctx);
+        s.parser.advance(&mut s.term, b"some text on the first row");
+        d.frame(&mut s, vec![]);
+        let (copied, _) = drag_to_grid(&mut d, &mut s, egui::pos2(2.0, 5.0));
+        let stale = s.term.selection_to_string().expect("the grid selects");
+        assert_eq!(copied, [stale.clone()]);
+        s.search.apply(crate::search::SearchCmd::Open);
+        d.frame(&mut s, vec![]);
+        let bar = crate::search::search_bar_rect(d.rect);
+        for from in [bar.left_center() + egui::vec2(2.0, 0.0), bar.center()] {
+            let copied = drag_to_grid(&mut d, &mut s, from);
+            assert_eq!(
+                copied,
+                (vec![], vec![]),
+                "from {from:?} re-copied {stale:?}"
+            );
+            assert_eq!(s.term.selection_to_string().as_ref(), Some(&stale));
+        }
         assert!(sent.lock().unwrap().is_empty());
     }
 

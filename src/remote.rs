@@ -301,11 +301,81 @@ pub fn carries_tunnel(argv: &[String]) -> bool {
 
 /// The agent provider (`claude` / `codex` / `grok`, from `board::AGENTS`)
 /// an argv runs, by the same scan the tab icon uses
-/// ([`crate::icons::IconKind::from_argv`]). The one "is an agent" predicate
-/// for the icon, the at-launch reply note and reconnect: they must agree, or
-/// an argv that shows the Claude icon could replay its prompt on reconnect.
+/// ([`crate::icons::IconKind::from_argv`]). The one "looks like an agent"
+/// predicate for the icon and reconnect: they must agree, or an argv that
+/// shows the Claude icon could replay its prompt on reconnect. It matches a
+/// mere mention (`vi codex.md`), so nothing that types into the pane or
+/// changes the launch decides by it: that is [`program_agent`].
 pub fn agent_of(argv: &[String]) -> Option<&'static str> {
     crate::icons::IconKind::from_argv(argv).and_then(crate::icons::IconKind::provider)
+}
+
+/// Launchers whose next argument (after an optional `--`) is the program
+/// they run, as foreman's own tests and [`relaunch`] name them.
+const AGENT_WRAPPERS: &[&str] = &["npx", "wsl"];
+
+/// npm packages that are an agent, as `npx` names them.
+const AGENT_PACKAGES: &[(&str, &str)] = &[
+    ("@anthropic-ai/claude-code", "claude"),
+    ("@openai/codex", "codex"),
+];
+
+/// The agent a Remote launch's PROGRAM is, from [`program_agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramAgent {
+    /// The provider, from `board::AGENTS`.
+    pub agent: &'static str,
+    /// Run through an [`AGENT_WRAPPERS`] launcher rather than by itself.
+    pub wrapped: bool,
+}
+
+/// Which agent `argv`'s program is, exactly: its file stem is the agent's
+/// name (case-insensitive: `claude`, `/usr/bin/codex`, `CLAUDE.exe`), or it
+/// is a known wrapper whose program argument is the bare name or the
+/// agent's npm package (`npx @openai/codex`, `wsl -- codex`). Anything that
+/// only mentions an agent (`vi codex.md`, `tail -f grok.log`,
+/// `env X=1 codex`, `bash -c "codex …"`, `npx -y @openai/codex`) is not one.
+/// The one predicate for every Remote launch decision that types into the
+/// pane or changes what runs: the reply note ([`note_route`],
+/// [`typed_route`]), Claude's hooks and its chat hold ([`hooked_claude`]).
+/// A wrong yes pastes the note and an Enter into whatever it is; a wrong no
+/// only waits for a post to carry the note.
+pub fn program_agent(argv: &[String]) -> Option<ProgramAgent> {
+    if install_of(argv).is_some() {
+        return None;
+    }
+    let named = |word: &str| {
+        crate::board::AGENTS
+            .iter()
+            .copied()
+            .find(|a| a.eq_ignore_ascii_case(word))
+    };
+    let (program, rest) = argv.split_first()?;
+    let stem = std::path::Path::new(program).file_stem()?.to_str()?;
+    if let Some(agent) = named(stem) {
+        return Some(ProgramAgent {
+            agent,
+            wrapped: false,
+        });
+    }
+    if !AGENT_WRAPPERS.iter().any(|w| w.eq_ignore_ascii_case(stem)) {
+        return None;
+    }
+    let runs = match rest {
+        [dashes, runs, ..] if dashes == "--" => runs,
+        [runs, ..] => runs,
+        [] => return None,
+    };
+    let agent = named(runs).or_else(|| {
+        AGENT_PACKAGES
+            .iter()
+            .find(|(package, _)| package == runs)
+            .map(|&(_, agent)| agent)
+    })?;
+    Some(ProgramAgent {
+        agent,
+        wrapped: true,
+    })
 }
 
 /// How a launch of `argv` on a `shell` Remote teaches its agent the reply
@@ -322,7 +392,7 @@ pub fn agent_of(argv: &[String]) -> Option<&'static str> {
 /// [`typed_route`].
 pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
     use crate::control::tunnel::NoteGoes;
-    if argv.len() < 2 || agent_of(argv).is_none() {
+    if argv.len() < 2 || program_agent(argv).is_none() {
         return NoteGoes::WithFirstPost;
     }
     let sees_env = shell == RemoteShell::Posix && matches!(argv[0].as_str(), "claude" | "codex");
@@ -345,10 +415,13 @@ pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel
 /// agent (Grok, Codex in a shape [`prompt_index`] refuses, their wrappers)
 /// has it typed at Ready, as before Claude's dialog was found: no dialog of
 /// theirs was seen to quit on it, and a Dispatch may never get a post to
-/// carry it.
+/// carry it. A command whose program is no agent ([`program_agent`]) gets it
+/// with its first post: `vi codex.md` would take it as text and its Enter.
 pub fn typed_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
     use crate::control::tunnel::NoteGoes;
-    if hooked_claude(argv, shell).is_some() || agent_of(argv) != Some("claude") {
+    let typed = hooked_claude(argv, shell).is_some()
+        || program_agent(argv).is_some_and(|p| p.agent != "claude");
+    if typed {
         NoteGoes::AtLaunch
     } else {
         NoteGoes::WithFirstPost
@@ -667,10 +740,13 @@ impl ChatHold {
 /// slash command (2026-11-24, Claude Code 2.1.331: `/cost` and `/context`
 /// fired no `UserPromptSubmit`, `/init` did).
 pub fn hooked_claude(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
-    let (program, rest) = argv.split_first()?;
-    let stem = std::path::Path::new(program).file_stem()?.to_str()?;
+    let rest = argv.get(1..)?;
+    let itself = ProgramAgent {
+        agent: "claude",
+        wrapped: false,
+    };
     if shell != RemoteShell::Posix
-        || !stem.eq_ignore_ascii_case("claude")
+        || program_agent(argv) != Some(itself)
         || rest
             .iter()
             .any(|a| a == "--settings" || a.starts_with("--settings="))
@@ -1971,13 +2047,93 @@ mod tests {
             (&["codex"], Pwsh, WithFirstPost, None),
             (&[], Posix, WithFirstPost, None),
             (&["htop", "-d", "5"], Posix, WithFirstPost, None),
+            // The program is the agent, by its exact stem, any case.
+            (
+                &["/home/u/.npm-global/bin/codex", brief],
+                Posix,
+                AtLaunch,
+                None,
+            ),
+            (&["Codex", "exec", brief], Posix, AtLaunch, None),
+            (
+                &["/usr/bin/Claude", brief],
+                Posix,
+                AtLaunch,
+                Some(UntilPrompt),
+            ),
+            (&[r"C:\npm\claude.CMD", brief], Pwsh, WithFirstPost, None),
+            (&["grok.exe", brief], Pwsh, AtLaunch, None),
+            // A known wrapper whose program argument is the agent's name or
+            // package.
+            (&["npx", "codex", brief], Posix, AtLaunch, None),
+            (&["npx", "claude", brief], Posix, WithFirstPost, None),
+            (&["npx.cmd", "@openai/codex", brief], Pwsh, AtLaunch, None),
+            (&["wsl", "codex", brief], Pwsh, AtLaunch, None),
+            (&["wsl", "--", "grok", brief], Pwsh, AtLaunch, None),
+            (&["wsl", "claude", brief], Pwsh, WithFirstPost, None),
+            // A command that only mentions an agent is no agent: nothing is
+            // typed into it, and its first post carries the note.
+            (&["vim", "codex.md"], Posix, WithFirstPost, None),
+            (&["vi", "codex.md"], Posix, WithFirstPost, None),
+            (&["tail", "-f", "grok.log"], Posix, WithFirstPost, None),
+            (
+                &["tail", "-f", "/var/log/grok.log"],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (&["cat", "claude.txt"], Posix, WithFirstPost, None),
+            (
+                &["/opt/claude/bin/python", "script.py"],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (
+                &["bash", "-c", "codex \"do the card\""],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (
+                &["env", "VAR=1", "codex", brief],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (&["codex-wrapper", brief], Posix, WithFirstPost, None),
+            (&["my-claude-wrapper.cmd", brief], Pwsh, WithFirstPost, None),
+            (
+                &["npx", "-y", "@openai/codex", brief],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (
+                &["npx", "@openai/codex-sdk", brief],
+                Posix,
+                WithFirstPost,
+                None,
+            ),
+            (&["npx", "codex-helper", brief], Posix, WithFirstPost, None),
+            (&["npx"], Posix, WithFirstPost, None),
+            (&["wsl", "-d", "codex", "bash"], Pwsh, WithFirstPost, None),
         ];
         for (words, shell, note, hold) in table {
             let a = argv(words);
             assert_eq!(note_route(&a, *shell), *note, "{words:?} on {shell:?}");
             assert_eq!(hooked_claude(&a, *shell), *hold, "{words:?} on {shell:?}");
             if *note == AtLaunch && agent_of(&a) == Some("claude") {
-                assert!(hold.is_some(), "a Claude is typed into only behind a hold: {words:?}");
+                assert!(
+                    hold.is_some(),
+                    "a Claude is typed into only behind a hold: {words:?}"
+                );
+            }
+            if *note != WithFirstPost || hold.is_some() {
+                assert!(
+                    program_agent(&a).is_some(),
+                    "only an agent program is typed into, hooked or held: {words:?}"
+                );
             }
             if a.is_empty() {
                 continue;
@@ -2072,12 +2228,20 @@ mod tests {
         assert_eq!(b.ssh, ssh_argv(&l, &a).unwrap());
         assert_eq!(b.hold, None);
         // Nothing is typed without a hold, even where no note will be armed.
-        for words in [&["claude", "hi"][..], &["claude", "/cost"], &["claude", "do the card"]] {
+        for words in [
+            &["claude", "hi"][..],
+            &["claude", "/cost"],
+            &["claude", "do the card"],
+        ] {
             let a = argv(words);
             let mut l = launch(&r, "", &a);
             l.tunnel = None;
             let b = build(&l).unwrap();
-            assert_eq!((b.note, b.hold), (NoteGoes::WithFirstPost, None), "{words:?}");
+            assert_eq!(
+                (b.note, b.hold),
+                (NoteGoes::WithFirstPost, None),
+                "{words:?}"
+            );
         }
     }
 

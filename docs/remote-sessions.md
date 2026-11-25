@@ -167,6 +167,14 @@ is for changing the feature.
   hookless Claude gets no note typed at launch, so a Dispatch alone cannot
   quit it, and it cannot post until it is posted to. Codex and Grok get the
   note typed at Ready, since a Dispatch may never get a post to carry it.
+- **Only an agent PROGRAM is typed into.** `remote::program_agent` decides
+  every Remote launch choice (typed note, hooks, hold): argv[0]'s stem is
+  the agent, or `npx`/`wsl` runs the bare name or its npm package. The tab
+  icon's `agent_of` also matches a mention, and on it `vi codex.md` got the
+  note and its Enter typed into vi (2026-11-24). Anything else (`env X=1
+  codex`, `bash -c "codex …"`, `npx -y @openai/codex`) gets the note with
+  its first post. Reconnect and restore still use `agent_of`, so a
+  reconnected `vi codex.md` starts a bare `codex`.
 - **Typed input at Ready can answer Codex's update prompt.** Seen
   2026-11-24: a reconnect's `codex resume --last` showed "update available"
   and the carried posts' paste and Enter picked its default. Codex ran
