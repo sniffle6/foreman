@@ -901,6 +901,10 @@ impl eframe::App for App {
             // off, `restored` stays false so the fallback below still runs.
             let mut restored = false;
             if self.settings.restore_workspace {
+                // Restore reads config::live (a saved Remote tab looks its
+                // Remote up there), and the frame's own seed comes later.
+                // Unseeded, every Remote tab restored as "gone", a local shell.
+                config::seed_live(&ctx, &self.settings);
                 let snap = workspace::WorkspaceSnapshot::load();
                 if !snap.is_empty() {
                     let rep = self.desktop.apply_workspace(&snap, &ctx);
